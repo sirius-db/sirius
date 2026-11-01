@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -59,6 +60,7 @@ class io_object_metadata;
 
 namespace sirius::op::scan {
 class scan_info;
+struct scan_execution_record;
 // Adapter-owned semantic input published by the shared scan preparation path.
 // Concrete connectors extend this type; the preparation coordinator only keeps
 // the lifetime and never interprets connector-specific payloads.
@@ -216,6 +218,7 @@ struct scan_publication_observation {
 
 struct physical_check_counters {
   std::atomic<uint64_t> split_flushed_for_schema{0};
+  std::atomic<uint64_t> arrow_batches_imported{0}, arrow_rows_imported{0};
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
@@ -224,11 +227,19 @@ struct physical_check_counters {
   std::atomic<uint64_t> descriptor_mismatches{0};
   std::atomic<uint64_t> iceberg_delete_corrupt_inputs{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
+  std::atomic<uint64_t> execution_record_shadow_mismatches{0};
+  std::atomic<uint64_t> execution_record_shadow_coverage_added{0};
 
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.
   std::function<void(std::string const&, bool)> parquet_phase_for_testing;
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
+  // Per decoded batch, before any residual filter: reader filter present, output rows.
+  std::function<void(bool, uint64_t)> parquet_filter_for_testing;
+  std::function<void(bool, scan_execution_record const&)> scan_execution_for_testing;
+  std::function<void(std::vector<std::size_t> const&)> scan_residual_for_testing;
+  // Actual cuDF prepend requests, independently for row and source index.
+  std::function<void(bool, bool)> parquet_positions_for_testing;
   std::function<void()> after_certify_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
@@ -259,11 +270,26 @@ struct physical_check_counters {
     std::lock_guard lock(units_mutex);
     ++publications_by_query[query_token].readahead_registrations[file];
   }
-  void prefetcher_conversions(uint64_t query_token, uint64_t count)
+  void prefetcher_conversions(uint64_t query_token, uint64_t count) noexcept
   {
     if (!track_units || count == 0) return;
-    std::lock_guard lock(units_mutex);
-    publications_by_query[query_token].prefetcher_conversions += count;
+    try {
+      std::lock_guard lock(units_mutex);
+      publications_by_query[query_token].prefetcher_conversions += count;
+    } catch (...) {  // Observation must not interrupt resource retirement.
+    }
+  }
+  void preparation_finished(uint64_t query_token, scan_publication_observation observation) noexcept
+  {
+    if (!track_units) return;
+    try {
+      std::lock_guard lock(units_mutex);
+      auto& stored = publications_by_query[query_token];
+      observation.readahead_registrations.swap(stored.readahead_registrations);
+      observation.prefetcher_conversions = stored.prefetcher_conversions;
+      stored                             = std::move(observation);
+    } catch (...) {  // Observation must not interrupt resource retirement.
+    }
   }
   void reader_call(std::string const& file)
   {

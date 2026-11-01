@@ -100,8 +100,8 @@ look-ahead is not a user-selectable YAML setting.
 
 **Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
 - `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
-- per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
-- the join is neither RIGHT-family nor `MIXED_JOIN`
+- two independent per-GPU bounds hold: the estimated cuco hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission including MARK) stay under `max_build_hash_table_bytes`, and the folded build payload that stays GPU-resident for the whole probe stream stays under `max_build_probe_resident_bytes`; the build must fold to a single batch per partition
+- the join is neither RIGHT-family, `MIXED_JOIN`, nor full `OUTER`
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
@@ -109,7 +109,7 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing by the join's partition placement
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB)
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) and `max_build_probe_resident_bytes` (folded resident build payload; default: 8× the derived batch size)
 
 ### COUNT DISTINCT Optimization (PR #414)
 
@@ -151,6 +151,25 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Low-Cardinality Grouped Aggregation (experimental)
+
+**Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
+
+**Mechanism:** A custom CUDA kernel path, tried first by `grouped_aggregate_table()`:
+1. `find_groups_kernel` builds a 16-bit code from up to two one-character string keys, verifies every key length, and records the codes present and one representative row per code.
+2. The host maps the codes to at most 64 dense groups.
+3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
+4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
+
+It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+
+**Code path:**
+- `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
+- `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
+
+**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
@@ -174,7 +193,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) — independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
 ### Zero-Copy Projection Passthrough (PR #991)
 
@@ -343,6 +362,20 @@ result materialization restore native carriers.
 **Config:** `enable_compressed_materialization` (default: `true`), settable through YAML under
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
+
+### Decode to Restore Type
+
+**Motivation:** With compressed materialization, a pinned column stored in a narrow carrier is cast back to its native type by the scan whenever a type-sensitive consumer needs it. TPC-H q1 restores four DECIMAL32 columns to DECIMAL64 in every batch: a separate read and write of each column, about 25 ms of cast kernels at SF1000.
+
+**Mechanism:** When the scan's output assembly is a leading identity, it passes its restore targets down to the Simpatico decode (`pushdown_request::output_types` → `scan_filter_request::output_types` → `decode_selection::output_type`). For a compacted (filter-pushdown) decode whose root is a bitpack node, the JIT renderer declares the kernel's output in the wider element type (entry symbol suffix `_to_<type>`), so the kernel widens in its store, and the decode allocates the output column in the target type. The scan's restore cast then finds the column already restored. Supported widenings: signed integer to a wider signed integer, same-scale DECIMAL widening, and a raw signed integer to DECIMAL or `TIMESTAMP_DAYS`. Other decodes keep the restore cast. The JIT decoder only has signed element types (`int8_t` through `__int128`), so unsigned storage is not widened in place, and only a compacted decode with a bitpack root writes in the restore type.
+
+**Code path:**
+- `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/op/scan/sirius_gpu_scan_operator_data.cpp` — restore targets
+- `src/compression/compressed_scan.cpp` — `pushdown_request::output_types`, `decompression_pushdown_scan::with_output_types()`
+- `src/compression/simpatico_codegen/src/plan/decompress.cpp` — `widened_element_dtype()`, `decode_fused_subtree_impl()`
+- `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
+
+**Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
 
 ### Late Materialization (unreleased, experimental)
 

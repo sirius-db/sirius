@@ -16,6 +16,9 @@
 
 #pragma once
 #include "expression_evaluator/query_policy.hpp"
+#include "scan_manager/preparation.hpp"
+#include "scan_manager/preparation_claim.hpp"
+#include "scan_manager/preparation_job.hpp"
 
 // cudf
 #include <cudf/table/table.hpp>
@@ -28,7 +31,6 @@
 
 // rmm
 #include "io/io_context.hpp"
-#include "scan_manager/preparation.hpp"
 
 #include <cuda/stream>
 
@@ -80,7 +82,7 @@ class scan_operator_input;
  * @brief Abstract source of cudf tables. One implementation per data format.
  *
  * Composed by @c scan_manager::split_provider, which drives the metadata
- * worker pool via @ref has_more_splits and @ref next_split_provider, and by
+ * worker pool via @ref make_preparation_sources, and by
  * @c sirius::op::scan::sirius_gpu_scan_operator, which calls
  * @ref materialize_table (and conditionally @ref post_filter_and_project)
  * on each split it pulls off its connector.
@@ -95,46 +97,8 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     _execution_completion = std::move(completion);
   }
 
-  using metadata_scan_task_t           = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
-  using stoppable_metadata_scan_task_t = metadata_scan_task_t;
-
-  struct preparation_claim {
-    metadata_scan_task_t work;
-    // Optional stop-aware wrapper used by the preparation coordinator before blocking reads.
-    std::function<std::unique_ptr<scan_info>(std::stop_token)> stop_work;
-    std::optional<scan_manager::unit_key> key;
-    scan_manager::required_input_set required;
-  };
-  virtual std::shared_ptr<scan_manager::preparation_admission> preparation_admission() const
-  {
-    return {};
-  }
-  virtual void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>) {}
-  virtual bool can_claim_preparation() { return true; }
-  virtual void stop_preparation() noexcept {}
-  /// Complete adapter-owned preparation cleanup after query work has drained.
-  virtual void finish_preparation() noexcept { stop_preparation(); }
-  virtual preparation_claim claim_preparation(io::ioctx_resolver resolve)
-  {
-    auto stop_work = next_split_provider_with_stop(resolve);
-    if (!stop_work) return {};
-    auto work = stop_work;
-    return {[work = std::move(work)](std::stop_token stop) { return work(stop); },
-            std::move(stop_work),
-            {},
-            {}};
-  }
-
-  virtual stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve)
-  {
-    auto work = next_split_provider(std::move(resolve));
-    if (!work) return {};
-    return [work = std::move(work)](std::stop_token stop) mutable {
-      if (stop.stop_requested())
-        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-      return work(stop);
-    };
-  }
+  using metadata_scan_task_t =
+    std::function<std::unique_ptr<scan_info>(scan_manager::preparation_stop_token)>;
 
   virtual ~gpu_ingestible() = default;
 
@@ -164,6 +128,14 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
   virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
 
+  /// Establish or validate the original bound provider transaction on the query thread.
+  /// Runs once per ingestible per attempt, before any scan acquires checkpoint keys,
+  /// including cached scans. Must not rebind, acquire keys, start readers or launch work.
+  /// The binding retains transaction ownership; temporary resources must be scope-owned
+  /// even on failure. The manager provides no rollback hook. Runtime jobs must still
+  /// validate their backend witness: preflight does not authorize a new/reopened backend.
+  virtual void preflight_for_query() {}
+
   /// Complete any metadata preparation deferred out of the constructor. Idempotent; throws on
   /// failure. Called by the scan manager before it builds a disk-reading split_provider.
   virtual void ensure_metadata_prepared() {}
@@ -171,7 +143,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
    *
-   * Called by @c split_provider::run on the driver thread before claiming
+   * Used by synchronous pinning before claiming
    * the next batch. Implementations typically compare an atomic batch
    * index against a precomputed total.
    */
@@ -181,13 +153,62 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * @brief Atomically claim the next batch and return a callable that
    *        produces its operator_data splits. Thread-safe.
    *
-   * Splitting the claim from the work lets @c split_provider::run enqueue
-   * one task per batch onto the scan_manager's worker pool. The callable
-   * returns the splits as a vector of operator_data; an empty vector or a
-   * null callable indicates no work was claimed (the driver loop skips
-   * empty handoffs).
+   * Used by synchronous pinning and the default preparation-source adapter.
+   * The task returns scan metadata; a null callable means no work remains.
+   * Readers that can be temporarily blocked override try_claim_split().
    */
   virtual metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) = 0;
+
+  using metadata_unit  = scan_manager::preparation_unit_requirement;
+  using metadata_job   = scan_manager::preparation_job;
+  using metadata_claim = scan_manager::preparation_claim<metadata_job>;
+  // Single coordinator owner. A ready job owns all resources; pending changes no cursor.
+  virtual metadata_claim try_claim_split(io::ioctx_resolver resolve)
+  {
+    auto work = next_split_provider(std::move(resolve));
+    if (!work) return scan_manager::preparation_exhausted{};
+    return metadata_job{std::move(work)};
+  }
+  virtual void bind_preparation_wakeup(scan_manager::preparation_wakeup) {}
+
+  /// Shared statement admission, if this scan needs bounded preparation resources.
+  virtual std::shared_ptr<scan_manager::preparation_admission> preparation_admission() const
+  {
+    return {};
+  }
+  /// Install execution state on the query thread before any source is registered or armed.
+  /// An adapter advertising admission must implement this; failure is cleaned up by stop/finish.
+  virtual void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>);
+  /// Idempotent, thread-neutral cleanup after jobs and source close drain, including failed
+  /// startup. Keep anything still borrowed by GPU consumers. Thread-affine cleanup belongs in
+  /// source.close.
+  virtual void stop_preparation() noexcept {}
+  /// Idempotent, thread-neutral final release after GPU consumers retire, even if never started.
+  virtual void finish_preparation() noexcept {}
+
+  struct preparation_source {
+    scan_manager::preparation_execution_domain execution =
+      scan_manager::preparation_execution_domain::metadata_worker;
+    std::function<metadata_claim()> try_claim;
+    std::function<void()> close = [] {};
+    std::function<void(scan_manager::preparation_wakeup)> bind_wakeup;
+    // Required for a multi-lane scan; each lane owns its own batching state.
+    std::unique_ptr<batch_coalescer> coalescer;
+  };
+  /// Called on the query thread once per registered scan source. Create only control
+  /// state here; initialize thread-affine readers in the first job on their domain.
+  /// Claim runs on the coordinator and must not enter the reader. Query/native close
+  /// runs on the reader's thread; metadata close runs on the coordinator. Close must
+  /// release reader resources even on failure. Remaining captures must be safe to
+  /// destroy on any thread, also if registration or native admission fails without close.
+  /// The default delegates to the existing ingestible cursor; it does not create an
+  /// independent cursor. The ingestible must outlive source drain.
+  virtual preparation_source make_preparation_source(io::ioctx_resolver resolve);
+  // One scan may prepare inputs in several domains. Return at least one source;
+  // dependencies use pending + wakeup, without blocking a worker or changing the bound view.
+  // Independent units need distinct keys across lanes. Each close releases only its lane's
+  // resources. The default wraps the single-source hook.
+  virtual std::vector<preparation_source> make_preparation_sources(io::ioctx_resolver resolve);
 
   /**
    * @brief Materialize the cudf table for one split. Called by

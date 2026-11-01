@@ -64,7 +64,7 @@
 // Failure handling
 // ----------------
 // Bitpack / Delta / Rle / For / Zigzag / Raw all render; Raw is a verbatim
-// passthrough leaf synthesized for a delta/rle/for channel that isn't further
+// passthrough leaf synthesized for a delta/rle/for/zigzag channel that isn't further
 // fused.  An op the renderer can't emit throws RenderError with a clear
 // diagnostic.
 
@@ -229,8 +229,8 @@ class SharedMemAllocator {
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  Walker(std::string dtype, std::int32_t num_chunks)
-    : dtype_(std::move(dtype)), num_chunks_(num_chunks)
+  Walker(std::string dtype, std::int32_t num_chunks, EncodeRenderMode mode)
+    : dtype_(std::move(dtype)), num_chunks_(num_chunks), mode_(mode)
   {
   }
 
@@ -252,6 +252,7 @@ class Walker {
   // ----------------- Accumulators -----------------
   std::string dtype_;
   std::int32_t num_chunks_;
+  EncodeRenderMode mode_;
   std::int32_t next_node_id_ = 0;
   std::ostringstream params_;  // post-(flat,n) params, joined with ",\n"
   std::ostringstream body_;    // kernel body lines
@@ -318,10 +319,12 @@ class Walker {
     spec.buffers      = std::move(buffers_);
     spec.block_x      = 128;  // uniform block=128 (fused TBSize)
     spec.shared_bytes = static_cast<std::int32_t>(sm_.peak_bytes());
-    spec.note =
-      "walker-rendered, OverAllocate; "
-      "dynamic-shared workspace = " +
-      std::to_string(sm_.peak_bytes()) + " bytes";
+
+    char const* layout = mode_ == EncodeRenderMode::full      ? "OverAllocate"
+                         : mode_ == EncodeRenderMode::measure ? "measure"
+                                                              : "pack";
+    spec.note          = std::string("walker-rendered, ") + layout +
+                "; dynamic-shared workspace = " + std::to_string(sm_.peak_bytes()) + " bytes";
     return spec;
   }
 
@@ -661,7 +664,9 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
   if (rit == node.children.end() || vit == node.children.end()) {
     throw RenderError("render: Rle missing 'runs' or 'values' child");
   }
-  const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
+  // pack: the launcher has already scanned the measure pass's run counts in place.
+  const bool write_offsets = mode_ != EncodeRenderMode::pack;
+  const DtypeInfo* op_dt   = lookup_dtype(in.elem_type);
   if (op_dt == nullptr) {
     throw RenderError("render: Rle op-local dtype '" + in.elem_type + "' not in dtype table");
   }
@@ -743,8 +748,9 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
         << "        if (tid == 0) {\n"
         << "            rle_snruns_" << idstr << " = total_runs;\n"
         << "            " << sh_startpos << "[total_runs] = rle_n;\n"
-        << "            " << p_offsets << "[chunk_id + 1] = total_runs;\n"
-        << "            if (chunk_id == 0) " << p_offsets << "[0] = 0;\n"
+        << (write_offsets ? "            " + p_offsets + "[chunk_id + 1] = total_runs;\n" +
+                              "            if (chunk_id == 0) " + p_offsets + "[0] = 0;\n"
+                          : std::string{})
         << "        }\n"
         << "        __syncthreads();\n"
         << "        " << v_nruns << " = rle_snruns_" << idstr << ";\n"
@@ -809,24 +815,24 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
 // =====================================================================
 // emit_raw — LEAF (passthrough).
 //
-// Raw stores its input verbatim — no compression.  Today it only
-// appears as a child of Rle (`RawRleLeaf` on the decode side), so the
-// LaneInput it receives is the parent Rle's per-run shared slab
-// (`sh_values`/`sh_counts`) with `length_expr == nruns`.
+// Raw stores its input verbatim — no compression.  It is the synthesized
+// sink of a Delta/For/Rle/Zigzag channel that no fused op consumes, so
+// its LaneInput is whatever that parent produced: a per-row expression
+// under Delta/For/Zigzag, or the parent Rle's per-run shared slab with
+// `length_expr == nruns`.
 //
-// Buffer layout — OverAllocate, mirroring Bitpack
-// -----------------------------------------------
-// The decode-side `RawRleLeaf::decode_at` reads
-// `data[offsets[chunk_id] + run]`.  A compact `data` (indexed by the
-// parent's exclusive run-prefix) would need each chunk's global run
-// base, but that prefix is only known AFTER the launcher's post-kernel
-// `rle_runs_offsets` cumsum — not at kernel time.  So we use the same
-// trick Bitpack's `packed` uses: a fixed per-chunk stride of CHUNK
-// elements.  Chunk c writes run r at `data[c*CHUNK + r]` and publishes
-// `offsets[c] = c*CHUNK`.  nruns ≤ CHUNK always, so the slot never
-// overflows; trailing slots are never read (decode masks to nruns).
-// This makes `offsets` an independent fixed-stride array rather than a
-// copy of `rle_runs_offsets`, but decode is layout-agnostic.
+// Decode reads `data[offsets[chunk_id] + i]`, so the layout is the
+// encoder's choice:
+//   full:    OverAllocate, mirroring Bitpack.  A chunk's dense base is
+//            only known after every chunk's length is, so chunk c writes
+//            element i at `data[c*CHUNK + i]` and publishes
+//            `offsets[c] = c*CHUNK`.  A length never exceeds CHUNK, so
+//            the slot never overflows; trailing slots are never read.
+//   measure: writes this chunk's length to `offsets[c+1]` (and chunk 0
+//            writes `offsets[0] = 0`); `data` is not touched.  The
+//            launcher inclusive-scans `offsets` in place.
+//   pack:    writes element i at `data[offsets[c] + i]` into a dense
+//            `data` sized from the scanned total; `offsets` is an input.
 // =====================================================================
 void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
@@ -852,26 +858,37 @@ void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
   add_param("int32_t*", p_offs);
 
   const std::size_t nc = static_cast<std::size_t>(num_chunks_);
+  // pack: the launcher sizes `data` from the scanned offsets, so this length is an upper bound.
   add_buffer(id, "data", op_dt->elem_size, nc * static_cast<std::size_t>(::codegen::kChunkSize));
   add_buffer(id, "offsets", sizeof(std::int32_t), nc + 1);
 
   body_ << "    // --- node " << id << ": Raw (leaf passthrough, " << in.elem_type << ") ---\n"
         << "    {\n"
-        << "        // OverAllocate: chunk c's runs occupy the fixed slot\n"
-        << "        // [c*CHUNK, (c+1)*CHUNK); offsets[c] = c*CHUNK so the\n"
-        << "        // decode-side RawRleLeaf reads data[offsets[c] + r].\n"
-        << "        const int64_t " << dbase << " = static_cast<int64_t>(chunk_id) *\n"
-        << "                             static_cast<int64_t>(CHUNK);\n"
-        << "        if (tid == 0) {\n"
-        << "            " << p_offs << "[chunk_id] = static_cast<int32_t>(" << dbase << ");\n"
-        << "            if (chunk_id == static_cast<int32_t>(gridDim.x) - 1) {\n"
-        << "                " << p_offs << "[chunk_id + 1] =\n"
-        << "                    static_cast<int32_t>(" << dbase << " + CHUNK);\n"
-        << "            }\n"
-        << "        }\n"
         << "        const int32_t " << rlen << " = static_cast<int32_t>(" << in.length_expr
-        << ");\n"
-        << "        for (int32_t i = tid; i < " << rlen << "; i += 128) {\n"
+        << ");\n";
+  if (mode_ == EncodeRenderMode::measure) {
+    body_ << "        if (tid == 0) {\n"
+          << "            " << p_offs << "[chunk_id + 1] = " << rlen << ";\n"
+          << "            if (chunk_id == 0) " << p_offs << "[0] = 0;\n"
+          << "        }\n"
+          << "    }\n";
+    return;
+  }
+  if (mode_ == EncodeRenderMode::pack) {
+    body_ << "        const int64_t " << dbase << " = static_cast<int64_t>(" << p_offs
+          << "[chunk_id]);\n";
+  } else {
+    body_ << "        const int64_t " << dbase << " = static_cast<int64_t>(chunk_id) *\n"
+          << "                             static_cast<int64_t>(CHUNK);\n"
+          << "        if (tid == 0) {\n"
+          << "            " << p_offs << "[chunk_id] = static_cast<int32_t>(" << dbase << ");\n"
+          << "            if (chunk_id == static_cast<int32_t>(gridDim.x) - 1) {\n"
+          << "                " << p_offs << "[chunk_id + 1] =\n"
+          << "                    static_cast<int32_t>(" << dbase << " + CHUNK);\n"
+          << "            }\n"
+          << "        }\n";
+  }
+  body_ << "        for (int32_t i = tid; i < " << rlen << "; i += 128) {\n"
         << "            " << p_data << "[" << dbase << " + i] = (" << at_lane(in.read_expr, "i")
         << ");\n"
         << "        }\n"
@@ -879,31 +896,18 @@ void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
 }
 
 // =====================================================================
-// emit_zigzag — DUAL-MODE (inline transformer OR storing leaf).
+// emit_zigzag — INLINE TRANSFORMER.
 //
 // ZigZag is the closed-form per-lane bijection
 //   z = (uv << 1) ^ (uv >> (W-1))   (arithmetic shift supplies the sign mask)
 // which the decode side inverts with  n = (z >> 1) ^ -(z & 1).
 //
-// Transformer mode (a FUSABLE op consumes the `zigzag` channel, e.g.
-// `zigzag.zigzag -> bitpack`):  ZigZag rewrites LaneInput.read_expr to the
-// closed-form map and recurses into the child WITHOUT storing anything — a
-// pure inline transform exactly like Delta/FOR splice their residual into the
-// child's read expression.  The child stores its own buffers; ZigZag carries
-// no per-chunk metadata.
-//
-// Leaf mode (no outgoing edge, or the edge feeds a NON-fused entropy coder
-// such as `…zigzag -> ans`):  ZigZag STORES the transformed stream into the
-// single output channel "zigzag" so a downstream non-fused op can entropy-code
-// it.  Layout — fixed-stride OverAllocate, identical to FOR's Raw passthrough.
-// Element i of chunk c lands at zigzag[c*CHUNK + i]; decode reads
-// zigzag[chunk_id*CHUNK + i] with the chunk_id known at kernel entry, so no
-// per-chunk offsets buffer is needed (the stride is the constant CHUNK).  The
-// buffer is num_chunks*CHUNK elements; trailing slots of the final short chunk
-// are pre-zeroed (default) and never read — keeping the entropy tail
-// deterministic.  The channel is exposed via the rep's named_channels() and
-// routed by the compress boundary loop exactly like FOR's `references` or
-// Bitpack's `packed`.
+// ZigZag rewrites LaneInput.read_expr to the closed-form map and recurses
+// into its `zigzag` child WITHOUT storing anything — exactly like Delta/FOR
+// splice their residual into the child's read expression.  The child is a
+// fused op (e.g. `zigzag.zigzag -> bitpack`) or, when nothing fused consumes
+// the channel, a synthesized Raw passthrough leaf that stores the mapped
+// stream.  ZigZag carries no per-chunk metadata of its own.
 // =====================================================================
 void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
@@ -917,65 +921,30 @@ void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
   const std::string utype = unsigned_counterpart(op_dt->elem_size);
   const int shift         = static_cast<int>(op_dt->elem_size) * 8 - 1;
 
-  // ---- Transformer mode: rewrite read_expr inline, recurse, store nothing.
-  if (!node.children.empty()) {
-    if (node.children.size() != 1) {
-      throw RenderError(
-        "render: Zigzag transformer must have exactly one child named "
-        "'zigzag' (got " +
-        std::to_string(node.children.size()) + " children)");
-    }
-    auto zit = node.children.find("zigzag");
-    if (zit == node.children.end()) {
-      throw RenderError("render: Zigzag missing 'zigzag' child (got '" +
-                        node.children.begin()->first + "' instead)");
-    }
-    // Consume a node id to keep the encode counter aligned with the
-    // decode-side DFS-preorder ids (the child must be id+1), even though
-    // ZigZag emits no params/buffers of its own.
-    const std::int32_t id = take_id();
-    const std::string v   = at_lane(in.read_expr, "(__LANE__)");
-    body_ << "    // --- node " << id << ": Zigzag (inline transform, " << in.elem_type
-          << ") ---\n";
-
-    LaneInput out;
-    out.kind      = LaneInput::Expr;
-    out.elem_type = in.elem_type;
-    out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(static_cast<" + utype + ">(" + v +
-                    ") << 1) ^ " + "static_cast<" + utype + ">((" + v + ") >> " +
-                    std::to_string(shift) + ")))";
-    out.length_expr = in.length_expr;
-    emit_node(*zit->second, std::move(out));
-    return;
+  if (node.children.size() != 1) {
+    throw RenderError("render: Zigzag must have exactly one child named 'zigzag' (got " +
+                      std::to_string(node.children.size()) + " children)");
   }
+  auto zit = node.children.find("zigzag");
+  if (zit == node.children.end()) {
+    throw RenderError("render: Zigzag missing 'zigzag' child (got '" +
+                      node.children.begin()->first + "' instead)");
+  }
+  // Consume a node id to keep the encode counter aligned with the
+  // decode-side DFS-preorder ids (the child must be id+1), even though
+  // ZigZag emits no params/buffers of its own.
+  const std::int32_t id = take_id();
+  const std::string v   = at_lane(in.read_expr, "(__LANE__)");
+  body_ << "    // --- node " << id << ": Zigzag (inline transform, " << in.elem_type << ") ---\n";
 
-  // ---- Leaf mode: store the ZigZag-mapped stream to the `zigzag` channel.
-  const std::int32_t id    = take_id();
-  const std::string idstr  = std::to_string(id);
-  const std::string p_data = "zigzag_" + idstr;
-  const std::string zbase  = "zz_base_" + idstr;
-  const std::string zlen   = "zz_len_" + idstr;
-
-  add_param(in.elem_type + "*", p_data);
-  const std::size_t nc = static_cast<std::size_t>(num_chunks_);
-  add_buffer(id, "zigzag", op_dt->elem_size, nc * static_cast<std::size_t>(::codegen::kChunkSize));
-
-  body_ << "    // --- node " << id << ": Zigzag (leaf store, " << in.elem_type << ") ---\n"
-        << "    {\n"
-        << "        const int64_t " << zbase << " = static_cast<int64_t>(chunk_id) *\n"
-        << "                             static_cast<int64_t>(CHUNK);\n"
-        << "        const int32_t " << zlen << " = static_cast<int32_t>(" << in.length_expr
-        << ");\n"
-        << "        for (int32_t i = tid; i < " << zlen << "; i += 128) {\n"
-        << "            const " << in.elem_type << " _zv = (" << at_lane(in.read_expr, "i")
-        << ");\n"
-        << "            const " << utype << " _zu =\n"
-        << "                (static_cast<" << utype << ">(_zv) << 1) ^\n"
-        << "                static_cast<" << utype << ">(_zv >> " << shift << ");\n"
-        << "            " << p_data << "[" << zbase << " + i] = static_cast<" << in.elem_type
-        << ">(_zu);\n"
-        << "        }\n"
-        << "    }\n";
+  LaneInput out;
+  out.kind      = LaneInput::Expr;
+  out.elem_type = in.elem_type;
+  out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(static_cast<" + utype + ">(" + v +
+                  ") << 1) ^ " + "static_cast<" + utype + ">((" + v + ") >> " +
+                  std::to_string(shift) + ")))";
+  out.length_expr = in.length_expr;
+  emit_node(*zit->second, std::move(out));
 }
 
 // =====================================================================
@@ -985,7 +954,8 @@ void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
 // chain of transformers preceded it (Delta, FOR, ...) has rewritten
 // LaneInput.read_expr into a single C++ expression for "lane T's
 // residual-input value"; we consume it here, run the reductions, and
-// write the OverAllocate packed output.  Tail codecs (bitcomp/ANS)
+// write the packed output: OverAllocate slots in full mode, dense at
+// bp_offsets in pack mode, nothing in measure mode.  Tail codecs (bitcomp/ANS)
 // attach downstream to the `packed_<id>` channel.
 //
 // The kernel work per chunk:
@@ -1031,7 +1001,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   const std::string p_cnt   = "chunk_count_" + idstr;
   const std::string p_bits  = "chunk_bits_" + idstr;
   const std::string p_pkd   = "packed_" + idstr;
-  const std::string p_lws   = "lw_shards_" + idstr;  // sharded atomicAdd (16-shard DtoH)
+  const std::string p_lws   = "lw_shards_" + idstr;  // sharded live-word counter
   const std::string v_need3 = "need3_" + idstr;      // per-chunk: bits_v+31 > 64 possible
   const std::string sh_min  = "sh_min_" + idstr;
   const std::string sh_max  = "sh_max_" + idstr;
@@ -1056,18 +1026,15 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   add_param("int32_t*", p_cnt);
   add_param("uint8_t*", p_bits);
   add_param("uint32_t*", p_pkd);
-  add_param("uint32_t*", p_lws);  // sharded live-word counter (16-shard)
+  add_param("uint32_t*", p_lws);
+  const bool measure      = mode_ == EncodeRenderMode::measure;
+  const bool pack         = mode_ == EncodeRenderMode::pack;
+  const std::string p_off = "bp_offsets_" + idstr;
+  if (pack) { add_param("const int32_t*", p_off); }
 
   const std::size_t stride_words =
     static_cast<std::size_t>(::codegen::kChunkSize) * op_dt->elem_size / sizeof(std::uint32_t);
   const std::size_t nc = static_cast<std::size_t>(num_chunks_);
-  // Sharded atomicAdd slab: kMaxBitsShards=16 shards × kStride=32 uint32s
-  // (128-byte spacing keeps each shard on its own L2 cache line to avoid
-  // serialisation).  Host post-kernel sums 16 entries.  Mirrors
-  // block_bitpack's packed_counter from fused_block_primitives.cuh.
-  constexpr std::size_t kMaxBitsShards = 16;
-  constexpr std::size_t kShardStride   = 32;
-
   add_buffer(id, "chunk_min", op_dt->elem_size, nc);
   add_buffer(id, "chunk_count", sizeof(std::int32_t), nc);
   add_buffer(id, "chunk_bits", sizeof(std::uint8_t), nc);
@@ -1079,7 +1046,13 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
              sizeof(std::uint32_t),
              nc * stride_words,
              /*no_pre_zero=*/use_smem);
-  add_buffer(id, "lw_shards", sizeof(std::uint32_t), kMaxBitsShards * kShardStride);
+  add_buffer(id,
+             "lw_shards",
+             sizeof(std::uint32_t),
+             ::codegen::kBitpackLiveWordShards * ::codegen::kBitpackLiveWordShardStride);
+  // pack: the dense word offset of each chunk, an input the caller scans from the measure
+  // pass's chunk_bits x chunk_count.
+  if (pack) { add_buffer(id, "bp_offsets", sizeof(std::int32_t), nc + 1, /*no_pre_zero=*/true); }
   // Note: no per-chunk live_words buffer — live_packed_bytes is derived
   // from lw_shards (DtoH only 2 KB instead of num_chunks×4 B).
   // compact_in_place() reconstructs per-chunk offsets from chunk_bits+chunk_count.
@@ -1102,47 +1075,60 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << "        constexpr " << in.elem_type << " " << emax << " = static_cast<" << in.elem_type
         << ">(" << op_dt->max_literal << ");\n"
         << "        uint32_t* " << dst << " = " << p_pkd
-        << " + static_cast<int64_t>(chunk_id) * static_cast<int64_t>(" << sw_var << ");\n"
+        << (pack ? " + " + p_off + "[chunk_id];\n"
+                 : " + static_cast<int64_t>(chunk_id) * static_cast<int64_t>(" + sw_var + ");\n")
         << "        const int32_t " << bp_len << " = static_cast<int32_t>(" << in.length_expr
         << ");\n"
         << "        if (" << bp_len << " <= 0) {\n"
-        << "            if (tid == 0) { " << p_min << "[chunk_id] = " << in.elem_type << "{0}; "
-        << p_cnt << "[chunk_id] = 0; " << p_bits << "[chunk_id] = 1; }\n"
+        << (pack ? std::string{}
+                 : "            if (tid == 0) { " + p_min + "[chunk_id] = " + in.elem_type +
+                     "{0}; " + p_cnt + "[chunk_id] = 0; " + p_bits + "[chunk_id] = 1; }\n")
         << "            break;\n"
-        << "        }\n"
-        // Pass 1: combined min+max in a single grid-stride loop.
-        << "        " << in.elem_type << " _lmin = " << emax << ";\n"
-        << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
-        << op_dt->min_literal << ");\n"
-        << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-        << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
-        << "            if (_vi < _lmin) _lmin = _vi;\n"
-        << "            if (_vi > _lmax) _lmax = _vi;\n"
-        << "        }\n"
-        << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
-        << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
-        << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
-        << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
-        << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-        << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
-        << "        __syncthreads();\n"
-        << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-        << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
-        << "        __syncthreads();\n"
-        << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
-        << "        const " << bp_utype << " " << max_r << " = static_cast<" << bp_utype << ">("
-        << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
-        << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
-        << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
-        << "        if (tid == 0) {\n"
-        << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
-        << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
-        << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
-        << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
-        << ") * " << bits_v << " + 31) / 32);\n"
-        << "            atomicAdd(" << p_lws
-        << " + (static_cast<uint32_t>(chunk_id) & 15u) * 32u, _pw);\n"
         << "        }\n";
+  if (pack) {
+    // The measure pass already reduced this chunk; read its range back.
+    body_ << "        const " << in.elem_type << " " << cmin << " = " << p_min << "[chunk_id];\n"
+          << "        const int32_t " << bits_v << " = static_cast<int32_t>(" << p_bits
+          << "[chunk_id]);\n";
+  } else {
+    body_
+      // Pass 1: combined min+max in a single grid-stride loop.
+      << "        " << in.elem_type << " _lmin = " << emax << ";\n"
+      << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
+      << op_dt->min_literal << ");\n"
+      << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
+      << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
+      << "            if (_vi < _lmin) _lmin = _vi;\n"
+      << "            if (_vi > _lmax) _lmax = _vi;\n"
+      << "        }\n"
+      << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
+      << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
+      << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
+      << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
+      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+      << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
+      << "        __syncthreads();\n"
+      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+      << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
+      << "        __syncthreads();\n"
+      << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
+      << "        const " << bp_utype << " " << max_r << " = static_cast<" << bp_utype << ">("
+      << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
+      << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
+      << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
+      << "        if (tid == 0) {\n"
+      << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
+      << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
+      << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
+      << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
+      << ") * " << bits_v << " + 31) / 32);\n"
+      << "            atomicAdd(" << p_lws << " + (static_cast<uint32_t>(chunk_id) & "
+      << (::codegen::kBitpackLiveWordShards - 1) << "u) * "
+      << ::codegen::kBitpackLiveWordShardStride << "u, _pw);\n"
+      << "        }\n";
+    // measure: the metadata and the live-word count are this mode's whole output.
+    if (measure) { body_ << "        break;\n"; }
+  }
 
   // Fast path: when bits_v equals the full element width (int8→8, int16→16,
   // int32→32) elements sit flush on 32-bit word boundaries, so we can do a
@@ -1246,7 +1232,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
 // =====================================================================
 EncodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
-                        std::int32_t num_chunks)
+                        std::int32_t num_chunks,
+                        EncodeRenderMode mode)
 {
   if (element_dtype.empty()) { throw std::invalid_argument("render: element_dtype is empty"); }
   if (num_chunks < 1) {
@@ -1259,7 +1246,7 @@ EncodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                       "'.  Supported: int32_t, int64_t");
   }
 
-  Walker w(element_dtype, num_chunks);
+  Walker w(element_dtype, num_chunks, mode);
   return w.build(tree);
 }
 

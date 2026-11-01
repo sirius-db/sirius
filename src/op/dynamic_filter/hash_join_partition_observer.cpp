@@ -88,6 +88,8 @@ std::optional<uint64_t> hash_join_partition_observer::before_transform(
   cucascade::read_only_data_batch const& batch,
   ::cuda::stream_ref stream)
 {
+  // Join-wide MARK build facts (any row, any NULL key) for a hash-partitioned build.
+  _join.observe_partitioned_build_batch(batch);
   if (!_accumulating.load(std::memory_order_acquire)) { return std::nullopt; }
   auto& session  = _join.dynamic_filter_session();
   auto const ids = input.original_batch_ids();

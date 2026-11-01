@@ -828,8 +828,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     // Predicates pushed into table_filters bypass the LogicalFilter guard —
     // reject nested columns here too (e.g. `WHERE items IS NULL`).
     for (auto const& entry : *table_filters) {
-      auto const column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
-      if (column_id < op.returned_types.size()) {
+      auto const column_id      = column_ids[entry.GetIndex()].GetPrimaryIndex();
+      auto const virtual_column = op.virtual_columns.find(column_id);
+      if (virtual_column != op.virtual_columns.end()) {
+        reject_nested_column_type(virtual_column->second.type,
+                                  virtual_column->second.name.GetIdentifierName(),
+                                  "a filter predicate");
+        reject_untranslatable_table_filter(entry.Filter(),
+                                           virtual_column->second.type,
+                                           virtual_column->second.name.GetIdentifierName());
+      } else if (column_id < op.returned_types.size()) {
         auto const column_name = column_id < op.names.size()
                                    ? op.names[column_id].GetIdentifierName()
                                    : std::to_string(column_id);

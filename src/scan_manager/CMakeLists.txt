@@ -1,6 +1,8 @@
 target_sources(
   sirius_objects
   PRIVATE preparation_coordinator.cpp
+          coordinator_pool.cpp
+          native_reader_executor.cpp
           preparation.cpp
           preparation_ledger.cpp
           late_mat_resolver.cpp

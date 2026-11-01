@@ -27,7 +27,7 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policy.cuh>
 #include <cuco/bloom_filter_ref.cuh>
-#include <cuda/dynamic_filter_probe.cuh>
+#include <cuda/dynamic_filter_fused_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
 #include <cuda/stream>
@@ -67,14 +67,8 @@
 namespace sirius::op {
 
 namespace {
-using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
-
-template <class KeyT>
-using sirius_bloom = cuco::bloom_filter<KeyT,
-                                        cuco::extent<std::size_t>,
-                                        cuda::thread_scope_device,
-                                        cuco::bloom_filter_policy<KeyT>,
-                                        bloom_alloc>;
+using detail::bloom_alloc;
+using detail::sirius_bloom;
 
 template <class Filter>
 using bloom_owner = std::unique_ptr<Filter>;
@@ -139,19 +133,6 @@ bloom_owner<Filter> build_bloom(membership_key_domain const& domain,
   }
   return result;
 }
-
-/// @brief The Bloom half of detail::membership_probe_functor: a converted key passes when the
-/// filter reports it. An inserted key always fits the key domain, so the adapter's rejection of a
-/// non-representable value preserves the no-false-negative contract.
-template <class FilterRef>
-struct bloom_lookup {
-  using key_type = typename FilterRef::key_type;
-  FilterRef ref;
-  __device__ __forceinline__ bool operator()(key_type key) const noexcept
-  {
-    return ref.contains(key);
-  }
-};
 
 }  // namespace
 
@@ -344,6 +325,28 @@ struct sirius_dynamic_bloom_filter::impl {
       });
     return it == replicas.end() ? nullptr : it->get();
   }
+
+  /// The `Store` interface of detail::compute_membership_mask; an accumulated replica wins.
+  template <class Fn>
+  void with_lookup(membership_key_domain const& domain, int device_id, Fn&& fn) const
+  {
+    if (auto const* accumulated = find_accumulated(device_id)) {
+      detail::dispatch_key_rep(domain.rep, [&]<class Key>(Key) {
+        auto ref = accumulated_ref<Key>(accumulated->bits->data(), accumulated->blocks);
+        static_assert(std::is_same_v<decltype(ref), detail::bloom_ref<Key>>);
+        fn(detail::bloom_lookup<decltype(ref)>{ref});
+      });
+      return;
+    }
+    auto const* replica = find(device_id);
+    if (!replica || !replica->has_bloom()) { return; }
+    std::visit(
+      [&](auto const& bloom) {
+        auto ref = bloom->ref();
+        fn(detail::bloom_lookup<decltype(ref)>{ref});
+      },
+      replica->bloom);
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -420,6 +423,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -469,14 +473,13 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
         continue;
       }
       pending.emplace_back(std::move(replica), std::move(stream_lease));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _impl->source_device,
-        device_id,
-        e.what());
-      continue;
+    } catch (...) {
+      if (failures.skip_if_recoverable(
+            "[sirius_dynamic_bloom_filter]", _impl->source_device, device_id)) {
+        continue;
+      }
+      // Earlier destinations still own asynchronous copies; drain them before propagating.
+      break;
     }
     SIRIUS_LOG_DEBUG("[sirius_dynamic_bloom_filter] queued {}-byte replica GPU {} -> GPU {}.",
                      bytes,
@@ -489,16 +492,14 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.sync();
-      _impl->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _impl->source_device,
-        device_id,
-        e.what());
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    } catch (...) {
+      failures.record_fatal("[sirius_dynamic_bloom_filter]", _impl->source_device, device_id);
     }
+  }
+  failures.rethrow_if_fatal();
+  for (auto& [replica, stream_lease] : pending) {
+    _impl->replicas.push_back(std::move(replica));
   }
 }
 
@@ -543,26 +544,23 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_impl(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  auto const resolved = detail::resolve_dynamic_filter_device_id(device_id);
-  if (auto const* accumulated = _impl ? _impl->find_accumulated(resolved) : nullptr) {
-    return detail::dispatch_key_rep(_domain.rep, [&]<class Key>(Key) {
-      auto const ref = accumulated_ref<Key>(accumulated->bits->data(), accumulated->blocks);
-      return detail::run_membership_probe<Key>(
-        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref}, prior_keep);
-    });
-  }
-  auto const* replica = _impl ? _impl->find(resolved) : nullptr;
-  if (!replica || !replica->has_bloom()) { return nullptr; }
+  return detail::compute_membership_mask(_impl.get(),
+                                         _domain,
+                                         probe,
+                                         prior_mask_words,
+                                         prior_keep,
+                                         device_id,
+                                         stream,
+                                         mr,
+                                         preserves_nulls());
+}
 
-  return std::visit(
-    [&](auto const& bloom) {
-      using owner_type = std::decay_t<decltype(bloom)>;
-      using key_type   = typename owner_type::element_type::key_type;
-      auto ref         = bloom->ref();
-      return detail::run_membership_probe<key_type>(
-        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref}, prior_keep);
-    },
-    replica->bloom);
+bool sirius_dynamic_bloom_filter::prepare_fused_probe(cudf::column_view const& probe,
+                                                      int device_id,
+                                                      detail::fused_probe& out) const
+{
+  return detail::prepare_fused_membership_probe(
+    _impl.get(), _domain, probe, device_id, out, preserves_nulls());
 }
 
 namespace detail {

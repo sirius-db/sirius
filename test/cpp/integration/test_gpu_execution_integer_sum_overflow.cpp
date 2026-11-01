@@ -20,17 +20,16 @@
  *
  * DuckDB accumulates SUM(INTEGER), SUM(BIGINT), AVG(INTEGER) and AVG(BIGINT) in 128 bits and
  * returns HUGEINT for SUM, unless its statistics prove the total fits in INT64 (sum_no_overflow).
- * The GPU computes such sums in INT64 while that is provably exact and over DECIMAL128 otherwise.
- * A SUM whose total does not fit BIGINT cannot be returned by the GPU and falls back to DuckDB at
- * runtime, which still returns the exact HUGEINT.
+ * The GPU computes such sums in INT64 while that is provably exact and over DECIMAL128 otherwise,
+ * and returns the exact HUGEINT, carried as DECIMAL128 with scale 0, even past BIGINT.
  *
- * An AVG that reaches the GPU is always computed there. But DuckDB's AGGREGATE_FUNCTION_REWRITER
- * turns every ungrouped AVG(x), and a grouped one that can share a SUM or COUNT, into
- * SUM(x) / COUNT(x). Such an AVG over a total past BIGINT is then that SUM and falls back too.
+ * DuckDB's AGGREGATE_FUNCTION_REWRITER turns every ungrouped AVG(x), and a grouped one that can
+ * share a SUM or COUNT, into SUM(x) / COUNT(x), which also stays on the GPU.
  *
  * AVG over a 128-bit sum is the sum converted to double divided by the count, while DuckDB
- * divides in long double. The two can differ in the last bit or two, so AVG columns compare
- * with a 1e-12 relative tolerance; every SUM compares exactly.
+ * divides in long double, and its HUGEINT -> DOUBLE cast rounds differently. The two can differ in
+ * the last bit or two, so AVG columns compare with a 1e-12 relative tolerance; every SUM compares
+ * exactly.
  */
 
 #include <catch.hpp>
@@ -84,10 +83,10 @@ TEST_CASE_METHOD(IntegerSumFixture,
   REQUIRE(cpu_plan_contains(*this, "SELECT SUM(x) FROM big", "sum("));
   REQUIRE_FALSE(cpu_plan_contains(*this, "SELECT SUM(x) FROM big", "sum_no_overflow"));
 
-  expect_runtime_fallback_matches_cpu("SELECT AVG(x) FROM big;");
+  compare_gpu_vs_cpu_approx("SELECT AVG(x) FROM big;", {0}, 1e-12);
   compare_gpu_vs_cpu_approx("SELECT g, AVG(x) FROM big GROUP BY g;", std::set<size_t>{1}, 1e-12);
-  expect_runtime_fallback_matches_cpu("SELECT SUM(x) FROM big;");
-  expect_runtime_fallback_matches_cpu("SELECT g, SUM(x) FROM big GROUP BY g;");
+  compare_gpu_vs_cpu("SELECT SUM(x) FROM big;");
+  compare_gpu_vs_cpu("SELECT g, SUM(x) FROM big GROUP BY g;");
   require_same_result_types(*this, "SELECT g, SUM(x), AVG(x) FROM big GROUP BY g;");
 }
 
@@ -96,7 +95,7 @@ TEST_CASE_METHOD(IntegerSumFixture,
                  "[integration][gpu_execution][aggregate][integer_sum_overflow]")
 {
   // 2^62 + (2^62 - 1) = INT64_MAX, and -2^62 - 2^62 = INT64_MIN: both still fit, but two rows of
-  // 2^62 already fail the per-batch bound, so they are summed over DECIMAL128 and narrowed back.
+  // 2^62 already fail the per-batch bound, so they are summed over DECIMAL128.
   run_ok(
     "CREATE TABLE at_max AS SELECT * FROM (VALUES (0, 4611686018427387904::BIGINT), "
     "(0, 4611686018427387903::BIGINT), (1, -4611686018427387904::BIGINT), "
@@ -114,12 +113,11 @@ TEST_CASE_METHOD(IntegerSumFixture,
   compare_gpu_vs_cpu("SELECT SUM(x) s FROM at_max WHERE g = 1;");
   compare_gpu_vs_cpu_approx("SELECT g, AVG(x) a FROM at_max GROUP BY g;", {1}, 1e-12);
 
-  expect_runtime_fallback_matches_cpu("SELECT SUM(x) FROM past_max;");
-  expect_runtime_fallback_matches_cpu("SELECT g, SUM(x) FROM past_max GROUP BY g;");
-  expect_runtime_fallback_matches_cpu("SELECT SUM(x) FROM past_min;");
-  expect_runtime_fallback_matches_cpu("SELECT g, SUM(x) FROM past_min GROUP BY g;");
-  // The grouped average of the same rows stays on the GPU; the ungrouped one is rewritten to a SUM.
-  expect_runtime_fallback_matches_cpu("SELECT AVG(x) FROM past_max;");
+  compare_gpu_vs_cpu("SELECT SUM(x) FROM past_max;");
+  compare_gpu_vs_cpu("SELECT g, SUM(x) FROM past_max GROUP BY g;");
+  compare_gpu_vs_cpu("SELECT SUM(x) FROM past_min;");
+  compare_gpu_vs_cpu("SELECT g, SUM(x) FROM past_min GROUP BY g;");
+  compare_gpu_vs_cpu_approx("SELECT AVG(x) FROM past_max;", {0}, 1e-12);
   compare_gpu_vs_cpu_approx("SELECT g, AVG(x) FROM past_min GROUP BY g;", {1}, 1e-12);
 }
 
@@ -128,7 +126,7 @@ TEST_CASE_METHOD(IntegerSumFixture,
                  "[integration][gpu_execution][aggregate][integer_sum_overflow]")
 {
   // Alternating +-4e18: any prefix of three same-sign rows exceeds INT64, but each group's
-  // total is small. The GPU sums over DECIMAL128 and narrows the exact total.
+  // total is small. The GPU sums over DECIMAL128 and returns the exact total.
   run_ok(
     "CREATE TABLE mixed AS SELECT (i % 3)::INTEGER g, "
     "CASE WHEN i % 2 = 0 THEN 4000000000000000000 ELSE -3999999999999999999 END::BIGINT x "
@@ -161,8 +159,8 @@ TEST_CASE_METHOD(IntegerSumFixture,
   compare_gpu_vs_cpu("SELECT SUM(x) s, AVG(x) a FROM empty_t;");
   compare_gpu_vs_cpu("SELECT g, SUM(x) s, AVG(x) a FROM empty_t GROUP BY g;");
   // All three non-NULL groups together exceed INT64: NULLs are skipped, not counted as zero.
-  expect_runtime_fallback_matches_cpu("SELECT SUM(x) FROM nulls;");
-  expect_runtime_fallback_matches_cpu("SELECT AVG(x) a FROM nulls;");
+  compare_gpu_vs_cpu("SELECT SUM(x) FROM nulls;");
+  compare_gpu_vs_cpu_approx("SELECT AVG(x) a FROM nulls;", {0}, 1e-12);
 }
 
 TEST_CASE_METHOD(IntegerSumFixture,
@@ -212,8 +210,8 @@ TEST_CASE_METHOD(IntegerSumFixture,
 
 // The ClickBench Q03 shape: AVG over a BIGINT id averaging ~2.5e18 across enough rows to span
 // several scan batches, so the partial sums are merged. Every batch overflows INT64, so every
-// partial is DECIMAL128. Q03's own AVG(UserID) is rewritten to SUM / COUNT and falls back; an AVG
-// that keeps its own state (no COUNT to share) stays on the GPU.
+// partial is DECIMAL128. Q03's own AVG(UserID) is rewritten to SUM / COUNT; both forms stay on the
+// GPU.
 
 TEST_CASE_METHOD(IntegerSumFixture,
                  "integer sum overflow - ClickBench Q03 AVG(UserID) over several batches",
@@ -224,12 +222,12 @@ TEST_CASE_METHOD(IntegerSumFixture,
     "- 500000000000000000)::BIGINT AS UserID, (i % 16)::INTEGER AS CounterID "
     "FROM range(30000000) t(i);");
   run_ok("CHECKPOINT;");
-  expect_runtime_fallback_matches_cpu("SELECT AVG(UserID) FROM hits;");
-  expect_runtime_fallback_matches_cpu(
-    "SELECT CounterID, AVG(UserID) a, COUNT(*) c FROM hits GROUP BY CounterID;");
+  compare_gpu_vs_cpu_approx("SELECT AVG(UserID) FROM hits;", {0}, 1e-12);
+  compare_gpu_vs_cpu_approx(
+    "SELECT CounterID, AVG(UserID) a, COUNT(*) c FROM hits GROUP BY CounterID;", {1}, 1e-12);
   compare_gpu_vs_cpu_approx(
     "SELECT CounterID, AVG(UserID) a FROM hits GROUP BY CounterID;", {1}, 1e-12);
-  expect_runtime_fallback_matches_cpu("SELECT SUM(UserID) FROM hits;");
+  compare_gpu_vs_cpu("SELECT SUM(UserID) FROM hits;");
 }
 
 TEST_CASE_METHOD(IntegerSumFixture,
@@ -239,7 +237,7 @@ TEST_CASE_METHOD(IntegerSumFixture,
   // 4e11 per row: a batch of a few million rows stays far below INT64, so each batch sums in
   // INT64, but 30M rows reach 1.2e19 in magnitude, beyond the merge's 2^62 bound (and beyond
   // what DuckDB's statistics can prove, so these are not sum_no_overflow). Alternating signs keep
-  // every group's total of x in range, so the merge widens and the narrowed SUM stays on the GPU.
+  // every group's total of x small, while the merge still widens.
   run_ok(
     "CREATE TABLE wide_merge AS SELECT (i % 5)::INTEGER g, "
     "CASE WHEN i % 2 = 0 THEN 400000000000 ELSE -399999999999 END::BIGINT x, "
@@ -249,9 +247,9 @@ TEST_CASE_METHOD(IntegerSumFixture,
   compare_gpu_vs_cpu("SELECT g, SUM(x) s FROM wide_merge GROUP BY g;");
   compare_gpu_vs_cpu("SELECT SUM(x) s FROM wide_merge;");
   compare_gpu_vs_cpu_approx("SELECT g, AVG(y) a FROM wide_merge GROUP BY g;", {1}, 1e-12);
-  // y sums to 2.4e18 per group, which fits, but 1.2e19 in total, which falls back.
+  // y sums to 2.4e18 per group, which fits BIGINT, but 1.2e19 in total, which needs HUGEINT.
   compare_gpu_vs_cpu("SELECT g, SUM(y) s FROM wide_merge GROUP BY g;");
-  expect_runtime_fallback_matches_cpu("SELECT SUM(y) FROM wide_merge;");
+  compare_gpu_vs_cpu("SELECT SUM(y) FROM wide_merge;");
 }
 
 TEST_CASE_METHOD(IntegerSumFixture,
@@ -263,10 +261,38 @@ TEST_CASE_METHOD(IntegerSumFixture,
     "CREATE TABLE inner_t AS SELECT (i % 4)::INTEGER g, 4000000000000000000::BIGINT x "
     "FROM range(8) r(i);");
   run_ok("CHECKPOINT;");
-  expect_runtime_fallback_matches_cpu(
-    "SELECT AVG(s) FROM (SELECT g, SUM(x) s FROM inner_t GROUP BY g);");
-  expect_runtime_fallback_matches_cpu(
-    "SELECT SUM(s) FROM (SELECT g, SUM(x) s FROM inner_t GROUP BY g);");
+  compare_gpu_vs_cpu_approx(
+    "SELECT AVG(s) FROM (SELECT g, SUM(x) s FROM inner_t GROUP BY g);", {0}, 1e-12);
+  compare_gpu_vs_cpu("SELECT SUM(s) FROM (SELECT g, SUM(x) s FROM inner_t GROUP BY g);");
   compare_gpu_vs_cpu(
     "SELECT SUM(s) FROM (SELECT g, SUM(x) s FROM inner_t GROUP BY g) WHERE g < 1;");
+}
+
+TEST_CASE_METHOD(IntegerSumFixture,
+                 "integer sum overflow - totals past BIGINT return HUGEINT with fallback disabled",
+                 "[integration][gpu_execution][aggregate][integer_sum_overflow]")
+{
+  // The #2067 repro: one past INT64_MAX and one past INT64_MIN.
+  run_ok(
+    "CREATE TABLE wide_sum AS SELECT * FROM (VALUES (0, 9223372036854775807::BIGINT), "
+    "(0, 1::BIGINT), (1, -9223372036854775807::BIGINT), (1, -2::BIGINT)) t(g, x);");
+  // The fuzzer's shape: twelve INT64_MIN and eleven INT64_MAX per key.
+  run_ok(
+    "CREATE TABLE extremes AS SELECT (i % 3)::INTEGER k, "
+    "CASE WHEN i % 23 < 12 THEN -9223372036854775808 ELSE 9223372036854775807 END::BIGINT x "
+    "FROM range(69) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SET enable_duckdb_fallback = false;");
+
+  auto result = con->Query("SELECT g, SUM(x) s FROM wide_sum GROUP BY g ORDER BY g;");
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->GetTypes()[1] == duckdb::LogicalType::HUGEINT);
+  CHECK(result->Collection().GetValue(1, 0).ToString() == "9223372036854775808");
+  CHECK(result->Collection().GetValue(1, 1).ToString() == "-9223372036854775809");
+
+  compare_gpu_vs_cpu("SELECT g, SUM(x) s FROM wide_sum GROUP BY g;");
+  compare_gpu_vs_cpu("SELECT SUM(x) s FROM wide_sum WHERE g = 0;");
+  compare_gpu_vs_cpu("SELECT k, SUM(x) s FROM extremes GROUP BY k;");
+  compare_gpu_vs_cpu("SELECT SUM(x) s FROM extremes;");
+  run_ok("SET enable_duckdb_fallback = true;");
 }

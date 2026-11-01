@@ -19,24 +19,33 @@
 namespace sirius::op::scan {
 class parquet_scan_core {
  public:
-  using metadata_scan_task_t           = gpu_ingestible::metadata_scan_task_t;
-  using stoppable_metadata_scan_task_t = gpu_ingestible::stoppable_metadata_scan_task_t;
+  using metadata_scan_task_t = gpu_ingestible::metadata_scan_task_t;
   void set_execution_completion(std::shared_ptr<pipeline::completion_handler> c)
   {
     _execution_completion = std::move(c);
   }
   /// Owns the Parquet bind data for the lifetime of the composing ingestible.
-  explicit parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info);
+  explicit parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info,
+                             parquet_source_kind source_kind = parquet_source_kind::PLAIN_PARQUET);
 
   ~parquet_scan_core();
 
+  /// Data-reader calls made by this ingestible (footer probes excluded).
+  [[nodiscard]] std::size_t reader_calls() const noexcept
+  {
+    return _reader_calls.load(std::memory_order_relaxed);
+  }
+
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const;
+
+  [[nodiscard]] scan_plan const& plan() const noexcept { return *_plan; }
 
   [[nodiscard]] bool has_processed_all_metadata() const;
 
+  /// Bind-time file predicates eliminated every file; no physical input is consumed.
+  [[nodiscard]] bool source_selection_empty() const noexcept { return _source_selection_empty; }
+
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve);
-  metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve, std::stop_token stop);
-  stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve);
 
   filtered_table materialize_metadata_to_table(
     scan_info const& info,
@@ -82,6 +91,13 @@ class parquet_scan_core {
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const { return _filter_analysis; }
 
  private:
+  [[nodiscard]] uint64_t execution_contract() const noexcept;
+  [[nodiscard]] scan_execution_record execution_progress(filtered_table const&) const;
+  [[nodiscard]] scan_execution_record decoded_execution(bool static_filter_applied,
+                                                        bool assembled) const;
+  [[nodiscard]] std::shared_ptr<void const> execution_layout(bool assembled) const;
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> residual_against(
+    std::span<predicate_progress const>) const;
   [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
     filtered_table const& input) const;
 
@@ -95,30 +111,23 @@ class parquet_scan_core {
                                                   std::shared_ptr<io::ioctx> const& io_ctx,
                                                   std::stop_token stop = {});
 
-  /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
-  [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(
-    std::unique_ptr<cudf::table> decoded,
-    cudf::io::parquet_reader_options const& reader_options,
-    std::string const& file_path,
-    std::size_t file_index,
-    std::int64_t file_row_offset,
-    ::cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const;
-
   [[nodiscard]] bool can_project_during_filter() const noexcept;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
   // Built only when physical evidence is consumed, after finalize has published it.
   std::once_flag _evidence_index_once;
   std::vector<std::size_t> _evidence_index_by_file;
+  const parquet_source_kind _source_kind;
+  const bool _requires_file_visibility;
+  parquet_read_mode _read_mode = parquet_read_mode::READER;
 
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
   // Shared plan-level projection options. Filters are applied per split.
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
-  // The same options without a column projection: stamped onto files whose
-  // carrier column is unavailable (parquet_file_scan_info::carrier_unavailable).
+  // Options without projection: footer parsing, metadata-only splits, and the
+  // retained natural-schema fallback. Per-file reader carrier options may differ.
   std::shared_ptr<cudf::io::parquet_reader_options> _natural_reader_options;
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
@@ -136,6 +145,8 @@ class parquet_scan_core {
   // so post_filter_and_project assembles the residual from what the batch
   // reports rather than from anything precomputed here.
   residual_filter _residual;
+  // IDs in the full catalogue, fixed before any reader/statistics exclusions.
+  std::vector<std::size_t> _reader_conjuncts;
 
   // The part of _duckdb_filter_expression safe to push into the reader: the
   // full predicate minus any top-level AND conjunct that cuDF's row-group
@@ -167,10 +178,13 @@ class parquet_scan_core {
   std::vector<null_prune_predicate> _null_prune_predicates;
 
   std::vector<std::string> _file_paths;
+  std::vector<std::size_t> _selected_file_indices;
+  bool _source_selection_empty = false;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
+  std::atomic<std::size_t> _reader_calls{0};
 
   // Dynamic join filters shared with the producing hash join; null when none are wired.
   // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in

@@ -258,7 +258,7 @@ std::vector<Tree> enumerate_shapes(int max_depth)
 std::vector<Tree> extra_shapes()
 {
   return {
-    jit::FusedTree::make(OpKind::Zigzag),
+    jit::FusedTree::make(OpKind::Zigzag, {{"zigzag", jit::FusedTree::make(OpKind::Raw)}}),
     jit::FusedTree::make(OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Raw)}}),
     jit::FusedTree::make(OpKind::For, {{"deltas", jit::FusedTree::make(OpKind::Raw)}}),
     jit::FusedTree::make(

@@ -19,10 +19,13 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include <dlfcn.h>
@@ -75,20 +78,24 @@ DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
     throw duckdb::InvalidInputException(
       "Cannot load %s while %s is already loaded", backend, other);
   }
-  // Mirrors ExtensionHelper::AutoLoadExtension without its error wrapper; recheck on DuckDB
-  // upgrades.
   if (db.ExtensionIsLoaded(backend)) { return; }
   try {
-    auto& fs = duckdb::FileSystem::GetLocal(db);
     if (duckdb::Settings::Get<duckdb::AutoinstallKnownExtensionsSetting>(db)) {
+      // The backends are community extensions. Only redirect the default (core) repository so
+      // explicit mirrors and local test repositories keep working.
       auto repository = duckdb::ExtensionHelper::GetAutoinstallRepository(db);
+      if (repository.path == duckdb::ExtensionRepository::CORE_REPOSITORY_URL &&
+          !duckdb::ExtensionRepository::TryGetKnownRepository("community", repository)) {
+        throw duckdb::InternalException("DuckDB has no community extension repository");
+      }
       duckdb::ExtensionInstallOptions options;
       options.repository = repository;
-      duckdb::ExtensionHelper::InstallExtension(db, fs, backend, options);
+      duckdb::ExtensionHelper::InstallExtension(
+        db, duckdb::FileSystem::GetLocal(db), backend, options);
     }
-    duckdb::ExtensionLoadOptions options(backend);
-    options.core_only = true;
-    duckdb::ExtensionHelper::LoadExternalExtension(db, fs, options);
+    auto connection = duckdb::Connection::CreateInternal(db);
+    connection.Query(duckdb::StringUtil::Format("LOAD %s", duckdb::SQLString(backend)))
+      ->ThrowIfError();
   } catch (std::exception const& error) {
     auto message = duckdb::StringUtil::Format(
       "Sirius selected %s for CUDA driver version %d.%d, but loading it failed. ",

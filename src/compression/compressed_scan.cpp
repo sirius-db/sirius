@@ -423,6 +423,9 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
     "[decompression-pushdown] wave-1 sources, ascending expected keep:{}", order_echo);
   wave_request.source_generation  = request.membership_generation;
   wave_request.measure_membership = request.membership_measurement.measure;
+  wave_request.output_types.assign(
+    request.output_types.begin(),
+    request.output_types.begin() + std::min(request.output_types.size(), selected.size()));
   // Safe as a raw pointer: the source representation owns the words, and
   // decompress_scan_filter synchronizes on every return path.
   if (keep_mask.has_mask()) {
@@ -526,6 +529,14 @@ decompression_pushdown_scan::without_row_selection() const
   if (narrowed.empty()) { return nullptr; }
   narrowed.row_selection_disabled = true;
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
+}
+
+std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::with_output_types(
+  std::vector<std::optional<cudf::data_type>> output_types) const
+{
+  auto refreshed         = _request;
+  refreshed.output_types = std::move(output_types);
+  return std::make_shared<const decompression_pushdown_scan>(std::move(refreshed));
 }
 
 std::shared_ptr<const decompression_pushdown_scan>

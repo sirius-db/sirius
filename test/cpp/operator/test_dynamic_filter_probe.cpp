@@ -431,8 +431,8 @@ TEST_CASE("prior keep-mask gates the membership probes", "[dynamic_filter][probe
   }
 }
 
-// A null probe key can never match a build key (admission rejects null-safe comparisons and the
-// join runs with null_equality::UNEQUAL), so the probe writes `false` for it in-kernel and the
+// For ordinary equality, a null probe key can never match a build key, so the probe writes
+// `false` for it in-kernel and the
 // mask carries no null mask of its own -- the filtered decode requires a non-nullable BOOL8.
 TEST_CASE("prior-masked probe writes null probe rows as false and returns a non-nullable mask",
           "[dynamic_filter][probe]")
@@ -2649,4 +2649,45 @@ TEST_CASE("BOOL8 prior probes accumulated Bloom replicas",
   auto const stream = fixture.task_stream(0);
   auto probe        = make_int32({0, 50, 99, 1000, 1099, 9999}, stream);
   check_bool8_prior(fixture.published_bloom(0), probe->view(), stream);
+}
+
+TEST_CASE("NULL-preserving membership respects prior rejection for every representation",
+          "[dynamic_filter][probe][reverse_rf]")
+{
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  auto keys                       = make_int64({1, 2, 3}, stream);
+  auto probe                      = make_int32({1, 2, 3, 1}, stream);
+  attach_validity(*probe, {true, false, false, true}, stream);
+  auto prior = upload_prior_mask({true, true, false, false}, stream);
+  auto check = [&](auto& filter) {
+    filter.set_preserve_nulls(true);
+    auto mask = filter.compute_mask(
+      probe->view(), static_cast<std::uint32_t const*>(prior.data()), kDevice, stream, mr);
+    REQUIRE(mask != nullptr);
+    CHECK_FALSE(mask->nullable());
+    CHECK(mask_to_host(mask->view(), stream) == std::vector<std::uint8_t>{1, 1, 0, 0});
+    auto bool_prior =
+      make_values<std::uint8_t>({1, 1, 0, 0}, cudf::data_type{cudf::type_id::BOOL8}, stream);
+    auto bool_mask = filter.compute_mask_if(probe->view(), bool_prior->view(), kDevice, stream, mr);
+    REQUIRE(bool_mask != nullptr);
+    CHECK_FALSE(bool_mask->nullable());
+    CHECK(mask_to_host(bool_mask->view(), stream) == std::vector<std::uint8_t>{1, 1, 0, 0});
+    check_bool8_prior(filter, probe->view(), stream);
+  };
+  SECTION("Bloom")
+  {
+    sirius_dynamic_bloom_filter filter{keys->view(), stream, mr};
+    check(filter);
+  }
+  SECTION("IN-list")
+  {
+    sirius_dynamic_in_list_filter filter{keys->view(), stream, mr};
+    check(filter);
+  }
+  SECTION("small IN-list")
+  {
+    sirius_dynamic_small_in_list_filter filter{keys->view(), stream, mr};
+    check(filter);
+  }
 }

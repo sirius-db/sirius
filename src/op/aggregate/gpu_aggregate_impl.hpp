@@ -91,6 +91,11 @@ class gpu_aggregate_impl {
    *        accumulates in HUGEINT (is_wide_integer_sum). Over an INT64 input such a SUM is
    *        computed over DECIMAL128 with scale 0 when the batch could overflow INT64, and its
    *        per-group result is then DECIMAL128 instead of INT64. An empty vector marks none.
+   * @param split_wide_integer_sums Whether such a widened SUM is computed as INT64 sums of its
+   *        32-bit halves (split_int64_halves) instead of over DECIMAL128. The caller decides; the
+   *        split is faster with few groups and slower with very many (see
+   *        sirius_physical_grouped_aggregate::split_wide_sum_max_groups).
+   * @param[out] num_groups If not null, receives the number of groups in the output.
    *
    * @return The output data batch.
    */
@@ -104,7 +109,9 @@ class gpu_aggregate_impl {
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info                    = {},
     const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
-    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {});
+    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
+    bool split_wide_integer_sums                                             = false,
+    cudf::size_type* num_groups                                              = nullptr);
 
   /**
    * @brief Perform local grouped aggregate over several grouping sets on the input data batch.

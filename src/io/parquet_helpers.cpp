@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace sirius::io::parquet_helpers {
@@ -361,6 +362,34 @@ duckdb::LogicalType leaf_schema_type(pq::SchemaElement const& element,
     if (logical.type == pq::LogicalType::UNKNOWN) return duckdb::LogicalType::SQLNULL;
   }
   return leaf_to_duckdb_type(element);
+}
+
+std::vector<std::size_t> top_level_schema_indices(pq::FileMetaData const& meta)
+{
+  if (meta.schema.empty() || meta.schema[0].num_children < 0)
+    throw std::invalid_argument("Parquet scalar projection has no valid root");
+  auto result = children(meta, 0);
+  std::unordered_set<std::size_t> seen;
+  for (auto index : result)
+    if (index == 0 || !seen.insert(index).second)
+      throw std::invalid_argument("Parquet root child is invalid or repeated");
+  return result;
+}
+schema_info extract_top_level_scalar_schema(pq::FileMetaData const& meta,
+                                            std::span<uint8_t const> annotations)
+{
+  schema_info result;
+  for (auto index : top_level_schema_indices(meta)) {
+    auto const& column = meta.schema[index];
+    result.names.push_back(column.name);
+    if (column.num_children < 0)
+      throw std::invalid_argument("Parquet column has a negative child count");
+    if (column.num_children || column.repetition_type == pq::FieldRepetitionType::REPEATED)
+      result.types.push_back(duckdb::LogicalType::SQLNULL);
+    else
+      result.types.push_back(map_subtree(meta, index, true, annotations));
+  }
+  return result;
 }
 
 schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta,
