@@ -33,14 +33,59 @@
 #include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <utility>
 
 namespace sirius {
 namespace op {
+
+namespace {
+
+/// Reorders @p views, partials with one key column, by their first key. The first keys are
+/// gathered into one small column, ordered on the device, and the order is read back with a
+/// single synchronization. Ties keep their input order. Returns false and leaves @p views
+/// untouched when a partial is empty or its key has nulls.
+bool order_partials_by_first_key(std::vector<cudf::table_view>& views,
+                                 ::cuda::stream_ref stream,
+                                 rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::column_view> first_rows;
+  first_rows.reserve(views.size());
+  for (auto const& view : views) {
+    if (view.num_rows() == 0 || view.column(0).has_nulls()) { return false; }
+    first_rows.push_back(cudf::slice(view.column(0), {0, 1}, stream)[0]);
+  }
+  auto const first_keys = cudf::concatenate(first_rows, stream, mr);
+  auto const order      = cudf::stable_sorted_order(cudf::table_view({first_keys->view()}),
+                                                    {cudf::order::ASCENDING},
+                                                    {cudf::null_order::AFTER},
+                                               stream,
+                                               mr);
+  std::vector<cudf::size_type> host_order(views.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(host_order.data(),
+                                order->view().data<cudf::size_type>(),
+                                host_order.size() * sizeof(cudf::size_type),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  stream.sync();
+  std::vector<cudf::table_view> ordered;
+  ordered.reserve(views.size());
+  for (auto const idx : host_order) {
+    ordered.push_back(views[idx]);
+  }
+  views = std::move(ordered);
+  return true;
+}
+
+}  // namespace
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
@@ -228,28 +273,9 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   // concatenation sorted, so the merge can use cuDF's sorted-keys path. The order is verified
   // after concatenation, so any other input keeps the hash path.
   auto const first_key_type   = input_cudf_table_views[0].column(0).type();
-  bool const try_sorted_merge = num_group_cols == 1 && first_key_type.id() == cudf::type_id::INT64;
-  if (try_sorted_merge) {
-    std::vector<std::pair<int64_t, cudf::table_view>> keyed_views;
-    bool orderable = true;
-    for (auto const& view : input_cudf_table_views) {
-      if (view.num_rows() == 0 || view.column(0).has_nulls()) {
-        orderable = false;
-        break;
-      }
-      auto const first = cudf::get_element(view.column(0), 0, stream, mr);
-      keyed_views.emplace_back(
-        static_cast<cudf::numeric_scalar<int64_t> const&>(*first).value(stream), view);
-    }
-    if (orderable) {
-      std::stable_sort(keyed_views.begin(),
-                       keyed_views.end(),
-                       [](auto const& lhs, auto const& rhs) { return lhs.first < rhs.first; });
-      for (std::size_t view_idx = 0; view_idx < keyed_views.size(); ++view_idx) {
-        input_cudf_table_views[view_idx] = keyed_views[view_idx].second;
-      }
-    }
-  }
+  bool const try_sorted_merge = num_group_cols == 1 && cudf::is_fixed_width(first_key_type) &&
+                                !cudf::is_floating_point(first_key_type);
+  if (try_sorted_merge) { order_partials_by_first_key(input_cudf_table_views, stream, mr); }
 
   // A wide integer SUM's partials are INT64, or DECIMAL128 where the batch could overflow INT64.
   // Concatenation needs one type per column, so once any batch carries DECIMAL128 the INT64

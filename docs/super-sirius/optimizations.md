@@ -167,7 +167,7 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Mechanism:** Both parts decide from the data, so there is no setting:
 1. **Partition:** `hash_partition()` checks whether a single INT64 partition key is ascending. If so it uses a stable partition (`cudf::stable_sorted_order` of the partition ids, then a gather) that keeps the input order within each partition; otherwise it calls `cudf::hash_partition` as before. Both assign a row by its MurmurHash3 row hash modulo the partition count, so batches of one input may take either path and a key still lands in one partition.
-2. **Merge:** for a single INT64 group key, `merge_grouped_aggregate()` orders the incoming partials by their first key, concatenates them, verifies the result with `keys_ascending()`, and uses the sorted-keys group-by if it passes. Any other input keeps the hash merge.
+2. **Merge:** for a single fixed-width, non-floating-point group key, `merge_grouped_aggregate()` orders the incoming partials by their first key (gathered into one column, sorted on the device and read back with one synchronization), concatenates them, verifies the result with `keys_ascending()`, and uses the sorted-keys group-by if it passes. Any other input keeps the hash merge.
 
 **Code path:** `src/op/partition/gpu_partition_impl.cpp` — `hash_partition()`; `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`
 

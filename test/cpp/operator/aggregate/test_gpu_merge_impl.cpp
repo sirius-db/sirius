@@ -1096,12 +1096,13 @@ namespace {
 using sirius::test::vector_to_cudf_column;
 using sirius::test::operator_utils::gpu_type_traits;
 
-std::shared_ptr<data_batch> make_partial(std::vector<int64_t> const& keys,
+template <typename Key = int64_t>
+std::shared_ptr<data_batch> make_partial(std::vector<Key> const& keys,
                                          std::vector<int64_t> const& sums,
                                          memory_space& mem_space)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(keys));
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<Key>>(keys));
   columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(sums));
   return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                  mem_space,
@@ -1133,6 +1134,29 @@ TEST_CASE("Grouped merge aggregate of sorted partials that arrive out of order",
   ro_batches.clear();
   validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
   REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 7);
+}
+
+TEST_CASE("Grouped merge aggregate of sorted partials with INT32 keys, ties and out of order",
+          "[operator][merge_grouped_agg]")
+{
+  // The first keys are ordered on the device for any integer-like key; partials with equal first
+  // keys keep their input order.
+  auto* mem_space                                  = get_shared_mem_space();
+  std::vector<std::shared_ptr<data_batch>> batches = {
+    make_partial<int32_t>({7, 8, 9}, {1, 2, 3}, *mem_space),
+    make_partial<int32_t>({-3, 0, 7}, {4, 5, 6}, *mem_space),
+    make_partial<int32_t>({7, 7, 10}, {7, 8, 9}, *mem_space)};
+  std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
+
+  std::vector<read_only_data_batch> ro_batches;
+  for (auto& batch : batches) {
+    ro_batches.push_back(batch->to_read_only());
+  }
+  auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, 1, aggregates, cudf::get_default_stream(), *mem_space);
+  ro_batches.clear();
+  validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
+  REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 6);
 }
 
 TEST_CASE("Grouped merge aggregate of partials that are not sorted",

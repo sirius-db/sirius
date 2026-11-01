@@ -19,6 +19,8 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -42,19 +44,22 @@ struct storage_of<T, std::enable_if_t<cudf::is_chrono<T>()>> {
   using type = typename T::rep;
 };
 
-struct ascending_fn {
+/// One typed pass over the values of a null-free fixed-width, non-floating-point column, which
+/// stops at the first descent.
+struct typed_ascending_fn {
   template <typename T>
   bool operator()(cudf::column_view const& keys, ::cuda::stream_ref stream) const
   {
     if constexpr (cudf::is_fixed_width<T>() && !std::is_floating_point_v<T>) {
       // The integer the type stores its values in: the chrono or fixed-point representation, or
-      // the type itself. One typed pass over the values, which stops at the first descent.
+      // the type itself.
       using storage      = typename storage_of<T>::type;
       auto const* values = keys.data<storage>();
-      return thrust::is_sorted(rmm::exec_policy(stream), values, values + keys.size());
+      return thrust::is_sorted(rmm::exec_policy(stream, cudf::get_current_device_resource_ref()),
+                               values,
+                               values + keys.size());
     } else {
-      return cudf::is_sorted(
-        cudf::table_view({keys}), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
+      CUDF_FAIL("keys_ascending: the typed pass supports fixed-width, non-floating-point types");
     }
   }
 };
@@ -66,11 +71,13 @@ bool keys_ascending(cudf::column_view const& keys, ::cuda::stream_ref stream)
   if (keys.size() < 2) { return true; }
   // cuDF's comparator handles nulls, floating-point (NaN ordering) and the non-fixed-width types;
   // its generic row comparison reads a plain integer column at a fraction of memory bandwidth.
-  if (keys.has_nulls()) {
+  bool const typed_pass =
+    !keys.has_nulls() && cudf::is_fixed_width(keys.type()) && !cudf::is_floating_point(keys.type());
+  if (!typed_pass) {
     return cudf::is_sorted(
       cudf::table_view({keys}), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
   }
-  return cudf::type_dispatcher(keys.type(), ascending_fn{}, keys, stream);
+  return cudf::type_dispatcher(keys.type(), typed_ascending_fn{}, keys, stream);
 }
 
 }  // namespace sirius::op
