@@ -664,7 +664,7 @@ TEST_CASE("FFI object store factories preserve pointers without network access",
   inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
   auto const config     = inputs.snapshot();
   {
-    auto context = make_context_from_config("", nullptr);
+    auto context = make_context_from_config(memory_config(), nullptr);
     REQUIRE(context);
     CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
     context->put_object_store(config);
@@ -673,7 +673,7 @@ TEST_CASE("FFI object store factories preserve pointers without network access",
     check_fields(*context->object_store_config_for(kFixtureUri), inputs);
   }
   {
-    auto context = make_context_from_config("", config);
+    auto context = make_context_from_config(memory_config(), config);
     REQUIRE(context);
     CHECK(context->object_store_config_for(kFixtureUri).get() == config.get());
     REQUIRE(context->object_store_config_for(kFixtureUri));
