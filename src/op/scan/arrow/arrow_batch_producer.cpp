@@ -33,7 +33,12 @@ namespace sirius::op::scan {
 namespace sm = scan_manager;
 scan_manager::scan_envelope arrow_preparation_envelope(arrow_batch_producer const& producer)
 {
-  return {{producer.limits().envelope}, {}, true, producer.minimum_permits()};
+  auto minimum = producer.minimum_permits();
+  return {
+    std::vector<scan_manager::unit_envelope>(std::max(1U, minimum), producer.limits().envelope),
+    {},
+    true,
+    minimum};
 }
 namespace {
 uint64_t add(uint64_t a, uint64_t b)

@@ -286,7 +286,8 @@ namespace {
 std::vector<cudf::data_type> validate_flat(ArrowSchema const& schema,
                                            ArrowArray const& array,
                                            arrow_metadata_lengths const& metadata_lengths,
-                                           bool payload)
+                                           bool payload,
+                                           bool proven_extents = false)
 {
   if constexpr (std::endian::native != std::endian::little) invalid();
   common(schema, array, metadata_lengths);
@@ -295,6 +296,9 @@ std::vector<cudf::data_type> validate_flat(ArrowSchema const& schema,
       (array.n_children && (!array.children || !schema.children)))
     invalid();
   if (payload && array.length > std::numeric_limits<cudf::size_type>::max()) invalid();
+  if (payload && !proven_extents &&
+      array.offset > std::numeric_limits<cudf::size_type>::max() - array.length)
+    invalid();
   if (array.null_count > 0) invalid();
   if (payload && array.null_count != 0 && array.buffers[0]) {
     auto bits = static_cast<uint8_t const*>(array.buffers[0]);
@@ -308,6 +312,10 @@ std::vector<cudf::data_type> validate_flat(ArrowSchema const& schema,
     auto const& s = *schema.children[i];
     common(s, a, metadata_lengths);
     if (a.n_children || s.n_children || a.length < array.offset + array.length) invalid();
+    if (payload && !proven_extents &&
+        (a.length > std::numeric_limits<cudf::size_type>::max() ||
+         a.offset > std::numeric_limits<cudf::size_type>::max() - array.offset - array.length))
+      invalid();
     auto type    = type_for(s.format);
     bool strings = type.id() == cudf::type_id::STRING;
     if (strings && array.length >= std::numeric_limits<cudf::size_type>::max()) invalid();
@@ -649,13 +657,17 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
     throw transparent::classified_execution_error(
       transparent::late_failure_cause::resource,
       "arrow_batch_too_large: Arrow rows exceed the destination row limit");
-  auto const& types = *program.input_types;
-  auto normalized   = std::make_shared<normalized_batch>(input, *input->staging_resource);
-  auto submission   = lane.begin();
+  auto const& types  = *program.input_types;
+  auto const* source = input->source.get();
+  auto normalized    = std::make_shared<normalized_batch>(input, *input->staging_resource);
+  // The synchronous legacy host path can fail normalization without submitting
+  // any work or retaining a lane ticket.
+  if (!source)
+    normalize_columns(*normalized, input->schema, input->array, types, *input->staging_resource);
+  auto submission = lane.begin();
   // Register roots, capacity and PMR staging before any partially failing copy.
   submission.on_retire([owner = normalized](cudaError_t) noexcept {});
   ::cuda::stream_ref stream{submission.stream()};
-  auto const* source = input->source.get();
   if (source) {
     int device = -1;
     CUDF_CUDA_TRY(cudaGetDevice(&device));
@@ -694,7 +706,7 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
     // Legacy inputs were already payload-validated by validate_for(). Qualified
     // host inputs need that validation only now, after their readiness event.
     if (source)
-      (void)validate_arrow_host_flat(input->schema, input->array, input->metadata_lengths);
+      (void)validate_flat(input->schema, input->array, input->metadata_lengths, true, true);
     if (source) {
       for (size_t i = 0; i < types.size(); ++i) {
         if (types[i].id() != cudf::type_id::STRING || !input->array.length) continue;
@@ -706,12 +718,13 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
           throw std::invalid_argument("arrow_layout_unsupported: declared string window mismatch");
       }
     }
-    normalize_columns(*normalized,
-                      input->schema,
-                      input->array,
-                      types,
-                      *input->staging_resource,
-                      source && source->memory == arrow_source_memory::pageable_host);
+    if (source)
+      normalize_columns(*normalized,
+                        input->schema,
+                        input->array,
+                        types,
+                        *input->staging_resource,
+                        source->memory == arrow_source_memory::pageable_host);
     if (source) {
       // All normalized data (and pageable payload) must use the charged pinned arena.
       for (auto const& column : normalized->columns) {
