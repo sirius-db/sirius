@@ -703,6 +703,9 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
     SIRIUS_LOG_INFO("Execute query time: {:.2f} ms", duration.count() / 1000.0);
   }
 
+  // Fetch on an unsuccessful DuckDB result rewrites its error as InvalidInput.
+  // Preserve the native CPU replay error (including its type) before fetching.
+  gstate.res->ThrowIfError();
   auto result_chunk = gstate.res->Fetch();
   if (result_chunk == nullptr) {
     gstate.finished = true;
