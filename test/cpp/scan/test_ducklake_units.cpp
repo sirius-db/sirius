@@ -953,27 +953,6 @@ TEST_CASE("DuckLake scalar layouts preserve decimal Boolean and temporal vector 
   }
 }
 
-TEST_CASE("DuckLake snapshot DV validates every blob before selecting visibility",
-          "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
-{
-  auto snapshot       = GENERATE(uint64_t{9}, uint64_t{10}, uint64_t{15}, uint64_t{20});
-  auto local_delete   = GENERATE(false, true);
-  auto reversed       = GENERATE(false, true);
-  auto early          = std::string(R"("ducklake-snapshot-id":"10","cardinality":"2")");
-  auto late           = std::string(R"("ducklake-snapshot-id":"20","cardinality":"2")");
-  auto source         = dv_test_container(reversed ? early : late, false, reversed ? late : early);
-  auto unit           = dv_test_unit(source);
-  unit.bound_snapshot = snapshot;
-  unit.transaction_local_delete = local_delete;
-  dv_test_budget budget(unit);
-  auto allocator  = budget.ledger.allocator(budget.permit);
-  auto visibility = prepare_dv_visibility(unit, 5, "data", source, allocator, {}, "delete");
-  CHECK(visibility->validated_blobs == 2);
-  CHECK(visibility->positions.size() == ((local_delete || snapshot >= 10) ? 2 : 0));
-  visibility.reset();
-  CHECK(budget.provider.seen->allocated_bytes == 0);
-}
-
 TEST_CASE("DuckLake snapshot DV rejects invalid future dependencies",
           "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
 {
@@ -1030,29 +1009,37 @@ std::vector<std::byte> snapshot_test_payload(std::initializer_list<uint32_t> pos
 TEST_CASE("DuckLake snapshot DV selects earliest deletes and preserves visible inline deletes",
           "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
 {
-  auto snapshot       = GENERATE(uint64_t{9}, uint64_t{10}, uint64_t{15}, uint64_t{20});
-  auto source         = dv_test_container(R"("ducklake-snapshot-id":"10","cardinality":"2")",
+  auto snapshot     = GENERATE(uint64_t{9}, uint64_t{10}, uint64_t{15}, uint64_t{20});
+  auto local_delete = GENERATE(false, true);
+  auto reversed     = GENERATE(false, true);
+  CAPTURE(snapshot, local_delete, reversed);
+  auto early         = std::string(R"("ducklake-snapshot-id":"10","cardinality":"2")");
+  auto late          = std::string(R"("ducklake-snapshot-id":"20","cardinality":"3")");
+  auto early_payload = snapshot_test_payload({1, 2});
+  auto late_payload  = snapshot_test_payload({1, 2, 5});
+  auto source        = dv_test_container(reversed ? early : late,
                                   false,
-                                  R"("ducklake-snapshot-id":"20","cardinality":"3")",
-                                  snapshot_test_payload({1, 2, 5}),
-                                  snapshot_test_payload({1, 2}));
-  auto unit           = dv_test_unit(source);
-  unit.bound_snapshot = snapshot;
+                                  reversed ? late : early,
+                                  reversed ? late_payload : early_payload,
+                                  reversed ? early_payload : late_payload);
+  auto unit                     = dv_test_unit(source);
+  unit.bound_snapshot           = snapshot;
+  unit.transaction_local_delete = local_delete;
   dv_test_budget budget(unit);
   auto allocator  = budget.ledger.allocator(budget.permit);
   auto visibility = prepare_dv_visibility(unit, 6, "data", source, allocator, {}, "delete");
   CHECK(visibility->validated_blobs == 2);
-  std::vector<int64_t> expected = snapshot < 10   ? std::vector<int64_t>{}
-                                  : snapshot < 20 ? std::vector<int64_t>{1, 2}
-                                                  : std::vector<int64_t>{1, 2, 5};
+  std::vector<int64_t> expected = !local_delete && snapshot < 10   ? std::vector<int64_t>{}
+                                  : !local_delete && snapshot < 20 ? std::vector<int64_t>{1, 2}
+                                                                   : std::vector<int64_t>{1, 2, 5};
   CHECK(std::vector<int64_t>(visibility->positions.begin(), visibility->positions.end()) ==
         expected);
   // Inline deletes remain effective even before the first file-delete snapshot.
   std::array<uint64_t, 2> inlined{2, 4};
   auto combined = combine_inline_visibility(visibility, inlined, 6, allocator);
-  expected      = snapshot < 10   ? std::vector<int64_t>{2, 4}
-                  : snapshot < 20 ? std::vector<int64_t>{1, 2, 4}
-                                  : std::vector<int64_t>{1, 2, 4, 5};
+  expected      = !local_delete && snapshot < 10   ? std::vector<int64_t>{2, 4}
+                  : !local_delete && snapshot < 20 ? std::vector<int64_t>{1, 2, 4}
+                                                   : std::vector<int64_t>{1, 2, 4, 5};
   CHECK(std::vector<int64_t>(combined->positions.begin(), combined->positions.end()) == expected);
   CHECK(combined->validated_blobs == 2);
   combined.reset();

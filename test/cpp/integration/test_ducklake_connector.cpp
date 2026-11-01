@@ -379,10 +379,10 @@ void check_mixed_input_gate(std::shared_ptr<sirius::ducklake::binding_handle> co
 
 struct ducklake_fixture {
   sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env{lake_config()};
+  sirius::test::shared_test_env env;
   duckdb::Connection con{env.make_connection()};
 
-  ducklake_fixture()
+  explicit ducklake_fixture(std::filesystem::path const& config = lake_config()) : env(config)
   {
     if (!load_ducklake(con)) SKIP("DuckLake extension is unavailable");
   }
@@ -2625,18 +2625,25 @@ TEST_CASE_METHOD(ducklake_fixture,
   check_gpu_query("SELECT d0, d30, label FROM lake.wide WHERE d15 IS NOT NULL");
 }
 
+namespace {
+auto snapshot_config()
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  return lake_config();
+}
+struct snapshot_fixture : ducklake_fixture {
+  snapshot_fixture() : ducklake_fixture(snapshot_config()) {}
+};
+}  // namespace
 
-TEST_CASE("DuckLake snapshot visibility native compaction and snapshot deletes match CPU on GPU",
-          "[ducklake_snapshot_visibility_gpu][isolated_context]")
+TEST_CASE_METHOD(
+  snapshot_fixture,
+  "DuckLake snapshot visibility native compaction and snapshot deletes match CPU on GPU",
+  "[ducklake_snapshot_visibility_gpu][isolated_context]")
 {
   auto vectors     = GENERATE(false, true);
   auto interleaved = GENERATE(false, true);
   INFO("deletion vectors: " << vectors << ", interleaved: " << interleaved);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit', 0)");
@@ -2735,16 +2742,12 @@ TEST_CASE("DuckLake snapshot visibility native compaction and snapshot deletes m
   }
 }
 
-TEST_CASE("DuckLake snapshot visibility pruned row groups retain original delete positions",
-          "[ducklake_snapshot_visibility_gpu][isolated_context]")
+TEST_CASE_METHOD(snapshot_fixture,
+                 "DuckLake snapshot visibility pruned row groups retain original delete positions",
+                 "[ducklake_snapshot_visibility_gpu][isolated_context]")
 {
   auto vectors = GENERATE(false, true);
   INFO("deletion vectors: " << vectors);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit', 0)");
@@ -2805,18 +2808,13 @@ TEST_CASE("DuckLake snapshot visibility pruned row groups retain original delete
   }
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility prepared scans refresh views across local changes and commits",
   "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_prepared][isolated_context]")
 {
   auto vectors = GENERATE(false, true);
   INFO("deletion vectors: " << vectors);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CALL lake.set_option('data_inlining_row_limit', 0)");
@@ -2955,6 +2953,15 @@ TEST_CASE(
 }
 
 namespace {
+void check_snapshot_result(duckdb::QueryResult& result,
+                           duckdb::QueryResult const& native,
+                           std::vector<std::string> const& expected)
+{
+  CHECK(ducklake_result_bag(result) == expected);
+  CHECK(result.GetTypes() == native.GetTypes());
+  CHECK(result.GetNames() == native.GetNames());
+}
+
 // Native A has deletes, so compaction merges only B/C. At the selected version,
 // C and the later file deletes are invisible, while committed inline rows remain.
 std::string snapshot_visibility_recovery_query(duckdb::Connection& con,
@@ -3001,7 +3008,8 @@ std::string snapshot_visibility_recovery_query(duckdb::Connection& con,
 }
 }  // namespace
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility failed attempts release visibility before replay and prepared "
   "reuse",
   "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_recovery][isolated_context]")
@@ -3010,12 +3018,6 @@ TEST_CASE(
   auto explicit_entry = GENERATE(false, true);
   auto fallback       = GENERATE(false, true);
   CAPTURE(vectors, explicit_entry, fallback);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto prefix = snapshot_visibility_recovery_query(con, vectors);
@@ -3078,9 +3080,7 @@ TEST_CASE(
     INFO((failed->HasError() ? failed->GetError() : "replay completed"));
     if (fallback) {
       REQUIRE_FALSE(failed->HasError());
-      CHECK(ducklake_result_bag(*failed) == oracle);
-      CHECK(failed->GetTypes() == native->GetTypes());
-      CHECK(failed->GetNames() == native->GetNames());
+      check_snapshot_result(*failed, *native, oracle);
       CHECK(reserved_at_replay.load() == reserved);
     } else {
       REQUIRE(failed->HasError());
@@ -3100,9 +3100,7 @@ TEST_CASE(
     auto clean_before = runtime->get_transparent_execution_stats();
     auto clean        = execute(parameter);
     REQUIRE_FALSE(clean->HasError());
-    CHECK(ducklake_result_bag(*clean) == oracle);
-    CHECK(clean->GetTypes() == native->GetTypes());
-    CHECK(clean->GetNames() == native->GetNames());
+    check_snapshot_result(*clean, *native, oracle);
     CHECK(decoded >= 2);
     CHECK(counters->arrow_rows_imported.load() > imports);
     auto clean_after = runtime->get_transparent_execution_stats();
@@ -3117,7 +3115,8 @@ TEST_CASE(
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility cancellation drains reads and allows a fresh query without replay",
   "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_cancel][isolated_context]")
 {
@@ -3125,12 +3124,6 @@ TEST_CASE(
   auto explicit_entry = GENERATE(false, true);
   auto footer         = GENERATE(false, true);
   CAPTURE(vectors, explicit_entry, footer);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto sql      = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -3200,9 +3193,7 @@ TEST_CASE(
   auto imports      = counters->arrow_rows_imported.load();
   auto fresh_before = runtime->get_transparent_execution_stats();
   auto fresh        = run(statement);
-  CHECK(ducklake_result_bag(*fresh) == expected);
-  CHECK(fresh->GetTypes() == native->GetTypes());
-  CHECK(fresh->GetNames() == native->GetNames());
+  check_snapshot_result(*fresh, *native, expected);
   CHECK(decoded >= 2);
   CHECK(counters->arrow_rows_imported.load() > imports);
   auto fresh_after = runtime->get_transparent_execution_stats();
@@ -3336,7 +3327,8 @@ class snapshot_visibility_crc_mutation {
 };
 }  // namespace
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility validates corrupt future DV blobs across repeated reads and replay",
   "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_corrupt_dv][isolated_context]")
 {
@@ -3345,12 +3337,6 @@ TEST_CASE(
   auto explicit_entry = GENERATE(false, true);
   auto fallback       = GENERATE(false, true);
   CAPTURE(future, warm, explicit_entry, fallback);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CALL lake.set_option('data_inlining_row_limit',0)");
@@ -3460,9 +3446,7 @@ TEST_CASE(
   auto before        = runtime->get_transparent_execution_stats();
   auto restored      = execute();
   REQUIRE_FALSE(restored->HasError());
-  CHECK(ducklake_result_bag(*restored) == expected);
-  CHECK(restored->GetTypes() == native->GetTypes());
-  CHECK(restored->GetNames() == native->GetNames());
+  check_snapshot_result(*restored, *native, expected);
   CHECK(decoded.load() > 0);
   CHECK(replays.load() == replay_before);
   auto after = runtime->get_transparent_execution_stats();
@@ -3473,7 +3457,8 @@ TEST_CASE(
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility concurrent commits refresh visibility while reusing physical "
   "metadata",
   "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_concurrent_cache][isolated_"
@@ -3483,12 +3468,6 @@ TEST_CASE(
   auto explicit_entry = GENERATE(false, true);
   auto after_decode   = GENERATE(false, true);
   CAPTURE(vectors, explicit_entry, after_decode);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto historical = snapshot_visibility_recovery_query(con, vectors);
@@ -3564,9 +3543,7 @@ TEST_CASE(
     }
     auto result = action();
     REQUIRE_FALSE(result->HasError());
-    CHECK(ducklake_result_bag(*result) == expected[view]);
-    CHECK(result->GetTypes() == native->GetTypes());
-    CHECK(result->GetNames() == native->GetNames());
+    check_snapshot_result(*result, *native, expected[view]);
     CHECK(decoded.load() >= reads + 2);
     CHECK(counters->arrow_rows_imported.load() > imports);
     if (require_hits) {
@@ -3600,16 +3577,10 @@ TEST_CASE(
   for (size_t view = 0; view < prefixes.size(); ++view) {
     INFO(view);
     verify(view, true, [&] {
-      std::promise<void> arrived, release;
-      auto at_barrier = arrived.get_future();
-      auto resume     = release.get_future().share();
+      query_pause pause;
       std::atomic<bool> first{true};
       auto rendezvous = [&] {
-        if (first.exchange(false)) {
-          arrived.set_value();
-          if (resume.wait_for(std::chrono::seconds(15)) != std::future_status::ready)
-            throw std::runtime_error("snapshot visibility concurrent commit rendezvous timed out");
-        }
+        if (first.exchange(false)) { pause.arrive_and_wait(std::chrono::seconds(15)); }
       };
       if (after_decode) {
         counters->parquet_filter_for_testing = [&](bool, uint64_t rows) {
@@ -3623,18 +3594,15 @@ TEST_CASE(
       }
       // Join the active query before resetting hooks or destroying their captures,
       // even when a writer or an assertion fails at the barrier.
-      auto reset    = std::shared_ptr<void>(nullptr, [&](void*) {
+      auto reset   = std::shared_ptr<void>(nullptr, [&](void*) {
         counters->after_certify_for_testing  = {};
         counters->parquet_filter_for_testing = [&](bool, uint64_t rows) {
           if (rows) ++decoded;
         };
       });
-      auto active   = std::async(std::launch::async, [&] { return execute(view); });
-      bool released = false;
-      auto unblock  = std::shared_ptr<void>(nullptr, [&](void*) {
-        if (!released) release.set_value();
-      });
-      REQUIRE(at_barrier.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
+      auto active  = std::async(std::launch::async, [&] { return execute(view); });
+      auto unblock = std::shared_ptr<void>(nullptr, [&](void*) { pause.release(); });
+      REQUIRE(pause.wait_until_arrived());
       query(writer, "BEGIN");
       query(writer,
             "DELETE FROM lake.q WHERE id IN (" + std::to_string(3 + view) + "," +
@@ -3643,8 +3611,7 @@ TEST_CASE(
       query(writer, "INSERT INTO lake.q VALUES (" + id + ",5),(" + id + ",5),(" + id + ",NULL)");
       query(writer, "COMMIT");
       CHECK(active.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
-      release.set_value();
-      released = true;
+      pause.release();
       REQUIRE(active.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
       return active.get();
     });
@@ -3732,7 +3699,8 @@ TEST_CASE_METHOD(
   check(" AT (VERSION => " + version + ")", 99, 4950);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility combines historical partial visibility with local overlays and "
   "defaults",
   "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_local_joint][isolated_context]")
@@ -3740,12 +3708,6 @@ TEST_CASE(
   auto vectors        = GENERATE(false, true);
   auto explicit_entry = GENERATE(false, true);
   CAPTURE(vectors, explicit_entry);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto historical = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -3786,9 +3748,7 @@ TEST_CASE(
       auto reads  = decoded.load();
       auto result =
         run(explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")" : sql);
-      CHECK(ducklake_result_bag(*result) == expected);
-      CHECK(result->GetNames() == native->GetNames());
-      CHECK(result->GetTypes() == native->GetTypes());
+      check_snapshot_result(*result, *native, expected);
       CHECK(decoded.load() >= reads + 2);
       auto after = runtime->get_transparent_execution_stats();
       if (!explicit_entry) CHECK(after.executions == before.executions + 1);
@@ -3821,7 +3781,8 @@ TEST_CASE(
   }
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility active views survive concurrent inline flush",
   "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_maintenance][isolated_context]")
 {
@@ -3829,12 +3790,6 @@ TEST_CASE(
   auto explicit_entry = GENERATE(false, true);
   auto after_decode   = GENERATE(false, true);
   CAPTURE(vectors, explicit_entry, after_decode);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto historical       = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -3856,16 +3811,10 @@ TEST_CASE(
   REQUIRE(hosts.size() == 1);
   auto reserved = hosts[0]->get_total_reserved_memory();
   std::atomic<unsigned> decoded{0};
-  std::promise<void> arrived, release;
-  auto at_barrier = arrived.get_future();
-  auto resume     = release.get_future().share();
+  query_pause pause;
   std::atomic<bool> first{true};
   auto rendezvous = [&] {
-    if (first.exchange(false)) {
-      arrived.set_value();
-      if (resume.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
-        throw std::runtime_error("snapshot visibility flush rendezvous timed out");
-    }
+    if (first.exchange(false)) { pause.arrive_and_wait(std::chrono::seconds(20)); }
   };
   counters->parquet_filter_for_testing = [&](bool, uint64_t rows) {
     if (rows) {
@@ -3881,30 +3830,24 @@ TEST_CASE(
   run("SET gpu_execution=true");
   run("SET enable_duckdb_fallback=false");
   run("SET scan_task_batch_size=1");
-  auto before   = runtime->get_transparent_execution_stats();
-  auto active   = std::async(std::launch::async, [&] {
+  auto before  = runtime->get_transparent_execution_stats();
+  auto active  = std::async(std::launch::async, [&] {
     return con.Query(explicit_entry
                        ? "CALL gpu_execution(" + duckdb::Value(historical).ToSQLString() + ")"
                        : historical);
   });
-  bool released = false;
-  auto unblock  = std::shared_ptr<void>(nullptr, [&](void*) {
-    if (!released) release.set_value();
-  });
-  REQUIRE(at_barrier.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
+  auto unblock = std::shared_ptr<void>(nullptr, [&](void*) { pause.release(); });
+  REQUIRE(pause.wait_until_arrived());
   query(writer, "CALL ducklake_flush_inlined_data('lake')");
   auto flushed_files =
     ducklake_result_bag(*query(writer, "SELECT data_file FROM ducklake_list_files('lake','q')"));
   REQUIRE(flushed_files != initial_files);
   CHECK(active.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
-  release.set_value();
-  released = true;
+  pause.release();
   REQUIRE(active.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
   auto result = active.get();
   REQUIRE_FALSE(result->HasError());
-  CHECK(ducklake_result_bag(*result) == expected);
-  CHECK(result->GetNames() == native->GetNames());
-  CHECK(result->GetTypes() == native->GetTypes());
+  check_snapshot_result(*result, *native, expected);
   CHECK(decoded >= 2);
   result.reset();
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
@@ -3921,9 +3864,7 @@ TEST_CASE(
     auto reads = decoded.load();
     auto fresh =
       run(explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")" : sql);
-    CHECK(ducklake_result_bag(*fresh) == bag);
-    CHECK(fresh->GetTypes() == cpu->GetTypes());
-    CHECK(fresh->GetNames() == cpu->GetNames());
+    check_snapshot_result(*fresh, *cpu, bag);
     CHECK(decoded > reads);
     fresh.reset();
     CHECK(hosts[0]->get_total_reserved_memory() == reserved);
@@ -3934,7 +3875,8 @@ TEST_CASE(
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility drains speculative publication before replay",
   "[isolated_context][ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_publication]")
 {
@@ -3944,12 +3886,6 @@ TEST_CASE(
   auto hold_batch     = GENERATE(false, true);
   auto fallback       = GENERATE(false, true);
   CAPTURE(explicit_entry, hold_batch, fallback);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   auto historical = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -4044,7 +3980,8 @@ TEST_CASE(
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility preserves owners and refuses replay after checkpoint cleanup "
   "failure",
   "[isolated_context][ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_cleanup]")
@@ -4053,12 +3990,6 @@ TEST_CASE(
   CAPTURE(vectors);
   auto explicit_entry = GENERATE(false, true);
   CAPTURE(explicit_entry);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   auto historical = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -4101,18 +4032,14 @@ TEST_CASE(
   CHECK(runtime->get_scan_manager().checkpoint_key_count() > 0);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility result fragments preserve joint visibility without replay",
   "[isolated_context][ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_fragment]")
 {
   auto vectors     = GENERATE(false, true);
   auto fail_decode = GENERATE(false, true);
   CAPTURE(vectors, fail_decode);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto sql      = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -4183,7 +4110,8 @@ TEST_CASE(
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility provider failures retain errors and cancellation drains without "
   "replay",
   "[isolated_context][ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_provider]")
@@ -4193,12 +4121,6 @@ TEST_CASE(
   auto inline_sql     = GENERATE(false, true);
   auto mode = GENERATE(0, 1, 2);  // cancel; provider failure without replay; failure with replay
   CAPTURE(vectors, explicit_entry, inline_sql, mode);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto sql      = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -4286,9 +4208,7 @@ TEST_CASE(
   }
   if (mode == 2) CHECK(reserved_at_replay == reserved);
   if (recovered) {
-    CHECK(ducklake_result_bag(*result) == expected);
-    CHECK(result->GetTypes() == native->GetTypes());
-    CHECK(result->GetNames() == native->GetNames());
+    check_snapshot_result(*result, *native, expected);
     CHECK(reserved_at_replay == reserved);
   }
   CHECK(replays == (mode == 2 ? 1 : 0));
@@ -4302,9 +4222,7 @@ TEST_CASE(
   auto imports = counters->arrow_rows_imported.load();
   auto reads   = decoded.load();
   auto fresh   = run(statement);
-  CHECK(ducklake_result_bag(*fresh) == expected);
-  CHECK(fresh->GetTypes() == native->GetTypes());
-  CHECK(fresh->GetNames() == native->GetNames());
+  check_snapshot_result(*fresh, *native, expected);
   CHECK(decoded >= reads + 2);
   CHECK(counters->arrow_rows_imported.load() > imports);
   CHECK(replays == (mode == 2 ? 1 : 0));
@@ -4313,7 +4231,8 @@ TEST_CASE(
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility refuses stale data after replacement or lost retention",
   "[isolated_context][ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_identity]")
 {
@@ -4321,12 +4240,6 @@ TEST_CASE(
   auto explicit_entry = GENERATE(false, true);
   auto missing        = GENERATE(false, true);
   CAPTURE(vectors, explicit_entry, missing);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   auto sql      = snapshot_visibility_recovery_query(con, vectors) + "0";
@@ -4461,24 +4374,18 @@ TEST_CASE(
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
 }
 
-TEST_CASE(
+TEST_CASE_METHOD(
+  snapshot_fixture,
   "DuckLake snapshot visibility bounded admission refuses both scans before dependent work",
   "[isolated_context][ducklake_snapshot_visibility_gpu][ducklake_snapshot_visibility_admission]")
 {
-  auto vectors        = GENERATE(false, true);
   auto explicit_entry = GENERATE(false, true);
-  CAPTURE(vectors, explicit_entry);
+  CAPTURE(explicit_entry);
   auto fallback = GENERATE(false, true);
   INFO(fallback);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  auto run = [&](std::string const& sql) { return query(con, sql); };
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
-  auto historical = snapshot_visibility_recovery_query(con, vectors) + "0";
+  auto historical = snapshot_visibility_recovery_query(con, false) + "0";
   std::string sql = "SELECT a.id AS left_id,b.id AS right_id FROM (" + historical + ") a JOIN (" +
                     historical + ") b ON a.id=b.id";
   auto expected = ducklake_result_bag(*run(sql));
