@@ -128,6 +128,7 @@ Adapters using this driver must also handle the following integration responsibi
 | Sharing a contract across slots and Arrow children | Use one `preparation_identity` for all slot keys and Arrow `next_unit_id` callbacks. Independent counters can produce duplicate keys. |
 | Reusing retained budget across files | Reuse slot permits. Keep each permit until the last consumer releases its backing. |
 | Retiring a slot | Its registered allowance becomes available only after all retained allocations and permits are released. |
+| Stopping discovery | Report token-driven stops as `std::errc::operation_canceled` so normal EOS can finish successfully. Propagate discovery errors unchanged. |
 
 ### Execution and ownership
 

@@ -29,6 +29,7 @@
 #include <array>
 #include <future>
 #include <numeric>
+#include <system_error>
 
 using namespace sirius::op::scan;
 namespace sm = sirius::scan_manager;
@@ -191,6 +192,7 @@ struct harness {
   std::shared_ptr<test_validator> validator = std::make_shared<test_validator>();
   std::vector<std::shared_ptr<test_child>> children;
   size_t discoveries = 0;
+  std::function<void()> on_discover;
   composite_scan_driver driver;
   std::vector<gpu_ingestible::preparation_source> sources;
   explicit harness(std::vector<std::shared_ptr<test_child>> inputs)
@@ -200,6 +202,7 @@ struct harness {
              check_bit(later_check::host_staged),
              4096,
              [this]() -> std::optional<composite_scan_child> {
+               if (on_discover) on_discover();
                if (discoveries == children.size()) return {};
                return composite_scan_child{
                  children[discoveries++], validator, check_bit(later_check::host_staged)};
@@ -517,12 +520,114 @@ TEST_CASE("Composite discovery releases its owner lane on abandonment and cancel
   REQUIRE(std::holds_alternative<sm::preparation_job>(claim));
   std::stop_source stop;
   stop.request_stop();
-  CHECK_THROWS_AS(std::get<sm::preparation_job>(std::move(claim))
-                    .run(sm::preparation_stop_token(stop.get_token())),
-                  duckdb::InterruptException);
+  try {
+    std::get<sm::preparation_job>(std::move(claim))
+      .run(sm::preparation_stop_token(stop.get_token()));
+    FAIL("stopped discovery must report cancellation");
+  } catch (std::system_error const& error) {
+    CHECK(error.code() == std::errc::operation_canceled);
+  }
   CHECK(h.discoveries == 0);
   CHECK_FALSE(h.run(0));
   CHECK(h.discoveries == 1);
+}
+
+TEST_CASE("Composite discovery preserves coordinator stop outcomes",
+          "[composite_scan][coordinator]")
+{
+  namespace prep = sirius::test::preparation;
+  enum class outcome {
+    normal_eos,
+    user_cancel,
+    prior_failure,
+    discovery_failure,
+    failure_after_eos
+  };
+  auto expected = GENERATE(outcome::normal_eos,
+                           outcome::user_cancel,
+                           outcome::prior_failure,
+                           outcome::discovery_failure,
+                           outcome::failure_after_eos);
+  CAPTURE(expected);
+  prep::fixture f(2, 4);
+  harness h({std::make_shared<test_child>()});
+  auto hold            = f.make_hold();
+  auto original_error  = std::make_exception_ptr(std::runtime_error("original failure"));
+  auto discovery_error = std::make_exception_ptr(std::runtime_error("discovery failed"));
+  bool discovery_fails =
+    expected == outcome::discovery_failure || expected == outcome::failure_after_eos;
+  size_t discovery_calls = 0;
+  h.on_discover          = [&] {
+    ++discovery_calls;
+    if (discovery_fails) {
+      hold->wait();
+      std::rethrow_exception(discovery_error);
+    }
+  };
+  if (!discovery_fails) {
+    auto claim             = std::move(h.sources[0].try_claim);
+    h.sources[0].try_claim = [claim = std::move(claim),
+                              hold]() mutable -> gpu_ingestible::metadata_claim {
+      auto result = claim();
+      if (auto* work = std::get_if<sm::preparation_job>(&result)) {
+        // Pause inside execution so the coordinator has already checked its stop gate.
+        return sm::preparation_job{
+          [work = std::move(*work), hold](sm::preparation_stop_token stop) mutable {
+            hold->wait();
+            return work.run(stop);
+          }};
+      }
+      return result;
+    };
+  }
+  std::atomic<size_t> publications{0};
+  f.coordinator.after_publication_for_testing([&](size_t, auto const&, size_t) { ++publications; });
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    std::vector<sm::preparation_coordinator::source> sources;
+    auto destination = std::make_shared<sm::split_connector>();
+    for (auto& lane : h.sources) {
+      sm::preparation_coordinator::source source;
+      source.execution   = lane.execution;
+      source.coalescer   = std::move(lane.coalescer);
+      source.try_claim   = std::move(lane.try_claim);
+      source.close       = std::move(lane.close);
+      source.bind_wakeup = std::move(lane.bind_wakeup);
+      source.destination = destination;
+      source.construct   = [](auto input) { return prep::make_publication(std::move(input)); };
+      sources.push_back(std::move(source));
+    }
+    f.coordinator.add_sources(std::move(sources));
+  });
+  REQUIRE(hold->await());
+  switch (expected) {
+    case outcome::normal_eos:
+    case outcome::failure_after_eos: f.coordinator.request_stop(sm::stop_reason::normal_eos); break;
+    case outcome::user_cancel: f.coordinator.request_stop(sm::stop_reason::user_cancel); break;
+    case outcome::prior_failure:
+      f.completion.report_error(original_error);
+      f.coordinator.request_stop(sm::stop_reason::failure_induced);
+      break;
+    case outcome::discovery_failure: break;
+  }
+  hold->release();
+  f.finish();
+  REQUIRE_FALSE(f.owner_error);
+  if (expected == outcome::normal_eos) {
+    CHECK_FALSE(f.completion.has_error());
+  } else {
+    REQUIRE(f.completion.has_error());
+    if (expected == outcome::user_cancel) {
+      CHECK_THROWS_AS(std::rethrow_exception(f.completion.terminal_error()),
+                      duckdb::InterruptException);
+    } else {
+      CHECK(f.completion.terminal_error() == (discovery_fails ? discovery_error : original_error));
+    }
+  }
+  CHECK(discovery_calls == (discovery_fails ? 1 : 0));
+  CHECK(h.discoveries == 0);
+  CHECK(publications == 0);
+  CHECK(f.coordinator.snapshot().phase == sm::preparation_coordinator::lifecycle::quiescent);
 }
 
 TEST_CASE("Composite routing cannot hide a child contract mismatch", "[composite_scan]")

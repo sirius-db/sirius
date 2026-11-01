@@ -18,10 +18,9 @@
 
 #include "scan_manager/preparation_ledger.hpp"
 
-#include <duckdb/common/exception.hpp>
-
 #include <algorithm>
 #include <atomic>
+#include <system_error>
 #include <utility>
 
 namespace sirius::op::scan {
@@ -313,7 +312,8 @@ struct composite_scan_driver::impl : std::enable_shared_from_this<impl> {
       auto pending = std::make_shared<release_owner>(shared_from_this());
       return job{[this, state, resolve, pending](
                    sm::preparation_stop_token stop) -> std::unique_ptr<scan::scan_info> {
-        if (stop.stop_requested()) throw duckdb::InterruptException();
+        if (stop.stop_requested())
+          throw std::system_error(std::make_error_code(std::errc::operation_canceled));
         if (state) close_lanes(state, sm::preparation_execution_domain::query_owner);
         current.store(discover(resolve));
         return {};
