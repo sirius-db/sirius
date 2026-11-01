@@ -17,6 +17,9 @@
 #include <cstring>
 #include <future>
 #include <vector>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 using namespace sirius::op::scan;
 namespace {
@@ -335,6 +338,70 @@ TEST_CASE("Qualified Arrow retains zero-column cardinality on every placement",
   CHECK(result.table.num_rows() == rows);
   CHECK(result.table.n_columns() == (rows ? 1 : 0));
   CHECK(result.row_count_carrier == bool(rows));
+}
+
+TEST_CASE("Qualified pageable Arrow imports a proven slice beyond 32-bit source offsets",
+          "[arrow_qualified][arrow_profile]")
+{
+#if defined(__linux__)
+  struct virtual_parent {
+    uint64_t bytes;
+    void* data;
+    explicit virtual_parent(uint64_t size)
+      : bytes(size),
+        data(mmap(nullptr,
+                  size,
+                  PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                  -1,
+                  0))
+    {
+      if (data == MAP_FAILED) throw std::bad_alloc();
+    }
+    ~virtual_parent() { munmap(data, bytes); }
+  };
+  constexpr int64_t offset = int64_t{INT32_MAX} + 1;
+  auto parent              = std::make_shared<virtual_parent>((offset + 3) * sizeof(int32_t));
+  std::array<int32_t, 3> expected{11, 22, 33};
+  std::memcpy(static_cast<int32_t*>(parent->data) + offset, expected.data(), sizeof(expected));
+  auto tree               = std::make_shared<import_tree>("i", 3);
+  tree->array.offset      = 0;
+  tree->column.offset     = offset;
+  tree->column.length     = 3;
+  tree->column.null_count = 0;
+  tree->buffers[1]        = parent->data;
+  arrow_source_profile profile;
+  profile.completed     = true;
+  profile.control_bytes = sizeof(import_tree);
+  profile.leases        = parent;
+  profile.allocations   = {{1, parent->data, parent->bytes}};
+  profile.buffers       = {{{}, arrow_buffer_use{1, 0, parent->bytes}}};
+  profile.strings.resize(1);
+  materialization_program program{701, 4, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+  program.input_types  = program.output_types;
+  program.arrow_schema = std::make_shared<arrow_bound_schema const>(
+    arrow_bound_schema{{{"value", "i", cudf::data_type{cudf::type_id::INT32}, true}}});
+  auto staging = std::make_shared<pinned_arena>(4096);
+  auto input   = std::make_shared<owned_arrow_batch>(
+    tree->schema,
+    tree->array,
+    tree,
+    *staging->resource,
+    arrow_metadata_lengths{},
+    std::make_shared<arrow_source_profile const>(std::move(profile)));
+  input->bind_staging(staging, *staging->resource);
+  CHECK(input->estimate().retained == parent->bytes);
+  rmm::cuda_stream stream;
+  sirius::exec::retire_lane lane(stream.value());
+  auto result = import_arrow_host(input, program, lane, cudf::get_current_device_resource_ref());
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  std::array<int32_t, 3> actual{};
+  cuda_ok(cudaMemcpy(
+    actual.data(), result.table.view().column(0).head(), sizeof(actual), cudaMemcpyDeviceToHost));
+  CHECK(actual == expected);
+#else
+  SKIP("requires sparse virtual memory mappings");
+#endif
 }
 
 TEST_CASE("Qualified Arrow imports the full scalar and string matrix from every placement",

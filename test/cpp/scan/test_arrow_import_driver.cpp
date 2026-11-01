@@ -2104,8 +2104,7 @@ TEST_CASE("Pending Arrow allows another source to progress and wakes the parked 
   sirius::exec::static_thread_pool pool(2);
   sirius::exec::scoped_dispatcher dispatcher(pool);
   sirius::pipeline::completion_handler completion;
-  sm::coordinator_pool control(1);
-  sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, nullptr, &control);
+  sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1});
   auto waiting_output = std::make_shared<sm::split_connector>();
   auto ready_output   = std::make_shared<sm::split_connector>();
   auto add            = [&](harness& h, std::shared_ptr<sm::split_connector> output) {
@@ -2131,22 +2130,27 @@ TEST_CASE("Pending Arrow allows another source to progress and wakes the parked 
   coordinator.before_control_wait_for_testing([&] {
     if (ready_output->is_discovery_complete() && !signaled.exchange(true)) parked.set_value();
   });
-  coordinator.arm();
-  coordinator.start();
+  auto query_owner = std::async(std::launch::async, [&] {
+    coordinator.arm();
+    coordinator.start();
+    while (coordinator.snapshot().phase != sm::preparation_coordinator::lifecycle::quiescent)
+      coordinator.advance(std::chrono::hours{1});
+    coordinator.drain();
+  });
   struct stop_control {
     sm::preparation_coordinator& control;
+    std::future<void>& owner;
     ~stop_control()
     {
       control.request_stop(sm::stop_reason::normal_eos);
-      control.drain();
+      if (owner.valid()) owner.wait();
     }
-  } cleanup{coordinator};
+  } cleanup{coordinator, query_owner};
   REQUIRE(idle.wait_for(5s) == std::future_status::ready);
   CHECK(ready_output->has_more_splits());
   CHECK_FALSE(waiting_output->is_discovery_complete());
   CHECK_FALSE(waiting_output->has_more_splits());
   CHECK(waiting.ledger->tracked_units() == 0);
-  ready_output->get_next_split().reset();
   // No test wake or periodic advance: only the producer transition wakes control.
   if (transition == 0) {
     auto offered = waiting_queue->acquire_offered_slot();
@@ -2161,6 +2165,7 @@ TEST_CASE("Pending Arrow allows another source to progress and wakes the parked 
   while (!waiting_output->is_discovery_complete() && std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(1ms);
   REQUIRE(waiting_output->is_discovery_complete());
+  ready_output->get_next_split().reset();
   if (transition == 2)
     CHECK(completion.has_error());
   else {
@@ -2173,6 +2178,9 @@ TEST_CASE("Pending Arrow allows another source to progress and wakes the parked 
     output.reset();
     CHECK_FALSE(completion.has_error());
   }
+  coordinator.request_stop(sm::stop_reason::normal_eos);
+  REQUIRE(query_owner.wait_for(5s) == std::future_status::ready);
+  REQUIRE_NOTHROW(query_owner.get());
 }
 
 TEST_CASE("Arrow outputs survive input retirement through task success and sink failure",
