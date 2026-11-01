@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace sirius::op::scan {
-// Planning-owned storage schema. It is never learned from the first input root.
+// Bound during planning, before the first root.
 struct arrow_bound_schema {
   struct column {
     std::string name;
@@ -39,20 +39,18 @@ struct arrow_string_window {
 struct arrow_source_profile {
   arrow_source_memory memory = arrow_source_memory::pageable_host;
   int device                 = -1;
-  // Either an explicit synchronous-completion declaration or an owned event.
+  // Exactly one of completed/ready_event is required.
   bool completed          = false;
   cudaEvent_t ready_event = nullptr;
   // Retains every allocation, readiness event, allocator and plugin release chain.
   std::shared_ptr<void> leases;
-  // Full retained host control backing: C Data trees, names/metadata and callback
-  // state, including spare capacity. Payload parent allocations are separate.
+  // C Data, names, metadata and callback backing, including spare capacity.
   uint64_t control_bytes = 0;
   std::vector<arrow_allocation> allocations;
   std::optional<arrow_buffer_use> root_validity;
   // One entry per C Data child buffer, including absent validity/empty payloads.
   std::vector<std::vector<std::optional<arrow_buffer_use>>> buffers;
-  // Declared selected character windows, verified against the actual offsets
-  // before conversion. Required for nonempty string columns, on every placement.
+  // Required for nonempty strings; checked against offsets before conversion.
   std::vector<std::optional<arrow_string_window>> strings;
 };
 struct arrow_input_estimate {

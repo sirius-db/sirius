@@ -16,8 +16,10 @@
 
 // sirius
 #include "compression/compressed_representation.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -147,7 +149,15 @@ scan_operator_input::scan_operator_input(
     _operator_id(operator_id)
 {
   auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
-  if (stored && stored->required_device_id()) preferred_device = stored->required_device_id();
+  if (auto required = stored ? stored->required_device_id() : std::nullopt) {
+    int devices = 0;
+    CUDF_CUDA_TRY(cudaGetDeviceCount(&devices));
+    if (*required < 0 || *required >= devices)
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::physical_input,
+        "arrow_layout_unsupported: required source device is unavailable");
+    preferred_device = required;
+  }
   if (preferred_device.has_value() && *preferred_device >= 0) {
     set_preferred_device_id(*preferred_device);
   }

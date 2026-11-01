@@ -1,10 +1,12 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "catch.hpp"
+#include "op/scan/arrow/arrow_batch_producer.hpp"
 #include "op/scan/arrow/arrow_staging_resource.hpp"
 #include "op/scan/arrow_materializer.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/scan/table_scan/owned_arrow_scan.hpp"
 #include "scan_manager/preparation_fixture.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -209,6 +211,143 @@ TEST_CASE("Qualified Arrow waits for the source event before reading on another 
     actual.data(), output.table.view().column(0).head(), sizeof(actual), cudaMemcpyDeviceToHost));
   CHECK(actual == std::array<int32_t, 3>{11, 22, 33});
   CHECK_FALSE(timed_out.load());
+}
+
+TEST_CASE("Arrow discard retains unfinished source writes before releasing callbacks and credits",
+          "[arrow_qualified][arrow_ownership][arrow_admission]")
+{
+  using namespace std::chrono_literals;
+  auto action = GENERATE(0, 1, 2);  // cancel, fail, abandoned offered slot
+  auto memory = GENERATE(arrow_source_memory::device,
+                         arrow_source_memory::pinned_host,
+                         arrow_source_memory::pageable_host);
+  placed_fixture f(memory);
+  f.producer.synchronize();
+  sirius::test::preparation::hold pending;
+  std::atomic<bool> timed_out{false};
+  std::pair<sirius::test::preparation::hold*, std::atomic<bool>*> blocked{&pending, &timed_out};
+  cuda_ok(cudaLaunchHostFunc(
+    f.producer.value(),
+    [](void* context) {
+      auto& state = *static_cast<decltype(blocked)*>(context);
+      try {
+        state.first->wait();
+      } catch (...) {
+        *state.second = true;
+      }
+    },
+    &blocked));
+  cuda_ok(cudaEventRecord(f.tree->ready, f.producer.value()));
+  struct release_state {
+    cudaEvent_t event;
+    arrow_push_queue* queue = nullptr;
+    std::atomic<unsigned> calls{0};
+    std::atomic<cudaError_t> status{cudaErrorNotReady};
+  } released{f.tree->ready};
+  auto queue                 = std::make_shared<arrow_push_queue>(f.program, 65536, [](auto) {});
+  released.queue             = queue.get();
+  auto slot                  = queue->acquire_offered_slot();
+  f.tree->array.private_data = &released;
+  f.tree->array.release      = [](ArrowArray* array) {
+    auto& state = *static_cast<release_state*>(array->private_data);
+    (void)state.queue->observe();
+    state.status = cudaEventQuery(state.event);
+    ++state.calls;
+    array->release = nullptr;
+  };
+  slot.set_input(f.tree->schema, f.tree->array, f.tree, f.profile);
+  if (action != 2) REQUIRE(queue->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  REQUIRE(pending.await());
+  REQUIRE(cudaEventQuery(f.tree->ready) == cudaErrorNotReady);
+  int device = 0;
+  cuda_ok(cudaGetDevice(&device));
+  auto discarding = std::async(std::launch::async, [&] {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    if (action == 0)
+      queue->cancel();
+    else if (action == 1)
+      queue->fail(std::make_exception_ptr(std::runtime_error("producer failure")));
+    else
+      slot = {};
+  });
+  struct release_hold {
+    sirius::test::preparation::hold& hold;
+    ~release_hold() { hold.release(); }
+  } cleanup{pending};
+  CHECK(discarding.wait_for(30ms) == std::future_status::timeout);
+  CHECK(released.calls == 0);
+  CHECK(queue->observe().accepted == (action == 2 ? 0 : 1));
+  CHECK(queue->observe().offered == (action == 2 ? 1 : 0));
+  pending.release();
+  REQUIRE(discarding.wait_for(5s) == std::future_status::ready);
+  discarding.get();
+  CHECK(released.calls == 1);
+  CHECK(released.status == cudaSuccess);
+  CHECK(queue->observe().accepted == 0);
+  CHECK(queue->observe().offered == 0);
+  CHECK_FALSE(timed_out.load());
+}
+
+TEST_CASE("Arrow refuses unavailable source devices before publishing a scan input",
+          "[arrow_qualified][arrow_profile]")
+{
+  placed_fixture f(arrow_source_memory::device);
+  cuda_ok(cudaGetDeviceCount(&f.profile.device));
+  auto input    = f.input();
+  auto metadata = std::make_shared<owned_arrow_scan_info>(
+    input, 701, 4, 0, std::make_shared<physical_profile_table>(), 8192);
+  try {
+    scan_operator_input split(
+      metadata, nullptr, 0, 0, scan_operator_input::prefetch_start::deferred);
+    FAIL("unavailable source device must be refused before task publication");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::physical_input);
+    CHECK(std::string(error.what()).find("required source device is unavailable") !=
+          std::string::npos);
+  }
+}
+
+TEST_CASE("Arrow string row limits are resource refusals after schema and extent validation",
+          "[arrow_qualified][arrow_profile][arrow_admission]")
+{
+  auto format        = GENERATE("u", "U");
+  auto rows          = GENERATE(int64_t{INT32_MAX}, int64_t{INT32_MAX} + 1);
+  auto malformed     = GENERATE(0, 1, 2);  // valid, schema drift, invalid buffer extent
+  auto tree          = std::make_shared<import_tree>(format, 0);
+  tree->array.offset = tree->column.offset = 0;
+  tree->array.length = tree->column.length = rows;
+  tree->column.null_count                  = 0;
+  auto base                                = reinterpret_cast<void const*>(uintptr_t{0x100000});
+  auto bytes       = static_cast<uint64_t>(rows + 1) * (std::string_view(format) == "U" ? 8 : 4);
+  tree->buffers[1] = base;
+  arrow_source_profile profile;
+  profile.memory        = arrow_source_memory::device;
+  profile.device        = 0;
+  profile.completed     = true;
+  profile.leases        = tree;
+  profile.control_bytes = sizeof(import_tree);
+  profile.allocations   = {{1, base, bytes}};
+  profile.buffers       = {{{}, arrow_buffer_use{1, 0, bytes}, {}}};
+  profile.strings       = {arrow_string_window{0, 0}};
+  materialization_program program{701, 4, {cudf::data_type{cudf::type_id::STRING}}, 0, false};
+  program.input_types  = program.output_types;
+  program.arrow_schema = std::make_shared<arrow_bound_schema const>(
+    arrow_bound_schema{{{"value", format, cudf::data_type{cudf::type_id::STRING}, true}}});
+  if (malformed == 1) tree->field.name = "wrong";
+  if (malformed == 2) --profile.buffers[0][1]->bytes;
+  arrow_push_queue queue(program, 64ULL << 30, [](auto) {});
+  auto slot = queue.acquire_offered_slot();
+  slot.set_input(tree->schema, tree->array, tree, std::move(profile));
+  try {
+    queue.offer(slot);
+    FAIL("oversized string rows must fail without accessing the virtual payload");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == (malformed ? sirius::transparent::late_failure_cause::physical_input
+                                    : sirius::transparent::late_failure_cause::resource));
+    if (!malformed)
+      CHECK(std::string(error.what()).find("arrow_batch_too_large") != std::string::npos);
+  }
+  CHECK(queue.observe().accepted == 0);
 }
 
 TEST_CASE("Qualified Arrow rejects actual placement drift before importing payload",
