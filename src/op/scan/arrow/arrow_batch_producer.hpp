@@ -65,6 +65,13 @@ class arrow_batch_producer {
   virtual void close() = 0;
   // Thread-neutral interrupt hook; must wake external offers without closing an affine reader.
   virtual void cancel() noexcept = 0;
+  // Qualified queues bound retained roots themselves; affine legacy readers
+  // continue holding the shared serial gate through final input retirement.
+  virtual bool releases_gate_after_next() const noexcept { return false; }
+  virtual uint32_t minimum_permits() const noexcept { return 1; }
+  // Bind before producers acquire roots; staging is charged in provider blocks.
+  virtual void bind_allocation_granularity(uint64_t) {}
+  virtual void check_status() const {}
 };
 
 // Accepted roots retain temporary permits while downstream consumers run.
@@ -93,10 +100,52 @@ struct arrow_push_limits {
 // One slot across all submitting threads. Only an external thread may wait in
 // offer(), holding no engine lock/lease needed by consumers to return capacity.
 class arrow_push_queue final : public arrow_batch_producer {
+  struct impl;
+
  public:
   arrow_push_queue(materialization_program,
                    arrow_push_limits,
                    std::function<void(std::exception_ptr)> report_failure);
+  // The planner passes operator_params::scan_task_batch_size unchanged here.
+  // Q=2 and the single offered slot are fixed, not user tuning parameters.
+  arrow_push_queue(materialization_program,
+                   uint64_t scan_task_batch_size,
+                   std::function<void(std::exception_ptr)> report_failure);
+  enum class offer_outcome { accepted, capacity_wait, terminal };
+  enum class capacity_result { available, closed, failed };
+  class offered_slot {
+   public:
+    offered_slot() = default;
+    offered_slot(offered_slot&&) noexcept;
+    offered_slot& operator=(offered_slot&&) noexcept;
+    offered_slot(offered_slot const&) = delete;
+    ~offered_slot();
+    bool held() const noexcept { return bool(state_); }
+    capacity_result status() const noexcept { return status_; }
+    // Call only after acquisition, before producing another root. Ownership is
+    // retained by this slot on capacity_wait/terminal and cleared only on accept.
+    void set_input(ArrowSchema&,
+                   ArrowArray&,
+                   std::shared_ptr<void> owner,
+                   arrow_source_profile,
+                   arrow_metadata_lengths = {});
+
+   private:
+    friend class arrow_push_queue;
+    void reset() noexcept;
+    std::shared_ptr<impl> state_;
+    std::shared_ptr<owned_arrow_batch> input_;
+    capacity_result status_ = capacity_result::closed;
+  };
+  struct observation {
+    uint32_t offered = 0, accepted = 0;
+    uint64_t unique_retained_bytes = 0, reserved_bytes = 0;
+    uint64_t control_reservation_bytes = 0;
+  };
+  offered_slot acquire_offered_slot();
+  offer_outcome offer(offered_slot&);
+  capacity_result wait_for_capacity_or_terminal(offered_slot const&);
+  observation observe() const;
   ~arrow_push_queue() override;
   bool offer(offered_arrow_input const&);
   void finish();
@@ -109,9 +158,12 @@ class arrow_push_queue final : public arrow_batch_producer {
   arrow_production next(admitted_arrow_input, scan_manager::preparation_stop_token) override;
   void close() override;
   void cancel() noexcept override;
+  bool releases_gate_after_next() const noexcept override;
+  uint32_t minimum_permits() const noexcept override;
+  void bind_allocation_granularity(uint64_t) override;
+  void check_status() const override;
 
  private:
-  struct impl;
-  std::unique_ptr<impl> impl_;
+  std::shared_ptr<impl> impl_;
 };
 }  // namespace sirius::op::scan

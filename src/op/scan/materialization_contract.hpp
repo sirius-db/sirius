@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace sirius::op::scan {
+struct arrow_bound_schema;
 // A program is query-local. A reader may report progress only for this exact binding.
 struct materialization_program {
   uint64_t contract   = 0;
@@ -28,6 +29,8 @@ struct materialization_program {
   std::shared_ptr<visibility_bindings const> required_visibility;
   std::shared_ptr<void const> input_layout;
   std::shared_ptr<void const> output_layout;
+  // Set by qualified Arrow bindings; legacy adapters keep their existing contract.
+  std::shared_ptr<arrow_bound_schema const> arrow_schema;
 };
 
 struct row_origin {

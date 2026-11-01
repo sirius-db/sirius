@@ -1,6 +1,7 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #pragma once
 #include "exec/cuda_event_completion_poll.hpp"
+#include "op/scan/arrow/arrow_input_profile.hpp"
 #include "op/scan/materialization_contract.hpp"
 
 #include <duckdb/common/arrow/arrow.hpp>
@@ -29,7 +30,8 @@ class owned_arrow_batch {
                     ArrowArray& array,
                     std::shared_ptr<void> capacity,
                     std::pmr::memory_resource& staging_resource,
-                    arrow_metadata_lengths metadata_lengths = {});
+                    arrow_metadata_lengths metadata_lengths            = {},
+                    std::shared_ptr<arrow_source_profile const> source = {});
   ~owned_arrow_batch();
   owned_arrow_batch(owned_arrow_batch const&)            = delete;
   owned_arrow_batch& operator=(owned_arrow_batch const&) = delete;
@@ -38,6 +40,11 @@ class owned_arrow_batch {
   std::vector<cudf::data_type> input_types() const;
   void validate_for(materialization_program const&) const;
   std::size_t estimated_device_bytes() const;
+  arrow_input_estimate estimate() const;
+  arrow_source_profile const* source_profile() const noexcept { return source.get(); }
+  // Called before publication; keeps admitted staging and the engine claim alive.
+  void bind_staging(std::shared_ptr<void>, std::pmr::memory_resource&);
+  void bind_credit(std::shared_ptr<void> credit);
 
  private:
   friend materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
@@ -46,12 +53,24 @@ class owned_arrow_batch {
                                               rmm::device_async_resource_ref);
   ArrowSchema schema{};
   ArrowArray array{};
+  // Destroyed last, after root callbacks, leases, staging and backing owners.
+  std::shared_ptr<void> credit;
+  std::shared_ptr<void> staging_owner;
   std::shared_ptr<void> capacity;
   // The producer's capacity owner must keep this resource alive through retirement.
   // It must support allocation here and deallocation on the lane's host drainer.
-  std::pmr::memory_resource& staging_resource;
+  std::pmr::memory_resource* staging_resource;
   arrow_metadata_lengths metadata_lengths;
+  std::shared_ptr<arrow_source_profile const> source;
 };
+
+// Metadata and declared extents only: never dereferences device/pending payloads.
+arrow_input_estimate validate_arrow_source(ArrowSchema const&,
+                                           ArrowArray const&,
+                                           arrow_source_profile const&,
+                                           arrow_bound_schema const&,
+                                           arrow_metadata_lengths const& = {});
+void validate_arrow_binding(arrow_bound_schema const&, materialization_program const&);
 
 std::vector<cudf::data_type> validate_arrow_host_flat(
   ArrowSchema const&, ArrowArray const&, arrow_metadata_lengths const& metadata_lengths = {});

@@ -144,6 +144,8 @@ scan_operator_input::scan_operator_input(
     _readahead(std::move(readahead)),
     _operator_id(operator_id)
 {
+  auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
+  if (stored && stored->required_device_id()) preferred_device = stored->required_device_id();
   if (preferred_device.has_value() && *preferred_device >= 0) {
     set_preferred_device_id(*preferred_device);
   }
