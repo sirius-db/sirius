@@ -199,7 +199,7 @@ std::unique_ptr<cudf::table> import_arrow_device_columns(ArrowArray const& root,
       rows, nulls ? cudf::mask_state::ALL_NULL : cudf::mask_state::UNALLOCATED, stream, mr);
     if (nulls) {
       normalize_bits<<<blocks(rows), 256, 0, stream.get()>>>(
-        static_cast<uint8_t*>(mask.data()), child.buffers[0], begin, rows, false);
+        reinterpret_cast<uint8_t*>(mask.data()), child.buffers[0], begin, rows, false);
       CUDF_CUDA_TRY(cudaGetLastError());
     }
     std::unique_ptr<cudf::column> column;
