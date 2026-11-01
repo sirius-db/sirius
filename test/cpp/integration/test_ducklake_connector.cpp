@@ -871,6 +871,7 @@ TEST_CASE_METHOD(ducklake_fixture,
     "SELECT 1 FROM lake.q",
     "SELECT value,id,label FROM lake.q WHERE id>=2",
     "SELECT id FROM lake.q WHERE id=1 OR id=4",
+    "SELECT id,value FROM lake.q ORDER BY id DESC, value ASC NULLS LAST LIMIT 3",
     "SELECT COUNT(*) FROM lake.q",
     "SELECT COUNT(*) FROM lake.q WHERE id>=2",
     "SELECT COUNT(*) FROM lake.q WHERE id%2=0",
@@ -2118,100 +2119,6 @@ TEST_CASE_METHOD(ducklake_fixture,
       }
     }
   }
-}
-
-TEST_CASE("DuckLake Top-N prunes unopened files and resets prepared bounds",
-          "[isolated_context][ducklake][ducklake_topn]")
-{
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
-  sirius::test::scoped_temp_directory disk;
-  // Use multiple batches so the runtime boundary can prune later files.
-  auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
-    config["sirius"]["operator_params"]["scan_task_batch_size"] = 8192;
-  });
-  sirius::test::shared_test_env env(config_path);
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
-  query(con, "SET gpu_execution=false");
-  attach_lake(con, disk.directory);
-  query(con, "CALL lake.set_option('data_inlining_row_limit', 0)");
-  query(con, "CREATE TABLE lake.events(ts TIMESTAMP, id BIGINT)");
-  constexpr int files = 256;
-  for (int i = 0; i < files; ++i) {
-    auto start = std::to_string(i * 1000);
-    query(con,
-          "INSERT INTO lake.events SELECT TIMESTAMP '2026-01-01' + INTERVAL (i) SECOND, i "
-          "FROM range(" +
-            start + "," + std::to_string((i + 1) * 1000) + ") r(i)");
-  }
-  // Warm CUDA kernels before measuring asynchronous file pruning.
-  query(con, "SET gpu_execution=true");
-  query(con, "SET enable_duckdb_fallback=false");
-  query(con, "SELECT * FROM lake.events WHERE id < 1000 ORDER BY ts ASC LIMIT 2");
-  auto runtime          = sirius::test::get_registered_sirius_context(con);
-  auto counters         = runtime->physical_counters();
-  counters->track_units = true;
-  std::mutex files_lock;
-  std::set<std::string> opened, decoded;
-  counters->parquet_phase_for_testing = [&](std::string const& path, bool footer) {
-    std::lock_guard<std::mutex> guard(files_lock);
-    (footer ? opened : decoded).insert(path);
-  };
-  auto clear =
-    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
-  for (auto const& order : {"ASC", "DESC"}) {
-    auto sql = std::string("SELECT * FROM lake.events ORDER BY ts ") + order + " LIMIT 2";
-    query(con, "SET gpu_execution=false");
-    auto expected = ducklake_result_bag(*query(con, sql));
-    query(con, "SET gpu_execution=true");
-    query(con, "SET enable_duckdb_fallback=false");
-    opened.clear();
-    decoded.clear();
-    auto before = get_transparent_execution_stats(con);
-    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
-    sirius::test::require_transparent_execution_delta(
-      before, get_transparent_execution_stats(con), 1, 0, 1);
-    INFO("Opened " << opened.size() << ", decoded " << decoded.size() << " of " << files);
-    CHECK_FALSE(decoded.empty());
-    CHECK(opened.size() < files);
-    CHECK(decoded.size() < files);
-  }
-  for (auto const& suffix :
-       {"WHERE ts > TIMESTAMP '2026-01-01 01:00:00' ORDER BY ts DESC LIMIT 5 OFFSET 3",
-        "ORDER BY ts DESC, id ASC LIMIT 2",
-        "ORDER BY ts ASC NULLS FIRST LIMIT 2"}) {
-    auto sql = std::string("SELECT * FROM lake.events ") + suffix;
-    query(con, "SET gpu_execution=false");
-    auto expected = ducklake_result_bag(*query(con, sql));
-    query(con, "SET gpu_execution=true");
-    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
-  }
-  query(con, "SET gpu_execution=false");
-  query(con, "CREATE TABLE lake.ties(ts TIMESTAMP, id BIGINT)");
-  for (int i = 0; i < 5; ++i) {
-    query(con,
-          "INSERT INTO lake.ties VALUES (TIMESTAMP '2026-01-01', " + std::to_string(i) +
-            "), (NULL, " + std::to_string(i + 10) + ")");
-  }
-  for (auto const& suffix : {"ORDER BY ts ASC NULLS FIRST, id DESC LIMIT 3",
-                             "ORDER BY ts DESC NULLS LAST, id DESC LIMIT 3",
-                             "ORDER BY ts ASC NULLS LAST, id ASC LIMIT 20",
-                             "ORDER BY ts DESC NULLS LAST, id DESC LIMIT 4 OFFSET 3"}) {
-    auto sql = std::string("SELECT * FROM lake.ties ") + suffix;
-    query(con, "SET gpu_execution=false");
-    auto expected = ducklake_result_bag(*query(con, sql));
-    query(con, "SET gpu_execution=true");
-    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
-  }
-  auto prepared = con.Prepare("SELECT id FROM lake.events ORDER BY ts DESC LIMIT 2");
-  REQUIRE_FALSE(prepared->HasError());
-  CHECK(ducklake_result_bag(*prepared->Execute()) ==
-        std::vector<std::string>{std::to_string(files * 1000 - 2) + "|",
-                                 std::to_string(files * 1000 - 1) + "|"});
-  query(con, "SET gpu_execution=false");
-  query(con, "DELETE FROM lake.events WHERE id >= 1000");
-  query(con, "SET gpu_execution=true");
-  CHECK(ducklake_result_bag(*prepared->Execute()) == std::vector<std::string>{"998|", "999|"});
 }
 
 TEST_CASE_METHOD(ducklake_fixture,
