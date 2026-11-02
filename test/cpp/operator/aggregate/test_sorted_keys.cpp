@@ -17,14 +17,13 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-
-#include <rmm/device_buffer.hpp>
 
 #include <catch.hpp>
 
@@ -44,16 +43,19 @@ std::unique_ptr<cudf::column> make_column(cudf::data_type type,
                                           std::optional<cudf::size_type> null_row = std::nullopt)
 {
   auto const stream = cudf::get_default_stream();
-  auto const mr     = cudf::get_current_device_resource_ref();
-  rmm::device_buffer data(values.data(), values.size() * sizeof(T), stream, mr);
-  auto const size = static_cast<cudf::size_type>(values.size());
-  if (!null_row) {
-    return std::make_unique<cudf::column>(type, size, std::move(data), rmm::device_buffer{}, 0);
+  auto const size   = static_cast<cudf::size_type>(values.size());
+  auto column       = cudf::make_fixed_width_column(
+    type, size, null_row ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED, stream);
+  cudaMemcpy(column->mutable_view().data<T>(),
+             values.data(),
+             values.size() * sizeof(T),
+             cudaMemcpyHostToDevice);
+  if (null_row) {
+    cudf::set_null_mask(
+      column->mutable_view().null_mask(), *null_row, *null_row + 1, false, stream);
+    column->set_null_count(1);
   }
-  auto mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-  cudf::set_null_mask(
-    static_cast<cudf::bitmask_type*>(mask.data()), *null_row, *null_row + 1, false);
-  return std::make_unique<cudf::column>(type, size, std::move(data), std::move(mask), 1);
+  return column;
 }
 
 /// keys_ascending() on @p column, checked against cuDF's own answer.
