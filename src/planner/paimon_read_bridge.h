@@ -76,7 +76,8 @@ struct PaimonReadBridgeV1 {
 };
 
 /* V2 preserves the descriptor prefix and adds experimental native reads.
- * V1-only consumers must reject V2 rather than assume binary compatibility. */
+ * Consumers that validate only V1 must reject V2. Descriptor-prefix acceptance
+ * requires explicit V2 version and size checks; it does not authorize native reads. */
 #define PAIMON_READ_BRIDGE_NATIVE_VERSION 2
 struct ArrowArray;
 struct ArrowSchema;

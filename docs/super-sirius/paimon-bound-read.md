@@ -1,8 +1,18 @@
 # Paimon bound-read consumer
 
-This is a descriptor-consumer prerequisite for [#2212](https://github.com/sirius-db/sirius/issues/2212).
+This component authenticates and retains read descriptors for
+[#2212](https://github.com/sirius-db/sirius/issues/2212). Its current implementation
+consumes the duckdb-paimon descriptor bridge proposed in
+[#135](https://github.com/polardb/duckdb-paimon/pull/135).
 It does not register a production connector, create native plans/readers, import batches,
 or authorize CPU replay. Normal Paimon SQL behavior is unchanged.
+
+The [maintainer-preferred integration](https://github.com/polardb/duckdb-paimon/pull/140#issuecomment-6556390686)
+exports metadata through `get_bind_info`, with
+Sirius owning native planning and readers. This descriptor bridge is not an unconditional
+prerequisite for that route. Authentication, bound-read identity and module lifetime must
+be reconciled with the selected metadata interface before production registration;
+this component does not establish that the bridge is needed by the final integration.
 
 `planner::paimon_read_provider::from_loaded()` obtains an independent reference by running
 the already-loaded Paimon initializer in a private CPU-only catalog. It never trusts the
@@ -45,9 +55,10 @@ its owner. Shared lifetime alone does not synchronize access to the same wrapper
 | Snapshot availability | Retention is not a lease. This component does not read files or qualify expired-snapshot behavior. |
 | Native planning/preparation/GPU/replay | Not enabled or qualified by this component. No global policy changes. |
 
-The copied C declarations come from duckdb-paimon `9e89afe799e88d36214be9026cb60add10c538f9`
+The C declarations were copied from duckdb-paimon `9e89afe799e88d36214be9026cb60add10c538f9`
 and the public wrapper definition from `80b391069a3192c56d8e52ae9a51d0d1dbb4074e`,
-with Sirius formatting. The wrapper definition and V1 layout agree at these revisions.
+with Sirius formatting and consumer-specific contract comments. The wrapper definition
+and V1 layout agree at these revisions.
 Neither header brings paimon-cpp or Arrow C++ dependencies into Sirius.
 
 The real DSO qualification pairing is Sirius DuckDB
