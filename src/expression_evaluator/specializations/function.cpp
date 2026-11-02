@@ -97,6 +97,18 @@ void require_safe_division(evaluate_result const& left_result,
       (!right_result.is_scalar() && right_result.get_column_view().is_empty())) {
     return;
   }
+  // Integer bounds can exclude both exceptional divisors without materializing row predicates.
+  // HUGEINT uses a scale-zero DECIMAL128 carrier; scaled decimals need their existing checks.
+  // Inconclusive bounds still need the exact guard, which accounts for paired NULLs and minima.
+  if (!right_result.is_scalar()) {
+    auto const divisor = right_result.get_column_view();
+    auto const type    = divisor.type();
+    if (cudf::is_integral_not_bool(type) ||
+        (type.id() == cudf::type_id::DECIMAL128 && type.scale() == 0)) {
+      auto const range = compute_exact_numeric_range(divisor, stream, mr);
+      if (range && (range->minimum > 0 || range->maximum < -1)) { return; }
+    }
+  }
   // Comparisons need a column on one side. Retain only one row for a scalar; the caller
   // keeps the original scalar for cuDF's scalar-column arithmetic overload.
   auto left_scalar        = left_result.is_scalar()

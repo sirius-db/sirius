@@ -302,6 +302,10 @@ which preserves DuckDB's `error_on_division_by_zero` setting and guarded `CASE` 
 fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
 `TRY(...)` continues to use plan-time CPU fallback.
 
+Integer column divisors, including HUGEINT, first use an exact non-NULL range reduction. A minimum
+above zero or a maximum below -1 rules out both exceptional divisors and skips the row checks.
+Inconclusive ranges retain the exact checks, including their paired-NULL semantics.
+
 A proven nonzero constant divisor other than -1 can use the existing cuDF AST path. Other divisors
 materialize under every evaluation strategy; the standalone translator declines them as well, so
 join and scan predicates cannot bypass the checks. The shared `ast_supports_function` predicate

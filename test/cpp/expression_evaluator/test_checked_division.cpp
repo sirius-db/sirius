@@ -26,6 +26,7 @@
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 using namespace sirius::expr_test;
@@ -78,6 +79,62 @@ std::unique_ptr<cudf::table> evaluate(ast_node const& expr,
 }
 
 }  // namespace
+
+TEMPLATE_TEST_CASE("checked division - safe integer column ranges preserve slices and NULLs",
+                   "[expression_evaluator][checked_division]",
+                   int32_t,
+                   int64_t,
+                   __int128_t)
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  auto const function = GENERATE(sirius::function_id::int_div, sirius::function_id::mod);
+  auto const divisor  = static_cast<TestType>(GENERATE(3, -3));
+  auto const type     = logical_type::make(std::is_same_v<TestType, int32_t>   ? type_id::INTEGER
+                                       : std::is_same_v<TestType, int64_t> ? type_id::BIGINT
+                                                                           : type_id::HUGEINT);
+  auto const physical = std::is_same_v<TestType, int32_t> ? cudf::data_type{cudf::type_id::INT32}
+                        : std::is_same_v<TestType, int64_t>
+                          ? cudf::data_type{cudf::type_id::INT64}
+                          : cudf::data_type{cudf::type_id::DECIMAL128, 0};
+  auto const minimum  = std::numeric_limits<TestType>::min();
+  auto left  = column<TestType>(physical, {minimum, minimum, 12, -12, 0, minimum, minimum}, {5});
+  auto right = column<TestType>(physical, {-1, divisor, divisor, divisor, 0, divisor, -1}, {4});
+  // Exclude exceptional pairs outside the slice; NULL divisor payloads do not affect its range.
+  auto l      = cudf::slice(left->view(), {1, 6})[0];
+  auto r      = cudf::slice(right->view(), {1, 6})[0];
+  auto expr   = division(function, type, make_ref_typed(1, type));
+  auto result = evaluate(*expr, cudf::table_view{{l, r}}, strategy);
+  CHECK(copy_valids_to_host(result->view().column(0)) ==
+        std::vector<bool>{true, true, true, false, false});
+  auto const values = copy_column_to_host<TestType>(result->view().column(0));
+  std::vector<TestType> numerators{minimum, 12, -12};
+  for (std::size_t i = 0; i < numerators.size(); ++i) {
+    CHECK(bool(values[i] == (function == sirius::function_id::int_div ? numerators[i] / divisor
+                                                                      : numerators[i] % divisor)));
+  }
+}
+
+TEST_CASE("checked division - unsigned column ranges preserve values above INT64_MAX",
+          "[expression_evaluator][checked_division]")
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  auto const function = GENERATE(sirius::function_id::int_div, sirius::function_id::mod);
+  auto const type     = logical_type::make(type_id::UBIGINT);
+  auto const physical = cudf::data_type{cudf::type_id::UINT64};
+  auto const maximum  = std::numeric_limits<uint64_t>::max();
+  auto left           = column<uint64_t>(physical, {maximum, maximum, 12});
+  auto right          = column<uint64_t>(physical, {maximum, 3, 0}, {2});
+  auto expr           = division(function, type, make_ref_typed(1, type));
+  auto result         = evaluate(*expr, cudf::table_view{{left->view(), right->view()}}, strategy);
+  CHECK(copy_valids_to_host(result->view().column(0)) == std::vector<bool>{true, true, false});
+  auto const values = copy_column_to_host<uint64_t>(result->view().column(0));
+  CHECK(values[0] == (function == sirius::function_id::int_div ? 1 : 0));
+  CHECK(values[1] == (function == sirius::function_id::int_div ? maximum / 3 : maximum % 3));
+}
 
 TEST_CASE("checked division - valid nullable and sliced column pairs",
           "[expression_evaluator][checked_division]")
