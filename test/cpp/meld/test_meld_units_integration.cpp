@@ -1,0 +1,125 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Ungrouped aggregates handed to Meld (SET meld_units = true), against DuckDB on the CPU, over a
+// lineitem of doubles. Every value is dyadic and small, so every sum is exact whatever order the
+// batches are added in, and the answers compare exactly.
+
+#include "meld/meld_unit.hpp"
+
+#include <catch.hpp>
+#include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
+
+#include <string>
+
+namespace {
+
+class MeldUnitsFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  MeldUnitsFixture()
+  {
+    run_ok(
+      "CREATE TABLE lineitem AS SELECT "
+      "(i % 50)::DOUBLE AS l_quantity, "
+      "((i % 97) * 0.25)::DOUBLE AS l_extendedprice, "
+      "((i % 11) * 0.0078125)::DOUBLE AS l_discount "
+      "FROM range(200000) t(i);");
+    run_ok("CHECKPOINT;");
+    run_ok("SET meld_units = true;");
+  }
+
+  ~MeldUnitsFixture() { con->Query("SET meld_units = false;"); }
+
+  /// Runs @p query on the GPU and on the CPU and compares them, and checks Meld ran batches of it.
+  void compare_in_meld(std::string const& query)
+  {
+    auto const before = sirius::meld::meld_unit::batches_run();
+    compare_gpu_vs_cpu(query);
+    CHECK(sirius::meld::meld_unit::batches_run() > before);
+  }
+
+  /// The same, for a query Meld is not given.
+  void compare_without_meld(std::string const& query)
+  {
+    auto const before = sirius::meld::meld_unit::batches_run();
+    compare_gpu_vs_cpu(query);
+    CHECK(sirius::meld::meld_unit::batches_run() == before);
+  }
+
+  sirius::test::scratch_dir dir{"meld_units"};
+};
+
+std::string const q6 =
+  "SELECT sum(l_extendedprice * l_discount) AS revenue FROM {} "
+  "WHERE l_quantity < 24 AND l_discount BETWEEN 0.0390625 AND 0.0625";
+
+std::string over(std::string const& query, std::string const& table)
+{
+  auto text = query;
+  text.replace(text.find("{}"), 2, table);
+  return text;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(MeldUnitsFixture, "Meld runs Q6 over doubles", "[meld_units][integration]")
+{
+  compare_in_meld(over(q6, "lineitem"));
+}
+
+TEST_CASE_METHOD(MeldUnitsFixture,
+                 "Meld runs the filter DuckDB leaves above the scan",
+                 "[meld_units][integration]")
+{
+  run_ok("SET disabled_optimizers = 'filter_pushdown';");
+  compare_in_meld(over(q6, "lineitem"));
+  run_ok("RESET disabled_optimizers;");
+}
+
+TEST_CASE_METHOD(MeldUnitsFixture,
+                 "Meld runs COUNT(*), AVG, MIN and MAX beside a SUM",
+                 "[meld_units][integration]")
+{
+  compare_in_meld(
+    "SELECT count(*), sum(l_extendedprice), avg(l_discount), min(l_quantity), "
+    "max(l_extendedprice * l_discount) FROM lineitem WHERE l_quantity >= 10");
+}
+
+TEST_CASE_METHOD(MeldUnitsFixture,
+                 "Meld runs Q6 over a Parquet table pinned on the GPU",
+                 "[meld_units][integration]")
+{
+  auto const parquet = dir.file("lineitem.parquet");
+  run_ok("COPY lineitem TO '" + parquet + "' (FORMAT PARQUET);");
+  run_ok("CREATE VIEW p_lineitem AS SELECT * FROM read_parquet('" + parquet + "');");
+  run_ok("CALL pin_table('" + parquet + "', tier='gpu', name='p_lineitem');");
+  compare_in_meld(over(q6, "p_lineitem"));
+  run_ok("CALL unpin_table('p_lineitem');");
+}
+
+TEST_CASE_METHOD(MeldUnitsFixture, "Meld is not given an integer sum", "[meld_units][integration]")
+{
+  compare_without_meld("SELECT sum(l_quantity::INTEGER) FROM lineitem WHERE l_discount > 0.03");
+}
+
+TEST_CASE_METHOD(MeldUnitsFixture,
+                 "Meld is not given an aggregate when meld_units is off",
+                 "[meld_units][integration]")
+{
+  run_ok("SET meld_units = false;");
+  compare_without_meld(over(q6, "lineitem"));
+}

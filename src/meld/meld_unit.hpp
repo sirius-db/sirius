@@ -24,6 +24,7 @@
 
 #include <cuda/stream>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -65,6 +66,9 @@ class meld_unit {
   [[nodiscard]] std::unique_ptr<cudf::table> run(cudf::table_view const& batch,
                                                  ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref const& mr) const;
+
+  /// How many batches every unit in this process has run over.
+  static std::uint64_t batches_run();
 
  private:
   meld_unit(std::string plan,

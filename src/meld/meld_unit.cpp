@@ -40,12 +40,15 @@
 #include <mlir/Parser/Parser.h>
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <optional>
 
 namespace sirius::meld {
 
 namespace {
+
+std::atomic<std::uint64_t> batches_run_so_far{0};
 
 void register_once()
 {
@@ -281,7 +284,13 @@ std::unique_ptr<cudf::table> meld_unit::run(cudf::table_view const& batch,
   if (mlir::failed(answers)) {
     throw internal_exception(session.why("Meld could not run the plan"));
   }
+  batches_run_so_far.fetch_add(1, std::memory_order_relaxed);
   return to_cudf(*answers->front(), stream, mr);
+}
+
+std::uint64_t meld_unit::batches_run()
+{
+  return batches_run_so_far.load(std::memory_order_relaxed);
 }
 
 }  // namespace sirius::meld

@@ -123,8 +123,11 @@ target_include_directories(
 )
 
 if(SIRIUS_ENABLE_MELD_UNITS)
-  target_sources(sirius_unittest PRIVATE test/cpp/meld/test_meld_plan_writer.cpp
-                                         test/cpp/meld/test_meld_unit.cpp)
+  target_sources(
+    sirius_unittest
+    PRIVATE test/cpp/meld/test_meld_plan_writer.cpp
+            test/cpp/meld/test_meld_unit.cpp
+            test/cpp/meld/test_meld_units_integration.cpp)
 endif()
 
 target_link_libraries(
