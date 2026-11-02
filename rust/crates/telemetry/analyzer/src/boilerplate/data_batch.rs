@@ -61,7 +61,7 @@ impl DataBatch {
 /// Builder for data-batch FSMs.
 pub type DataBatchBuilder = AnalyzedFsmBuilder<schema::DataBatchEvent>;
 
-native_fsm!(DataBatch, schema::DataBatchEvent, fsm);
+super::native_fsm!(DataBatch, schema::DataBatchEvent, fsm);
 
 impl RefTreeEntity for DataBatch {
     fn parent_id(&self) -> Option<Uuid> {

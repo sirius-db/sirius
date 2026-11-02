@@ -46,7 +46,7 @@ impl Task {
 /// Builder for task FSMs.
 pub type TaskBuilder = AnalyzedFsmBuilder<schema::TaskEvent>;
 
-native_fsm!(Task, schema::TaskEvent, 0);
+super::native_fsm!(Task, schema::TaskEvent, 0);
 
 impl RefTreeEntity for Task {
     fn parent_id(&self) -> Option<Uuid> {
