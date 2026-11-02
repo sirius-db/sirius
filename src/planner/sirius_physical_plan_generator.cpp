@@ -1405,7 +1405,7 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
       hgb_ptr->types,
       hgb_ptr->estimated_cardinality,
-      sirius::op::partition_spec{grouped.get_output_grouping_indices()},
+      sirius::op::partition_spec{grouped.get_output_grouping_indices(), {}, true},
       sirius::op::MemoryBarrierType::FULL,
       compressed_materialization_observer,
       op_params.enable_runtime_size_estimation);
@@ -1768,7 +1768,7 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
   auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
     original->types,
     original->estimated_cardinality,
-    sirius::op::partition_spec{original_agg_ptr->get_output_grouping_indices()});
+    sirius::op::partition_spec{original_agg_ptr->get_output_grouping_indices(), {}, true});
   auto* partition_ptr = partition.get();
   partition->children.push_back(std::move(original));
 

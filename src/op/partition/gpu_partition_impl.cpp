@@ -118,7 +118,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   int num_partitions,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  bool preserve_input_order)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -167,11 +168,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
 
   // A sorted single key is the shape of a sorted-key partial aggregate, whose merge uses the
   // sorted-keys group-by when its partials stay in order. Only then is the stable partition worth
-  // its sort. `cudf::hash_partition` assigns rows to the partition MurmurHash3(key) % n, like the
+  // its sort, so the planner asks for it only where a merge of sorted partials follows.
+  // `cudf::hash_partition` assigns rows to the partition MurmurHash3(key) % n, like the
   // stable partition, so batches of one input may take different paths. Any other input is
   // partitioned as before.
   bool keep_input_order = false;
-  if (effective_key_idx.size() == 1) {
+  if (preserve_input_order && effective_key_idx.size() == 1) {
     auto const& key  = effective_table.column(effective_key_idx[0]);
     keep_input_order = cudf::is_fixed_width(key.type()) && !cudf::is_floating_point(key.type()) &&
                        keys_ascending(key, stream);

@@ -201,13 +201,14 @@ std::shared_ptr<data_batch> make_key_row_batch(int num_rows,
 /// Partitions @p batch by column 0 and returns, per partition, its rows as [key, row].
 std::vector<std::vector<std::vector<int64_t>>> partition_by_key(data_batch& batch,
                                                                 int num_partitions,
-                                                                memory_space& mem_space)
+                                                                memory_space& mem_space,
+                                                                bool preserve_input_order = false)
 {
   std::vector<std::shared_ptr<data_batch>> output_batches;
   {
     auto ro        = batch.to_read_only();
     output_batches = gpu_partition_impl::hash_partition(
-      ro, {0}, num_partitions, cudf::get_default_stream(), mem_space);
+      ro, {0}, num_partitions, cudf::get_default_stream(), mem_space, {}, preserve_input_order);
   }
   validate_hash_partition(batch, output_batches, num_partitions);
   std::vector<std::vector<std::vector<int64_t>>> partitions(num_partitions);
@@ -229,10 +230,11 @@ TEMPLATE_TEST_CASE("Hash partition keeps the order of a sorted key and places ke
   constexpr int num_input_rows = 500;
   constexpr int num_partitions = 4;
 
-  // A sorted key takes the order-preserving path: rows stay in input order within a partition.
+  // A sorted key with the planner's hint takes the order-preserving path: rows stay in input order
+  // within a partition.
   auto sorted_batch =
     make_key_row_batch<TestType>(num_input_rows, /*descending=*/false, *mem_space);
-  auto sorted = partition_by_key(*sorted_batch, num_partitions, *mem_space);
+  auto sorted = partition_by_key(*sorted_batch, num_partitions, *mem_space, true);
   std::map<int64_t, int> partition_of_key;
   for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
     auto const& rows = sorted[partition_idx];
@@ -245,8 +247,15 @@ TEMPLATE_TEST_CASE("Hash partition keeps the order of a sorted key and places ke
     }
   }
 
-  // A descending key takes the plain `cudf::hash_partition` path, but each key must land in the
-  // same partition as in the sorted batch: batches of one input may take different paths.
+  // Without the hint, or with a descending key, the plain `cudf::hash_partition` path runs, but
+  // each key must land in the same partition as in the order-preserving batch: batches of one
+  // input may take different paths.
+  auto unhinted = partition_by_key(*sorted_batch, num_partitions, *mem_space);
+  for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
+    for (auto const& row : unhinted[partition_idx]) {
+      REQUIRE(partition_of_key.at(row[0]) == partition_idx);
+    }
+  }
   auto descending_batch =
     make_key_row_batch<TestType>(num_input_rows, /*descending=*/true, *mem_space);
   auto descending = partition_by_key(*descending_batch, num_partitions, *mem_space);
