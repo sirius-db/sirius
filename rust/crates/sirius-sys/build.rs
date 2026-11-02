@@ -1,9 +1,11 @@
 //! Build script for `sirius-sys`.
 //!
 //! Two jobs:
-//!  1. Compile the cxx bridge glue against Sirius's lightweight public FFI header
-//!     (`include/sirius/ffi.hpp`) — no internal Sirius headers are needed, so
-//!     this is the only include directory.
+//!  1. Compile the cxx bridge glue plus the small adapter in `src/shim.cpp` (aggregate
+//!     construction of `ObjectStoreConfig` from named fields and the object-store factory
+//!     overload, which cxx cannot bind directly) against Sirius's lightweight public FFI
+//!     header (`include/sirius/ffi.hpp`) — no internal Sirius headers are needed, so this
+//!     is the only include directory.
 //!  2. Link the single Sirius artifact that exports the FFI symbols (no
 //!     hand-maintained transitive dependency list). `cargo:rustc-link-{lib,search}`
 //!     propagate to downstream binaries, e.g. the `sirius` crate's `cargo test`.
@@ -41,6 +43,7 @@ fn main() {
 
     // 1. Compile the cxx glue against the public FFI header only.
     cxx_build::bridge("src/lib.rs")
+        .file("src/shim.cpp")
         .std("c++20")
         .include(repo.join("include"))
         .compile("sirius_sys");
@@ -62,6 +65,8 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src/shim.hpp");
+    println!("cargo:rerun-if-changed=src/shim.cpp");
     println!("cargo:rerun-if-changed={}", ffi_header.display());
     println!("cargo:rerun-if-changed={}", lib_dir.display());
     println!("cargo:rerun-if-env-changed=SIRIUS_BUILD_DIR");

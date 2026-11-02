@@ -18,11 +18,13 @@
 // filtered aggregate input to CASE WHEN filter THEN input ELSE NULL END below the aggregate and
 // lowers count(*) FILTER to count(mask), so these cases prove the mask-to-null lowering on the
 // real GPU path: every compare_gpu_vs_cpu query runs once on the GPU with a no-fallback
-// assertion and once on DuckDB CPU, then compares results. Rejected shapes (DISTINCT / first
-// with FILTER) are asserted to take the plan-time transparent CPU fallback instead.
+// assertion and once on DuckDB CPU, then compares results. Rejected shapes (DISTINCT other than
+// COUNT(DISTINCT), and first, with FILTER) are asserted to take the plan-time transparent CPU
+// fallback instead.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -178,8 +180,82 @@ TEST_CASE_METHOD(AggFilterFixture,
                  "gpu_execution rejected FILTER shapes take the plan-time CPU fallback",
                  "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  expect_plan_fallback_and_compare("SELECT count(DISTINCT x) FILTER (WHERE x < 50) FROM agg_f");
+  expect_plan_fallback_and_compare("SELECT sum(DISTINCT x) FILTER (WHERE x < 50) FROM agg_f");
   expect_plan_fallback_and_compare("SELECT first(x) FILTER (WHERE x = 42) FROM agg_f");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER on several columns and types",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // Every value repeats, so DISTINCT changes each count. xn % 2 = 0 is NULL where x = 50, which
+  // must mask out. The unfiltered COUNT(DISTINCT x) proves the mask stays local.
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "count(DISTINCT x) FILTER (WHERE x < 50), "
+                       "count(DISTINCT xn) FILTER (WHERE x <= 50), "
+                       "count(DISTINCT s) FILTER (WHERE x % 3 = 0), "
+                       "count(DISTINCT d) FILTER (WHERE xn % 2 = 0), count(DISTINCT x) "
+                       "FROM agg_f" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER is 0 when no non-NULL value passes",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // In agg_nulls group 2 passes only a NULL value and group 3 passes no row. The distinct count
+  // shares its masked input with the other aggregates filtered on keep.
+  for (bool grouped : {false, true}) {
+    for (auto const* table : {"agg_nulls", "agg_empty"}) {
+      compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                         "count(DISTINCT v) FILTER (WHERE keep), count(v) FILTER (WHERE keep), "
+                         "sum(v) FILTER (WHERE keep), count(DISTINCT v) FILTER (WHERE NOT keep) "
+                         "FROM " +
+                         table + (grouped ? " GROUP BY g" : ""));
+    }
+  }
+  for (auto group : {2, 3}) {
+    compare_gpu_vs_cpu("SELECT count(DISTINCT v) FILTER (WHERE keep) FROM agg_nulls WHERE g = " +
+                       std::to_string(group));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER with a NOT IN subquery (TPC-Havoc Q16_V07)",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // HAVING repeats the filtered aggregate, so the plan has two MARK joins.
+  compare_gpu_vs_cpu(
+    "SELECT g, count(DISTINCT x) FILTER (WHERE x NOT IN (SELECT y FROM marks WHERE y IS NOT NULL)) "
+    "FROM agg_f GROUP BY g "
+    "HAVING count(DISTINCT x) FILTER (WHERE x NOT IN (SELECT y FROM marks WHERE y IS NOT NULL)) "
+    "> 24");
+  // The NULL in marks makes NOT IN FALSE or NULL on every row, so every count is 0.
+  compare_gpu_vs_cpu(
+    "SELECT g, count(DISTINCT x) FILTER (WHERE x NOT IN (SELECT y FROM marks)) FROM agg_f "
+    "GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER merges sets across batches",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // Each (g, v) pair repeats 150000 rows later, in another batch, so the merge must union the
+  // sets. Only the first rows pass i < 100000, so later batches contribute empty or NULL sets.
+  run_ok(
+    "CREATE TABLE agg_big AS SELECT i, (i % 150000)::INTEGER v, (i % 150000 % 7)::INTEGER g "
+    "FROM range(300000) r(i);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 65536};
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "count(DISTINCT v) FILTER (WHERE i < 100000), "
+                       "count(DISTINCT v) FILTER (WHERE v % 3 = 0), count(DISTINCT v) "
+                       "FROM agg_big" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
 }
 
 TEST_CASE_METHOD(AggFilterFixture,

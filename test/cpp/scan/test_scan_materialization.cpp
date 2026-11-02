@@ -7,6 +7,7 @@
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "op/scan/table_scan/owned_arrow_scan.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -956,7 +957,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Adapter mapping hook runs without an Iceberg physical schema",
-                 "[materialization][scan][mapping][adapter]")
+                 "[materialization][scan][mapping][adapter][integration]")
 {
   sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
@@ -990,6 +991,23 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
   REQUIRE(file.field_mapping);
   CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(prepared));
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  REQUIRE(batch.execution);
+  CHECK_FALSE(batch.execution->authoritative);
+  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+  CHECK(output->num_rows() == 1);
+  CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
@@ -1542,4 +1560,101 @@ TEST_CASE("Default field mapping preserves row-count carrier eligibility",
   CHECK(opted_in.read_types() == std::vector<duckdb::LogicalType>{timestamp
                                                                     ? duckdb::LogicalType::TIMESTAMP
                                                                     : duckdb::LogicalType::DATE});
+}
+
+TEST_CASE("Bound Arrow validators reject stale or foreign evidence",
+          "[materialization][scan][split_validator]")
+{
+  int releases  = 0;
+  auto fixture  = std::make_shared<arrow_fixture>(releases);
+  auto batch    = owned_fixture(fixture);
+  auto profiles = std::make_shared<physical_profile_table>();
+  owned_arrow_scan_info split(batch, 91, 7, 3, profiles, sizeof(arrow_fixture));
+  materialization_program program{91, 7, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+  program.input_types = program.output_types;
+  auto validator      = owned_arrow_split_validator(program);
+  auto required =
+    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
+  REQUIRE_NOTHROW(validate_split_for_gpu(91, required, {}, split, *validator, 7, profiles));
+  auto copy = split.coalesced_copy();
+  CHECK(copy->certificates()[0].profile == split.certificates()[0].profile);
+  CHECK(copy->batch() == batch);
+  CHECK_NOTHROW(validate_split_for_gpu(91, required, {}, *copy, *validator, 7, profiles));
+  CHECK_THROWS_AS(validate_split_for_gpu(92, required, {}, split, *validator, 7, profiles),
+                  std::runtime_error);
+  CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, split, *validator, 8, profiles),
+                  certificate_incomplete);
+  CHECK_THROWS_AS(
+    validate_split_for_gpu(91, required, {}, split, *parquet_split_validator(), 7, profiles),
+    certificate_incomplete);
+  auto foreign = std::make_shared<physical_profile_table>();
+  CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, split, *validator, 7, foreign),
+                  certificate_incomplete);
+  program.input_types = std::vector{cudf::data_type{cudf::type_id::INT64}};
+  auto wrong_schema   = owned_arrow_split_validator(program);
+  CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, split, *wrong_schema, 7, profiles),
+                  certificate_incomplete);
+  CHECK_THROWS_AS(validate_split_for_gpu(
+                    91, check_bit(later_check::key_held), {}, split, *validator, 7, profiles),
+                  certificate_incomplete);
+  auto ambiguous = combine_split_validators({validator, validator});
+  CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, split, *ambiguous, 7, profiles),
+                  certificate_incomplete);
+  auto certificates = std::vector<split_materializer_certificate>{split.certificates().begin(),
+                                                                  split.certificates().end()};
+  auto dependencies =
+    std::vector<split_dependencies>{split.dependencies().begin(), split.dependencies().end()};
+  SECTION("missing host evidence") { certificates[0].validation.reset(); }
+  SECTION("missing profile owner") { dependencies[0].profiles.reset(); }
+  SECTION("foreign file evidence") { dependencies[0].checkpoint_iteration = 1; }
+  SECTION("wrong unit") { certificates[0].split_id++; }
+  SECTION("missing profile") { certificates[0].profile = 0; }
+  SECTION("wrong generation")
+  {
+    owned_arrow_scan_info stale(batch, 91, 6, 3, profiles, sizeof(arrow_fixture));
+    CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, stale, *validator, 7, profiles),
+                    certificate_incomplete);
+    return;
+  }
+  SECTION("missing certificate")
+  {
+    certificates.clear();
+    dependencies.clear();
+  }
+  SECTION("wrong input identity") { certificates[0].input_identity = "other input"; }
+  split.set_contract_payload(91, std::move(certificates), std::move(dependencies));
+  CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, split, *validator, 7, profiles),
+                  certificate_incomplete);
+  // Coalescing must not turn damaged certificates into freshly valid evidence.
+  if (!split.certificates().empty()) {
+    auto malformed = split.coalesced_copy();
+    CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, *malformed, *validator, 7, profiles),
+                    certificate_incomplete);
+  }
+}
+
+TEST_CASE("Planning binds validators before publishing correspondence",
+          "[materialization][scan][split_validator]")
+{
+  sirius::transparent::read_view_registry registry;
+  bound_read_identity identity;
+  identity.source    = {"test", source_kind::parquet_local, "test.parquet"};
+  identity.data_view = file_inventory{0};
+  bound_read_view view;
+  view.identity = make_bound_read_identity(std::move(identity), {});
+  auto id       = allocate_scan_contract(registry,
+                                         {},
+                                   4,
+                                   1,
+                                   std::make_shared<bound_read_view const>(view),
+                                         {},
+                                         {},
+                                         {materializer_kind::parquet, "parquet.v1"});
+  REQUIRE(registry.entry(id).contract.materializer.validator == parquet_split_validator());
+  CHECK_THROWS_AS(registry.bind_split_validator(id, nullptr), std::invalid_argument);
+  registry.bind_split_validator(id, native_split_validator());
+  std::array originals{view};
+  registry.publish_correspondence(
+    certificate_evidence_scope::binding_correspondence, "test", originals);
+  CHECK_THROWS_AS(registry.bind_split_validator(id, parquet_split_validator()), std::logic_error);
 }

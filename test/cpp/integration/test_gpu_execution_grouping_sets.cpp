@@ -240,6 +240,11 @@ TEST_CASE_METHOD(GroupingSetsFixture,
     compare_gpu_vs_cpu(
       "SELECT a, b, sum(v) FILTER (WHERE v > 10) s FROM gs_t GROUP BY ROLLUP(a, b);");
   }
+  SECTION("COUNT(DISTINCT) under ROLLUP")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT a, count(DISTINCT c) FILTER (WHERE v % 4 < 2) n FROM gs_t GROUP BY ROLLUP(a);");
+  }
   SECTION("GROUP BY")
   {
     compare_gpu_vs_cpu(
