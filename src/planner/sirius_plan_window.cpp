@@ -83,6 +83,12 @@ bool partition_key(duckdb::LogicalType const& type)
   }
 }
 
+/// Whether COUNT, MIN and MAX accept an argument of @p type.
+bool count_min_max_argument(duckdb::LogicalType const& type)
+{
+  return numeric_argument(type) || partition_key(type);
+}
+
 /**
  * @brief Return the aggregate to run for @p expression, or decline it.
  *
@@ -116,6 +122,8 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
   }
   auto const id =
     from_duckdb_aggregate_name(expression.AggregateFunction()->GetName().GetIdentifierName());
+  // Every aggregate below also requires the result type DuckDB bound. Any other overload is
+  // declined, so the result column keeps the type the rest of the plan expects.
   // DuckDB names the nullary COUNT overload `count`. Like count_star, it counts every row.
   if ((id == aggregate_id::count_star ||
        (id == aggregate_id::count && expression.GetChildren().empty())) &&
@@ -124,13 +132,11 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
   }
   if (expression.GetChildren().size() == 1) {
     auto const& argument = expression.GetChildren()[0]->GetReturnType();
-    // The types that COUNT, MIN and MAX accept.
-    bool const count_min_max_type = numeric_argument(argument) || partition_key(argument);
-    if (count_min_max_type && id == aggregate_id::count &&
+    if (count_min_max_argument(argument) && id == aggregate_id::count &&
         expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
       return aggregate_id::count;
     }
-    if (count_min_max_type && expression.GetReturnType() == argument) {
+    if (count_min_max_argument(argument) && expression.GetReturnType() == argument) {
       if (id == aggregate_id::min) { return aggregate_id::min; }
       if (id == aggregate_id::max) { return aggregate_id::max; }
     }
@@ -158,22 +164,20 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
   decline("aggregate function or result type");
 }
 
-void count_window_stages(duckdb::LogicalOperator const& plan, std::size_t& window_stages)
+std::size_t count_window_stages(duckdb::LogicalOperator const& plan)
 {
+  auto stages = static_cast<std::size_t>(plan.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW);
   for (auto const& child : plan.children) {
-    count_window_stages(*child, window_stages);
+    stages += count_window_stages(*child);
   }
-  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW && ++window_stages > 1) {
-    decline("more than one window operator in a plan");
-  }
+  return stages;
 }
 
 }  // namespace
 
 void validate_whole_partition_window_stages(duckdb::LogicalOperator const& plan)
 {
-  std::size_t window_stages = 0;
-  count_window_stages(plan, window_stages);
+  if (count_window_stages(plan) > 1) { decline("more than one window operator in a plan"); }
 }
 
 whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window)
