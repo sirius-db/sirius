@@ -229,7 +229,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                            count,
                                                            stream,
                                                            *space,
-                                                           batch_telemetry());
+                                                           batch_telemetry(),
+                                                           _spec.preserve_input_order);
   std::vector<std::size_t> destinations(partitioned_results.size());
   std::iota(destinations.begin(), destinations.end(), std::size_t{0});
   auto result =

@@ -45,11 +45,20 @@ struct partition_spec {
   /// Per-key cast before hashing (e.g. INT32 vs INT64). Empty = hash as-is. Ignored in broadcast.
   std::vector<cudf::data_type> key_cast_types;
 
+  /// Set by the planner when the consumer merges sorted partials, so a sorted batch keeps its
+  /// row order within each partition. Joins leave it off: the current hash joins gain nothing
+  /// from ordered input (a sort-merge join could).
+  bool preserve_input_order = false;
+
   partition_spec() = default;
 
   /// Hash-mode shorthand: partition_spec({col}, {cast}) without naming the mode.
-  partition_spec(std::vector<int> keys, std::vector<cudf::data_type> casts = {})
-    : key_columns(std::move(keys)), key_cast_types(std::move(casts))
+  partition_spec(std::vector<int> keys,
+                 std::vector<cudf::data_type> casts = {},
+                 bool preserve_order                = false)
+    : key_columns(std::move(keys)),
+      key_cast_types(std::move(casts)),
+      preserve_input_order(preserve_order)
   {
   }
 };
