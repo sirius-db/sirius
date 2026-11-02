@@ -349,6 +349,66 @@ class plan_builder {
     return logical(conj.op == sirius::ast::conjunction::kind::op_and ? "and" : "or", args);
   }
 
+  value emit(sirius::ast::between const& range)
+  {
+    auto input = emit(*range.input);
+    auto lower = emit(*range.lower);
+    auto upper = emit(*range.upper);
+    if (range.lower_inclusive && range.upper_inclusive) {
+      std::vector<value> args{input, lower, upper};
+      return call(
+        comparison_urn, key_of("between", args), args, logical_type::make(type_id::BOOLEAN));
+    }
+    auto above =
+      comparison(range.lower_inclusive ? sirius::comparison_type::ge : sirius::comparison_type::gt,
+                 input,
+                 lower);
+    auto below =
+      comparison(range.upper_inclusive ? sirius::comparison_type::le : sirius::comparison_type::lt,
+                 input,
+                 upper);
+    return logical("and", {above, below});
+  }
+
+  value emit(sirius::ast::function_call const& fn)
+  {
+    // Floating point only: integer arithmetic overflows differently in Meld than in DuckDB, and
+    // DuckDB divides by zero to NULL.
+    static std::map<sirius::function_id, char const*> const names = {
+      {sirius::function_id::add, "add"},
+      {sirius::function_id::sub, "subtract"},
+      {sirius::function_id::mul, "multiply"},
+    };
+    auto found = names.find(fn.function());
+    if (found == names.end() || fn.arguments().size() != 2 || !is_float(fn.return_type())) {
+      refuse("Meld is not given the function {}", sirius::to_duckdb_function_name(fn.function()));
+    }
+    std::vector<value> args;
+    for (auto const& argument : fn.arguments()) {
+      args.push_back(emit(*argument));
+    }
+    return call(arithmetic_urn, key_of(found->second, args), args, fn.return_type());
+  }
+
+  value emit(sirius::ast::cast const& cast)
+  {
+    if (cast.kind != sirius::ast::cast_kind::semantic) {
+      refuse("Meld does not restore a physical carrier");
+    }
+    auto input = emit(*cast.child);
+    if (meld_type(input.type, false) == meld_type(cast.target_type, false)) {
+      return {input.ir, cast.target_type};
+    }
+    auto result =
+      mlir::meld::CastOp::create(_builder,
+                                 _loc,
+                                 meld_type(cast.target_type, input.nullable() || cast.try_cast),
+                                 input.ir,
+                                 cast.try_cast ? mlir::meld::CastFailureBehavior::ReturnNull
+                                               : mlir::meld::CastFailureBehavior::Error);
+    return {result, cast.target_type};
+  }
+
   template <typename Other>
   value emit(Other const&)
   {
@@ -435,12 +495,16 @@ class plan_builder {
         return;
       case sirius::aggregate_id::sum:
       case sirius::aggregate_id::sum_no_overflow:
+      case sirius::aggregate_id::avg:
         // An integer sum is accumulated wider than its type in Sirius, to keep it from
         // overflowing.
         if (args.size() != 1 || !is_float(args[0].type)) {
-          refuse("Meld is not given a SUM that is not of floating point");
+          refuse("Meld is not given a SUM or AVG that is not of floating point");
         }
         measure(arithmetic_urn, "sum", args, args[0].type, true, measures);
+        if (aggregate.function() == sirius::aggregate_id::avg) {
+          measure(aggregate_urn, "count", args, count_type, false, measures);
+        }
         return;
       case sirius::aggregate_id::min:
       case sirius::aggregate_id::max:

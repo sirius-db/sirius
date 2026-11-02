@@ -55,7 +55,7 @@ struct meld_plan {
 
 /**
  * @brief The Meld plan computing @p chain's per-batch partial: one row with a column per partial
- * Sirius's ungrouped aggregate makes.
+ * Sirius's ungrouped aggregate makes, AVG as its SUM and its COUNT.
  *
  * Returns std::nullopt and says why in @p why for what Meld is not given in this version: decimals,
  * integer sums, physical carriers, and the expressions it has no counterpart for.

@@ -100,6 +100,45 @@ struct filtered_aggregates {
   }
 };
 
+/// WHERE quantity < 24 AND discount BETWEEN 0.0625 AND 0.125, then price * discount, over
+/// (quantity, price, discount).
+struct q6 {
+  std::unique_ptr<ast::node> filter;
+  std::unique_ptr<ast::node> product;
+  ast::aggregate sum   = aggregate(sirius::aggregate_id::sum, ref(0));
+  ast::aggregate count = aggregate(sirius::aggregate_id::count_star, nullptr);
+  ast::aggregate avg   = aggregate(sirius::aggregate_id::avg, ref(0));
+
+  q6()
+  {
+    ast::between range;
+    range.input = ref(2);
+    range.lower = literal(0.0625);
+    range.upper = literal(0.125);
+    ast::conjunction both;
+    both.op = ast::conjunction::kind::op_and;
+    both.children.push_back(less_than(ref(0), literal(24.0)));
+    both.children.push_back(std::make_unique<ast::node>(std::move(range)));
+    filter = std::make_unique<ast::node>(std::move(both));
+
+    std::vector<std::unique_ptr<ast::node>> factors;
+    factors.push_back(ref(1));
+    factors.push_back(ref(2));
+    product = std::make_unique<ast::node>(
+      ast::function_call(sirius::function_id::mul, std::move(factors), f64));
+  }
+
+  [[nodiscard]] sirius::meld::meld_chain chain() const
+  {
+    sirius::meld::meld_chain chain;
+    chain.input_types = {f64, f64, f64};
+    chain.steps.emplace_back(sirius::meld::meld_chain::filter{filter.get()});
+    chain.steps.emplace_back(sirius::meld::meld_chain::projection{{product.get()}});
+    chain.aggregates = {&sum, &count, &avg};
+    return chain;
+  }
+};
+
 std::unique_ptr<cudf::column> doubles(std::vector<double> const& values)
 {
   auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
@@ -155,6 +194,41 @@ TEST_CASE("write_meld_plan writes a filter, a projection and aggregates that Mel
   CHECK(scalar_at<double>(answer->view().column(3)) == 32.0);
 }
 
+TEST_CASE("write_meld_plan writes a Q6 of doubles that Meld runs", "[meld_plan_writer]")
+{
+  q6 query;
+  std::string why;
+  auto plan = sirius::meld::write_meld_plan(query.chain(), why);
+  INFO(why);
+  REQUIRE(plan);
+  CHECK(plan->column_names == std::vector<std::string>{"c0", "c1", "c2"});
+
+  auto unit = sirius::meld::meld_unit::check(plan->text, plan->column_names, why);
+  INFO(plan->text);
+  INFO(why);
+  REQUIRE(unit);
+  // SUM, COUNT(*), and AVG as its SUM and its COUNT, as Sirius's partials are.
+  CHECK(unit->answer_types() ==
+        std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::FLOAT64},
+                                     cudf::data_type{cudf::type_id::INT64},
+                                     cudf::data_type{cudf::type_id::FLOAT64},
+                                     cudf::data_type{cudf::type_id::INT64}});
+
+  auto quantity = doubles({1.0, 30.0, 2.5, 4.0, 8.0});
+  auto price    = doubles({16.0, 2.0, 32.0, 64.0, 128.0});
+  auto discount = doubles({0.0625, 0.125, 0.125, 0.25, 0.09375});
+  cudf::table_view batch({quantity->view(), price->view(), discount->view()});
+  auto answer =
+    unit->run(batch, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+
+  // Rows 0, 2 and 4 pass; row 1 has too many, row 3 too much off.
+  double const kept_sum = 16.0 * 0.0625 + 32.0 * 0.125 + 128.0 * 0.09375;
+  CHECK(scalar_at<double>(answer->view().column(0)) == kept_sum);
+  CHECK(scalar_at<std::int64_t>(answer->view().column(1)) == 3);
+  CHECK(scalar_at<double>(answer->view().column(2)) == kept_sum);
+  CHECK(scalar_at<std::int64_t>(answer->view().column(3)) == 3);
+}
+
 TEST_CASE("write_meld_plan does not hand Meld decimals", "[meld_plan_writer]")
 {
   filtered_aggregates query;
@@ -178,4 +252,21 @@ TEST_CASE("write_meld_plan does not hand Meld an integer sum", "[meld_plan_write
   std::string why;
   CHECK_FALSE(sirius::meld::write_meld_plan(chain, why));
   CHECK(why.find("floating point") != std::string::npos);
+}
+
+TEST_CASE("write_meld_plan does not hand Meld a physical carrier", "[meld_plan_writer]")
+{
+  ast::cast restore;
+  restore.child       = ref(0, logical_type::make(type_id::SMALLINT));
+  restore.target_type = logical_type::make(type_id::INTEGER);
+  restore.kind        = ast::cast_kind::carrier_restore;
+  ast::node restored(std::move(restore));
+  ast::aggregate count = aggregate(sirius::aggregate_id::count_star, nullptr);
+  sirius::meld::meld_chain chain;
+  chain.input_types = {logical_type::make(type_id::SMALLINT)};
+  chain.steps.emplace_back(sirius::meld::meld_chain::projection{{&restored}});
+  chain.aggregates = {&count};
+  std::string why;
+  CHECK_FALSE(sirius::meld::write_meld_plan(chain, why));
+  CHECK(why.find("carrier") != std::string::npos);
 }
