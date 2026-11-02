@@ -21,15 +21,17 @@
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/exception.hpp>
 
+#include <vector>
+
 namespace sirius::planner {
 
 // Preserve primary column indices and supported row-count carriers. Unsupported
 // types may remain in the bound schema only when the scan does not read them.
-inline duckdb::vector<logical_type> scan_returned_types(
+inline std::vector<logical_type> scan_returned_types(
   duckdb::vector<duckdb::LogicalType> const& types,
   duckdb::vector<duckdb::ColumnIndex> const& column_ids)
 {
-  duckdb::vector<bool> required(types.size(), false);
+  std::vector<bool> required(types.size(), false);
   for (auto const& column : column_ids) {
     if (column.IsVirtualColumn()) { continue; }
     auto const primary = column.GetPrimaryIndex();
@@ -38,7 +40,7 @@ inline duckdb::vector<logical_type> scan_returned_types(
     }
     required[primary] = true;
   }
-  duckdb::vector<logical_type> result;
+  std::vector<logical_type> result;
   result.reserve(types.size());
   for (std::size_t i = 0; i < types.size(); ++i) {
     try {
