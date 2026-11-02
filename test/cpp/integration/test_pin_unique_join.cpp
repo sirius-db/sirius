@@ -250,6 +250,25 @@ std::string join_query_on(fs::path const& fact, fs::path const& dim, std::string
          sirius::test::sql_literal(dim.string()) + ") d ON f.f_k = d." + dim_key;
 }
 
+/// A Hive-partitioned dimension, `year=2020` and `year=2021`, whose files also hold a physical
+/// column `year` that is distinct across the table (100000 + n and 200000 + n). Read with Hive
+/// partitioning on, the scan's `year` is the directory's value, which repeats.
+void generate_hive_dim(fs::path const& dir)
+{
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  for (auto const year : {2020, 2021}) {
+    auto const part_dir = dir / ("year=" + std::to_string(year));
+    fs::create_directories(part_dir);
+    run_generator(gen,
+                  "COPY (SELECT range + " + std::to_string(year == 2020 ? 100000 : 200000) +
+                    " AS year, range AS payload FROM range(500)) TO " +
+                    sirius::test::sql_literal((part_dir / "part.parquet").string()) +
+                    " (FORMAT PARQUET);");
+  }
+}
+
 /// @p extra_sections are appended under `sirius:` (indented by two spaces).
 void write_config(fs::path const& yaml_path, std::string const& extra_sections = "")
 {
@@ -474,4 +493,61 @@ TEST_CASE("the exact-stage byte cap is shared by every column the pin retains",
 
   set_option(con, "RESET pin_table_unique_exact_max_bytes;");
   con.Query("CALL unpin_table('pin_unique_join_two_key_dim');");
+}
+
+TEST_CASE("a Hive partition column is not proven unique by a same-named file column",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_hive"};
+  auto const& tmp       = scratch.path();
+  auto const hive_dir   = tmp / "hive_dim";
+  auto const unused_dim = tmp / "unused_unique_dim.parquet";
+  auto const unused_dup = tmp / "unused_dup_dim.parquet";
+  auto const fact       = tmp / "fact.parquet";
+  fs::create_directories(hive_dir);
+  generate_parquet(unused_dim, unused_dup, fact);
+  generate_hive_dim(hive_dir);
+  auto const hive_glob = hive_dir / "*" / "*.parquet";
+
+  auto const yaml_path = tmp / "pin_unique_join_hive.yaml";
+  write_config(yaml_path);
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
+  pin(con, hive_glob, "pin_unique_join_hive_dim");
+
+  auto const query = [&](std::string const& hive_option) {
+    return "SELECT count(*), sum(f.v + d.payload) FROM read_parquet(" +
+           sirius::test::sql_literal(fact.string()) + ") f JOIN read_parquet(" +
+           sirius::test::sql_literal(hive_glob.string()) + ", hive_partitioning=" + hive_option +
+           ") d ON f.f_k = d.year";
+  };
+
+  SECTION("with Hive partitioning the scan's year is the directory's and is not proven")
+  {
+    // f_k reaches 2020 and 2021, each of which matches 500 rows, so a wrong proof would keep one
+    // match per row. Sirius cannot execute a Hive-partitioned scan on the GPU yet, so this case
+    // checks the plan alone.
+    CHECK_FALSE(join_proven_unique(con, query("true")));
+  }
+
+  SECTION("without Hive partitioning the file's year column is still proven")
+  {
+    auto const sql = query("false");
+    CHECK(join_proven_unique(con, sql));
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+  }
+
+  con.Query("CALL unpin_table('pin_unique_join_hive_dim');");
 }

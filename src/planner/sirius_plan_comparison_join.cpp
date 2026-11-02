@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
@@ -88,6 +89,16 @@ static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
     return false;
   };
 
+  // A Hive partition column takes its value from the directory name, even when the files also hold
+  // a column of that name, so what the pin proved about the file column says nothing about it.
+  std::unordered_set<duckdb::idx_t> hive_partition_columns;
+  if (auto const* multi_file =
+        dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
+    for (auto const& partition : multi_file->reader_bind.hive_partitioning_indexes) {
+      hive_partition_columns.insert(partition.index);
+    }
+  }
+
   auto const& column_ids  = get.GetColumnIds();
   auto const& proj_ids    = get.projection_ids;
   auto const output_count = proj_ids.empty() ? column_ids.size() : proj_ids.size();
@@ -96,6 +107,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
     auto const table_index = column_ids[column_idx].GetPrimaryIndex();
     // Virtual columns (row ids and the like) have no pinned counterpart.
     if (table_index >= get.names.size()) { continue; }
+    if (hive_partition_columns.contains(table_index)) { continue; }
     auto const& column_name = get.names[table_index].GetIdentifierName();
     if (proven_unique(column_name)) {
       SIRIUS_LOG_DEBUG("[join] build key '{}' proven distinct by the pinned table", column_name);
