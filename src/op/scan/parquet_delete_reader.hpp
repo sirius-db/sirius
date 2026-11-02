@@ -56,7 +56,12 @@ struct parquet_delete_read_options {
 using parquet_delete_bind =
   std::function<std::vector<uint64_t>(std::vector<parquet_delete_column> const&, uint64_t)>;
 
-// Synchronous, on the caller's thread and ClientContext (including credentials).
+using parquet_delete_consumer = std::function<void(duckdb::DataChunk&)>;
+
+// The factory runs on the caller's thread once per worker. Each consumer receives
+// batches from its worker only. There is no ordering guarantee across workers.
+// Stop and identity callbacks must be safe to invoke concurrently. All workers
+// use the caller's ClientContext and finish before this call returns or throws.
 // The caller owns the active query/transaction needed for filesystem secret lookup.
 // Batches are borrowed until consume returns. Callers must discard accumulated
 // output on any exception; successful return certifies complete footer coverage.
@@ -66,6 +71,6 @@ void read_parquet_delete_batches(duckdb::ClientContext& context,
                                  duckdb::OpenFileInfo file,
                                  parquet_delete_read_options const& options,
                                  parquet_delete_bind const& bind,
-                                 std::function<void(duckdb::DataChunk&)> const& consume);
+                                 std::function<parquet_delete_consumer()> const& make_consumer);
 
 }  // namespace sirius::op::scan

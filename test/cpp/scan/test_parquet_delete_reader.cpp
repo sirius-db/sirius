@@ -27,7 +27,9 @@
 #include <unistd.h>
 #include <utils/s3_backend.hpp>
 
+#include <algorithm>
 #include <barrier>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -70,7 +72,7 @@ struct delete_fixture {
             std::function<void(duckdb::DataChunk&)> const& consume)
   {
     read_parquet_delete_batches(
-      *connection.context, duckdb::OpenFileInfo(path), options, bind, consume);
+      *connection.context, duckdb::OpenFileInfo(path), options, bind, [&] { return consume; });
   }
 };
 auto position_projection = [](auto const&, uint64_t) { return std::vector<uint64_t>{0}; };
@@ -79,6 +81,7 @@ auto position_projection = [](auto const&, uint64_t) { return std::vector<uint64
 TEST_CASE("Parquet deletes project reordered columns across row groups", "[parquet_delete_reader]")
 {
   delete_fixture f;
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
   f.write(10000);
   uint64_t count = 0, batches = 0;
   f.read(
@@ -103,9 +106,52 @@ TEST_CASE("Parquet deletes project reordered columns across row groups", "[parqu
   REQUIRE(batches > 1);
 }
 
+TEST_CASE("Parquet delete workers claim each group once and propagate consumer failures",
+          "[parquet_delete_reader]")
+{
+  delete_fixture f;
+  f.write(10000);
+  REQUIRE_FALSE(f.connection.Query("SET threads=2")->HasError());
+  const bool fail = GENERATE(false, true);
+  size_t workers  = 0;
+  std::promise<void> ready[2];
+  auto first = ready[0].get_future(), second = ready[1].get_future();
+  std::vector<int64_t> positions[2];
+  auto scan = [&] {
+    read_parquet_delete_batches(
+      *f.connection.context, duckdb::OpenFileInfo(f.path), {}, position_projection, [&] {
+        auto worker = workers++;
+        REQUIRE(worker < 2);
+        return [&, worker](duckdb::DataChunk& chunk) {
+          if (positions[worker].empty()) {
+            ready[worker].set_value();
+            auto& peer = worker ? first : second;
+            if (peer.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+              throw std::runtime_error("second worker did not start");
+            if (fail && worker == 0) throw std::runtime_error("consumer failed");
+          }
+          for (duckdb::idx_t i = 0; i < chunk.size(); ++i)
+            positions[worker].push_back(chunk.GetValue(0, i).GetValue<int64_t>());
+        };
+      });
+  };
+  if (fail) {
+    REQUIRE_THROWS_WITH(scan(), Catch::Matchers::ContainsSubstring("consumer failed"));
+  } else {
+    scan();
+    positions[0].insert(positions[0].end(), positions[1].begin(), positions[1].end());
+    std::sort(positions[0].begin(), positions[0].end());
+    REQUIRE(positions[0].size() == 10000);
+    for (int64_t i = 0; i < 10000; ++i)
+      REQUIRE(positions[0][i] == i);
+  }
+  REQUIRE(workers == 2);
+}
+
 TEST_CASE("Parquet deletes validate empty files and binding claims", "[parquet_delete_reader]")
 {
   delete_fixture f;
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
   f.write(0);
   uint64_t batches = 0;
   f.read({}, position_projection, [&](auto&) { ++batches; });
@@ -125,6 +171,7 @@ TEST_CASE("Parquet deletes validate empty files and binding claims", "[parquet_d
 TEST_CASE("Parquet deletes stop before open and between batches", "[parquet_delete_reader]")
 {
   delete_fixture f;
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
   bool cancelled = true;
   parquet_delete_read_options options;
   options.check_stop = [&] {
@@ -153,6 +200,7 @@ TEST_CASE("Parquet deletes reject changes and release handles after consumer fai
           "[parquet_delete_reader]")
 {
   delete_fixture f;
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
   f.write(10000);
   REQUIRE_THROWS(f.read({}, position_projection, [&](auto&) {
     std::ofstream changed(f.path, std::ios::binary | std::ios::app);
@@ -283,6 +331,7 @@ TEST_CASE("Remote Parquet deletes reject replacement and release handles on fail
           "[parquet_delete_reader][remote]")
 {
   delete_fixture f;
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
   f.write(10000);
   auto fs                 = duckdb::make_uniq<delete_remote_fs>(f.path);
   auto& remote            = *fs;

@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -429,6 +430,8 @@ void read_positional_delete_file(duckdb::ClientContext& context,
                                  std::string const& delete_file_path,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
+  using position_map = std::unordered_map<std::string, std::vector<int64_t>>;
+  std::deque<position_map> partials;
   read_parquet_delete_batches(
     context,
     duckdb::OpenFileInfo(delete_file_path),
@@ -451,16 +454,36 @@ void read_positional_delete_file(duckdb::ClientContext& context,
       }
       return projection;
     },
-    [&](duckdb::DataChunk& chunk) {
-      for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
-        auto path = chunk.GetValue(0, i);
-        auto pos  = chunk.GetValue(1, i);
-        if (path.IsNull() || pos.IsNull())
-          throw std::runtime_error("[iceberg] Invalid null position delete");
-        // Preserve signed legacy positions; visibility filtering excludes out-of-range values.
-        out_map[path.GetValue<std::string>()].push_back(pos.GetValue<int64_t>());
-      }
+    [&] {
+      auto& positions = partials.emplace_back();
+      return [&positions](duckdb::DataChunk& chunk) {
+        for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
+          auto path = chunk.GetValue(0, i);
+          auto pos  = chunk.GetValue(1, i);
+          if (path.IsNull() || pos.IsNull())
+            throw std::runtime_error("[iceberg] Invalid null position delete");
+          // Preserve signed legacy positions; visibility filtering excludes out-of-range values.
+          positions[path.GetValue<std::string>()].push_back(pos.GetValue<int64_t>());
+        }
+      };
     });
+  std::unordered_map<std::string_view, size_t> remaining;
+  for (auto& partial : partials) {
+    out_map.merge(partial);
+    for (auto const& [path, positions] : partial)
+      remaining[path] += positions.size();
+  }
+  for (auto& partial : partials) {
+    for (auto& [path, positions] : partial) {
+      auto& dest = out_map.at(path);
+      auto total = remaining.extract(path);
+      // For small appends, retain vector's amortized growth across delete files.
+      if (!total.empty() && total.mapped() > dest.size())
+        dest.reserve(dest.size() + total.mapped());
+      dest.insert(dest.end(), positions.begin(), positions.end());
+      std::vector<int64_t>().swap(positions);
+    }
+  }
 }
 
 struct equality_delete_read_result {

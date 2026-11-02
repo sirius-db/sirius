@@ -6,6 +6,7 @@
  */
 
 #include "catch.hpp"
+#include "io/io_errors.hpp"
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/sirius_httpfs.hpp"
@@ -35,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -688,9 +690,14 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
   CAPTURE(replace_during_batches);
   bool replaced       = false;
   auto replace_object = [&] {
-    REQUIRE(sirius::test::put_s3_test_object(key, replacement));
+    if (!sirius::test::put_s3_test_object(key, replacement))
+      throw std::runtime_error("S3 replacement requires managed test backend");
     replaced = true;
   };
+  auto const threads = GENERATE(1, 2);
+  CAPTURE(threads);
+  require_query_ok(fixture.con, "SET threads=" + std::to_string(threads));
+  std::mutex consume_mutex;
   uint64_t consumed  = 0;
   auto read_complete = [&] {
     std::vector<int64_t> pending;
@@ -702,27 +709,28 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
         if (!replace_during_batches) replace_object();
         return std::vector<uint64_t>{1};
       },
-      [&](duckdb::DataChunk& chunk) {
-        for (duckdb::idx_t i = 0; i < chunk.size(); ++i)
-          pending.push_back(chunk.GetValue(0, i).GetValue<int64_t>());
-        consumed += chunk.size();
-        if (replace_during_batches && !replaced) replace_object();
+      [&] {
+        return [&](duckdb::DataChunk& chunk) {
+          std::lock_guard lock(consume_mutex);
+          for (duckdb::idx_t i = 0; i < chunk.size(); ++i)
+            pending.push_back(chunk.GetValue(0, i).GetValue<int64_t>());
+          consumed += chunk.size();
+          if (replace_during_batches && !replaced) replace_object();
+        };
       });
     return pending;
   };
   fixture.con.BeginTransaction();
   std::vector<int64_t> published;
-  auto failure = thrown_message([&] { published = read_complete(); });
-  INFO(failure);
-  REQUIRE(replaced);
-  REQUIRE_FALSE(failure.empty());
   if (replace_during_batches) {
+    REQUIRE_THROWS_AS(published = read_complete(), sirius::io::object_changed_error);
     REQUIRE(consumed > 0);
-    REQUIRE(failure.find("changed since it was opened") != std::string::npos);
   } else {
+    REQUIRE_THROWS_WITH(published = read_complete(),
+                        Catch::Matchers::ContainsSubstring("object changed"));
     REQUIRE(consumed == 0);
-    REQUIRE(failure.find("object changed") != std::string::npos);
   }
+  REQUIRE(replaced);
   REQUIRE(published.empty());
   fixture.con.Rollback();
 
