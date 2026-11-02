@@ -1344,10 +1344,11 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // names outlive cache_info, which every insert path moves from.
     auto const pinned_column_names = cache_info.column_names();
     auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
-    // With pin_table_prove_unique_keys, every other column is observed too, as a join-key
-    // candidate.
+    // With pin_table_prove_unique_keys, every other column of a parquet pin is observed too, as a
+    // join-key candidate. A native table's scan takes the planner's PRIMARY KEY branch and never
+    // reads pin facts, so observing its columns would only cost pin time and GPU memory.
     auto const probe_unique_automatic = sirius::late_mat::pin_unique_automatic_selection(
-      probe_unique_columns, unique_cfg->prove_unique_keys);
+      probe_unique_columns, unique_cfg->prove_unique_keys && data.args.format == "parquet");
     for (std::size_t i = 0; i < probe_unique_columns.size(); ++i) {
       if (probe_unique_automatic[i]) { probe_unique_columns[i] = true; }
     }
