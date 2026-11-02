@@ -1256,6 +1256,16 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 |----------|---------|-------------|
 | `enable_low_cardinality_groupby` | true | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. |
 
+### Meld Execution Units
+
+Only in a build with `SIRIUS_ENABLE_MELD_UNITS`, which needs `SIMPATICO_ENABLE_MELD` and Meld's
+source tree in `SIMPATICO_MELD_SOURCE_DIR`; the `release-meld` preset sets all three
+(`pixi run make release-meld`, with Meld checked out beside Sirius).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `meld_units` | false | Hand an ungrouped aggregate whose input is filters and projections over a table scan to Meld, which computes its per-batch partial over each scanned batch as one compiled unit in place of those operators. Takes effect when a plan is built. Meld is not given decimals, integer sums, or columns in other physical carriers; what it refuses runs as before, with the reason logged at debug level. |
+
 ### Fused Scan Filtering
 
 | Variable | Default | Description |
@@ -1335,6 +1345,7 @@ When `LOAD sirius` cannot load a CUDA backend, the loader registers `gpu_executi
 | `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
 | `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
+| `src/meld/meld_units_pass.cpp` | `meld_units` registration, in a build with Meld's execution units |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `cucascade/include/cucascade/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
 | `cucascade/include/cucascade/io/uring/config.hpp`, `io/rest/config.hpp`, `io/tls/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / TLS / object-store sub-configs (cuCascade) |

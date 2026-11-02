@@ -100,6 +100,9 @@ foreach(_target sirius_objects sirius_core sirius_shared)
   target_compile_definitions(
     ${_target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN
                        CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+  if(SIRIUS_ENABLE_MELD_UNITS)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_WITH_MELD_UNITS)
+  endif()
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
