@@ -23,27 +23,14 @@ impl QueryActivityTrack {
                 "activity track id cannot be nil".into(),
             ));
         }
-        let QueryActivityTrackEvent::Declaration { label, activity_id } = event.data;
+        let QueryActivityTrackEvent::Declaration { label, query_id } = event.data;
         Ok(Self {
             id: event.id,
-            parent: activity_id.target,
+            parent: query_id.target,
             label,
             start: event.timestamp,
             end: event.timestamp,
         })
-    }
-    pub(crate) fn preparation(
-        query_id: Uuid,
-        start: TimeUnixNanoSec,
-        end: TimeUnixNanoSec,
-    ) -> Self {
-        Self {
-            id: crate::presentation::PreparationLane::new(query_id).id(),
-            parent: query_id,
-            label: "Preparation".into(),
-            start,
-            end,
-        }
     }
     pub(crate) fn include(&mut self, start: TimeUnixNanoSec, end: TimeUnixNanoSec) {
         self.start = self.start.min(start);

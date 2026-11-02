@@ -982,6 +982,8 @@ TEST_CASE("query activities preserve nesting and finish once on unwind or query 
     observer.planning_generation(7);
     auto parent = observer.activity("preparation");
     REQUIRE(parent.id().has_value());
+    query_observer moved(std::move(observer));
+    observer = std::move(moved);
     {
       auto child = observer.activity("admission", "wait", parent.id());
       child.finish();
@@ -999,6 +1001,21 @@ TEST_CASE("query activities preserve nesting and finish once on unwind or query 
   }
   auto const lines = read_all_telemetry_lines(output, "QueryActivity");
   REQUIRE(lines.size() == 6);
+  auto const tracks = read_all_telemetry_lines(output, "QueryActivityTrack");
+  REQUIRE(tracks.size() == 1);
+  REQUIRE(any_line_with_all(tracks, {"query_id", "Preparation"}));
+  std::optional<std::string> resource_id;
+  for (auto const& line : lines) {
+    auto const key    = std::string{"\"track\":{\"target\":\""};
+    auto const offset = line.find(key);
+    if (offset == std::string::npos) continue;
+    auto const begin = offset + key.size();
+    auto const id    = line.substr(begin, line.find('"', begin) - begin);
+    if (resource_id) REQUIRE(id == *resource_id);
+    resource_id = id;
+  }
+  REQUIRE(resource_id.has_value());
+  REQUIRE(tracks.front().find(*resource_id) != std::string::npos);
   REQUIRE(any_line_with_all(lines, {"admission", "wait"}));
   REQUIRE(any_line_with_all(lines, {"Finished", "failed"}));
   REQUIRE(any_line_with_all(lines, {"Finished", "cancelled"}));

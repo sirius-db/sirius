@@ -643,7 +643,7 @@ impl SiriusModelBuilder {
         }
     }
 
-    pub(crate) fn try_build(self) -> AnalyzerResult<SiriusModel> {
+    pub(crate) fn try_build(mut self) -> AnalyzerResult<SiriusModel> {
         let engine = self.engine.ok_or_else(|| {
             AnalyzerError::IncompleteEntity(format!("engine {} has no events", self.engine_id))
         })?;
@@ -743,7 +743,33 @@ impl SiriusModelBuilder {
             }
             model.activities.retain(|id, _| !invalid.contains(id));
         }
-        crate::presentation::project_preparation_lanes(&mut model, &self.activity_tracks)?;
+        for activity in model.activities.values() {
+            let track = self
+                .activity_tracks
+                .get_mut(&activity.track_id())
+                .filter(|track| track.parent_id() == Some(activity.query_id()))
+                .ok_or_else(|| {
+                    AnalyzerError::Validation(
+                        "query activity has no matching query resource".into(),
+                    )
+                })?;
+            track.include(activity.earliest_timestamp(), activity.latest_timestamp());
+        }
+        model.activity_tracks = self
+            .activity_tracks
+            .into_iter()
+            .filter(|(_, track)| {
+                track
+                    .parent_id()
+                    .is_some_and(|id| model.queries.contains_key(&id))
+            })
+            .collect();
+        model
+            .resource_types
+            .get_mut("query_activity_track")
+            .unwrap()
+            .used_by
+            .insert(sirius_telemetry_store::QueryActivityEvent::TYPE_NAME.into());
 
         for (task_id, task_builder) in self.tasks {
             let task = match Task::from_builder(task_builder) {

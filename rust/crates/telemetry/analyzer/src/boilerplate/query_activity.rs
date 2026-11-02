@@ -7,40 +7,18 @@ use quent_ui::{
     fsm::{FsmTypeDecl, FsmTypeDeclaration},
 };
 
-pub(crate) struct QueryActivityBuilder {
-    fsm: AnalyzedFsmBuilder<schema::QueryActivityEvent>,
-    source_track: Option<Uuid>,
-}
-impl QueryActivityBuilder {
-    pub(crate) fn try_new(id: Uuid) -> AnalyzerResult<Self> {
-        Ok(Self {
-            fsm: AnalyzedFsmBuilder::try_new(id)?,
-            source_track: None,
-        })
-    }
-    pub(crate) fn push_transition(&mut self, mut event: Event<schema::QueryActivityEvent>) {
-        if let Some(source) =
-            crate::presentation::PreparationLane::project_transition(&mut event.data)
-        {
-            self.source_track.get_or_insert(source);
-        }
-        self.fsm.push_transition(event);
-    }
-}
+pub(crate) type QueryActivityBuilder = AnalyzedFsmBuilder<schema::QueryActivityEvent>;
 #[derive(Debug)]
-pub(crate) struct QueryActivity(AnalyzedFsm<schema::QueryActivityEvent>, Uuid);
+pub(crate) struct QueryActivity(AnalyzedFsm<schema::QueryActivityEvent>);
 impl QueryActivity {
     pub(crate) fn from_builder(builder: QueryActivityBuilder) -> AnalyzerResult<Self> {
-        let fsm = builder.fsm.try_build()?;
-        Ok(Self(
-            fsm,
-            builder
-                .source_track
-                .expect("validated activity has a start"),
-        ))
+        Ok(Self(builder.try_build()?))
     }
-    pub(crate) fn source_track_id(&self) -> Uuid {
-        self.1
+    pub(crate) fn track_id(&self) -> Uuid {
+        match self.start() {
+            schema::QueryActivityEvent::Started { track, .. } => track.target,
+            _ => unreachable!(),
+        }
     }
     fn start(&self) -> &schema::QueryActivityEvent {
         &self.0.transitions()[0].data

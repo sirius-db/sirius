@@ -59,6 +59,7 @@ class query_observer {
       context_(std::move(other.context_)),
       handle_(std::exchange(other.handle_, std::nullopt)),
       details_handle_(std::exchange(other.details_handle_, std::nullopt)),
+      activity_track_(std::exchange(other.activity_track_, std::nullopt)),
       metadata_revision_(std::exchange(other.metadata_revision_, 0)),
       finished_(std::exchange(other.finished_, true))
   {
@@ -71,9 +72,11 @@ class query_observer {
       // Release the old handle while its context is still alive.
       handle_.reset();
       details_handle_.reset();
+      activity_track_.reset();
       context_           = std::move(other.context_);
       handle_            = std::exchange(other.handle_, std::nullopt);
       details_handle_    = std::exchange(other.details_handle_, std::nullopt);
+      activity_track_    = std::exchange(other.activity_track_, std::nullopt);
       metadata_revision_ = std::exchange(other.metadata_revision_, 0);
       metadata_          = std::move(other.metadata_);
       phase_             = other.phase_;
@@ -104,14 +107,17 @@ class query_observer {
     if (!context_ || !context_->enabled() || !handle_ || finished_) return {};
     try {
       auto handle = context_->context().query_activity_observer()->handle();
-      auto track  = context_->context().query_activity_track_observer()->handle();
-      track.declaration({.activity_id = handle.id(), .label = phase});
+      if (!activity_track_) {
+        auto track = context_->context().query_activity_track_observer()->handle();
+        track.declaration({.query_id = handle_->id(), .label = "Preparation"});
+        activity_track_.emplace(std::move(track));
+      }
       auto active = std::move(handle)
-                      .started({.query_id            = handle_->id(),
-                                .parent_activity_id  = parent,
-                                .track               = {.target = track.id(), .data = {}},
-                                .phase               = phase,
-                                .kind                = kind,
+                      .started({.query_id           = handle_->id(),
+                                .parent_activity_id = parent,
+                                .track              = {.target = activity_track_->id(), .data = {}},
+                                .phase              = phase,
+                                .kind               = kind,
                                 .planning_generation = metadata_.planning_generation,
                                 .execution_query_id  = metadata_.execution_query_id})
                       .into_dynamic();
@@ -281,6 +287,7 @@ class query_observer {
   std::shared_ptr<const telemetry_context> context_;
   std::optional<quent::DynamicFsmHandle<quent::Query>> handle_;
   std::optional<quent::Handle<quent::QueryDetails>> details_handle_;
+  std::optional<quent::Handle<quent::QueryActivityTrack>> activity_track_;
   uint64_t metadata_revision_ = 0;
   bool finished_              = false;
 };

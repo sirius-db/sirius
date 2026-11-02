@@ -697,9 +697,15 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .map(|s| s.resolve(&self.model))
             .transpose()?;
         if entry.filter.entity_type_name.is_none() {
-            entry.filter.entity_type_name =
-                presentation::PreparationLane::default_entity_type(&self.model, scope.as_ref())
-                    .map(str::to_owned);
+            entry.filter.entity_type_name = scope
+                .as_ref()
+                .filter(|ids| {
+                    !ids.is_empty()
+                        && ids
+                            .iter()
+                            .all(|id| self.model.activity_tracks.contains_key(id))
+                })
+                .map(|_| sirius_telemetry_store::QueryActivityEvent::TYPE_NAME.to_owned());
         }
         let operator_filter = entry.application;
 
