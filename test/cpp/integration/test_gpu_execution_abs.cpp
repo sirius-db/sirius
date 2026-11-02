@@ -116,10 +116,16 @@ TEST_CASE_METHOD(AbsFixture,
   run_ok("CHECKPOINT;");
   for (auto const* column : {"i8", "i16", "i32", "i64"}) {
     CAPTURE(column);
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
     auto const result = con->Query(std::string("SELECT abs(") + column + ") FROM abs_min;");
+    auto const after  = sirius::test::get_transparent_execution_stats(*con);
     REQUIRE(result);
     REQUIRE(result->HasError());
+    REQUIRE(result->GetErrorType() == duckdb::ExceptionType::OUT_OF_RANGE);
+    REQUIRE(result->GetError().find("Out of Range Error") != std::string::npos);
     REQUIRE(result->GetError().find("Overflow on abs") != std::string::npos);
+    // Overflow surfaces directly from GPU execution without triggering a CPU fallback replay.
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
     // Rows that are filtered out do not raise, and NULL is not an overflow.
     compare_gpu_vs_cpu(std::string("SELECT abs(") + column + ") AS a FROM abs_min WHERE " + column +
                        " IS NULL OR " + column + " > 0");

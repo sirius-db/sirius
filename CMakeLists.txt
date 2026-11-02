@@ -49,6 +49,7 @@ include(cmake/sirius-dependencies.cmake)
 add_library(sirius_objects OBJECT)
 add_subdirectory(src)
 
+include(cmake/sirius-nvrtc-device-runtime.cmake)
 include(cmake/sirius-substrait.cmake)
 
 include(cmake/sirius-targets.cmake)

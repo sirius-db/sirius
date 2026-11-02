@@ -2520,7 +2520,7 @@ static void ApplyExpressionEvaluatorStrategy(ClientContext& context,
   if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
       "Invalid expression_evaluator_strategy '%s'. Valid values: materialize, ast_interpret, "
-      "ast_jit",
+      "ast_jit, nvrtc_jit",
       value);
   }
   if (scope == SetScope::GLOBAL)
@@ -3032,8 +3032,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   std::lock_guard log_lock(Config::logging_mutex);
   config.AddExtensionOption(
     "expression_evaluator_strategy",
-    "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
-    "'ast_jit'",
+    "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', 'ast_jit', or "
+    "'nvrtc_jit'",
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
@@ -3042,7 +3042,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "expression_executor_strategy",
     "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
-    "'materialize', 'ast_interpret', or 'ast_jit'",
+    "'materialize', 'ast_interpret', 'ast_jit', or 'nvrtc_jit'",
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionExecutorStrategyDeprecated);

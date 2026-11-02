@@ -36,6 +36,10 @@ bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out)
     out = expression_evaluator_strategy::AST_JIT;
     return true;
   }
+  if (sv == "nvrtc_jit") {
+    out = expression_evaluator_strategy::NVRTC_JIT;
+    return true;
+  }
   return false;
 }
 
@@ -45,6 +49,7 @@ std::string_view strategy_to_string(expression_evaluator_strategy s)
     case expression_evaluator_strategy::MATERIALIZE: return "materialize";
     case expression_evaluator_strategy::AST_INTERPRET: return "ast_interpret";
     case expression_evaluator_strategy::AST_JIT: return "ast_jit";
+    case expression_evaluator_strategy::NVRTC_JIT: return "nvrtc_jit";
   }
   assert(false && "Unrecognized expression_evaluator_strategy");
   __builtin_unreachable();

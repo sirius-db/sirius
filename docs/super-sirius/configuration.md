@@ -802,7 +802,7 @@ leaving the previous sink active.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
+| `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, `ast_jit`, or `nvrtc_jit` (compiles each expression tree into one fused CUDA kernel with NVRTC; see [expression-executor.md](expression-executor.md)) |
 | `enable_regex_jit_impl` | true | Enable the specialized JIT implementation for supported regex patterns |
 
 These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is

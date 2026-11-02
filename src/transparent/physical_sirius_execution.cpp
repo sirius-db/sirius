@@ -19,6 +19,7 @@
 #include "cuda/device_health.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
@@ -26,6 +27,7 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
+#include <duckdb/common/exception.hpp>
 #include <duckdb/execution/executor.hpp>
 #include <duckdb/execution/operator/helper/physical_result_collector.hpp>
 #include <duckdb/execution/operator/helper/physical_result_sink.hpp>
@@ -401,6 +403,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       gpu_error                 = duckdb::ErrorData(e);
       gpu_failed                = true;
       runtime_unavailable_error = true;
+    } catch (sirius::out_of_range_exception const& e) {
+      if (window) window->report_failure(std::current_exception());
+      duckdb::OutOfRangeException out_of_range(e.what());
+      gpu_error  = duckdb::ErrorData(out_of_range);
+      gpu_failed = true;
     } catch (std::exception& e) {
       if (window) window->report_failure(std::current_exception());
       state.sirius_context->get_query_lifecycle_registry().report_failure(std::current_exception());
@@ -438,8 +445,12 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       const std::string gpu_msg = gpu_error.RawMessage();
       SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg);
 
-      // A user interrupt is never a fallback candidate — propagate it as-is.
-      if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
+      // A user interrupt or deterministic out-of-range SQL error is never a
+      // fallback candidate — propagate it directly after window cleanup.
+      if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT ||
+          gpu_error.Type() == duckdb::ExceptionType::OUT_OF_RANGE) {
+        gpu_error.Throw();
+      }
 
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
       // message — the S3 branch below must not rewrite it (S3 has no CPU

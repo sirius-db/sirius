@@ -30,6 +30,23 @@ void read_device_bytes_completed(void* destination,
                                  std::size_t bytes,
                                  ::cuda::stream_ref stream);
 
+/**
+ * @brief Copy @p bytes host bytes at @p source into device memory at @p destination on @p stream.
+ *
+ * Stages through pinned host storage that the calling thread keeps for its lifetime (growing from
+ * 64 KiB up to `pinned_staging_cap_bytes`), waiting for any earlier copy from that storage before
+ * rewriting it, so @p source may be reclaimed as soon as the call returns without blocking the
+ * host on a pageable staging copy. Larger writes copy directly from @p source and wait for
+ * @p stream before returning.
+ *
+ * @throw std::runtime_error carrying the CUDA error string if the copy, the event synchronization,
+ * or the pinned allocation fails
+ */
+void write_device_bytes_async(void* destination,
+                              void const* source,
+                              std::size_t bytes,
+                              ::cuda::stream_ref stream);
+
 /// One device-to-host copy for the batched read_device_bytes_completed().
 struct device_read {
   void* destination;

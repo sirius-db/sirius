@@ -42,7 +42,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
 
   auto const floating = floating_comparison(alt.input->return_type(), alt.lower->return_type()) ||
                         floating_comparison(alt.input->return_type(), alt.upper->return_type());
-  if (floating || (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (floating || (is_cudf_ast_strategy(_policy.strategy) &&
                    (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
     auto input = evaluate_narrow_domain_operand(*alt.input, narrow_carrier, evaluation_mode::AST);
     D_ASSERT(!input.is_scalar());

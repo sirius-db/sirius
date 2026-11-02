@@ -194,6 +194,19 @@ struct node {
   [[nodiscard]] sirius::logical_type return_type() const;
 };
 
+inline sirius::logical_type unary_op::return_type() const
+{
+  switch (op) {
+    case kind::op_not:
+    case kind::op_is_null:
+    case kind::op_is_not_null: return sirius::logical_type::make(sirius::type_id::BOOLEAN);
+    case kind::op_try: return child ? child->return_type() : sirius::logical_type{};
+    default:
+      throw internal_exception("[ast::unary_op::return_type] unknown kind: {}",
+                               static_cast<int>(op));
+  }
+}
+
 // Match the already-bound signature.
 inline std::optional<date_arithmetic_operation> function_call::date_operation() const
 {

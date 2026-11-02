@@ -156,6 +156,12 @@ void KernelCache::clear()
 {
   std::lock_guard<std::mutex> lock(mu_);
   table_.clear();
+  generation_.fetch_add(1, std::memory_order_release);
+}
+
+std::uint64_t KernelCache::generation() const noexcept
+{
+  return generation_.load(std::memory_order_acquire);
 }
 
 }  // namespace codegen::jit

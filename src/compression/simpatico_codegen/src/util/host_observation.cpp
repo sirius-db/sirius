@@ -13,24 +13,34 @@ namespace simpatico {
 
 namespace {
 
-// Pinned storage one thread reuses as the destination of its device-to-host observation copies.
-// Thread-exit destruction may run after the CUDA context is gone, so the destructor ignores the
-// cudaFreeHost result, the convention stream_pool::shutdown follows.
+// Pinned storage one thread reuses for its observation copies. The read and the write path each
+// keep their own thread_local slab (a device-to-host readback never shares storage with a pending
+// host-to-device write). Thread-exit destruction may run after the CUDA context is gone, so the
+// destructor ignores the cudaFreeHost result, the convention stream_pool::shutdown follows.
 class pinned_staging_slab {
  public:
   pinned_staging_slab() = default;
   ~pinned_staging_slab()
   {
+    if (event_) {
+      if (pending_) (void)cudaEventSynchronize(event_);
+      (void)cudaEventDestroy(event_);
+    }
     if (data_) (void)cudaFreeHost(data_);
   }
   pinned_staging_slab(pinned_staging_slab const&)            = delete;
   pinned_staging_slab& operator=(pinned_staging_slab const&) = delete;
 
-  // Storage of at least `bytes`, or nullptr above the cap. It is valid until the next call, which
-  // does not wait for pending copies.
+  // Storage of at least `bytes`, or nullptr above the cap. If a previous host-to-device copy from
+  // this slab is still pending, waits for its recorded event before returning the buffer.
   void* reserve(std::size_t bytes)
   {
     if (bytes > pinned_staging_cap_bytes) return nullptr;
+    if (pending_) {
+      throw_if_cuda_error(cudaEventSynchronize(event_),
+                          "host observation: pinned staging event wait");
+      pending_ = false;
+    }
     if (data_ && bytes <= capacity_) return data_;
     // Allocate before releasing so a failed growth leaves the current slab usable.
     auto const grown =
@@ -44,10 +54,24 @@ class pinned_staging_slab {
     return data_;
   }
 
+  // Record that an asynchronous copy reading this slab was queued on `stream`.
+  void mark_pending(::cuda::stream_ref stream)
+  {
+    if (!event_) {
+      throw_if_cuda_error(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming),
+                          "host observation: pinned staging event create");
+    }
+    throw_if_cuda_error(cudaEventRecord(event_, stream.get()),
+                        "host observation: pinned staging event record");
+    pending_ = true;
+  }
+
  private:
   static constexpr std::size_t initial_bytes = std::size_t{64} << 10;
   void* data_                                = nullptr;
   std::size_t capacity_                      = 0;
+  cudaEvent_t event_                         = nullptr;
+  bool pending_                              = false;
 };
 
 }  // namespace
@@ -96,6 +120,29 @@ void read_device_bytes_completed(std::span<device_read const> reads, ::cuda::str
     // A copy may still be queued into a destination or the staging storage.
     (void)cudaStreamSynchronize(stream.get());
     throw;
+  }
+}
+
+void write_device_bytes_async(void* destination,
+                              void const* source,
+                              std::size_t bytes,
+                              ::cuda::stream_ref stream)
+{
+  if (bytes == 0) return;
+  thread_local pinned_staging_slab slab;
+  void* const staging = slab.reserve(bytes);
+  if (staging) {
+    std::memcpy(staging, source, bytes);
+    throw_if_cuda_error(
+      cudaMemcpyAsync(destination, staging, bytes, cudaMemcpyHostToDevice, stream.get()),
+      "host observation: host-to-device copy");
+    slab.mark_pending(stream);
+  } else {
+    throw_if_cuda_error(
+      cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream.get()),
+      "host observation: unbuffered host-to-device copy");
+    throw_if_cuda_error(cudaStreamSynchronize(stream.get()),
+                        "host observation: unbuffered host-to-device wait");
   }
 }
 

@@ -27,6 +27,8 @@ namespace sirius {
  * AST_INTERPRET: Executes by constructing a cudf::ast::tree and interpreting it with cudf::compute
  *                (monolithic kernel with large switch statement).
  * AST_JIT: Executes by constructing a cudf::ast::tree and compiling it with cudf::compute_jit.
+ * NVRTC_JIT: Executes by compiling Sirius expression trees directly into standalone CUDA
+ *            __global__ kernels via NVRTC.
  *
  * @note Not all expression nodes have cuDF AST equivalents ('AST breakers'), so the AST-based
  * strategies build ASTs for as many nodes as they can before encountering AST breakers. The result
@@ -36,11 +38,18 @@ enum class expression_evaluator_strategy {
   MATERIALIZE,
   AST_INTERPRET,
   AST_JIT,
+  NVRTC_JIT,
 };
+
+[[nodiscard]] constexpr bool is_cudf_ast_strategy(expression_evaluator_strategy strategy) noexcept
+{
+  return strategy == expression_evaluator_strategy::AST_INTERPRET ||
+         strategy == expression_evaluator_strategy::AST_JIT;
+}
 
 /**
  * @brief Parse a string into an expression_evaluator_strategy.
- * Accepts "materialize", "ast_interpret", "ast_jit".
+ * Accepts "materialize", "ast_interpret", "ast_jit", "nvrtc_jit".
  * @return true on success; false on unrecognized input.
  */
 bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out);

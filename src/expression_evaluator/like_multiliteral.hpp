@@ -90,6 +90,11 @@ class like_multiliteral_pattern {
  public:
   /// The literals, in pattern order. Each is 1..max_literal_bytes ASCII bytes.
   [[nodiscard]] std::vector<std::string> const& literals() const noexcept { return _literals; }
+  /// Kernel-side descriptor of the literals (SWAR digram broadcasts and chunked literal words).
+  [[nodiscard]] detail::like_multiliteral_pattern_desc const& descriptor() const noexcept
+  {
+    return _descriptor;
+  }
 
  private:
   explicit like_multiliteral_pattern(std::vector<std::string> literals);

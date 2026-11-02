@@ -140,13 +140,58 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 
 **File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
-The evaluator supports three strategies, selected via `policy.strategy` in the `expression_query_policy` constructor argument:
+The evaluator supports four strategies, selected via `policy.strategy` in the `expression_query_policy` constructor argument:
 
-| Strategy | How it executes | cuDF API |
+| Strategy | How it executes | API |
 |----------|-----------------|----------|
 | `MATERIALIZE` | Materializes intermediate results as `cudf::column`s. Floating comparisons use small interpreted ASTs for NaN semantics; this strategy never selects AST JIT. | `cudf::unary_operation`, `cudf::binary_operation`, `cudf::compute_column` |
 | `AST_INTERPRET` (default) | Builds a `cudf::ast::tree` and interprets it with a single monolithic kernel. | `cudf::compute_column` |
 | `AST_JIT` | Builds a `cudf::ast::tree` and JIT-compiles it into a fused kernel. | `cudf::compute_column_jit` |
+| `NVRTC_JIT` | Compiles the Sirius expression trees directly into one CUDA `__global__` kernel per projection list or filter predicate (see [NVRTC_JIT kernels](#nvrtc_jit-kernels)). | NVRTC via `codegen::jit::KernelCache` |
+
+### NVRTC_JIT kernels
+
+**Files:** `src/expression_evaluator/nvrtc/`. `supportability.cpp` decides what compiles;
+`translation_context.cpp` emits per-row CUDA statements over `(value, valid, overflow)` Register
+Values; `kernel_abi.cpp` derives both the kernel signature and the `cuLaunchKernel` argument
+array from one parameter table; `sink_launch.cpp` compiles, launches and reads status back;
+`project_sink.cpp` and `filter_sink.cpp` wrap the statements in the `ProjectSink` and
+`FilterSink` kernels. The device runtime the kernels are compiled behind lives in
+`device_runtime/*.cuh` (embedded at build time and also compiled by nvcc as a syntax check).
+
+- **Kernel shape.** Blocks of 256 threads process a tile of rows, each thread handling several
+  rows strided by the block width (4 per thread for projections, 16 for filters) so loads and
+  stores stay coalesced and every thread has several memory requests in flight. Full tiles run an
+  unguarded copy of the row body; only the last tile checks `row < num_rows`.
+- **Null masks.** Input validity bits are loaded independently of the payload (a null row's slot
+  still exists). Output validity words come from one `__ballot_sync` per warp and row group; null
+  counts are accumulated per warp in registers and reduced once per block. A column with no
+  nulls in the batch, and any expression over such columns and non-NULL constants, is statically
+  non-null: no mask is allocated and no null count is read back.
+- **Constants** travel as kernel parameters so one compiled kernel serves every literal value;
+  only a constant's NULL-ness is baked into the source. Overflow and the null counts are read
+  back once per evaluation through a pinned staging slab (`read_status_words`), which is the one
+  host synchronization of an evaluation; a projection whose outputs are statically non-null and
+  cannot overflow does not synchronize at all. Binding a string column reads nothing from the
+  device: the end of its characters is derived in-kernel from `offsets[num_rows]`.
+- **Filters** compact survivors in a single pass for a one-tile batch, otherwise in three
+  launches: the predicate kernel writes a survivor count per tile plus the per-warp ballot words,
+  a one-block scan turns the counts into tile offsets, and a scatter kernel writes the surviving
+  row indices in ascending order with coalesced stores. The survivors feed `cudf::gather` (or are
+  returned to late materialization).
+- **Strings** are `str_view{ptr, len, limit}` registers; `limit` bounds word-at-a-time loads.
+  `%lit1%...%litN%` LIKE patterns and `contains` use a SWAR digram matcher (the literal
+  descriptor is a kernel parameter) when the `like_swar_fastpath` setting is on, classified once
+  per query through the evaluator's shared LIKE cache and capped at eight descriptors per kernel;
+  other patterns use a byte-wise backtracking matcher.
+- **Compile time.** The device runtime preamble is self-contained (its own limits, traits,
+  checked 128-bit arithmetic and civil-calendar helpers; no CCCL includes), because parsing
+  `<cuda/std/chrono>` and `<cuda/numeric>` dominated every kernel compile. Compiled kernels are
+  cached in memory and on disk (`SIMPATICO_JIT_CACHE_DIR`). `SIRIUS_NVRTC_DUMP_DIR` writes every
+  generated source for inspection.
+- **Benchmarking.** `sirius_unittest "[expr_bench]"` times a fixed set of projections and
+  filters across all four strategies (see the header of
+  `test/cpp/expression_evaluator/bench_expression_evaluator.cpp`).
 
 ### Tree of AST Trees
 
@@ -169,7 +214,7 @@ Internal to the evaluator, each node is evaluated with either `evaluation_mode::
 The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 
 ```sql
-SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
+SET expression_evaluator_strategy = 'nvrtc_jit';   -- or 'ast_jit', 'ast_interpret', 'materialize'
 ```
 
 ### Policy ownership
@@ -252,7 +297,9 @@ the helpers do not depend on DuckDB types or a frontend identity.
 
 `cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
 columns to microseconds. It checks finite values before multiplying, preserves
-infinity, and truncates nanoseconds toward zero. Overflow raises
+infinity, and rounds nanoseconds to the nearest microsecond with ties away from the
+epoch, as DuckDB's `TryCastTimestampBase` does for every precision decrease (the
+`NVRTC_JIT` kernels apply the same rule to every fine-to-coarse timestamp cast). Overflow raises
 `sirius::invalid_input_exception`; reading the overflow result synchronizes the
 supplied stream. The cast evaluator dispatches to this helper for semantic casts.
 

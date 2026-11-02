@@ -21,6 +21,7 @@
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
+#include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 
 // cudf
 #include "cudf/ast_compat.hpp"
@@ -473,6 +474,46 @@ class expression_evaluator {
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
   std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
+
+  // Materialize a single evaluate_result into an owned cudf::column matching @p expr's declared
+  // return type.
+  std::unique_ptr<cudf::column> materialize_result_column(sirius::ast::node const& expr,
+                                                          evaluate_result result);
+
+  // Pre-evaluated in-tree Materialization Boundaries and the augmented input table view binding
+  // them to synthetic column indices.
+  struct materialized_boundary_state {
+    std::vector<std::unique_ptr<cudf::column>> boundary_cols;
+    std::vector<cudf::column_view> combined_views;
+    std::unordered_map<sirius::ast::node const*, std::uint32_t> boundary_map;
+
+    [[nodiscard]] cudf::table_view combined_table() const noexcept
+    {
+      return cudf::table_view{combined_views};
+    }
+  };
+
+  // Collects and evaluates in-tree Materialization Boundaries for @p expressions, returning
+  // std::nullopt if no boundaries exist.
+  [[nodiscard]] std::optional<materialized_boundary_state> evaluate_materialization_boundaries(
+    std::span<sirius::ast::node const* const> expressions);
+
+  // The boundary map and this evaluator's LIKE policy, as the NVRTC_JIT sinks take them.
+  [[nodiscard]] nvrtc::sink_options nvrtc_sink_options(
+    nvrtc::boundary_column_map const* boundary_map = nullptr);
+
+  // Attempt to evaluate a batch of fixed-width expressions via a single fused NVRTC_JIT kernel,
+  // pre-evaluating any in-tree Materialization Boundaries into synthetic input columns.
+  std::optional<std::unique_ptr<cudf::table>> try_evaluate_nvrtc_with_boundaries(
+    std::span<sirius::ast::node const* const> expressions);
+
+  // Attempt to evaluate a single boolean filter predicate via the NVRTC_JIT FilterSink kernel
+  // (using Sparse-to-Dense Compaction), pre-evaluating any in-tree Materialization Boundaries
+  // into synthetic input columns.
+  std::optional<std::unique_ptr<cudf::table>> try_select_nvrtc_with_boundaries(
+    cudf::table_view input,
+    cudf::table_view projected_input,
+    std::unique_ptr<cudf::column>* out_survivors = nullptr);
 
   // Execute the AST tree rooted at the given expression reference and return the result as a
   // column.

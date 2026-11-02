@@ -18,8 +18,10 @@
 #include "expression_evaluator/comparison_expression.hpp"
 
 #include <expression/ast/node.hpp>
+#include <expression/ast/utils.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <helper/logical_type.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
@@ -45,6 +47,7 @@
 
 // standard library
 #include <algorithm>
+#include <array>
 #include <string>
 #include <variant>
 
@@ -258,13 +261,23 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
                                                evaluation_mode mode)
 {
   if (alt.op == sirius::ast::unary_op::kind::op_try) {
+    sirius::ast::node temp_node{sirius::ast::unary_op{alt.op, sirius::ast::clone(*alt.child)}};
+    std::array<sirius::ast::node const*, 1> exprs{&temp_node};
+    if (nvrtc::can_compile_project_sink(exprs, _input_table)) {
+      auto result =
+        nvrtc::evaluate_project_sink(exprs, _input_table, _stream, _mr, nvrtc_sink_options());
+      _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+      auto col = std::move(result.table->release()[0]);
+      if (mode == evaluation_mode::AST) { return materialize_as_ast_column(std::move(col)); }
+      return evaluate_result(std::move(col));
+    }
     throw not_implemented_exception(
       "[expression_evaluator] evaluate called on an unsupported TRY operator expression.");
   }
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (is_cudf_ast_strategy(_policy.strategy) &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child        = evaluate(*alt.child, evaluation_mode::AST);
     auto build_output = [&](expr_ref const& produced) -> evaluate_result {
@@ -358,11 +371,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   // cuDF contains treats NaNs and signed zeros as equal. Keep its constant-list lookup under
   // MATERIALIZE; the path below also handles NULL list entries and NOT IN. Nonconstant floating
   // lists still need the NaN-aware comparison chain, including when MATERIALIZE is selected.
-  auto const constant_lookup =
-    _policy.strategy == expression_evaluator_strategy::MATERIALIZE && all_constants;
+  auto const constant_lookup = !is_cudf_ast_strategy(_policy.strategy) && all_constants;
   auto const floating = floating_comparison(alt.probe->return_type(), alt.probe->return_type());
   if ((floating && !constant_lookup) ||
-      (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+      (is_cudf_ast_strategy(_policy.strategy) &&
        (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
     D_ASSERT(!alt.values.empty());
 

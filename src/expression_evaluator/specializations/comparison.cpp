@@ -75,7 +75,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
 
   auto const ast_op_count = alt.cudf_ast_op_count();
   auto const floating     = floating_comparison(alt.left->return_type(), alt.right->return_type());
-  if (floating || (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (floating || (is_cudf_ast_strategy(_policy.strategy) &&
                    (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
     auto left  = evaluate_narrow_domain_operand(*alt.left, narrow_carrier, evaluation_mode::AST);
     auto right = evaluate_narrow_domain_operand(*alt.right, narrow_carrier, evaluation_mode::AST);

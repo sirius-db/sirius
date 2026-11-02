@@ -279,7 +279,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (ast_supported && _policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (ast_supported && is_cudf_ast_strategy(_policy.strategy) &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     // Only numeric binary functions are supported in AST currently.
     D_ASSERT(args.size() == 2);
@@ -673,12 +673,12 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
       input = evaluate_result(
         cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
-    // cuDF wraps abs of a signed minimum; fall back so DuckDB raises its overflow error.
+    // cuDF wraps abs of a signed minimum; raise DuckDB's overflow error here rather than replaying
+    // the query on the CPU for it.
     auto const column = input.get_column_view();
     if (holds_signed_minimum(column, _stream, _mr)) {
-      throw not_implemented_exception(
-        "[expression_evaluator:function] abs overflows for the smallest value of a signed "
-        "integer type, expected to fall back to CPU execution");
+      throw out_of_range_exception("Overflow on abs of signed integer minimum ({})",
+                                   cudf::type_to_name(column.type()));
     }
     return evaluate_result(cudf::unary_operation(column, cudf::unary_operator::ABS, _stream, _mr));
   }

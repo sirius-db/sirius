@@ -16,12 +16,14 @@
 
 #include "sirius_interface.hpp"
 
+#include "duckdb/common/exception.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/settings.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
 
@@ -115,6 +117,11 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
   } catch (duckdb::SiriusRuntimeUnavailableException&) {
     // The caller routes this typed error to the transaction-preserving fallback.
     throw;
+  } catch (sirius::out_of_range_exception const& e) {
+    duckdb::OutOfRangeException out_of_range(e.what());
+    duckdb::ErrorData error(out_of_range);
+    sirius_process_error(error, query);
+    return duckdb::make_uniq<duckdb::QueryResult>(std::move(error));
   } catch (std::exception& e) {
     if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state"))
       runtime->get_query_lifecycle_registry().report_failure(std::current_exception(), query_id);

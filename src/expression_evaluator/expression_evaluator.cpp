@@ -20,8 +20,11 @@
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
+#include <expression_evaluator/nvrtc/register_value.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
+#include <telemetry/nvtx.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -37,8 +40,10 @@
 #include <cuda/stream>
 
 // standard library
+#include <array>
 #include <memory>
 #include <numeric>
+#include <unordered_map>
 #include <variant>
 
 namespace {
@@ -274,8 +279,110 @@ void expression_evaluator::release_temporaries(
   }
 }
 
+std::unique_ptr<cudf::column> expression_evaluator::materialize_result_column(
+  sirius::ast::node const& expr, evaluate_result result)
+{
+  if (expr.holds<sirius::ast::reference>()) {
+    // A narrowed reference restores as a view of a column owned by the per-evaluation restoration
+    // cache; an unchanged reference stays a zero-copy view of the input. Copying the view (or
+    // releasing an owned column) gives the output table independent columns.
+    if (result.is_owned_column()) { return result.release_column(); }
+    return std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
+  }
+
+  // Cast the `result` from libcudf to the node's return type if `result` has a different
+  // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
+  // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
+  // STRING/LIST/STRUCT).
+  auto const cudf_return_type = sirius::require_cudf_type(expr.return_type());
+  std::unique_ptr<cudf::column> result_column;
+  if (result.is_scalar()) {
+    result_column =
+      cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr);
+  } else if (result.is_column_view()) {
+    result_column = std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
+  } else {
+    result_column = result.release_column();
+  }
+  if (result_column->type() != cudf_return_type) {
+    // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
+    if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
+      // Final result-type reconciliation is a physical schema restore. The declared output
+      // type provides the provenance needed to restore a narrowed DATE representation.
+      result_column =
+        sirius::cast_through_rep(result_column->view(), cudf_return_type, _stream, _mr);
+    } else {
+      throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
+                               cudf::type_to_name(result_column->type()),
+                               cudf::type_to_name(cudf_return_type));
+    }
+  }
+  return result_column;
+}
+
+std::optional<expression_evaluator::materialized_boundary_state>
+expression_evaluator::evaluate_materialization_boundaries(
+  std::span<sirius::ast::node const* const> expressions)
+{
+  std::vector<sirius::ast::node const*> boundaries;
+  nvrtc::collect_materialization_boundaries(expressions, _input_table, boundaries);
+  if (boundaries.empty()) { return std::nullopt; }
+
+  materialized_boundary_state state;
+  state.boundary_cols.reserve(boundaries.size());
+  state.combined_views.reserve(_input_table.num_columns() + boundaries.size());
+  for (cudf::size_type c = 0; c < _input_table.num_columns(); ++c) {
+    state.combined_views.push_back(_input_table.column(c));
+  }
+
+  state.boundary_map.reserve(boundaries.size());
+  for (auto const* bnode : boundaries) {
+    auto b_res         = evaluate(*bnode, evaluation_mode::MATERIALIZE);
+    auto b_col         = materialize_result_column(*bnode, std::move(b_res));
+    auto const syn_idx = static_cast<std::uint32_t>(state.combined_views.size());
+    state.combined_views.push_back(b_col->view());
+    state.boundary_cols.push_back(std::move(b_col));
+    state.boundary_map.emplace(bnode, syn_idx);
+  }
+  return state;
+}
+
+std::optional<std::unique_ptr<cudf::table>>
+expression_evaluator::try_evaluate_nvrtc_with_boundaries(
+  std::span<sirius::ast::node const* const> expressions)
+{
+  if (expressions.empty()) { return std::nullopt; }
+  if (nvrtc::can_compile_project_sink(expressions, _input_table)) {
+    auto result =
+      nvrtc::evaluate_project_sink(expressions, _input_table, _stream, _mr, nvrtc_sink_options());
+    _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+    return std::move(result.table);
+  }
+
+  auto state = evaluate_materialization_boundaries(expressions);
+  if (!state) { return std::nullopt; }
+
+  auto const combined_table = state->combined_table();
+  if (!nvrtc::can_compile_project_sink(expressions, combined_table, &state->boundary_map)) {
+    return std::nullopt;
+  }
+  auto result = nvrtc::evaluate_project_sink(
+    expressions, combined_table, _stream, _mr, nvrtc_sink_options(&state->boundary_map));
+  _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+  return std::move(result.table);
+}
+
+nvrtc::sink_options expression_evaluator::nvrtc_sink_options(
+  nvrtc::boundary_column_map const* boundary_map)
+{
+  return nvrtc::sink_options{boundary_map, _like_swar_fastpath, [this](std::string_view pattern) {
+                               return get_or_classify_like(pattern);
+                             }};
+}
+
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
 {
+  nvtx_scoped_range nvtx_range{"expression_evaluator::evaluate"};
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
 
@@ -293,53 +400,6 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // Get the table_view from the input_batch
   _input_table = std::move(input);
 
-  // Per-result column post-processing. The node's kind and result type are read
-  // natively from the Sirius AST (no DuckDB round-trip).
-  auto post_process = [this](sirius::ast::node const& expr, evaluate_result result) {
-    if (expr.holds<sirius::ast::reference>()) {
-      // A narrowed reference restores as a view of a column owned by the per-evaluation restoration
-      // cache; an unchanged reference stays a zero-copy view of the input. Copying the view (or
-      // releasing an owned column) gives the output table independent columns.
-      if (result.is_owned_column()) {
-        _output_columns.push_back(result.release_column());
-      } else {
-        _output_columns.push_back(
-          std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
-      }
-    } else {
-      // Cast the `result` from libcudf to the node's return type if `result` has a different
-      // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
-      // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
-      // STRING/LIST/STRUCT).
-      auto const cudf_return_type = sirius::require_cudf_type(expr.return_type());
-      std::unique_ptr<cudf::column> result_column;
-      if (result.is_scalar()) {
-        result_column =
-          cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr);
-      } else if (result.is_column_view()) {
-        result_column = std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
-      } else {
-        result_column = result.release_column();
-      }
-      if (result_column->type() != cudf_return_type) {
-        // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
-        if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
-          // Final result-type reconciliation is a physical schema restore. The declared output
-          // type provides the provenance needed to restore a narrowed DATE representation.
-          result_column =
-            sirius::cast_through_rep(result_column->view(), cudf_return_type, _stream, _mr);
-        } else {
-          throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
-                                   cudf::type_to_name(result_column->type()),
-                                   cudf::type_to_name(cudf_return_type));
-        }
-      }
-      _output_columns.push_back(std::move(result_column));
-    }
-  };
-
-  // Iterate _ast_expressions and route through the std::visit dispatcher, then
-  // post-process each result using the node's native kind + return type.
   for (auto const* ast_expr : _ast_expressions) {
     if (!ast_expr) {
       // This is a Sirius bug, not a user error: a null slot means from_duckdb
@@ -352,11 +412,110 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
         "from_duckdb returned nullptr for an unsupported expression; "
         "cannot evaluate on GPU");
     }
-    auto result = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
-    post_process(*ast_expr, std::move(result));
   }
 
+  //===----------NVRTC_JIT mode----------===//
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
+    if (auto table = try_evaluate_nvrtc_with_boundaries(_ast_expressions)) {
+      _temp_scalars.clear();
+      _temp_columns.clear();
+      return std::move(*table);
+    }
+
+    // Mixed projection list (e.g. top-level VARCHAR / STRUCT expressions alongside fixed-width
+    // compilable expressions): batch all fixed-width compilable root expressions into one fused
+    // NVRTC_JIT kernel and evaluate the remaining root expressions through the materialized path.
+    std::vector<sirius::ast::node const*> compilable_exprs;
+    std::vector<std::size_t> compilable_indices;
+    for (std::size_t i = 0; i < _ast_expressions.size(); ++i) {
+      auto const* expr          = _ast_expressions[i];
+      auto const opt_type       = sirius::get_cudf_type(expr->return_type());
+      bool const is_untyped_ref = expr->holds<sirius::ast::reference>() &&
+                                  (expr->return_type().id() == sirius::type_id::INVALID ||
+                                   expr->return_type().id() == sirius::type_id::SQLNULL);
+      if ((opt_type && nvrtc::is_supported_fixed_width(*opt_type)) || is_untyped_ref) {
+        compilable_exprs.push_back(expr);
+        compilable_indices.push_back(i);
+      }
+    }
+
+    if (!compilable_exprs.empty() && compilable_exprs.size() < _ast_expressions.size()) {
+      if (auto compiled_table = try_evaluate_nvrtc_with_boundaries(compilable_exprs)) {
+        _output_columns.resize(_ast_expressions.size());
+        auto compiled_cols = (*compiled_table)->release();
+        for (std::size_t k = 0; k < compilable_indices.size(); ++k) {
+          _output_columns[compilable_indices[k]] = std::move(compiled_cols[k]);
+        }
+        for (std::size_t i = 0; i < _ast_expressions.size(); ++i) {
+          if (_output_columns[i]) { continue; }
+          auto result        = evaluate(*_ast_expressions[i], evaluation_mode::MATERIALIZE);
+          _output_columns[i] = materialize_result_column(*_ast_expressions[i], std::move(result));
+        }
+        _temp_scalars.clear();
+        _temp_columns.clear();
+        return std::make_unique<cudf::table>(std::move(_output_columns));
+      }
+    }
+  }
+
+  // Iterate _ast_expressions and route through the std::visit dispatcher, then
+  // post-process each result using the node's native kind + return type.
+  for (auto const* ast_expr : _ast_expressions) {
+    auto result = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
+    _output_columns.push_back(materialize_result_column(*ast_expr, std::move(result)));
+  }
+
+  _temp_scalars.clear();
+  _temp_columns.clear();
   return std::make_unique<cudf::table>(std::move(_output_columns));
+}
+
+std::optional<std::unique_ptr<cudf::table>> expression_evaluator::try_select_nvrtc_with_boundaries(
+  cudf::table_view input,
+  cudf::table_view projected_input,
+  std::unique_ptr<cudf::column>* out_survivors)
+{
+  D_ASSERT(_ast_expressions.size() == 1);
+  D_ASSERT(_ast_expressions[0] != nullptr);
+  D_ASSERT(_ast_expressions[0]->return_type().id() == sirius::type_id::BOOLEAN);
+
+  _restored_reference_cache.clear();
+  _restored_reference_cast_count  = 0;
+  _narrow_domain_comparison_count = 0;
+  _ast_tree                       = cudf::ast::tree{};
+  _temp_scalars.clear();
+  _temp_columns.clear();
+  _input_table = input;
+
+  auto const* pred  = _ast_expressions[0];
+  auto const finish = [&](nvrtc::filter_sink_result result) {
+    _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+    if (out_survivors != nullptr) { *out_survivors = std::move(result.survivors); }
+    _temp_scalars.clear();
+    _temp_columns.clear();
+    return std::move(result.table);
+  };
+  bool const want_survivors = out_survivors != nullptr;
+  if (nvrtc::can_compile_filter_sink(*pred, _input_table)) {
+    return finish(nvrtc::evaluate_filter_sink(
+      *pred, _input_table, projected_input, want_survivors, _stream, _mr, nvrtc_sink_options()));
+  }
+
+  std::array<sirius::ast::node const*, 1> const pred_span{pred};
+  auto state = evaluate_materialization_boundaries(pred_span);
+  if (!state) { return std::nullopt; }
+
+  auto const combined_table = state->combined_table();
+  if (!nvrtc::can_compile_filter_sink(*pred, combined_table, &state->boundary_map)) {
+    return std::nullopt;
+  }
+  return finish(nvrtc::evaluate_filter_sink(*pred,
+                                            combined_table,
+                                            projected_input,
+                                            want_survivors,
+                                            _stream,
+                                            _mr,
+                                            nvrtc_sink_options(&state->boundary_map)));
 }
 
 std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_view input)
@@ -371,6 +530,7 @@ std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_vie
 std::unique_ptr<cudf::table> expression_evaluator::select(
   cudf::table_view input, std::span<cudf::size_type const> output_indices)
 {
+  nvtx_scoped_range nvtx_range{"expression_evaluator::select"};
   // A cuDF table with zero columns cannot carry a row count, so a pure-filter result with no
   // output columns (e.g. count(*) over a filtered scan) is unrepresentable here. Such callers
   // must use the all-columns select() overload so the surviving row count is preserved.
@@ -379,9 +539,14 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "[expression_evaluator] select(): output_indices must be non-empty; use the "
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
+  auto const projected_input = input.select(output_indices.begin(), output_indices.end());
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
+    if (auto out = try_select_nvrtc_with_boundaries(input, projected_input, nullptr)) {
+      return std::move(*out);
+    }
+  }
   auto mask = compute_mask(input);
-  return sirius::apply_retention_mask(
-    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+  return sirius::apply_retention_mask(projected_input, mask->view(), _stream, _mr);
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
@@ -393,11 +558,16 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
     throw internal_exception(
       "[expression_evaluator] select_with_survivors(): output_indices must be non-empty");
   }
+  auto const projected_input = input.select(output_indices.begin(), output_indices.end());
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
+    if (auto out = try_select_nvrtc_with_boundaries(input, projected_input, &survivors)) {
+      return std::move(*out);
+    }
+  }
   // ONE mask, used twice: the survivors must be exactly the rows the output
   // holds, so computing the predicate a second time would risk two answers.
   auto mask     = compute_mask(input);
-  auto selected = sirius::apply_retention_mask(
-    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+  auto selected = sirius::apply_retention_mask(projected_input, mask->view(), _stream, _mr);
 
   auto const rows = input.num_rows();
   auto positions  = cudf::sequence(rows,
@@ -413,6 +583,12 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
 
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
+  nvtx_scoped_range nvtx_range{"expression_evaluator::select"};
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
+    if (auto out = try_select_nvrtc_with_boundaries(input, input, nullptr)) {
+      return std::move(*out);
+    }
+  }
   auto mask = compute_mask(input);
   return sirius::apply_retention_mask(input, mask->view(), _stream, _mr);
 }
@@ -427,6 +603,15 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*e
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::node const& expr, evaluation_mode mode)
 {
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT &&
+      mode == evaluation_mode::MATERIALIZE && !expr.holds<sirius::ast::reference>() &&
+      !expr.holds<sirius::ast::constant>()) {
+    std::array<sirius::ast::node const*, 1> single_expr{&expr};
+    if (auto table = try_evaluate_nvrtc_with_boundaries(single_expr)) {
+      return evaluate_result(std::move((*table)->release()[0]));
+    }
+  }
+
   // Every sirius::ast alternative has a matching private evaluate(alt, mode)
   // overload, so overload resolution enforces dispatch completeness at compile
   // time (a new alternative without an overload fails to compile here).
