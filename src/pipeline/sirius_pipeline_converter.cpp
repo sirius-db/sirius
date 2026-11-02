@@ -62,11 +62,10 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   compute_repository_wiring(root_pipeline.get_state());
   setup_pipeline_parents();
   finalize_pipeline_structure();
-  link_join_partition_siblings();
   configure_partition_consumers();
   restrict_dynamic_filter_replicas();
-  // Must run after finalize_pipeline_structure (populates `dependencies`) and after
-  // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
+  // Dependencies are complete after finalize_pipeline_structure; input roles were bound by
+  // planning.
   reorder_pipelines_topologically(scheduled_);
 
   // Number the operators now that the pipeline set is final and topologically ordered. This is
@@ -337,8 +336,7 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
   // parent->dependency population.
   for (const auto& pipeline : scheduled_) {
     // For each parent pipeline, add the current pipeline to its dependencies. Join
-    // dependencies must end up build-side-first: link_join_partition_siblings() reads
-    // dependencies[0]/[1] positionally, and reorder_pipelines_topologically() visits
+    // dependencies must end up build-side-first: reorder_pipelines_topologically() visits
     // producers in slot order — build-first is what schedules a join's dynamic-filter
     // publication before the probe-side scans it prunes. The meta-sweep emits
     // probe-first, so build concats are inserted at the front instead.
@@ -354,73 +352,6 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
         locked_parent->dependencies.insert(locked_parent->dependencies.begin(), pipeline);
       } else {
         locked_parent->dependencies.push_back(pipeline);
-      }
-    }
-  }
-}
-
-void sirius_pipeline_converter::link_join_partition_siblings()
-{
-  for (const auto& pipeline : scheduled_) {
-    // DENSE_COUNT_JOIN feeds from bare PARTITIONs with no CONCAT between, so its dependencies are
-    // the partition pipelines directly. Sides are identified by is_build_partition() rather than
-    // by dependency position: dependency order follows build_pipelines' child order, which is not
-    // the same for this operator as for the joins below.
-    if (pipeline->source->type == op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
-      if (pipeline->dependencies.size() != 2) { continue; }
-      auto* first  = pipeline->dependencies[0]->get_sink().get();
-      auto* second = pipeline->dependencies[1]->get_sink().get();
-      if (first == nullptr || second == nullptr ||
-          first->type != op::SiriusPhysicalOperatorType::PARTITION ||
-          second->type != op::SiriusPhysicalOperatorType::PARTITION) {
-        continue;
-      }
-      auto& first_partition  = first->Cast<op::sirius_physical_partition>();
-      auto& second_partition = second->Cast<op::sirius_physical_partition>();
-      // Exactly one side is the build (preserved) side; it drives the partition count.
-      D_ASSERT(first_partition.is_build_partition() != second_partition.is_build_partition());
-      first_partition.set_sibling_partition_op(&second_partition);
-      second_partition.set_sibling_partition_op(&first_partition);
-      continue;
-    }
-    // Both join types use the same CONCAT/PARTITION wrap. Probe input is PARTIAL except for
-    // right-family hash joins whose complete probe drives partition sizing; RIGHT_DELIM_JOIN
-    // inner joins use their build side instead.
-    if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
-        pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-      auto build_concat_pipeline    = pipeline->dependencies[0];
-      auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
-      auto probe_concat_pipeline    = pipeline->dependencies[1];
-      auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
-      // Positional roles are guaranteed by finalize_pipeline_structure() (tree path) /
-      // emission order (legacy). A swap here mislinks sibling partitions and, for
-      // right-family joins, drives_partition_count.
-      D_ASSERT(build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
-               pipeline->source->input_port_for(*build_concat_pipeline->get_sink()) == "build");
-      bool const inner_join_of_rdj =
-        pipeline->source->get_parent_op() != nullptr &&
-        pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
-      // Right-family sizing applies to hash joins only — NLJ probe partitions always stream.
-      bool const probe_drives_partition_count =
-        pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN &&
-        pipeline->source->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-        !inner_join_of_rdj;
-
-      // partition pipeline only has one operator, so sink and source are the same
-      auto& build_partition_op =
-        build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-      auto& probe_partition_op =
-        probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-      build_partition_op.set_join_concat(
-        &build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>());
-      probe_partition_op.set_join_concat(
-        &probe_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>());
-      D_ASSERT(pipeline->source->input_port_for(*probe_concat_pipeline->get_sink()) == "default");
-      build_partition_op.set_sibling_partition_op(&probe_partition_op);
-      probe_partition_op.set_sibling_partition_op(&build_partition_op);
-      if (probe_drives_partition_count) {
-        build_partition_op.set_drives_partition_count(false);
-        probe_partition_op.set_drives_partition_count(true);
       }
     }
   }
@@ -481,9 +412,6 @@ void sirius_pipeline_converter::configure_partition_consumers()
     auto source = pipe->get_source();
     if (sink) set_ids(sink.get());
     if (source) set_ids(source.get());
-    if (sink && sink->type == op::SiriusPhysicalOperatorType::PARTITION) {
-      set_ids(sink->Cast<op::sirius_physical_partition>().get_downstream_consumer_op());
-    }
   }
   // Sub-operators that emit or receive through a wiring without being a pipeline boundary (build
   // CONCATs, delim-join internals), resolved the way materialize_repository_wiring resolves them.

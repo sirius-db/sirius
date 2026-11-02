@@ -59,7 +59,7 @@ uint64_t process_peak_host_kib()
 }  // namespace
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R2a certification cost on ten thousand borrowed Parquet files",
+                 "Certification cost on ten thousand borrowed Parquet files",
                  "[.][integration][scan][certificate][cost]")
 {
   // The production path must not perform test-setting lookups when the test

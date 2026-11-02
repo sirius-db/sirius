@@ -131,7 +131,7 @@ compressed_host_representation::compressed_host_representation(
 // ── idata_representation interface ───────────────────────────────────────────
 
 std::unique_ptr<cucascade::idata_representation> compressed_host_representation::clone(
-  ::cuda::stream_ref /*stream*/)
+  ::cuda::stream_ref /*stream*/) const
 {
   // Share the same backing blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_host_representation>(
@@ -205,18 +205,15 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
   auto const [compressed, uncompressed] = projected_bytes(
     absolute, _column_sizes, _column_names.size(), _compressed_bytes, _uncompressed_bytes);
 
-  // const_cast is safe: select_columns is logically const (it creates a
-  // projection sharing the same blob) but the base-class constructor requires
-  // a non-const memory_space& — the underlying object is non-const.
-  return std::unique_ptr<compressed_host_representation>(new compressed_host_representation(
-    const_cast<cucascade::memory::memory_space&>(get_memory_space()),
-    _blob,
-    _column_names,
-    compressed,
-    uncompressed,
-    _num_rows,
-    std::move(absolute),
-    _column_sizes));
+  return std::unique_ptr<compressed_host_representation>(
+    new compressed_host_representation(get_memory_space(),
+                                       _blob,
+                                       _column_names,
+                                       compressed,
+                                       uncompressed,
+                                       _num_rows,
+                                       std::move(absolute),
+                                       _column_sizes));
 }
 
 // ── compressed_device_representation ─────────────────────────────────────────
@@ -299,7 +296,7 @@ const simpatico::compressed_table& compressed_device_representation::table() con
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(
-  ::cuda::stream_ref /*stream*/)
+  ::cuda::stream_ref /*stream*/) const
 {
   // Share the same cached blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_device_representation>(
@@ -325,18 +322,15 @@ std::unique_ptr<compressed_device_representation> compressed_device_representati
   auto const [compressed, uncompressed] = projected_bytes(
     absolute, _column_sizes, _column_names.size(), _compressed_bytes, _uncompressed_bytes);
 
-  // const_cast is safe: select_columns is logically const (it creates a
-  // projection sharing the same blob) but the base-class constructor requires
-  // a non-const memory_space& — the underlying object is non-const.
-  return std::unique_ptr<compressed_device_representation>(new compressed_device_representation(
-    const_cast<cucascade::memory::memory_space&>(get_memory_space()),
-    _blob,
-    _column_names,
-    compressed,
-    uncompressed,
-    _num_rows,
-    std::move(absolute),
-    _column_sizes));
+  return std::unique_ptr<compressed_device_representation>(
+    new compressed_device_representation(get_memory_space(),
+                                         _blob,
+                                         _column_names,
+                                         compressed,
+                                         uncompressed,
+                                         _num_rows,
+                                         std::move(absolute),
+                                         _column_sizes));
 }
 
 }  // namespace sirius

@@ -262,8 +262,7 @@ std::shared_ptr<codegen::jit::CompiledKernel const> compile_kernel_source(std::s
                                                                           std::string const& source)
 {
   codegen::jit::CompileOptions opts;
-  opts.arch_cc       = cached_arch_cc_for_current_device();
-  opts.device_int128 = true;
+  opts.arch_cc = cached_arch_cc_for_current_device();
   maybe_dump_kernel_source(entry, source);
   try {
     return codegen::jit::KernelCache::instance().get_or_compile_plain(

@@ -47,6 +47,32 @@ __device__ __forceinline__ reg_val<bool> eval_kleene_or(reg_val<bool> acc, reg_v
   return reg_val<bool>{false, false, false};
 }
 
+//===----------FLOATING-POINT COMPARISON----------===//
+// DuckDB orders NaN above every other value, +inf included, and treats all NaNs as equal.
+template <typename T>
+__device__ __forceinline__ bool fp_is_nan(T v)
+{
+  return v != v;
+}
+
+template <typename T>
+__device__ __forceinline__ bool eval_fp_eq(T a, T b)
+{
+  return (fp_is_nan(a) && fp_is_nan(b)) || a == b;
+}
+
+template <typename T>
+__device__ __forceinline__ bool eval_fp_lt(T a, T b)
+{
+  return !fp_is_nan(a) && (fp_is_nan(b) || a < b);
+}
+
+template <typename T>
+__device__ __forceinline__ bool eval_fp_le(T a, T b)
+{
+  return fp_is_nan(b) || (!fp_is_nan(a) && a <= b);
+}
+
 //===----------CHECKED ARITHMETIC----------===//
 template <typename T, typename L, typename R>
 __device__ __forceinline__ reg_val<T> eval_add(reg_val<L> l, reg_val<R> r)
@@ -188,6 +214,19 @@ __device__ __forceinline__ reg_val<T> eval_mod(reg_val<L> l, reg_val<R> r)
       if (lv == limits<T>::lowest() && rv == T{-1}) { return reg_val<T>{T{0}, true, false}; }
     }
     return reg_val<T>{static_cast<T>(lv % rv), true, false};
+  }
+}
+
+template <typename T, typename InT>
+__device__ __forceinline__ reg_val<T> eval_negate(reg_val<InT> in)
+{
+  if (!in.valid || in.overflow) { return reg_val<T>{T{}, in.valid, in.overflow}; }
+  T const v = static_cast<T>(in.val);
+  if constexpr (is_floating_point_v<T>) {
+    return reg_val<T>{-v, true, false};
+  } else {
+    if (v == limits<T>::lowest()) { return reg_val<T>{T{}, true, true}; }
+    return reg_val<T>{static_cast<T>(-v), true, false};
   }
 }
 

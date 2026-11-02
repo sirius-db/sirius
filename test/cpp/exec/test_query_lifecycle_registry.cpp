@@ -527,6 +527,62 @@ TEST_CASE("query resources survive their engine and cannot retire while borrowed
   CHECK(destroyed);
 }
 
+TEST_CASE("query diagnostics survive retirement without retaining work",
+          "[query_lifecycle_gate][concurrency]")
+{
+  query_lifecycle_registry registry;
+  auto id = make_query_id(42);
+  registry.open_query(id);
+  auto wait     = registry.begin_memory_wait(id);
+  auto snapshot = registry.diagnostics();
+  REQUIRE(snapshot.size() == 1);
+  CHECK(snapshot[0].memory_waiters == 1);
+  CHECK(snapshot[0].first_memory_wait >= snapshot[0].admitted);
+  registry.record_error(id, std::make_exception_ptr(std::runtime_error("first failure")));
+  registry.record_error(id, std::make_exception_ptr(std::runtime_error("second failure")));
+  wait.reset();
+  registry.quiesce(id);
+  registry.close(id);
+  snapshot = registry.diagnostics();
+  REQUIRE(snapshot.size() == 1);
+  CHECK(snapshot[0].error == "first failure");
+  CHECK(snapshot[0].memory_waiters == 0);
+  CHECK(snapshot[0].completed >= snapshot[0].retiring);
+  CHECK(registry.completed_count() == 1);
+  CHECK(registry.size() == 0);
+  for (unsigned i = 100; i < 300; ++i) {
+    registry.open_query(make_query_id(i));
+    registry.close(make_query_id(i));
+  }
+  CHECK(registry.diagnostics().size() == 128);
+  CHECK(registry.completed_count() == 201);
+}
+
+TEST_CASE("failed runtime closes existing publishers and refuses late initialization",
+          "[query_lifecycle_gate][device_health]")
+{
+  query_lifecycle_registry registry;
+  registry.open_query(make_query_id(1));
+  auto already_publishing = registry.try_begin_submission(make_query_id(1));
+  registry.open_query(make_query_id(2));
+  CHECK_FALSE(registry.report_failure(
+    std::make_exception_ptr(std::runtime_error("SQL literal cudaErrorUnknown")), make_query_id(1)));
+  CHECK_FALSE(registry.runtime_failed());
+  CHECK(registry.accepts_work(make_query_id(1)));
+  CHECK(registry.accepts_work(make_query_id(2)));
+  auto fatal = std::make_exception_ptr(cudf::cuda_error("device failed", cudaErrorIllegalAddress));
+  CHECK(registry.report_failure(fatal, make_query_id(1)));
+  CHECK(registry.report_failure(fatal));  // Idempotent; also works without a query owner.
+  CHECK_FALSE(registry.accepts_work(make_query_id(2)));
+  CHECK_FALSE(registry.try_begin_submission(make_query_id(1)));
+  CHECK_THROWS_AS(registry.open_query(make_query_id(3)),
+                  query_lifecycle_registry::runtime_unavailable_error);
+  already_publishing.finish();
+  registry.wait_for_work(make_query_id(1));
+  registry.close(make_query_id(1));
+  CHECK(registry.runtime_failed());
+}
+
 TEST_CASE("retaining query resources requires registration", "[query_lifecycle_gate]")
 {
   sirius::exec::query_lifecycle_registry registry;
@@ -552,4 +608,65 @@ TEST_CASE("retaining null resources fails without consuming registration", "[que
   registry.release_resources(q);
   REQUIRE(owner.use_count() == 1);
   registry.close(q);
+}
+
+TEST_CASE("a health poll cannot replace the originating query error",
+          "[query_lifecycle_gate][device_health]")
+{
+  query_lifecycle_registry registry;
+  auto id = make_query_id(1);
+  registry.open_query(id);
+  auto poll = std::async(std::launch::async, [&] {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!registry.runtime_failed() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    auto cause = registry.runtime_failure_message();
+    // The completion observer has not run yet. Model the health poll reporting first.
+    registry.report_failure(
+      std::make_exception_ptr(std::runtime_error("runtime unavailable: " + cause)), id);
+    return cause;
+  });
+  auto original =
+    std::make_exception_ptr(cudf::cuda_error("original task failure", cudaErrorIllegalAddress));
+  CHECK(registry.report_failure(original, id));
+  auto cause = poll.get();
+  CHECK(cause.find("cudaErrorIllegalAddress") != std::string::npos);
+  CHECK(cause.find("original task failure") != std::string::npos);
+  registry.record_error(id, original);  // delayed completion observer
+  auto diagnostic = registry.diagnostics();
+  REQUIRE(diagnostic.size() == 1);
+  CHECK(diagnostic.front().error == "original task failure");
+}
+
+TEST_CASE("first fatal runtime cause survives query retirement without retaining resources",
+          "[query_lifecycle_gate][device_health]")
+{
+  query_lifecycle_registry registry;
+  auto id = make_query_id(1);
+  registry.open_query(id);
+  auto ordinary = std::make_exception_ptr(std::runtime_error("earlier query-local failure"));
+  CHECK_FALSE(registry.report_failure(ordinary, id));
+  CHECK(registry.runtime_failure_message().empty());
+
+  struct fatal_with_resource : cudf::cuda_error {
+    std::shared_ptr<int> resource;
+    explicit fatal_with_resource(std::shared_ptr<int> resource)
+      : cudf::cuda_error("background worker failure", cudaErrorIllegalAddress),
+        resource(std::move(resource))
+    {
+    }
+  };
+  auto resource           = std::make_shared<int>(1);
+  std::weak_ptr<int> weak = resource;
+  // No query ID, as with a prefetch worker. No status name in the exception's text.
+  CHECK(registry.report_failure(std::make_exception_ptr(fatal_with_resource(std::move(resource)))));
+  CHECK(weak.expired());
+  auto cause = registry.runtime_failure_message();
+  CHECK(cause == "cudaErrorIllegalAddress: background worker failure");
+  CHECK(registry.report_failure(
+    std::make_exception_ptr(cudf::cuda_error("later fatal failure", cudaErrorUnknown)), id));
+  CHECK(registry.runtime_failure_message() == cause);
+  registry.close(id);
+  CHECK(registry.diagnostics().front().error == "earlier query-local failure");
+  CHECK(registry.runtime_failure_message() == cause);
 }

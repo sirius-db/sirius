@@ -22,7 +22,7 @@ graph TD
 
     GPE -->|"unified GPU scan source"| SM
     GPE -->|"memory reservations"| MRM["sirius_memory_reservation_manager"]
-    GPE -->|"consume/produce"| DRM["shared_data_repository_manager"]
+    GPE -->|"consume/produce"| DRM["data_repository_manager_registry"]
 
     DE["downgrade_executor(s)"] -->|"monitor pressure"| MRM
     DE -->|"move GPU→Host"| DRM
@@ -39,26 +39,32 @@ graph TD
 
 ## Ownership Hierarchy
 
-`SiriusContext` (`src/sirius_context.hpp`) is a `ClientContextState` subclass that owns the lifetime of all Sirius subsystems within a DuckDB connection:
+`SiriusContext` (`src/sirius_context.hpp`) is shared by connections to one DuckDB DatabaseInstance. Connection-local state holds settings and planning captures; each execution owns its engine and query:
 
 ```
 SiriusContext
 ├── sirius_config                       # Configuration (thread counts, memory sizes, operator params)
 ├── sirius_memory_reservation_manager   # GPU/Host/Disk memory management via cuCascade
 ├── small_pinned_host_memory_resource   # Pinned host memory allocator
-├── shared_data_repository_manager      # Central registry of all data repositories
+├── data_repository_manager_registry    # One repository manager per query
+├── query_admission                     # Query/planning/maintenance permits
+├── query_lifecycle_registry            # Publication gates, work leases and retained plans
 ├── task_scheduler                      # Top-level executor (owns the GPU pipeline executors)
 ├── sirius_scan_manager                 # Scan-side preparation + I/O (io_context, prefetch cache, split providers)
 ├── downgrade_executor[]                # Per-memory-space monitors for GPU→Host spilling
 ├── task_creator                        # Creates GPU pipeline tasks based on data availability
-└── query                               # Current query context (pipeline hashmap)
+└── per-query scan/creator state         # Registered and retired by query ID
 ```
 
 Key lifecycle methods on `SiriusContext`:
 - `initialize()` — initializes all subsystems with config
 - `terminate()` — releases all resources
 - `QueryBegin()` / `QueryEnd()` — DuckDB query lifecycle hooks
-- `create_query()` — creates a new query with pipeline metadata
+- `create_query()` — returns an execution-owned query with pipeline metadata
+- `StandaloneQueryScope` — owns admission and query-specific registration/retirement
+
+See [Concurrent queries](concurrent-queries.md) and [Query lifetime](query-lifecycle.md) for
+work ownership, cancellation, and exclusive maintenance.
 
 Scans are not a separate executor. A unified `sirius_gpu_scan_operator` (operator type `GPU_SCAN`) is the pipeline source: it pulls splits from a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible` (parquet or duckdb-native today). The `sirius_scan_manager` prepares this state per query — it builds the per-table ingestible, installs the split connector, drives a `split_provider`, and owns the I/O backends (an `io_context` over io_uring plus optional REST/kvikio paths) and the prefetching cache.
 

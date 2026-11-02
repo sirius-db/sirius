@@ -15,44 +15,55 @@
  */
 
 #pragma once
+#include "exec/invocable.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "op/scan/batch_coalescer.hpp"
-#include "op/sirius_physical_operator.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "scan_manager/native_reader_executor.hpp"
+#include "scan_manager/preparation_claim.hpp"
+#include "scan_manager/preparation_job.hpp"
 #include "scan_manager/preparation_options.hpp"
+#include "scan_manager/preparation_stop_token.hpp"
+#include "scan_manager/split_connector.hpp"
 
 #include <functional>
 #include <stop_token>
 #include <thread>
+#include <type_traits>
+#include <variant>
+#include <vector>
 namespace sirius::scan_manager {
-enum class stop_reason : uint8_t { user_cancel, failure_induced, normal_eos };
 class preparation_coordinator {
  public:
-  struct job {
-    std::function<std::unique_ptr<op::scan::scan_info>()> work;
-    std::shared_ptr<preparation_unit> unit;
-    // Stop-aware work is used by the dispatcher when present. Keep the legacy
-    // no-argument callback for callers that construct jobs directly.
-    std::function<std::unique_ptr<op::scan::scan_info>(std::stop_token)> stop_work;
-  };
+  using job          = preparation_job;
+  using claim_result = preparation_claim<job>;
   struct publication {
-    std::unique_ptr<op::operator_data> input;
-    size_t bytes = 0;
-    // Bound by construct() while it still holds the concrete input type. Runs under the
-    // publication gate before publish, at most once; must not wait for I/O or reenter the gate.
-    std::function<void()> prepare;
+    std::unique_ptr<op::scan::scan_operator_input> input;
+    size_t bytes             = 0;
     size_t preparation_bytes = 0;
   };
+  using execution_domain = preparation_execution_domain;
+  // Control hooks are serialized but may migrate between pool workers. They must not
+  // retain thread-local state, wait for I/O/capacity/dependencies, or synchronously drain.
+  // Claim, construction and close run outside the gate; metadata inspection may run under
+  // it and must not reenter. Gate -> pool/executor is the lock order; wake callbacks from
+  // those executors must release their own bookkeeping locks before acquiring the gate.
   struct source {
     std::shared_ptr<op::scan::batch_coalescer> coalescer;
-    std::function<std::optional<job>()> claim;
-    // Construct without prefetch side effects. Failed inputs are destroyed outside the gate.
+    // Always called by C. Must only claim independent control state, never enter a provider.
+    exec::invocable<claim_result()> try_claim;
+    // Return an input with deferred prefetch; construction runs outside the publication gate.
     std::function<publication(std::unique_ptr<op::scan::scan_info>)> construct;
-    // Keep input owned by the caller on failure so cleanup does not run under the gate.
-    std::function<void(publication&)> publish;
+    // The gate exposes only this concrete queue operation, never arbitrary source hooks.
+    std::shared_ptr<split_connector> destination;
     std::function<void()> close;
-    std::function<void(std::function<void(size_t)>)> bind_consumption;
-    std::function<bool()> can_claim;
+    std::function<void(preparation_wakeup)> bind_wakeup;
+    // query_owner: work and close run on the registering/arming thread. Returned scan_info
+    // must own detached storage; close must release all thread-affine session resources.
+    // native_reader: initialize lazily on the leased executor. Work and close share its
+    // thread. Only detached, independently releasable storage may cross to materialization.
+    execution_domain execution = execution_domain::metadata_worker;
   };
   enum class lifecycle { constructed, armed, running, quiescent };
   struct statistics {
@@ -65,28 +76,50 @@ class preparation_coordinator {
   };
   preparation_coordinator(pipeline::completion_handler&,
                           exec::scoped_dispatcher&,
-                          preparation_options);
+                          preparation_options,
+                          native_reader_executor* native = nullptr,
+                          coordinator_pool* pool         = nullptr);
   ~preparation_coordinator();
   preparation_coordinator(preparation_coordinator const&)            = delete;
   preparation_coordinator& operator=(preparation_coordinator const&) = delete;
   void add_source(source);
+  // Lanes have independent coalescers and credits, but one scan output. Close it after
+  // every lane settles its tail; close_output runs outside the gate, before reader close.
+  void add_sources(std::vector<source>, std::function<void()> close_output = {});
   std::shared_ptr<void> external_use();
   std::shared_ptr<preparation_gate> publication_gate() const;
+  // Called on the coordinator: must be nonblocking and safe across threads.
   void set_interrupt_check(std::function<bool()>);
   void arm();
-  void run_on_query_thread();
+  // Arm selects the driver; start opens its gate after consumers are ready.
+  void start();
+  // On Q: advance metadata-only control work, or run one provider operation/close.
+  // If idle, wait up to idle_wait for progress. External threads only stop/wait.
+  bool advance(std::chrono::milliseconds idle_wait = std::chrono::milliseconds{0});
+  // Close admission/publication and signal running jobs; the control driver retires queues.
   void request_stop(stop_reason) noexcept;
   void drain();
   std::shared_ptr<preparation_unit> admit_unit(unit_key, required_input_set);
   void retire_unit(unit_key);
   std::optional<unit_record> unit_state_snapshot(unit_key) const;
   statistics snapshot() const;
+  void before_thread_for_testing(std::function<void()>);
   void before_submission_for_testing(std::function<void()>);
+  void before_publication_for_testing(std::function<void()>);
+  void before_control_wait_for_testing(std::function<void()>);
+  void fail_next_batch_enqueue_for_testing();
+  void after_publication_for_testing(
+    std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)>);
   void clock_for_testing(std::function<op::scan::batch_coalescer::clock::time_point()>);
   void wake_for_testing();
 
  private:
   struct state;
   std::shared_ptr<state> state_;
+  // Serializes handle creation and joining. The runner never takes this mutex.
+  std::mutex execution_mutex_;
+  std::thread runner_;
+  coordinator_pool* pool_;
+  std::shared_ptr<coordinator_pool::registration> pooled_;
 };
 }  // namespace sirius::scan_manager

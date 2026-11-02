@@ -16,6 +16,7 @@
 
 #pragma once
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "scan_manager/coordinator_pool.hpp"
 #include "transparent/replay_admission.hpp"
 
 #include <bitset>
@@ -29,11 +30,9 @@
 #include <optional>
 #include <string>
 
-namespace sirius::op::scan {
-struct iceberg_delete_set;
-}
 namespace sirius::scan_manager {
-enum class required_input : uint8_t { footer, segments, delete_set, checkpoint_iteration };
+enum class preparation_execution_domain { metadata_worker, query_owner, native_reader };
+enum class required_input : uint8_t { footer, segments, visibility, checkpoint_iteration };
 using required_input_set = std::bitset<4>;
 enum class unit_state : uint8_t { pending, ready, failed, cancelled };
 struct unit_key {
@@ -62,8 +61,8 @@ struct footer_input {
 struct segments_input {
   std::shared_ptr<op::scan::physical_profile_table> profiles;
 };
-struct delete_set_input {
-  std::shared_ptr<op::scan::iceberg_delete_set const> value;
+struct visibility_input {
+  std::shared_ptr<op::scan::prepared_visibility const> value;
 };
 struct checkpoint_input {
   uint64_t iteration;
@@ -72,6 +71,16 @@ struct checkpoint_input {
 struct preparation_gate {
   std::mutex mutex;
   std::condition_variable cv;
+  // Protected by mutex; captures notifications that arrive during unlocked callbacks.
+  uint64_t wake_generation = 0;
+  // Lock order is gate -> pool. This only schedules a step, never executes it inline.
+  coordinator_pool::wakeup pool_wakeup;
+  void notify_under_lock() noexcept
+  {
+    ++wake_generation;
+    cv.notify_all();
+    pool_wakeup();
+  }
   // Bound before arm; callers hold mutex while checking admission or publication.
   std::function<bool()> interrupted;
   void check_interrupted();
@@ -79,6 +88,22 @@ struct preparation_gate {
   size_t callbacks = 0;
   std::function<void(std::exception_ptr)> report_error;
   std::function<void(preparation_failure const&)> report_failure;
+};
+// A resource owner can signal readiness, but cannot install arbitrary cleanup callbacks.
+class preparation_wakeup {
+ public:
+  preparation_wakeup() = default;
+  explicit preparation_wakeup(std::weak_ptr<preparation_gate> gate) : gate_(std::move(gate)) {}
+  void operator()() const noexcept
+  {
+    if (auto gate = gate_.lock()) {
+      std::lock_guard lock(gate->mutex);
+      gate->notify_under_lock();
+    }
+  }
+
+ private:
+  std::weak_ptr<preparation_gate> gate_;
 };
 // The attempt owns registration; workers receive only this unit and independent inputs.
 // Readiness is not publication: the attempt's publication gate is checked separately.
@@ -91,7 +116,7 @@ class preparation_unit {
   required_input_set required() const noexcept { return required_; }
   bool complete_input(footer_input);
   bool complete_input(segments_input);
-  bool complete_input(delete_set_input);
+  bool complete_input(visibility_input);
   bool complete_input(checkpoint_input);
   bool fail(preparation_failure);
   bool cancel();
@@ -109,7 +134,8 @@ class preparation_unit {
   unit_record record_;
   op::scan::split_dependencies deps_;
 };
-// Map only actual dependencies; a connector explicitly contributes delete membership closure.
-required_input_set required_inputs(op::scan::later_check_set const&, bool needs_delete_set);
+// Map only actual dependencies; a connector explicitly contributes its visibility membership
+// closure.
+required_input_set required_inputs(op::scan::later_check_set const&, bool needs_visibility);
 transparent::failure_cause classify_failure(preparation_failure const&);
 }  // namespace sirius::scan_manager

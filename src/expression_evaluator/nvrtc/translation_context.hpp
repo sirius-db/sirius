@@ -28,6 +28,7 @@
 #include <helper/logical_type.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -78,14 +79,20 @@ struct like_pattern_binding {
 };
 
 /**
+ * @brief Classifies a constant LIKE pattern for the SWAR matcher; the evaluator binds its own
+ *        memo over the query-owned @c like_multiliteral_cache so both paths share one lookup.
+ */
+using like_classifier = std::function<like_multiliteral_cache::entry_ptr(std::string_view)>;
+
+/**
  * @brief How constant LIKE / CONTAINS patterns are matched, shared with the materialize path.
  *
- * @c swar_fastpath false makes every pattern take the generic byte-wise matcher. A non-null @c
- * cache classifies each pattern once per query instead of once per evaluation.
+ * @c swar_fastpath false makes every pattern take the generic byte-wise matcher. A non-empty @c
+ * classify classifies each pattern through the caller's memo instead of once per evaluation.
  */
 struct like_policy {
-  bool swar_fastpath{false};                      ///< Honour the `like_swar_fastpath` setting.
-  like_multiliteral_cache const* cache{nullptr};  ///< Optional query-owned classification cache.
+  bool swar_fastpath{false};   ///< Honour the `like_swar_fastpath` setting.
+  like_classifier classify{};  ///< Optional memoized classification shared with the evaluator.
 };
 
 /**

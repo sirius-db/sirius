@@ -16,13 +16,14 @@
 
 #include "sirius_engine.hpp"
 
+#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
-#include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -57,13 +58,12 @@ namespace {
 
 // Walks the live plan rather than the query index: on a failed start the engine never receives
 // the index, while the plan still names every scan whose descriptors must be retired.
-void finish_deferred_preparation(op::sirius_physical_operator const* plan) noexcept
+void finish_scan_preparation(op::sirius_physical_operator const* plan) noexcept
 {
   if (!plan) return;
   planner::for_each_gpu_scan(*plan, [](op::sirius_physical_operator const& source) {
     if (auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&source))
-      if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&scan->get_ingestible()))
-        ice->finish_preparation();
+      scan->get_ingestible().finish_preparation();
   });
 }
 
@@ -152,7 +152,7 @@ sirius_engine::~sirius_engine()
     try {
       runtime->retire_query_work(query_id_,
                                  duckdb::SiriusContext::query_retirement_mode::cancelled);
-      finish_deferred_preparation(sirius_physical_plan.get());
+      finish_scan_preparation(sirius_physical_plan.get());
     } catch (...) {
       // The registry retains the plan if retirement fails. Do not free resources whose
       // borrowers cannot be proved idle; the shutdown path retires them after worker joins.
@@ -172,7 +172,7 @@ void sirius_engine::quiesce_plan_users()
   if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
   }
-  finish_deferred_preparation(sirius_physical_plan.get());
+  finish_scan_preparation(sirius_physical_plan.get());
   plan_users_quiescent_ = true;
 }
 
@@ -266,6 +266,7 @@ void sirius_engine::execute()
   if (!completion_handler_) {
     throw std::logic_error("execution requires a live window completion handler");
   }
+  auto* registry                       = &sirius_ctx->get_query_lifecycle_registry();
   completion_handler_->execution_owner = std::this_thread::get_id();
   auto future                          = completion_handler_->get_awaitable();
 
@@ -282,27 +283,34 @@ void sirius_engine::execute()
                                       },
                                       [&client = context] { return client.IsInterrupted(); });
     sirius_ctx->get_task_scheduler().start_query(*query_);
-    sirius_ctx->get_scan_manager().run_preparation_on_query_thread(query_id_);
+    sirius_ctx->get_scan_manager().start_preparation(query_id_);
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
   }
   try {
-    while (future.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
-      if (context.IsInterrupted()) { throw duckdb::InterruptException(); }
-    }
-    future.get();
+    sirius_ctx->get_scan_manager().await_query_completion(
+      query_id_, future, [&client = context, sirius_ctx] {
+        if (client.IsInterrupted()) return true;
+        if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+          sirius_ctx->throw_runtime_unavailable();
+        return false;
+      });
+    if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+      sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
-    finish_deferred_preparation(sirius_physical_plan.get());
+    finish_scan_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
     quiesce_plan_users();
     throw;
   } catch (...) {
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
     quiesce_plan_users();

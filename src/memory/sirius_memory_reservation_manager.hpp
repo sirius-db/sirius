@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "memory/runtime_stream_pool.hpp"
+
 #include <cuda/memory_resource>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -51,6 +53,7 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
     cucascade::memory::memory_space const& space);
 
  private:
+  std::vector<runtime_stream_pool::registration> runtime_stream_pools_;
   // Previous cuDF device resources, saved in constructor and restored in destructor.
   // Stored as owning any_resource (not as non-owning device_async_resource_ref) because
   // rmm 26.06 moved the per-device resource map to store any_resource by value: calling

@@ -26,6 +26,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace simpatico {
@@ -63,6 +64,11 @@ std::unique_ptr<compressed_representation> make_payload(std::string const& codec
   if (channels[0]->type().id() != cudf::type_id::UINT8) reject(codec + " 'output' must be UINT8");
   auto const* meta = std::get_if<Meta>(&metadata);
   if (!meta) reject(codec + ": missing leaf metadata (uncompressed_size, original_type_id)");
+  if constexpr (std::is_same_v<Meta, leaf_meta::ans> ||
+                std::is_same_v<Meta, leaf_meta::nvcomp_cascaded>) {
+    auto const error = detail::nvcomp_payload_compatibility_error(codec, meta->payload_format);
+    if (!error.empty()) reject(error);
+  }
   auto const type       = cudf::data_type{static_cast<cudf::type_id>(meta->original_type_id)};
   auto const bytes      = meta->uncompressed_size;
   auto const rows       = bytes > 0 && cudf::is_fixed_width(type)
@@ -232,8 +238,13 @@ std::unique_ptr<compressed_representation> reconstruct(std::string const& compre
                                                                     std::move(channels));
     }
     case OpId::Ans:
-      return make_simple_payload<ans_compressed_representation, leaf_meta::ans>(
-        "ans", names, channels, meta);
+      return make_payload<leaf_meta::ans>(
+        "ans", names, channels, meta, [](auto const& ans, auto&&... args) {
+          auto rep =
+            std::make_unique<ans_compressed_representation>(std::forward<decltype(args)>(args)...);
+          rep->payload_format = ans.payload_format;
+          return rep;
+        });
     case OpId::Snappy:
       return make_simple_payload<snappy_compressed_representation, leaf_meta::snappy>(
         "snappy", names, channels, meta);
@@ -256,7 +267,8 @@ std::unique_ptr<compressed_representation> reconstruct(std::string const& compre
             std::forward<decltype(args)>(args)...,
             cascaded.num_deltas,
             cascaded.num_RLEs,
-            cascaded.use_bp);
+            cascaded.use_bp,
+            cascaded.payload_format);
         });
     // The fused ops have no standalone reconstruction; the codegen decode path inverts them.
     case OpId::Bitpack:

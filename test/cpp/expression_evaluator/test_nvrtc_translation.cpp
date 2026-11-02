@@ -231,7 +231,8 @@ TEST_CASE("nvrtc_codegen - the LIKE policy selects the matcher and bounds the de
   SECTION("the shared cache is consulted and classifies a pattern once per query")
   {
     sirius::like_multiliteral_cache cache;
-    sirius::nvrtc::like_policy const policy{true, &cache};
+    sirius::nvrtc::like_policy const policy{
+      true, [&cache](std::string_view pattern) { return cache.get_or_classify(pattern); }};
     for (int i = 0; i < 3; ++i) {
       auto const expr = make_like(sirius::function_id::like, 3, "%special%requests%");
       sirius::nvrtc::translation_context ctx(table.view, nullptr, policy);

@@ -237,11 +237,13 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_e
   }
 
   cudf::table_view combined_table_view(combined_column_views);
-  if (_policy.strategy == expression_evaluator_strategy::AST_INTERPRET) {
-    return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
-  } else {
+  if (_policy.strategy == expression_evaluator_strategy::AST_JIT) {
+    ++_ast_jit_evaluation_count;
     return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
   }
+  // MATERIALIZE uses a small interpreted AST for floating comparison semantics.
+  // Building that AST must not opt a query into the JIT backend.
+  return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::materialize_as_ast_column(
@@ -252,6 +254,14 @@ evaluate_result expression_evaluator::materialize_as_ast_column(
   _temp_columns.push_back(std::move(column));
   auto const& col_ref = _ast_tree.emplace<cudf::ast::column_reference>(col_idx);
   return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
+}
+
+evaluate_result expression_evaluator::evaluate_as_column(sirius::ast::node const& expr)
+{
+  auto result = evaluate(expr, evaluation_mode::MATERIALIZE);
+  if (!result.is_scalar()) { return result; }
+  return evaluate_result(
+    cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
 }
 
 void expression_evaluator::release_temporaries(
@@ -363,9 +373,11 @@ expression_evaluator::try_evaluate_nvrtc_with_boundaries(
 }
 
 nvrtc::sink_options expression_evaluator::nvrtc_sink_options(
-  nvrtc::boundary_column_map const* boundary_map) const noexcept
+  nvrtc::boundary_column_map const* boundary_map)
 {
-  return nvrtc::sink_options{boundary_map, _like_swar_fastpath, _like_cache.get()};
+  return nvrtc::sink_options{boundary_map, _like_swar_fastpath, [this](std::string_view pattern) {
+                               return get_or_classify_like(pattern);
+                             }};
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
@@ -378,6 +390,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // the restored-reference cache over them, and the per-call instrumentation do not carry stale
   // state across calls.
   _restored_reference_cache.clear();
+  _hugeint_reference_bounds.clear();
   _restored_reference_cast_count  = 0;
   _narrow_domain_comparison_count = 0;
   _ast_tree                       = cudf::ast::tree{};

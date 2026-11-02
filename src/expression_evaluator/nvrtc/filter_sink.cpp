@@ -329,7 +329,7 @@ filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
   }
 
   translation_context ctx(
-    input, options.boundary_map, like_policy{options.like_swar_fastpath, options.like_cache});
+    input, options.boundary_map, like_policy{options.like_swar_fastpath, options.classify_like});
   auto const pred_reg = ctx.produce(predicate);
 
   // status_and_counts: [0] = status flags,

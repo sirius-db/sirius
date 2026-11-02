@@ -190,6 +190,13 @@ void for_each_child_node(sirius::ast::node const& expr, Fn&& fn)
       if (cudf::is_fixed_point(ret_type)) { return cudf::is_fixed_point(ct) && ct == ret_type; }
       return is_integer_or_float(ret_type) && ct == ret_type;
     }
+    case sirius::function_id::negate: {
+      if (args.size() != 1) { return false; }
+      auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
+      if (ct != ret_type) { return false; }
+      if (cudf::is_fixed_point(ret_type)) { return true; }
+      return is_integer_or_float(ret_type) && !cudf::is_unsigned(ret_type);
+    }
     case sirius::function_id::round: {
       if (args.size() != 1 && args.size() != 2) { return false; }
       auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);

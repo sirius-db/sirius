@@ -18,8 +18,11 @@
 
 /**
  * @file
- * @brief The @c str_view register, string comparison, lengths, prefix/suffix/contains, the SWAR
- *        multi-literal LIKE matcher, the generic backtracking LIKE matcher, and substring.
+ * @brief The @c str_view register and the string functions: comparison, lengths, prefix/suffix,
+ *        contains, the generic backtracking LIKE matcher, the SWAR multi-literal LIKE matcher, and
+ *        substring. The byte, UTF-8 and word-at-a-time primitives they share come first.
+ *
+ * Fragment 5 of the NVRTC expression evaluator device runtime.
  */
 
 #include "codegen/stdint_shim.hpp"
@@ -33,26 +36,52 @@ struct str_view {
             ///< read the aligned words that overlap [ptr, ptr + len) only up to this bound.
 };
 
-//===----------STRING MATCHING----------===//
-// Mirrors @c sirius::detail::like_multiliteral_{literal,pattern}_desc.
-struct like_literal_desc {
-  uint64_t chunk_val[4];
-  uint64_t chunk_mask[4];
-  uint64_t b0_bcast;
-  uint64_t b1_bcast;
-  int32_t len;
-  int32_t nchunks;
-};
-struct like_pattern_desc {
-  like_literal_desc literals[4];
-  int32_t n;
-  int32_t total_len;
-};
+//===-------------------------------------------------------------------------===//
+// SHARED PRIMITIVES:
+//  - UTF-8 BYTES
+//  - BYTE SEARCH
+//  - SWAR WORDS
+//===-------------------------------------------------------------------------===//
+
+//===----------UTF-8 BYTES----------===//
+/**
+ * @brief Whether @p byte continues a multi-byte UTF-8 code point rather than starting one.
+ */
+__device__ __forceinline__ bool is_utf8_continuation(char byte)
+{
+  return (static_cast<uint8_t>(byte) & 0xC0u) == 0x80u;
+}
+
+__device__ __forceinline__ int32_t next_utf8_char(char const* s, int32_t slen, int32_t pos)
+{
+  int32_t next = pos + 1;
+  while (next < slen && is_utf8_continuation(s[next])) {
+    ++next;
+  }
+  return next;
+}
+
+//===----------BYTE SEARCH----------===//
+__device__ __forceinline__ int32_t find_byte_plain(char const* s,
+                                                   int32_t slen,
+                                                   int32_t start,
+                                                   char target)
+{
+  int32_t pos = start;
+  while (pos < slen && s[pos] != target) {
+    ++pos;
+  }
+  return pos;
+}
+
+//===----------SWAR WORDS----------===//
 __device__ __forceinline__ uint64_t swar_byte_eq_mask(uint64_t x, uint64_t bcast)
 {
   uint64_t const v = x ^ bcast;
   return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;
 }
+
+/// @brief Aligned 8-byte word at @p addr, zero-padded past the allocation bound @p limit.
 __device__ __forceinline__ uint64_t load_bounded_word(uintptr_t addr, uintptr_t limit)
 {
   if (addr + 8U <= limit) { return *reinterpret_cast<uint64_t const*>(addr); }
@@ -63,7 +92,9 @@ __device__ __forceinline__ uint64_t load_bounded_word(uintptr_t addr, uintptr_t 
   return value;
 }
 
-// Unaligned 8-byte window at byte address `p` assembled from two bounded aligned words.
+/**
+ * @brief Unaligned 8-byte window at byte address @p p assembled from two bounded aligned words.
+ */
 __device__ __forceinline__ uint64_t read_window(uintptr_t p, uintptr_t limit)
 {
   uintptr_t const a = p & ~static_cast<uintptr_t>(7u);
@@ -74,167 +105,9 @@ __device__ __forceinline__ uint64_t read_window(uintptr_t p, uintptr_t limit)
   return (lo >> bit_off) | (hi << (64 - bit_off));
 }
 
-// Superset of the byte lanes where the literal's first byte sits at lane k and (len >= 2) its
-// second byte follows; bit 7 of each byte marks a candidate (SWAR false positives are filtered by
-// verification).
-__device__ __forceinline__ uint64_t
-like_candidates(uint64_t cur, uint64_t next, uint64_t b0, uint64_t b1, int32_t len)
-{
-  uint64_t const c1 = swar_byte_eq_mask(cur, b0);
-  if (len == 1) { return c1; }
-  uint64_t const c2  = swar_byte_eq_mask(cur, b1);
-  uint64_t const c2n = swar_byte_eq_mask(next, b1);
-  return c1 & ((c2 >> 8) | (c2n << 56));
-}
-
-// Literal fields are selected with a switch so the kernel parameter is never indexed dynamically
-// (which would force a local-memory copy of the whole descriptor).
-__device__ __forceinline__ like_literal_desc const& like_literal_at(like_pattern_desc const& pat,
-                                                                    int32_t li)
-{
-  switch (li) {
-    case 0: return pat.literals[0];
-    case 1: return pat.literals[1];
-    case 2: return pat.literals[2];
-    default: return pat.literals[3];
-  }
-}
-
-__device__ __forceinline__ bool like_verify(uintptr_t p,
-                                            uintptr_t limit,
-                                            like_literal_desc const& lit)
-{
-#pragma unroll
-  for (int c = 0; c < 4; ++c) {
-    if (c == lit.nchunks) { break; }
-    uint64_t const win = read_window(p + static_cast<uintptr_t>(8 * c), limit);
-    if ((win & lit.chunk_mask[c]) != lit.chunk_val[c]) { return false; }
-  }
-  return true;
-}
-
-// `%lit1%lit2%...%` (and contains = one literal): scan the string one aligned 8-byte word at a
-// time, locating candidate starts of the current literal with SWAR digram masks and verifying them
-// in order. Each literal must start at or after the previous match's end.
-template <bool Invert>
-__device__ __forceinline__ reg_val<bool> eval_like_multiliteral(reg_val<str_view> s,
-                                                                like_pattern_desc const& pat)
-{
-  if (!s.valid || s.overflow) { return reg_val<bool>{false, s.valid, s.overflow}; }
-  bool match = false;
-  if (s.val.len >= pat.total_len) {
-    uintptr_t const start = reinterpret_cast<uintptr_t>(s.val.ptr);
-    uintptr_t const end   = start + static_cast<uintptr_t>(s.val.len);
-    uintptr_t const limit = reinterpret_cast<uintptr_t>(s.val.limit);
-    int32_t li            = 0;
-    uintptr_t min_pos     = start;
-    uint64_t b0           = pat.literals[0].b0_bcast;
-    uint64_t b1           = pat.literals[0].b1_bcast;
-    int32_t len           = pat.literals[0].len;
-    uintptr_t w           = start & ~static_cast<uintptr_t>(7u);
-    uint64_t cur          = load_bounded_word(w, limit);
-    for (; w < end && !match; w += 8u) {
-      uint64_t const next = load_bounded_word(w + 8u, limit);
-      uint64_t cand       = like_candidates(cur, next, b0, b1, len);
-      while (cand != 0ULL) {
-        int const k = __ffsll(static_cast<long long>(cand)) - 1;
-        cand &= cand - 1ULL;
-        uintptr_t const p = w + static_cast<uintptr_t>(k >> 3);
-        if (p < min_pos || p + static_cast<uintptr_t>(len) > end) { continue; }
-        if (!like_verify(p, limit, like_literal_at(pat, li))) { continue; }
-        min_pos = p + static_cast<uintptr_t>(len);
-        ++li;
-        if (li == pat.n) {
-          match = true;
-          break;
-        }
-        like_literal_desc const& nl = like_literal_at(pat, li);
-        b0                          = nl.b0_bcast;
-        b1                          = nl.b1_bcast;
-        len                         = nl.len;
-        cand                        = like_candidates(cur, next, b0, b1, len);
-      }
-      cur = next;
-    }
-  }
-  return reg_val<bool>{match != Invert, true, false};
-}
-
-//===----------STRING COMPARISON----------===//
-__device__ __forceinline__ int str_view_cmp(str_view a, str_view b)
-{
-  int32_t const min_len = a.len < b.len ? a.len : b.len;
-  for (int32_t i = 0; i < min_len; ++i) {
-    uint8_t const ca = static_cast<uint8_t>(a.ptr[i]);
-    uint8_t const cb = static_cast<uint8_t>(b.ptr[i]);
-    if (ca != cb) { return (ca < cb) ? -1 : 1; }
-  }
-  return (a.len < b.len) ? -1 : ((a.len > b.len) ? 1 : 0);
-}
-__device__ __forceinline__ bool operator==(str_view a, str_view b)
-{
-  if (a.len != b.len) { return false; }
-  for (int32_t i = 0; i < a.len; ++i) {
-    if (a.ptr[i] != b.ptr[i]) { return false; }
-  }
-  return true;
-}
-__device__ __forceinline__ bool operator!=(str_view a, str_view b) { return !(a == b); }
-__device__ __forceinline__ bool operator<(str_view a, str_view b) { return str_view_cmp(a, b) < 0; }
-__device__ __forceinline__ bool operator<=(str_view a, str_view b)
-{
-  return str_view_cmp(a, b) <= 0;
-}
-__device__ __forceinline__ bool operator>(str_view a, str_view b) { return str_view_cmp(a, b) > 0; }
-__device__ __forceinline__ bool operator>=(str_view a, str_view b)
-{
-  return str_view_cmp(a, b) >= 0;
-}
-
-//===----------STRING LENGTH----------===//
-template <typename OutT>
-__device__ __forceinline__ reg_val<OutT> eval_strlen(reg_val<str_view> in)
-{
-  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }
-  return reg_val<OutT>{static_cast<OutT>(in.val.len), true, false};
-}
-
-template <typename OutT>
-__device__ __forceinline__ reg_val<OutT> eval_utf8_length(reg_val<str_view> in)
-{
-  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }
-  int32_t count = 0;
-  for (int32_t i = 0; i < in.val.len; ++i) {
-    if ((static_cast<uint8_t>(in.val.ptr[i]) & 0xC0u) != 0x80u) { ++count; }
-  }
-  return reg_val<OutT>{static_cast<OutT>(count), true, false};
-}
-
-__device__ __forceinline__ reg_val<bool> eval_prefix(reg_val<str_view> s, reg_val<str_view> pat)
-{
-  bool const ovf   = s.overflow || pat.overflow;
-  bool const valid = s.valid && pat.valid;
-  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }
-  if (pat.val.len > s.val.len) { return reg_val<bool>{false, true, false}; }
-  for (int32_t i = 0; i < pat.val.len; ++i) {
-    if (s.val.ptr[i] != pat.val.ptr[i]) { return reg_val<bool>{false, true, false}; }
-  }
-  return reg_val<bool>{true, true, false};
-}
-
-__device__ __forceinline__ reg_val<bool> eval_suffix(reg_val<str_view> s, reg_val<str_view> pat)
-{
-  bool const ovf   = s.overflow || pat.overflow;
-  bool const valid = s.valid && pat.valid;
-  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }
-  if (pat.val.len > s.val.len) { return reg_val<bool>{false, true, false}; }
-  int32_t const start = s.val.len - pat.val.len;
-  for (int32_t i = 0; i < pat.val.len; ++i) {
-    if (s.val.ptr[start + i] != pat.val.ptr[i]) { return reg_val<bool>{false, true, false}; }
-  }
-  return reg_val<bool>{true, true, false};
-}
-
+/**
+ * @brief 8-byte window at @p byte_pos of a string, zero-padded past the string's own end.
+ */
 __device__ __forceinline__ uint64_t load_aligned_str_word(char const* base_ptr,
                                                           int32_t total_len,
                                                           int32_t byte_pos)
@@ -288,6 +161,94 @@ __device__ __forceinline__ int32_t find_byte_swar(char const* s,
   return slen;
 }
 
+//===-------------------------------------------------------------------------===//
+// STRING FUNCTIONS:
+//  - COMPARISON
+//  - LENGTH
+//  - PREFIX / SUFFIX
+//  - CONTAINS
+//  - LIKE (GENERIC)
+//  - LIKE (SWAR MULTI-LITERAL)
+//  - SUBSTRING
+//===-------------------------------------------------------------------------===//
+
+//===----------STRING COMPARISON----------===//
+__device__ __forceinline__ int str_view_cmp(str_view a, str_view b)
+{
+  int32_t const min_len = a.len < b.len ? a.len : b.len;
+  for (int32_t i = 0; i < min_len; ++i) {
+    uint8_t const ca = static_cast<uint8_t>(a.ptr[i]);
+    uint8_t const cb = static_cast<uint8_t>(b.ptr[i]);
+    if (ca != cb) { return (ca < cb) ? -1 : 1; }
+  }
+  return (a.len < b.len) ? -1 : ((a.len > b.len) ? 1 : 0);
+}
+__device__ __forceinline__ bool operator==(str_view a, str_view b)
+{
+  if (a.len != b.len) { return false; }
+  for (int32_t i = 0; i < a.len; ++i) {
+    if (a.ptr[i] != b.ptr[i]) { return false; }
+  }
+  return true;
+}
+__device__ __forceinline__ bool operator!=(str_view a, str_view b) { return !(a == b); }
+__device__ __forceinline__ bool operator<(str_view a, str_view b) { return str_view_cmp(a, b) < 0; }
+__device__ __forceinline__ bool operator<=(str_view a, str_view b)
+{
+  return str_view_cmp(a, b) <= 0;
+}
+__device__ __forceinline__ bool operator>(str_view a, str_view b) { return str_view_cmp(a, b) > 0; }
+__device__ __forceinline__ bool operator>=(str_view a, str_view b)
+{
+  return str_view_cmp(a, b) >= 0;
+}
+
+//===----------STRING LENGTH----------===//
+template <typename OutT>
+__device__ __forceinline__ reg_val<OutT> eval_strlen(reg_val<str_view> in)
+{
+  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }
+  return reg_val<OutT>{static_cast<OutT>(in.val.len), true, false};
+}
+
+template <typename OutT>
+__device__ __forceinline__ reg_val<OutT> eval_utf8_length(reg_val<str_view> in)
+{
+  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }
+  int32_t count = 0;
+  for (int32_t i = 0; i < in.val.len; ++i) {
+    if (!is_utf8_continuation(in.val.ptr[i])) { ++count; }
+  }
+  return reg_val<OutT>{static_cast<OutT>(count), true, false};
+}
+
+//===----------PREFIX / SUFFIX----------===//
+__device__ __forceinline__ reg_val<bool> eval_prefix(reg_val<str_view> s, reg_val<str_view> pat)
+{
+  bool const ovf   = s.overflow || pat.overflow;
+  bool const valid = s.valid && pat.valid;
+  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }
+  if (pat.val.len > s.val.len) { return reg_val<bool>{false, true, false}; }
+  for (int32_t i = 0; i < pat.val.len; ++i) {
+    if (s.val.ptr[i] != pat.val.ptr[i]) { return reg_val<bool>{false, true, false}; }
+  }
+  return reg_val<bool>{true, true, false};
+}
+
+__device__ __forceinline__ reg_val<bool> eval_suffix(reg_val<str_view> s, reg_val<str_view> pat)
+{
+  bool const ovf   = s.overflow || pat.overflow;
+  bool const valid = s.valid && pat.valid;
+  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }
+  if (pat.val.len > s.val.len) { return reg_val<bool>{false, true, false}; }
+  int32_t const start = s.val.len - pat.val.len;
+  for (int32_t i = 0; i < pat.val.len; ++i) {
+    if (s.val.ptr[start + i] != pat.val.ptr[i]) { return reg_val<bool>{false, true, false}; }
+  }
+  return reg_val<bool>{true, true, false};
+}
+
+//===----------CONTAINS----------===//
 __device__ __forceinline__ reg_val<bool> eval_contains(reg_val<str_view> s, reg_val<str_view> pat)
 {
   bool const ovf   = s.overflow || pat.overflow;
@@ -323,27 +284,7 @@ __device__ __forceinline__ reg_val<bool> eval_contains(reg_val<str_view> s, reg_
   return reg_val<bool>{false, true, false};
 }
 
-__device__ __forceinline__ int32_t next_utf8_char(char const* s, int32_t slen, int32_t pos)
-{
-  int32_t next = pos + 1;
-  while (next < slen && (static_cast<uint8_t>(s[next]) & 0xC0u) == 0x80u) {
-    ++next;
-  }
-  return next;
-}
-
-__device__ __forceinline__ int32_t find_byte_plain(char const* s,
-                                                   int32_t slen,
-                                                   int32_t start,
-                                                   char target)
-{
-  int32_t pos = start;
-  while (pos < slen && s[pos] != target) {
-    ++pos;
-  }
-  return pos;
-}
-
+//===----------LIKE (GENERIC)----------===//
 __device__ __forceinline__ bool raw_like(str_view s, str_view pat)
 {
   int32_t si      = 0;
@@ -394,6 +335,111 @@ __device__ __forceinline__ reg_val<bool> eval_like(reg_val<str_view> s, reg_val<
   return reg_val<bool>{Invert ? !m : m, true, false};
 }
 
+//===----------LIKE (SWAR MULTI-LITERAL)----------===//
+// Mirrors @c sirius::detail::like_multiliteral_{literal,pattern}_desc.
+struct like_literal_desc {
+  uint64_t chunk_val[4];
+  uint64_t chunk_mask[4];
+  uint64_t b0_bcast;
+  uint64_t b1_bcast;
+  int32_t len;
+  int32_t nchunks;
+};
+
+struct like_pattern_desc {
+  like_literal_desc literals[4];
+  int32_t n;
+  int32_t total_len;
+};
+
+/**
+ * @brief Superset of the byte lanes where the literal's first byte sits at lane k and (len >= 2)
+ *        its second byte follows; bit 7 of each byte marks a candidate (SWAR false positives are
+ *        filtered by verification).
+ */
+__device__ __forceinline__ uint64_t
+like_candidates(uint64_t cur, uint64_t next, uint64_t b0, uint64_t b1, int32_t len)
+{
+  uint64_t const c1 = swar_byte_eq_mask(cur, b0);
+  if (len == 1) { return c1; }
+  uint64_t const c2  = swar_byte_eq_mask(cur, b1);
+  uint64_t const c2n = swar_byte_eq_mask(next, b1);
+  return c1 & ((c2 >> 8) | (c2n << 56));
+}
+
+__device__ __forceinline__ like_literal_desc const& like_literal_at(like_pattern_desc const& pat,
+                                                                    int32_t li)
+{
+  switch (li) {
+    case 0: return pat.literals[0];
+    case 1: return pat.literals[1];
+    case 2: return pat.literals[2];
+    default: return pat.literals[3];
+  }
+}
+
+__device__ __forceinline__ bool like_verify(uintptr_t p,
+                                            uintptr_t limit,
+                                            like_literal_desc const& lit)
+{
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    if (c == lit.nchunks) { break; }
+    uint64_t const win = read_window(p + static_cast<uintptr_t>(8 * c), limit);
+    if ((win & lit.chunk_mask[c]) != lit.chunk_val[c]) { return false; }
+  }
+  return true;
+}
+
+/**
+ *  @brief `%lit1%lit2%...%` (and contains = one literal): scan the string one aligned 8-byte word
+ *         at a time, locating candidate starts of the current literal with SWAR digram masks and
+ *         verifying them in order. Each literal must start at or after the previous match's end.
+ */
+template <bool Invert>
+__device__ __forceinline__ reg_val<bool> eval_like_multiliteral(reg_val<str_view> s,
+                                                                like_pattern_desc const& pat)
+{
+  if (!s.valid || s.overflow) { return reg_val<bool>{false, s.valid, s.overflow}; }
+  bool match = false;
+  if (s.val.len >= pat.total_len) {
+    uintptr_t const start = reinterpret_cast<uintptr_t>(s.val.ptr);
+    uintptr_t const end   = start + static_cast<uintptr_t>(s.val.len);
+    uintptr_t const limit = reinterpret_cast<uintptr_t>(s.val.limit);
+    int32_t li            = 0;
+    uintptr_t min_pos     = start;
+    uint64_t b0           = pat.literals[0].b0_bcast;
+    uint64_t b1           = pat.literals[0].b1_bcast;
+    int32_t len           = pat.literals[0].len;
+    uintptr_t w           = start & ~static_cast<uintptr_t>(7u);
+    uint64_t cur          = load_bounded_word(w, limit);
+    for (; w < end && !match; w += 8u) {
+      uint64_t const next = load_bounded_word(w + 8u, limit);
+      uint64_t cand       = like_candidates(cur, next, b0, b1, len);
+      while (cand != 0ULL) {
+        int const k = __ffsll(static_cast<long long>(cand)) - 1;
+        cand &= cand - 1ULL;
+        uintptr_t const p = w + static_cast<uintptr_t>(k >> 3);
+        if (p < min_pos || p + static_cast<uintptr_t>(len) > end) { continue; }
+        if (!like_verify(p, limit, like_literal_at(pat, li))) { continue; }
+        min_pos = p + static_cast<uintptr_t>(len);
+        ++li;
+        if (li == pat.n) {
+          match = true;
+          break;
+        }
+        like_literal_desc const& nl = like_literal_at(pat, li);
+        b0                          = nl.b0_bcast;
+        b1                          = nl.b1_bcast;
+        len                         = nl.len;
+        cand                        = like_candidates(cur, next, b0, b1, len);
+      }
+      cur = next;
+    }
+  }
+  return reg_val<bool>{match != Invert, true, false};
+}
+
 //===----------SUBSTRING----------===//
 __device__ __forceinline__ str_view slice_utf8_forward(str_view s,
                                                        int32_t start_char,
@@ -404,7 +450,7 @@ __device__ __forceinline__ str_view slice_utf8_forward(str_view s,
   int32_t byte_start = s.len;
   int32_t byte_stop  = s.len;
   for (int32_t b = 0; b < s.len; ++b) {
-    if ((static_cast<uint8_t>(s.ptr[b]) & 0xC0u) != 0x80u) {
+    if (!is_utf8_continuation(s.ptr[b])) {
       if (char_idx == start_char) { byte_start = b; }
       if (char_idx == stop_char) {
         byte_stop = b;
@@ -429,7 +475,7 @@ __device__ __forceinline__ reg_val<str_view> eval_substring(reg_val<str_view> in
   }
   int32_t char_len = 0;
   for (int32_t b = 0; b < in.val.len; ++b) {
-    if ((static_cast<uint8_t>(in.val.ptr[b]) & 0xC0u) != 0x80u) { ++char_len; }
+    if (!is_utf8_continuation(in.val.ptr[b])) { ++char_len; }
   }
   int32_t r_start = (start_char < 0) ? (char_len + start_char) : start_char;
   if (r_start < 0) { r_start = 0; }

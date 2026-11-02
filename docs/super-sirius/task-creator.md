@@ -126,13 +126,21 @@ Uses base class for both `get_next_task_hint()` and `get_next_task_input_data()`
 
 ### PARTITION
 
-| Method | Behavior |
-|--------|----------|
-| `get_next_task_hint()` | If the non-driving side has no `_num_partitions`, delegates to the sizing sibling's hint. Otherwise: base class. |
-| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count from the designated sizing side on first call. Notifies the hash join when build-side sizing can select an execution mode. Then delegates to base class. |
-| Why custom | Sibling pair coordination: build normally sizes both sides; RIGHT-family joins other than `RIGHT_DELIM_JOIN` size both from the retained probe side. |
+PARTITION receives explicit keys and an ingress barrier from planning. A fixed layout needs no
+consumer policy. For adaptive inputs, both task hints and task creation enter one shared
+`partition_exchange` before claiming data. Nonempty unresolved inputs nominate the sizing input
+for task creation; hints do not select a consumer algorithm. Consumer-specific bindings choose the count,
+routing modes, placement, and any concat-all requirement. The decision is serialized once for all
+bound inputs; the routers do not acquire each other's operator locks.
 
-Deadlock prevention: both this and sibling partition locks are acquired in a fixed order using `std::scoped_lock`.
+Hash-join bindings normally size from build; right-family joins size from probe except inside a
+right-delim join. Dense-count bindings wait for both producers before measuring the combined
+input. Grouped-merge bindings may use a projected size. A completed empty sizing input preserves
+the one-partition fallback. After resolution, normal port barriers determine readiness.
+
+The build-input observer certifies dynamic-filter inventory before the first claim, contributes
+before scatter, and publishes after successful scatter. That lifecycle belongs to the hash-join
+binding rather than the router's scheduling policy.
 
 ### CONCAT
 
@@ -157,11 +165,10 @@ and a common memory space before forwarding or concatenating them.
 Allocation failures use the executor's normal OOM handling and bounded
 retry path; CONCAT has no separate target-capacity precheck.
 
-Join wrapping selects the initial flag from join semantics. Both sibling PARTITION entry paths
-hold their locks while negotiating runtime BUILD_PROBE or whole-build dynamic-filter folding,
-before either can claim input and publish any partition output. Each join input partition keeps
-an explicit non-owning reference to its output CONCAT; build/probe roles come from the join's
-input child edges. The converter preserves build-first dependencies. A later change to the
+Join wrapping selects the initial flag from join semantics. Its explicit input binding keeps
+the build CONCAT reference and configures runtime BUILD_PROBE or whole-build dynamic-filter
+folding inside the shared exchange decision, before either router can claim input. The routers
+carry no build/probe roles or CONCAT references. The converter preserves build-first dependencies. A later change to the
 CONCAT flag after its first successful claim throws, since already emitted partial groups cannot
 be combined retroactively. Normal producer completion and task retirement govern readiness;
 there is no separate repository completion protocol.
@@ -181,6 +188,10 @@ there is no separate repository completion protocol.
 | `get_next_task_hint()` | Base class (no override) |
 | `get_next_task_input_data()` | Mutex-locked: drains ALL batches from one partition, advances `_current_partition_index`. |
 | Why custom | One task per partition — must drain entire partition for multi-way merge |
+
+### MERGE_AGGREGATE
+
+The ungrouped aggregate merge waits for its upstream producer to finish and claims one task, regardless of whether partial-result batches exist. It drains all partials for a normal merge, or returns `input_free_operator_data` to construct the final empty-input row. Its `all_ports_empty()` override remains false until this descriptor is handed out, preventing a zero-batch input from finishing the pipeline before finalization. The existing pipeline task-creation lock covers handout and incrementing the task count.
 
 ### GROUPED_AGGREGATE_MERGE
 
@@ -203,11 +214,12 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 |----------|------------------------|------------------------------|------------|
 | HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
 | HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
-| PARTITION | Delegates to sizing sibling | Mutex-locked count determination | Sibling coordination |
+| PARTITION | Resolves the bound input policy, then checks port readiness | Resolves once before claiming | Shared exchange layout |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
 | MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |
 | GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |
+| MERGE_AGGREGATE | Claim one task after upstream completion | Drain all partials or create input-free descriptor | Final SQL row even with zero input batches |
 | TOP_N_MERGE | Base class | Drain all from one partition | Per-partition merge |
 | DELIM_JOIN | N/A | Delegates to partition_join | Wrapper pattern |
 
@@ -230,14 +242,18 @@ while running:
     5. Schedule work on the thread pool. Every source — a GPU_SCAN scan or any
        GPU operator with buffered input — drives the same loop:
            - Loop while (!node.all_ports_empty()):
-             - pipeline.mark_task_created()  // BEFORE popping data
-             - data = node.get_next_task_input_data()  // a GPU_SCAN blocks on its split_connector
-             - If data: create a gpu_pipeline_task, dispatch to task_scheduler
-             - If no data: pipeline.mark_task_completed()
+             - Acquire the pipeline's task_creation_guard
+             - data = node.get_next_task_input_data()  // may wait for source input
+             - If no data: leave the loop; the scoped guard releases automatically
+             - Otherwise construct gpu_pipeline_task, which calls mark_task_created()
+             - Release the guard, then dispatch to task_scheduler
              - If the request was a look-ahead: break after one task
+           - Recheck pipeline status with update_pipeline_status(false)
 ```
 
-The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
+The creation guard serializes input claims with a separate mutex. It marks creation active under the pipeline status mutex, then releases that mutex before reading input. Existing tasks can therefore complete while a source waits. Status checks defer finalization until the guard releases, protecting the gap between taking the last input and registering its task.
+
+Releasing the guard does not recheck status. Every normal exit from the creation loop must call `update_pipeline_status(false)`, including an empty input or exhausted source. This rechecks deferred completion and schedules downstream consumers when the pipeline closes. Exceptions release the guard and fail the query through the creator's error handler.
 
 ### Look-ahead task creation
 
@@ -255,9 +271,9 @@ When the manager loop builds a `gpu_pipeline_task`, it also chooses the task's `
 
 Partitioned operators — BUILD_PROBE hash join, `grouped_aggregate_merge`, and the other partition-keyed operators above — build a per-partition cuco hash table that is valid only on the GPU it was built on. Touching it from a stream bound to another device trips `cudaErrorInvalidValue`. So every task of a partition must run on one fixed device.
 
-The task creator does not choose that device. The partition's consumer chooses a `partition_placement` (one device per partition) together with the partition count, PARTITION hands it to every operator that emits that exchange's partitions, and the emitter stamps the partition's device on the `partitioned_operator_data` it creates. The task creator reads it back through `get_preferred_device_id()` like a scan split's device. The default policy is round-robin, partition `p` on `active_gpu_ids[p % n]`, which keeps every task of a pinned partition (build + all probes) on one GPU while spreading partitions across GPUs; see [multi-gpu-architecture.md](multi-gpu-architecture.md) for the broadcast and single-partition cases. Partitioned data with no index, or with an unpinned placement, carries no stamp and is placed by locality. Nested-loop joins and single-partition STANDARD hash joins, grouped-aggregate merges, dense-count joins, and empty-build fallbacks use unpinned placement; BUILD_PROBE joins retain a fixed GPU even with one partition.
+The task creator does not choose that device. The partition's consumer chooses a `partition_placement` (one device per partition) together with the partition count, `partition_exchange` installs it on each bound PARTITION, which hands it to every operator that emits that exchange's partitions, and the emitter stamps the partition's device on the `partitioned_operator_data` it creates. The task creator reads it back through `get_preferred_device_id()` like a scan split's device. The default policy is round-robin, partition `p` on `active_gpu_ids[p % n]`, which keeps every task of a pinned partition (build + all probes) on one GPU while spreading partitions across GPUs; see [multi-gpu-architecture.md](multi-gpu-architecture.md) for the broadcast and single-partition cases. Partitioned data with no index, or with an unpinned placement, carries no stamp and is placed by locality. Nested-loop joins and single-partition STANDARD hash joins, grouped-aggregate merges, dense-count joins, and empty-build fallbacks use unpinned placement; BUILD_PROBE joins retain a fixed GPU even with one partition.
 
-Placements are drawn from the query's admitted set: `sirius_engine::initialize_internal` computes the admitted subset, installs it on the task creator via `set_active_gpu_ids()`, and builds `pipeline_build_context` from the same list, which the pipeline converter hands to every partition consumer. PARTITION rejects a placement that names a device outside it. See [configuration.md](configuration.md) for `topology.gpus_per_query`.
+Placements are drawn from the query's admitted set: `sirius_engine::initialize_internal` computes the admitted subset, installs it on the task creator via `set_active_gpu_ids()`, and builds `pipeline_build_context` from the same list, which the pipeline converter hands to every partition consumer. Consumer input policy rejects a placement that names a device outside it. See [configuration.md](configuration.md) for `topology.gpus_per_query`.
 
 The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into `_active_gpu_ids` at the point the preference is written to the task's local state. The clamp applies to stamped preferences too, as a backstop.
 

@@ -25,10 +25,10 @@ namespace op {
 
 //! Terminates one arm of a UNION: a non-partitioning pipeline sink that forwards every batch
 //! unchanged into the downstream UNION's per-arm input port. It replaces the join's
-//! `PARTITION -> CONCAT` feeder chain, which a bag union needs neither half of.
+//! `PARTITION -> CONCAT` feeder chain, which a union needs neither half of.
 //!
 //! Emitting plain `pipelineable_operator_data` is the load-bearing part: with no partition and no
-//! stamped device, `task_creator::create_task` selects a device by data locality rather than by a
+//! stamped device, the task creator selects a device by data locality rather than by a
 //! partition placement, so each batch is consumed on the GPU its scan produced it on.
 //! Pushing through the base `sink()` also means the receiving UNION need not be a
 //! `sirius_physical_partition_consumer_operator`.
@@ -37,8 +37,7 @@ class sirius_physical_passthrough_sink : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::PASSTHROUGH_SINK;
 
-  //! @param types       Output schema: the union's, since a materialized CTE arm declares its
-  //!                    materialization side rather than what it emits.
+  //! @param types       Output schema: the union's.
   //! @param port_label  The downstream port this arm feeds, `sirius_physical_union::port_label(i)`.
   explicit sirius_physical_passthrough_sink(duckdb::vector<sirius::logical_type> types,
                                             std::size_t estimated_cardinality,
@@ -66,8 +65,8 @@ class sirius_physical_passthrough_sink : public sirius_physical_operator {
   }
 
  private:
-  //! Owns the storage behind the `string_view` in the wiring descriptor and in the upstream
-  //! operator's `next_port_info`, both of which outlive plan conversion.
+  //! Owns the storage behind the `string_view` in the wiring descriptor and in this operator's
+  //! `next_port_info`, both of which outlive plan conversion.
   std::string _union_port_label;
 };
 

@@ -49,6 +49,16 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
 }
 
 /** @brief 10^exp as an __int128_t literal, for resolving scale gaps between decimals. */
+/**
+ * @brief Decimal digits available to @p type: its SQL precision, or the 38 digits of the DECIMAL128
+ *        carrier for HUGEINT, which has no SQL precision of its own.
+ */
+[[nodiscard]] int target_decimal_precision(sirius::logical_type const& type)
+{
+  if (type.id() == sirius::type_id::HUGEINT) { return 38; }
+  return static_cast<int>(type.decimal_precision());
+}
+
 [[nodiscard]] std::string format_int128_pow10(int exp)
 {
   if (exp <= 0) { return "static_cast<__int128_t>(1)"; }
@@ -125,6 +135,48 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
     operand = format("({} * {})", operand, format_int128_pow10(target_scale - own_scale));
   }
   return operand;
+}
+
+/**
+ * @brief The boolean expression comparing @p lhs with @p rhs, both already rendered as
+ *        @p cmp_type. Floating-point comparisons follow DuckDB: NaN equals NaN and orders above
+ *        every other value.
+ */
+[[nodiscard]] std::string comparison_text(sirius::comparison_type op,
+                                          std::string const& lhs,
+                                          std::string const& rhs,
+                                          std::string const& cmp_type)
+{
+  bool const floating = cmp_type == "float" || cmp_type == "double";
+  if (floating) {
+    switch (op) {
+      case sirius::comparison_type::equal:
+      case sirius::comparison_type::not_distinct_from:
+        return format("eval_fp_eq({}, {})", lhs, rhs);
+      case sirius::comparison_type::not_equal:
+      case sirius::comparison_type::distinct_from: return format("!eval_fp_eq({}, {})", lhs, rhs);
+      case sirius::comparison_type::lt: return format("eval_fp_lt({}, {})", lhs, rhs);
+      case sirius::comparison_type::le: return format("eval_fp_le({}, {})", lhs, rhs);
+      case sirius::comparison_type::gt: return format("eval_fp_lt({}, {})", rhs, lhs);
+      case sirius::comparison_type::ge: return format("eval_fp_le({}, {})", rhs, lhs);
+      default: break;
+    }
+  } else {
+    char const* op_sym = nullptr;
+    switch (op) {
+      case sirius::comparison_type::equal:
+      case sirius::comparison_type::not_distinct_from: op_sym = "=="; break;
+      case sirius::comparison_type::not_equal:
+      case sirius::comparison_type::distinct_from: op_sym = "!="; break;
+      case sirius::comparison_type::lt: op_sym = "<"; break;
+      case sirius::comparison_type::le: op_sym = "<="; break;
+      case sirius::comparison_type::gt: op_sym = ">"; break;
+      case sirius::comparison_type::ge: op_sym = ">="; break;
+      default: break;
+    }
+    if (op_sym != nullptr) { return format("({} {} {})", lhs, op_sym, rhs); }
+  }
+  throw internal_exception("[nvrtc] Unrecognized comparison operator: {}", static_cast<int>(op));
 }
 
 [[nodiscard]] std::string overflow_expression(std::initializer_list<register_value const*> regs)
@@ -254,8 +306,8 @@ std::optional<std::size_t> translation_context::try_bind_like_pattern(
     like_text = text;
   }
   sirius::detail::like_multiliteral_pattern_desc descriptor{};
-  if (_like.cache != nullptr) {
-    auto const entry = _like.cache->get_or_classify(like_text);
+  if (_like.classify) {
+    auto const entry = _like.classify(like_text);
     if (!entry || !*entry) { return std::nullopt; }
     descriptor = (*entry)->descriptor();
   } else {
@@ -521,11 +573,10 @@ register_value translation_context::produce_comparison(sirius::ast::comparison c
   if (expr.op == sirius::comparison_type::not_distinct_from) {
     emit_reg_val("bool",
                  var_name,
-                 format("(!{0}.valid && !{1}.valid) || ({0}.valid && {1}.valid && ({2} == {3}))",
+                 format("(!{0}.valid && !{1}.valid) || ({0}.valid && {1}.valid && {2})",
                         lhs.var_name,
                         rhs.var_name,
-                        lhs_val,
-                        rhs_val),
+                        comparison_text(expr.op, lhs_val, rhs_val, cmp_type)),
                  "true",
                  ovf_e);
     return make_bool_register(var_name, /*is_statically_non_null=*/true, can_ovf);
@@ -533,30 +584,16 @@ register_value translation_context::produce_comparison(sirius::ast::comparison c
   if (expr.op == sirius::comparison_type::distinct_from) {
     emit_reg_val("bool",
                  var_name,
-                 format("({0}.valid != {1}.valid) || ({0}.valid && {1}.valid && ({2} != {3}))",
+                 format("({0}.valid != {1}.valid) || ({0}.valid && {1}.valid && {2})",
                         lhs.var_name,
                         rhs.var_name,
-                        lhs_val,
-                        rhs_val),
+                        comparison_text(expr.op, lhs_val, rhs_val, cmp_type)),
                  "true",
                  ovf_e);
     return make_bool_register(var_name, /*is_statically_non_null=*/true, can_ovf);
   }
 
-  char const* op_sym = nullptr;
-  switch (expr.op) {
-    case sirius::comparison_type::equal: op_sym = "=="; break;
-    case sirius::comparison_type::not_equal: op_sym = "!="; break;
-    case sirius::comparison_type::lt: op_sym = "<"; break;
-    case sirius::comparison_type::le: op_sym = "<="; break;
-    case sirius::comparison_type::gt: op_sym = ">"; break;
-    case sirius::comparison_type::ge: op_sym = ">="; break;
-    default:
-      throw internal_exception("[nvrtc] Unrecognized comparison operator: {}",
-                               static_cast<int>(expr.op));
-  }
-
-  auto const compare  = format("({} {} {})", lhs_val, op_sym, rhs_val);
+  auto const compare  = comparison_text(expr.op, lhs_val, rhs_val, cmp_type);
   bool const non_null = all_statically_non_null({&lhs, &rhs});
   if (non_null) {
     emit_reg_val("bool", var_name, compare, "true", ovf_e);
@@ -592,33 +629,45 @@ register_value translation_context::produce_between(sirius::ast::between const& 
   bool const mixed =
     is_dec && (s_i != s_l || s_i != s_h || in_reg.device_type != lo_reg.device_type ||
                in_reg.device_type != hi_reg.device_type);
-  auto const cmp_type = mixed ? std::string("__int128_t") : cuda_type_name(in_reg.device_type);
-  auto const in_val   = comparison_operand(in_reg, cmp_type, s_i, s_max);
-  auto const lo_val   = comparison_operand(lo_reg, cmp_type, s_l, s_max);
-  auto const hi_val   = comparison_operand(hi_reg, cmp_type, s_h, s_max);
-  auto const compare  = format("(({0} {1} {2}) && ({0} {3} {4}))",
-                              in_val,
-                              expr.lower_inclusive ? ">=" : ">",
-                              lo_val,
-                              expr.upper_inclusive ? "<=" : "<",
-                              hi_val);
+  auto const cmp_type  = mixed ? std::string("__int128_t") : cuda_type_name(in_reg.device_type);
+  auto const in_val    = comparison_operand(in_reg, cmp_type, s_i, s_max);
+  auto const lo_val    = comparison_operand(lo_reg, cmp_type, s_l, s_max);
+  auto const hi_val    = comparison_operand(hi_reg, cmp_type, s_h, s_max);
+  auto const lower_cmp = comparison_text(
+    expr.lower_inclusive ? sirius::comparison_type::ge : sirius::comparison_type::gt,
+    in_val,
+    lo_val,
+    cmp_type);
+  auto const upper_cmp = comparison_text(
+    expr.upper_inclusive ? sirius::comparison_type::le : sirius::comparison_type::lt,
+    in_val,
+    hi_val,
+    cmp_type);
 
   bool const non_null = all_statically_non_null({&in_reg, &lo_reg, &hi_reg});
   bool const can_ovf  = any_can_overflow({&in_reg, &lo_reg, &hi_reg});
-  auto const ovf_e    = overflow_expression({&in_reg, &lo_reg, &hi_reg});
   if (non_null) {
-    emit_reg_val("bool", var_name, compare, "true", ovf_e);
-  } else {
-    emit_line(format("bool const {}_valid = {}.valid && {}.valid && {}.valid;",
-                     var_name,
-                     in_reg.var_name,
-                     lo_reg.var_name,
-                     hi_reg.var_name));
     emit_reg_val("bool",
                  var_name,
-                 format("{}_valid ? {} : false", var_name, compare),
-                 var_name + "_valid",
-                 ovf_e);
+                 format("({} && {})", lower_cmp, upper_cmp),
+                 "true",
+                 overflow_expression({&in_reg, &lo_reg, &hi_reg}));
+  } else {
+    // SQL BETWEEN is a three-valued conjunction: FALSE AND NULL is FALSE.
+    auto const emit_bound = [&](std::string const& cmp, register_value const& bound) {
+      auto const bound_var = next_var_name();
+      emit_line(format(
+        "bool const {}_valid = {}.valid && {}.valid;", bound_var, in_reg.var_name, bound.var_name));
+      emit_line(format("reg_val<bool> const {0}{{{0}_valid ? {1} : false, {0}_valid, {2}}};",
+                       bound_var,
+                       cmp,
+                       overflow_expression({&in_reg, &bound})));
+      return bound_var;
+    };
+    auto const lower_var = emit_bound(lower_cmp, lo_reg);
+    auto const upper_var = emit_bound(upper_cmp, hi_reg);
+    emit_line(
+      format("reg_val<bool> const {} = eval_kleene_and({}, {});", var_name, lower_var, upper_var));
   }
   return make_bool_register(var_name, non_null, can_ovf);
 }
@@ -755,10 +804,9 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
     auto const eq_var = next_var_name();
     emit_line(format(
       "bool const {}_valid = {}.valid && {}.valid;", eq_var, probe_reg.var_name, val_reg.var_name));
-    emit_line(format("reg_val<bool> const {0}{{{0}_valid ? ({1} == {2}) : false, {0}_valid, {3}}};",
+    emit_line(format("reg_val<bool> const {0}{{{0}_valid ? {1} : false, {0}_valid, {2}}};",
                      eq_var,
-                     probe_val,
-                     rhs_val,
+                     comparison_text(sirius::comparison_type::equal, probe_val, rhs_val, cmp_type),
                      overflow_expression({&probe_reg, &val_reg})));
     if (i == 0) {
       emit_line(format("{} = {};", var_name, eq_var));
@@ -832,7 +880,7 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
     call(format("eval_cast_to_bool({})", c));
   } else if (src_type.id() == cudf::type_id::BOOL8) {
     if (cudf::is_fixed_point(dst_type)) {
-      int const prec       = static_cast<int>(expr.target_type.decimal_precision());
+      int const prec       = target_decimal_precision(expr.target_type);
       int const scale      = sql_decimal_scale(dst_type);
       bool const can_fit_1 = (prec > scale);
       call(format("eval_cast_bool_to_dec<{0}, {1}>({2}, static_cast<{0}>({3}))",
@@ -851,7 +899,7 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
   } else if (cudf::is_fixed_point(src_type) && cudf::is_fixed_point(dst_type)) {
     int const s_in       = sql_decimal_scale(src_type);
     int const s_out      = sql_decimal_scale(dst_type);
-    int const p_out      = static_cast<int>(expr.target_type.decimal_precision());
+    int const p_out      = target_decimal_precision(expr.target_type);
     auto const limit_str = format_int128_pow10(p_out);
     if (s_out >= s_in) {
       call(format("eval_cast_dec_scale_up<{}>({}, {}, {})",
@@ -879,7 +927,7 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
                 c,
                 format_double_pow10(sql_decimal_scale(src_type))));
   } else if (cudf::is_integral(src_type) && cudf::is_fixed_point(dst_type)) {
-    int const p_out = static_cast<int>(expr.target_type.decimal_precision());
+    int const p_out = target_decimal_precision(expr.target_type);
     int const s_out = sql_decimal_scale(dst_type);
     call(format("eval_cast_int_to_dec<{}>({}, {}, {})",
                 dst_str,
@@ -888,7 +936,7 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
                 format_int128_pow10(s_out)));
     can_ovf = true;
   } else if (cudf::is_floating_point(src_type) && cudf::is_fixed_point(dst_type)) {
-    int const p_out = static_cast<int>(expr.target_type.decimal_precision());
+    int const p_out = target_decimal_precision(expr.target_type);
     int const s_out = sql_decimal_scale(dst_type);
     call(format("eval_cast_float_to_dec<{}>({}, {}, {}, {})",
                 dst_str,
@@ -1239,6 +1287,14 @@ register_value translation_context::produce_function_call(sirius::ast::function_
   auto const var_name = next_var_name();
 
   //===----------UNARY ARITHMETIC FUNCTIONS----------===//
+  if (fid == sirius::function_id::negate) {
+    auto const child = produce(*args[0]);
+    emit_reg_val_assign(
+      type_str, var_name, format("eval_negate<{}>({})", type_str, child.var_name));
+    bool const can_ovf = child.can_overflow || !cudf::is_floating_point(ret_type);
+    return register_value{var_name, ret_type, child.is_statically_non_null, can_ovf};
+  }
+
   if (fid == sirius::function_id::abs) {
     auto const child = produce(*args[0]);
     emit_reg_val_assign(type_str, var_name, format("eval_abs<{}>({})", type_str, child.var_name));

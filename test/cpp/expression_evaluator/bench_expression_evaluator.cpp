@@ -196,6 +196,8 @@ std::unique_ptr<cudf::column> upload_strings(std::vector<std::string> const& str
                   cudaMemcpyHostToDevice,
                   stream.value());
   rmm::device_buffer chars_buf(chars.data(), chars.size(), stream, mr);
+  // Pageable sources may be read asynchronously (HMM/ATS); the local buffers must outlive the copy.
+  stream.synchronize();
   return cudf::make_strings_column(
     n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{0, stream, mr});
 }
@@ -275,6 +277,8 @@ bench_input make_bench_input(cudf::size_type rows,
     views.push_back(c->view());
   }
   in.view = cudf::table_view(views);
+  // The host vectors above die with this frame; wait for every upload to finish reading them.
+  stream.synchronize();
   return in;
 }
 

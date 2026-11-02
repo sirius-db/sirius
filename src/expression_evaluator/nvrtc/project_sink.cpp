@@ -260,7 +260,7 @@ project_sink_result evaluate_project_sink(std::span<sirius::ast::node const* con
   }
 
   translation_context ctx(
-    input, options.boundary_map, like_policy{options.like_swar_fastpath, options.like_cache});
+    input, options.boundary_map, like_policy{options.like_swar_fastpath, options.classify_like});
   std::vector<register_value> out_regs;
   out_regs.reserve(expressions.size());
   for (auto const* expr : expressions) {

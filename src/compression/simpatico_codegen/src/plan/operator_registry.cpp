@@ -11,6 +11,9 @@
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 
+#include <nvcomp/version.h>
+
+#include <stdexcept>
 #include <string_view>
 
 namespace simpatico {
@@ -180,6 +183,9 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
       return nullptr;
     }
     case OpId::NvcompCascaded: {
+#if NVCOMP_VER_MAJOR >= 6
+      throw std::runtime_error("nvcomp_cascaded: unavailable with nvCOMP 6");
+#else
       // `nvcomp_cascaded` — nvcomp default opts; `nvcomp_cascaded_<N>D<M>R<K>B` — explicit opts.
       if (name == "nvcomp_cascaded") return std::make_unique<cascaded_compressor>();
       int deltas = 0, rles = 0, bp = 0;
@@ -188,6 +194,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
         return std::make_unique<cascaded_compressor>(deltas, rles, bp);
       }
       return nullptr;
+#endif
     }
     // Codegen-fused ops are built by the JIT encoder, not this factory.
     case OpId::Delta:

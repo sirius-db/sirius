@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <latch>
 #include <memory>
 #include <mutex>
@@ -81,10 +82,11 @@ namespace sirius::io::cache {
 struct cache_generation {
   /// Materialise a chunk for every offset in @p incoming, fold the matching
   /// entry of @p desired into its populated extent, and count the calling
-  /// request as a subscriber of each.  Returns the chunks in @p incoming
-  /// order.  @p desired runs index-parallel to @p incoming.
-  std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
-                                                   std::span<const chunk_fill> desired);
+  /// request as a subscriber of each. Records each acquired subscription in result,
+  /// in incoming order. The caller owns rollback even if acquisition throws.
+  void subscribe_chunks(std::span<const size_t> incoming,
+                        std::span<const chunk_fill> desired,
+                        std::vector<cached_chunk*>& result);
 
   std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                           std::size_t size,
@@ -119,6 +121,13 @@ struct prefetch_failure_slot {
   std::exception_ptr failure;
 };
 
+/// Completion of the IO submitted by one prefetch. Success alone does not
+/// imply coverage: another loader may own some of the requested chunks.
+struct prefetch_result {
+  bool ok{false};
+  bool covered{false};
+};
+
 /// One prefetch request: the two stage machines plus the chunk set they cover.
 /// Held by value — the cache's queues and the owning @ref cache_handle
 /// each carry a copy, so the stages outlive whichever side finishes first.
@@ -132,6 +141,9 @@ struct prefetch_request {
   std::shared_ptr<producer_stage> producer;
   std::shared_ptr<consumer_stage> consumer;
   std::shared_ptr<const std::vector<cached_chunk*>> chunks;
+  // Immutable requested extents, index-parallel with chunks. A resident chunk
+  // can have a narrower fill than this request needs.
+  std::shared_ptr<const std::vector<chunk_fill>> required_fills;
   std::weak_ptr<cache_generation> generation;
   std::shared_ptr<prefetch_failure_slot> failure;
   std::uint32_t timestamp{0};
@@ -300,6 +312,7 @@ class prefetching_cache {
   // fadvise dispatch through it.
   friend class sirius::io::sirius_datasource;
   friend class cache_handle;
+  friend struct prefetching_cache_test_access;
 
  public:
   using byte_range = cudf::io::text::byte_range_info;
@@ -355,7 +368,14 @@ class prefetching_cache {
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
   /// completion.  Returns whether IO was issued.
-  bool prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done);
+  bool prefetch(cache_handle& handle, exec::invocable<void(prefetch_result) noexcept> on_done);
+
+  /// Configure only while prefetch workers are stopped. Runs after producer
+  /// loading is published and before any chunk is claimed.
+  void set_before_prefetch_claim_for_testing(std::function<void()> hook)
+  {
+    _before_prefetch_claim = std::move(hook);
+  }
 
   /// Bytes of staging memory the cache currently holds: every chunk buffer
   /// handed out by the pool and not yet reclaimed.  This is what an explicit
@@ -513,6 +533,7 @@ class prefetching_cache {
 
   void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
+  std::function<void()> _before_prefetch_claim;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;

@@ -18,6 +18,10 @@ on:
   merge_group:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
+
 jobs:
   lint:
     runs-on: ubuntu-24.04
@@ -50,8 +54,10 @@ jobs:
           cache: false
           locked: true
           pixi-version: v0.81.0
+          # cmakelang (cmake-format hook) crashes on Python 3.15: its re.Scanner
+          # patterns use capturing groups, which 3.15 rejects. Match pixi.toml.
           global-environments: |
-            pre-commit
+            pre-commit --with python=3.14
 
       - run: |
           set -o pipefail
@@ -190,7 +196,28 @@ jobs:
           engine=$(git rev-parse HEAD:duckdb)
           wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
           [[ "$engine" == "$wrapper" ]]
-          grep -q "duckdb_version: $engine" .github/workflows/distribution.yml
+
+          declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+          tag=
+          if [[ "$declared" == v* ]]; then
+            tag=$declared
+            git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
+            declared=$(git -C duckdb rev-parse "${declared}^{commit}")
+          fi
+
+          [[ "$declared" == "$engine" ]]
+
+          # DUCKDB_EXPLICIT_VERSION must name the declared tag everywhere, or nowhere for a SHA.
+          files=(sirius-duckdb/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
+          explicit=$(grep -h 'DUCKDB_EXPLICIT_VERSION' "${files[@]}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | sort -u || true)
+          if [[ -n "$tag" ]]; then
+            [[ "$explicit" == "$tag" ]]
+            for f in "${files[@]}"; do grep 'DUCKDB_EXPLICIT_VERSION' "$f" | grep -qF "$tag"; done
+            grep -qF "$engine" sirius-duckdb/Makefile
+            grep -qF "$engine" cmake/sirius-duckdb-provider.cmake
+          else
+            [[ -z "$explicit" ]]
+          fi
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the
@@ -231,13 +258,15 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_INSTALLED_DIR="$PWD/build/static-install" -DVCPKG_MANIFEST_INSTALL=OFF
           pixi run --locked -e vcpkg cmake --build build/static-consumer
-          readelf -d build/static-consumer/consumer > build/static-consumer/dynamic.txt
-          while read -r library; do
-            case "$library" in
-              libcuda.so.1|libnvidia-ml.so.1|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|ld-linux*.so.*) ;;
-              *) echo "Unexpected runtime dependency: $library"; exit 1 ;;
-            esac
-          done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' build/static-consumer/dynamic.txt)
+          for consumer in consumer c_consumer; do
+            readelf -d "build/static-consumer/$consumer" > "build/static-consumer/$consumer.dynamic.txt"
+            while read -r library; do
+              case "$library" in
+                libcuda.so.1|libnvidia-ml.so.1|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|ld-linux*.so.*) ;;
+                *) echo "$consumer: unexpected runtime dependency: $library"; exit 1 ;;
+              esac
+            done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' "build/static-consumer/$consumer.dynamic.txt")
+          done
 
       - name: Surface build errors (vcpkg)
         if: failure() && matrix.build.environment == 'vcpkg'

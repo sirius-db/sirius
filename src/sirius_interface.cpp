@@ -123,6 +123,8 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     sirius_process_error(error, query);
     return duckdb::make_uniq<duckdb::QueryResult>(std::move(error));
   } catch (std::exception& e) {
+    if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state"))
+      runtime->get_query_lifecycle_registry().report_failure(std::current_exception(), query_id);
     duckdb::ErrorData error(e);
     sirius_process_error(error, query);
     return duckdb::make_uniq<duckdb::QueryResult>(std::move(error));

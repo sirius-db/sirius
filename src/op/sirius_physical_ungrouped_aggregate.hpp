@@ -48,7 +48,8 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   //! The aggregates that have to be computed
   duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
   /// Parallel to aggregates: the plan-time bound on |unscaled value| of a decimal SUM or AVG input
-  /// (planner::resolve_decimal_sum_input_bounds); nullopt when unproven.
+  /// (planner::resolve_sum_input_bounds); nullopt when unproven. A wide integer SUM is reduced in
+  /// 128 bits (wide_integer_sum) and ignores its bound.
   std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs;
 
   //! Schema emitted by the per-task partial aggregate. AVG expands to SUM + COUNT here; the

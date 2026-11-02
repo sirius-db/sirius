@@ -18,6 +18,8 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include "cucascade/memory/common.hpp"
+#include "log/logging.hpp"
+#include "memory/pool_peer_access.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -61,7 +63,15 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   if (gpu_spaces.empty()) {
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
+  // Complete grants before installing resource references that constructor unwinding could
+  // invalidate.
+  for_each_pair_without_pool_access(gpu_spaces, [](int owner_device, int accessor_device) {
+    SIRIUS_LOG_INFO(
+      "Pool access unavailable: owner GPU {}, accessor GPU {}", owner_device, accessor_device);
+    return true;
+  });
   for (const auto* space : gpu_spaces) {
+    runtime_stream_pools_.push_back(runtime_stream_pool::install(*space));
     auto const device_mr = space->get_default_allocator();
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
     // Capture the old resource by value (not by ref) — see comment in header for why.
@@ -113,7 +123,17 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
   // device. The cost is a single device sync per managed GPU at teardown.
   for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
-    cudaDeviceSynchronize();
+    auto const status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      log::log_noexcept([&] {
+        SIRIUS_LOG_ERROR(
+          "GPU {} teardown synchronization failed: {} ({}); continuing best-effort cleanup",
+          gpu_spaces[i]->get_device_id(),
+          cudaGetErrorName(status),
+          cudaGetErrorString(status));
+      });
+    }
+    runtime_stream_pools_[i].reset();
     cudf::set_current_device_resource(std::move(prev_device_mrs_[i]));
   }
 }

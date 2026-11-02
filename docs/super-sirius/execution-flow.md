@@ -111,7 +111,6 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 - Sinks are pushed into operator arrays
 - Source references are set
 - Parent-child dependencies are established
-- Sibling partition operators are linked for hash joins
 - The finalized pipeline list is stored in `new_scheduled`
 
 ## Step 5: Execution

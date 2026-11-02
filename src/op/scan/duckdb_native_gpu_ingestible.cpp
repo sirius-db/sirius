@@ -444,10 +444,12 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
   // throws if no backend supports the path.
   // Runs on a scan-manager dispatcher thread:
   return [this, rg_begin, rg_end, resolve = std::move(resolve)](
-           std::stop_token stop) -> std::unique_ptr<scan_info> {
+           scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(_info->db_path);
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     duckdb_native_row_group_range range;
     try {
       range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
@@ -469,6 +471,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                          std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                          ")): " + range.viability_failure_reason);
     }
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto split = std::make_unique<duckdb_native_scan_info>(
       std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
     std::vector<split_materializer_certificate> certificates;

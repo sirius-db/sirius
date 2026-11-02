@@ -12,6 +12,7 @@
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/config.hpp"
@@ -24,14 +25,22 @@
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1042,6 +1051,21 @@ TEST_CASE("internal sirius_read_parquet is registered as a one-argument table fu
   REQUIRE(result->RowCount() == 1);
   CHECK(result->Collection().GetValue(0, 0).ToString() == "sirius_read_parquet");
   CHECK(result->Collection().GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
+
+  con.context->RunFunctionInTransaction([&] {
+    auto& entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
+      *con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "sirius_read_parquet");
+    auto function =
+      entry.functions.GetFunctionByArguments(*con.context, {duckdb::LogicalType::VARCHAR});
+    REQUIRE(function->get_virtual_columns != nullptr);
+    auto const columns = function->get_virtual_columns(*con.context, nullptr);
+    CHECK(columns.at(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME).type ==
+          duckdb::LogicalType::VARCHAR);
+    CHECK(columns.at(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX).type ==
+          duckdb::LogicalType::UBIGINT);
+    CHECK(columns.at(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER).type ==
+          duckdb::LogicalType::BIGINT);
+  });
 }
 
 TEST_CASE("S3 SQL config guard keeps object-store credentials out of YAML", "[s3][config]")
@@ -1267,6 +1291,129 @@ TEST_CASE("transparent read_parquet over S3 routes to kvikio when backend is kvi
   auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
                            local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("S3 virtual columns preserve file identity and row positions through both SQL entries",
+          "[s3][integration][sql][virtual_columns]")
+{
+  auto const transparent = GENERATE(false, true);
+  CAPTURE(transparent);
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  // The explicit gpu_execution wrapper must remain a DuckDB table-function
+  // call; its inner SQL is planned by Sirius. Transparent mode plans plain SQL.
+  set_gpu_execution(fixture.con, transparent);
+  require_query_ok(fixture.con, "SET enable_duckdb_fallback = false");
+  auto compare = [&](std::string const& remote_sql, std::string const& local_sql) {
+    if (transparent) {
+      compare_transparent_s3_gpu_to_local_cpu(fixture, remote_sql, local_sql);
+    } else {
+      compare_s3_gpu_to_local_cpu(fixture, remote_sql, local_sql);
+    }
+  };
+  auto const uri    = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const remote = s3_parquet_scan(*env, "nation");
+  auto const local  = local_parquet_scan(*env, "nation");
+  // The CPU oracle reads the identical local fixture. Only the filename is
+  // replaced with the expected S3 URI; row numbers come from native Parquet.
+  auto const expected_prefix =
+    "SELECT " + sql_quote(uri) + " AS filename, file_index, file_row_number, n_nationkey FROM ";
+  auto const actual_prefix = "SELECT filename, file_index, file_row_number, n_nationkey FROM ";
+  for (auto const& condition : {std::string{},
+                                std::string{" WHERE n_nationkey IN (2, 9, 23)"},
+                                std::string{" WHERE file_row_number > 7 AND n_nationkey < 13"},
+                                std::string{" WHERE file_index = 1"}}) {
+    auto const s3_sql  = actual_prefix + remote + condition + " ORDER BY file_row_number";
+    auto const cpu_sql = expected_prefix + local + condition + " ORDER BY file_row_number";
+    compare(s3_sql, cpu_sql);
+  }
+
+  auto const virtual_only = "SELECT file_index, file_row_number FROM ";
+  compare(virtual_only + remote + " ORDER BY file_row_number",
+          virtual_only + local + " ORDER BY file_row_number");
+
+  compare(
+    virtual_only + s3_parquet_scan(*env, "virtual_nested_only") + " ORDER BY file_row_number",
+    virtual_only + local_parquet_scan(*env, "virtual_nested_only") + " ORDER BY file_row_number");
+
+  // A filter-only virtual column must be bound even when no virtual is projected.
+  compare("SELECT n_nationkey FROM " + remote + " WHERE filename = " + sql_quote(uri) +
+            " ORDER BY n_nationkey",
+          "SELECT n_nationkey FROM " + local + " ORDER BY n_nationkey");
+
+  // Non-contiguous groups plus row filtering must preserve file-local positions.
+  auto const provenance_uri = s3_uri(env->bucket, "parquet/virtual_provenance.parquet");
+  auto const predicate = " WHERE (marker < 2048 OR marker >= 6144) AND keep = 1 ORDER BY marker";
+  compare("SELECT filename, file_index, file_row_number, marker FROM " +
+            s3_parquet_scan(*env, "virtual_provenance") + predicate,
+          "SELECT " + sql_quote(provenance_uri) + ", file_index, file_row_number, marker FROM " +
+            local_parquet_scan(*env, "virtual_provenance") + predicate);
+
+  // A physical column sharing a virtual name wins binding, including its type
+  // and null semantics; registration must not replace it with a constant.
+  for (auto const& suffix : {std::string{" ORDER BY marker"},
+                             std::string{" WHERE filename IS NULL ORDER BY marker"},
+                             std::string{" WHERE filename IS NOT NULL ORDER BY marker"}}) {
+    auto const prefix = "SELECT filename, file_index, file_row_number FROM ";
+    compare(prefix + s3_parquet_scan(*env, "virtual_physical_names") + suffix,
+            prefix + local_parquet_scan(*env, "virtual_physical_names") + suffix);
+  }
+
+  // Value::ToString() cannot distinguish a SQL NULL from the VARCHAR "NULL" and
+  // also loses the logical types. Check the actual remote result at both SQL entries.
+  auto query = [&](std::string const& sql) {
+    return require_query_ok(fixture.con, transparent ? sql : gpu_execution_sql(sql));
+  };
+  duckdb::vector<duckdb::LogicalType> const virtual_types{
+    duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::BIGINT};
+  for (bool empty : {false, true}) {
+    auto result = query("SELECT filename, file_index, file_row_number FROM " + remote +
+                        (empty ? " WHERE file_index = 99" : "") + " ORDER BY file_row_number");
+    CHECK(result->GetTypes() == virtual_types);
+    REQUIRE(result->RowCount() == (empty ? 0 : 25));
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      for (duckdb::idx_t col = 0; col < 3; ++col) {
+        CHECK_FALSE(result->Collection().GetValue(col, row).IsNull());
+      }
+      CHECK(result->Collection().GetValue(0, row).GetValue<std::string>() == uri);
+      CHECK(result->Collection().GetValue(1, row).GetValue<uint64_t>() == 0);
+      CHECK(result->Collection().GetValue(2, row).GetValue<int64_t>() == row);
+    }
+  }
+  auto star = query("SELECT * FROM " + remote + " LIMIT 1");
+  REQUIRE(star->ColumnCount() == 4);
+  CHECK(star->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::VARCHAR,
+                                                                duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::VARCHAR});
+  for (duckdb::idx_t col = 0; col < 4; ++col) {
+    CHECK(star->ColumnName(col).GetIdentifierName() ==
+          std::vector<std::string>{"n_nationkey", "n_name", "n_regionkey", "n_comment"}[col]);
+  }
+  auto const physical_remote = s3_parquet_scan(*env, "virtual_physical_names");
+  auto physical              = query("SELECT * FROM " + physical_remote + " ORDER BY marker");
+  REQUIRE(physical->ColumnCount() == 4);
+  CHECK(physical->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT,
+                                                                    duckdb::LogicalType::VARCHAR,
+                                                                    duckdb::LogicalType::BIGINT,
+                                                                    duckdb::LogicalType::INTEGER});
+  REQUIRE(physical->RowCount() == 3);
+  CHECK(physical->Collection().GetValue(1, 0).IsNull());
+  CHECK_FALSE(physical->Collection().GetValue(1, 1).IsNull());
+  CHECK(physical->Collection().GetValue(1, 1).GetValue<std::string>() == "NULL");
+  CHECK(physical->Collection().GetValue(1, 2).GetValue<std::string>() == "physical");
+  for (duckdb::idx_t row = 0; row < physical->RowCount(); ++row) {
+    CHECK(physical->Collection().GetValue(2, row).GetValue<int64_t>() == 77);
+    CHECK(physical->Collection().GetValue(3, row).GetValue<int32_t>() == 88);
+  }
+  auto only_null = query("SELECT marker FROM " + physical_remote + " WHERE filename IS NULL");
+  REQUIRE(only_null->RowCount() == 1);
+  CHECK(only_null->Collection().GetValue(0, 0).GetValue<int64_t>() == 0);
+  auto text_null = query("SELECT marker FROM " + physical_remote + " WHERE filename = 'NULL'");
+  REQUIRE(text_null->RowCount() == 1);
+  CHECK(text_null->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
 }
 
 TEST_CASE("SIRIUS_S3 CREATE SECRET credentials are scoped and refreshed for Sirius scans",
@@ -3338,7 +3485,7 @@ TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
 }
 
-TEST_CASE("R2a S3 semantic verdict keeps the source replay veto",
+TEST_CASE("S3 semantic verdict keeps the source replay veto",
           "[s3][integration][transparent][verdict]")
 {
   auto env = load_s3_test_env();
@@ -3375,7 +3522,7 @@ TEST_CASE("S3 late physical refusal follows a published GPU batch and never repl
                    "COPY (SELECT x::DOUBLE x FROM (VALUES (1.2),(2.0)) t(x)) TO " +
                      directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
   for (auto file : {"a.parquet", "b.parquet"}) {
-    if (!sirius::test::put_s3_test_object(std::string("r2a-late/") + file,
+    if (!sirius::test::put_s3_test_object(std::string("late-scan-refusal/") + file,
                                           read_binary_file(directory.path() / file))) {
       SUCCEED("managed MinIO is required to upload the late-failure fixture");
       return;
@@ -3385,12 +3532,12 @@ TEST_CASE("S3 late physical refusal follows a published GPU batch and never repl
   require_query_ok(fixture.con, "SET scan_task_batch_size=1");
   require_query_ok(fixture.con, "SET sirius_test_hold_footer_index=2");
   auto& context = require_sirius_context(fixture);
-  auto sql      = "SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "r2a-late/*.parquet");
+  auto sql      = "SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "late-scan-refusal/*.parquet");
   // The explicit SQL rewriter accepts a single S3 URI, not a glob. The view
   // preserves this same two-file bound scan without rewriting the glob as an object key.
   require_query_ok(fixture.con,
                    "CREATE VIEW late_s3_input AS SELECT * FROM " +
-                     s3_parquet_glob_scan(*env, "r2a-late/*.parquet"));
+                     s3_parquet_glob_scan(*env, "late-scan-refusal/*.parquet"));
   for (bool explicit_entry : {false, true}) {
     auto before = context.get_transparent_execution_stats();
     std::promise<void> footer_started;
@@ -3428,8 +3575,8 @@ TEST_CASE("S3 late physical refusal follows a published GPU batch and never repl
     }
     REQUIRE(observations.size() == 1);
     auto const& registrations = observations.front().readahead_registrations;
-    CHECK(registrations.contains(s3_uri(env->bucket, "r2a-late/a.parquet")));
-    CHECK_FALSE(registrations.contains(s3_uri(env->bucket, "r2a-late/b.parquet")));
+    CHECK(registrations.contains(s3_uri(env->bucket, "late-scan-refusal/a.parquet")));
+    CHECK_FALSE(registrations.contains(s3_uri(env->bucket, "late-scan-refusal/b.parquet")));
   }
 }
 
@@ -3457,7 +3604,7 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     fixture.con,
     "COPY (SELECT 20::DOUBLE x) TO " + directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
   for (auto file : {"a.parquet", "b.parquet"}) {
-    REQUIRE(sirius::test::put_s3_test_object(std::string("r2a-d7/") + file,
+    REQUIRE(sirius::test::put_s3_test_object(std::string("schema-validation/") + file,
                                              read_binary_file(directory.path() / file)));
   }
   auto local = require_query_ok(
@@ -3496,9 +3643,9 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     auto cold_source = manager.create_datasource(directory.file("pin-a.parquet"));
     REQUIRE(cold_source);
     CHECK(cold_source->metadata() == nullptr);
-    require_query_ok(
-      fixture.con,
-      "CALL pin_table(" + pin_glob + ", name='r2a_d7_pin', format='parquet', tier='parquet')");
+    require_query_ok(fixture.con,
+                     "CALL pin_table(" + pin_glob +
+                       ", name='schema_validation_pin', format='parquet', tier='parquet')");
     CHECK(cold_source->metadata() != nullptr);
     auto local_before = sirius::test::get_transparent_execution_stats(fixture.con);
     auto pinned = require_query_ok(fixture.con, "SELECT x FROM read_parquet(" + pin_glob + ")");
@@ -3512,7 +3659,7 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     CHECK(local_after.runtime_fallbacks == local_before.runtime_fallbacks);
     CHECK(local_after.split_physical_rejections == local_before.split_physical_rejections);
   }
-  auto query    = "SELECT x FROM " + s3_parquet_glob_scan(*env, "r2a-d7/*.parquet");
+  auto query    = "SELECT x FROM " + s3_parquet_glob_scan(*env, "schema-validation/*.parquet");
   auto counters = require_sirius_context(fixture).physical_counters();
   std::mutex hits_mutex;
   std::map<std::string, int> hits;
@@ -3544,7 +3691,7 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
     CHECK(after.budget_exceeded == before.budget_exceeded);
     for (auto file : {"a.parquet", "b.parquet"}) {
-      auto uri    = s3_uri(env->bucket, std::string("r2a-d7/") + file);
+      auto uri    = s3_uri(env->bucket, std::string("schema-validation/") + file);
       auto source = manager.create_datasource(uri);
       REQUIRE(source);
       CHECK(source->prefers_bulk_io() == bulk);
@@ -3813,4 +3960,132 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   CHECK(collect_rows(*remote_result) == expected);
   CHECK(deferred_route);
   CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
+}
+
+TEST_CASE("S3 mapped Parquet normalizes IDs on bulk and general readers",
+          "[s3][integration][field_id_mapping]")
+{
+  using namespace sirius::op::scan;
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  auto limits = large_sirius_memory_limits("sirius");
+  bool bulk   = true;
+  SECTION("REST bulk") {}
+  SECTION("kvikIO general")
+  {
+    limits.backend    = sirius::scan_manager::io_backend::kvikio;
+    limits.cache_mode = "none";
+    bulk              = false;
+  }
+  s3_sql_fixture fixture(*env, limits);
+  sirius::test::scratch_dir directory("s3_field_id_mapping");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(fixture.con,
+                   "COPY (SELECT (range - 2)::INTEGER old_count FROM range(5)) TO " +
+                     directory.file_literal("data.parquet") +
+                     " (FORMAT PARQUET, FIELD_IDS {old_count: 2})");
+  REQUIRE(sirius::test::put_s3_test_object("field-id-mapping/data.parquet",
+                                           read_binary_file(directory.path() / "data.parquet")));
+  auto uri    = s3_uri(env->bucket, "field-id-mapping/data.parquet");
+  auto source = require_sirius_context(fixture).get_scan_manager().create_datasource(uri);
+  REQUIRE(source);
+  REQUIRE(source->prefers_bulk_io() == bulk);
+  auto options  = cudf::io::parquet_reader_options::builder().build();
+  auto resolved = resolve_parquet_metadata_with_identity(*source, 71, uri, options);
+  materialization_program program{
+    71,
+    1,
+    {cudf::data_type{cudf::type_id::INT64}, cudf::data_type{cudf::type_id::INT32}},
+    0,
+    false};
+  program.input_types = program.output_types;
+  auto mapping        = field_id_mapping::compile(
+    resolved.artifact,
+    resolved.identity,
+    program,
+    {{2, duckdb::LogicalType::BIGINT, {}, true},
+            {3, duckdb::LogicalType::INTEGER, duckdb::Value::INTEGER(42), false}});
+  bound_table_scan contract;
+  contract.contract_id = 71;
+  contract.profiles    = std::make_shared<physical_profile_table>();
+  parquet_source input{source, resolved.artifact->file_metadata(), {0}};
+  std::vector<std::size_t> groups{0};
+  rmm::cuda_stream stream;
+  auto batch = materialize_mapped_parquet(
+    input, mapping, contract, groups, stream, cudf::get_current_device_resource_ref());
+  stream.synchronize();
+  REQUIRE(batch.rows == 5);
+  std::array<int64_t, 5> values;
+  std::array<int32_t, 5> defaults;
+  REQUIRE(cudaMemcpy(values.data(),
+                     batch.table.view().column(0).head<int64_t>(),
+                     sizeof(values),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy(defaults.data(),
+                     batch.table.view().column(1).head<int32_t>(),
+                     sizeof(defaults),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  CHECK(values == std::array<int64_t, 5>{-2, -1, 0, 1, 2});
+  CHECK(defaults == std::array<int32_t, 5>{42, 42, 42, 42, 42});
+  REQUIRE(batch.lineage.runs.size() == 1);
+  CHECK(batch.lineage.runs[0].file_row_offset == 0);
+}
+
+TEST_CASE("S3 metadata-only provenance skips pruned sources and data readers",
+          "[s3][integration][virtual_columns][metadata_only]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  s3_sql_fixture fixture(*env);
+  namespace scan  = sirius::op::scan;
+  auto const uri  = s3_uri(env->bucket, "parquet/virtual_provenance.parquet");
+  auto& context   = require_sirius_context(fixture);
+  auto datasource = context.get_scan_manager().create_datasource(uri);
+  REQUIRE(datasource);
+  auto ioctx = datasource->io_ctx();
+  auto* rest = dynamic_cast<sirius::io::rest::rest_ioctx*>(ioctx.get());
+  REQUIRE(rest);
+  auto info                    = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths    = {s3_uri(env->bucket, "does-not-exist-pruned.parquet"), uri};
+  info->names                  = {"marker", "keep"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT),
+                                  sirius::logical_type::make(sirius::type_id::INTEGER)};
+  auto const index_id          = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
+  auto const row_id            = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+  info->column_ids             = {duckdb::ColumnIndex(index_id), duckdb::ColumnIndex(row_id)};
+  info->projected_output_count = 2;
+  info->virtual_columns        = {
+    {index_id, "file_index", sirius::logical_type::make(sirius::type_id::UBIGINT), std::nullopt},
+    {row_id, "file_row_number", sirius::logical_type::make(sirius::type_id::BIGINT), std::nullopt}};
+  info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(0),
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL,
+                                  duckdb::Value::UBIGINT(1)));
+  auto reader = scan::make_ingestible(std::move(info));
+  std::vector<std::string> resolved;
+  auto task = reader->next_split_provider([&](std::string_view path) {
+    resolved.emplace_back(path);
+    return ioctx;
+  });
+  REQUIRE(task);
+  auto file = task({});
+  REQUIRE(resolved == std::vector<std::string>{uri});
+  REQUIRE(reader->has_processed_all_metadata());
+  CHECK(file->fadvise_hints().empty());
+  auto coalescer = reader->create_batch_coalescer();
+  CHECK(coalescer->push(std::move(file)).empty());
+  auto splits = coalescer->flush();
+  REQUIRE(splits.size() == 1);
+  CHECK(splits.front()->fadvise_hints().empty());
+  auto const* space =
+    context.get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  auto decoded = reader->materialize_metadata_to_table(
+    *splits.front(), *space, cudf::get_default_stream(), false, nullptr);
+  auto output = reader->post_filter_and_project(
+    std::move(decoded), *space, cudf::get_default_stream(), false, nullptr, nullptr, {});
+  REQUIRE(output);
+  CHECK(output->num_rows() == 8193);
+  CHECK(reader->reader_calls() == 0);
 }

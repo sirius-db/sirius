@@ -62,10 +62,9 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
       }
       total_rows += *stats.rows;
     }
-    // Unknown row counts are checked against the actual tables after preparation.
-    auto batch_ro = batch_idle->to_read_only();
-    total_batch_size =
-      memory::saturating_add(total_batch_size, batch_ro.get_data()->get_size_in_bytes());
+    // Unknown row counts are checked against the actual tables after preparation. The byte count
+    // is the decoded size: a compressed batch occupies a fraction of what the task will decode.
+    total_batch_size = memory::saturating_add(total_batch_size, stats.bytes);
     if (!_concat_all && total_batch_size > _concat_batch_bytes) {
       // The accumulated group is complete; the overflowing batch seeds the next group.
       if (!group.empty()) { return group; }
@@ -214,16 +213,8 @@ void sirius_physical_concat::sink(const operator_data& output_data, ::cuda::stre
   auto partition_idx = *partition_idx_opt;
   for (auto& batch : partitioned_output_data->get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
-      auto partition_consumer_op =
-        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
-      if (partition_consumer_op) {
-        partition_consumer_op->push_data_batch_partitioned(
-          next_port_info.next_operator_port_name, batch, partition_idx);
-      } else {
-        throw std::runtime_error(
-          "sirius_physical_concat::sink(): Next operator is not a partition consumer operator: " +
-          SiriusPhysicalOperatorToString(next_port_info.next_operator->type));
-      }
+      next_port_info.next_operator->push_data_batch_partitioned(
+        next_port_info.next_operator_port_name, batch, partition_idx);
     }
   }
 }

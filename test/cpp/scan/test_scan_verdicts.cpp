@@ -32,18 +32,19 @@
 using namespace sirius::op::scan;
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R2a two-pass verdict records every scan before lowering",
+                 "Two-pass verdict records every scan before lowering",
                  "[scan][certificate][verdict][integration]")
 {
-  run_ok("CREATE TABLE r2a_pass(i INTEGER)");
-  run_ok("INSERT INTO r2a_pass VALUES (1),(2)");
+  run_ok("CREATE TABLE scan_verdict_pass(i INTEGER)");
+  run_ok("INSERT INTO scan_verdict_pass VALUES (1),(2)");
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=false");
   for (auto const& injected : {"unsupported", "incomplete", "unsupported@2"}) {
     CAPTURE(injected);
     run_ok(std::string("SET sirius_test_inject_scan_verdict='") + injected + "'");
     run_ok("BEGIN TRANSACTION READ ONLY");
-    auto logical = con->ExtractPlan("SELECT i FROM r2a_pass UNION ALL SELECT i FROM r2a_pass");
+    auto logical =
+      con->ExtractPlan("SELECT i FROM scan_verdict_pass UNION ALL SELECT i FROM scan_verdict_pass");
     sirius::planner::sirius_physical_plan_generator generator(*con->context);
     auto before = sirius::test::get_transparent_execution_stats(*con);
     REQUIRE_THROWS_AS(generator.create_plan(std::move(logical)), scan_verdict_declined);
@@ -62,13 +63,12 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   }
 }
 
-TEST_CASE_METHOD(
-  sirius::test::GpuExecutionFixture,
-  "R2a certification budget counts in production mode and declines only under test flag",
-  "[scan][certificate][verdict][integration]")
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Certification budget counts in production mode and declines only under test flag",
+                 "[scan][certificate][verdict][integration]")
 {
-  run_ok("CREATE TABLE r2a_budget(i INTEGER)");
-  run_ok("INSERT INTO r2a_budget VALUES (1)");
+  run_ok("CREATE TABLE certification_budget(i INTEGER)");
+  run_ok("INSERT INTO certification_budget VALUES (1)");
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=false");
   for (bool decline : {false, true}) {
@@ -78,8 +78,8 @@ TEST_CASE_METHOD(
       run_ok(std::string("SET sirius_test_inject_certification_delay_ms=") + (time ? "51" : "0"));
       run_ok(std::string("SET sirius_test_inject_certification_bytes=") + (time ? "0" : "8388609"));
       run_ok("BEGIN TRANSACTION READ ONLY");
-      auto logical =
-        con->ExtractPlan("SELECT i FROM r2a_budget UNION ALL SELECT i FROM r2a_budget");
+      auto logical = con->ExtractPlan(
+        "SELECT i FROM certification_budget UNION ALL SELECT i FROM certification_budget");
       sirius::planner::sirius_physical_plan_generator generator(*con->context);
       auto before = sirius::test::get_transparent_execution_stats(*con);
       if (decline)
@@ -104,11 +104,11 @@ TEST_CASE_METHOD(
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R2a semantic lineage distinguishes export from semantic input",
+                 "Semantic lineage distinguishes export from semantic input",
                  "[scan][certificate][lineage][integration]")
 {
-  run_ok("CREATE TABLE r2a_lineage(a INTEGER, b INTEGER, c INTEGER)");
-  run_ok("INSERT INTO r2a_lineage VALUES (1,2,3),(4,5,6)");
+  run_ok("CREATE TABLE scan_lineage(a INTEGER, b INTEGER, c INTEGER)");
+  run_ok("INSERT INTO scan_lineage VALUES (1,2,3),(4,5,6)");
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=false");
   auto inspect = [&](std::string const& sql, bool expected) {
@@ -127,33 +127,33 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     CHECK(marked == expected);
     run_ok("ROLLBACK");
   };
-  inspect("SELECT b,a FROM r2a_lineage", false);
-  inspect("SELECT a+1 FROM r2a_lineage", true);
-  inspect("SELECT a FROM r2a_lineage WHERE b=2", true);
-  inspect("SELECT sum(b) FROM r2a_lineage GROUP BY a", true);
-  inspect("SELECT a FROM r2a_lineage ORDER BY b", true);
-  inspect("SELECT a FROM r2a_lineage LIMIT 1", false);
-  inspect("SELECT a FROM r2a_lineage UNION ALL SELECT b FROM r2a_lineage", false);
+  inspect("SELECT b,a FROM scan_lineage", false);
+  inspect("SELECT a+1 FROM scan_lineage", true);
+  inspect("SELECT a FROM scan_lineage WHERE b=2", true);
+  inspect("SELECT sum(b) FROM scan_lineage GROUP BY a", true);
+  inspect("SELECT a FROM scan_lineage ORDER BY b", true);
+  inspect("SELECT a FROM scan_lineage LIMIT 1", false);
+  inspect("SELECT a FROM scan_lineage UNION ALL SELECT b FROM scan_lineage", false);
   // A UNION common-type cast is evaluated in the branch projection, so its source input must be
   // semantic before the batch reaches the UNION forwarder.
-  inspect("SELECT a FROM r2a_lineage UNION ALL SELECT CAST(b AS BIGINT) FROM r2a_lineage", true);
+  inspect("SELECT a FROM scan_lineage UNION ALL SELECT CAST(b AS BIGINT) FROM scan_lineage", true);
   inspect(
-    "SELECT a FROM r2a_lineage UNION ALL SELECT b FROM r2a_lineage UNION ALL SELECT c FROM "
-    "r2a_lineage",
+    "SELECT a FROM scan_lineage UNION ALL SELECT b FROM scan_lineage UNION ALL SELECT c FROM "
+    "scan_lineage",
     false);
-  inspect("WITH q AS MATERIALIZED (SELECT * FROM r2a_lineage) SELECT a FROM q", true);
+  inspect("WITH q AS MATERIALIZED (SELECT * FROM scan_lineage) SELECT a FROM q", true);
   run_ok("SET sirius_test_lineage_unmodelled=true");
-  inspect("SELECT a FROM r2a_lineage", true);
+  inspect("SELECT a FROM scan_lineage", true);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R2a lineage follows reordered join outputs and pure-filter inputs",
+                 "Lineage follows reordered join outputs and pure-filter inputs",
                  "[scan][verdict][lineage][integration]")
 {
   // This direct ExtractPlan test needs the optimizer mask Sirius normally publishes at load.
   sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
-  run_ok("CREATE TABLE r2a_leaf(a INTEGER,b INTEGER,c INTEGER)");
-  run_ok("INSERT INTO r2a_leaf VALUES (1,2,3),(2,1,4)");
+  run_ok("CREATE TABLE lineage_leaf(a INTEGER,b INTEGER,c INTEGER)");
+  run_ok("INSERT INTO lineage_leaf VALUES (1,2,3),(2,1,4)");
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=false");
   auto inspect = [&](std::string const& sql, std::multiset<std::set<uint64_t>> expected) {
@@ -173,24 +173,25 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     CHECK(actual == expected);
     run_ok("ROLLBACK");
   };
-  inspect("SELECT c,a FROM r2a_leaf", {{}});
-  inspect("SELECT c FROM r2a_leaf WHERE b=2", {{1}});
-  inspect("SELECT c,a+1 FROM r2a_leaf", {{0}});
+  inspect("SELECT c,a FROM lineage_leaf", {{}});
+  inspect("SELECT c FROM lineage_leaf WHERE b=2", {{1}});
+  inspect("SELECT c,a+1 FROM lineage_leaf", {{0}});
   // Sort and TOP_N payloads must retain their physical type until host export.
-  inspect("SELECT c FROM r2a_leaf ORDER BY b", {{1, 2}});
-  inspect("SELECT c FROM r2a_leaf ORDER BY b LIMIT 1", {{1, 2}});
-  inspect("SELECT l.c,r.a FROM r2a_leaf l JOIN r2a_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
-  inspect("SELECT l.c,r.a+1 FROM r2a_leaf l JOIN r2a_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
-  inspect("SELECT l.c FROM r2a_leaf l WHERE EXISTS (SELECT 1 FROM r2a_leaf r WHERE r.b=l.a)",
-          {{0, 2}, {1}});
+  inspect("SELECT c FROM lineage_leaf ORDER BY b", {{1, 2}});
+  inspect("SELECT c FROM lineage_leaf ORDER BY b LIMIT 1", {{1, 2}});
+  inspect("SELECT l.c,r.a FROM lineage_leaf l JOIN lineage_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
+  inspect("SELECT l.c,r.a+1 FROM lineage_leaf l JOIN lineage_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
+  inspect(
+    "SELECT l.c FROM lineage_leaf l WHERE EXISTS (SELECT 1 FROM lineage_leaf r WHERE r.b=l.a)",
+    {{0, 2}, {1}});
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R2a budget cannot overwrite established unsupported verdict",
+                 "Budget cannot overwrite established unsupported verdict",
                  "[scan][verdict][integration]")
 {
-  run_ok("CREATE TABLE r2a_priority(i INTEGER)");
-  run_ok("INSERT INTO r2a_priority VALUES (1)");
+  run_ok("CREATE TABLE verdict_priority(i INTEGER)");
+  run_ok("INSERT INTO verdict_priority VALUES (1)");
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=false");
   run_ok("SET sirius_test_inject_scan_verdict='unsupported'");
@@ -198,7 +199,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("SET sirius_test_budget_declines=true");
   run_ok("BEGIN TRANSACTION READ ONLY");
   auto logical =
-    con->ExtractPlan("SELECT i FROM r2a_priority UNION ALL SELECT i FROM r2a_priority");
+    con->ExtractPlan("SELECT i FROM verdict_priority UNION ALL SELECT i FROM verdict_priority");
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   REQUIRE_THROWS_AS(generator.create_plan(std::move(logical)), scan_verdict_declined);
   auto const& entries = generator.read_views->entries();

@@ -20,9 +20,10 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 
@@ -57,7 +58,7 @@ struct validity_sidecar {
 /// outlive it.
 cudf::column_view strip_validity(cudf::column_view input,
                                  validity_sidecar& out,
-                                 rmm::cuda_stream_view stream,
+                                 ::cuda::stream_ref stream,
                                  rmm::device_async_resource_ref mr);
 
 /// Reattach @p v to a freshly decoded column. A no-op when @p v is all_valid.
@@ -65,7 +66,7 @@ cudf::column_view strip_validity(cudf::column_view input,
 /// is copied rather than moved.
 void attach_validity(cudf::column& col,
                      validity_sidecar const& v,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr);
 
 }  // namespace simpatico

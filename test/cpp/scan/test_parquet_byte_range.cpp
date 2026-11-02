@@ -30,6 +30,7 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -289,11 +290,12 @@ fs::path write_multi_row_group_parquet(fs::path const& dir,
   std::vector<std::int64_t> host(rows);
   std::iota(host.begin(), host.end(), 0);
   rmm::device_buffer data(host.data(), rows * sizeof(std::int64_t), stream);
-  auto column = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
-                                               static_cast<cudf::size_type>(rows),
-                                               std::move(data),
-                                               rmm::device_buffer{},
-                                               0);
+  auto column =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
+                                   static_cast<cudf::size_type>(rows),
+                                   std::move(data),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+                                   0);
   cudf::table_view table({column->view()});
   cudf::io::table_input_metadata metadata(table);
   metadata.column_metadata[0].set_name("a");

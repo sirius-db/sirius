@@ -25,6 +25,7 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <expression/ast/constant_range.hpp>
 #include <expression/ast/from_duckdb.hpp>
@@ -248,7 +249,7 @@ std::optional<sirius::numeric_range> to_decoded_bound(duckdb::Value const& value
   }
 
   if (!col_type.is_decimal() && !col_type.is_integer()) { return std::nullopt; }
-  // Wider decimals are int128-backed and never bitpack-planned.
+  // Wider decimals are int128-backed, and the range ballot compares in int64.
   if (col_type.is_decimal() &&
       col_type.decimal_precision() > sirius::logical_type::decimal_max_precision_int64) {
     return std::nullopt;
@@ -571,11 +572,22 @@ residual_filter::residual_filter(std::vector<table_filter_conjunct> conjuncts,
         "[residual_filter] a pushed-down filter conjunct cannot be lowered to Sirius AST: " +
         source.expr->ToString());
     }
+    std::vector<std::size_t> value_slots;
+    std::function<void(duckdb::Expression const&)> collect_slots = [&](auto const& expression) {
+      if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+        value_slots.push_back(static_cast<std::size_t>(
+          expression.template Cast<duckdb::BoundReferenceExpression>().Index()));
+      }
+      duckdb::ExpressionIterator::EnumerateChildren(expression, collect_slots);
+    };
+    collect_slots(*source.expr);
+    std::ranges::sort(value_slots);
+    value_slots.erase(std::ranges::unique(value_slots).begin(), value_slots.end());
     std::optional<std::size_t> answered_at;
     if (source.batch_position && answerable_batch_positions.count(*source.batch_position)) {
       answered_at = source.batch_position;
     }
-    _conjuncts.push_back({std::move(lowered), answered_at});
+    _conjuncts.push_back({std::move(lowered), answered_at, std::move(value_slots)});
   }
 }
 
@@ -584,27 +596,51 @@ std::unique_ptr<sirius::ast::node> residual_filter::against(
 {
   if (_conjuncts.empty()) { return nullptr; }
 
-  auto const answered = [&](std::optional<std::size_t> position) {
-    return position.has_value() &&
-           std::find(answered_positions.begin(), answered_positions.end(), *position) !=
-             answered_positions.end();
-  };
+  std::vector<predicate_progress> progress;
+  for (std::size_t i = 0; i < _conjuncts.size(); ++i) {
+    auto const position = _conjuncts[i].answered_at;
+    if (position && std::find(answered_positions.begin(), answered_positions.end(), *position) !=
+                      answered_positions.end()) {
+      progress.push_back({i,
+                          answers_enforced ? predicate_stage::enforced : predicate_stage::answer,
+                          answers_enforced ? std::nullopt : position});
+    }
+  }
+  return against_progress(progress);
+}
 
+std::unique_ptr<sirius::ast::node> residual_filter::against_progress(
+  std::span<predicate_progress const> progress) const
+{
+  std::vector<predicate_progress const*> by_id(_conjuncts.size(), nullptr);
+  for (auto const& item : progress) {
+    if (item.conjunct >= by_id.size() || by_id[item.conjunct])
+      throw std::invalid_argument("residual progress has an unknown or duplicate conjunct");
+    if (item.stage != predicate_stage::untouched && item.stage != predicate_stage::pruning_only &&
+        item.stage != predicate_stage::answer && item.stage != predicate_stage::enforced)
+      throw std::invalid_argument("unknown residual predicate stage");
+    if ((item.stage == predicate_stage::answer) != item.answer_slot.has_value())
+      throw std::invalid_argument("residual answer requires exactly one answer slot");
+    if (item.answer_slot && _conjuncts[item.conjunct].answered_at != item.answer_slot)
+      throw std::invalid_argument("residual answer is not bound to this conjunct");
+    by_id[item.conjunct] = &item;
+  }
   std::vector<std::unique_ptr<sirius::ast::node>> children;
-  children.reserve(_conjuncts.size());
-  for (auto const& conjunct : _conjuncts) {
-    if (answered(conjunct.answered_at)) {
-      // The decode already dropped the rows this conjunct rejects, so asking
-      // again would be redundant work on a condition that cannot be false.
-      if (answers_enforced) { continue; }
-      // Otherwise the column IS the answer — a BOOL8 result, not values — so
-      // reference it. Re-running the comparison would test a mask against the
-      // original constant.
+  for (std::size_t i = 0; i < _conjuncts.size(); ++i) {
+    auto const* item = by_id[i];
+    if (item && item->stage == predicate_stage::enforced) continue;
+    if (item && item->stage == predicate_stage::answer) {
       children.push_back(std::make_unique<sirius::ast::node>(
-        sirius::ast::reference{static_cast<std::uint32_t>(*conjunct.answered_at),
+        sirius::ast::reference{static_cast<std::uint32_t>(*item->answer_slot),
                                sirius::logical_type::make(sirius::type_id::BOOLEAN)}));
     } else {
-      children.push_back(sirius::ast::clone(*conjunct.comparison));
+      for (auto const& other : progress) {
+        if (!other.answer_slot) continue;
+        if (std::ranges::find(_conjuncts[i].value_slots, *other.answer_slot) !=
+            _conjuncts[i].value_slots.end())
+          throw std::invalid_argument("residual value was replaced by another conjunct's answer");
+      }
+      children.push_back(sirius::ast::clone(*_conjuncts[i].comparison));
     }
   }
 

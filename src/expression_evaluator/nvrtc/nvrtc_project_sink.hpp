@@ -27,6 +27,7 @@
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/nvrtc/boundary_column_map.hpp>
+#include <expression_evaluator/nvrtc/translation_context.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -77,10 +78,9 @@ struct sink_options {
   boundary_column_map const* boundary_map{
     nullptr};  ///< Pre-evaluated Materialization Boundary nodes mapped to synthetic column
                ///< indices in the input, or null when the input is the original table.
-  bool like_swar_fastpath{false};  ///< Whether constant `%lit%...%` patterns may use the SWAR
-                                   ///< matcher (the `like_swar_fastpath` setting), and the
-                                   ///< query-owned classification cache to consult.
-  like_multiliteral_cache const* like_cache{nullptr};  ///< The query-owned classification cache.
+  bool like_swar_fastpath{false};   ///< Whether constant `%lit%...%` patterns may use the SWAR
+                                    ///< matcher (the `like_swar_fastpath` setting).
+  like_classifier classify_like{};  ///< The evaluator's memoized pattern classification.
 };
 
 /** @brief Result of @c evaluate_project_sink. */

@@ -144,9 +144,8 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
-  size_t offset, size_t size, cudf_datasource_stream_t stream_arg)
+  size_t offset, size_t size, ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   rmm::device_buffer buf(size, stream);
   auto n = device_read(offset, size, reinterpret_cast<uint8_t*>(buf.data()), stream);
   n      = std::min(n, size);
@@ -157,9 +156,8 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
 size_t sirius_datasource::device_read(size_t offset,
                                       size_t size,
                                       uint8_t* dst,
-                                      cudf_datasource_stream_t stream_arg)
+                                      ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();
   stream.sync();
@@ -169,9 +167,8 @@ size_t sirius_datasource::device_read(size_t offset,
 std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
-                                                         cudf_datasource_stream_t stream_arg)
+                                                         ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   return bridge_semi_to_std([&] {
     if (uses_prefetching_cache()) {
       auto* cache = _io_ctx->cache();
@@ -259,28 +256,29 @@ prepare_result sirius_datasource::prepare_prefetch(bool wait_for_eviction)
   return prepare_result::nothing_to_prepare;
 }
 
-prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
+prefetch_refusal sirius_datasource::prefetch_async(
+  exec::invocable<void(cache::prefetch_result) noexcept> on_done)
 {
   if (!_cache_handle || !uses_prefetching_cache()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::no_cache;
   }
 
   if (_cache_handle.has_started_reading()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::consumer_ahead;
   }
 
   auto const producer = _cache_handle.producer_state();
   if (producer == cache::producer_stage::abandoned) {
-    on_done(false);
+    on_done({});
     // Allocation pressure no longer abandons a request: prepare() leaves it
     // queued so readahead can evict and retry.  An abandoned request therefore
     // lost the race with its consumer (or was cancelled), not its buffers.
     return prefetch_refusal::other;
   }
   if (producer < cache::producer_stage::prepared) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::other;
   }
   if (_io_ctx->cache()->prefetch(_cache_handle, std::move(on_done))) {
