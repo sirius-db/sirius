@@ -62,7 +62,8 @@ std::shared_ptr<const telemetry_context> telemetry_context::create(
 telemetry_context::telemetry_context(quent::Context&& context,
                                      const telemetry_config& config,
                                      const cucascade::memory::memory_reservation_manager* manager)
-  : engine_name_(config.engine_name),
+  : enabled_(config.enable_quent),
+    engine_name_(config.engine_name),
     context_(std::move(context)),
     engine_handle_(context_.engine_observer()->handle()),
     worker_handle_(context_.worker_observer()->handle()),

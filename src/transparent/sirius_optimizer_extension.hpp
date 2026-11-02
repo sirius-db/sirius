@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "telemetry/query_activity.hpp"
+
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
@@ -64,6 +66,8 @@ bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::Log
 /// \param plan     The plan to copy. Not consumed.
 /// \param context  DuckDB client context for \c LogicalOperator::Copy.
 [[nodiscard]] duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(
-  duckdb::LogicalOperator const& plan, duckdb::ClientContext& context);
+  duckdb::LogicalOperator const& plan,
+  duckdb::ClientContext& context,
+  std::optional<telemetry::query_activity::id_type> parent = std::nullopt);
 
 }  // namespace sirius::transparent

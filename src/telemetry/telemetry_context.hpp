@@ -96,6 +96,7 @@ class telemetry_context {
   {
     return shared_thread_group_handle_.id();
   }
+  [[nodiscard]] bool enabled() const noexcept { return enabled_; }
   [[nodiscard]] const quent::Context& context() const { return context_; }
   [[nodiscard]] const std::shared_ptr<const memory_context>& get_memory_context() const
   {
@@ -135,6 +136,7 @@ class telemetry_context {
     return *fallback_gpu_device_handles_;
   }
 
+  bool enabled_;
   std::string engine_name_;
   quent::Context context_;
 

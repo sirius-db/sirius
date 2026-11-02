@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
 quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb", features = ["serde"] }
 quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb", default-features = false, features = ["io-ndjson"] }
 serde = { version = "1", features = ["derive"] }
@@ -14,3 +15,12 @@ smallvec = "1"
 quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
 quent-store-build = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
 quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
+quent-schema = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
+quent-fsm = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
+quent-resource = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
+heck = "0.5"
+proc-macro2 = "1"
+quote = "1"
+serde_json = "1"
+syn = { version = "2", features = ["full"] }
+prettyplease = "0.2"

@@ -43,6 +43,10 @@ class sirius_engine;
 class sirius_prepared_statement_data;
 }  // namespace sirius
 
+namespace sirius::telemetry {
+class query_observer;
+}
+
 namespace sirius::exec {
 
 struct stream_input_spec {
@@ -177,6 +181,7 @@ class streaming_fragment {
   duckdb::shared_ptr<sirius::sirius_prepared_statement_data> _result_plan;
   duckdb::unique_ptr<duckdb::QueryResult> _result;
   duckdb::unique_ptr<op::sirius_physical_operator> _plan_root;
+  std::unique_ptr<telemetry::query_observer> _observer;
   std::unique_ptr<sirius::sirius_engine> _engine;
   stream_session _session;
 

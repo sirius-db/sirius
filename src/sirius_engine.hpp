@@ -32,7 +32,7 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry-bridge/gen/query.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
-#include "telemetry/telemetry_context.hpp"
+#include "telemetry/query_observer.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 
@@ -60,11 +60,11 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  /// @p query_label and @p session_label name the query and its session in telemetry.
+  /// Borrows the invocation observer, which must outlive this engine.
+  /// @pre observer has not been moved from.
   sirius_engine(duckdb::ClientContext& context,
                 sirius::query_id_t query_id,
-                const std::optional<std::string>& query_label   = std::nullopt,
-                const std::optional<std::string>& session_label = std::nullopt);
+                telemetry::query_observer& observer);
   ~sirius_engine();
 
   /// \brief The query_id this engine belongs to.
@@ -124,8 +124,7 @@ class sirius_engine {
   /// (in sirius_interface::cleanup_internal) before the query's cleanup drains the task queues,
   /// so a task still unwinding must be able to report without touching freed memory.
   std::shared_ptr<pipeline::completion_handler> completion_handler_;
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
-  quent::DynamicFsmHandle<quent::Query> query_handle_;
+  telemetry::query_observer& observer_;
 };
 
 }  // namespace sirius
