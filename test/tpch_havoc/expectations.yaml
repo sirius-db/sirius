@@ -14,11 +14,6 @@
 
 expectations:
   - outcome: plan_rejected
-    reason: Aggregate FILTER not supported on GPU
-    issue: 2285
-    queries: [Q16_V07]
-
-  - outcome: plan_rejected
     reason: Window not supported
     issue: 1745
     queries: [Q02_V07, Q02_V09, Q03_V09, Q04_V09, Q05_V09, Q06_V09, Q07_V09, Q08_V09, Q09_V09,

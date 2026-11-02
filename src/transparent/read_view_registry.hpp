@@ -109,6 +109,9 @@ class read_view_registry {
   }
   [[nodiscard]] std::vector<candidate_binding> candidate_bindings() const;
   void record_verdict(op::scan::scan_contract_id id, op::scan::certification_result const& result);
+  // Trusted planning only, before correspondence is published or dispatch begins.
+  void bind_split_validator(op::scan::scan_contract_id,
+                            std::shared_ptr<op::scan::split_validator const>);
   // Returns true only for the first refusal of this LogicalGet in this query.
   bool record_declined_lookup(duckdb::LogicalGet const&, planner::lookup_decline);
   [[nodiscard]] auto const& declined_lookups() const noexcept { return declined_lookups_; }

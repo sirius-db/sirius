@@ -184,7 +184,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
       return finish_scalar(std::move(scalar), mode);
     }
     default:
-      throw not_implemented_exception("[expression_evaluator] Unsupported scalar type: %s",
+      throw not_implemented_exception("[expression_evaluator] Unsupported scalar type: {}",
                                       alt.return_type().to_string());
   }
 }

@@ -86,4 +86,23 @@ class scan_byte_ranges_state : public duckdb::ClientContextState {
 [[nodiscard]] std::map<std::string, std::vector<scan_byte_range>> extract_scan_byte_ranges(
   const std::string& plan_bytes);
 
+/// LocalFiles and Iceberg inputs needed by an embedding context before DuckDB binding,
+/// gathered in one parse.
+struct scan_plan_inputs {
+  /// Local byte-range attribution; remote ranges are never returned here.
+  std::map<std::string, std::vector<scan_byte_range>> byte_ranges;
+  /// Canonical remote LocalFiles paths (uri_file or uri_path) and raw non-empty
+  /// iceberg_table.direct.metadata_uri values, in first-encounter order with duplicates removed.
+  /// A local metadata path does not prove that its data files are local. Empty metadata URIs
+  /// are left to the consumer's validation. A nonempty inventory must be refused before
+  /// binding or using byte_ranges; the direct extractor retains its range-validation policy.
+  std::vector<std::string> remote_paths;
+};
+
+/// Parse LocalFiles and Iceberg inputs once for the embedding pre-pass. A nonempty remote_paths
+/// inventory must be refused by the caller before binding or using byte_ranges.
+/// Local-only plans retain extract_scan_byte_ranges validation; the direct extractor
+/// separately retains its remote-range refusal.
+[[nodiscard]] scan_plan_inputs inspect_scan_plan_inputs(const std::string& plan_bytes);
+
 }  // namespace sirius::planner

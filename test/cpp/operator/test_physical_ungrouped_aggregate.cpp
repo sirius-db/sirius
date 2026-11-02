@@ -20,6 +20,10 @@
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 
+#include <cudf/lists/lists_column_view.hpp>
+#include <cudf/structs/structs_column_view.hpp>
+
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -492,4 +496,100 @@ TEST_CASE("FIRST skips empty partials and preserves a real NULL",
   if (scenario < 2 || scenario == 6) REQUIRE(copy_column_to_host<int64_t>(view.column(0))[0] == 42);
   REQUIRE(copy_column_to_host<int64_t>(view.column(1))[0] ==
           ((scenario == 2 || scenario == 3 || scenario == 7) ? 0 : 1));
+}
+
+TEMPLATE_TEST_CASE("Empty scalar aggregates reserve memory for every partial result",
+                   "[ungrouped_aggregate][empty_aggregate_budget]",
+                   double,
+                   string_tag)
+{
+  using Traits = gpu_type_traits<TestType>;
+  std::string scenario;
+  if constexpr (std::is_same_v<TestType, double>) {
+    scenario = GENERATE("sum", "count", "first", "avg", "stddev_samp", "mixed");
+  } else {
+    scenario = GENERATE("first", "min", "max", "count_distinct");
+  }
+  auto n = GENERATE(std::size_t{1}, std::size_t{3});
+  CAPTURE(scenario, n);
+  std::vector<std::string> names =
+    scenario == "mixed"
+      ? std::vector<std::string>{"sum", "count", "first", "avg", "stddev_samp"}
+      : std::vector<std::string>{scenario == "count_distinct" ? "count" : scenario};
+  auto defs = sirius::test::create_aggregate_expressions<Traits>(
+    {}, names, std::vector<std::size_t>(names.size(), 0));
+  if (scenario == "count_distinct") {
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
+    auto function = MakeDummyAggregate("count", {Traits::logical_type()}, LogicalType::BIGINT);
+    BoundAggregateExpression expression(duckdb::BoundAggregateFunction(function),
+                                        std::move(children),
+                                        nullptr,
+                                        nullptr,
+                                        AggregateType::DISTINCT);
+    defs.aggregates[0] = sirius::ast::from_duckdb(expression);
+  }
+  sirius_physical_ungrouped_aggregate local(std::move(defs.output_types),
+                                            std::move(defs.aggregates),
+                                            1,
+                                            duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto estimate = local.no_history_peak_memory_estimate({n, 0});
+  REQUIRE(estimate > 0);
+  std::vector<std::shared_ptr<data_batch>> batches;
+  for (std::size_t i = 0; i < n; ++i) {
+    if constexpr (std::is_same_v<TestType, double>) {
+      batches.push_back(make_numeric_batch<double>(*space, {}, cudf::type_id::FLOAT64));
+    } else {
+      batches.push_back(make_string_batch(*space, {}));
+    }
+  }
+  auto reservation = space->make_reservation_or_null(estimate);
+  REQUIRE(reservation);
+  auto* allocator =
+    reservation->template get_memory_resource_as<reservation_aware_resource_adaptor>();
+  REQUIRE(allocator);
+  REQUIRE(
+    allocator->attach_reservation_to_tracker(default_stream(),
+                                             std::move(reservation),
+                                             std::make_unique<fail_reservation_limit_policy>(),
+                                             nullptr));
+  absl::Cleanup reset = [allocator]() { allocator->reset_stream_reservation(default_stream()); };
+  auto result         = local.execute(pipelineable_operator_data(batches), default_stream());
+  auto const& outputs = dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches();
+  REQUIRE(outputs.size() == n);
+  for (auto const& batch : outputs) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_rows() == 1);
+    REQUIRE(view.num_columns() == local.get_local_output_types().size());
+    cudf::size_type index = 0;
+    for (auto const& name : names) {
+      auto column = view.column(index++);
+      if (scenario == "count_distinct") {
+        REQUIRE(column.type().id() == cudf::type_id::LIST);
+        CHECK(cudf::lists_column_view(column).child().size() == 0);
+      } else if (name == "count") {
+        CHECK(column.null_count() == 0);
+        CHECK(copy_column_to_host<int64_t>(column)[0] == 0);
+      } else if (name == "stddev_samp") {
+        REQUIRE(column.type().id() == cudf::type_id::STRUCT);
+        cudf::structs_column_view state(column);
+        REQUIRE(state.num_children() == 3);
+        CHECK(state.get_sliced_child(0).null_count() == 0);
+        CHECK(copy_column_to_host<int64_t>(state.get_sliced_child(0))[0] == 0);
+        CHECK(state.get_sliced_child(1).null_count() == 1);
+        CHECK(state.get_sliced_child(2).null_count() == 1);
+      } else {
+        CHECK(column.null_count() == 1);
+        if (name == "first" || name == "avg") {
+          auto count = view.column(index++);
+          CHECK(count.null_count() == 0);
+          CHECK(copy_column_to_host<int64_t>(count)[0] == 0);
+        }
+      }
+    }
+    CHECK(index == view.num_columns());
+  }
 }

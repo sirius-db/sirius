@@ -21,7 +21,9 @@
 #include "scan_manager/preparation_stop_token.hpp"
 
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
+#include <utility>
 
 namespace sirius::scan_manager {
 struct preparation_unit_requirement {
@@ -53,6 +55,18 @@ class preparation_job {
   preparation_job(F&& work, Requirement requirement) : preparation_job(std::forward<F>(work))
   {
     this->requirement = requirement;
+  }
+  // Transform the raw result before run() settles the admitted unit. Keep admission,
+  // dependency completion and failure reporting on this job, including mapper failures.
+  template <typename F>
+  preparation_job map_output(F&& transform) &&
+  {
+    if (!operation_) throw std::logic_error("preparation job already consumed");
+    operation_ = [operation = std::move(operation_), fn = std::forward<F>(transform)](
+                   preparation_stop_token stop) mutable -> std::unique_ptr<op::scan::scan_info> {
+      return fn(operation(stop));
+    };
+    return std::move(*this);
   }
   std::unique_ptr<op::scan::scan_info> run(preparation_stop_token stop);
   std::optional<preparation_unit_requirement> requirement;
