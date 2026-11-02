@@ -26,12 +26,12 @@ records:
 
 entities:
   QueryActivityTrack:
-    doc: A query activity timeline lane; never a GPU execution resource.
+    doc: A query-owned resource shared by its activity intervals.
     resource: true
     events:
       declaration:
         attributes:
-          activity_id: { scope-ref: QueryActivity }
+          query_id: { scope-ref: Query }
           label: string
 
   QueryDetails:

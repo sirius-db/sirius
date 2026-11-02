@@ -201,7 +201,7 @@ operator filter excludes them.
 `families.rs` registers the finalized families' resource, reference-tree and FSM
 capabilities. Registration supplies lookup, iteration, declarations and the
 pinned listing API's typed dispatch. It does not ingest or finalize entities:
-metadata revisions, incomplete traces, parent/query checks and source-reference
+metadata revisions, incomplete traces, parent/query checks and resource ownership
 validation remain explicit. Scoped views and listing share the same FSM
 ownership policy.
 
@@ -213,31 +213,17 @@ the existing data-batch diagram remains a compatibility declaration. Activity
 state aliases (`working`/`waiting`), legacy attribute order, instance names,
 parents and derived task attributes remain explicit application policies.
 
-`presentation.rs` contains the pinned viewer adapters. Preparation lane
-membership is selected by query identity, independently of resource claims;
-nested and overlapping activities remain separate members with their recorded
-parent IDs and timestamps. The old viewer requests intervals through resource
-rows, so the adapter still projects activity usages onto one synthetic
-`query_activity_track`. These projected claims are display intervals, not
-measurements of exclusive resource utilization. Original producer track
-references are retained and validated before projection. The same module adapts
-a planless query to the viewer's required root plan; the analyzed model remains
-planless.
+The query observer lazily declares one query-owned `QueryActivityTrack` resource,
+labelled Preparation, when its first activity starts. All activities reference that
+resource directly. The analyzer validates query ownership and extends the resource's
+time bounds from its activities. Nested usages are ordinary overlapping resource
+usages: their aggregate counts active intervals, not CPU utilization. There is no
+synthetic resource or track rewriting, and the previous per-activity track schema is
+not supported.
 
-The following consumer changes remain upstream work, not implemented here:
-
-- Add a presentation-lane descriptor and a request for its members, separate
-  from the resource-utilization API. The Preparation descriptor uses query
-  identity; members retain nesting and recorded times. Once supported by the
-  pinned viewer, replace untyped resource-row inference with lane requests.
-- Allow a query bundle to represent an absent plan and show lifecycle details
-  and timelines with an empty plan panel. Preserve normal validation and
-  rendering for queries with real plans.
-- Migrate producers away from per-activity tracks only after supported
-  consumers use the lane API. Keep a versioned old-trace adapter and original
-  source-reference validation for traces that contain those tracks. Remove
-  the synthetic lane and plan projections only when these consumer contracts
-  are established.
+`presentation.rs` only adapts planless queries to the pinned viewer's required root
+plan. The analyzed model remains planless. Removing this adapter requires viewer
+support for an absent plan; activity resources need no Quent version change.
 
 The response-matrix regression test covers listing filters, paging, query
 isolation, resource and resource-group timelines, and planless bundles. Set
@@ -327,18 +313,18 @@ duration), grouped and sortable, to, for example, quickly find the most expensiv
 outer query UUID. Each invocation of a phase gets a fresh activity ID; optional parent
 IDs describe nesting, while generation and execution-window fields correlate the
 interval with preparation and admission. They are separate from GPU tasks and operators.
-The viewer projects all of a query's activities onto one **Preparation** lane. Expand
-that lane to see the named steps as compact Gantt bars, like the operator timeline;
+All of a query's activities use its **Preparation** resource. Expand
+that resource to see the named steps as compact Gantt bars, like the operator timeline;
 overlapping and nested intervals stack within that chart. Repeated phases remain separate
 bars, and parent IDs, waits, and outcomes remain available in the activity details.
-The analyzer validates recorded per-activity track references before mapping them
-to the shared presentation lane. This projection adds no GPU operators or tasks.
+The analyzer validates that each activity references a resource owned by its query.
+No GPU operators or tasks are added.
 
 Each interval's `working` or `waiting` state runs from the recorded Started timestamp to
 Finished. Click an interval to inspect its phase, kind, correlations, and recorded
 outcome. Parent durations are inclusive: do not add them to child durations. No timing
 is inferred from phase names or callback order. Planning-only queries have the same
-Preparation lane, even when they have no execution plan.
+Preparation resource, even when they have no execution plan.
 
 Scoped cleanup closes an interval on normal return or exception (`success` or `failed`).
 Query completion closes any remaining intervals with the available terminal outcome;

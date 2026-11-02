@@ -1335,6 +1335,14 @@ fn query_list_visibility_uses_the_final_snapshot_not_any_previous_label() {
 fn activity_fixture() -> Vec<Event<E>> {
     let mut events = planless_fixture();
     events.push(ev(4, 10, E::Query(s::QueryEvent::Finished { seq: 1 })));
+    events.push(ev(
+        101,
+        1,
+        E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
+            query_id: EntityRef::new(id(4), ()),
+            label: "Preparation".into(),
+        }),
+    ));
     for (n, parent, kind, start, end, outcome) in [
         (100, None, "work", 1, Some(8), "success"),
         (102, Some(100), "wait", 4, Some(7), "success"),
@@ -1342,21 +1350,13 @@ fn activity_fixture() -> Vec<Event<E>> {
         (106, Some(100), "work", 5, None, "success"),
     ] {
         events.push(ev(
-            n + 1,
-            start,
-            E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
-                activity_id: EntityRef::new(id(n), ()),
-                label: "copy".into(),
-            }),
-        ));
-        events.push(ev(
             n,
             start,
             E::QueryActivity(s::QueryActivityEvent::Started {
                 seq: 0,
                 query_id: EntityRef::new(id(4), ()),
                 parent_activity_id: parent.map(|n| EntityRef::new(id(n), ())),
-                track: EntityRef::new(id(n + 1), s::QueryActivityTrackUsage {}),
+                track: EntityRef::new(id(101), s::QueryActivityTrackUsage {}),
                 phase: "copy".into(),
                 kind: kind.into(),
                 planning_generation: Some(7),
@@ -1391,7 +1391,7 @@ fn activity_fixture() -> Vec<Event<E>> {
             301,
             1,
             E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
-                activity_id: EntityRef::new(id(300), ()),
+                query_id: EntityRef::new(id(200), ()),
                 label: "other".into(),
             }),
         ),
@@ -1435,8 +1435,8 @@ fn nested_query_activities_render_without_execution_and_keep_repeated_phases() {
     let bundle = analyzer.query_bundle(id(4)).unwrap();
     assert!(analyzer.model.plans.is_empty());
     assert_eq!(analyzer.model.activities.len(), 4);
-    let track_id = crate::presentation::PreparationLane::new(id(4)).id();
-    let other_track_id = crate::presentation::PreparationLane::new(id(200)).id();
+    let track_id = id(101);
+    let other_track_id = id(301);
     assert_ne!(track_id, other_track_id);
     let view = analyzer.model.query_view(id(4)).unwrap();
     let tree = view.resource_tree().unwrap();
@@ -1560,8 +1560,8 @@ fn mixed_fsm_response_matrix() {
             .filter(|event| event.id.as_u128() >= 100),
     );
     let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
-    let lane = crate::presentation::PreparationLane::new(id(4)).id();
-    let foreign_lane = crate::presentation::PreparationLane::new(id(200)).id();
+    let lane = id(101);
+    let foreign_lane = id(301);
     let mut payloads = vec![
         serde_json::to_value(analyzer.query_bundle(id(4)).unwrap()).unwrap(),
         serde_json::to_value(analyzer.query_bundle(id(200)).unwrap()).unwrap(),
@@ -1768,8 +1768,7 @@ fn registered_capabilities_agree_on_lookup_iteration_and_query_scope() {
 }
 
 #[test]
-fn preparation_lane_membership_and_source_validation_remain_separate() {
-    use crate::presentation::PreparationLane;
+fn activity_resources_validate_query_ownership() {
     use quent_analyzer::AnalyzerError;
     let analyzer = SiriusUiAnalyzer::try_new(id(1), activity_fixture().into_iter()).unwrap();
     let view = analyzer.model.query_view(id(4)).unwrap();
@@ -1777,8 +1776,8 @@ fn preparation_lane_membership_and_source_validation_remain_separate() {
         let fsm = crate::fsms::FsmRef::Activity(activity);
         use quent_analyzer::resource::Usage;
         for usage in fsm.usages() {
-            assert_eq!(usage.resource_id(), PreparationLane::new(id(4)).id());
-            assert_ne!(usage.resource_id(), PreparationLane::new(id(200)).id());
+            assert_eq!(usage.resource_id(), id(101));
+            assert_ne!(usage.resource_id(), id(301));
         }
     }
     let mut members: Vec<_> = analyzer
@@ -1810,17 +1809,17 @@ fn preparation_lane_membership_and_source_validation_remain_separate() {
             for event in &mut events {
                 if event.id == id(101)
                     && let E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
-                        activity_id,
+                        query_id,
                         ..
                     }) = &mut event.data
                 {
-                    activity_id.target = id(104);
+                    query_id.target = id(200);
                 }
             }
         }
         assert!(
             matches!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()),
-            Err(AnalyzerError::Validation(message)) if message == "query activity has no matching track")
+            Err(AnalyzerError::Validation(message)) if message == "query activity has no matching query resource")
         );
     }
     // A child cannot cross a query boundary through its parent, even if that
