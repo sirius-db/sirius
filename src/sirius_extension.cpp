@@ -673,7 +673,13 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         gpu_error.Throw();
       }
       if (!duckdb_fallback_enabled(context)) {
-        throw std::runtime_error("SiriusExecuteQuery error: " + gpu_error.RawMessage());
+        // Match transparent execution: keep ordinary types, but do not let a GPU
+        // INTERNAL/FATAL error invalidate the database.
+        if (gpu_error.Type() == ExceptionType::INTERNAL ||
+            gpu_error.Type() == ExceptionType::FATAL) {
+          throw ExecutorException("SiriusExecuteQuery error: " + gpu_error.RawMessage());
+        }
+        gpu_error.Throw("SiriusExecuteQuery error: ");
       }
       // Check the bound sources before entering CPU replay. The helper below
       // retains its existing SQL-text check as an additional S3 signal.

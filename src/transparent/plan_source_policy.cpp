@@ -19,6 +19,7 @@
 #include "planner/connector_registry.hpp"
 #include "sirius_sql_rewrite.hpp"
 
+#include <duckdb/common/error_data.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -189,7 +190,13 @@ void require_non_s3_cpu_replay(plan_source_policy const& policy, std::string con
     } catch (duckdb::InterruptException const&) {
       throw;
     } catch (std::exception const& error) {
-      discovery_message = error.what();
+      duckdb::ErrorData discovery(error);
+      if (discovery.Type() != duckdb::ExceptionType::INVALID || !discovery.ExtraInfo().empty()) {
+        // The type controls DuckDB transaction invalidation, not just diagnostics.
+        discovery.Throw("CPU fallback is not supported. Underlying GPU error: " + gpu_error +
+                        ". Source discovery failed: ");
+      }
+      discovery_message = discovery.RawMessage();
     } catch (...) {
       discovery_message = "non-standard exception";
     }

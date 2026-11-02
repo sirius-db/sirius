@@ -66,12 +66,13 @@ duckdb::unique_ptr<duckdb::LogicalGet> file_scan(std::string name, std::string p
 struct non_standard_discovery_error {};
 
 struct throwing_list final : duckdb::SimpleMultiFileList {
-  explicit throwing_list(bool non_standard = false)
-    : SimpleMultiFileList({}), non_standard(non_standard)
+  explicit throwing_list(bool non_standard = false, bool catalog = false)
+    : SimpleMultiFileList({}), non_standard(non_standard), catalog(catalog)
   {
   }
   [[noreturn]] void fail() const
   {
+    if (catalog) throw duckdb::CatalogException("inventory catalog entry missing");
     if (non_standard) throw non_standard_discovery_error{};
     throw std::runtime_error("inventory extraction failed");
   }
@@ -81,6 +82,7 @@ struct throwing_list final : duckdb::SimpleMultiFileList {
   duckdb::OpenFileInfo GetFile(duckdb::idx_t) const override { fail(); }
 
   bool non_standard;
+  bool catalog;
 };
 
 struct external_child_operator final : duckdb::PhysicalOperator {
@@ -200,6 +202,32 @@ TEST_CASE("Source policy does not wrap retained interrupts", "[transparent][poli
   policy.discovery_error    = std::make_exception_ptr(duckdb::InterruptException());
   REQUIRE_THROWS_AS(require_cpu_replay(policy, "", "GPU scan unsupported"),
                     duckdb::InterruptException);
+}
+
+TEST_CASE("Source policy preserves DuckDB error types and metadata", "[transparent][policy]")
+{
+  for (auto type : {duckdb::ExceptionType::CATALOG,
+                    duckdb::ExceptionType::BINDER,
+                    duckdb::ExceptionType::INVALID_INPUT,
+                    duckdb::ExceptionType::INVALID,
+                    duckdb::ExceptionType::OUT_OF_MEMORY}) {
+    CAPTURE(type);
+    plan_source_policy policy;
+    policy.discovery_complete = false;
+    policy.discovery_error    = std::make_exception_ptr(
+      duckdb::Exception({{"position", "7"}}, type, "typed discovery failure"));
+    duckdb::ErrorData error;
+    try {
+      require_cpu_replay(policy, "", "GPU scan unsupported");
+    } catch (std::exception const& ex) {
+      error = duckdb::ErrorData(ex);
+    }
+    REQUIRE(error.HasError());
+    CHECK(error.Type() == type);
+    CHECK(error.ExtraInfo().at("position") == "7");
+    CHECK(error.RawMessage().find("typed discovery failure") != std::string::npos);
+    CHECK(error.RawMessage().find("GPU scan unsupported") != std::string::npos);
+  }
 }
 
 TEST_CASE("Source policy visits physical GetChildren and forbids a failed walk",
@@ -604,6 +632,7 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
                                       : "inventory extraction failed") != std::string::npos);
     } else if (!fallback) {
       CHECK(result->GetError().find("SiriusExecuteQuery error:") != std::string::npos);
+      CHECK(result->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
     }
   }
   auto after = context->get_transparent_execution_stats();
@@ -717,6 +746,72 @@ TEST_CASE("Transparent finalize preserves GPU errors before incomplete-source ve
       CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
       fixture.run_ok("SELECT 1");
     }
+  }
+}
+
+TEST_CASE("Discovery catalog errors preserve the open transaction at the query boundary",
+          "[integration][policy][discovery_transaction]")
+{
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con             = *fixture.con;
+  auto const name       = "catalog_discovery_" + fixture.attach_alias;
+  precedence_bind_count = 0;
+  duckdb::ExtensionLoader loader(*con.context->db, "catalog_discovery_test");
+  loader.RegisterFunction(duckdb::TableFunction(
+    duckdb::Identifier(name),
+    {},
+    [](duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) {
+      FAIL("CPU source must not execute");
+    },
+    [](duckdb::ClientContext&,
+       duckdb::TableFunctionBindInput&,
+       duckdb::vector<duckdb::LogicalType>& types,
+       duckdb::vector<duckdb::Identifier>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
+      if (++precedence_bind_count > 1)
+        throw duckdb::NotImplementedException("catalog source GPU replan refused");
+      types           = {duckdb::LogicalType::INTEGER};
+      names           = {"id"};
+      auto bind       = duckdb::make_uniq<duckdb::MultiFileBindData>();
+      bind->types     = types;
+      bind->names     = names;
+      bind->file_list = duckdb::make_shared_ptr<throwing_list>(false, true);
+      return std::move(bind);
+    }));
+  fixture.run_ok("SET gpu_execution = false");
+  fixture.run_ok("SET enable_duckdb_fallback = true");
+  fixture.run_ok("CREATE TEMP TABLE discovery_transaction_rows(id INTEGER)");
+  for (auto const* policy :
+       {"SYNTACTIC_ERRORS_DO_NOT_INVALIDATE", "ALL_ERRORS_INVALIDATE_TRANSACTION"}) {
+    CAPTURE(policy);
+    fixture.run_ok(std::string("SET default_transaction_invalidation_policy = '") + policy + "'");
+    fixture.run_ok("BEGIN");
+    fixture.run_ok("INSERT INTO discovery_transaction_rows VALUES (42)");
+    fixture.run_ok("SET gpu_execution = true");
+    precedence_bind_count = 0;
+    duckdb::unique_ptr<duckdb::QueryResult> result;
+    REQUIRE_NOTHROW(result = con.Query("SELECT * FROM " + name + "()"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(precedence_bind_count >= 2);
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::CATALOG);
+    CHECK(result->GetError().find("inventory catalog entry missing") != std::string::npos);
+    CHECK(result->GetError().find("catalog source GPU replan refused") != std::string::npos);
+    auto next = con.Query("SELECT count(*) FROM discovery_transaction_rows");
+    REQUIRE(next);
+    if (std::string_view(policy) == "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE") {
+      REQUIRE_FALSE(next->HasError());
+      CHECK(next->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
+      fixture.run_ok("COMMIT");
+    } else {
+      CHECK(next->HasError());
+      CHECK(next->GetErrorType() == duckdb::ExceptionType::TRANSACTION);
+      fixture.run_ok("ROLLBACK");
+    }
+    fixture.run_ok("SET gpu_execution = false");
+    auto persisted = con.Query("SELECT count(*) FROM discovery_transaction_rows");
+    REQUIRE_FALSE(persisted->HasError());
+    CHECK(persisted->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
   }
 }
 
@@ -846,7 +941,7 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
     unavailable = true;
     context->mark_runtime_unavailable();
   }
-  for (auto const source : {"stream", "incomplete", "s3", "s3_text"}) {
+  for (auto const source : {"stream", "incomplete", "catalog", "s3", "s3_text"}) {
     for (bool fallback : {false, true}) {
       CAPTURE(source, fallback, unavailable);
       fixture.run_ok(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"));
@@ -860,6 +955,10 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
                                 "stream source has no CPU body"});
       } else if (std::string_view(source) == "incomplete") {
         policy.discovery_complete = false;
+      } else if (std::string_view(source) == "catalog") {
+        policy.discovery_complete = false;
+        policy.discovery_error    = std::make_exception_ptr(
+          duckdb::CatalogException("runtime inventory catalog entry missing"));
       } else if (std::string_view(source) == "s3") {
         policy.scans.push_back({"read_parquet", byte_source_class::sirius_owned_s3, false, "S3"});
       } else {
@@ -910,6 +1009,11 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
         CHECK(error.RawMessage().find(unavailable ? "Sirius GPU runtime is unavailable"
                                                   : "missing the logical plan template") !=
               std::string::npos);
+      } else if (std::string_view(source) == "catalog") {
+        CHECK(error.Type() == duckdb::ExceptionType::CATALOG);
+        CHECK(error.RawMessage().find("runtime inventory catalog entry missing") !=
+              std::string::npos);
+        CHECK(error.RawMessage().find("Underlying GPU error:") != std::string::npos);
       } else {
         CHECK(error.RawMessage().find("CPU fallback is not supported:") != std::string::npos);
         CHECK(error.RawMessage().find(std::string_view(source) == "stream"
