@@ -148,12 +148,13 @@ GPU memory for it first, and a column whose sort cannot be reserved, or fails, s
 while the pin goes on. See
 [Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys).
 
-The exact stage is bounded per column in bytes by `pin_table_unique_exact_max_bytes` (default
-10% of the GPU memory space capacity), which replaces the former row cap
-`SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS`. The cap bounds the concatenated column; the stage holds the
-retained chunks, their concatenation and the sorted copy at once, so its peak is about three
-times the cap, on top of the pin itself. A column past the cap stays UNKNOWN and the other
-columns continue. Wide columns under `PIN_UNIQUE_COLS=all` are still extra pin-time work, so name
+The exact stage is bounded in bytes, across all the columns it retains together, by
+`pin_table_unique_exact_max_bytes` (default 10% of the GPU memory space capacity), which replaces
+the former row cap `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS`. Each retained chunk holds a GPU
+reservation. The stage holds the retained chunks, the concatenation of one column and its sorted
+copy at once, so its peak is about three times the cap, on top of the pin itself. When the cap is
+short, earlier columns keep their check and later ones stay UNKNOWN; a copy that fails has the
+same effect, and the pin goes on. Wide columns under `PIN_UNIQUE_COLS=all` are still extra pin-time work, so name
 the columns a ride actually needs.
 
 **Absence of a fact means UNKNOWN, never "not unique."** A false positive would collapse

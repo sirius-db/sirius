@@ -107,10 +107,12 @@ namespace sirius::late_mat {
 [[nodiscard]] std::vector<bool> pin_unique_automatic_selection(
   std::vector<bool> const& explicitly_selected, bool prove_unique_keys);
 
-/// Byte cap for one column in the exact stage (`pin_table_unique_exact_max_bytes`):
+/// Byte cap on what the exact stage retains across all columns
+/// (`pin_table_unique_exact_max_bytes`):
 /// @p configured_bytes when non-zero, otherwise `config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION`
 /// of @p gpu_capacity_bytes.
-/// The check's peak GPU use is about three times the cap; a column past it stays UNKNOWN.
+/// The check's peak GPU use is about three times the cap; a column that no longer fits stays
+/// UNKNOWN.
 [[nodiscard]] std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
                                                     std::uint64_t gpu_capacity_bytes);
 

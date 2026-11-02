@@ -225,6 +225,31 @@ void generate_overlapping_dim(fs::path const& dir)
   }
 }
 
+/// Like generate_overlapping_dim, with a second distinct column `k2` (k + 1) whose chunks overlap
+/// in range too, so both columns need the exact stage.
+void generate_overlapping_two_key_dim(fs::path const& dir)
+{
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  for (int parity = 0; parity < 2; ++parity) {
+    run_generator(gen,
+                  "COPY (SELECT range * 2 + " + std::to_string(parity) + " AS k, range * 2 + " +
+                    std::to_string(parity) + " + 1 AS k2, range AS payload FROM range(" +
+                    std::to_string(dim_rows / 2) + ")) TO " +
+                    sirius::test::sql_literal(
+                      (dir / ("part." + std::to_string(parity) + ".parquet")).string()) +
+                    " (FORMAT PARQUET);");
+  }
+}
+
+std::string join_query_on(fs::path const& fact, fs::path const& dim, std::string const& dim_key)
+{
+  return "SELECT count(*), sum(f.v + d.payload) FROM read_parquet(" +
+         sirius::test::sql_literal(fact.string()) + ") f JOIN read_parquet(" +
+         sirius::test::sql_literal(dim.string()) + ") d ON f.f_k = d." + dim_key;
+}
+
 /// @p extra_sections are appended under `sirius:` (indented by two spaces).
 void write_config(fs::path const& yaml_path, std::string const& extra_sections = "")
 {
@@ -385,4 +410,68 @@ TEST_CASE("the exact-stage byte cap declines a column over the cap",
   }
 
   con.Query("CALL unpin_table('pin_unique_join_overlap_dim');");
+}
+
+TEST_CASE("the exact-stage byte cap is shared by every column the pin retains",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_shared_cap"};
+  auto const& tmp       = scratch.path();
+  auto const dim_dir    = tmp / "two_key_dim";
+  auto const unused_dim = tmp / "unused_unique_dim.parquet";
+  auto const unused_dup = tmp / "unused_dup_dim.parquet";
+  auto const fact       = tmp / "fact.parquet";
+  fs::create_directories(dim_dir);
+  generate_parquet(unused_dim, unused_dup, fact);
+  generate_overlapping_two_key_dim(dim_dir);
+  auto const dim_glob = dim_dir / "*.parquet";
+
+  // A small scan batch makes each file its own pinned chunk, so the chunks overlap in range. One
+  // column of one chunk is 80 KB, so both chunks of one column are 160 KB.
+  auto const yaml_path = tmp / "pin_unique_join_shared_cap.yaml";
+  write_config(yaml_path,
+               "  operator_params:\n"
+               "    scan_task_batch_size: 64KiB\n");
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
+  auto const on_k  = join_query_on(fact, dim_glob, "k");
+  auto const on_k2 = join_query_on(fact, dim_glob, "k2");
+
+  // The pin retains three columns for the exact stage (k, k2 and payload, whose chunks all overlap
+  // in range), 160 KB each; payload is the one that goes first when the cap is short.
+  SECTION("a cap that holds k and k2 proves both")
+  {
+    set_option(con, "SET pin_table_unique_exact_max_bytes = 450000;");
+    pin(con, dim_glob, "pin_unique_join_two_key_dim");
+    CHECK(join_proven_unique(con, on_k));
+    CHECK(join_proven_unique(con, on_k2));
+    CHECK(gpu_answer(con, on_k) == cpu_answer(on_k));
+    CHECK(gpu_answer(con, on_k2) == cpu_answer(on_k2));
+  }
+
+  SECTION("a cap that holds one column keeps the first and leaves the second unproven")
+  {
+    // Each column alone fits the cap; k and k2 together do not, and the earlier column wins.
+    set_option(con, "SET pin_table_unique_exact_max_bytes = 200000;");
+    pin(con, dim_glob, "pin_unique_join_two_key_dim");
+    CHECK(join_proven_unique(con, on_k));
+    CHECK_FALSE(join_proven_unique(con, on_k2));
+    CHECK(gpu_answer(con, on_k) == cpu_answer(on_k));
+    CHECK(gpu_answer(con, on_k2) == cpu_answer(on_k2));
+  }
+
+  set_option(con, "RESET pin_table_unique_exact_max_bytes;");
+  con.Query("CALL unpin_table('pin_unique_join_two_key_dim');");
 }

@@ -277,12 +277,12 @@ struct operator_params {
   /// late materialization asks for.
   bool prove_unique_keys{true};
 
-  /// Cap, in bytes, on one column in the pin-time exact uniqueness check, which sorts the whole
-  /// column when its chunks overlap in range. The cap bounds the concatenated column; the check's
-  /// peak GPU use is about three times that. A column past the cap stays unproven. 0 = a share
-  /// (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the pinning GPU memory space's capacity.
-  /// Applies to every observed column, whether late materialization or join-key proofs asked
-  /// for it.
+  /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
+  /// sorts a whole column when its chunks overlap in range. Earlier columns take priority when the
+  /// cap is short; the check's peak GPU use is about three times the cap. A column that no longer
+  /// fits stays unproven. 0 = a share (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the
+  /// pinning GPU memory space's capacity. Applies to every observed column, whether late
+  /// materialization or join-key proofs asked for it.
   uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.

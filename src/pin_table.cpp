@@ -265,14 +265,25 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   // only exists HERE -- once a compressed pin has been encoded, the values are
   // gone, and the deferred exact check at query time skips a compressed chunk
   // outright. So retain the observed columns as they pass and finish the proof
-  // before returning. Each column's retention is bounded in bytes
-  // (options.unique_exact_max_bytes, see late_mat::exact_uniqueness_byte_cap); a
-  // column past the cap leaves the exact stage and stays UNKNOWN. Retention is
-  // abandoned outright if the pin spreads across devices.
+  // before returning. Retention is bounded in bytes across ALL columns together
+  // (options.unique_exact_max_bytes, see late_mat::exact_uniqueness_byte_cap), each
+  // retained chunk holds a GPU reservation, and a column that no longer fits, or whose
+  // copy fails, leaves the exact stage and stays UNKNOWN. Retention is abandoned
+  // outright if the pin spreads across devices.
   std::vector<std::vector<std::unique_ptr<cudf::column>>> exact_chunks(
     options.probe_unique_columns.size());
+  std::vector<std::vector<std::unique_ptr<cucascade::memory::reservation>>> exact_reservations(
+    options.probe_unique_columns.size());
   std::vector<std::size_t> exact_bytes(options.probe_unique_columns.size(), 0);
+  std::size_t exact_total_bytes = 0;
   std::vector<bool> exact_declined(options.probe_unique_columns.size(), false);
+  // Gives back everything retained for one column: its chunks, their reservations and bytes.
+  auto release_exact_column = [&](std::size_t column_pos) {
+    exact_total_bytes -= exact_bytes[column_pos];
+    exact_bytes[column_pos] = 0;
+    exact_chunks[column_pos].clear();
+    exact_reservations[column_pos].clear();
+  };
   bool exact_retaining                      = unique_probe.active();
   std::size_t exact_rows                    = 0;
   std::optional<int> exact_gpu              = std::nullopt;
@@ -280,8 +291,8 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   auto abandon_exact                        = [&](char const* why) {
     if (!exact_retaining) { return; }
     exact_retaining = false;
-    for (auto& col : exact_chunks) {
-      col.clear();
+    for (std::size_t i = 0; i < exact_chunks.size(); ++i) {
+      release_exact_column(i);
     }
     SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check abandoned: {}", why);
   };
@@ -360,27 +371,54 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
         }
         for (std::size_t i = 0; i < options.probe_unique_columns.size(); ++i) {
           // Retain only what the exact stage may still need: a column the probe already
-          // refused releases what it retained so far, and so does a column past the cap.
+          // refused releases what it retained so far, and so does a column that no longer fits.
           if (!unique_probe.candidate(i) || exact_declined[i]) {
-            exact_chunks[i].clear();
+            release_exact_column(i);
             continue;
           }
+          auto const decline = [&](std::size_t column_pos, std::string const& why) {
+            SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check skipped for column {}: {}",
+                             column_pos,
+                             why);
+            exact_declined[column_pos] = true;
+            release_exact_column(column_pos);
+          };
           auto const chunk_bytes = tbl->get_column(static_cast<cudf::size_type>(i)).alloc_size();
-          if (exact_bytes[i] + chunk_bytes > *exact_byte_cap) {
-            SIRIUS_LOG_DEBUG(
-              "[late-mat] pin-time exact uniqueness check skipped for column {}: more than {} "
-              "bytes (pin_table_unique_exact_max_bytes)",
-              i,
-              *exact_byte_cap);
-            exact_declined[i] = true;
-            exact_chunks[i].clear();
+          // Earlier columns take priority: make room by giving up the highest columns first, so
+          // which columns keep their check does not depend on how the chunks interleave.
+          for (std::size_t later = exact_bytes.size();
+               later-- > i + 1 && exact_total_bytes + chunk_bytes > *exact_byte_cap;) {
+            if (exact_bytes[later] > 0) {
+              decline(later,
+                      "its retained values were released for an earlier column "
+                      "(pin_table_unique_exact_max_bytes)");
+            }
+          }
+          if (exact_total_bytes + chunk_bytes > *exact_byte_cap) {
+            decline(i,
+                    "more than " + std::to_string(*exact_byte_cap) +
+                      " bytes retained across columns (pin_table_unique_exact_max_bytes)");
             continue;
           }
+          auto reservation = target->make_reservation_or_null(chunk_bytes);
+          if (reservation == nullptr) {
+            decline(
+              i, "no GPU memory could be reserved for " + std::to_string(chunk_bytes) + " bytes");
+            continue;
+          }
+          try {
+            exact_chunks[i].push_back(
+              std::make_unique<cudf::column>(tbl->view().column(static_cast<cudf::size_type>(i)),
+                                             stream,
+                                             target->get_default_allocator()));
+          } catch (std::exception const& e) {
+            // A failed copy must cost the optimization, never the pin.
+            decline(i, std::string{"copying the chunk failed: "} + e.what());
+            continue;
+          }
+          exact_reservations[i].push_back(std::move(reservation));
           exact_bytes[i] += chunk_bytes;
-          exact_chunks[i].push_back(
-            std::make_unique<cudf::column>(tbl->view().column(static_cast<cudf::size_type>(i)),
-                                           stream,
-                                           target->get_default_allocator()));
+          exact_total_bytes += chunk_bytes;
         }
       }
     }
@@ -449,13 +487,13 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
             late_mat::exact_distinct_over_chunks(views, ::cuda::stream_ref{cudaStream_t{}});
           // Release this column's chunks before the next column's check, so only one column's
           // check is in flight.
-          exact_chunks[i].clear();
+          release_exact_column(i);
           if (!unique.has_value()) { continue; }  // undecidable stays UNKNOWN
           verdicts[i] =
             *unique ? late_mat::unique_verdict::proven : late_mat::unique_verdict::refused;
         } catch (std::exception const& e) {
           // A failed check must cost the optimization, never the pin.
-          exact_chunks[i].clear();
+          release_exact_column(i);
           SIRIUS_LOG_WARN("[late-mat] pin-time exact uniqueness check failed: {}", e.what());
         }
       }
