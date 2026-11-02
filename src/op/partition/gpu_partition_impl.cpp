@@ -31,6 +31,7 @@
 #include <cudf/sorting.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <cuda_runtime.h>
 
@@ -164,15 +165,17 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   // error from an earlier call would be misattributed to the scan inside hash_partition.
   (void)cudaGetLastError();
 
-  // A sorted single INT64 key is the shape of a sorted-key partial aggregate, whose merge uses
-  // the sorted-keys group-by when its partials stay in order. Only then is the stable partition
-  // worth its sort. Both partitions assign a key to the same partition, so batches of one input
-  // may take different paths. Any other input is partitioned as before. Only INT64 keys are known
-  // to be assigned identically by `cudf::hash_partition` and the stable partition.
-  bool const keep_input_order =
-    effective_key_idx.size() == 1 &&
-    effective_table.column(effective_key_idx[0]).type().id() == cudf::type_id::INT64 &&
-    keys_ascending(effective_table.column(effective_key_idx[0]), stream);
+  // A sorted single key is the shape of a sorted-key partial aggregate, whose merge uses the
+  // sorted-keys group-by when its partials stay in order. Only then is the stable partition worth
+  // its sort. `cudf::hash_partition` assigns rows to the partition MurmurHash3(key) % n, like the
+  // stable partition, so batches of one input may take different paths. Any other input is
+  // partitioned as before.
+  bool keep_input_order = false;
+  if (effective_key_idx.size() == 1) {
+    auto const& key  = effective_table.column(effective_key_idx[0]);
+    keep_input_order = cudf::is_fixed_width(key.type()) && !cudf::is_floating_point(key.type()) &&
+                       keys_ascending(key, stream);
+  }
   auto partition_result = keep_input_order
                             ? stable_hash_partition(effective_table,
                                                     effective_key_idx,

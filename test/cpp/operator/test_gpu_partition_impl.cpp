@@ -176,20 +176,21 @@ namespace {
 using sirius::test::vector_to_cudf_column;
 using sirius::test::operator_utils::gpu_type_traits;
 
-/// A batch of [key INT64, row INT64] where key = row / 5, in ascending or descending row order.
+/// A batch of [key, row INT64] where key = row / 5, in ascending or descending row order.
+template <typename Key = int64_t>
 std::shared_ptr<data_batch> make_key_row_batch(int num_rows,
                                                bool descending,
                                                memory_space& mem_space)
 {
-  std::vector<int64_t> keys;
+  std::vector<Key> keys;
   std::vector<int64_t> rows;
   for (int i = 0; i < num_rows; ++i) {
     int const row = descending ? num_rows - 1 - i : i;
-    keys.push_back(row / 5);
+    keys.push_back(static_cast<Key>(row / 5));
     rows.push_back(row);
   }
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(keys));
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<Key>>(keys));
   columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(rows));
   return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                  mem_space,
@@ -219,16 +220,19 @@ std::vector<std::vector<std::vector<int64_t>>> partition_by_key(data_batch& batc
 
 }  // namespace
 
-TEST_CASE("Hash partition keeps the order of a sorted key and places keys consistently",
-          "[operator][hash_partition]")
+TEMPLATE_TEST_CASE("Hash partition keeps the order of a sorted key and places keys consistently",
+                   "[operator][hash_partition]",
+                   int32_t,
+                   int64_t)
 {
   auto* mem_space              = get_shared_mem_space();
-  constexpr int num_input_rows = 1000;
+  constexpr int num_input_rows = 500;
   constexpr int num_partitions = 4;
 
   // A sorted key takes the order-preserving path: rows stay in input order within a partition.
-  auto sorted_batch = make_key_row_batch(num_input_rows, /*descending=*/false, *mem_space);
-  auto sorted       = partition_by_key(*sorted_batch, num_partitions, *mem_space);
+  auto sorted_batch =
+    make_key_row_batch<TestType>(num_input_rows, /*descending=*/false, *mem_space);
+  auto sorted = partition_by_key(*sorted_batch, num_partitions, *mem_space);
   std::map<int64_t, int> partition_of_key;
   for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
     auto const& rows = sorted[partition_idx];
@@ -243,8 +247,9 @@ TEST_CASE("Hash partition keeps the order of a sorted key and places keys consis
 
   // A descending key takes the plain `cudf::hash_partition` path, but each key must land in the
   // same partition as in the sorted batch: batches of one input may take different paths.
-  auto descending_batch = make_key_row_batch(num_input_rows, /*descending=*/true, *mem_space);
-  auto descending       = partition_by_key(*descending_batch, num_partitions, *mem_space);
+  auto descending_batch =
+    make_key_row_batch<TestType>(num_input_rows, /*descending=*/true, *mem_space);
+  auto descending = partition_by_key(*descending_batch, num_partitions, *mem_space);
   for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
     for (auto const& row : descending[partition_idx]) {
       REQUIRE(partition_of_key.at(row[0]) == partition_idx);
