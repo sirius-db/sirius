@@ -441,6 +441,13 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
+  /// CPUs reserved for the pinned REST reactors and kept out of every Sirius
+  /// thread pool's affinity; empty when nothing is reserved.
+  [[nodiscard]] const std::vector<int>& get_rest_reactor_cpus() const noexcept
+  {
+    return _rest_reactor_cpus;
+  }
+
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
@@ -494,6 +501,12 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
+  /// Restrict the GPU pipeline, scan manager, task creator and downgrade pools
+  /// to the CPUs the REST reactors will not pin to (see
+  /// @c scan_manager_config::reserve_rest_reactor_cpus).  Called from
+  /// @ref finalize_derived_config.
+  void reserve_rest_reactor_cpus();
+
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
@@ -507,6 +520,8 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+  /// CPUs the REST reactors will pin to, reserved from the thread pools (empty: none).
+  std::vector<int> _rest_reactor_cpus;
 };
 
 /// Validated configuration intent. Construction and parsing never discover hardware.

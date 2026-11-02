@@ -19,9 +19,11 @@
 #include "sirius_config.hpp"
 #include "utils/log_test_utils.hpp"
 
+#include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/tls/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <unistd.h>
@@ -35,6 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using cucascade::io::cache::cache_mode;
 using cucascade::io::cache::eviction_policy;
@@ -701,6 +704,63 @@ TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][rea
                                         scan_manager_yaml("      max_readahead_scans: 12\n"));
   REQUIRE(budget.max_readahead_scans.has_value());
   CHECK(*budget.max_readahead_scans == 12);
+}
+
+TEST_CASE("reserve_rest_reactor_cpus keeps the thread pools off the planned reactor CPUs",
+          "[scan_manager][config][rest_placement]")
+{
+  auto const load = [](std::string const& name, std::string const& body) {
+    scoped_yaml yaml(name, scan_manager_yaml(body));
+    sirius::sirius_config cfg;
+    cfg.load_from_file(yaml.path());
+    return cfg;
+  };
+  auto const pool_affinities = [](sirius::sirius_config const& cfg) {
+    return std::array<std::vector<int>, 4>{
+      cfg.get_gpu_pipeline_executor_config().cpu_affinity_list,
+      cfg.get_scan_manager_config().thread_pool.cpu_affinity_list,
+      cfg.get_task_creator_config().thread_pool.cpu_affinity_list,
+      cfg.get_downgrade_executor_config().thread_pool.cpu_affinity_list};
+  };
+
+  // Unpinned reactors reserve nothing and leave every pool alone.
+  auto const unpinned = load("sirius_reserve_unpinned.yaml",
+                             "      rest_n_reactors: 0\n"
+                             "      rest:\n"
+                             "        pin_to_irq_cpus: false\n");
+  CHECK(unpinned.get_rest_reactor_cpus().empty());
+  for (auto const& affinity : pool_affinities(unpinned)) {
+    CHECK(affinity.empty());
+  }
+
+  // The switch off: nothing reserved even where the reactors would pin.
+  auto const off = load("sirius_reserve_off.yaml",
+                        "      rest_n_reactors: 0\n"
+                        "      reserve_rest_reactor_cpus: false\n");
+  CHECK_FALSE(off.get_scan_manager_config().reserve_rest_reactor_cpus);
+  CHECK(off.get_rest_reactor_cpus().empty());
+
+  // The default: exactly cuCascade's plan for this host (empty unless its NIC IRQs are steered),
+  // and no pool keeps any of those CPUs.
+  auto const on = load("sirius_reserve_on.yaml", "      rest_n_reactors: 0\n");
+  CHECK(on.get_scan_manager_config().reserve_rest_reactor_cpus);
+  auto const planned =
+    cucascade::io::rest::planned_reactor_cpus(0, on.get_scan_manager_config().rest);
+  auto const allowed = cucascade::exec::thread_util::get_current_thread_affinity();
+  bool const room    = std::any_of(allowed.begin(), allowed.end(), [&](int cpu) {
+    return std::find(planned.begin(), planned.end(), cpu) == planned.end();
+  });
+  if (planned.empty() || !room) {
+    CHECK(on.get_rest_reactor_cpus().empty());
+  } else {
+    CHECK(on.get_rest_reactor_cpus() == planned);
+    for (auto const& affinity : pool_affinities(on)) {
+      CHECK_FALSE(affinity.empty());
+      for (int const cpu : planned) {
+        CHECK(std::find(affinity.begin(), affinity.end(), cpu) == affinity.end());
+      }
+    }
+  }
 }
 
 TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][readahead]")

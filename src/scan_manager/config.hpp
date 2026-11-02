@@ -252,6 +252,13 @@ struct scan_manager_config {
   /// unpinned reactors otherwise.
   std::size_t rest_n_reactors{2};
 
+  /// Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator,
+  /// downgrade) off the CPUs the REST reactors pin to (cuCascade's
+  /// @c planned_reactor_cpus: the NIC's steered IRQ CPUs when
+  /// @c rest.pin_to_irq_cpus is on), so those CPUs carry only the NIC's
+  /// interrupts and the reactors.  No effect when the reactors run unpinned.
+  bool reserve_rest_reactor_cpus{true};
+
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
   /// with a cache on, the budget is the backend reactor's own
