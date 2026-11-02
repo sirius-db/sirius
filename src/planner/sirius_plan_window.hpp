@@ -57,16 +57,11 @@ struct whole_partition_window_plan {
   std::vector<whole_partition_expression> expressions;
 };
 
-// Keep integer window results out of consumers that would apply the generic HUGEINT -> INT64
-// expression mapping. Passthrough references and ordering remain admitted. An integer SUM is an
-// exact DECIMAL128 with scale 0 on the GPU, and that mapping can truncate a sum wider than 64 bits.
-// Carrying HUGEINT as DECIMAL128 everywhere is tracked in
-// https://github.com/sirius-db/sirius/issues/2067
-void validate_whole_partition_window_consumers(duckdb::LogicalOperator const& plan);
+// Admit at most one window operator in a plan. Throws NotImplementedException otherwise.
+void validate_whole_partition_window_stages(duckdb::LogicalOperator const& plan);
 
-// Requires resolved column references. Does not consume or modify the logical
-// plan. Throws NotImplementedException for unsupported combinations, even on
-// empty input. Hidden columns must survive through reduction/expansion and be
+// Requires resolved column references. Throws NotImplementedException for unsupported
+// combinations, even on empty input. Hidden columns must survive through reduction/expansion and be
 // removed when the visible output is published.
 whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window);
 

@@ -227,6 +227,9 @@ TEST_CASE_METHOD(WindowFixture,
   compare_window(
     "SELECT id,total FROM (SELECT id,sum(v) OVER (PARTITION BY p) total FROM w) t "
     "ORDER BY total,id LIMIT 25");
+  compare_window("SELECT id,sum(v) OVER () + 1 FROM w");
+  compare_window("SELECT s,count(*) FROM (SELECT sum(v) OVER () s FROM w) t GROUP BY s");
+  compare_window("SELECT id FROM (SELECT id,sum(v) OVER () s FROM w) t WHERE s>0");
 }
 
 TEST_CASE_METHOD(WindowFixture,
@@ -239,11 +242,6 @@ TEST_CASE_METHOD(WindowFixture,
   expect_plan_fallback_matches_cpu(
     "SELECT sum(s) OVER (PARTITION BY p) FROM "
     "(SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t");
-  expect_plan_fallback_matches_cpu("SELECT sum(v) OVER () + 1 FROM w");
-  expect_plan_fallback_matches_cpu(
-    "SELECT s,count(*) FROM (SELECT sum(v) OVER () s FROM w) t GROUP BY s");
-  expect_plan_fallback_matches_cpu(
-    "SELECT id FROM (SELECT id,sum(v) OVER () s FROM w) t WHERE s>0");
 }
 
 TEST_CASE_METHOD(WindowFixture,

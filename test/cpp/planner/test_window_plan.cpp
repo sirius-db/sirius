@@ -256,16 +256,12 @@ TEST_CASE("whole-partition window planner activates only admitted windows",
   REQUIRE(find(find, *physical));
 }
 
-TEST_CASE("whole-partition activation rejects unsafe consumers and chained stages",
-          "[planner][window_plan]")
+TEST_CASE("whole-partition activation rejects chained stages", "[planner][window_plan]")
 {
   window_fixture fixture;
-  auto const query = GENERATE(
-    "SELECT sum(v) OVER ()+1 FROM w",
-    "SELECT s,count(*) FROM (SELECT sum(v) OVER () s FROM w) t GROUP BY s",
+  auto logical = fixture.bind(
     "SELECT sum(s) OVER (PARTITION BY p) FROM (SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t");
-  auto logical = fixture.bind(query);
-  REQUIRE_THROWS_AS(sirius::planner::validate_whole_partition_window_consumers(*logical),
+  REQUIRE_THROWS_AS(sirius::planner::validate_whole_partition_window_stages(*logical),
                     duckdb::NotImplementedException);
 }
 

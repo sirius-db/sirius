@@ -114,20 +114,25 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
        expression.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE)) {
     decline("frame does not cover the whole partition");
   }
-  auto const& name = expression.AggregateFunction()->GetName().GetIdentifierName();
-  if ((name == "count_star" || name == "count") && expression.GetChildren().empty() &&
+  auto const id =
+    from_duckdb_aggregate_name(expression.AggregateFunction()->GetName().GetIdentifierName());
+  // DuckDB names the nullary COUNT overload `count`. Like count_star, it counts every row.
+  if ((id == aggregate_id::count_star ||
+       (id == aggregate_id::count && expression.GetChildren().empty())) &&
       expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
     return aggregate_id::count_star;
   }
   if (expression.GetChildren().size() == 1) {
     auto const& argument = expression.GetChildren()[0]->GetReturnType();
-    bool const scalar    = numeric_argument(argument) || partition_key(argument);
-    if (scalar && name == "count" && expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
+    // The types that COUNT, MIN and MAX accept.
+    bool const count_min_max_type = numeric_argument(argument) || partition_key(argument);
+    if (count_min_max_type && id == aggregate_id::count &&
+        expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
       return aggregate_id::count;
     }
-    if (scalar && expression.GetReturnType() == argument) {
-      if (name == "min") { return aggregate_id::min; }
-      if (name == "max") { return aggregate_id::max; }
+    if (count_min_max_type && expression.GetReturnType() == argument) {
+      if (id == aggregate_id::min) { return aggregate_id::min; }
+      if (id == aggregate_id::max) { return aggregate_id::max; }
     }
   }
   if (expression.GetChildren().size() != 1 ||
@@ -135,12 +140,12 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
     decline("aggregate argument type or arity");
   }
   auto const& argument = expression.GetChildren()[0]->GetReturnType();
-  if (name == "avg" && expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
+  if (id == aggregate_id::avg && expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
     return aggregate_id::avg;
   }
   // Statistics propagation replaces SUM with this internal implementation while retaining
   // the exact bound result type. We still evaluate it using checked, widened accumulation.
-  if (name == "sum" || name == "sum_no_overflow") {
+  if (id == aggregate_id::sum || id == aggregate_id::sum_no_overflow) {
     duckdb::LogicalType expected = duckdb::LogicalType::HUGEINT;
     if (argument.id() == duckdb::LogicalTypeId::DECIMAL) {
       expected = duckdb::LogicalType::DECIMAL(38, duckdb::DecimalType::GetScale(argument));
@@ -153,49 +158,22 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
   decline("aggregate function or result type");
 }
 
-bool validate_consumers(duckdb::LogicalOperator const& plan, std::size_t& window_stages)
+void count_window_stages(duckdb::LogicalOperator const& plan, std::size_t& window_stages)
 {
-  bool has_integer_window = false;
   for (auto const& child : plan.children) {
-    has_integer_window |= validate_consumers(*child, window_stages);
+    count_window_stages(*child, window_stages);
   }
-  if (has_integer_window) {
-    duckdb::LogicalOperatorVisitor::EnumerateExpressions(plan, [&](auto const* expression) {
-      if (!*expression) { return; }
-      auto const forwards_reference =
-        plan.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
-        plan.type == duckdb::LogicalOperatorType::LOGICAL_ORDER_BY ||
-        plan.type == duckdb::LogicalOperatorType::LOGICAL_TOP_N;
-      if (forwards_reference &&
-          (*expression)->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-        return;
-      }
-      auto visit = [](auto&& self, duckdb::Expression const& expr) -> void {
-        if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
-            expr.GetReturnType() == duckdb::LogicalType::HUGEINT) {
-          decline("expressions over integer SUM results require an exact HUGEINT consumer");
-        }
-        duckdb::ExpressionIterator::EnumerateChildren(
-          expr, [&](duckdb::Expression const& child) { self(self, child); });
-      };
-      visit(visit, **expression);
-    });
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW && ++window_stages > 1) {
+    decline("more than one window operator in a plan");
   }
-  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW) {
-    if (++window_stages > 1) { decline("more than one window operator in a plan"); }
-    for (auto const& expression : plan.expressions) {
-      has_integer_window |= expression->GetReturnType() == duckdb::LogicalType::HUGEINT;
-    }
-  }
-  return has_integer_window;
 }
 
 }  // namespace
 
-void validate_whole_partition_window_consumers(duckdb::LogicalOperator const& plan)
+void validate_whole_partition_window_stages(duckdb::LogicalOperator const& plan)
 {
   std::size_t window_stages = 0;
-  (void)validate_consumers(plan, window_stages);
+  count_window_stages(plan, window_stages);
 }
 
 whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window)
@@ -268,12 +246,13 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
     if (window.types[output_slot] != expression.GetReturnType()) {
       decline("result column mapping");
     }
-    auto const& argument = function == aggregate_id::count_star
-                             ? static_cast<duckdb::Expression const&>(count_all_argument)
-                             : *expression.GetChildren()[0];
+    auto const& argument     = function == aggregate_id::count_star
+                                 ? static_cast<duckdb::Expression const&>(count_all_argument)
+                                 : *expression.GetChildren()[0];
+    auto const argument_slot = prepare(argument);
     plan.expressions.push_back({function,
-                                prepare(argument),
-                                argument.GetReturnType(),
+                                argument_slot,
+                                plan.prepared_types[argument_slot],
                                 expression.GetReturnType(),
                                 expression.WindowStart(),
                                 expression.WindowEnd(),
@@ -341,13 +320,14 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_ex
   if (hash_partition_bytes == 0) {
     throw std::invalid_argument("Partition byte target must be positive");
   }
-  std::vector<int> keys;
+  std::vector<cudf::size_type> keys;
+  keys.reserve(partition_slots.size());
   for (auto slot : partition_slots) {
     if (slot >= prepared.size() ||
-        slot > static_cast<duckdb::idx_t>(std::numeric_limits<int>::max())) {
+        slot > static_cast<duckdb::idx_t>(std::numeric_limits<cudf::size_type>::max())) {
       throw duckdb::NotImplementedException("Window partition slot exceeds the native index range");
     }
-    keys.push_back(static_cast<int>(slot));
+    keys.push_back(static_cast<cudf::size_type>(slot));
   }
   auto assembly = duckdb::make_uniq<op::sirius_physical_concat>(
     prepared, estimated_cardinality, /*concat_all=*/true);

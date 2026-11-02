@@ -116,9 +116,7 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
       auto const type = require_cudf_type(types[i]);
       // String extrema retain variable-width values. Offsets alone are a safe lower bound.
       // Their character storage and scratch still use ordinary allocation/OOM accounting.
-      auto const width = types[i].id() == type_id::HUGEINT ? 16
-                         : cudf::is_fixed_width(type)      ? cudf::size_of(type)
-                                                           : sizeof(cudf::size_type);
+      auto const width = cudf::is_fixed_width(type) ? cudf::size_of(type) : sizeof(cudf::size_type);
       result_width     = memory::saturating_add(result_width, width);
     }
     auto const input_bytes = batch.get_data()->get_size_in_bytes();
@@ -150,8 +148,7 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
     std::shared_ptr<cudf::table> results = evaluate_whole_partition_window(
       cudf::table_view(columns), _partition_columns, _aggregates, stream, mr);
 
-    // Forward payload in its original carrier and row order. Results retain DECIMAL128(scale=0)
-    // for HUGEINT. The generic HUGEINT -> INT64 mapping must not run on this output.
+    // Forward payload in its original carrier and row order, followed by the window results.
     std::vector<cudf::column_view> visible;
     for (std::size_t i = 0; i < _input_width; ++i) {
       visible.push_back(table.column(i));
