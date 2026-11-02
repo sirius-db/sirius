@@ -303,8 +303,8 @@ __device__ __forceinline__ reg_val<DstFloat> eval_cast_float_to_float(reg_val<Sr
  * @brief Float/double to integer cast.
  *
  * @note Follows DuckDB's @c TryCastWithOverflowCheckFloat: the value is rounded to the nearest
- * integer with ties to even (std::nearbyint under the default rounding mode), and it is the rounded
- * value that must lie in [lowest, max + 1); a non-finite input overflows.
+ *       integer with ties to even (@c std::nearbyint under the default rounding mode), and it is
+ *       the rounded value that must lie in [lowest, max + 1); a non-finite input overflows.
  */
 template <typename DstInt, typename SrcFloat>
 __device__ __forceinline__ reg_val<DstInt> eval_cast_float_to_int(reg_val<SrcFloat> in)

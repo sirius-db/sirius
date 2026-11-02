@@ -118,12 +118,12 @@ __device__ __forceinline__ reg_val<int32_t> eval_cast_timestamp_to_date(reg_val<
  */
 __device__ __forceinline__ void civil_from_days(int32_t days, int16_t& y, int16_t& m, int16_t& d)
 {
-  int32_t const z     = static_cast<int32_t>(static_cast<uint32_t>(days) + 719468u);
-  int32_t const z_neg = static_cast<int32_t>(static_cast<uint32_t>(z) - 146096u);
+  int32_t const z     = static_cast<int32_t>(static_cast<uint32_t>(days) + 719468U);
+  int32_t const z_neg = static_cast<int32_t>(static_cast<uint32_t>(z) - 146096U);
   // `z >= 0` is tested as `days >= -719468`: that is how the optimizer folds the (formally
   // overflowing) test in the compiled chrono code, and it is what decides the sentinel's value.
   int32_t const era  = (days >= -719468 ? z : z_neg) / 146097;
-  uint32_t const doe = static_cast<uint32_t>(z) - static_cast<uint32_t>(era) * 146097u;
+  uint32_t const doe = static_cast<uint32_t>(z) - static_cast<uint32_t>(era) * 146097U;
   uint32_t const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
   int32_t const yr   = static_cast<int32_t>(yoe) + era * 400;
   uint32_t const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
