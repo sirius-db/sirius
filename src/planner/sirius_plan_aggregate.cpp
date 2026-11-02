@@ -186,20 +186,15 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> project_shared_filter_p
   }
   if (shared_predicates.empty()) { return child; }
 
-  auto types = child->types;
   duckdb::vector<std::unique_ptr<sirius::ast::node>> projected;
-  projected.reserve(input_width + shared_predicates.size());
-  for (std::size_t index = 0; index < input_width; ++index) {
-    projected.push_back(std::make_unique<sirius::ast::node>(
-      sirius::ast::reference{static_cast<uint32_t>(index), types[index]}));
-  }
+  duckdb::vector<sirius::logical_type> types;
   for (auto& predicate : translate_expressions(std::move(shared_predicates))) {
     types.push_back(sirius::logical_type::make(sirius::type_id::BOOLEAN));
     projected.push_back(std::move(predicate));
   }
   auto const estimated_cardinality = child->estimated_cardinality;
-  return push_projection(
-    std::move(child), std::move(types), std::move(projected), estimated_cardinality);
+  return push_appending_projection(
+    std::move(child), std::move(projected), std::move(types), estimated_cardinality);
 }
 
 duckdb::AggregateFunctionCatalogEntry& builtin_count_entry(duckdb::ClientContext& context)

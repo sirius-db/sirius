@@ -214,11 +214,7 @@ void sirius_physical_hash_join::materialize_expression_join_keys(
   auto prepare_side = [&](auto& child, auto& projection_map, bool is_left) {
     auto const old_width = child->types.size();
     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
-    duckdb::vector<sirius::logical_type> types = child->types;
-    for (std::size_t c = 0; c < old_width; ++c) {
-      expressions.push_back(std::make_unique<sirius::ast::node>(
-        sirius::ast::reference{static_cast<uint32_t>(c), types[c]}));
-    }
+    duckdb::vector<sirius::logical_type> types;
     for (auto& condition : conditions) {
       auto& operand = is_left ? condition.left : condition.right;
       if (!operand) { throw duckdb::NotImplementedException("Join operand is missing"); }
@@ -232,21 +228,21 @@ void sirius_physical_hash_join::materialize_expression_join_keys(
       // A cast is an evaluated operation, including its kind, try_cast, and nested children.
       // Use the ordinary projection evaluator rather than inferring a physical conversion.
       auto const type  = operand->return_type();
-      auto const index = expressions.size();
+      auto const index = old_width + expressions.size();
       expressions.push_back(std::move(operand));
       types.push_back(type);
       operand = std::make_unique<sirius::ast::node>(
         sirius::ast::reference{static_cast<uint32_t>(index), type});
     }
-    if (expressions.size() == old_width) { return; }
+    if (expressions.empty()) { return; }
     if (projection_map.empty()) {
       for (std::size_t c = 0; c < old_width; ++c) {
         projection_map.push_back(c);
       }
     }
     auto const cardinality = child->estimated_cardinality;
-    child                  = sirius::planner::push_projection(
-      std::move(child), std::move(types), std::move(expressions), cardinality);
+    child                  = sirius::planner::push_appending_projection(
+      std::move(child), std::move(expressions), std::move(types), cardinality);
   };
   prepare_side(left, left_projection_map, true);
   prepare_side(right, right_projection_map, false);
