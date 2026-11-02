@@ -56,7 +56,7 @@ impl QueryActivity {
         })
     }
 }
-native_fsm!(QueryActivity, schema::QueryActivityEvent, 0);
+super::native_fsm!(QueryActivity, schema::QueryActivityEvent, 0);
 
 impl RefTreeEntity for QueryActivity {
     fn parent_id(&self) -> Option<Uuid> {
