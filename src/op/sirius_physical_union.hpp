@@ -26,6 +26,7 @@ namespace op {
 
 //! N-ary union: joins its arms' rows into one stream without inspecting them, so this operator
 //! only routes batches and `execute` is the identity. It does not materialize.
+//! Also merges the tagged inputs of EXCEPT ALL / INTERSECT ALL.
 //!
 //! `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, and each sink feeds a distinct
 //! `port_label(i)` port.

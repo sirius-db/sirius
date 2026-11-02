@@ -19,6 +19,7 @@
 
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -29,9 +30,11 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace sirius::op {
 
@@ -58,6 +61,46 @@ struct value_magnitude {
     return input.is_valid(i) ? fabs(static_cast<double>(input.element<int64_t>(i))) : 0.0;
   }
 };
+
+constexpr int halves_block_size = 256;
+
+/// The grid that covers @p rows with halves_block_size threads per block, capped so very large
+/// columns loop instead.
+unsigned int halves_grid_size(cudf::size_type rows)
+{
+  auto const blocks = (static_cast<std::int64_t>(rows) + halves_block_size - 1) / halves_block_size;
+  return static_cast<unsigned int>(std::min<std::int64_t>(blocks, 65535));
+}
+
+/// high[i] = value >> 32 (arithmetic) and low[i] = value & 0xFFFFFFFF. NULL rows are written too;
+/// the output null masks hide them.
+__global__ void split_halves_kernel(std::int64_t const* input,
+                                    std::int64_t* high,
+                                    std::int64_t* low,
+                                    cudf::size_type rows)
+{
+  // 64-bit, so the last stride past a row count near INT32_MAX cannot overflow.
+  auto const stride = static_cast<std::int64_t>(blockDim.x) * gridDim.x;
+  for (auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < rows;
+       i += stride) {
+    auto const value = input[i];
+    high[i]          = value >> 32;
+    low[i]           = value & 0xFFFFFFFFLL;
+  }
+}
+
+/// out[i] = high[i] * 2^32 + low[i] in 128 bits; |high| < 2^63, so the shift cannot overflow.
+__global__ void combine_halves_kernel(std::int64_t const* high,
+                                      std::int64_t const* low,
+                                      __int128_t* out,
+                                      cudf::size_type rows)
+{
+  auto const stride = static_cast<std::int64_t>(blockDim.x) * gridDim.x;
+  for (auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < rows;
+       i += stride) {
+    out[i] = (static_cast<__int128_t>(high[i]) << 32) + low[i];
+  }
+}
 
 /// Writes the sum of @p row_value(i) over the rows of @p input to the device address @p result.
 template <typename Out, typename RowValue>
@@ -100,6 +143,61 @@ std::unique_ptr<cudf::column> wide_integer_sum(cudf::column_view const& input,
     sum_rows_into(input, widened_value<int32_t>{*device}, sum, stream, mr);
   } else {
     sum_rows_into(input, widened_value<int64_t>{*device}, sum, stream, mr);
+  }
+  return result;
+}
+
+std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>> split_int64_halves(
+  cudf::column_view const& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
+{
+  if (input.type().id() != cudf::type_id::INT64) {
+    throw sirius::internal_exception("split_int64_halves: expected an INT64 column, got {}",
+                                     cudf::type_to_name(input.type()));
+  }
+  auto const int64 = cudf::data_type{cudf::type_id::INT64};
+  auto high        = cudf::make_numeric_column(
+    int64, input.size(), cudf::copy_bitmask(input, stream, mr), input.null_count(), stream, mr);
+  auto low = cudf::make_numeric_column(
+    int64, input.size(), cudf::copy_bitmask(input, stream, mr), input.null_count(), stream, mr);
+  if (input.size() > 0) {
+    split_halves_kernel<<<halves_grid_size(input.size()), halves_block_size, 0, stream.get()>>>(
+      input.data<std::int64_t>(),
+      high->mutable_view().data<std::int64_t>(),
+      low->mutable_view().data<std::int64_t>(),
+      input.size());
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
+  return {std::move(high), std::move(low)};
+}
+
+std::unique_ptr<cudf::column> combine_int64_halves(cudf::column_view const& high,
+                                                   cudf::column_view const& low,
+                                                   ::cuda::stream_ref stream,
+                                                   rmm::device_async_resource_ref mr)
+{
+  if (high.type().id() != cudf::type_id::INT64 || low.type().id() != cudf::type_id::INT64 ||
+      high.size() != low.size()) {
+    throw sirius::internal_exception(
+      "combine_int64_halves: expected two INT64 columns of one size, got {} ({} rows) and {} ({} "
+      "rows)",
+      cudf::type_to_name(high.type()),
+      high.size(),
+      cudf::type_to_name(low.type()),
+      low.size());
+  }
+  auto result = cudf::make_fixed_point_column(wide_integer_sum_type(),
+                                              high.size(),
+                                              cudf::copy_bitmask(high, stream, mr),
+                                              high.null_count(),
+                                              stream,
+                                              mr);
+  if (high.size() > 0) {
+    combine_halves_kernel<<<halves_grid_size(high.size()), halves_block_size, 0, stream.get()>>>(
+      high.data<std::int64_t>(),
+      low.data<std::int64_t>(),
+      result->mutable_view().data<__int128_t>(),
+      high.size());
+    CUDF_CUDA_TRY(cudaGetLastError());
   }
   return result;
 }

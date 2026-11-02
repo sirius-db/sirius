@@ -14,12 +14,10 @@
  * limitations under the License.
  */
 
-#include "sirius_config.hpp"
+#include "config_loading.hpp"
 
 #include <sirius/context/config_builder.hpp>
-#include <yaml-cpp/yaml.h>
 
-#include <fstream>
 #include <utility>
 
 namespace sirius {
@@ -50,29 +48,19 @@ ContextConfigBuilder::~ContextConfigBuilder() noexcept = default;
 std::expected<ContextConfigBuilder, Error> ContextConfigBuilder::from_yaml(
   const std::filesystem::path& path)
 {
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    return std::unexpected(
-      Error{ErrorCode::configuration_io, "Cannot open configuration file: " + path.string()});
-  }
-  std::string contents;
-  char buffer[8192];
-  while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
-    contents.append(buffer, static_cast<std::size_t>(file.gcount()));
-  }
-  if (!file.eof()) {
-    return std::unexpected(
-      Error{ErrorCode::configuration_io, "Cannot read configuration file: " + path.string()});
-  }
-
   auto impl = std::make_shared<Impl>();
   try {
-    auto root    = YAML::Load(contents);
-    impl->config = parsed_sirius_config::from_node(root, path);
-  } catch (const YAML::Exception& e) {
-    return std::unexpected(Error{ErrorCode::malformed_yaml, path.string() + ": " + e.what()});
-  } catch (const configuration_input_error& e) {
-    return std::unexpected(Error{ErrorCode::invalid_configuration, e.what()});
+    impl->config = load_configuration(path);
+  } catch (const configuration_load_error& e) {
+    auto code = ErrorCode::invalid_configuration;
+    switch (e.code) {
+      case configuration_load_error_code::io: code = ErrorCode::configuration_io; break;
+      case configuration_load_error_code::malformed_yaml: code = ErrorCode::malformed_yaml; break;
+      case configuration_load_error_code::invalid_configuration:
+        code = ErrorCode::invalid_configuration;
+        break;
+    }
+    return std::unexpected(Error{code, e.what()});
   }
   return ContextConfigBuilder(std::move(impl));
 }

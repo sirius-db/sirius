@@ -170,8 +170,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
       return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL128: {
-      auto const scale =
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())};
+      // From the carrier: HUGEINT is DECIMAL128 with scale 0.
+      auto const scale = numeric::scale_type{cudf_type.scale()};
       __int128_t const rep =
         is_valid ? std::get<sirius::decimal128>(alt.payload).value : __int128_t{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
@@ -184,7 +184,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
       return finish_scalar(std::move(scalar), mode);
     }
     default:
-      throw not_implemented_exception("[expression_evaluator] Unsupported scalar type: %s",
+      throw not_implemented_exception("[expression_evaluator] Unsupported scalar type: {}",
                                       alt.return_type().to_string());
   }
 }

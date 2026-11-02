@@ -25,13 +25,17 @@
  * negative values (-2^31, -2^63), whose magnitude is one more than the maximum.
  */
 
+#include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/groupby.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -45,6 +49,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -289,8 +294,8 @@ bool narrows(std::unique_ptr<cudf::column> const& column)
 }
 
 using sirius::op::is_wide_integer_sum;
-using sirius::op::narrow_wide_integer_sum;
 using sirius::op::partial_sums_may_overflow;
+using sirius::op::to_hugeint_carrier;
 using sirius::op::wide_integer_sum_type;
 
 std::unique_ptr<cudf::column> i64(std::vector<int64_t> const& values)
@@ -308,22 +313,22 @@ std::unique_ptr<cudf::column> d128(std::vector<__int128_t> const& values)
   return make_column(wide_integer_sum_type(), values);
 }
 
-std::vector<int64_t> to_host(cudf::column_view const& column)
-{
-  return sirius::test::operator_utils::copy_column_to_host<int64_t>(column,
-                                                                    cudf::get_default_stream());
-}
-
 bool partials_may_overflow(std::unique_ptr<cudf::column> const& column)
 {
   return partial_sums_may_overflow(
     column->view(), cudf::get_default_stream(), cudf::get_current_device_resource_ref());
 }
 
-std::unique_ptr<cudf::column> narrow(std::unique_ptr<cudf::column> column)
+std::unique_ptr<cudf::column> to_hugeint(std::unique_ptr<cudf::column> column)
 {
-  return narrow_wide_integer_sum(
+  return to_hugeint_carrier(
     std::move(column), cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
+std::vector<__int128_t> to_host_128(cudf::column_view const& column)
+{
+  return sirius::test::operator_utils::copy_column_to_host<__int128_t>(column,
+                                                                       cudf::get_default_stream());
 }
 
 }  // namespace
@@ -355,6 +360,41 @@ TEST_CASE("decimal sum narrowing - measured values on the 2^63 - 1 boundary",
   CHECK_FALSE(narrows(narrow_d128({half + 1, half + 1})));  // 2 * 2^62 = 2^63 > limit
   // TPC-H Q9 profits: four-decimal amounts of a few hundred thousand over many rows.
   CHECK(narrows(narrow_d128({1049999900, -1000000000, 7, 0})));
+}
+
+TEST_CASE("decimal sum narrowing - a batch whose SUM could pass 128 bits falls back",
+          "[aggregate][decimal_sum_overflow]")
+{
+  constexpr auto max128 = std::numeric_limits<__int128>::max();
+  CHECK_FALSE(narrows(narrow_d128({max128})));                     // 1 row: exact
+  CHECK_FALSE(narrows(narrow_d128({max128 / 2, -(max128 / 2)})));  // 2 * (2^126 - 1) < limit
+  CHECK_THROWS_AS(narrows(narrow_d128({max128 / 2 + 1, 0})), sirius::not_implemented_exception);
+  CHECK_THROWS_AS(narrows(narrow_d128({std::numeric_limits<__int128>::min(), 0})),
+                  sirius::not_implemented_exception);
+}
+
+TEST_CASE("decimal128 partial sums - the merge falls back unless the total stays below 2^127",
+          "[aggregate][decimal_sum_overflow]")
+{
+  constexpr auto max128 = std::numeric_limits<__int128>::max();
+  auto const check      = [](std::vector<cudf::column_view> const& partials) {
+    sirius::op::require_decimal128_partial_sums_in_range(
+      partials, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  };
+  auto const third = d128({max128 / 3});
+  auto const small = d128({5, -7});
+  CHECK_NOTHROW(check({third->view(), third->view(), third->view()}));  // 3 * floor(max / 3)
+  CHECK_NOTHROW(check({third->view(), small->view()}));
+  auto const half = d128({max128 / 2 + 1});
+  // Each batch fits on its own; the total across batches could not.
+  CHECK_NOTHROW(check({half->view()}));
+  CHECK_THROWS_AS(check({half->view(), half->view()}), sirius::not_implemented_exception);
+  CHECK_THROWS_AS(check({third->view(), third->view(), third->view(), small->view()}),
+                  sirius::not_implemented_exception);
+  // INT64 partials and empty or all-null columns cannot contribute.
+  auto const int64_partials = i64({std::numeric_limits<int64_t>::max()});
+  auto const empty          = cudf::make_empty_column(wide_integer_sum_type());
+  CHECK_NOTHROW(check({half->view(), int64_partials->view(), empty->view()}));
 }
 
 TEST_CASE("decimal sum narrowing - nulls, empty input and no candidates",
@@ -415,15 +455,17 @@ TEST_CASE("wide integer sum - which aggregates DuckDB accumulates in HUGEINT",
   using sirius::aggregate_id;
   using sirius::logical_type;
   using sirius::type_id;
-  for (auto id : {type_id::INTEGER, type_id::BIGINT, type_id::HUGEINT}) {
+  for (auto id : {type_id::INTEGER, type_id::BIGINT}) {
     CHECK(is_wide_integer_sum(aggregate_id::sum, logical_type::make(id)));
     CHECK(is_wide_integer_sum(aggregate_id::avg, logical_type::make(id)));
     // DuckDB's statistics proved the total fits in INT64.
     CHECK_FALSE(is_wide_integer_sum(aggregate_id::sum_no_overflow, logical_type::make(id)));
     CHECK_FALSE(is_wide_integer_sum(aggregate_id::min, logical_type::make(id)));
   }
-  // DuckDB itself sums these in INT64; decimals have their own widening.
-  for (auto id : {type_id::TINYINT, type_id::SMALLINT, type_id::BOOLEAN, type_id::DOUBLE}) {
+  // Narrow totals cannot leave INT64; HUGEINT is a DECIMAL128 carrier and, like decimals, has its
+  // own SUM path.
+  for (auto id :
+       {type_id::TINYINT, type_id::SMALLINT, type_id::BOOLEAN, type_id::DOUBLE, type_id::HUGEINT}) {
     CHECK_FALSE(is_wide_integer_sum(aggregate_id::sum, logical_type::make(id)));
   }
   CHECK_FALSE(is_wide_integer_sum(aggregate_id::sum, logical_type::make_decimal(18, 2)));
@@ -462,29 +504,30 @@ TEST_CASE("wide integer sum - INT64 partials are merged in INT64 only below 2^62
   CHECK_THROWS_AS(partials_may_overflow(d64({1})), sirius::internal_exception);
 }
 
-TEST_CASE("wide integer sum - a DECIMAL128 total narrows to INT64 or falls back",
+TEST_CASE("wide integer sum - a HUGEINT result is finalized to DECIMAL128 with scale 0",
           "[aggregate][wide_integer_sum]")
 {
-  // INT64 passes through untouched.
-  auto int64_result = narrow(i64({5, -7}));
-  CHECK(int64_result->type().id() == cudf::type_id::INT64);
-  CHECK(to_host(int64_result->view()) == std::vector<int64_t>{5, -7});
+  // INT64 totals, including both extremes, widen exactly.
+  auto widened = to_hugeint(i64({kMax64, kMin64, 0}));
+  CHECK(widened->type() == wide_integer_sum_type());
+  CHECK(to_host_128(widened->view()) == std::vector<__int128_t>{kMax64, kMin64, 0});
 
-  // Totals inside the INT64 range, including both extremes, narrow exactly.
-  auto narrowed = narrow(d128({kMax64, kMin64, 0}));
-  CHECK(narrowed->type().id() == cudf::type_id::INT64);
-  CHECK(to_host(narrowed->view()) == std::vector<int64_t>{kMax64, kMin64, 0});
+  // DECIMAL128 totals past either end pass through untouched.
+  auto const past_max = __int128_t{kMax64} + 1;
+  auto const past_min = __int128_t{kMin64} - 1;
+  auto passed         = to_hugeint(d128({past_max, past_min}));
+  CHECK(passed->type() == wide_integer_sum_type());
+  CHECK(to_host_128(passed->view()) == std::vector<__int128_t>{past_max, past_min});
 
-  // One past either end is a HUGEINT result: the query must fall back to DuckDB.
-  CHECK_THROWS_AS(narrow(d128({__int128_t{kMax64} + 1})), sirius::not_implemented_exception);
-  CHECK_THROWS_AS(narrow(d128({0, __int128_t{kMin64} - 1})), sirius::not_implemented_exception);
-
-  // An all-null total (an all-null group) narrows to an all-null INT64 column.
-  auto all_null = d128({__int128_t{kMax64} * 4});
+  // An all-null INT64 total (an all-null group) widens to an all-null DECIMAL128 column.
+  auto all_null = i64({kMax64});
   set_all_null(*all_null);
-  auto narrowed_null = narrow(std::move(all_null));
-  CHECK(narrowed_null->type().id() == cudf::type_id::INT64);
-  CHECK(narrowed_null->null_count() == 1);
+  auto widened_null = to_hugeint(std::move(all_null));
+  CHECK(widened_null->type() == wide_integer_sum_type());
+  CHECK(widened_null->null_count() == 1);
+
+  CHECK_THROWS_AS(to_hugeint(i32({1})), sirius::internal_exception);
+  CHECK_THROWS_AS(to_hugeint(d64({1})), sirius::internal_exception);
 }
 
 namespace {
@@ -538,4 +581,197 @@ TEST_CASE("wide integer sum - one-pass 128-bit reduction of INT64 and INT32",
   CHECK(sum128(sliced) == 6);
 
   CHECK_THROWS_AS(sum128(d64({1})->view()), sirius::internal_exception);
+}
+
+namespace {
+
+using sirius::op::combine_int64_halves;
+using sirius::op::split_int64_halves;
+
+/// Splits @p column and recombines the halves row by row, which must reproduce each value.
+std::unique_ptr<cudf::column> split_and_combine(cudf::column_view const& column)
+{
+  auto [high, low] =
+    split_int64_halves(column, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  REQUIRE(high->type().id() == cudf::type_id::INT64);
+  REQUIRE(low->type().id() == cudf::type_id::INT64);
+  return combine_int64_halves(
+    high->view(), low->view(), cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
+/// Per INT32 key, the exact 128-bit sum of @p values computed as the grouped aggregate does: an
+/// INT64 cuDF hash groupby SUM of each half, then combine_int64_halves. Ordered by key.
+std::map<int32_t, std::optional<__int128_t>> grouped_split_sums(cudf::column_view const& keys,
+                                                                cudf::column_view const& values)
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto [high, low]  = split_int64_halves(values, stream, mr);
+  std::vector<cudf::groupby::aggregation_request> requests(2);
+  requests[0].values = high->view();
+  requests[0].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  requests[1].values = low->view();
+  requests[1].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  cudf::groupby::groupby groupby(cudf::table_view({keys}));
+  auto [group_keys, results] = groupby.aggregate(requests, stream, mr);
+  auto sums =
+    combine_int64_halves(results[0].results[0]->view(), results[1].results[0]->view(), stream, mr);
+  REQUIRE(sums->type() == wide_integer_sum_type());
+  auto const key_host =
+    sirius::test::operator_utils::copy_column_to_host<int32_t>(group_keys->get_column(0), stream);
+  auto const sum_host = to_host_128(sums->view());
+  auto const valid    = sirius::test::operator_utils::copy_validity_to_host(sums->view());
+  std::map<int32_t, std::optional<__int128_t>> out;
+  for (cudf::size_type i = 0; i < sums->size(); ++i) {
+    out[key_host[i]] = valid[i] ? std::optional{sum_host[i]} : std::nullopt;
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("wide integer sum - INT64 halves recombine to every value exactly",
+          "[aggregate][wide_integer_sum]")
+{
+  auto column = i64({0, 1, -1, kMax64, kMin64, 0xFFFFFFFFLL, -0x100000000LL, 0x123456789ABCDEFLL});
+  auto result = split_and_combine(column->view());
+  CHECK(to_host_128(result->view()) ==
+        std::vector<__int128_t>{
+          0, 1, -1, kMax64, kMin64, 0xFFFFFFFFLL, -0x100000000LL, 0x123456789ABCDEFLL});
+
+  // NULL rows stay NULL, and a slice keeps its offset.
+  auto some_null = i64({kMax64, kMin64, 7});
+  set_validity(*some_null, 0b101);  // row 1 invalid
+  auto with_null = split_and_combine(some_null->view());
+  CHECK(with_null->null_count() == 1);
+  CHECK(sirius::test::operator_utils::copy_validity_to_host(with_null->view()) ==
+        std::vector<bool>{true, false, true});
+  auto const sliced = cudf::slice(column->view(), {3, 5})[0];
+  CHECK(to_host_128(split_and_combine(sliced)->view()) == std::vector<__int128_t>{kMax64, kMin64});
+
+  CHECK(split_and_combine(i64({})->view())->size() == 0);
+  CHECK_THROWS_AS(split_and_combine(i32({1})->view()), sirius::internal_exception);
+  CHECK_THROWS_AS(combine_int64_halves(i64({1})->view(),
+                                       i64({1, 2})->view(),
+                                       cudf::get_default_stream(),
+                                       cudf::get_current_device_resource_ref()),
+                  sirius::internal_exception);
+}
+
+TEST_CASE("wide integer sum - grouped sums of the halves are exact past INT64",
+          "[aggregate][wide_integer_sum]")
+{
+  // Two groups with many INT64 extremes each: every group's total leaves INT64.
+  std::vector<int32_t> keys;
+  std::vector<int64_t> values;
+  for (int i = 0; i < 1000; ++i) {
+    keys.push_back(0);
+    values.push_back(kMax64);
+    keys.push_back(1);
+    values.push_back(kMin64);
+  }
+  // A third group of mixed signs whose total cancels to a small value.
+  for (int64_t v : {kMax64, kMin64, int64_t{5}}) {
+    keys.push_back(2);
+    values.push_back(v);
+  }
+  auto key_column   = i32(keys);
+  auto value_column = i64(values);
+  CHECK(grouped_split_sums(key_column->view(), value_column->view()) ==
+        std::map<int32_t, std::optional<__int128_t>>{
+          {0, __int128_t{kMax64} * 1000}, {1, __int128_t{kMin64} * 1000}, {2, __int128_t{4}}});
+
+  // A group whose values are all NULL sums to NULL, as SQL's SUM of nothing.
+  auto null_keys   = i32({0, 0, 1});
+  auto null_values = i64({kMax64, kMax64, 3});
+  set_validity(*null_values, 0b011);  // row 2 (the only row of group 1) invalid
+  CHECK(
+    grouped_split_sums(null_keys->view(), null_values->view()) ==
+    std::map<int32_t, std::optional<__int128_t>>{{0, __int128_t{kMax64} * 2}, {1, std::nullopt}});
+}
+
+namespace {
+
+/// Groups -> SUM of a local grouped aggregate over (INT32 key, INT64 value), with the wide integer
+/// SUM split into halves or not. Also returns the result column's type and the group count.
+struct local_sum_result {
+  std::map<int32_t, __int128_t> sums;
+  cudf::data_type type;
+  cudf::size_type num_groups;
+};
+
+local_sum_result local_wide_sum(std::vector<int32_t> const& keys,
+                                std::vector<int64_t> const& values,
+                                bool split)
+{
+  auto* space       = sirius::test::operator_utils::get_default_gpu_space();
+  auto const stream = cudf::get_default_stream();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(i32(keys));
+  columns.push_back(i64(values));
+  auto batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                       *space,
+                                       stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  cudf::size_type num_groups = -1;
+  auto out        = sirius::op::gpu_aggregate_impl::local_grouped_aggregate(batch->to_read_only(),
+                                                                            {0},
+                                                                            {cudf::aggregation::Kind::SUM},
+                                                                            {1},
+                                                                            {},
+                                                                     stream,
+                                                                     *space,
+                                                                            {},
+                                                                            {},
+                                                                            {true},
+                                                                     split,
+                                                                     &num_groups);
+  auto const view = sirius::get_cudf_table_view(*out);
+  auto const key_host =
+    sirius::test::operator_utils::copy_column_to_host<int32_t>(view.column(0), stream);
+  std::vector<__int128_t> sum_host;
+  if (view.column(1).type() == wide_integer_sum_type()) {
+    sum_host = to_host_128(view.column(1));
+  } else {
+    for (auto v :
+         sirius::test::operator_utils::copy_column_to_host<int64_t>(view.column(1), stream)) {
+      sum_host.push_back(v);
+    }
+  }
+  local_sum_result result{{}, view.column(1).type(), num_groups};
+  for (std::size_t i = 0; i < key_host.size(); ++i) {
+    result.sums[key_host[i]] = sum_host[i];
+  }
+  return result;
+}
+
+}  // namespace
+
+TEST_CASE(
+  "wide integer sum - a grouped aggregate gives the same exact sums with or without the "
+  "split",
+  "[aggregate][wide_integer_sum]")
+{
+  // Values that make this batch able to overflow INT64, so the SUM is widened either way.
+  std::vector<int32_t> keys;
+  std::vector<int64_t> values;
+  for (int i = 0; i < 100; ++i) {
+    keys.push_back(i % 2);
+    values.push_back(i % 2 == 0 ? kMax64 : kMin64);
+  }
+  auto const expected =
+    std::map<int32_t, __int128_t>{{0, __int128_t{kMax64} * 50}, {1, __int128_t{kMin64} * 50}};
+  for (bool split : {false, true}) {
+    auto const result = local_wide_sum(keys, values, split);
+    CHECK(result.type == wide_integer_sum_type());
+    CHECK(result.num_groups == 2);
+    CHECK(result.sums == expected);
+  }
+
+  // Small values: the batch provably fits INT64, so neither path widens.
+  for (bool split : {false, true}) {
+    auto const result = local_wide_sum({0, 1, 0}, {5, 7, -2}, split);
+    CHECK(result.type.id() == cudf::type_id::INT64);
+    CHECK(result.sums == std::map<int32_t, __int128_t>{{0, 3}, {1, 7}});
+  }
 }

@@ -125,16 +125,16 @@ struct decimal128 {
  * position, so std::visit dispatch depends on this ordering. NULL is
  * alternative 0 so value{} default-constructs to NULL.
  *
- * HUGEINT and UHUGEINT do not have distinct alternatives; they reuse int64_t
- * and uint64_t respectively (narrowing — matches the executor's current cuDF
- * mapping).
+ * HUGEINT and UHUGEINT do not have distinct alternatives. HUGEINT is an exact
+ * decimal128 with scale 0, its cuDF carrier; UHUGEINT reuses uint64_t
+ * (narrowing — matches the executor's current cuDF mapping).
  */
 using value = std::variant<null_value,
                            bool,
                            int8_t,
                            int16_t,
                            int32_t,
-                           int64_t,  // BIGINT and HUGEINT (narrowed)
+                           int64_t,
                            uint8_t,
                            uint16_t,
                            uint32_t,
@@ -148,15 +148,15 @@ using value = std::variant<null_value,
                            timestamp_ns_value,
                            decimal32,
                            decimal64,
-                           decimal128,
+                           decimal128,  // DECIMAL(19..38) and HUGEINT (scale 0)
                            std::string>;
 
 /**
  * @brief Convert a duckdb::Value to a sirius::value.
  *
  * The supplied logical_type drives DECIMAL precision recovery and typed-NULL
- * fidelity. For HUGEINT / UHUGEINT, the value is narrowed to int64_t /
- * uint64_t — the same narrowing the executor performs today via
+ * fidelity. HUGEINT becomes an exact decimal128 with scale 0; UHUGEINT is
+ * narrowed to uint64_t — the same narrowing the executor performs today via
  * sirius::get_cudf_type.
  *
  * @throws sirius::not_implemented_exception if the type is unsupported.

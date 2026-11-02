@@ -232,11 +232,13 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_e
   }
 
   cudf::table_view combined_table_view(combined_column_views);
-  if (_policy.strategy == expression_evaluator_strategy::AST_INTERPRET) {
-    return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
-  } else {
+  if (_policy.strategy == expression_evaluator_strategy::AST_JIT) {
+    ++_ast_jit_evaluation_count;
     return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
   }
+  // MATERIALIZE uses a small interpreted AST for floating comparison semantics.
+  // Building that AST must not opt a query into the JIT backend.
+  return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::materialize_as_ast_column(
@@ -281,6 +283,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // the restored-reference cache over them, and the per-call instrumentation do not carry stale
   // state across calls.
   _restored_reference_cache.clear();
+  _hugeint_reference_bounds.clear();
   _restored_reference_cast_count  = 0;
   _narrow_domain_comparison_count = 0;
   _ast_tree                       = cudf::ast::tree{};

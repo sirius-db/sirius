@@ -50,7 +50,10 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
   switch (t.id()) {
     case sirius::type_id::TINYINT:
     case sirius::type_id::SMALLINT:
-    case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT64};
+    case sirius::type_id::INTEGER:
+    // HUGEINT's DECIMAL128 carrier hashes 16 bytes; its INT64 wrap matches a BIGINT key exactly for
+    // every value a BIGINT can equal, and equal out-of-range values still wrap alike.
+    case sirius::type_id::HUGEINT: return cudf::data_type{cudf::type_id::INT64};
     case sirius::type_id::BIGINT:
     case sirius::type_id::BOOLEAN:
     case sirius::type_id::VARCHAR: return cudf::data_type{cudf::type_id::EMPTY};
@@ -205,17 +208,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> streaming_fragment::make_result
   if (!prepared) { prepared = synthesize_prepared(subtree->types); }
   // The collector decodes GPU output with prepared->types; a mismatch would misread it.
   _sink_types = sirius::from_duckdb_vec(prepared->types);
-  // DuckDB types SUM(BIGINT) as HUGEINT while the planner narrows it to BIGINT; the collector
-  // casts the BIGINT column back, so that pair is not a mismatch.
-  auto decodes_as = [](const sirius::logical_type& declared, const sirius::logical_type& planned) {
-    return declared == planned ||
-           (declared.id() == sirius::type_id::HUGEINT && planned.id() == sirius::type_id::BIGINT);
-  };
-  if (!std::equal(_sink_types.begin(),
-                  _sink_types.end(),
-                  subtree->types.begin(),
-                  subtree->types.end(),
-                  decodes_as)) {
+  if (!std::equal(
+        _sink_types.begin(), _sink_types.end(), subtree->types.begin(), subtree->types.end())) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: prepared result types do not match the physical plan's " +
       std::to_string(subtree->types.size()) + " output column(s)");

@@ -344,7 +344,11 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 //
 // 14: ANS and Cascaded leaf metadata explicitly records the nvCOMP payload format.
 //     File layout and codec compatibility can now evolve independently.
-static constexpr std::uint8_t kVersion = 14;
+//
+// 15: a ZigZag output no fused op consumes is stored like Delta's and FOR's, as a Raw
+//     passthrough {data, offsets} parked on the ZigZag node, instead of as a "zigzag"
+//     buffer on the ZigZag node's own rep.
+static constexpr std::uint8_t kVersion = 15;
 
 // Per-column validity record, written right after num_rows:
 //

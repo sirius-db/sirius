@@ -423,12 +423,6 @@ bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 duckdb_native_gpu_ingestible::metadata_scan_task_t
 duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 {
-  return next_split_provider_with_stop(std::move(resolve));
-}
-
-duckdb_native_gpu_ingestible::stoppable_metadata_scan_task_t
-duckdb_native_gpu_ingestible::next_split_provider_with_stop(io::ioctx_resolver resolve)
-{
   // Backstop: the scan manager already ran the walk on the query thread, so this is a no-op.
   if (metadata_walk_pending()) {
     SIRIUS_LOG_WARN(
@@ -450,7 +444,7 @@ duckdb_native_gpu_ingestible::next_split_provider_with_stop(io::ioctx_resolver r
   // throws if no backend supports the path.
   // Runs on a scan-manager dispatcher thread:
   return [this, rg_begin, rg_end, resolve = std::move(resolve)](
-           std::stop_token stop) -> std::unique_ptr<scan_info> {
+           scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(_info->db_path);

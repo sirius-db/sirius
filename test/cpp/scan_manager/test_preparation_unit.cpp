@@ -133,6 +133,28 @@ TEST_CASE("Terminal preparation releases partial dependencies outside both locks
   CHECK(gate->callbacks == 0);
 }
 
+TEST_CASE("Failure before reporter binding accounts for physical input disposal",
+          "[scan_preparation][preparation_unit][preparation_cleanup]")
+{
+  auto gate     = std::make_shared<preparation_gate>();
+  auto seen     = std::make_shared<test::cleanup_observation>(gate);
+  auto required = needs(required_input::segments) | needs(required_input::checkpoint_iteration);
+  preparation_unit unit({1, 2}, required, gate);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  REQUIRE(unit.complete_input(segments_input{std::move(profile)}));
+  REQUIRE_FALSE(gate->report_failure);
+  REQUIRE(unit.fail({sirius::transparent::late_failure_cause::other, {}, "before arm", {}}));
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->callbacks_seen > 0);
+  std::lock_guard lock(gate->mutex);
+  CHECK(gate->callbacks == 0);
+}
+
 TEST_CASE("Failed ready snapshot retries release replaced dependency owners outside locks",
           "[.][host_allocation_fault][preparation_allocation_fault]")
 {
@@ -433,7 +455,7 @@ TEST_CASE("Delete result validation rejects invalid positions and releases its r
 {
   sirius::scan_manager::test::test_reservation_provider provider;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{{{8, 8, 16, 20}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{8, 8, 16}, 20}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
   ledger.register_unit({1, 1}, 20);
   auto permit    = ledger.acquire_permit({1, 1});

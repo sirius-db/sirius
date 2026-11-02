@@ -18,8 +18,9 @@
 #include "duckdb/common/exception.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "scan_manager/native_reader_executor.hpp"
 #include "scan_manager/preparation_coordinator.hpp"
-#include "scan_manager/preparation_test_support.hpp"
+#include "scan_manager/preparation_fixture.hpp"
 #include "utils/host_allocation_fault.hpp"
 
 #include <algorithm>
@@ -28,1092 +29,39 @@
 #include <deque>
 #include <future>
 #include <mutex>
-#include <stop_token>
 using namespace sirius::scan_manager;
 using namespace std::chrono_literals;
+using namespace sirius::test::preparation;
+
 namespace {
-struct hold {
-  std::mutex mutex;
-  std::condition_variable cv;
-  bool entered = false, released = false;
-  void wait()
-  {
-    std::unique_lock l(mutex);
-    entered = true;
-    cv.notify_all();
-    if (!cv.wait_for(l, 5s, [&] { return released; }))
-      throw std::runtime_error("test hold expired");
-  }
-  bool await()
-  {
-    std::unique_lock l(mutex);
-    return cv.wait_for(l, 1s, [&] { return entered; });
-  }
-  void release()
-  {
-    std::lock_guard l(mutex);
-    released = true;
-    cv.notify_all();
-  }
-};
-struct tagged : sirius::op::scan::scan_info {
-  int id;
-  size_t rows;
-  tagged(int i, size_t n = 1) : id(i), rows(n) {}
-  size_t preparation_bytes() const noexcept override { return rows; }
-};
-struct cleanup_tagged : tagged {
-  std::shared_ptr<test::cleanup_observation> seen;
-  explicit cleanup_tagged(std::shared_ptr<test::cleanup_observation> seen)
-    : tagged(1), seen(std::move(seen))
-  {
-  }
-  ~cleanup_tagged() override { seen->release(); }
-};
-struct accumulator : sirius::op::scan::batch_coalescer {
-  size_t cap, retained = 0;
-  int last      = 0;
-  bool produced = false;
-  std::optional<clock::time_point> fake_now;
-  std::function<clock::time_point()> fake_clock;
-  std::function<void()> on_retained;
-  explicit accumulator(size_t cap = 1000) : cap(cap) {}
-  size_t target_batch_bytes() const noexcept override { return cap; }
-  size_t retained_bytes() const noexcept override { return retained; }
-  cursor_step advance(sirius::op::scan::scan_info& input, size_t& cursor, size_t quantum) override
-  {
-    auto& data   = dynamic_cast<tagged&>(input);
-    size_t steps = 0;
-    while (cursor < data.rows && steps++ < quantum) {
-      note_retained(fake_clock ? fake_clock() : fake_now.value_or(clock::now()));
-      if (on_retained) on_retained();
-      ++retained;
-      ++cursor;
-      last = data.id;
-      if (retained >= cap) return {partial_emit(), cursor == data.rows};
-    }
-    return {nullptr, cursor == data.rows};
-  }
-  std::unique_ptr<sirius::op::scan::scan_info> partial_emit() override
-  {
-    if (!retained) return {};
-    auto result = std::make_unique<tagged>(last, retained);
-    retained    = 0;
-    produced    = true;
-    clear_retained();
-    return result;
-  }
-  std::vector<std::unique_ptr<sirius::op::scan::scan_info>> push(
-    std::unique_ptr<sirius::op::scan::scan_info> input) override
-  {
-    size_t cursor = 0;
-    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> out;
-    for (;;) {
-      auto s = advance(*input, cursor, 1);
-      if (s.batch) out.push_back(std::move(s.batch));
-      if (s.finished) return out;
-    }
-  }
-  std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
-  {
-    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> out;
-    if (auto b = partial_emit()) out.push_back(std::move(b));
-    if (!produced) {
-      out.push_back(std::make_unique<tagged>(-1, 0));
-      produced = true;
-    }
-    return out;
-  }
-};
-struct sink {
-  std::mutex mutex;
-  std::condition_variable cv;
-  std::vector<int> published;
-  std::function<void(size_t)> consumed;
-  std::deque<size_t> pending_bytes;
-  std::atomic<bool> closed{false};
-  std::atomic<size_t> close_calls{0};
-  std::atomic<size_t> preparations{0};
-  size_t count()
-  {
-    std::lock_guard l(mutex);
-    return published.size();
-  }
-  bool await(size_t n)
-  {
-    std::unique_lock l(mutex);
-    return cv.wait_for(l, 1s, [&] { return published.size() >= n; });
-  }
-  bool await_closed()
-  {
-    std::unique_lock l(mutex);
-    return cv.wait_for(l, 1s, [&] { return closed.load(); });
-  }
-  void consume()
-  {
-    size_t bytes;
-    {
-      std::lock_guard l(mutex);
-      if (pending_bytes.empty()) return;
-      bytes = pending_bytes.front();
-      pending_bytes.pop_front();
-    }
-    if (consumed) consumed(bytes);
-  }
-};
-auto finite_jobs(size_t count,
-                 std::function<std::unique_ptr<sirius::op::scan::scan_info>(int)> make_input)
+// Metadata-only coordination is owner-driven regardless of pool size.
+auto control_drivers()
 {
-  return [count,
-          make_input = std::move(make_input),
-          next       = 0]() mutable -> std::optional<preparation_coordinator::job> {
-    auto id = next++;
-    if (static_cast<size_t>(id) >= count) return {};
-    return preparation_coordinator::job{[make_input, id] { return make_input(id); }, {}};
-  };
+  using domain = preparation_coordinator::execution_domain;
+  return Catch::Generators::table<domain, unsigned>({{domain::metadata_worker, 2},
+                                                     {domain::query_owner, 0},
+                                                     {domain::query_owner, 2},
+                                                     {domain::native_reader, 0},
+                                                     {domain::native_reader, 2}});
 }
-auto single_job(std::function<std::unique_ptr<sirius::op::scan::scan_info>()> make_input,
-                std::shared_ptr<preparation_unit> unit = {})
+bool gate_is_available(std::shared_ptr<preparation_gate> const& gate)
 {
-  return [job     = preparation_coordinator::job{std::move(make_input), std::move(unit)},
-          claimed = false]() mutable -> std::optional<preparation_coordinator::job> {
-    if (std::exchange(claimed, true)) return {};
-    return std::move(job);
-  };
-}
-struct fixture {
-  sirius::exec::static_thread_pool pool;
-  sirius::exec::scoped_dispatcher dispatcher;
-  sirius::pipeline::completion_handler completion;
-  preparation_coordinator coordinator;
-  std::vector<std::shared_ptr<hold>> holds;
-  explicit fixture(size_t workers                               = 2,
-                   size_t lookahead                             = 4,
-                   std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval,
-                   std::optional<preparation_options> options   = std::nullopt)
-    : pool(static_cast<int>(workers)),
-      dispatcher(pool),
-      coordinator(completion,
-                  dispatcher,
-                  options.value_or(preparation_options{workers,
-                                                       lookahead,
-                                                       workers,
-                                                       1,
-                                                       interrupt_interval,
-                                                       0,
-                                                       partial_batch_options{50, 20ms, 20ms}}))
-  {
-  }
-  std::thread owner;
-  std::exception_ptr owner_error;
-  void start()
-  {
-    owner = std::thread([this] {
-      try {
-        coordinator.arm();
-        coordinator.run_on_query_thread();
-        coordinator.drain();
-      } catch (...) {
-        owner_error = std::current_exception();
-        completion.report_error(owner_error);
-        coordinator.drain();
+  bool available = false;
+  std::thread probe([&] {
+    auto deadline = std::chrono::steady_clock::now() + 100ms;
+    do {
+      std::unique_lock lock(gate->mutex, std::try_to_lock);
+      if (lock.owns_lock()) {
+        available = true;
+        return;
       }
-    });
-  }
-  void finish()
-  {
-    if (owner.joinable()) owner.join();
-  }
-  void stop()
-  {
-    for (auto& h : holds)
-      h->release();
-    coordinator.request_stop(stop_reason::normal_eos);
-    finish();
-  }
-  std::shared_ptr<fixture> shutdown_guard()
-  {
-    return std::shared_ptr<fixture>(this, [](fixture* f) { f->stop(); });
-  }
-  ~fixture()
-  {
-    for (auto& h : holds)
-      h->release();
-    coordinator.request_stop(stop_reason::normal_eos);
-    finish();
-    if (coordinator.snapshot().phase == preparation_coordinator::lifecycle::constructed)
-      coordinator.drain();
-  }
-  std::shared_ptr<hold> make_hold()
-  {
-    auto h = std::make_shared<hold>();
-    holds.push_back(h);
-    return h;
-  }
-  void source(std::shared_ptr<accumulator> a,
-              std::shared_ptr<sink> out,
-              std::function<std::optional<preparation_coordinator::job>()> claim,
-              std::shared_ptr<hold> construction = {})
-  {
-    coordinator.add_source(
-      {a,
-       std::move(claim),
-       [construction, out](std::unique_ptr<sirius::op::scan::scan_info> batch) {
-         if (construction) construction->wait();
-         using sirius::op::scan::scan_operator_input;
-         auto input =
-           std::make_unique<scan_operator_input>(std::move(batch),
-                                                 nullptr,
-                                                 0,
-                                                 std::nullopt,
-                                                 scan_operator_input::prefetch_start::deferred);
-         auto prepare = [out, raw = input.get()] {
-           raw->initialize_prefetch();
-           ++out->preparations;
-         };
-         return preparation_coordinator::publication{std::move(input), 0, std::move(prepare)};
-       },
-       [out](preparation_coordinator::publication& p) {
-         auto& input = dynamic_cast<sirius::op::scan::scan_operator_input&>(*p.input);
-         auto metadata =
-           std::get<std::shared_ptr<sirius::op::scan::scan_info>>(input.materialization_info);
-         auto& tag = dynamic_cast<tagged&>(*metadata);
-         std::lock_guard l(out->mutex);
-         out->published.push_back(tag.id);
-         out->pending_bytes.push_back(p.preparation_bytes);
-         out->cv.notify_all();
-       },
-       [out] {
-         std::lock_guard l(out->mutex);
-         ++out->close_calls;
-         out->closed = true;
-         out->cv.notify_all();
-       },
-       [out](std::function<void(size_t)> consume) { out->consumed = std::move(consume); },
-       {}});
-  }
-};
+      std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+  });
+  probe.join();
+  return available;
+}
 }  // namespace
-TEST_CASE("Preparation input disposal is outside the gate on every terminal path",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  enum class path {
-    finished,
-    ready_unit,
-    late_worker,
-    cancelled_unit,
-    parked_result,
-    queued_batch,
-    dropped_before_enqueue,
-    invalid_flush
-  };
-  auto mode = GENERATE(path::finished,
-                       path::ready_unit,
-                       path::late_worker,
-                       path::cancelled_unit,
-                       path::parked_result,
-                       path::queued_batch,
-                       path::dropped_before_enqueue,
-                       path::invalid_flush);
-  CAPTURE(static_cast<int>(mode));
-  fixture f(1, 1);
-  auto out    = std::make_shared<sink>();
-  auto seen   = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
-  auto worker = f.make_hold();
-  struct pruning_coalescer : accumulator {
-    std::function<std::unique_ptr<sirius::op::scan::scan_info>()> emit;
-    std::shared_ptr<test::cleanup_observation> invalid_flush;
-    cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
-    {
-      return {emit ? emit() : nullptr, true};
-    }
-    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
-    {
-      std::vector<std::unique_ptr<sirius::op::scan::scan_info>> out;
-      if (invalid_flush) {
-        out.push_back(std::make_unique<cleanup_tagged>(invalid_flush));
-        out.push_back(std::make_unique<cleanup_tagged>(invalid_flush));
-      }
-      return out;
-    }
-  };
-  auto coalescer = std::make_shared<pruning_coalescer>();
-  if (mode == path::invalid_flush) coalescer->invalid_flush = seen;
-  if (mode == path::queued_batch) {
-    coalescer->emit = [&] {
-      f.coordinator.request_stop(stop_reason::normal_eos);
-      return std::make_unique<cleanup_tagged>(seen);
-    };
-  }
-  std::shared_ptr<preparation_unit> unit;
-  if (mode == path::ready_unit || mode == path::dropped_before_enqueue) {
-    required_input_set required;
-    required.set(static_cast<size_t>(required_input::segments));
-    required.set(static_cast<size_t>(required_input::checkpoint_iteration));
-    unit = f.coordinator.admit_unit({93, 1}, required);
-    REQUIRE(unit);
-    auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
-      new sirius::op::scan::physical_profile_table, [seen](auto* value) {
-        seen->release();
-        delete value;
-      });
-    REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
-    REQUIRE(unit->complete_input(checkpoint_input{7}));
-  } else if (mode == path::cancelled_unit || mode == path::parked_result) {
-    required_input_set required;
-    required.set(static_cast<size_t>(required_input::visibility));
-    unit = f.coordinator.admit_unit({93, 1}, required);
-    REQUIRE(unit);
-  }
-  f.source(coalescer,
-           out,
-           single_job(
-             [&, seen]() -> std::unique_ptr<sirius::op::scan::scan_info> {
-               if (mode == path::ready_unit || mode == path::dropped_before_enqueue)
-                 return std::make_unique<tagged>(1);
-               auto input = std::make_unique<cleanup_tagged>(seen);
-               if (mode == path::late_worker) worker->wait();
-               return input;
-             },
-             unit));
-  if (mode == path::ready_unit || mode == path::dropped_before_enqueue) unit.reset();
-  if (mode == path::dropped_before_enqueue)
-    f.coordinator.before_submission_for_testing(
-      [&] { f.coordinator.request_stop(stop_reason::normal_eos); });
-  auto cleanup = f.shutdown_guard();
-  f.start();
-  if (mode == path::late_worker) {
-    REQUIRE(worker->await());
-    f.coordinator.request_stop(stop_reason::normal_eos);
-    worker->release();
-  } else if (unit) {
-    auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (!f.coordinator.snapshot().results_peak && std::chrono::steady_clock::now() < deadline)
-      std::this_thread::yield();
-    REQUIRE(f.coordinator.snapshot().results_peak == 1);
-    if (mode == path::cancelled_unit)
-      REQUIRE(unit->cancel());
-    else
-      f.coordinator.request_stop(stop_reason::normal_eos);
-  }
-  f.finish();
-  CHECK_FALSE(f.owner_error);
-  CHECK(f.completion.has_error() == (mode == path::invalid_flush));
-  if (mode == path::invalid_flush)
-    CHECK_THROWS_WITH(f.completion.get_awaitable().get(),
-                      "final flush exceeded its reserved output slot");
-  CHECK(seen->releases == (mode == path::invalid_flush ? 3 : mode == path::queued_batch ? 2 : 1));
-  CHECK(seen->outside == seen->releases);
-  CHECK(seen->errors == 0);
-  CHECK(out->count() == 0);
-  CHECK(out->close_calls == 1);
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-  CHECK(f.coordinator.snapshot().jobs_peak == 1);
-  CHECK(f.coordinator.snapshot().results_peak <= 1);
-  CHECK(f.coordinator.snapshot().output_peak <= 1);
-}
-
-TEST_CASE("Failed result settlement releases owners outside the gate and preserves the error",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  fixture f(2, 1);
-  auto failure = f.completion.get_awaitable();
-  auto out     = std::make_shared<sink>();
-  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
-  auto first = f.make_hold(), second = f.make_hold();
-  struct sized_input : cleanup_tagged {
-    size_t bytes;
-    sized_input(std::shared_ptr<test::cleanup_observation> seen, size_t bytes)
-      : cleanup_tagged(std::move(seen)), bytes(bytes)
-    {
-    }
-    size_t preparation_bytes() const noexcept override { return bytes; }
-  };
-  required_input_set required;
-  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
-  auto unit = f.coordinator.admit_unit({100, 1}, required);
-  REQUIRE(unit);
-  f.source(std::make_shared<accumulator>(std::numeric_limits<size_t>::max()),
-           out,
-           [&, next = 0]() mutable -> std::optional<preparation_coordinator::job> {
-             if (next == 2) return {};
-             auto id = next++;
-             return preparation_coordinator::job{
-               [=] {
-                 (id == 0 ? first : second)->wait();
-                 return std::make_unique<sized_input>(
-                   seen, id == 0 ? std::numeric_limits<size_t>::max() : 1);
-               },
-               unit};
-           });
-  auto cleanup = f.shutdown_guard();
-  f.start();
-  REQUIRE(first->await());
-  REQUIRE(second->await());
-  first->release();
-  auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (!f.coordinator.snapshot().results_peak && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  REQUIRE(f.coordinator.snapshot().results_peak == 1);
-  second->release();
-  f.finish();
-  CHECK_FALSE(f.owner_error);
-  REQUIRE(f.completion.has_error());
-  CHECK_THROWS_WITH(failure.get(), "preparation lookahead work size overflow");
-  CHECK(seen->releases == 2);
-  CHECK(seen->outside == 2);
-  CHECK(seen->errors == 0);
-  CHECK(out->count() == 0);
-  CHECK(out->close_calls == 1);
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-}
-
-TEST_CASE("Retiring units releases final owners but preserves external ready snapshots",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  enum class mode { pending, ready, retained_snapshot };
-  auto stage = GENERATE(mode::pending, mode::ready, mode::retained_snapshot);
-  CAPTURE(static_cast<int>(stage));
-  fixture f;
-  auto seen = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
-  required_input_set required;
-  required.set(static_cast<size_t>(required_input::segments));
-  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
-  auto unit = f.coordinator.admit_unit({94, 1}, required);
-  REQUIRE(unit);
-  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
-    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
-      seen->release();
-      delete value;
-    });
-  sirius::op::scan::physical_profile value;
-  value.storage_version = 77;
-  auto id               = profile->add(value);
-  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
-  if (stage != mode::pending) REQUIRE(unit->complete_input(checkpoint_input{7}));
-  unit_record snapshot;
-  if (stage == mode::retained_snapshot) snapshot = unit->record();
-  unit.reset();
-  f.coordinator.retire_unit({94, 1});
-  CHECK_FALSE(f.coordinator.unit_state_snapshot({94, 1}));
-  if (stage == mode::retained_snapshot) {
-    CHECK(seen->releases == 0);
-    REQUIRE(snapshot.deps);
-    REQUIRE(snapshot.deps->profiles);
-    CHECK(snapshot.deps->profiles->get(id).storage_version == 77);
-    CHECK(snapshot.deps->checkpoint_iteration == 7);
-    snapshot = {};
-  } else {
-    CHECK(seen->callbacks_seen > 0);
-  }
-  CHECK(seen->releases == 1);
-  CHECK(seen->outside == 1);
-  CHECK(seen->errors == 0);
-  f.coordinator.retire_unit({94, 1});
-  CHECK(seen->releases == 1);
-}
-
-TEST_CASE("Dependency disposal keeps drain pending through terminal cleanup",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  enum class operation { cancel, fail, retire, stop };
-  auto mode = GENERATE(operation::cancel, operation::fail, operation::retire, operation::stop);
-  CAPTURE(static_cast<int>(mode));
-  fixture f(1, 1);
-  auto paused       = f.make_hold();
-  auto seen         = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
-  seen->after_probe = [paused] { paused->wait(); };
-  required_input_set required;
-  required.set(static_cast<size_t>(required_input::segments));
-  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
-  auto unit = f.coordinator.admit_unit({95, 1}, required);
-  REQUIRE(unit);
-  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
-    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
-      seen->release();
-      delete value;
-    });
-  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
-  unit.reset();
-  // No preparation job protects this caller: disposal needs its own drain credit.
-  std::atomic<bool> terminal_done{false};
-  std::jthread terminal([&] {
-    if (mode == operation::retire) {
-      f.coordinator.retire_unit({95, 1});
-    } else if (mode == operation::stop) {
-      f.coordinator.request_stop(stop_reason::normal_eos);
-    } else {
-      auto pending = f.coordinator.admit_unit({95, 1}, required);
-      if (mode == operation::cancel)
-        pending->cancel();
-      else
-        pending->fail({sirius::transparent::late_failure_cause::other, {}, "cleanup failure", {}});
-    }
-    terminal_done = true;
-  });
-  // Release before joining even if a REQUIRE aborts this test.
-  auto release = std::shared_ptr<hold>(paused.get(), [paused](hold*) { paused->release(); });
-  auto cleanup = f.shutdown_guard();
-  REQUIRE(paused->await());
-  REQUIRE(seen->outside == 1);
-  CHECK(seen->callbacks_seen > 0);
-  f.start();
-  f.coordinator.request_stop(stop_reason::normal_eos);
-  auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (!f.coordinator.snapshot().wakes && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  REQUIRE(f.coordinator.snapshot().wakes > 0);
-  std::this_thread::sleep_for(30ms);
-  CHECK_FALSE(terminal_done);
-  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
-  paused->release();
-  terminal.join();
-  f.finish();
-  CHECK(terminal_done);
-  CHECK(seen->releases == 1);
-  CHECK(seen->outside == 1);
-  CHECK(seen->errors == 0);
-  CHECK_FALSE(f.owner_error);
-  CHECK(f.completion.has_error() == (mode == operation::fail));
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-}
-
-TEST_CASE("Quiescent preparation ignores late dispatcher stop notifications",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  auto failure = GENERATE(false, true);
-  CAPTURE(failure);
-  sirius::exec::static_thread_pool pool(1);
-  std::optional<sirius::exec::scoped_dispatcher> dispatcher(std::in_place, pool);
-  sirius::pipeline::completion_handler completion;
-  preparation_coordinator coordinator(completion, *dispatcher, preparation_config{}.resolve(1));
-  coordinator.arm();
-  coordinator.run_on_query_thread();
-  REQUIRE(coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-
-  // Transparent replacement makes a stale borrow observable without accessing a dead mutex.
-  dispatcher.reset();
-  dispatcher.emplace(pool);
-  auto paused  = std::make_shared<hold>();
-  auto drain   = std::shared_ptr<void>(nullptr, [&](void*) {
-    dispatcher->request_stop();
-    dispatcher->wait_for_all();
-  });
-  auto release = std::shared_ptr<hold>(paused.get(), [paused](hold*) { paused->release(); });
-  std::promise<std::stop_token> started;
-  auto running = started.get_future();
-  dispatcher->enqueue([paused, started = std::move(started)](std::stop_token token) mutable {
-    started.set_value(token);
-    paused->wait();
-  });
-  REQUIRE(running.wait_for(1s) == std::future_status::ready);
-  auto token = running.get();
-  if (failure)
-    completion.report_error("late completion failure");
-  else
-    completion.mark_completed();
-  coordinator.request_stop(stop_reason::normal_eos);
-  coordinator.request_stop(stop_reason::normal_eos);
-  CHECK_FALSE(token.stop_requested());
-  CHECK(completion.has_error() == failure);
-  CHECK(coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-}
-
-TEST_CASE("Final release stop notifications coalesce while units retire themselves",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  fixture f(1, 32);
-  size_t depth = 0, peak = 0;
-  std::array<size_t, 32> releases{};
-  std::vector<std::shared_ptr<preparation_unit>> units;
-  auto cleanup = f.shutdown_guard();
-  required_input_set required;
-  required.set(static_cast<size_t>(required_input::segments));
-  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
-  for (size_t index = 0; index < releases.size(); ++index) {
-    unit_key key{96, index};
-    auto unit = f.coordinator.admit_unit(key, required);
-    REQUIRE(unit);
-    auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
-      new sirius::op::scan::physical_profile_table, [&, key, index](auto* value) {
-        peak = std::max(peak, ++depth);
-        ++releases[index];
-        f.coordinator.request_stop(stop_reason::normal_eos);
-        f.coordinator.retire_unit(key);
-        --depth;
-        delete value;
-      });
-    REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
-    units.push_back(std::move(unit));
-  }
-  f.coordinator.request_stop(stop_reason::normal_eos);
-  CHECK(depth == 0);
-  CHECK(peak == 1);
-  for (size_t index = 0; index < releases.size(); ++index) {
-    CHECK(releases[index] == 1);
-    CHECK(units[index]->record().state == unit_state::cancelled);
-    CHECK_FALSE(f.coordinator.unit_state_snapshot({96, index}));
-  }
-  f.start();
-  f.finish();
-  CHECK_FALSE(f.owner_error);
-  CHECK_FALSE(f.completion.has_error());
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-}
-
-TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  fixture f(1, 2, k_interrupt_check_interval, preparation_options{2, 2, 2, 1, 20ms});
-  auto blocked = f.make_hold();
-  std::atomic<size_t> work_calls{0};
-  std::atomic<size_t> active{0}, peak{0};
-  std::array<std::atomic<size_t>, 2> releases{};
-  struct notify_on_release {
-    preparation_coordinator& coordinator;
-    std::atomic<size_t>&active, &peak, &releases;
-    notify_on_release(preparation_coordinator& coordinator,
-                      std::atomic<size_t>& active,
-                      std::atomic<size_t>& peak,
-                      std::atomic<size_t>& releases)
-      : coordinator(coordinator), active(active), peak(peak), releases(releases)
-    {
-    }
-    ~notify_on_release()
-    {
-      static thread_local size_t depth = 0;
-      auto nested                      = ++depth;
-      auto prior                       = peak.load();
-      while (prior < nested && !peak.compare_exchange_weak(prior, nested)) {}
-      ++active;
-      ++releases;
-      coordinator.request_stop(stop_reason::normal_eos);
-      --active;
-      --depth;
-    }
-  };
-  auto cleanup = f.shutdown_guard();
-  f.dispatcher.enqueue([blocked] { blocked->wait(); });
-  REQUIRE(blocked->await());
-  f.source(std::make_shared<accumulator>(1),
-           std::make_shared<sink>(),
-           [&, next = size_t{0}]() mutable -> std::optional<preparation_coordinator::job> {
-             if (next == releases.size()) return {};
-             auto token =
-               std::make_shared<notify_on_release>(f.coordinator, active, peak, releases[next++]);
-             return preparation_coordinator::job{
-               [token, &work_calls] {
-                 ++work_calls;
-                 return std::make_unique<tagged>(1);
-               },
-               {},
-               [token = std::move(token), &work_calls](std::stop_token) {
-                 ++work_calls;
-                 return std::make_unique<tagged>(1);
-               }};
-           });
-  f.start();
-  auto deadline = std::chrono::steady_clock::now() + 2s;
-  // The third iteration starts only after both previous enqueue calls returned.
-  while (f.coordinator.snapshot().wakes < 3 && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  REQUIRE(f.coordinator.snapshot().wakes >= 3);
-  REQUIRE(f.coordinator.snapshot().jobs_peak == 2);
-  f.coordinator.request_stop(stop_reason::normal_eos);
-  blocked->release();
-  f.finish();
-  CHECK(active == 0);
-  CHECK(peak == 1);
-  CHECK(releases[0] == 1);
-  CHECK(releases[1] == 1);
-  CHECK(work_calls == 0);
-  CHECK_FALSE(f.owner_error);
-  CHECK_FALSE(f.completion.has_error());
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-}
-
-TEST_CASE("Completion stop retains sweep credit through discarded dispatcher captures",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  auto failure = GENERATE(false, true);
-  CAPTURE(failure);
-  fixture f(1, 1);
-  auto blocked      = f.make_hold();
-  auto paused       = f.make_hold();
-  auto seen         = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
-  seen->after_probe = [paused] { paused->wait(); };
-  auto cleanup      = f.shutdown_guard();
-  auto external     = f.coordinator.external_use();
-  f.dispatcher.enqueue([blocked] { blocked->wait(); });
-  REQUIRE(blocked->await());
-  std::atomic<size_t> calls{0};
-  // This pending capture has no job ticket or unit cleanup credit of its own.
-  auto capture = std::shared_ptr<void>(nullptr, [seen](void*) { seen->release(); });
-  f.dispatcher.enqueue([capture = std::move(capture), &calls] { ++calls; });
-  f.start();
-  auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (!f.coordinator.snapshot().wakes && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  REQUIRE(f.coordinator.snapshot().wakes > 0);
-
-  std::atomic<bool> notified{false};
-  std::jthread terminal([&] {
-    if (failure)
-      f.completion.report_error("discarded capture failure");
-    else
-      f.completion.mark_completed();
-    notified = true;
-  });
-  auto release = std::shared_ptr<hold>(paused.get(), [paused](hold*) { paused->release(); });
-  REQUIRE(paused->await());
-  CHECK(seen->outside == 1);
-  // Observe the credit directly: dispatcher wait_for_all also prevents quiescence.
-  CHECK(seen->callbacks_seen > 0);
-  external.reset();
-  blocked->release();
-  CHECK_FALSE(notified);
-  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
-  paused->release();
-  terminal.join();
-  f.finish();
-  CHECK(notified);
-  CHECK(calls == 0);
-  CHECK(seen->releases == 1);
-  CHECK(seen->errors == 0);
-  CHECK_FALSE(f.owner_error);
-  CHECK(f.completion.has_error() == failure);
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-}
-
-TEST_CASE("Preparation cancel retirement and stop bookkeeping allocate no host memory",
-          "[.][host_allocation_fault][preparation_allocation_fault]")
-{
-  using fault = sirius::test::scoped_host_allocation_fault;
-  REQUIRE(fault::available());
-  enum class operation { cancel, retire, stop };
-  auto mode = GENERATE(operation::cancel, operation::retire, operation::stop);
-  CAPTURE(static_cast<int>(mode));
-  fixture f;
-  std::atomic<size_t> released{0};
-  required_input_set required;
-  required.set(static_cast<size_t>(required_input::segments));
-  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
-  auto unit = f.coordinator.admit_unit({98, 1}, required);
-  REQUIRE(unit);
-  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
-    new sirius::op::scan::physical_profile_table, [&](auto* value) {
-      ++released;
-      delete value;
-    });
-  auto cleanup = f.shutdown_guard();
-  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
-  if (mode != operation::cancel) unit.reset();
-  size_t allocations = 0;
-  {
-    // The deleter only updates an atomic: observer thread creation is not counted.
-    fault counting{fault::every_allocation_scope, 0};
-    if (mode == operation::cancel)
-      unit->cancel();
-    else if (mode == operation::retire)
-      f.coordinator.retire_unit({98, 1});
-    else
-      f.coordinator.request_stop(stop_reason::normal_eos);
-    allocations = counting.stop();
-  }
-  CHECK(allocations == 0);
-  CHECK(released == 1);
-}
-
-TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
-          "[.][host_allocation_fault][preparation_allocation_fault]")
-{
-  auto dual_callbacks = GENERATE(false, true);
-  using fault         = sirius::test::scoped_host_allocation_fault;
-  REQUIRE(fault::available());
-  enum class path { rejected, abandoned, submission_error };
-  auto mode            = GENERATE(path::rejected, path::abandoned, path::submission_error);
-  const bool abandoned = mode == path::abandoned;
-  CAPTURE(static_cast<int>(mode));
-  fixture f(1, 1);
-  struct measurement {
-    std::optional<fault> counting;
-    std::thread::id owner;
-    bool control_fired = false, finished = false, same_thread = false;
-    size_t allocations = 0;
-    void arm() noexcept
-    {
-      {
-        fault control{fault::every_allocation_scope, 1};
-        try {
-          void* pointer                         = ::operator new(64);
-          *static_cast<volatile char*>(pointer) = 1;
-          ::operator delete(pointer);
-        } catch (std::bad_alloc const&) {
-          control_fired = control.fired();
-        }
-        (void)control.stop();
-      }
-      owner = std::this_thread::get_id();
-      counting.emplace(fault::every_allocation_scope, 0);
-    }
-    void finish() noexcept
-    {
-      same_thread = owner == std::this_thread::get_id();
-      if (same_thread && counting) {
-        allocations = counting->stop();
-        counting.reset();
-        finished = true;
-      }
-    }
-  };
-  auto measured = std::make_shared<measurement>();
-  auto blocked  = f.make_hold();
-  std::atomic<size_t> work_calls{0};
-  required_input_set required;
-  required.set(static_cast<size_t>(required_input::segments));
-  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
-  auto unit = f.coordinator.admit_unit({99, 1}, required);
-  REQUIRE(unit);
-  auto cleanup = f.shutdown_guard();
-  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
-    new sirius::op::scan::physical_profile_table, [measured](auto* value) {
-      measured->finish();
-      delete value;
-    });
-  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
-  REQUIRE(unit->complete_input(checkpoint_input{7}));
-  std::function<std::unique_ptr<sirius::op::scan::scan_info>()> work;
-  if (mode != path::rejected) {
-    struct arm_on_destroy {
-      std::shared_ptr<measurement> measured;
-      explicit arm_on_destroy(std::shared_ptr<measurement> measured) : measured(std::move(measured))
-      {
-      }
-      ~arm_on_destroy() { measured->arm(); }
-    };
-    auto token = std::make_shared<arm_on_destroy>(measured);
-    work       = [token = std::move(token), &work_calls] {
-      ++work_calls;
-      return std::make_unique<tagged>(1);
-    };
-    if (abandoned) {
-      f.dispatcher.enqueue([blocked] { blocked->wait(); });
-      REQUIRE(blocked->await());
-    }
-  } else {
-    work = [&, measured] {
-      ++work_calls;
-      auto input = std::make_unique<tagged>(1);
-      blocked->wait();
-      measured->arm();
-      return input;
-    };
-  }
-  f.source(std::make_shared<accumulator>(1),
-           std::make_shared<sink>(),
-           [claim = single_job(std::move(work), std::move(unit)), dual_callbacks]() mutable {
-             auto job = claim();
-             if (job && dual_callbacks)
-               job->stop_work = [work = job->work](std::stop_token) { return work(); };
-             return job;
-           });
-  if (mode == path::submission_error) {
-    auto original = std::make_exception_ptr(std::runtime_error("submission failed before enqueue"));
-    f.coordinator.before_submission_for_testing([original] { std::rethrow_exception(original); });
-  }
-  f.start();
-  if (mode != path::submission_error) {
-    auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (f.coordinator.snapshot().wakes < 2 && std::chrono::steady_clock::now() < deadline)
-      std::this_thread::yield();
-    REQUIRE(f.coordinator.snapshot().wakes >= 2);
-    if (!abandoned) REQUIRE(blocked->await());
-    f.coordinator.request_stop(stop_reason::normal_eos);
-    blocked->release();
-  }
-  f.finish();
-  CHECK_FALSE(f.owner_error);
-  CHECK(f.completion.has_error() == (mode == path::submission_error));
-  if (mode == path::submission_error)
-    CHECK_THROWS_WITH(f.completion.get_awaitable().get(), "submission failed before enqueue");
-  CHECK(work_calls == (mode == path::rejected ? 1 : 0));
-  CHECK(measured->control_fired);
-  CHECK(measured->same_thread);
-  CHECK(measured->finished);
-  CHECK(measured->allocations == 0);
-  CHECK(f.coordinator.snapshot().results_peak == 0);
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-}
-
-TEST_CASE("Queue allocation failure unwinds every caller payload outside the gate",
-          "[.][host_allocation_fault][preparation_allocation_fault]")
-{
-  using fault = sirius::test::scoped_host_allocation_fault;
-  REQUIRE(fault::available());
-  enum class path { advance, partial, sized, full_window, flush };
-  auto mode = GENERATE(path::advance, path::partial, path::sized, path::full_window, path::flush);
-  CAPTURE(static_cast<int>(mode));
-  preparation_options options{
-    1, 1, 1, 1, k_interrupt_check_interval, 0, partial_batch_options{50, 20ms, 20ms}};
-  if (mode == path::sized) options.partial_batch->max_residence = 2s;
-  if (mode == path::full_window) options.partial_batch.reset();
-  fixture f(1, 1, k_interrupt_check_interval, options);
-  auto failure = f.completion.get_awaitable();
-  auto out     = std::make_shared<sink>();
-  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
-  std::optional<fault> armed;
-  size_t made = 0, refused_id = 0, observed_allocations = 0;
-  auto disarm = [&](size_t id) {
-    if (armed) {
-      observed_allocations += armed->stop();
-      if (armed->fired()) refused_id = id;
-      armed.reset();
-    }
-  };
-  struct queued_payload : tagged {
-    std::shared_ptr<test::cleanup_observation> seen;
-    std::function<void()> disarm;
-    queued_payload(int id,
-                   std::shared_ptr<test::cleanup_observation> seen,
-                   std::function<void()> disarm)
-      : tagged(id), seen(std::move(seen)), disarm(std::move(disarm))
-    {
-    }
-    ~queued_payload() override
-    {
-      disarm();
-      seen->release();
-    }
-  };
-  auto make_batch = [&]() -> std::unique_ptr<sirius::op::scan::scan_info> {
-    auto id = ++made;
-    return std::make_unique<queued_payload>(static_cast<int>(id), seen, [&, id] { disarm(id); });
-  };
-  struct fault_coalescer : accumulator {
-    path mode;
-    std::function<std::unique_ptr<sirius::op::scan::scan_info>()> make;
-    std::function<void()> arm;
-    size_t advance_calls = 0, partial_calls = 0, flush_calls = 0;
-    explicit fault_coalescer(path mode)
-      : accumulator(mode == path::full_window ? 1 : 1000), mode(mode)
-    {
-    }
-    cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
-    {
-      ++advance_calls;
-      if (mode == path::partial || mode == path::sized || mode == path::full_window) {
-        retained = mode == path::partial ? 1 : cap;
-        note_retained(clock::now() - (mode == path::partial ? 1s : 100ms));
-        return {nullptr, true};
-      }
-      auto batch = make();
-      arm();
-      return {std::move(batch), true};
-    }
-    std::unique_ptr<sirius::op::scan::scan_info> partial_emit() override
-    {
-      if (!first_retained_time()) return {};
-      ++partial_calls;
-      clear_retained();
-      auto batch = make();
-      arm();
-      return batch;
-    }
-    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
-    {
-      ++flush_calls;
-      std::vector<std::unique_ptr<sirius::op::scan::scan_info>> batches;
-      if (mode == path::flush) {
-        batches.push_back(make());
-        // Construct the vector and payload before arming the queue allocation.
-        arm();
-      }
-      return batches;
-    }
-  };
-  constexpr size_t attempts = 1024;
-  const size_t sources      = mode == path::flush ? attempts : 1;
-  std::vector<std::shared_ptr<fault_coalescer>> coalescers;
-  for (size_t index = 0; index < sources; ++index) {
-    auto coalescer  = std::make_shared<fault_coalescer>(mode);
-    coalescer->make = make_batch;
-    coalescer->arm  = [&] { armed.emplace(fault::every_allocation_scope, 1); };
-    coalescers.push_back(coalescer);
-    preparation_coordinator::source source;
-    source.coalescer = coalescer;
-    source.claim     = finite_jobs(mode == path::flush ? 0 : attempts,
-                               [](int id) { return std::make_unique<tagged>(id); });
-    source.construct = [&](std::unique_ptr<sirius::op::scan::scan_info> batch) {
-      disarm(static_cast<tagged&>(*batch).id);
-      using sirius::op::scan::scan_operator_input;
-      auto input = std::make_unique<scan_operator_input>(
-        std::move(batch), nullptr, 0, std::nullopt, scan_operator_input::prefetch_start::deferred);
-      return preparation_coordinator::publication{std::move(input), 0};
-    };
-    source.publish = [out](preparation_coordinator::publication& publication) {
-      auto& input = static_cast<sirius::op::scan::scan_operator_input&>(*publication.input);
-      auto metadata =
-        std::get<std::shared_ptr<sirius::op::scan::scan_info>>(input.materialization_info);
-      std::lock_guard lock(out->mutex);
-      out->published.push_back(static_cast<tagged&>(*metadata).id);
-      out->pending_bytes.push_back(publication.preparation_bytes);
-      out->cv.notify_all();
-    };
-    source.close = [out, sources] {
-      std::lock_guard lock(out->mutex);
-      if (++out->close_calls == sources) out->closed = true;
-      out->cv.notify_all();
-    };
-    source.bind_consumption = [out](std::function<void(size_t)> consume) {
-      out->consumed = std::move(consume);
-    };
-    f.coordinator.add_source(std::move(source));
-  }
-  auto cleanup = f.shutdown_guard();
-  f.start();
-  size_t consumed = 0;
-  while (!f.completion.has_error() && !out->closed) {
-    if (out->await(consumed + 1)) {
-      out->consume();
-      ++consumed;
-    } else {
-      REQUIRE((f.completion.has_error() || out->closed));
-    }
-  }
-  f.finish();
-  CHECK_FALSE(f.owner_error);
-  REQUIRE(f.completion.has_error());
-  CHECK_THROWS_AS(failure.get(), std::bad_alloc);
-  REQUIRE(refused_id > 0);
-  CHECK(observed_allocations == 1);
-  CHECK(made > 1);
-  CHECK(made <= attempts);
-  CHECK(std::count(out->published.begin(), out->published.end(), static_cast<int>(refused_id)) ==
-        0);
-  CHECK(seen->releases == made);
-  CHECK(seen->outside == made);
-  CHECK(seen->errors == 0);
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-  if (mode == path::sized) CHECK(f.coordinator.snapshot().size_emissions > 0);
-  if (mode == path::partial) {
-    CHECK(f.coordinator.snapshot().partial_emissions > 0);
-    CHECK(f.coordinator.snapshot().size_emissions == 0);
-  }
-  if (mode == path::full_window) {
-    CHECK(f.coordinator.snapshot().normal_emissions > 0);
-    CHECK(f.coordinator.snapshot().partial_emissions == 0);
-  }
-  if (mode == path::partial || mode == path::sized || mode == path::full_window)
-    CHECK(coalescers.front()->partial_calls == made);
-  else if (mode == path::advance)
-    CHECK(coalescers.front()->advance_calls == made);
-  else {
-    size_t flushes = 0;
-    for (auto const& coalescer : coalescers)
-      flushes += coalescer->flush_calls;
-    CHECK(flushes == made);
-  }
-}
 
 TEST_CASE("Non-Iceberg adapter source uses one coordinator claim path and releases the last split",
           "[scan_preparation][coordinator][adapter_contract]")
@@ -1122,23 +70,15 @@ TEST_CASE("Non-Iceberg adapter source uses one coordinator claim path and releas
   auto out = std::make_shared<sink>();
   std::atomic<unsigned> claims{0};
   std::atomic<unsigned> reads{0};
-  auto source_claim = [&]() -> std::optional<preparation_coordinator::job> {
+  auto source_claim = [&]() -> preparation_coordinator::claim_result {
     auto id = claims.fetch_add(1);
     if (id >= 2) return {};
-    preparation_coordinator::job job;
-    job.work = [&, id] {
-      ++reads;
-      return std::make_unique<tagged>(static_cast<int>(id), 1);
-    };
-    // This is the same stop-aware contract used by a format adapter.  The
-    // coordinator must use it even though this source has no admission unit.
-    job.stop_work = [&, id](std::stop_token stop) {
+    return preparation_coordinator::job{[&, id](preparation_stop_token stop) {
       if (stop.stop_requested())
         throw std::system_error(std::make_error_code(std::errc::operation_canceled));
       ++reads;
       return std::make_unique<tagged>(static_cast<int>(id), 1);
-    };
-    return job;
+    }};
   };
   f.source(std::make_shared<accumulator>(1), out, std::move(source_claim));
   auto guard = f.shutdown_guard();
@@ -1164,7 +104,7 @@ TEST_CASE("Coordinator admission is shared once across adapter units",
   REQUIRE(unit);
   REQUIRE(f.coordinator.admit_unit({101, 1}, {}) == unit);
 
-  auto claim = [unit, count = 0]() mutable -> std::optional<preparation_coordinator::job> {
+  auto claim = [unit, count = 0]() mutable -> preparation_coordinator::claim_result {
     if (count == 2) return {};
     auto id = count++;
     return preparation_coordinator::job{[id] { return std::make_unique<tagged>(id, 1); }, unit};
@@ -1273,16 +213,15 @@ TEST_CASE("Continuous small completion events cannot starve the deadline",
   fixture f;
   auto out = std::make_shared<sink>();
   std::atomic<int> claimed{0};
-  f.source(
-    std::make_shared<accumulator>(), out, [&]() -> std::optional<preparation_coordinator::job> {
-      int id = claimed++;
-      if (id >= 100) return {};
-      return preparation_coordinator::job{[id] {
-                                            std::this_thread::sleep_for(2ms);
-                                            return std::make_unique<tagged>(id, id % 3 ? 1 : 0);
-                                          },
-                                          {}};
-    });
+  f.source(std::make_shared<accumulator>(), out, [&]() -> preparation_coordinator::claim_result {
+    int id = claimed++;
+    if (id >= 100) return {};
+    return preparation_coordinator::job{[id] {
+                                          std::this_thread::sleep_for(2ms);
+                                          return std::make_unique<tagged>(id, id % 3 ? 1 : 0);
+                                        },
+                                        {}};
+  });
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(out->await(1));
@@ -1339,137 +278,38 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
 TEST_CASE("Normal EOS does not report worker operation_canceled as a query error",
           "[scan_preparation][coordinator]")
 {
-  auto gpu_completion = GENERATE(false, true);
   fixture f;
-  auto out = std::make_shared<sink>();
+  auto out      = std::make_shared<sink>();
+  auto claiming = f.make_hold();
+  std::promise<void> stopped;
+  auto notified = stopped.get_future();
   std::promise<void> started;
   auto ready   = started.get_future();
   bool claimed = false;
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(claimed, true)) return {};
-      preparation_coordinator::job job;
-      job.stop_work =
-        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+  f.source(std::make_shared<accumulator>(1), out, [&]() -> preparation_coordinator::claim_result {
+    if (std::exchange(claimed, true)) {
+      claiming->wait();
+      return {};
+    }
+    preparation_coordinator::job job{
+      [&](preparation_stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
         started.set_value();
         while (!stop.stop_requested())
           std::this_thread::yield();
+        stopped.set_value();
         throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-      };
-      return job;
-    });
+      }};
+    return job;
+  });
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(ready.wait_for(1s) == std::future_status::ready);
-  if (gpu_completion)
-    f.completion.mark_completed();
-  else
-    f.coordinator.request_stop(stop_reason::normal_eos);
-  f.finish();
-  CHECK_FALSE(f.completion.has_error());
-}
-
-TEST_CASE("Stop-aware work takes precedence and releases both callbacks before settlement",
-          "[scan_preparation][coordinator][preparation_cleanup]")
-{
-  fixture f(1, 1);
-  auto out          = std::make_shared<sink>();
-  auto seen         = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
-  auto disposing    = f.make_hold();
-  seen->after_probe = [disposing] { disposing->wait(); };
-  std::atomic<bool> checked{false}, released_before_settlement{true}, token_forwarded{false};
-  struct checked_input : tagged {
-    std::function<void()> inspect;
-    explicit checked_input(std::function<void()> inspect) : tagged(1), inspect(std::move(inspect))
-    {
-    }
-    size_t preparation_bytes() const noexcept override
-    {
-      inspect();
-      return 1;
-    }
-  };
-  f.source(std::make_shared<accumulator>(1),
-           out,
-           [&, claimed = false]() mutable -> std::optional<preparation_coordinator::job> {
-             if (std::exchange(claimed, true)) return {};
-             auto capture = [seen] {
-               return std::shared_ptr<int>(new int, [seen](int* value) {
-                 seen->release();
-                 delete value;
-               });
-             };
-             auto legacy = capture(), aware = capture();
-             auto inspect = [&, legacy = std::weak_ptr(legacy), aware = std::weak_ptr(aware)] {
-               if (!legacy.expired() || !aware.expired()) released_before_settlement = false;
-               checked = true;
-             };
-             return preparation_coordinator::job{
-               [legacy = std::move(legacy)]() -> std::unique_ptr<sirius::op::scan::scan_info> {
-                 throw std::runtime_error("legacy callback must not run");
-               },
-               {},
-               [&, aware = std::move(aware), inspect](std::stop_token stop) {
-                 token_forwarded = stop.stop_possible();
-                 return std::make_unique<checked_input>(inspect);
-               }};
-           });
-  auto guard = f.shutdown_guard();
-  f.start();
-  REQUIRE(disposing->await());
-  CHECK_FALSE(checked);
-  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
-  disposing->release();
-  REQUIRE(out->await(1));
-  out->consume();
-  f.finish();
-  CHECK_FALSE(f.owner_error);
-  CHECK_FALSE(f.completion.has_error());
-  CHECK(token_forwarded);
-  CHECK(checked);
-  CHECK(released_before_settlement);
-  CHECK(seen->releases == 2);
-  CHECK(seen->outside == 2);
-  CHECK(seen->errors == 0);
-}
-
-TEST_CASE("Worker operation_canceled is not suppressed after user or failure stop",
-          "[scan_preparation][coordinator]")
-{
-  auto reason = GENERATE(stop_reason::user_cancel, stop_reason::failure_induced);
-  CAPTURE(static_cast<int>(reason));
-  fixture f;
-  auto done = f.completion.get_awaitable();
-  auto held = f.make_hold();
-  std::promise<void> started;
-  auto ready = started.get_future();
-  f.source(std::make_shared<accumulator>(1),
-           std::make_shared<sink>(),
-           [&, claimed = false]() mutable -> std::optional<preparation_coordinator::job> {
-             if (std::exchange(claimed, true)) return {};
-             return preparation_coordinator::job{
-               {}, {}, [&](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
-                 started.set_value();
-                 while (!stop.stop_requested())
-                   std::this_thread::yield();
-                 held->wait();
-                 throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-               }};
-           });
-  auto guard = f.shutdown_guard();
-  f.start();
-  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
-  f.coordinator.request_stop(reason);
-  REQUIRE(held->await());
+  REQUIRE(claiming->await());
   f.coordinator.request_stop(stop_reason::normal_eos);
-  held->release();
+  CHECK(notified.wait_for(1s) == std::future_status::ready);
+  claiming->release();
   f.finish();
-  CHECK_FALSE(f.owner_error);
-  REQUIRE(f.completion.has_error());
-  if (reason == stop_reason::user_cancel)
-    CHECK_THROWS_AS(done.get(), duckdb::InterruptException);
-  else
-    CHECK_THROWS_AS(done.get(), std::system_error);
+  CHECK_FALSE(f.completion.has_error());
 }
 
 TEST_CASE("Normal EOS still reports a real late worker error", "[scan_preparation][coordinator]")
@@ -1479,19 +319,17 @@ TEST_CASE("Normal EOS still reports a real late worker error", "[scan_preparatio
   std::promise<void> started;
   auto ready   = started.get_future();
   bool claimed = false;
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(claimed, true)) return {};
-      preparation_coordinator::job job;
-      job.stop_work =
-        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+  f.source(std::make_shared<accumulator>(1), out, [&]() -> preparation_coordinator::claim_result {
+    if (std::exchange(claimed, true)) return {};
+    preparation_coordinator::job job{
+      [&started](preparation_stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
         started.set_value();
         while (!stop.stop_requested())
           std::this_thread::yield();
         throw std::runtime_error("late worker failure");
-      };
-      return job;
-    });
+      }};
+    return job;
+  });
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(ready.wait_for(1s) == std::future_status::ready);
@@ -1534,6 +372,36 @@ TEST_CASE("Unresolved typed input forbids scan input construction until the whol
   CHECK_FALSE(f.coordinator.admit_unit({3, 2}, required));
   CHECK(unit->record().state == unit_state::ready);
 }
+TEST_CASE("Bounded cancellation releases incomplete inputs held by a live unit",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f;
+  auto gate = f.coordinator.publication_gate();
+  auto seen = std::make_shared<test::cleanup_observation>(gate);
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit  = f.coordinator.admit_unit({96, 1}, required);
+  auto input = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(input)}));
+  auto guard = f.shutdown_guard();
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(seen->releases == 0);  // Stop itself does not run the bounded retirement work.
+  f.start();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK(unit->record().state == unit_state::cancelled);
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->errors == 0);
+  CHECK(seen->callbacks_seen > 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
 TEST_CASE(
   "A full output window bounds jobs, results and file fan-out without blocking worker settlement",
   "[scan_preparation][coordinator]")
@@ -1541,12 +409,11 @@ TEST_CASE(
   fixture f(2, 1);
   auto out = std::make_shared<sink>();
   std::atomic<int> next{0};
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      int id = next++;
-      if (id >= 1000) return {};
-      return preparation_coordinator::job{[id] { return std::make_unique<tagged>(id, 1000); }, {}};
-    });
+  f.source(std::make_shared<accumulator>(1), out, [&]() -> preparation_coordinator::claim_result {
+    int id = next++;
+    if (id >= 1000) return {};
+    return preparation_coordinator::job{[id] { return std::make_unique<tagged>(id, 1000); }, {}};
+  });
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(out->await(1));
@@ -1575,10 +442,9 @@ TEST_CASE("Claim and partial submission failures release reserved completion slo
   SECTION("claim throws")
   {
     expected_error = "claim injected";
-    f.source(
-      std::make_shared<accumulator>(), out, []() -> std::optional<preparation_coordinator::job> {
-        throw std::runtime_error("claim injected");
-      });
+    f.source(std::make_shared<accumulator>(), out, []() -> preparation_coordinator::claim_result {
+      throw std::runtime_error("claim injected");
+    });
   }
   SECTION("second submission throws while a real read is running")
   {
@@ -1742,7 +608,8 @@ TEST_CASE("A unit failed before execution start remains the original terminal fa
   REQUIRE(future.wait_for(1s) == std::future_status::ready);
   CHECK_THROWS_WITH(future.get(), "pre-start read failure");
   f.finish();
-  CHECK(f.coordinator.unit_state_snapshot({12, 1})->state == unit_state::failed);
+  CHECK_FALSE(f.coordinator.unit_state_snapshot({12, 1}));
+  CHECK(unit->record().state == unit_state::failed);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 TEST_CASE("GPU completion cannot hide an accepted preparation failure",
@@ -1796,30 +663,6 @@ TEST_CASE("Later scans filling their lookahead cannot block the first scan",
   CHECK(f.coordinator.snapshot().output_peak <= 3);
 }
 
-TEST_CASE(
-  "Query driver is armed before consumers and runs on its owner without waiting for success",
-  "[scan_preparation][coordinator]")
-{
-  sirius::exec::static_thread_pool pool(1);
-  sirius::exec::scoped_dispatcher dispatcher(pool);
-  sirius::pipeline::completion_handler completion;
-  preparation_coordinator c(completion, dispatcher, preparation_config{}.resolve(1));
-  auto done = completion.get_awaitable();
-  CHECK(c.snapshot().phase == preparation_coordinator::lifecycle::constructed);
-  c.arm();
-  CHECK(c.snapshot().phase == preparation_coordinator::lifecycle::armed);
-  c.run_on_query_thread();
-  CHECK(c.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-  CHECK(c.snapshot().owner == std::this_thread::get_id());
-  CHECK(c.snapshot().runner == std::this_thread::get_id());
-  CHECK(done.wait_for(0ms) == std::future_status::timeout);
-  completion.mark_completed();
-  REQUIRE(done.wait_for(100ms) == std::future_status::ready);
-  done.get();
-  CHECK_THROWS_AS(c.run_on_query_thread(), std::logic_error);
-  c.drain();
-  c.drain();
-}
 TEST_CASE("Cancellation or startup failure before run drains without starting jobs",
           "[scan_preparation][coordinator]")
 {
@@ -1867,7 +710,10 @@ TEST_CASE("Expired partial batch parks at a full output window and resumes on co
       return step;
     }
   };
-  fixture f(2, 1);
+  auto pooled = GENERATE(false, true);
+  coordinator_pool pool(1);
+  native_reader_executor native(1, 1);
+  fixture f(2, 1, k_interrupt_check_interval, std::nullopt, &native, pooled ? &pool : nullptr);
   auto out   = std::make_shared<sink>();
   auto later = f.make_hold();
 
@@ -1876,7 +722,20 @@ TEST_CASE("Expired partial batch parks at a full output window and resumes on co
              return std::make_unique<tagged>(id, id == 0 ? 2 : 0);
            }));
   auto guard = f.shutdown_guard();
-  f.start();
+  if (pooled) {
+    f.source(
+      std::make_shared<accumulator>(),
+      std::make_shared<sink>(),
+      []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+      {},
+      {},
+      preparation_coordinator::execution_domain::native_reader);
+    // No owner advance/drain until teardown and no interrupt callback/timer is installed.
+    f.coordinator.arm();
+    f.coordinator.start();
+  } else {
+    f.start();
+  }
   REQUIRE(out->await(1));
   std::this_thread::sleep_for(30ms);
   auto before = f.coordinator.snapshot().wakes;
@@ -1897,7 +756,8 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
   auto out            = std::make_shared<sink>();
   auto coalescer      = std::make_shared<accumulator>(1);
   bool fail_construct = false, fail_close = false, normal_close_failure = false;
-  bool fail_initialize = false, destroyed_outside_gate = false;
+  bool fail_initialize = false, fail_enqueue = false;
+  auto destroyed_outside_gate = std::make_shared<std::atomic<bool>>(false);
   struct observed_input : sirius::op::scan::scan_operator_input {
     using scan_operator_input::scan_operator_input;
     std::function<void()> on_destroy;
@@ -1913,11 +773,17 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
     fail_construct = true;
     expected_error = "construct injected";
   }
-  SECTION("visible queue push throws") {}
+  SECTION("pre-commit failure") {}
+  SECTION("closed connector rejects the queue commit")
+  {
+    fail_enqueue   = true;
+    expected_error = "prepared scan published after connector close";
+    out->connector->close();
+  }
   SECTION("prefetch initialization throws")
   {
     fail_initialize = true;
-    expected_error  = "prefetch initialization failed";
+    expected_error  = "scan input prefetch initialization already attempted";
   }
   SECTION("tail publication throws followed by a close failure")
   {
@@ -1935,36 +801,21 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
   }
   preparation_coordinator::source source;
   source.coalescer = coalescer;
-  source.claim     = single_job([] { return std::make_unique<tagged>(1); });
+  source.try_claim = single_job([] { return std::make_unique<tagged>(1); });
   source.construct = [&](std::unique_ptr<sirius::op::scan::scan_info> batch) {
     if (fail_construct) throw std::runtime_error("construct injected");
     auto input = std::make_unique<observed_input>(
       std::move(batch), nullptr, 0, std::nullopt, observed_input::prefetch_start::deferred);
-    input->on_destroy = [&, gate = f.coordinator.publication_gate()] {
-      // Probe from another thread so a cleanup-under-lock regression fails instead of hanging.
-      std::thread probe([&] {
-        auto deadline = std::chrono::steady_clock::now() + 100ms;
-        do {
-          std::unique_lock lock(gate->mutex, std::try_to_lock);
-          if (lock.owns_lock()) {
-            destroyed_outside_gate = true;
-            return;
-          }
-          std::this_thread::yield();
-        } while (std::chrono::steady_clock::now() < deadline);
-      });
-      probe.join();
+    input->on_destroy = [destroyed_outside_gate, gate = f.coordinator.publication_gate()] {
+      *destroyed_outside_gate = gate_is_available(gate);
     };
-    auto prepare = [&, raw = input.get()] {
-      raw->initialize_prefetch();
-      if (fail_initialize) throw std::runtime_error(expected_error);
-    };
-    return preparation_coordinator::publication{std::move(input), 0, std::move(prepare)};
+    if (fail_initialize) input->prepare_prefetch();
+    return preparation_coordinator::publication{std::move(input), 0};
   };
-  source.publish = [&](preparation_coordinator::publication&) {
+  f.coordinator.before_publication_for_testing([&] {
     ++publications;
-    if (!normal_close_failure) throw std::runtime_error(expected_error);
-  };
+    if (!normal_close_failure && !fail_enqueue) throw std::runtime_error(expected_error);
+  });
   source.close = [out, fail_close] {
     std::lock_guard lock(out->mutex);
     ++out->close_calls;
@@ -1972,10 +823,7 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
     out->closed = true;
     out->cv.notify_all();
   };
-  source.bind_consumption = [out](std::function<void(size_t)> callback) {
-    out->consumed = std::move(callback);
-  };
-  f.coordinator.add_source(std::move(source));
+  f.register_source(std::move(source), out);
   auto done  = f.completion.get_awaitable();
   auto guard = f.shutdown_guard();
   f.start();
@@ -1984,9 +832,14 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
   f.finish();
   f.coordinator.drain();
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
-  CHECK(out->count() == 0);
+  if (fail_close)
+    CHECK_THROWS_WITH(f.completion.throw_if_preparation_cleanup_failed(), expected_error);
+  else
+    CHECK_NOTHROW(f.completion.throw_if_preparation_cleanup_failed());
+  if (normal_close_failure) out->consume();
+  CHECK(out->count() == (normal_close_failure ? 1 : 0));
   CHECK(publications == (fail_construct || fail_initialize ? 0 : 1));
-  CHECK(destroyed_outside_gate == !fail_construct);
+  CHECK(destroyed_outside_gate->load() == !fail_construct);
   CHECK(out->close_calls == 1);
 }
 
@@ -2102,9 +955,8 @@ TEST_CASE("Physical external users delay quiescence after success or cancellatio
 {
   fixture f;
   auto out = std::make_shared<sink>();
-  f.source(std::make_shared<accumulator>(), out, [] {
-    return std::optional<preparation_coordinator::job>{};
-  });
+  f.source(
+    std::make_shared<accumulator>(), out, [] { return preparation_coordinator::claim_result{}; });
   auto use     = f.coordinator.external_use();
   auto done    = f.completion.get_awaitable();
   auto cleanup = std::shared_ptr<fixture>(&f, [&](fixture* ptr) {
@@ -2182,7 +1034,7 @@ TEST_CASE(
   sirius::scan_manager::test::test_reservation_provider provider;
   provider.grant_bytes = 32 + 16 * permits;
   preparation_ledger ledger(provider);
-  std::array envelope{scan_envelope{{{16, 0, 0, 16}, {16, 0, 0, 16}}, 0, 0, true}};
+  std::array envelope{scan_envelope{{{{16, 0, 0}, 16}, {{16, 0, 0}, 16}}, {}, true}};
   REQUIRE(
     ledger.admit(envelope, memory_space_id(cucascade::memory::Tier::HOST, 0), permits).n_permits ==
     permits);
@@ -2191,24 +1043,15 @@ TEST_CASE(
     input(int id, decltype(deletes) set) : tagged(id), deletes(std::move(set)) {}
   };
   int next = 0;
-  w_permit pending;
-  bool registered = false;
   preparation_coordinator::source source;
   source.coalescer = std::make_shared<accumulator>(1);
-  source.can_claim = [&] {
-    if (next >= 2) return true;
-    if (!registered) {
-      ledger.register_unit({1, next + 1u}, 16);
-      registered = true;
-    }
-    if (!pending) pending = ledger.acquire_permit({1, next + 1u});
-    return bool(pending);
-  };
-  source.claim = [&]() -> std::optional<preparation_coordinator::job> {
+  source.try_claim = [&]() -> preparation_coordinator::claim_result {
     if (next >= 2) return {};
+    auto key      = unit_key{1, next + 1u};
+    auto acquired = ledger.try_acquire_unit(key, 16);
+    if (!acquired) return preparation_pending{};
     auto id     = next++;
-    registered  = false;
-    auto permit = std::make_shared<w_permit>(std::move(pending));
+    auto permit = std::make_shared<w_permit>(std::move(acquired));
     return preparation_coordinator::job{
       [&, id, permit] {
         auto allocator = ledger.allocator(*permit);
@@ -2224,25 +1067,13 @@ TEST_CASE(
       },
       {}};
   };
-  source.construct = [](std::unique_ptr<sirius::op::scan::scan_info> batch) {
-    return preparation_coordinator::publication{
-      std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch)), 0};
-  };
-  source.publish = [out](preparation_coordinator::publication& p) {
-    std::lock_guard lock(out->mutex);
-    out->published.push_back(1);
-    out->pending_bytes.push_back(p.preparation_bytes);
-    out->cv.notify_all();
-  };
-  source.close = [out] {
+  source.construct = [](auto batch) { return make_publication(std::move(batch), 0); };
+  source.close     = [out] {
     std::lock_guard lock(out->mutex);
     out->closed = true;
     out->cv.notify_all();
   };
-  source.bind_consumption = [out](std::function<void(size_t)> callback) {
-    out->consumed = std::move(callback);
-  };
-  f.coordinator.add_source(std::move(source));
+  f.register_source(std::move(source), out);
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(blocked->await());
@@ -2285,7 +1116,7 @@ TEST_CASE("Observed interruption stops claims and publication while owned work d
   f.source(
     std::make_shared<accumulator>(1),
     out,
-    [&]() -> std::optional<preparation_coordinator::job> {
+    [&]() -> preparation_coordinator::claim_result {
       if (claims++ != 0) return {};
       return preparation_coordinator::job{[&] {
                                             ++reads;
@@ -2498,16 +1329,28 @@ TEST_CASE("Size-based partial emission waits for consumption but timeout can use
 TEST_CASE("Partial batch deadlines wake while all preparation workers are held",
           "[scan_preparation][coordinator][partial_batch]")
 {
+  auto pool_workers = GENERATE(0u, 1u);
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(1, 1);
   auto bytes            = GENERATE(1, 50);
   auto options          = preparation_config{}.resolve(1);
   options.partial_batch = partial_batch_options{50, 10ms, 40ms};
-  fixture f(1, 2, k_interrupt_check_interval, options);
+  fixture f(
+    1, 2, k_interrupt_check_interval, options, &executor, pool_workers ? &coordinators : nullptr);
   auto out     = std::make_shared<sink>();
   auto blocked = f.make_hold();
   f.source(std::make_shared<accumulator>(100), out, finite_jobs(2, [=](int id) {
              if (id == 1) blocked->wait();
              return std::make_unique<tagged>(id, id ? 0 : bytes);
            }));
+  if (pool_workers)
+    f.source(
+      std::make_shared<accumulator>(1),
+      std::make_shared<sink>(),
+      []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+      {},
+      {},
+      preparation_coordinator::execution_domain::native_reader);
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(blocked->await());
@@ -2515,4 +1358,2395 @@ TEST_CASE("Partial batch deadlines wake while all preparation workers are held",
   auto stats = f.coordinator.snapshot();
   CHECK(stats.partial_emissions == 1);
   CHECK_FALSE(out->closed.load());
+}
+
+TEST_CASE("Claim jobs transfer their move-only captures and execute at most once",
+          "[scan_preparation][coordinator][claim]")
+{
+  static_assert(!std::is_copy_constructible_v<preparation_coordinator::job>);
+  struct resource {
+    int& releases;
+    ~resource() { ++releases; }
+  };
+  int releases = 0;
+  int runs     = 0;
+  {
+    preparation_coordinator::job job{
+      [owned = std::make_unique<resource>(releases), &runs](preparation_stop_token) {
+        ++runs;
+        return std::make_unique<tagged>(42);
+      }};
+    auto moved = std::move(job);
+    CHECK_THROWS_AS(job.run({}), std::logic_error);
+    auto output = moved.run({});
+    CHECK(dynamic_cast<tagged&>(*output).id == 42);
+    CHECK_THROWS_AS(moved.run({}), std::logic_error);
+    CHECK(releases == 1);
+  }
+  CHECK(runs == 1);
+  CHECK(releases == 1);
+  {
+    preparation_coordinator::job dropped{
+      [owned = std::make_unique<resource>(releases), &runs](preparation_stop_token) {
+        ++runs;
+        return std::make_unique<tagged>(0);
+      }};
+  }
+  CHECK(runs == 1);
+  CHECK(releases == 2);
+}
+
+TEST_CASE("Pending claims do not block ready sources or become exhaustion",
+          "[scan_preparation][coordinator][claim][native_lane]")
+{
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::metadata_worker, domain::native_reader);
+  CAPTURE(execution);
+  native_reader_executor native(1, 2);
+  fixture f(1, 1, 5s, std::nullopt, &native);
+  auto first  = std::make_shared<sink>();
+  auto second = std::make_shared<sink>();
+  std::atomic<bool> ready{false};
+  std::function<void()> wake;
+  f.source(
+    std::make_shared<accumulator>(1),
+    first,
+    [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+      if (!ready) return preparation_pending{};
+      if (std::exchange(claimed, true)) return preparation_exhausted{};
+      return preparation_coordinator::job{[] { return std::make_unique<tagged>(1); }};
+    },
+    {},
+    [&](auto callback) { wake = std::move(callback); },
+    execution);
+  f.source(std::make_shared<accumulator>(1),
+           second,
+           single_job([] { return std::make_unique<tagged>(2); }),
+           {},
+           {},
+           execution);
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(second->await(1));
+  CHECK_FALSE(first->closed);
+  CHECK(first->count() == 0);
+  second->consume();
+  ready = true;
+  wake();
+  REQUIRE(first->await(1));
+  first->consume();
+  REQUIRE(first->await_closed());
+  REQUIRE(second->await_closed());
+  f.finish();
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Readiness and stop wakes cannot be lost between control work and waiting",
+          "[scan_preparation][coordinator][claim]")
+{
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(control_drivers());
+  coordinator_pool coordinators(pool_workers);
+  auto after_step = GENERATE(false, true);
+  auto stopping   = GENERATE(false, true);
+  CAPTURE(execution, after_step, stopping);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 5s, std::nullopt, &native, pool_workers ? &coordinators : nullptr);
+  auto out = std::make_shared<sink>();
+  std::function<void()> wake;
+  unsigned calls = 0;
+  bool signalled = false;
+  auto signal    = [&] {
+    if (std::exchange(signalled, true)) return;
+    if (stopping)
+      f.coordinator.request_stop(stop_reason::normal_eos);
+    else
+      wake();
+  };
+  if (after_step) f.coordinator.before_control_wait_for_testing(signal);
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    f.source(
+      std::make_shared<accumulator>(1),
+      out,
+      [&]() -> preparation_coordinator::claim_result {
+        if (++calls == 1) {
+          if (!after_step) signal();
+          return preparation_pending{};
+        }
+        if (calls > 2) return preparation_exhausted{};
+        return preparation_coordinator::job{[] { return std::make_unique<tagged>(3); }};
+      },
+      {},
+      [&](auto callback) { wake = std::move(callback); },
+      execution);
+  });
+  if (!stopping) {
+    REQUIRE(out->await(1));  // No interrupt poll or unrelated event is needed.
+    out->consume();
+  }
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(coordinators.started_workers() ==
+        (execution == domain::metadata_worker ? 0 : pool_workers));
+  CHECK(signalled);
+  CHECK(calls == (stopping ? 1 : 3));
+  CHECK(out->count() == (stopping ? 0 : 1));
+  CHECK(out->close_calls == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Retirement parks the driver until metadata work drains",
+          "[scan_preparation][coordinator][retirement]")
+{
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(control_drivers());
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 5s, std::nullopt, &native, pool_workers ? &coordinators : nullptr);
+  auto out     = std::make_shared<sink>();
+  auto reading = f.make_hold();
+  std::promise<void> parked;
+  auto waiting  = parked.get_future();
+  bool notified = false;
+  f.coordinator.before_control_wait_for_testing([&] {
+    std::lock_guard lock(f.coordinator.publication_gate()->mutex);
+    if (f.coordinator.publication_gate()->closed && !std::exchange(notified, true))
+      parked.set_value();
+  });
+  auto cleanup = f.shutdown_guard();
+  f.start([&] {
+    f.source(std::make_shared<accumulator>(1), out, single_job([reading] {
+               reading->wait();
+               return std::make_unique<tagged>(1);
+             }));
+    if (execution != domain::metadata_worker)
+      f.source(
+        std::make_shared<accumulator>(1),
+        std::make_shared<sink>(),
+        []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+        {},
+        {},
+        execution);
+  });
+  REQUIRE(reading->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  REQUIRE(waiting.wait_for(1s) == std::future_status::ready);
+  CHECK_FALSE(out->closed.load());
+  reading->release();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("A dispatcher that drops accepted work cannot turn it into successful empty input",
+          "[scan_preparation][coordinator][claim]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::atomic<int> runs{0};
+  f.source(std::make_shared<accumulator>(1), out, single_job([&] {
+             ++runs;
+             return std::make_unique<tagged>(1);
+           }));
+  f.dispatcher.request_stop();
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(runs == 0);
+  CHECK(out->count() == 0);
+  CHECK(f.completion.has_error());
+}
+
+TEST_CASE("Discarded results and failed enqueues release temporary allocations outside the gate",
+          "[scan_preparation][coordinator][temporary_release]")
+{
+  bool enqueue_failure = GENERATE(false, true);
+  sirius::scan_manager::test::test_reservation_provider provider;
+  auto ledger = std::make_shared<preparation_ledger>(provider);
+  std::array envelope{scan_envelope{{{{16, 0, 0}, 16}}, {}, true}};
+  REQUIRE(ledger->admit(envelope, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  fixture f;
+  auto out     = std::make_shared<sink>();
+  auto blocked = f.make_hold();
+  auto gate    = f.coordinator.publication_gate();
+  ledger->bind_wakeup(preparation_wakeup{gate});
+  charged_block rescued;
+  bool released_outside_gate = true;
+  struct temporary_input : tagged {
+    charged_block storage;
+    std::function<void(charged_block&)> check_release;
+    temporary_input(charged_block bytes, std::function<void(charged_block&)> check)
+      : tagged(1), storage(std::move(bytes)), check_release(std::move(check))
+    {
+    }
+    temporary_input(temporary_input&& other)
+      : tagged(other.id, other.rows),
+        storage(std::move(other.storage)),
+        check_release(std::move(other.check_release))
+    {
+    }
+    ~temporary_input() override
+    {
+      if (storage) check_release(storage);
+    }
+  };
+  struct moving_coalescer : accumulator {
+    cursor_step advance(sirius::op::scan::scan_info& input, size_t&, size_t) override
+    {
+      produced = true;
+      return {std::make_unique<temporary_input>(std::move(dynamic_cast<temporary_input&>(input))),
+              true};
+    }
+  };
+  if (enqueue_failure) f.coordinator.fail_next_batch_enqueue_for_testing();
+  f.source(std::make_shared<moving_coalescer>(), out, single_job([&] {
+             auto permit = ledger->try_acquire_unit({1, 1}, 16);
+             auto bytes  = ledger->allocator(permit).allocate(8);
+             ledger->retire_unit({1, 1});
+             blocked->wait();
+             return std::make_unique<temporary_input>(
+               std::move(bytes), [&](charged_block& storage) {
+                 released_outside_gate = gate_is_available(gate);
+                 // Report a regression instead of deadlocking while trying to wake the gate.
+                 if (!released_outside_gate) rescued = std::move(storage);
+               });
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  if (!enqueue_failure) f.coordinator.request_stop(stop_reason::normal_eos);
+  blocked->release();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(released_outside_gate);
+  rescued.release();
+  CHECK(out->count() == 0);
+  CHECK(f.completion.has_error() == enqueue_failure);
+  if (enqueue_failure)
+    CHECK_THROWS_AS(std::rethrow_exception(f.completion.terminal_error()), std::bad_alloc);
+  CHECK(ledger->permits_in_flight() == 0);
+  CHECK(ledger->tracked_units() == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Failure callback credit covers the last physical input release",
+          "[scan_preparation][coordinator][failure_release]")
+{
+  fixture f;
+  auto out     = std::make_shared<sink>();
+  auto release = f.make_hold();
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::visibility));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit  = f.coordinator.admit_unit({94, 1}, required);
+  auto input = std::shared_ptr<sirius::op::scan::iceberg_delete_set const>(
+    new sirius::op::scan::iceberg_delete_set("file"), [release](auto* value) {
+      release->wait();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(visibility_input{std::move(input)}));
+  std::promise<void> started;
+  auto ready = started.get_future();
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           single_job(
+             [&] {
+               started.set_value();
+               return std::make_unique<tagged>(1);
+             },
+             unit));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  auto failure = std::async(std::launch::async, [&] {
+    return unit->fail(
+      preparation_failure{sirius::transparent::late_failure_cause::reader_io,
+                          {},
+                          "input release failure",
+                          std::make_exception_ptr(std::runtime_error("input release failure"))});
+  });
+  CHECK(release->await());
+  auto gate = f.coordinator.publication_gate();
+  {
+    std::lock_guard lock(gate->mutex);
+    CHECK(gate->callbacks == 1);
+  }
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  release->release();
+  REQUIRE(failure.get());
+  f.finish();
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Cleanup waits for explicit retirement begun after the reader barrier",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f(1, 1);
+  auto closing   = f.make_hold();
+  auto releasing = f.make_hold();
+  auto guard     = f.shutdown_guard();
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  unit_key key{94, 1};
+  auto unit  = f.coordinator.admit_unit(key, required);
+  auto input = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [releasing](auto* value) {
+      releasing->wait();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(input)}));
+  unit.reset();
+  auto out = std::make_shared<sink>();
+  preparation_coordinator::source source;
+  source.coalescer = std::make_shared<accumulator>(1);
+  source.try_claim = []() -> preparation_coordinator::claim_result {
+    return preparation_pending{};
+  };
+  source.construct = [](auto) -> preparation_coordinator::publication {
+    throw std::logic_error("metadata-only source cannot produce an input");
+  };
+  source.close = [closing, out] {
+    closing->wait();
+    out->close();
+  };
+  f.register_source(std::move(source), out);
+  f.start();
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  REQUIRE(closing->await());
+  auto disposal = std::async(std::launch::async, [&] { f.coordinator.retire_unit(key); });
+  CHECK(releasing->await());
+  auto gate = f.coordinator.publication_gate();
+  {
+    std::lock_guard lock(gate->mutex);
+    CHECK(gate->callbacks == 1);
+  }
+  closing->release();
+  auto drained = std::async(std::launch::async, [&] { f.finish(); });
+  CHECK(drained.wait_for(50ms) == std::future_status::timeout);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  releasing->release();
+  disposal.get();
+  REQUIRE(drained.wait_for(1s) == std::future_status::ready);
+  drained.get();
+  CHECK_FALSE(f.owner_error);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  std::lock_guard lock(gate->mutex);
+  CHECK(gate->callbacks == 0);
+}
+
+TEST_CASE("An old settled unit cannot erase a replacement registration",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f(1, 1);
+  auto blocked = f.make_hold();
+  unit_key key{97, 1};
+  auto old = f.coordinator.admit_unit(key, {});
+  std::promise<void> next_claim;
+  auto next = next_claim.get_future();
+  auto out  = std::make_shared<sink>();
+  preparation_coordinator::source source;
+  source.coalescer = std::make_shared<accumulator>(1);
+  source.try_claim = [old, blocked, &next_claim, claimed = false, notified = false]() mutable
+    -> preparation_coordinator::claim_result {
+    if (!std::exchange(claimed, true)) {
+      return preparation_coordinator::job{
+        [blocked]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+          blocked->wait();
+          return {};
+        },
+        old};
+    }
+    if (!std::exchange(notified, true)) next_claim.set_value();
+    return preparation_pending{};
+  };
+  source.construct = [](auto) -> preparation_coordinator::publication {
+    throw std::logic_error("metadata-only job cannot produce an input");
+  };
+  source.close = [out] { out->close(); };
+  f.register_source(std::move(source), out);
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  f.coordinator.retire_unit(key);
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto replacement = f.coordinator.admit_unit(key, required);
+  REQUIRE(replacement);
+  CHECK(replacement != old);
+  blocked->release();
+  // With one job slot, the driver advances the old result before making another claim.
+  CHECK(next.wait_for(1s) == std::future_status::ready);
+  auto registered = f.coordinator.unit_state_snapshot(key);
+  CHECK(registered.has_value());
+  if (registered) CHECK(registered->state == unit_state::pending);
+  replacement->cancel();
+  f.coordinator.retire_unit(key);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK(out->count() == 0);
+}
+
+TEST_CASE("Pre-arm physical disposal keeps coordinator retirement pending",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  bool fail = GENERATE(false, true);
+  CAPTURE(fail);
+  fixture f;
+  auto release = f.make_hold();
+  auto guard   = f.shutdown_guard();
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  unit_key key{95, 1};
+  auto unit  = f.coordinator.admit_unit(key, required);
+  auto input = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [release](auto* value) {
+      release->wait();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(input)}));
+  if (!fail) unit.reset();  // The registry is the last owner on explicit retirement.
+  auto original = std::make_exception_ptr(std::runtime_error("before arm"));
+  auto disposal = std::async(std::launch::async, [&] {
+    if (fail) {
+      return unit->fail(
+        {sirius::transparent::late_failure_cause::reader_io, {}, "before arm", original});
+    }
+    f.coordinator.retire_unit(key);
+    return true;
+  });
+  CHECK(release->await());
+  auto gate = f.coordinator.publication_gate();
+  {
+    std::lock_guard lock(gate->mutex);
+    CHECK(gate->callbacks == 1);
+  }
+  f.start();
+  auto drained = std::async(std::launch::async, [&] { f.finish(); });
+  CHECK(drained.wait_for(50ms) == std::future_status::timeout);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  release->release();
+  CHECK(disposal.get());
+  REQUIRE(drained.wait_for(1s) == std::future_status::ready);
+  drained.get();
+  CHECK_FALSE(f.owner_error);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  if (fail) CHECK(f.completion.terminal_error() == original);
+  std::lock_guard lock(gate->mutex);
+  CHECK(gate->callbacks == 0);
+}
+
+TEST_CASE(
+  "Prepared publication keeps its concrete type and cancellation can win before queue commit",
+  "[scan_preparation][coordinator][publication]")
+{
+  using input = sirius::op::scan::scan_operator_input;
+  static_assert(
+    std::is_same_v<decltype(preparation_coordinator::publication::input)::element_type, input>);
+  fixture f;
+  auto out = std::make_shared<sink>();
+  f.source(
+    std::make_shared<accumulator>(1), out, single_job([] { return std::make_unique<tagged>(1); }));
+  bool prepared = false;
+  f.coordinator.before_publication_for_testing([&] {
+    // The hook runs outside the gate; cancellation must be able to acquire it.
+    prepared = true;
+    f.coordinator.request_stop(stop_reason::normal_eos);
+  });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(prepared);
+  CHECK(out->count() == 0);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Prefetch preparation and visibility each execute at most once",
+          "[scan_preparation][coordinator][publication]")
+{
+  using input = sirius::op::scan::scan_operator_input;
+  input prepared(
+    std::make_shared<tagged>(1), nullptr, 0, std::nullopt, input::prefetch_start::deferred);
+  CHECK_THROWS_AS(prepared.publish_prefetch(), std::logic_error);
+  REQUIRE_NOTHROW(prepared.prepare_prefetch());
+  CHECK_THROWS_AS(prepared.prepare_prefetch(), std::logic_error);
+  REQUIRE_NOTHROW(prepared.publish_prefetch());
+  CHECK_THROWS_AS(prepared.publish_prefetch(), std::logic_error);
+}
+
+TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
+          "[scan_preparation][coordinator]")
+{
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(control_drivers());
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(1, 1);
+  fixture f(2,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
+  unsigned driver_starts = 0;
+  f.coordinator.before_thread_for_testing([&] { ++driver_starts; });
+  auto done = f.completion.get_awaitable();
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::constructed);
+  auto out = std::make_shared<sink>();
+  std::atomic<size_t> claims{0};
+  f.source(
+    std::make_shared<accumulator>(),
+    out,
+    [&]() -> preparation_coordinator::claim_result {
+      ++claims;
+      return preparation_exhausted{};
+    },
+    {},
+    {},
+    execution);
+  CHECK(f.coordinator.snapshot().runner == std::thread::id{});
+  f.coordinator.arm();
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::armed);
+  CHECK(f.coordinator.snapshot().runs == 0);
+  CHECK(claims == 0);
+  CHECK(driver_starts == (execution == domain::metadata_worker ? 0 : 1));
+  SECTION("open startup gate")
+  {
+    f.coordinator.start();
+    f.coordinator.drain();
+    CHECK(claims == 1);
+    CHECK(f.coordinator.snapshot().runs == 1);
+    auto stats = f.coordinator.snapshot();
+    CHECK(stats.owner == std::this_thread::get_id());
+    CHECK((stats.runner == stats.owner) == (execution == domain::metadata_worker));
+    CHECK(stats.runner != std::thread::id{});
+    CHECK(done.wait_for(0ms) == std::future_status::timeout);
+    auto waiting = std::chrono::steady_clock::now();
+    CHECK_FALSE(f.coordinator.advance(10ms));
+    CHECK(std::chrono::steady_clock::now() - waiting >= 10ms);
+    f.completion.mark_completed();
+    REQUIRE(done.wait_for(100ms) == std::future_status::ready);
+    CHECK_NOTHROW(done.get());
+    CHECK_THROWS_AS(f.coordinator.start(), std::logic_error);
+  }
+  SECTION("cancel before startup gate")
+  {
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    f.coordinator.drain();
+    CHECK(claims == 0);
+    CHECK(f.coordinator.snapshot().runs == 0);
+  }
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  f.coordinator.drain();
+}
+
+TEST_CASE("Coordinator thread creation failure closes the preparation barrier exactly once",
+          "[scan_preparation][coordinator]")
+{
+  auto pool_workers = GENERATE(0u, 1u, 2u);
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(1, 1);
+  fixture f(2,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
+  auto out = std::make_shared<sink>();
+  f.source(
+    std::make_shared<accumulator>(),
+    out,
+    [] { return preparation_exhausted{}; },
+    {},
+    {},
+    preparation_coordinator::execution_domain::native_reader);
+  auto done = f.completion.get_awaitable();
+  if (pool_workers)
+    coordinators.before_thread_for_testing([&](size_t i) {
+      if (i + 1 == pool_workers) throw std::runtime_error("thread allocation failed");
+    });
+  else
+    f.coordinator.before_thread_for_testing(
+      [] { throw std::runtime_error("thread allocation failed"); });
+  CHECK_THROWS_WITH(f.coordinator.arm(), "thread allocation failed");
+  CHECK(f.coordinator.snapshot().runs == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  CHECK(out->close_calls == 1);
+  REQUIRE(done.wait_for(100ms) == std::future_status::ready);
+  CHECK_THROWS_WITH(done.get(), "thread allocation failed");
+  f.coordinator.drain();
+  CHECK(out->close_calls == 1);
+}
+
+TEST_CASE("Consumers may finish before coordinator startup without a false startup error",
+          "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto done = f.completion.get_awaitable();
+  f.coordinator.arm();
+  f.completion.mark_completed();
+  f.coordinator.drain();
+  REQUIRE(done.wait_for(100ms) == std::future_status::ready);
+  CHECK_NOTHROW(done.get());
+  CHECK_NOTHROW(f.coordinator.start());
+  CHECK_THROWS_AS(f.coordinator.start(), std::logic_error);
+  CHECK(f.coordinator.snapshot().runs == 0);
+}
+
+TEST_CASE("Concurrent retirement waits for final cleanup and one source close",
+          "[scan_preparation][coordinator]")
+{
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(Catch::Generators::table<domain, unsigned>(
+    {{domain::metadata_worker, 2}, {domain::native_reader, 0}, {domain::native_reader, 2}}));
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(1, 1);
+  fixture f(2,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
+  auto blocked = f.make_hold();
+  auto out     = std::make_shared<sink>();
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           finite_jobs(1,
+                       [blocked](int id) {
+                         blocked->wait();
+                         return std::make_unique<tagged>(id);
+                       }),
+           {},
+           {},
+           execution);
+  std::promise<void> first_entered, second_entered;
+  std::future<void> first, second;
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  first  = std::async(std::launch::async, [&] {
+    first_entered.set_value();
+    f.coordinator.drain();
+  });
+  second = std::async(std::launch::async, [&] {
+    second_entered.set_value();
+    f.coordinator.drain();
+  });
+  first_entered.get_future().wait();
+  second_entered.get_future().wait();
+  CHECK(first.wait_for(0ms) == std::future_status::timeout);
+  CHECK(second.wait_for(0ms) == std::future_status::timeout);
+  blocked->release();
+  f.finish();
+  first.get();
+  second.get();
+  CHECK(out->close_calls == 1);
+  CHECK(out->count() == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Coordinator rejects self join before acquiring the retirement mutex",
+          "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::atomic<bool> rejected{false};
+  f.coordinator.before_publication_for_testing([&] {
+    try {
+      f.coordinator.drain();
+    } catch (std::logic_error const&) {
+      rejected = true;
+    }
+  });
+  f.source(std::make_shared<accumulator>(1), out, finite_jobs(1, [](int id) {
+             return std::make_unique<tagged>(id);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(rejected);
+  CHECK(out->count() == 1);
+}
+
+TEST_CASE("Startup cancellation close hook cannot self join the coordinator",
+          "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::atomic<bool> rejected{false};
+  preparation_coordinator::source source;
+  source.coalescer = std::make_shared<accumulator>();
+  source.try_claim = [] { return preparation_exhausted{}; };
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] {
+    try {
+      f.coordinator.drain();
+    } catch (std::logic_error const&) {
+      rejected = true;
+    }
+  };
+  f.register_source(std::move(source), out);
+  f.coordinator.arm();
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.coordinator.drain();
+  CHECK(rejected);
+  CHECK(f.coordinator.snapshot().runs == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Reader work captures and close stay on the assigned thread across pulls",
+          "[scan_preparation][provider_lane][native_lane]")
+{
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::query_owner, domain::native_reader);
+  native_reader_executor executor(2, 4);
+  fixture f(1, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  auto out = std::make_shared<sink>();
+  std::vector<std::thread::id> workers, disposers;
+  bool closed_after_release = false;
+  auto source               = make_source(execution);
+  source.try_claim          = [&, next = 0]() mutable -> preparation_coordinator::claim_result {
+    if (next == 3) return preparation_exhausted{};
+    auto id      = next++;
+    auto capture = std::shared_ptr<int>(new int, [&](int* p) {
+      f.coordinator.snapshot();  // Capture disposal must not hold the publication gate.
+      disposers.push_back(std::this_thread::get_id());
+      delete p;
+    });
+    return preparation_coordinator::job{[&, id, capture = std::move(capture)] {
+      workers.push_back(std::this_thread::get_id());
+      return std::make_unique<tagged>(id, id == 0 ? 0 : 1);
+    }};
+  };
+  source.close = [&] {
+    closed_after_release = disposers.size() == 3;
+    out->close();
+  };
+  auto guard = f.shutdown_guard();
+  f.start([&] { f.register_source(std::move(source), out); });
+  REQUIRE(out->await_closed());
+  f.finish();
+  REQUIRE(workers.size() == 3);
+  CHECK(disposers == workers);
+  CHECK(closed_after_release);
+  CHECK((workers.front() == f.coordinator.snapshot().owner) == (execution == domain::query_owner));
+  CHECK(workers.front() != f.coordinator.snapshot().runner);
+  CHECK(std::ranges::all_of(workers, [&](auto id) { return id == workers.front(); }));
+  CHECK(out->closing_thread == workers.front());
+  CHECK(out->close_calls == 1);
+  CHECK(out->count() == 2);  // A zero-row pull does not exhaust the reader.
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Provider zero row result is not exhaustion and lookahead blocks further pulls",
+          "[scan_preparation][provider_lane]")
+{
+  fixture f(1, 1);
+  auto out = std::make_shared<sink>();
+  std::atomic<size_t> calls{0};
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    f.source(std::make_shared<accumulator>(1),
+             out,
+             finite_jobs(3,
+                         [&](int id) {
+                           ++calls;
+                           return std::make_unique<tagged>(id, id == 0 ? 0 : 1);
+                         }),
+             {},
+             {},
+             preparation_coordinator::execution_domain::query_owner);
+  });
+  REQUIRE(out->await(1));
+  CHECK(calls == 2);
+  out->consume();
+  REQUIRE(out->await(2));
+  CHECK(calls == 3);
+  // Terminal close after stop cannot wait for this full output window to be consumed.
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK(out->close_calls == 1);
+}
+
+TEST_CASE("Retired provider results and wakeups cannot affect another attempt",
+          "[scan_preparation][provider_lane][attempt_isolation]")
+{
+  const bool late_error = GENERATE(false, true);
+  auto released         = std::make_shared<std::atomic<bool>>(false);
+  auto finish_current   = std::make_shared<std::atomic<bool>>(false);
+  auto old_wakeup       = std::make_shared<preparation_wakeup>();
+  auto current_wakeup   = std::make_shared<preparation_wakeup>();
+  auto old              = std::make_unique<fixture>();
+  fixture current;
+  auto old_out                  = std::make_shared<sink>();
+  auto current_out              = std::make_shared<sink>();
+  auto blocked                  = old->make_hold();
+  auto owner                    = std::shared_ptr<int>(new int(1), [released](int* value) {
+    delete value;
+    *released = true;
+  });
+  std::weak_ptr<int> weak_owner = owner;
+  auto old_guard                = old->shutdown_guard();
+  auto current_guard            = current.shutdown_guard();
+  old->start([&, owner]() mutable {
+    auto source      = make_source(preparation_coordinator::execution_domain::query_owner,
+                              std::make_shared<accumulator>(1));
+    source.try_claim = single_job([owner, blocked, late_error, completion = &old->completion] {
+      blocked->wait();
+      if (late_error)
+        completion->report_error(std::make_exception_ptr(std::runtime_error("late old error")));
+      else
+        completion->mark_completed();
+      return std::make_unique<tagged>(101);
+    });
+    source.construct = [](auto) -> preparation_coordinator::publication {
+      throw std::runtime_error("retired attempt reached publication");
+    };
+    source.close = [owner, old_out]() mutable {
+      // The provider session owner remains valid until Q finishes close.
+      owner.reset();
+      old_out->close();
+    };
+    source.bind_wakeup = [old_wakeup](preparation_wakeup wake) { *old_wakeup = std::move(wake); };
+    old->register_source(std::move(source), old_out);
+    owner.reset();  // Only the claimed job and Q close retain the session owner.
+  });
+  owner.reset();
+  REQUIRE(blocked->await());
+  old->coordinator.request_stop(stop_reason::user_cancel);
+  auto first_error = old->completion.terminal_error();
+  REQUIRE(first_error);
+  CHECK_FALSE(weak_owner.expired());
+  CHECK_FALSE(released->load());
+  CHECK(old_out->close_calls == 0);
+
+  current.start([&] {
+    current.source(
+      std::make_shared<accumulator>(1),
+      current_out,
+      [finish_current, claimed = false]() mutable -> preparation_coordinator::claim_result {
+        if (!std::exchange(claimed, true))
+          return preparation_coordinator::job{[] { return std::make_unique<tagged>(202); }};
+        if (finish_current->load()) return preparation_exhausted{};
+        return preparation_pending{};
+      },
+      {},
+      [current_wakeup](preparation_wakeup wake) { *current_wakeup = std::move(wake); },
+      preparation_coordinator::execution_domain::query_owner);
+  });
+  REQUIRE(current_out->await(1));
+  // A's result and completion arrive only after B has published its own output.
+  blocked->release();
+  old->finish();
+  REQUIRE_FALSE(old->owner_error);
+  CHECK(old->completion.terminal_error() == first_error);
+  CHECK(old_out->count() == 0);
+  CHECK(old_out->close_calls == 1);
+  CHECK(old_out->closing_thread == old->coordinator.snapshot().owner);
+  CHECK(weak_owner.expired());
+  CHECK(released->load());
+  old_guard.reset();
+  old.reset();
+  (*old_wakeup)();  // An escaped notification remains safe after A's destruction.
+
+  CHECK_FALSE(current.completion.has_error());
+  CHECK(current_out->count() == 1);
+  CHECK(current_out->close_calls == 0);
+  CHECK(current.coordinator.snapshot().phase == preparation_coordinator::lifecycle::running);
+  {
+    std::lock_guard lock(current_out->mutex);
+    CHECK(current_out->published == std::vector<int>{202});
+  }
+  current_out->consume();
+  *finish_current = true;
+  (*current_wakeup)();
+  REQUIRE(current_out->await_closed());
+  current.finish();
+  CHECK_FALSE(current.owner_error);
+  CHECK_FALSE(current.completion.has_error());
+  CHECK(current_out->close_calls == 1);
+  CHECK(current_out->count() == 1);
+}
+
+TEST_CASE("Reader close after startup failure preserves the first error and returns resources",
+          "[scan_preparation][provider_lane][native_lane]")
+{
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::query_owner, domain::native_reader);
+  CAPTURE(execution);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, k_interrupt_check_interval, std::nullopt, &native);
+  auto out                 = std::make_shared<sink>();
+  size_t closes            = 0;
+  bool self_drain_rejected = false;
+  std::thread::id closer;
+  auto source      = make_source(execution, std::make_shared<accumulator>());
+  source.try_claim = [] { return preparation_exhausted{}; };
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] {
+    ++closes;
+    closer = std::this_thread::get_id();
+    try {
+      f.coordinator.drain();
+    } catch (std::logic_error const&) {
+      self_drain_rejected = true;
+    }
+    throw std::runtime_error("provider close error");
+  };
+  f.register_source(std::move(source), out);
+  f.coordinator.before_thread_for_testing(
+    [] { throw std::runtime_error("thread allocation failed"); });
+  auto done = f.completion.get_awaitable();
+  CHECK_THROWS_WITH(f.coordinator.arm(), "thread allocation failed");
+  f.coordinator.drain();
+  CHECK(closes == 1);
+  CHECK(self_drain_rejected);
+  CHECK((closer == std::this_thread::get_id()) == (execution == domain::query_owner));
+  auto reused = native.reserve(1);
+  CHECK(reused.size() == 1);
+  CHECK_THROWS_WITH(done.get(), "thread allocation failed");
+  CHECK_THROWS_WITH(f.completion.throw_if_preparation_cleanup_failed(), "thread allocation failed");
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Unpumped provider requests stay bounded and cancellation disposes captures before close",
+          "[scan_preparation][provider_lane]")
+{
+  bool const before_dispatch = GENERATE(false, true);
+  CAPTURE(before_dispatch);
+  fixture f;
+  auto submitted = f.make_hold();
+  auto out       = std::make_shared<sink>();
+  std::atomic<size_t> claims{0};
+  std::promise<void> revisited;
+  auto progressed = revisited.get_future();
+  bool ran = false, released = false, closed_after_release = false;
+  std::thread::id destroyed;
+  auto capture     = std::shared_ptr<int>(new int, [&](int* p) {
+    f.coordinator.snapshot();
+    destroyed = std::this_thread::get_id();
+    released  = true;
+    delete p;
+  });
+  auto source      = make_source(preparation_coordinator::execution_domain::query_owner,
+                            std::make_shared<accumulator>());
+  source.try_claim = [capture = std::move(capture),
+                      &ran,
+                      &claims,
+                      claimed = false]() mutable -> preparation_coordinator::claim_result {
+    ++claims;
+    if (std::exchange(claimed, true)) return preparation_exhausted{};
+    return preparation_coordinator::job{[capture = std::move(capture), &ran] {
+      ran = true;
+      return std::make_unique<tagged>(1);
+    }};
+  };
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] { closed_after_release = released; };
+  f.register_source(std::move(source), out);
+  if (before_dispatch)
+    f.coordinator.before_submission_for_testing([submitted] { submitted->wait(); });
+  // Two visits ensure the coordinator rechecks the queued reader without Q pumping it.
+  f.source(std::make_shared<accumulator>(),
+           std::make_shared<sink>(),
+           [&, visits = 0]() mutable -> preparation_coordinator::claim_result {
+             if (++visits == 1) f.coordinator.wake_for_testing();
+             if (visits == 2) revisited.set_value();
+             return preparation_pending{};
+           });
+  auto guard = f.shutdown_guard();
+  f.coordinator.arm();
+  f.coordinator.start();
+  if (before_dispatch)
+    REQUIRE(submitted->await());
+  else
+    REQUIRE(progressed.wait_for(1s) == std::future_status::ready);
+  CHECK(claims == 1);
+  CHECK_FALSE(ran);
+  CHECK_FALSE(released);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(f.coordinator.advance());
+  CHECK(released);
+  CHECK_FALSE(ran);
+  CHECK(destroyed == std::this_thread::get_id());
+  submitted->release();
+  f.coordinator.drain();
+  CHECK(closed_after_release);
+  CHECK(claims == 1);
+  CHECK(out->count() == 0);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Reader close waits for the control driver to finish an active claim",
+          "[scan_preparation][coordinator][claim]")
+{
+  fixture f;
+  auto reader   = std::make_shared<sink>();
+  auto metadata = std::make_shared<sink>();
+  auto claiming = f.make_hold();
+  auto unit     = f.coordinator.admit_unit(
+    {124, 1}, required_input_set{}.set(static_cast<size_t>(required_input::visibility)));
+  std::promise<void> stopped, started;
+  auto stop_notified = stopped.get_future().share();
+  auto job_started   = started.get_future();
+  auto guard         = f.shutdown_guard();
+  f.source(std::make_shared<accumulator>(1),
+           std::make_shared<sink>(),
+           [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+             if (std::exchange(claimed, true)) return preparation_exhausted{};
+             return preparation_coordinator::job{[&](preparation_stop_token stop) {
+                                                   std::stop_callback observer(
+                                                     stop.token(), [&] { stopped.set_value(); });
+                                                   started.set_value();
+                                                   stop_notified.wait();
+                                                   return std::make_unique<tagged>(1);
+                                                 },
+                                                 unit};
+           });
+  f.source(
+    std::make_shared<accumulator>(1),
+    reader,
+    []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+    {},
+    {},
+    preparation_coordinator::execution_domain::query_owner);
+  f.source(std::make_shared<accumulator>(1),
+           metadata,
+           [claiming]() -> preparation_coordinator::claim_result {
+             claiming->wait();
+             return preparation_exhausted{};
+           });
+  f.coordinator.arm();
+  f.coordinator.start();
+  REQUIRE(claiming->await());
+  REQUIRE(job_started.wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(stop_notified.wait_for(0s) == std::future_status::ready);
+  // The driver is still inside claim: worker settlement must cancel the removed unit itself.
+  auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (unit->record().state == unit_state::pending && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  CHECK(unit->record().state == unit_state::cancelled);
+  // Pumping Q can dispose returned jobs, but cannot close a reader ahead of the driver.
+  f.coordinator.advance();
+  CHECK(reader->close_calls == 0);
+  CHECK(metadata->close_calls == 0);
+  claiming->release();
+  f.coordinator.drain();
+  CHECK(reader->close_calls == 1);
+  CHECK(reader->closing_thread == std::this_thread::get_id());
+  CHECK(metadata->close_calls == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("External provider retirement waits for Q close without blocking Q drain",
+          "[scan_preparation][provider_lane]")
+{
+  bool before_arm = GENERATE(false, true);
+  fixture f;
+  auto out     = std::make_shared<sink>();
+  auto running = f.make_hold();
+  auto closing = f.make_hold();
+  std::thread::id closer;
+  std::future<void> external;
+  auto guard           = f.shutdown_guard();
+  auto register_source = [&] {
+    auto source      = make_source(preparation_coordinator::execution_domain::query_owner,
+                              std::make_shared<accumulator>());
+    source.try_claim = single_job([running] {
+      running->wait();
+      return std::make_unique<tagged>(1);
+    });
+    source.construct = [](auto) { return preparation_coordinator::publication{}; };
+    source.close     = [&] {
+      closer = std::this_thread::get_id();
+      closing->wait();
+    };
+    f.register_source(std::move(source), out);
+  };
+  if (before_arm) {
+    f.owner = std::thread([&] {
+      register_source();
+      running->wait();
+      f.coordinator.drain();
+    });
+  } else {
+    f.start(register_source);
+  }
+  auto owner = f.owner.get_id();
+  REQUIRE(running->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  external = std::async(std::launch::async, [&] { f.coordinator.drain(); });
+  CHECK(external.wait_for(10ms) == std::future_status::timeout);
+  running->release();
+  REQUIRE(closing->await());
+  CHECK(external.wait_for(10ms) == std::future_status::timeout);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  closing->release();
+  REQUIRE(external.wait_for(1s) == std::future_status::ready);
+  external.get();
+  f.finish();
+  CHECK(closer == owner);
+  CHECK(out->count() == 0);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Provider pump rejects a different owner and recursive execution or drain",
+          "[scan_preparation][provider_lane]")
+{
+  fixture f;
+  auto out            = std::make_shared<sink>();
+  size_t rejected     = 0;
+  auto reject_reentry = [&] {
+    try {
+      f.coordinator.advance();
+    } catch (std::logic_error const&) {
+      ++rejected;
+    }
+    try {
+      f.coordinator.drain();
+    } catch (std::logic_error const&) {
+      ++rejected;
+    }
+  };
+  auto source      = make_source(preparation_coordinator::execution_domain::query_owner,
+                            std::make_shared<accumulator>(1));
+  source.try_claim = single_job([&] {
+    reject_reentry();
+    return std::make_unique<tagged>(1);
+  });
+  source.close     = reject_reentry;
+  f.register_source(std::move(source), out);
+  auto foreign = std::async(std::launch::async, [&] {
+    try {
+      f.coordinator.advance();
+    } catch (std::logic_error const&) {
+      return true;
+    }
+    return false;
+  });
+  CHECK(foreign.get());
+  f.coordinator.arm();
+  f.coordinator.start();
+  f.coordinator.drain();
+  CHECK(rejected == 4);
+  CHECK(out->count() == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Retirement racing arm stops the startup gate before waiting for its runner",
+          "[scan_preparation][coordinator]")
+{
+  native_reader_executor executor(1, 1);
+  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  auto creating = f.make_hold();
+  auto out      = std::make_shared<sink>();
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           single_job([] { return std::make_unique<tagged>(1); }),
+           {},
+           {},
+           preparation_coordinator::execution_domain::native_reader);
+  f.coordinator.before_thread_for_testing([creating] { creating->wait(); });
+  std::future<void> arming, retiring;
+  auto guard = f.shutdown_guard();
+  arming     = std::async(std::launch::async, [&] { f.coordinator.arm(); });
+  REQUIRE(creating->await());
+  retiring = std::async(std::launch::async, [&] { f.coordinator.drain(); });
+  CHECK(retiring.wait_for(10ms) == std::future_status::timeout);
+  creating->release();
+  arming.get();
+  REQUIRE(retiring.wait_for(1s) == std::future_status::ready);
+  retiring.get();
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().runs == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Blocked readers leave other execution domains and coordination available",
+          "[scan_preparation][native_lane][provider_lane]")
+{
+  using domain      = preparation_coordinator::execution_domain;
+  auto execution    = GENERATE(domain::query_owner, domain::native_reader);
+  auto pool_workers = GENERATE(0u, 1u);
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(1, 4);
+  fixture f(1,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
+  auto blocked  = f.make_hold();
+  auto reader   = std::make_shared<sink>();
+  auto waiting  = std::make_shared<sink>();
+  auto metadata = std::make_shared<sink>();
+  auto neighbor = std::make_shared<sink>();
+  std::atomic<size_t> waiting_claims{0};
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    f.source(std::make_shared<accumulator>(1),
+             reader,
+             single_job([blocked] {
+               blocked->wait();
+               return std::make_unique<tagged>(1);
+             }),
+             {},
+             {},
+             execution);
+    if (execution == domain::native_reader)
+      f.source(
+        std::make_shared<accumulator>(1),
+        waiting,
+        [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+          ++waiting_claims;
+          if (std::exchange(claimed, true)) return preparation_exhausted{};
+          return preparation_coordinator::job{[] { return std::make_unique<tagged>(2); }};
+        },
+        {},
+        {},
+        domain::native_reader);
+    f.source(std::make_shared<accumulator>(1), metadata, single_job([] {
+               return std::make_unique<tagged>(3);
+             }));
+    f.source(std::make_shared<accumulator>(1),
+             neighbor,
+             single_job([] { return std::make_unique<tagged>(4); }),
+             {},
+             {},
+             execution == domain::native_reader ? domain::query_owner : domain::native_reader);
+  });
+  REQUIRE(blocked->await());
+  REQUIRE(metadata->await(1));
+  REQUIRE(neighbor->await(1));
+  if (execution == domain::native_reader) {
+    CHECK_THROWS_WITH(executor.stop(), "cannot stop native executor with active readers");
+    CHECK(waiting_claims <= 1);
+  }
+  CHECK(reader->count() == 0);
+  blocked->release();
+  f.finish();
+  CHECK(reader->count() == 1);
+  if (execution == domain::native_reader) {
+    CHECK(waiting->count() == 1);
+    CHECK(waiting->close_calls == 1);
+  }
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Native executor is shared and stopping one attempt does not stop its neighbor",
+          "[scan_preparation][native_lane]")
+{
+  auto pool_workers = GENERATE(0u, 1u, 2u);
+  auto stop_blocked = GENERATE(false, true);
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(2, 4);
+  fixture first(1,
+                4,
+                k_interrupt_check_interval,
+                std::nullopt,
+                &executor,
+                pool_workers ? &coordinators : nullptr);
+  fixture second(1,
+                 4,
+                 k_interrupt_check_interval,
+                 std::nullopt,
+                 &executor,
+                 pool_workers ? &coordinators : nullptr);
+  auto blocked  = first.make_hold();
+  auto native   = std::make_shared<sink>();
+  auto waiting  = std::make_shared<sink>();
+  auto metadata = std::make_shared<sink>();
+  std::atomic<size_t> claims{0};
+  first.source(std::make_shared<accumulator>(1),
+               native,
+               single_job([blocked] {
+                 blocked->wait();
+                 return std::make_unique<tagged>(1);
+               }),
+               {},
+               {},
+               preparation_coordinator::execution_domain::native_reader);
+  second.source(
+    std::make_shared<accumulator>(1),
+    waiting,
+    [&]() -> preparation_coordinator::claim_result {
+      ++claims;
+      return preparation_exhausted{};
+    },
+    {},
+    {},
+    preparation_coordinator::execution_domain::native_reader);
+  second.source(std::make_shared<accumulator>(1), metadata, single_job([] {
+                  return std::make_unique<tagged>(2);
+                }));
+  auto first_guard  = first.shutdown_guard();
+  auto second_guard = second.shutdown_guard();
+  first.start();
+  REQUIRE(blocked->await());
+  if (stop_blocked) first.coordinator.request_stop(stop_reason::normal_eos);
+  second.start();
+  REQUIRE(metadata->await(1));
+  second.coordinator.request_stop(stop_reason::normal_eos);
+  second.finish();
+  CHECK(claims <= 1);
+  CHECK(waiting->close_calls == 1);
+  CHECK(native->close_calls == 0);
+  blocked->release();
+  first.finish();
+  CHECK(native->count() == (stop_blocked ? 0 : 1));
+  CHECK(native->close_calls == 1);
+  auto stats = first.coordinator.snapshot();
+  CHECK(stats.owner != std::thread::id{});
+  CHECK(stats.runner != stats.owner);
+  if (!stop_blocked) {
+    CHECK(stats.publisher != stats.owner);
+    CHECK(stats.publisher != std::thread::id{});
+    if (pool_workers < 2) CHECK(stats.publisher == stats.runner);
+  }
+  CHECK_FALSE(first.completion.has_error());
+}
+
+TEST_CASE("Reader cancellation waits for work disposal and thread-affine close",
+          "[scan_preparation][native_lane][provider_lane]")
+{
+  using domain      = preparation_coordinator::execution_domain;
+  auto execution    = GENERATE(domain::query_owner, domain::native_reader);
+  auto pool_workers = GENERATE(0u, 2u);
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(1, 4);
+  fixture f(1,
+            1,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
+  auto out     = std::make_shared<sink>();
+  auto blocked = f.make_hold();
+  auto closing = f.make_hold();
+  std::thread::id next_thread, close_thread, destroy_thread;
+  std::atomic<bool> released{false}, saw_stop{false};
+  auto capture     = std::shared_ptr<int>(new int, [&](int* p) {
+    f.coordinator.snapshot();
+    destroy_thread = std::this_thread::get_id();
+    released       = true;
+    delete p;
+  });
+  auto source      = make_source(execution, std::make_shared<accumulator>(1));
+  source.try_claim = [&,
+                      capture = std::move(capture),
+                      claimed = false]() mutable -> preparation_coordinator::claim_result {
+    if (std::exchange(claimed, true)) return preparation_exhausted{};
+    return preparation_coordinator::job{
+      [&, capture = std::move(capture)](preparation_stop_token stop) {
+        next_thread = std::this_thread::get_id();
+        blocked->wait();
+        saw_stop = stop.stop_requested();
+        return std::make_unique<tagged>(1);
+      }};
+  };
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] {
+    close_thread = std::this_thread::get_id();
+    closing->wait();
+    out->close();
+  };
+  auto guard = f.shutdown_guard();
+  f.start([&] { f.register_source(std::move(source), out); });
+  REQUIRE(blocked->await());
+  f.coordinator.request_stop(stop_reason::user_cancel);
+  CHECK_FALSE(released);
+  CHECK(out->close_calls == 0);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  blocked->release();
+  REQUIRE(closing->await());
+  CHECK(released);
+  CHECK(next_thread == destroy_thread);
+  CHECK(next_thread == close_thread);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  closing->release();
+  f.finish();
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(saw_stop);
+  CHECK(f.completion.has_error());
+}
+
+TEST_CASE("Native readers share a fixed worker while one source is backpressured",
+          "[scan_preparation][native_lane]")
+{
+  native_reader_executor executor(1, 2);
+  fixture f(1, 1, k_interrupt_check_interval, std::nullopt, &executor);
+  auto probe = std::make_shared<sink>();
+  auto build = std::make_shared<sink>();
+  std::atomic<size_t> pulls{0};
+  f.source(std::make_shared<accumulator>(1),
+           probe,
+           finite_jobs(2,
+                       [&](int id) {
+                         ++pulls;
+                         return std::make_unique<tagged>(id);
+                       }),
+           {},
+           {},
+           preparation_coordinator::execution_domain::native_reader);
+  f.source(std::make_shared<accumulator>(1),
+           build,
+           single_job([] { return std::make_unique<tagged>(9); }),
+           {},
+           {},
+           preparation_coordinator::execution_domain::native_reader);
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(probe->await(1));
+  // Model a join whose probe cannot be consumed before the build has produced its rows.
+  REQUIRE(build->await(1));
+  CHECK(pulls == 1);
+  probe->consume();
+  build->consume();
+  REQUIRE(probe->await(2));
+  f.coordinator.request_stop(stop_reason::normal_eos);  // close needs no output credit
+  f.finish();
+  CHECK(pulls == 2);
+  CHECK(probe->close_calls == 1);
+  CHECK(build->close_calls == 1);
+  CHECK(probe->closing_thread == build->closing_thread);
+}
+
+TEST_CASE("Native reader group admission fails without partial leases or neighbor cancellation",
+          "[scan_preparation][native_lane]")
+{
+  native_reader_executor executor(1, 2);
+  fixture first(1, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  fixture second(1, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  auto blocked = first.make_hold();
+  auto live    = std::make_shared<sink>();
+  first.source(std::make_shared<accumulator>(1),
+               live,
+               single_job([blocked] {
+                 blocked->wait();
+                 return std::make_unique<tagged>(1);
+               }),
+               {},
+               {},
+               preparation_coordinator::execution_domain::native_reader);
+  auto a = std::make_shared<sink>();
+  auto b = std::make_shared<sink>();
+  for (auto out : {a, b})
+    second.source(std::make_shared<accumulator>(1),
+                  out,
+                  single_job([] { return std::make_unique<tagged>(2); }),
+                  {},
+                  {},
+                  preparation_coordinator::execution_domain::native_reader);
+  auto guard = first.shutdown_guard();
+  first.start();
+  REQUIRE(blocked->await());
+  CHECK_THROWS_WITH(second.coordinator.arm(),
+                    "native reader capacity unavailable for complete attempt");
+  CHECK(second.completion.failure().cause == sirius::transparent::late_failure_cause::resource);
+  CHECK(sirius::transparent::classify_failure(second.completion.terminal_error()).cause ==
+        sirius::transparent::late_failure_cause::resource);
+  CHECK(a->close_calls == 0);
+  CHECK(b->close_calls == 0);
+  CHECK(a->count() == 0);
+  // Failure did not retain the one otherwise available slot.
+  auto free = executor.reserve(1);
+  free.clear();
+  CHECK(live->close_calls == 0);
+  blocked->release();
+  first.finish();
+  CHECK(live->count() == 1);
+  CHECK_FALSE(first.completion.has_error());
+  auto all = executor.reserve(2);
+  CHECK(all.size() == 2);
+}
+
+TEST_CASE("Native execution and close errors retain the first error and return the lease",
+          "[scan_preparation][native_lane]")
+{
+  native_reader_executor executor(1, 1);
+  fixture f(1, 1, k_interrupt_check_interval, std::nullopt, &executor);
+  auto out = std::make_shared<sink>();
+  std::thread::id next_thread, close_thread;
+  size_t rejected  = 0;
+  auto source      = make_source(preparation_coordinator::execution_domain::native_reader,
+                            std::make_shared<accumulator>());
+  source.try_claim = single_job([&]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+    next_thread = std::this_thread::get_id();
+    try {
+      f.coordinator.drain();
+    } catch (std::logic_error const&) {
+      ++rejected;
+    }
+    throw std::runtime_error("native next failed");
+  });
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] {
+    close_thread = std::this_thread::get_id();
+    try {
+      f.coordinator.drain();
+    } catch (std::logic_error const&) {
+      ++rejected;
+    }
+    throw std::runtime_error("native close failed");
+  };
+  f.register_source(std::move(source), out);
+  auto done = f.completion.get_awaitable();
+  f.coordinator.arm();
+  f.coordinator.start();
+  f.coordinator.drain();
+  CHECK_THROWS_WITH(done.get(), "native next failed");
+  CHECK_THROWS_WITH(f.completion.throw_if_preparation_cleanup_failed(), "native next failed");
+  CHECK(next_thread == close_thread);
+  CHECK(rejected == 2);
+  CHECK(out->count() == 0);
+  auto reused = executor.reserve(1);
+  CHECK(reused.size() == 1);
+}
+
+TEST_CASE(
+  "Reader submission failure disposes accepted captures before close on its assigned thread",
+  "[scan_preparation][provider_lane][native_lane]")
+{
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::query_owner, domain::native_reader);
+  CAPTURE(execution);
+  native_reader_executor executor(1, 1);
+  fixture f(1, 1, k_interrupt_check_interval, std::nullopt, &executor);
+  auto out = std::make_shared<sink>();
+  std::thread::id destroyed, closed;
+  bool ran = false, closed_after_release = false;
+  auto capture     = std::shared_ptr<int>(new int, [&](int* p) {
+    f.coordinator.snapshot();
+    destroyed = std::this_thread::get_id();
+    delete p;
+  });
+  auto source      = make_source(execution, std::make_shared<accumulator>());
+  source.try_claim = [&,
+                      capture = std::move(capture),
+                      claimed = false]() mutable -> preparation_coordinator::claim_result {
+    if (std::exchange(claimed, true)) return preparation_exhausted{};
+    return preparation_coordinator::job{[&, capture = std::move(capture)] {
+      ran = true;
+      return std::make_unique<tagged>(1);
+    }};
+  };
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] {
+    closed               = std::this_thread::get_id();
+    closed_after_release = destroyed == closed;
+  };
+  f.register_source(std::move(source), out);
+  f.coordinator.before_submission_for_testing(
+    [] { throw std::runtime_error("reader submit failed"); });
+  auto done = f.completion.get_awaitable();
+  f.coordinator.arm();
+  f.coordinator.start();
+  f.coordinator.drain();
+  CHECK_THROWS_WITH(done.get(), "reader submit failed");
+  CHECK_FALSE(ran);
+  CHECK(closed_after_release);
+  CHECK(closed != f.coordinator.snapshot().runner);
+  CHECK((closed == f.coordinator.snapshot().owner) == (execution == domain::query_owner));
+  auto reused = executor.reserve(1);
+  CHECK(reused.size() == 1);
+  CHECK(out->count() == 0);
+}
+
+TEST_CASE("Queued native work is disposed on its worker after cancellation",
+          "[scan_preparation][native_lane]")
+{
+  native_reader_executor executor(1, 2);
+  fixture f(1, 1, k_interrupt_check_interval, std::nullopt, &executor);
+  auto blocked = f.make_hold();
+  auto first   = std::make_shared<sink>();
+  auto queued  = std::make_shared<sink>();
+  std::promise<void> submitted;
+  size_t submissions = 0;
+  std::atomic<bool> ran{false};
+  std::thread::id worker, destroyed;
+  auto capture = std::shared_ptr<int>(new int, [&](int* p) {
+    f.coordinator.snapshot();
+    destroyed = std::this_thread::get_id();
+    delete p;
+  });
+  f.source(std::make_shared<accumulator>(1),
+           first,
+           single_job([&] {
+             worker = std::this_thread::get_id();
+             blocked->wait();
+             return std::make_unique<tagged>(1);
+           }),
+           {},
+           {},
+           preparation_coordinator::execution_domain::native_reader);
+  f.source(
+    std::make_shared<accumulator>(1),
+    queued,
+    [&,
+     capture = std::move(capture),
+     claimed = false]() mutable -> preparation_coordinator::claim_result {
+      if (std::exchange(claimed, true)) return preparation_exhausted{};
+      return preparation_coordinator::job{[&, capture = std::move(capture)] {
+        ran = true;
+        return std::make_unique<tagged>(2);
+      }};
+    },
+    {},
+    {},
+    preparation_coordinator::execution_domain::native_reader);
+  f.coordinator.before_submission_for_testing([&] {
+    if (++submissions == 2) submitted.set_value();
+  });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  REQUIRE(submitted.get_future().wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  blocked->release();
+  f.finish();
+  CHECK_FALSE(ran);
+  CHECK(destroyed == worker);
+  CHECK(queued->closing_thread == worker);
+  CHECK(first->count() == 0);
+  CHECK(queued->count() == 0);
+  auto reused = executor.reserve(2);
+  CHECK(reused.size() == 2);
+}
+
+TEST_CASE("Reader stop intent distinguishes cancellation failure and normal completion",
+          "[scan_preparation][reader_stop]")
+{
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::metadata_worker, domain::query_owner, domain::native_reader);
+  // User cancellation, reported failure, explicit EOS, GPU/LIMIT, predicate, cleanup intent.
+  auto trigger = GENERATE(0, 1, 2, 3, 4, 5);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 1ms, std::nullopt, &native);
+  auto out      = std::make_shared<sink>();
+  auto blocked  = f.make_hold();
+  auto terminal = f.completion.get_awaitable().share();
+  std::promise<preparation_stop_token> started;
+  auto token_future = started.get_future();
+  std::promise<std::pair<std::optional<stop_reason>, bool>> notified;
+  auto notification = notified.get_future();
+  std::atomic<bool> interrupted{false};
+  f.coordinator.set_interrupt_check([&] { return interrupted.load(); });
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    f.source(
+      std::make_shared<accumulator>(1),
+      out,
+      [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+        if (std::exchange(claimed, true)) return preparation_exhausted{};
+        return preparation_coordinator::job{[&](preparation_stop_token stop) {
+          std::stop_callback observer(stop.token(), [&] {
+            notified.set_value({stop.reason(), terminal.wait_for(0s) == std::future_status::ready});
+          });
+          started.set_value(stop);
+          blocked->wait();
+          return std::make_unique<tagged>(1);
+        }};
+      },
+      {},
+      {},
+      execution);
+  });
+  REQUIRE(token_future.wait_for(1s) == std::future_status::ready);
+  auto token = token_future.get();
+  CHECK_FALSE(token.stop_requested());
+  CHECK_FALSE(token.reason());
+  switch (trigger) {
+    case 0: f.coordinator.request_stop(stop_reason::user_cancel); break;
+    case 1: f.completion.report_error("original execution failure"); break;
+    case 2: f.coordinator.request_stop(stop_reason::normal_eos); break;
+    case 3: f.completion.mark_completed(); break;
+    case 4:
+      interrupted = true;
+      f.coordinator.wake_for_testing();
+      break;
+    case 5: f.coordinator.request_stop(stop_reason::failure_induced); break;
+  }
+  REQUIRE(notification.wait_for(1s) == std::future_status::ready);
+  auto [reason, terminal_ready] = notification.get();
+  auto expected                 = trigger == 0 || trigger == 4   ? stop_reason::user_cancel
+                                  : trigger == 1 || trigger == 5 ? stop_reason::failure_induced
+                                                                 : stop_reason::normal_eos;
+  CHECK(reason == expected);
+  CHECK(terminal_ready == (trigger == 0 || trigger == 1 || trigger == 4));
+  CHECK(token.stop_requested());
+  CHECK(token.reason() == expected);
+  // A child query clearing its own interrupt flag cannot clear the attempt's intent.
+  interrupted = false;
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(token.reason() == expected);
+  CHECK(out->close_calls == 0);
+  // Cleanup intent can precede the runner reporting the actual exception.
+  if (trigger == 5) f.completion.report_error("original execution failure");
+  blocked->release();
+  f.finish();
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  if (trigger == 0 || trigger == 4)
+    CHECK_THROWS_AS(terminal.get(), duckdb::InterruptException);
+  else if (trigger == 1 || trigger == 5)
+    CHECK_THROWS_WITH(terminal.get(), "original execution failure");
+  else {
+    f.completion.mark_completed();
+    CHECK_NOTHROW(terminal.get());
+  }
+}
+
+TEST_CASE("Stop intent upgrades without replaying callbacks or replacing the terminal error",
+          "[scan_preparation][reader_stop]")
+{
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::query_owner, domain::native_reader);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 1ms, std::nullopt, &native);
+  auto out      = std::make_shared<sink>();
+  auto blocked  = f.make_hold();
+  auto terminal = f.completion.get_awaitable();
+  std::promise<preparation_stop_token> started;
+  auto token_future = started.get_future();
+  std::atomic<size_t> notifications{0};
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    f.source(
+      std::make_shared<accumulator>(1),
+      out,
+      [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+        if (std::exchange(claimed, true)) return preparation_exhausted{};
+        return preparation_coordinator::job{[&](preparation_stop_token stop) {
+          std::stop_callback observer(stop.token(), [&] { ++notifications; });
+          started.set_value(stop);
+          blocked->wait();
+          return std::make_unique<tagged>(1);
+        }};
+      },
+      {},
+      {},
+      execution);
+  });
+  REQUIRE(token_future.wait_for(1s) == std::future_status::ready);
+  auto token = token_future.get();
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(token.reason() == stop_reason::normal_eos);
+  f.completion.report_error("first failure");
+  CHECK(token.reason() == stop_reason::failure_induced);
+  f.coordinator.request_stop(stop_reason::user_cancel);
+  CHECK(token.reason() == stop_reason::user_cancel);
+  f.coordinator.request_stop(stop_reason::failure_induced);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(token.reason() == stop_reason::user_cancel);
+  CHECK(notifications == 1);
+  blocked->release();
+  f.finish();
+  CHECK_THROWS_WITH(terminal.get(), "first failure");
+  CHECK(token.reason() == stop_reason::user_cancel);
+  CHECK(out->close_calls == 1);
+}
+
+TEST_CASE("Natural reader exhaustion retains a normal stop view after coordinator destruction",
+          "[scan_preparation][reader_stop]")
+{
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::query_owner, domain::native_reader);
+  preparation_stop_token retained;
+  {
+    native_reader_executor native(1, 1);
+    fixture f(1, 1, 1ms, std::nullopt, &native);
+    auto out   = std::make_shared<sink>();
+    auto guard = f.shutdown_guard();
+    f.start([&] {
+      f.source(
+        std::make_shared<accumulator>(1),
+        out,
+        [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+          if (std::exchange(claimed, true)) return preparation_exhausted{};
+          return preparation_coordinator::job{[&](preparation_stop_token stop) {
+            retained = stop;
+            return std::unique_ptr<tagged>{};
+          }};
+        },
+        {},
+        {},
+        execution);
+    });
+    // The fixture coalescer emits its final empty batch; it must not keep the reader open.
+    REQUIRE(out->await(1));
+    out->consume();
+    REQUIRE(out->await_closed());
+    f.finish();
+    CHECK_FALSE(f.completion.has_error());
+  }
+  CHECK(retained.stop_requested());
+  CHECK(retained.reason() == stop_reason::normal_eos);
+}
+
+TEST_CASE("One scan coordinates dependent lanes without sharing their output credits",
+          "[scan_preparation][preparation_group]")
+{
+  using domain       = preparation_coordinator::execution_domain;
+  auto reader_domain = GENERATE(domain::query_owner, domain::native_reader);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 1ms, std::nullopt, &native);
+  auto out = std::make_shared<sink>();
+  std::atomic<bool> discovered{false}, finish_reader{false};
+  preparation_wakeup wake;
+  auto unit = f.coordinator.admit_unit(
+    {10, 0}, required_input_set{}.set(static_cast<size_t>(required_input::checkpoint_iteration)));
+  std::promise<void> file_prepared, metadata_closed;
+  auto prepared = file_prepared.get_future(), closed = metadata_closed.get_future();
+  std::thread::id reader, closer;
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    auto metadata        = make_source(domain::metadata_worker);
+    metadata.destination = out->connector;
+    metadata.try_claim   = [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+      if (!discovered) return preparation_pending{};
+      if (std::exchange(claimed, true)) return preparation_exhausted{};
+      return preparation_coordinator::job{[&] {
+                                            file_prepared.set_value();
+                                            return std::make_unique<tagged>(20);
+                                          },
+                                          unit};
+    };
+    metadata.close       = [&] { metadata_closed.set_value(); };
+    auto provider        = make_source(reader_domain);
+    provider.destination = out->connector;
+    provider.bind_wakeup = [&](preparation_wakeup value) { wake = std::move(value); };
+    provider.try_claim   = [&, next = 0]() mutable -> preparation_coordinator::claim_result {
+      if (next == 2)
+        return finish_reader ? preparation_coordinator::claim_result{preparation_exhausted{}}
+                               : preparation_coordinator::claim_result{preparation_pending{}};
+      return preparation_coordinator::job{[&, step = next++] {
+        reader = std::this_thread::get_id();
+        if (step == 0)
+          discovered = true;
+        else
+          unit->complete_input(checkpoint_input{17});
+        wake();
+        return std::make_unique<tagged>(10 + step);
+      }};
+    };
+    provider.close = [&] { closer = std::this_thread::get_id(); };
+    f.outputs      = {out, out};
+    std::vector<preparation_coordinator::source> lanes;
+    lanes.push_back(std::move(metadata));
+    lanes.push_back(std::move(provider));
+    f.coordinator.add_sources(std::move(lanes), [out] { out->close(); });
+  });
+  REQUIRE(out->await(1));
+  REQUIRE(prepared.wait_for(1s) == std::future_status::ready);
+  CHECK(out->count() == 1);  // The file must wait for the provider's dependency.
+  CHECK(unit->record().state == unit_state::pending);
+  out->consume();  // Returns only the provider's credit, allowing its next pull.
+  REQUIRE(out->await(3));
+  out->consume();
+  out->consume();
+  REQUIRE(closed.wait_for(1s) == std::future_status::ready);
+  CHECK_FALSE(out->connector->is_discovery_complete());
+  CHECK(out->close_calls == 0);
+  finish_reader = true;
+  wake();
+  f.finish();
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(out->connector->is_closed());
+  CHECK(out->close_calls == 1);
+  CHECK(reader == closer);
+  CHECK((reader == f.coordinator.snapshot().owner) == (reader_domain == domain::query_owner));
+  auto published = out->published;
+  std::ranges::sort(published);
+  CHECK(published == std::vector<int>{10, 11, 20});
+}
+
+TEST_CASE("Grouped lanes close their shared output after cancellation and failures",
+          "[scan_preparation][preparation_group]")
+{
+  enum class ending { cancel, read_failure, close_failure };
+  auto mode = GENERATE(ending::cancel, ending::read_failure, ending::close_failure);
+  fixture f(1, 1);
+  auto terminal = f.completion.get_awaitable();
+  auto out      = std::make_shared<sink>();
+  auto blocked  = f.make_hold();
+  std::promise<void> provider_closed;
+  auto closed = provider_closed.get_future();
+  std::atomic<size_t> metadata_closes{0};
+  std::atomic<bool> finish_provider{false};
+  preparation_wakeup wake;
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    auto metadata        = make_source(preparation_coordinator::execution_domain::metadata_worker);
+    metadata.destination = out->connector;
+    metadata.try_claim   = single_job([&]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+      blocked->wait();
+      if (mode == ending::read_failure) throw std::runtime_error("metadata failed");
+      return std::make_unique<tagged>(1);
+    });
+    metadata.close       = [&] { ++metadata_closes; };
+    auto coalescer       = std::make_shared<accumulator>(1);
+    coalescer->produced  = true;  // This lane supplies no rows.
+    auto provider = make_source(preparation_coordinator::execution_domain::query_owner, coalescer);
+    provider.destination = out->connector;
+    provider.bind_wakeup = [&](preparation_wakeup value) { wake = std::move(value); };
+    provider.try_claim   = [&]() -> preparation_coordinator::claim_result {
+      if (!finish_provider) return preparation_pending{};
+      return preparation_exhausted{};
+    };
+    provider.close = [&] {
+      provider_closed.set_value();
+      if (mode == ending::close_failure) throw std::runtime_error("provider close failed");
+    };
+    f.outputs = {out, out};
+    std::vector<preparation_coordinator::source> lanes;
+    lanes.push_back(std::move(metadata));
+    lanes.push_back(std::move(provider));
+    f.coordinator.add_sources(std::move(lanes), [out] { out->close(); });
+  });
+  REQUIRE(blocked->await());
+  finish_provider = true;
+  wake();
+  REQUIRE(closed.wait_for(1s) == std::future_status::ready);
+  CHECK_FALSE(out->connector->is_discovery_complete());
+  if (mode == ending::cancel) f.coordinator.request_stop(stop_reason::user_cancel);
+  if (mode == ending::close_failure) REQUIRE(terminal.wait_for(1s) == std::future_status::ready);
+  blocked->release();
+  f.finish();
+  CHECK(f.completion.has_error());
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(metadata_closes == 1);
+  CHECK(out->connector->is_closed());
+  if (mode != ending::cancel)
+    CHECK(f.completion.failure().detail ==
+          (mode == ending::read_failure ? "metadata failed" : "provider close failed"));
+}
+
+TEST_CASE("Rejected native group admission closes output without opening readers",
+          "[scan_preparation][preparation_group]")
+{
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 1ms, std::nullopt, &native);
+  auto out     = std::make_shared<sink>();
+  size_t calls = 0, closes = 0;
+  std::vector<preparation_coordinator::source> lanes;
+  for (int i = 0; i < 2; ++i) {
+    auto source        = make_source(preparation_coordinator::execution_domain::native_reader);
+    source.destination = out->connector;
+    source.try_claim   = single_job([&] {
+      ++calls;
+      return std::make_unique<tagged>(1);
+    });
+    source.close       = [&] { ++closes; };
+    lanes.push_back(std::move(source));
+  }
+  f.coordinator.add_sources(std::move(lanes), [out] { out->close(); });
+  CHECK_THROWS_WITH(f.coordinator.arm(), "native reader capacity unavailable for complete attempt");
+  f.coordinator.drain();
+  CHECK(calls == 0);
+  CHECK(closes == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(out->connector->is_closed());
+  auto reused = native.reserve(1);
+  CHECK(reused.size() == 1);
+}
+
+TEST_CASE("Pooled retirement yields between unit cancellation and source cleanup actions",
+          "[scan_preparation][coordinator_pool]")
+{
+  coordinator_pool pool(1);
+  preparation_options options{1, 4, 1, 1};
+  fixture f(1, 4, k_interrupt_check_interval, options, nullptr, &pool);
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  std::vector<std::shared_ptr<preparation_unit>> units;
+  for (unsigned i = 0; i < 8; ++i)
+    units.push_back(f.coordinator.admit_unit({123, i}, required));
+  bool admission_closed = false, input_rejected = false, cancellation_deferred = false;
+  std::atomic<unsigned> closed{0};
+  unsigned observed_closed = 0, observed_cancelled = 0;
+  std::promise<void> neighbor_done;
+  auto done     = neighbor_done.get_future();
+  auto neighbor = pool.add(
+    [&] {
+      auto cancelled = std::ranges::count_if(
+        units, [](auto const& unit) { return unit->record().state == unit_state::cancelled; });
+      if (cancelled && !observed_cancelled) {
+        observed_cancelled = cancelled;
+        // Retire keys on both sides of the cancellation cursor between control steps.
+        f.coordinator.retire_unit(units.front()->key());
+        f.coordinator.retire_unit(units.back()->key());
+        f.coordinator.request_stop(stop_reason::normal_eos);
+      }
+      auto count = closed.load();
+      if (count && !observed_closed) observed_closed = count;
+      if (count != 8) return coordinator_pool::step_result{coordinator_pool::progress::runnable};
+      neighbor_done.set_value();
+      return coordinator_pool::step_result{coordinator_pool::progress::finished};
+    },
+    [] {},
+    [](auto) {});
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    f.source(
+      std::make_shared<accumulator>(),
+      std::make_shared<sink>(),
+      []() -> preparation_coordinator::claim_result { return preparation_exhausted{}; },
+      {},
+      {},
+      preparation_coordinator::execution_domain::query_owner);
+    for (unsigned i = 0; i < 8; ++i) {
+      auto source      = make_source(preparation_coordinator::execution_domain::metadata_worker);
+      source.try_claim = []() -> preparation_coordinator::claim_result {
+        return preparation_exhausted{};
+      };
+      source.close = [&] { ++closed; };
+      f.register_source(std::move(source), std::make_shared<sink>());
+    }
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    // Admission and input completion stop immediately, without walking every unit.
+    admission_closed      = !f.coordinator.admit_unit({123, 8}, required);
+    input_rejected        = !units.back()->complete_input(checkpoint_input{1});
+    cancellation_deferred = units.back()->record().state == unit_state::pending;
+    neighbor->wake();
+  });
+  REQUIRE(done.wait_for(2s) == std::future_status::ready);
+  neighbor->wait();
+  f.finish();
+  CHECK(admission_closed);
+  CHECK(input_rejected);
+  CHECK(cancellation_deferred);
+  CHECK(observed_cancelled == 1);
+  CHECK(observed_closed == 1);
+  for (auto const& unit : units)
+    CHECK(unit->record().state == unit_state::cancelled);
+  CHECK(closed == 8);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Preparation cancel retirement and stop bookkeeping allocate no host memory",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  enum class operation { cancel, retire, stop };
+  auto mode = GENERATE(operation::cancel, operation::retire, operation::stop);
+  CAPTURE(static_cast<int>(mode));
+  fixture f;
+  std::atomic<size_t> released{0};
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({98, 1}, required);
+  REQUIRE(unit);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [&](auto* value) {
+      ++released;
+      delete value;
+    });
+  auto cleanup = f.shutdown_guard();
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  if (mode != operation::cancel) unit.reset();
+  size_t allocations = 0;
+  {
+    // The deleter only updates an atomic: observer thread creation is not counted.
+    fault counting{fault::every_allocation_scope, 0};
+    if (mode == operation::cancel)
+      unit->cancel();
+    else if (mode == operation::retire)
+      f.coordinator.retire_unit({98, 1});
+    else
+      f.coordinator.request_stop(stop_reason::normal_eos);
+    allocations = counting.stop();
+  }
+  CHECK(allocations == 0);
+  CHECK(released == (mode == operation::stop ? 0 : 1));
+  f.start();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK(released == 1);
+}
+
+TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  enum class path { rejected, abandoned, submission_error };
+  auto mode            = GENERATE(path::rejected, path::abandoned, path::submission_error);
+  const bool abandoned = mode == path::abandoned;
+  CAPTURE(static_cast<int>(mode));
+  fixture f(1, 1);
+  struct measurement {
+    std::optional<fault> counting;
+    std::thread::id owner;
+    bool control_fired = false, finished = false, same_thread = false;
+    size_t allocations = 0;
+    void arm() noexcept
+    {
+      {
+        fault control{fault::every_allocation_scope, 1};
+        try {
+          void* pointer                         = ::operator new(64);
+          *static_cast<volatile char*>(pointer) = 1;
+          ::operator delete(pointer);
+        } catch (std::bad_alloc const&) {
+          control_fired = control.fired();
+        }
+        (void)control.stop();
+      }
+      owner = std::this_thread::get_id();
+      counting.emplace(fault::every_allocation_scope, 0);
+    }
+    void finish() noexcept
+    {
+      same_thread = owner == std::this_thread::get_id();
+      if (same_thread && counting) {
+        allocations = counting->stop();
+        counting.reset();
+        finished = true;
+      }
+    }
+  };
+  auto measured = std::make_shared<measurement>();
+  auto blocked  = f.make_hold();
+  std::atomic<size_t> work_calls{0};
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({99, 1}, required);
+  REQUIRE(unit);
+  auto cleanup = f.shutdown_guard();
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [measured](auto* value) {
+      measured->finish();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  REQUIRE(unit->complete_input(checkpoint_input{7}));
+  std::function<std::unique_ptr<sirius::op::scan::scan_info>()> work;
+  if (mode != path::rejected) {
+    struct arm_on_destroy {
+      std::shared_ptr<measurement> measured;
+      explicit arm_on_destroy(std::shared_ptr<measurement> measured) : measured(std::move(measured))
+      {
+      }
+      ~arm_on_destroy() { measured->arm(); }
+    };
+    auto token = std::make_shared<arm_on_destroy>(measured);
+    work       = [token = std::move(token), &work_calls] {
+      ++work_calls;
+      return std::make_unique<tagged>(1);
+    };
+    if (abandoned) {
+      f.dispatcher.enqueue([blocked] { blocked->wait(); });
+      REQUIRE(blocked->await());
+    }
+  } else {
+    work = [&, measured] {
+      ++work_calls;
+      auto input = std::make_unique<tagged>(1);
+      blocked->wait();
+      measured->arm();
+      return input;
+    };
+  }
+  f.source(std::make_shared<accumulator>(1),
+           std::make_shared<sink>(),
+           single_job(std::move(work), std::move(unit)));
+  if (mode == path::submission_error) {
+    auto original = std::make_exception_ptr(std::runtime_error("submission failed before enqueue"));
+    f.coordinator.before_submission_for_testing([original] { std::rethrow_exception(original); });
+  }
+  f.start();
+  if (mode != path::submission_error) {
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (f.coordinator.snapshot().wakes < 2 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    REQUIRE(f.coordinator.snapshot().wakes >= 2);
+    if (!abandoned) REQUIRE(blocked->await());
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    blocked->release();
+  }
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK(f.completion.has_error() == (mode == path::submission_error));
+  if (mode == path::submission_error)
+    CHECK_THROWS_WITH(f.completion.get_awaitable().get(), "submission failed before enqueue");
+  CHECK(work_calls == (mode == path::rejected ? 1 : 0));
+  CHECK(measured->control_fired);
+  CHECK(measured->same_thread);
+  CHECK(measured->finished);
+  CHECK(measured->allocations == 0);
+  CHECK(f.coordinator.snapshot().results_peak == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Queue allocation failure unwinds every caller payload outside the gate",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  enum class path { advance, partial, sized, full_window, flush };
+  auto mode = GENERATE(path::advance, path::partial, path::sized, path::full_window, path::flush);
+  CAPTURE(static_cast<int>(mode));
+  preparation_options options{
+    1, 1, 1, 1, k_interrupt_check_interval, 0, partial_batch_options{50, 20ms, 20ms}};
+  if (mode == path::sized) options.partial_batch->max_residence = 2s;
+  if (mode == path::full_window) options.partial_batch.reset();
+  fixture f(1, 1, k_interrupt_check_interval, options);
+  auto failure = f.completion.get_awaitable();
+  auto out     = std::make_shared<sink>();
+  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  std::optional<fault> armed;
+  size_t made = 0, refused_id = 0, observed_allocations = 0;
+  auto disarm = [&](size_t id) {
+    if (armed) {
+      observed_allocations += armed->stop();
+      if (armed->fired()) refused_id = id;
+      armed.reset();
+    }
+  };
+  struct queued_payload : tagged {
+    std::shared_ptr<test::cleanup_observation> seen;
+    std::function<void()> disarm;
+    queued_payload(int id,
+                   std::shared_ptr<test::cleanup_observation> seen,
+                   std::function<void()> disarm)
+      : tagged(id), seen(std::move(seen)), disarm(std::move(disarm))
+    {
+    }
+    ~queued_payload() override
+    {
+      disarm();
+      seen->release();
+    }
+  };
+  auto make_batch = [&]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+    auto id = ++made;
+    return std::make_unique<queued_payload>(static_cast<int>(id), seen, [&, id] { disarm(id); });
+  };
+  struct fault_coalescer : accumulator {
+    path mode;
+    std::function<std::unique_ptr<sirius::op::scan::scan_info>()> make;
+    std::function<void()> arm;
+    size_t advance_calls = 0, partial_calls = 0, flush_calls = 0;
+    explicit fault_coalescer(path mode)
+      : accumulator(mode == path::full_window ? 1 : 1000), mode(mode)
+    {
+    }
+    cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
+    {
+      ++advance_calls;
+      if (mode == path::partial || mode == path::sized || mode == path::full_window) {
+        retained = mode == path::partial ? 1 : cap;
+        note_retained(clock::now() - (mode == path::partial ? 1s : 100ms));
+        return {nullptr, true};
+      }
+      auto batch = make();
+      arm();
+      return {std::move(batch), true};
+    }
+    std::unique_ptr<sirius::op::scan::scan_info> partial_emit() override
+    {
+      if (!first_retained_time()) return {};
+      ++partial_calls;
+      clear_retained();
+      auto batch = make();
+      arm();
+      return batch;
+    }
+    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
+    {
+      ++flush_calls;
+      std::vector<std::unique_ptr<sirius::op::scan::scan_info>> batches;
+      if (mode == path::flush) {
+        batches.push_back(make());
+        // Construct the vector and payload before arming the queue allocation.
+        arm();
+      }
+      return batches;
+    }
+  };
+  constexpr size_t attempts = 1024;
+  const size_t sources      = mode == path::flush ? attempts : 1;
+  std::vector<std::shared_ptr<fault_coalescer>> coalescers;
+  for (size_t index = 0; index < sources; ++index) {
+    auto coalescer  = std::make_shared<fault_coalescer>(mode);
+    coalescer->make = make_batch;
+    coalescer->arm  = [&] { armed.emplace(fault::every_allocation_scope, 1); };
+    coalescers.push_back(coalescer);
+    preparation_coordinator::source source;
+    source.coalescer = coalescer;
+    source.try_claim = finite_jobs(mode == path::flush ? 0 : attempts,
+                                   [](int id) { return std::make_unique<tagged>(id); });
+    source.construct = [&](std::unique_ptr<sirius::op::scan::scan_info> batch) {
+      disarm(static_cast<tagged&>(*batch).id);
+      using sirius::op::scan::scan_operator_input;
+      auto input = std::make_unique<scan_operator_input>(
+        std::move(batch), nullptr, 0, std::nullopt, scan_operator_input::prefetch_start::deferred);
+      return preparation_coordinator::publication{std::move(input), 0};
+    };
+    source.close = [out, sources] {
+      std::lock_guard lock(out->mutex);
+      if (++out->close_calls == sources) out->closed = true;
+      out->cv.notify_all();
+    };
+    f.register_source(std::move(source), out);
+  }
+  auto cleanup = f.shutdown_guard();
+  f.start();
+  size_t consumed = 0;
+  while (!f.completion.has_error() && !out->closed) {
+    if (out->await(consumed + 1)) {
+      out->consume();
+      ++consumed;
+    } else {
+      REQUIRE((f.completion.has_error() || out->closed));
+    }
+  }
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  REQUIRE(f.completion.has_error());
+  CHECK_THROWS_AS(failure.get(), std::bad_alloc);
+  REQUIRE(refused_id > 0);
+  CHECK(observed_allocations == 1);
+  CHECK(made > 1);
+  CHECK(made <= attempts);
+  CHECK(std::count(out->published.begin(), out->published.end(), static_cast<int>(refused_id)) ==
+        0);
+  CHECK(seen->releases == made);
+  CHECK(seen->outside == made);
+  CHECK(seen->errors == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  if (mode == path::sized) CHECK(f.coordinator.snapshot().size_emissions > 0);
+  if (mode == path::partial) {
+    CHECK(f.coordinator.snapshot().partial_emissions > 0);
+    CHECK(f.coordinator.snapshot().size_emissions == 0);
+  }
+  if (mode == path::full_window) {
+    CHECK(f.coordinator.snapshot().normal_emissions > 0);
+    CHECK(f.coordinator.snapshot().partial_emissions == 0);
+  }
+  if (mode == path::partial || mode == path::sized || mode == path::full_window)
+    CHECK(coalescers.front()->partial_calls == made);
+  else if (mode == path::advance)
+    CHECK(coalescers.front()->advance_calls == made);
+  else {
+    size_t flushes = 0;
+    for (auto const& coalescer : coalescers)
+      flushes += coalescer->flush_calls;
+    CHECK(flushes == made);
+  }
 }
