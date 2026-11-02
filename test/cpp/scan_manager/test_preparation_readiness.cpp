@@ -3605,10 +3605,6 @@ TEST_CASE("Queue allocation failure unwinds every caller payload outside the gat
     1, 1, 1, 1, k_interrupt_check_interval, 0, partial_batch_options{50, 20ms, 20ms}};
   if (mode == path::sized) options.partial_batch->max_residence = 2s;
   if (mode == path::full_window) options.partial_batch.reset();
-  fixture f(1, 1, k_interrupt_check_interval, options);
-  auto failure = f.completion.get_awaitable();
-  auto out     = std::make_shared<sink>();
-  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
   std::optional<fault> armed;
   size_t made = 0, refused_id = 0, observed_allocations = 0;
   auto disarm = [&](size_t id) {
@@ -3618,6 +3614,11 @@ TEST_CASE("Queue allocation failure unwinds every caller payload outside the gat
       armed.reset();
     }
   };
+  // The callback outlives the fixture, including exceptional consumer teardown.
+  fixture f(1, 1, k_interrupt_check_interval, options);
+  auto failure = f.completion.get_awaitable();
+  auto out     = std::make_shared<sink>();
+  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
   struct queued_payload : tagged {
     std::shared_ptr<test::cleanup_observation> seen;
     std::function<void()> disarm;
@@ -3682,6 +3683,7 @@ TEST_CASE("Queue allocation failure unwinds every caller payload outside the gat
   constexpr size_t attempts = 1024;
   const size_t sources      = mode == path::flush ? attempts : 1;
   std::vector<std::shared_ptr<fault_coalescer>> coalescers;
+  std::vector<preparation_coordinator::source> lanes;
   for (size_t index = 0; index < sources; ++index) {
     auto coalescer  = std::make_shared<fault_coalescer>(mode);
     coalescer->make = make_batch;
@@ -3703,19 +3705,19 @@ TEST_CASE("Queue allocation failure unwinds every caller payload outside the gat
       if (++out->close_calls == sources) out->closed = true;
       out->cv.notify_all();
     };
-    f.register_source(std::move(source), out);
+    source.destination = out->connector;
+    lanes.push_back(std::move(source));
   }
+  f.coordinator.add_sources(std::move(lanes));
+  f.coordinator.after_publication_for_testing([out](size_t, auto const& metadata, size_t) {
+    // Consume on the driver: all fault arming/disarming stays on its original thread.
+    // The connector and the publication observer both release their owners before its next step.
+    out->published.push_back(static_cast<tagged&>(*metadata).id);
+    if (!out->connector->get_next_split())
+      throw std::logic_error("missing published fault payload");
+  });
   auto cleanup = f.shutdown_guard();
   f.start();
-  size_t consumed = 0;
-  while (!f.completion.has_error() && !out->closed) {
-    if (out->await(consumed + 1)) {
-      out->consume();
-      ++consumed;
-    } else {
-      REQUIRE((f.completion.has_error() || out->closed));
-    }
-  }
   f.finish();
   CHECK_FALSE(f.owner_error);
   REQUIRE(f.completion.has_error());
