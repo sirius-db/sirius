@@ -33,6 +33,12 @@ namespace sirius {
 /**
  * @brief An immutable, validated configuration produced by ContextConfigBuilder::build().
  *
+ * @par Thread safety
+ * Objects may be transferred between threads, including for destruction.
+ * Const operations and copying may run concurrently while the source stays alive.
+ * Assignment and destruction require exclusive access to that object; separate
+ * copies may be used independently on different threads.
+ *
  * A snapshot retains its values independently of builder reassignment and
  * changes to the source YAML file. Copies share immutable storage and remain
  * valid after the original snapshot or builder is destroyed. Copying from an

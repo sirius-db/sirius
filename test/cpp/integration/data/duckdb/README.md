@@ -29,6 +29,10 @@ TPCDS_SF=0.01 pixi run bash test/cpp/integration/data/duckdb/generate_tpcds_duck
 Then commit the regenerated file. A precondition case in the test asserts the data
 still contains NULLs in every column under test, so a bad regeneration fails loudly.
 
+The original TPC-DS queries Q12, Q20, Q53, Q63, Q89 and Q98 that `test_gpu_execution_window.cpp`
+runs against this database are in `../tpcds_queries/`, copied from DuckDB's
+`extension/tpcds/dsdgen/queries/`.
+
 ## `integration.duckdb`
 
 TPC-H data (~27 MB) — the eight standard tables (`lineitem`, `orders`, `customer`,
