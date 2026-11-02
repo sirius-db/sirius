@@ -282,18 +282,19 @@ duckdb::unique_ptr<op::sirius_physical_operator> prepare_whole_partition_window_
     throw duckdb::InternalException("Window preparation schema does not match its child");
   }
   auto prepared = sirius::from_duckdb_vec(plan.prepared_types);
-  duckdb::vector<std::unique_ptr<ast::node>> select;
   for (duckdb::idx_t i = 0; i < plan.input_width; ++i) {
     if (child->types[i] != prepared[i]) {
       throw duckdb::InternalException("Window child type mismatch");
     }
-    select.push_back(
-      std::make_unique<ast::node>(ast::reference{static_cast<uint32_t>(i), prepared[i]}));
   }
+  duckdb::vector<std::unique_ptr<ast::node>> hidden;
   for (auto const& expression : plan.hidden_expressions) {
-    select.push_back(ast::clone(*expression));
+    hidden.push_back(ast::clone(*expression));
   }
-  return push_projection(std::move(child), prepared, std::move(select), estimated_cardinality);
+  duckdb::vector<sirius::logical_type> hidden_types(prepared.begin() + plan.input_width,
+                                                    prepared.end());
+  return push_appending_projection(
+    std::move(child), std::move(hidden), std::move(hidden_types), estimated_cardinality);
 }
 
 }  // namespace
