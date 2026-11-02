@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <thread>
 
 namespace {
 using namespace sirius::op::scan;
@@ -172,7 +173,7 @@ TEST_CASE("Parquet deletes stop before open and between batches", "[parquet_dele
 {
   delete_fixture f;
   REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
-  bool cancelled = true;
+  std::atomic<bool> cancelled{true};
   parquet_delete_read_options options;
   options.check_stop = [&] {
     if (cancelled) throw std::runtime_error("cancelled");
@@ -257,6 +258,7 @@ class delete_remote_fs : public duckdb::FileSystem {
     delete_remote_fs& owner;
     uint64_t generation;
   };
+  std::function<void()> before_read;
   std::string bytes;
   uint64_t generation                     = 1;
   int live_handles                        = 0;
@@ -278,6 +280,7 @@ class delete_remote_fs : public duckdb::FileSystem {
   }
   void Read(duckdb::FileHandle& h, void* buffer, int64_t count, duckdb::idx_t offset) override
   {
+    if (before_read) before_read();
     auto& handle = static_cast<remote_handle&>(h);
     if (handle.generation != generation) throw duckdb::IOException("Remote precondition failed");
     if (count < 0 || offset > bytes.size() || uint64_t(count) > bytes.size() - offset)
@@ -306,6 +309,74 @@ class delete_remote_fs : public duckdb::FileSystem {
   std::string GetName() const override { return "delete-remote"; }
 };
 }  // namespace
+
+TEST_CASE("Remote Parquet deletes honor read-ahead settings with one decode worker",
+          "[parquet_delete_reader][remote]")
+{
+  delete_fixture f;
+  f.write(10000);
+  REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
+  auto mode =
+    std::string(GENERATE("enabled", "no_async_threads", "zero_depth", "disable_prefetch"));
+  CAPTURE(mode);
+  REQUIRE_FALSE(
+    f.connection.Query(mode == "no_async_threads" ? "SET async_threads=0" : "SET async_threads=2")
+      ->HasError());
+  REQUIRE_FALSE(
+    f.connection.Query(mode == "zero_depth" ? "SET read_ahead_depth=0" : "SET read_ahead_depth=2")
+      ->HasError());
+  if (mode == "disable_prefetch")
+    REQUIRE_FALSE(f.connection.Query("SET disable_parquet_prefetching=true")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET enable_external_file_cache=false")->HasError());
+  std::atomic<bool> scanning{false};
+  std::atomic<unsigned> reads{0};
+  std::promise<void> second_read;
+  auto overlap            = second_read.get_future();
+  auto fs                 = duckdb::make_uniq<delete_remote_fs>(f.path);
+  auto& remote            = *fs;
+  remote.expected_context = f.connection.context.get();
+  const auto caller       = std::this_thread::get_id();
+  remote.before_read      = [&] {
+    if (!scanning) return;
+    auto n = ++reads;
+    if (mode != "enabled") {
+      if (std::this_thread::get_id() != caller)
+        throw std::runtime_error("disabled read-ahead issued a background read");
+      return;
+    }
+    if (n == 1 && overlap.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+      throw std::runtime_error("second range read did not start");
+    if (n == 2) second_read.set_value();
+  };
+  f.db.GetFileSystem().RegisterSubSystem(std::move(fs));
+  f.path         = "delete-remote://bucket/deletes.parquet";
+  uint64_t count = 0;
+  f.read(
+    {},
+    [&](auto const&, uint64_t) {
+      scanning = true;
+      return std::vector<uint64_t>{0};
+    },
+    [&](duckdb::DataChunk& chunk) {
+      for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
+        REQUIRE(chunk.GetValue(0, i).GetValue<int64_t>() == int64_t(count));
+        ++count;
+      }
+    });
+  REQUIRE(count == 10000);
+  REQUIRE(reads >= 2);
+  REQUIRE(remote.live_handles == 0);
+
+  std::atomic<bool> cancelled{false};
+  parquet_delete_read_options options;
+  options.check_stop = [&] {
+    if (cancelled) throw duckdb::InterruptException();
+  };
+  REQUIRE_THROWS_AS(f.read(options, position_projection, [&](auto&) { cancelled = true; }),
+                    duckdb::InterruptException);
+  REQUIRE(cancelled);
+  REQUIRE(remote.live_handles == 0);
+}
 
 TEST_CASE("Remote Parquet deletes preserve caller context and native filesystem support",
           "[parquet_delete_reader][remote]")
@@ -351,6 +422,7 @@ TEST_CASE("Remote Parquet deletes reject replacement and release handles on fail
   }
   SECTION("replacement during batches")
   {
+    REQUIRE_FALSE(f.connection.Query("SET read_ahead_depth=1")->HasError());
     REQUIRE_THROWS(f.read({}, position_projection, [&](auto&) { ++remote.generation; }));
   }
   SECTION("additional bound identity rejects before publishing")
@@ -363,7 +435,7 @@ TEST_CASE("Remote Parquet deletes reject replacement and release handles on fail
   }
   SECTION("cancellation between remote batches")
   {
-    bool stop = false;
+    std::atomic<bool> stop{false};
     parquet_delete_read_options options;
     options.check_stop = [&] {
       if (stop) throw std::runtime_error("cancelled");

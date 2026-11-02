@@ -697,6 +697,8 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
   auto const threads = GENERATE(1, 2);
   CAPTURE(threads);
   require_query_ok(fixture.con, "SET threads=" + std::to_string(threads));
+  // Leave later row groups unread until the first batch replaces the object.
+  require_query_ok(fixture.con, "SET read_ahead_depth=1");
   std::mutex consume_mutex;
   uint64_t consumed  = 0;
   auto read_complete = [&] {

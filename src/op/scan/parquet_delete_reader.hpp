@@ -40,7 +40,7 @@ struct parquet_delete_column {
 struct parquet_delete_read_options {
   std::optional<uint64_t> expected_size;
   std::optional<uint64_t> expected_footer_size;
-  // Throws on cancellation or expired caller-owned execution/transaction state.
+  // Called on scan workers and before queued I/O. Throw to cancel the read.
   std::function<void()> check_stop;
   // Optional additional binding-identity check for remote inputs. The default
   // checks size, modification time and version tag exposed by the filesystem;
