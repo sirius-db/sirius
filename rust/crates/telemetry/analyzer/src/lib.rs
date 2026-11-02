@@ -1505,15 +1505,20 @@ impl SiriusUiAnalyzer {
         Ok(())
     }
 
-    /// Turn Task and DataBatch ids into UI FSM data.
+    /// Order timeline intervals chronologically, independent of hash-table traversal.
+    /// UUID breaks ties reproducibly when reopening the same trace.
     fn task_entities_to_ui_fsm(
         &self,
         entity_ids: &[Uuid],
         epoch: TimeUnixNanoSec,
     ) -> AnalyzerResult<Vec<FiniteStateMachine>> {
-        entity_ids
+        let mut selected: Vec<_> = entity_ids
             .iter()
             .filter_map(|&id| fsms::get(&self.model, id))
+            .collect();
+        selected.sort_unstable_by_key(|fsm| (fsm.earliest_timestamp(), fsm.id()));
+        selected
+            .into_iter()
             .map(|fsm| fsm.try_to_ui(&self.model, epoch))
             .collect()
     }

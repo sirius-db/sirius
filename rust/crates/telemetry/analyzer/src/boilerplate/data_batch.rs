@@ -15,36 +15,11 @@ use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec};
 use quent_ui::{
     FiniteStateMachine,
-    fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration},
+    fsm::{FsmTypeDecl, FsmTypeDeclaration},
 };
 use rustc_hash::FxHashSet as HashSet;
 use sirius_telemetry_store as schema;
 use uuid::Uuid;
-
-fn declaration() -> FsmTypeDecl {
-    let state = |name: &str, usages: &[&str]| FsmStateTypeDecl {
-        name: name.to_owned(),
-        usages: usages.iter().map(|usage| (*usage).to_owned()).collect(),
-    };
-    FsmTypeDecl {
-        name: "data_batch".to_owned(),
-        states: vec![
-            state("constructed", &[]),
-            state("stationary", &["memory"]),
-            state("in_transit", &["source_memory", "dest_memory", "channel"]),
-            state("destructed", &[]),
-        ],
-        transitions: vec![
-            FsmTransitionDecl::Entry("constructed".to_owned()),
-            FsmTransitionDecl::Transition("constructed".to_owned(), "stationary".to_owned()),
-            FsmTransitionDecl::Transition("stationary".to_owned(), "in_transit".to_owned()),
-            FsmTransitionDecl::Transition("in_transit".to_owned(), "stationary".to_owned()),
-            FsmTransitionDecl::Transition("stationary".to_owned(), "stationary".to_owned()),
-            FsmTransitionDecl::Transition("stationary".to_owned(), "destructed".to_owned()),
-            FsmTransitionDecl::Exit("destructed".to_owned()),
-        ],
-    }
-}
 
 /// The reconstructed data-batch FSM.
 #[derive(Debug)]
@@ -96,7 +71,7 @@ impl RefTreeEntity for DataBatch {
 
 impl FsmTypeDeclaration for DataBatch {
     fn fsm_type_declaration() -> FsmTypeDecl {
-        declaration()
+        super::data_batch_declaration()
     }
 }
 

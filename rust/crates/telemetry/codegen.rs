@@ -73,9 +73,8 @@ fn attribute_value(ty: &DataType, name: &str, value: TokenStream) -> Result<Toke
     Ok(expression)
 }
 
-/// Schema facts are generated; the activity's display aliases and attribute
-/// priorities below are application presentation policy. Unlisted fields keep
-/// schema order and are included automatically.
+/// Activity display aliases are application presentation policy.
+/// Attributes follow their declaration order in the schema.
 fn aliases(entity: &str, state: &str) -> Vec<String> {
     if entity == "QueryActivity" && state == "started" {
         vec!["working".into(), "waiting".into()]
@@ -152,19 +151,6 @@ pub fn generate(schema: &Schema, ui_entities: &[&str]) -> Result<(TokenStream, T
                     attr_fields.push(field);
                 }
             }
-            // Existing UI clients consume producer order, including these legacy
-            // presentation priorities. This does not reorder recorded events.
-            let priority: &[&str] = match (name.as_str(), state.as_str()) {
-                ("QueryActivity", "started") => &["phase", "kind", "parent_activity_id"],
-                ("QueryActivity", "finished") => &["decision", "outcome"],
-                _ => &[],
-            };
-            attr_fields.sort_by_key(|f| {
-                priority
-                    .iter()
-                    .position(|p| *p == &**f.name())
-                    .unwrap_or(priority.len())
-            });
             let attr_names: Vec<_> = attr_fields
                 .iter()
                 .map(|f| format_ident!("{}", f.name().to_string()))

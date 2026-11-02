@@ -998,6 +998,47 @@ fn fsm_diagrams_use_final_states() {
 }
 
 #[test]
+fn data_batch_diagram_includes_all_terminal_edges() {
+    use quent_ui::fsm::{FsmTransitionDecl, FsmTypeDeclaration};
+    let declaration = crate::boilerplate::DataBatch::fsm_type_declaration();
+    for source in ["constructed", "stationary", "in_transit"] {
+        assert!(declaration.transitions.iter().any(
+            |transition| matches!(transition, FsmTransitionDecl::Transition(from, to)
+                if from == source && to == "destructed")
+        ));
+    }
+}
+
+#[test]
+fn timeline_intervals_have_chronological_order_with_uuid_ties() {
+    for reverse in [false, true] {
+        let mut events = activity_fixture();
+        // Equal start times must not fall back to source map or set traversal order.
+        for event in &mut events {
+            if event.id == id(104)
+                && matches!(
+                    event.data,
+                    E::QueryActivity(s::QueryActivityEvent::Started { .. })
+                )
+            {
+                event.timestamp = EPOCH + SECOND;
+            }
+        }
+        if reverse {
+            events.reverse();
+        }
+        let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+        for ids in [[id(102), id(104), id(100)], [id(100), id(102), id(104)]] {
+            let fsms = analyzer.task_entities_to_ui_fsm(&ids, EPOCH).unwrap();
+            assert_eq!(
+                fsms.iter().map(|fsm| fsm.id).collect::<Vec<_>>(),
+                vec![id(100), id(104), id(102)]
+            );
+        }
+    }
+}
+
+#[test]
 fn query_groups_use_ui_attributes() {
     use quent_query_engine_analyzer::QueryEntity;
 
