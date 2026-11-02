@@ -167,13 +167,18 @@ if(SIRIUS_ENABLE_MELD_UNITS)
         "SIRIUS_ENABLE_MELD_UNITS needs SIMPATICO_ENABLE_MELD and SIMPATICO_MELD_SOURCE_DIR"
     )
   endif()
-  block()
+  block(PROPAGATE SIRIUS_MELD_INCLUDE_DIRS)
   # Meld is C++20, and the 17 cached for DuckDB would otherwise win over it.
   set(CMAKE_CXX_STANDARD 20)
   set(MELD_INCLUDE_TESTS OFF)
   set(MELD_BUILD_APPS OFF)
   add_subdirectory("${SIMPATICO_MELD_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/meld"
                    EXCLUDE_FROM_ALL)
+  # Meld names its headers, and MLIR's, for the whole of its tree rather than
+  # for its targets.
+  get_directory_property(
+    SIRIUS_MELD_INCLUDE_DIRS DIRECTORY "${SIMPATICO_MELD_SOURCE_DIR}"
+                                       INCLUDE_DIRECTORIES)
   endblock()
   message(
     STATUS "Sirius: Meld's execution units from ${SIMPATICO_MELD_SOURCE_DIR}")
