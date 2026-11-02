@@ -158,7 +158,6 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
 `project_sink.cpp` and `filter_sink.cpp` wrap the statements in the `ProjectSink` and
 `FilterSink` kernels. The device runtime the kernels are compiled behind lives in
 `device_runtime/*.cuh` (embedded at build time and also compiled by nvcc as a syntax check).
-Design background is in [ADR 0001](../adr/0001-nvrtc-expression-and-pipeline-compilation.md).
 
 - **Kernel shape.** Blocks of 256 threads process a tile of rows, each thread handling several
   rows strided by the block width (4 per thread for projections, 16 for filters) so loads and

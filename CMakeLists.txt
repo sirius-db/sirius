@@ -43,7 +43,6 @@ if(VCPKG_BUILD)
 endif()
 
 include(cmake/sirius-duckdb-provider.cmake)
-include(cmake/sirius-clangd-cuda.cmake)
 
 include(cmake/sirius-dependencies.cmake)
 
