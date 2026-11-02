@@ -926,7 +926,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   // working-set estimate too — it seeds the cold-start guess below via
   // input_stats, so do not gate this on residency.
   if (input_type == op::operator_data_type::GPU_SCAN && ls._input_data) {
-    working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
+    working_set_bytes =
+      scan_input && target_space
+        ? scan_input->get_estimated_working_set_size_in_bytes(target_space->get_device_id())
+        : ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
   std::size_t num_batches = 0;

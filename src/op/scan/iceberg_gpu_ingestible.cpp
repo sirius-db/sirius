@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include "memory/size_arithmetic.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
+#include "op/scan/positional_visibility.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "sirius/exception.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -244,7 +246,9 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   return set;
 }
 
-void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_delete_set const> set)
+void attach_delete_set(parquet_file_scan_info& file,
+                       std::shared_ptr<iceberg_delete_set const> set,
+                       scan_plan const& plan)
 {
   auto deps =
     std::vector<split_dependencies>(file.dependencies().begin(), file.dependencies().end());
@@ -252,8 +256,49 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
     throw sirius::internal_exception(
       "[iceberg_gpu_ingestible] parquet file requires one delete-set dependency");
   auto const has_deletes  = !set->positions.empty();
-  deps.front().visibility = std::move(set);
-  file.disable_filter_pushdown |= has_deletes;
+  deps.front().visibility = set;
+  std::vector<std::size_t> selected_deletes;
+  if (has_deletes && file.position_filter_eligible) {
+    int64_t first  = 0;
+    std::size_t rg = 0;
+    for (auto const& group : file.row_groups) {
+      while (rg < static_cast<std::size_t>(group.index))
+        first += file.file_metadata->row_groups[rg++].num_rows;
+      auto const lo = std::lower_bound(set->positions.begin(), set->positions.end(), first);
+      auto const hi = std::lower_bound(lo, set->positions.end(), first + group.num_rows);
+      selected_deletes.push_back(static_cast<std::size_t>(hi - lo));
+    }
+  }
+  file.requires_row_positions =
+    std::any_of(selected_deletes.begin(), selected_deletes.end(), [](auto count) { return count; });
+  if (file.requires_row_positions) {
+    file.disable_filter_pushdown = false;
+    bool virtual_row = false, virtual_source = false;
+    for (auto const& column : plan.virtual_columns) {
+      virtual_row |= column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+      virtual_source |= column.kind != scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+    }
+    // Reader indices before/after filtering: 2 * (8 B row + 4 B source).
+    // Add 8 B/row selection scratch, a 1 B/row mask and payload coexistence.
+    // Charge source indices conservatively: a later coalesced split may need them.
+    for (std::size_t i = 0; i < file.row_groups.size(); ++i) {
+      auto& group                  = file.row_groups[i];
+      group.requires_row_positions = selected_deletes[i] != 0;
+      // Virtual scans already reserve payload coexistence, their requested
+      // reader indices and selection scratch. Add only the missing indices.
+      auto const index_bytes    = std::size_t{16} * !virtual_row + std::size_t{8} * !virtual_source;
+      auto const position_bytes = memory::saturating_add(
+        group.decode_working_bytes,
+        memory::saturating_add(memory::saturating_mul(group.num_rows, index_bytes),
+                               memory::saturating_mul(selected_deletes[i], sizeof(int64_t))));
+      group.unfiltered_working_bytes = group.decode_working_bytes;
+      group.decode_working_bytes     = position_bytes;
+    }
+  } else if (!file.position_filter_eligible) {
+    file.disable_filter_pushdown |= has_deletes;
+  }
+  // Eligible virtual scans keep the reader decision when footer pruning removed
+  // every delete-bearing group. The adapter rechecks the selected split ranges.
   file.set_contract_payload(file.contract_id(),
                             std::vector<split_materializer_certificate>(file.certificates().begin(),
                                                                         file.certificates().end()),
@@ -287,12 +332,13 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
   if (_deferred) throw std::logic_error("deferred DV work requires an owning claim");
   auto work = _core.next_split_provider(std::move(resolve));
   if (!work) return {};
-  return [work = std::move(work), sets = _delete_sets](scan_manager::preparation_stop_token stop) {
+  return [work = std::move(work), sets = _delete_sets, plan = &_core.plan()](
+           scan_manager::preparation_stop_token stop) {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto metadata = work(stop);
     auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
-    attach_delete_set(file, sets->at(file.file_path));
+    attach_delete_set(file, sets->at(file.file_path), *plan);
     return metadata;
   };
 }
@@ -318,18 +364,19 @@ gpu_ingestible::metadata_claim iceberg_gpu_ingestible::try_claim_split(io::ioctx
     metadata_scan_task_t footer;
     io::ioctx_resolver resolve;
     std::shared_ptr<physical_check_counters> counters;
+    scan_plan const* plan;
     std::unique_ptr<scan_info> run(scan_manager::preparation_stop_token stop)
     {
       auto metadata = footer(stop);
       auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
       auto set      = read_prepared_delete_set(*owned, resolve, counters, stop.token());
       owned->complete(set);
-      attach_delete_set(file, std::move(set));
+      attach_delete_set(file, std::move(set), *plan);
       return metadata;
     }
   };
   auto state = std::make_shared<operation>(
-    operation{owned, {}, resolve, profiles ? profiles->counters : nullptr});
+    operation{owned, {}, resolve, profiles ? profiles->counters : nullptr, &_core.plan()});
   metadata_scan_task_t work = [state](scan_manager::preparation_stop_token stop) {
     return state->run(stop);
   };
@@ -517,10 +564,29 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
     sets.emplace(set->data_file, set);
     has_deletes |= !set->positions.empty();
   }
-  if (has_deletes && !split.disable_filter_pushdown) {
-    throw sirius::internal_exception(
-      "[iceberg_gpu_ingestible] positional deletes require pushdown suppression");
+  if (has_deletes && !split.disable_filter_pushdown && !split.requires_row_positions) {
+    // The file's deletes may belong to another split. Independently verify the
+    // selected ranges against the bound sets before allowing selection without
+    // positions; keep those identities in the completion record even for a no-op.
+    auto const layout = build_batch_layout(split);
+    has_deletes       = std::any_of(layout.begin(), layout.end(), [&](auto const& run) {
+      auto const& set = sets.at(delete_key_for(run.data_file_path));
+      auto const pos =
+        std::lower_bound(set->positions.begin(), set->positions.end(), run.file_row_offset);
+      return pos != set->positions.end() && *pos < run.file_row_offset + run.num_rows;
+    });
+    if (has_deletes)
+      throw sirius::internal_exception(
+        "[iceberg_gpu_ingestible] positional deletes require pushdown suppression");
   }
+  // Freeze requirements before decode from the independently validated split.
+  static auto const empty_requirements = std::make_shared<visibility_bindings const>();
+  visibility_bindings required;
+  for (auto const& [path, set] : sets)
+    if (!set->positions.empty()) required.push_back({path, set});
+  auto requirements = required.empty()
+                        ? empty_requirements
+                        : std::make_shared<visibility_bindings const>(std::move(required));
   // Forwarded untouched: these steer the base decode's LIKE evaluation and have nothing to say
   // about deletes. The check below is what guards the case that matters -- if they cause the
   // reader to filter rows, positions stop identifying file rows and we refuse rather than
@@ -528,50 +594,108 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   auto base = _core.materialize_metadata_to_table(
     info, mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
 
-  if (!has_deletes) { return base; }
+  base.required_visibility = std::move(requirements);
+  if (!base.execution) throw sirius::internal_exception("Iceberg decode omitted execution facts");
+  if (!has_deletes) base.execution->positions = row_position_state::none;
+  finish_visibility(
+    *base.required_visibility,
+    base.execution->visibility_applied,
+    base.execution->visibility_complete,
+    [&](std::span<applied_visibility const> pending) {
+      if (!has_deletes) return;
+      iceberg_delete_sets pending_sets;
+      for (auto const& binding : pending)
+        pending_sets.emplace(binding.file, sets.at(binding.file));
+      if (split.requires_row_positions && !base.table.num_rows()) {
+        base.row_positions.reset();
+        if (base.execution) base.execution->positions = row_position_state::none;
+        return;
+      }
 
-  // Position-matched deletes require the decoded rows in file order; anything else means the
-  // reader filtered, and the mapping below would delete the wrong rows.
-  if (base.state != filter_state::UNFILTERED) {
-    throw sirius::internal_exception(
-      "[iceberg_gpu_ingestible] '" + _table_path +
-      "': decode returned a filtered table, so row positions no longer identify file rows; "
-      "reader-side pushdown must be suppressed for iceberg splits carrying deletes");
-  }
+      if (base.row_positions) {
+        if (!split.requires_row_positions)
+          throw sirius::internal_exception("[iceberg_gpu_ingestible] unsolicited reader positions");
+        // Validate reader-local source bindings against this exact split before resolving
+        // the manifest's delete keys. No path strings are constructed for individual rows.
+        std::size_t source = 0;
+        for (auto const& slice : split.rg_slices) {
+          if (slice.row_group_indices.empty()) continue;
+          if (source >= base.row_positions->sources.size() ||
+              base.row_positions->sources[source].file != slice.file_path ||
+              base.row_positions->sources[source].file_rows != slice.file_metadata->num_rows)
+            throw sirius::internal_exception("[iceberg_gpu_ingestible] misbound reader positions");
+          base.row_positions->sources[source++].file = delete_key_for(slice.file_path);
+        }
+        if (source != base.row_positions->sources.size())
+          throw sirius::internal_exception(
+            "[iceberg_gpu_ingestible] extra reader position sources");
+        rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+        try {
+          base.table = owning_table_view(apply_positional_visibility(
+            base.table.release(stream, mr_ref),
+            std::move(base.row_positions),
+            [&](std::string const& path) -> std::span<int64_t const> {
+              auto it = pending_sets.find(path);
+              return it == pending_sets.end() ? std::span<int64_t const>{} : it->second->positions;
+            },
+            stream,
+            mr_ref));
+        } catch (std::invalid_argument const& error) {
+          throw sirius::internal_exception(
+            std::string("[iceberg_gpu_ingestible] invalid reader positions: ") + error.what());
+        }
+        if (base.execution) base.execution->positions = row_position_state::lost;
+        return;
+      }
 
-  auto layout = build_batch_layout(split);
-  // Runs carry the scan's path; the delete map is keyed on the manifest's.
-  for (auto& run : layout) {
-    run.data_file_path = delete_key_for(run.data_file_path);
-  }
+      // Position-matched deletes require the decoded rows in file order; anything else means the
+      // reader filtered, and the mapping below would delete the wrong rows.
+      if (base.state != filter_state::UNFILTERED ||
+          (base.table.num_rows() && base.execution &&
+           base.execution->positions == row_position_state::lost)) {
+        throw sirius::internal_exception(
+          "[iceberg_gpu_ingestible] '" + _table_path +
+          "': decode returned a filtered table, so row positions no longer identify file rows; "
+          "reader-side pushdown must be suppressed for iceberg splits carrying deletes");
+      }
 
-  auto const expected_rows = std::accumulate(
-    layout.begin(), layout.end(), int64_t{0}, [](int64_t acc, batch_row_run const& run) {
-      return acc + run.num_rows;
+      auto layout = build_batch_layout(split);
+      // Runs carry the scan's path; the delete map is keyed on the manifest's.
+      for (auto& run : layout) {
+        run.data_file_path = delete_key_for(run.data_file_path);
+      }
+
+      auto const expected_rows = std::accumulate(
+        layout.begin(), layout.end(), int64_t{0}, [](int64_t acc, batch_row_run const& run) {
+          return acc + run.num_rows;
+        });
+      if (expected_rows != static_cast<int64_t>(base.table.num_rows())) {
+        throw sirius::internal_exception(
+          "[iceberg_gpu_ingestible] '" + _table_path + "': decoded " +
+          std::to_string(base.table.num_rows()) + " rows but the split's row groups describe " +
+          std::to_string(expected_rows) + "; iceberg delete positions cannot be mapped");
+      }
+
+      // release() on an empty handle would hand back a null table.
+      if (expected_rows == 0) { return; }
+
+      rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+      auto table = base.table.release(stream, mr_ref);
+      if (!table) {
+        throw sirius::internal_exception("[iceberg_gpu_ingestible] '" + _table_path +
+                                         "': decoded table has " + std::to_string(expected_rows) +
+                                         " rows but no owned state to filter");
+      }
+
+      positional_delete_filter filter(pending_sets);
+      auto filtered = filter.apply(std::move(table), layout, stream, mr_ref);
+      // State is unchanged: deletes are not the query predicate, which post_filter_and_project must
+      // still apply — after the deletes, as Iceberg requires.
+      base.table = owning_table_view{std::move(filtered)};
+      if (base.execution) base.execution->positions = row_position_state::lost;
+      return;
     });
-  if (expected_rows != static_cast<int64_t>(base.table.num_rows())) {
-    throw sirius::internal_exception(
-      "[iceberg_gpu_ingestible] '" + _table_path + "': decoded " +
-      std::to_string(base.table.num_rows()) + " rows but the split's row groups describe " +
-      std::to_string(expected_rows) + "; iceberg delete positions cannot be mapped");
-  }
-
-  // release() on an empty handle would hand back a null table.
-  if (expected_rows == 0) { return base; }
-
-  rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
-  auto table = base.table.release(stream, mr_ref);
-  if (!table) {
-    throw sirius::internal_exception("[iceberg_gpu_ingestible] '" + _table_path +
-                                     "': decoded table has " + std::to_string(expected_rows) +
-                                     " rows but no owned state to filter");
-  }
-
-  positional_delete_filter filter(std::move(sets));
-  auto filtered = filter.apply(std::move(table), layout, stream, mr_ref);
-  // State is unchanged: deletes are not the query predicate, which post_filter_and_project must
-  // still apply — after the deletes, as Iceberg requires.
-  return filtered_table{owning_table_view{std::move(filtered)}, filter_state::UNFILTERED};
+  return base;
 }
 
 }  // namespace sirius::op::scan

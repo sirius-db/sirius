@@ -18,8 +18,9 @@
  * @file test_plan_aggregate_filter.cpp
  * @brief Plan-time handling of the aggregate FILTER clause: supported filtered aggregates
  *        convert with their inputs mask-wrapped as CASE projections below the aggregate (and
- *        `count(*) FILTER` lowered to `count(mask)`), while DISTINCT and `first` with FILTER
- *        throw duckdb::NotImplementedException so the query falls back to CPU.
+ *        `count(*) FILTER` lowered to `count(mask)`), while DISTINCT aggregates other than
+ *        COUNT(DISTINCT), nested inputs, and `first` with FILTER throw
+ *        duckdb::NotImplementedException so the query falls back to CPU.
  */
 
 #include "expression/aggregate_id.hpp"
@@ -281,13 +282,69 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
 }
 
 TEST_CASE_METHOD(plan_aggregate_filter_fixture,
-                 "aggregate filter - DISTINCT with FILTER is rejected for CPU fallback",
+                 "aggregate filter - grouped COUNT(DISTINCT) FILTER collects a masked CASE input",
                  "[aggregate_filter][isolated_context]")
 {
-  REQUIRE_THROWS_AS(
-    generate_sirius_plan(
-      *con, "SELECT val % 2 AS g, count(DISTINCT id) FILTER (WHERE id < 5) FROM events GROUP BY g"),
-    duckdb::NotImplementedException);
+  auto plan = generate_sirius_plan(*con,
+                                   "SELECT val % 2 AS g, count(DISTINCT id) FILTER (WHERE id < 5), "
+                                   "sum(id) FILTER (WHERE id < 5) FROM events GROUP BY g");
+
+  auto* group_by = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  REQUIRE(group_by != nullptr);
+
+  // COLLECT_SET skips the NULLs the mask writes, so the distinct count and the sum read one
+  // shared masked column.
+  auto& aggregate = group_by->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  std::vector<cudf::aggregation::Kind> const expected{cudf::aggregation::Kind::COLLECT_SET,
+                                                      cudf::aggregation::Kind::SUM};
+  CHECK(aggregate.cudf_aggregates == expected);
+  CHECK(aggregate.cudf_aggregate_idx == std::vector<int>{1, 1});
+
+  auto* projection = find_first(group_by, SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(projection != nullptr);
+  CHECK(count_case_entries(projection->Cast<sirius::op::sirius_physical_projection>()) == 1);
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - ungrouped COUNT(DISTINCT) FILTER keeps DISTINCT over the mask",
+                 "[aggregate_filter][isolated_context]")
+{
+  auto plan =
+    generate_sirius_plan(*con, "SELECT count(DISTINCT val) FILTER (WHERE id < 50) FROM events");
+
+  auto* ungrouped = find_first(plan.get(), SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+  REQUIRE(ungrouped != nullptr);
+
+  auto& aggregate = ungrouped->Cast<sirius::op::sirius_physical_ungrouped_aggregate>();
+  REQUIRE(aggregate.aggregates.size() == 1);
+  REQUIRE(aggregate.aggregates[0]->holds<sirius::ast::aggregate>());
+  auto const& agg = aggregate.aggregates[0]->get<sirius::ast::aggregate>();
+  CHECK(agg.function() == sirius::aggregate_id::count);
+  CHECK(agg.distinct());
+  REQUIRE(agg.arguments().size() == 1);
+  CHECK(agg.arguments()[0]->holds<sirius::ast::reference>());
+
+  auto* projection = find_first(ungrouped, SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(projection != nullptr);
+  CHECK(count_case_entries(projection->Cast<sirius::op::sirius_physical_projection>()) == 1);
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - other DISTINCT aggregates and nested inputs are rejected",
+                 "[aggregate_filter][isolated_context]")
+{
+  // The GPU evaluator cannot build the NULL STRUCT the mask of the multi-column count needs.
+  for (auto const* aggregate : {"sum(DISTINCT id)", "count(DISTINCT (id, val))"}) {
+    for (bool grouped : {false, true}) {
+      CAPTURE(aggregate, grouped);
+      auto const query = std::string("SELECT ") + (grouped ? "val % 2 AS g, " : "") + aggregate +
+                         " FILTER (WHERE id < 5) FROM events" + (grouped ? " GROUP BY g" : "");
+      REQUIRE_THROWS_MATCHES(generate_sirius_plan(*con, query),
+                             duckdb::NotImplementedException,
+                             Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring(
+                               "Aggregate FILTER not supported")));
+    }
+  }
 }
 
 TEST_CASE_METHOD(plan_aggregate_filter_fixture,

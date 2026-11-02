@@ -14,11 +14,6 @@
 
 expectations:
   - outcome: plan_rejected
-    reason: Aggregate FILTER not supported on GPU
-    issue: 2285
-    queries: [Q16_V07]
-
-  - outcome: plan_rejected
     reason: "Unsupported whole-partition window: FILTER"
     issue: 1745
     queries: [Q02_V07]
@@ -27,11 +22,6 @@ expectations:
     reason: "Unsupported whole-partition window: only SUM, AVG, COUNT, MIN and MAX aggregates are planned"
     issue: 1745
     queries: [Q02_V09, Q03_V09, Q15_V09, Q18_V09]
-
-  - outcome: plan_rejected
-    reason: "Unsupported whole-partition window: expressions over integer SUM results require an exact HUGEINT consumer"
-    issue: 1745
-    queries: [Q12_V09]
 
   - outcome: plan_rejected
     reason: "Unsupported expression in aggregate .*: list\\("
