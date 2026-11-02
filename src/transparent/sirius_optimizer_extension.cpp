@@ -21,6 +21,7 @@
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -86,8 +87,12 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
+  conn_state->end_frontend_interval();
+  auto eligibility = conn_state->activity("eligibility");
   // Decide before optimization can remove scans, including when GPU execution is off.
   (void)should_use_duckdb(context, plan.get(), &input.optimizer.binder.GetStatementProperties());
+  eligibility.finish();
+  conn_state->frontend_interval("between_optimizer_hooks");
   // DuckDB v2 derives the single-table restrictions implied by an OR-ed join condition itself
   // (JoinDependentFilterRule now also runs on INNER and SEMI join conditions, which is where the
   // TPC-H q19 and q7 disjunctions end up). This hook used to derive them too, for DuckDB 1.5, which
@@ -108,16 +113,30 @@ bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::Log
   return matched;
 }
 
-duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
-                                                              duckdb::ClientContext& context)
+duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(
+  duckdb::LogicalOperator const& plan,
+  duckdb::ClientContext& context,
+  std::optional<telemetry::query_activity::id_type> parent)
 {
-  auto copy = plan.Copy(context);
+  auto state = duckdb::get_sirius_connection_state(context);
+  auto copy_activity =
+    state ? state->activity("logical_copy", "work", parent) : telemetry::query_activity{};
+  auto observe = [&](const char* phase) {
+    return state ? state->activity(phase, "work", copy_activity.id()) : telemetry::query_activity{};
+  };
+  auto deserialize = observe("serialize_deserialize");
+  auto copy        = plan.Copy(context);
+  deserialize.finish();
+  auto bindings = observe("preserve_parquet_bindings");
   preserve_parquet_bindings(plan, *copy, context);
+  bindings.finish();
+  auto cardinality = observe("restore_cardinality");
   if (!copy_cardinality_estimates(plan, *copy)) {
     SIRIUS_LOG_DEBUG(
       "Transparent execution: plan copy differs in shape from the original, some cardinality "
       "estimates were not copied");
   }
+  cardinality.finish();
   return copy;
 }
 
@@ -130,6 +149,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
+  conn_state->end_frontend_interval();
+  // Runs on every return, including declines and caught copy failures.
+  auto remaining =
+    absl::Cleanup([&] { conn_state->frontend_interval("remaining_duckdb_preparation"); });
+  auto capture = conn_state->activity("optimizer_capture");
   // Preserve the pre-hook's decline; optimized plans may no longer contain the scans.
   if (should_use_duckdb(context, nullptr, nullptr) != decline_reason::none) { return; }
   if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
@@ -151,9 +175,12 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
       if (plan->children.size() != 1) { return; }
       captured = plan->children[0].get();
     }
+    auto read_views = conn_state->activity("logical_read_view_capture", "work", capture.id());
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    read_views.finish();
+    conn_state->set_captured_plan(copy_logical_plan(*captured, context, capture.id()));
+
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
     // indistinguishable from "GPU ran and was slow": the query still returns correct

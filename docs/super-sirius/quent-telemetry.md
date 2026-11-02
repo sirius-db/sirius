@@ -63,6 +63,189 @@ CALL gpu_execution(
 `gpu_execution(...)` call, an inline `query_label` parameter takes precedence over a pending label set
 with `sirius_set_query_label`. Unlabeled queries are reported as `unnamed_query`.
 
+The UI query list shows explicitly named queries and queries that reached the
+`Executing` state. Unnamed observations that never executed (for example, setup
+SET and CREATE VIEW statements) are omitted from that list. Their events remain
+in the capture and their query bundles remain available by UUID. Named
+planning-only, failed, and cancelled queries remain visible. Selection uses the
+final metadata snapshot, so a label attached after preparation preserves the
+whole preparation interval. Existing traces with a nonempty initial name other
+than `unnamed_query` remain visible; an explicit late label literally equal to
+`unnamed_query` also counts as named.
+
+The TPC-DS runner labels each execution as `tpcds_q<N>_run1` and
+`tpcds_q<N>_run2`, with label-setting calls excluded from its SQL timer output.
+
+### Query lifecycle metadata
+
+The query UUID identifies one observation. `Init`, `Planning`, `Executing`, and
+`Finished` remain its lifecycle transitions. Completion is read from `Finished`
+explicitly, including `Init -> Finished` and `Planning -> Finished`; completion
+alone does not imply success. The FSM analyzer omits truncated or
+invalid lifecycles with a warning, rather than synthesizing a terminal event.
+
+`QueryDetails.update` carries a query reference, a positive revision, and a complete
+`QueryMetadata` snapshot. One observer owns this metadata stream; its revision and
+handle survive moves. The analyzer selects the highest revision, independently of
+file/arrival ordering and lifecycle timestamps. Metadata may arrive after `Finished`
+without extending the query duration. Duplicate/older revisions are ignored. Mixing
+metadata streams for one query is rejected.
+
+The optional fields are `instance_name`, `connection_id`, `query_ordinal`,
+`planning_generation`, `execution_query_id`, `worker_id`, `disposition`, and `outcome`.
+Snapshots replace previous metadata rather than patching it, so producers must
+include all currently known fields. An absent execution ID remains unknown; no
+runtime window is invented for a query that never executes. An absent late name
+retains the name from `Init`. Correlation and outcome appear in the query's custom
+attributes, preserving numeric IDs as unsigned integers.
+
+Disposition describes the path (`cpu_only`, `gpu`, `gpu_to_cpu`); outcome describes
+the outer invocation (`success`, `failed`, `cancelled`, `abandoned`). These are
+independent, extensible string vocabularies. In particular, a failed GPU attempt
+followed by successful CPU replay has disposition `gpu_to_cpu`; a separate
+terminal outcome describes the outer result when known. Existing traces lacking metadata retain their initial name/group and
+have unknown correlation, disposition, and outcome.
+
+The Quent viewer requires a root plan. For a query with no stored plan,
+Sirius adds a deterministic, empty **presentation-only** plan to `QueryBundle`,
+labelled `No execution plan - query lifecycle only`. Its query has the custom
+attribute `plan_representation=query_lifecycle_placeholder`. This placeholder is
+absent from the trace and analyzed model; it has no worker, edges, operators, tasks,
+or execution window. Nonempty execution plans still pass normal plan-tree
+validation. The single-plan picker displays the plan UUID with a generic
+`Query:` prefix.
+
+Observation starts at the outer DuckDB `QueryBegin`, once the shared telemetry
+context is initialized. `SiriusConnectionState` owns begin and end, including SQL
+correlation logging. DuckDB dispatches registered states from an unordered map;
+Sirius therefore restores the final CPU replay error and completes telemetry in
+the **same** callback, without depending on another state's callback order.
+
+Each invocation enters coarse `Planning` immediately; `Executing` still starts
+in the engine. The engine borrows the observer and never completes it. GPU plan
+and task references use the outer UUID, and an admitted GPU window attaches its
+numeric execution ID and worker. `gpu` denotes an admitted GPU attempt, including
+failures before engine construction. A CPU query has no invented window or worker.
+CPU replay changes disposition to `gpu_to_cpu` and remains inside the observation.
+
+Errors at query end produce `failed` or `cancelled` (DuckDB INTERRUPT). **With the
+DuckDB QueryEnd callback, no error means unknown outcome:** it passes the same null
+error for successful completion and abandonment, after clearing the active query.
+Sirius leaves outcome absent for both, including successful CPU replay, rather
+than claiming success for abandoned results. Replacement, connection-state
+teardown, and observers destroyed without explicit completion report `abandoned`.
+
+SQL PREPARE, C++ `Connection::Prepare`, and every subsequent EXECUTE have distinct
+outer invocations. Prepared plans retain no live observer. Each outer bind/rebind
+attempt publishes the connection's monotonic planning generation. Internal-query
+guards suppress lifecycle callbacks and generation changes; intentional internal
+replanning does not replace the outer identity. Parsing or preprocessing failures
+before DuckDB calls `QueryBegin`, extension initialization, and standalone
+`ExtractPlan` calls without an outer invocation are outside this coverage.
+
+DuckDB serializes connection callbacks and source-state initialization under its
+ClientContext lock. Execution can run on a worker thread: invocation consumers
+retain the observer explicitly, and its mutations (FSM and complete metadata
+snapshots together) are mutex protected. End runs after DuckDB drains tasks.
+Moves require exclusive access; runtime workers only receive UUIDs. Completion
+is idempotent and telemetry transitions/cleanup cannot replace native errors.
+Admission and retirement barriers retain their existing owners and ordering.
+
+Explicit `gpu_execution(...)` SQL uses its CALL invocation, including replay.
+Non-SQL streaming/FFI fragments own an independent observer once `run()` passes
+its state and closed-input checks, before admission, through execution-window
+cleanup. Success/error is known at that boundary. Fragment build, input staging,
+and rejected calls to `run()` are outside that interval. The observer outlives
+the retained engine; an engine's later destruction cannot extend completion.
+Disabled telemetry retains a valid no-op context and emits no records.
+
+Labels are consumed at the following boundaries:
+
+- Transparent SQL consumes a pending label in the GPU wrapper's
+  `GetGlobalSourceState`; explicit `gpu_execution` consumes it during binding.
+- An explicit inline label takes precedence, while still consuming the pending
+  label at the explicit-bind boundary.
+- Ordinary CPU statements, SET, and label-setting statements do not consume a
+  pending label. The session label is sticky.
+- The initial query group uses the session-label snapshot at the outer
+  `QueryBegin` and remains frozen for that invocation. Session-label changes
+  within a statement affect subsequent invocations. Observation itself never
+  consumes a pending query label. A late label updates the existing UUID at
+  the consumption boundary; reusable explicit bind data also supplies that label
+  to subsequent executions without retaining a live observer.
+
+Use matching Sirius producer/analyzer revisions and the Quent revision pinned by
+their `model.qmi`. Analyzers must support every entity type emitted by the producer,
+including `QueryDetails`, to import a capture.
+
+### Analyzer boundaries and viewer compatibility
+
+Each FSM adapter implements `ScopedFsm`: query visibility, reference-tree inclusion,
+operator association/filtering, and UI conversion. `QueryScope` contains only the
+query ID and its operator IDs. The family inventory generates `ScopedFsms` with
+typed borrowed maps, accessors, lookup, and iteration, constructed once per query
+view. A borrowed traversal list preserves the model's response ordering across
+map reconstruction. Consumer-only batches remain resolvable but excluded from
+the scoped reference tree; activities retain their scoped tree exclusion.
+Preparation presentation consumes scoped activities; it does not define ownership.
+Task metrics and batch data flow use the generated typed accessors.
+
+The analyzer keeps typed event storage and lifecycle validation. Borrowed FSM
+views in `rust/crates/telemetry/analyzer/src/fsms.rs` centralize query ownership,
+operator association, usage iteration and detail conversion. Common timeline
+endpoints consume these views; task byte-rate and data-flow calculations remain
+explicit typed operations. Unscoped entity requests still default to tasks.
+Activities have query ownership and no operator association, so a nonempty
+operator filter excludes them.
+
+`families.rs` registers the finalized families' resource, reference-tree and FSM
+capabilities. Registration supplies lookup, iteration, declarations and the
+pinned listing API's typed dispatch. It does not ingest or finalize entities:
+metadata revisions, incomplete traces, parent/query checks and source-reference
+validation remain explicit. Scoped views and listing share the same FSM
+ownership policy.
+
+`rust/crates/telemetry/codegen.rs` reads the parsed `model.yaml` schema to generate
+transition validation, usages and ordinary attributes for stored FSM events.
+Optional values stay absent. The analyzer shares mechanical native-FSM
+forwarding and transition conversion. Task and activity diagrams are generated;
+the existing data-batch diagram remains a compatibility declaration. Activity
+state aliases (`working`/`waiting`), legacy attribute order, instance names,
+parents and derived task attributes remain explicit application policies.
+
+`presentation.rs` contains the pinned viewer adapters. Preparation lane
+membership is selected by query identity, independently of resource claims;
+nested and overlapping activities remain separate members with their recorded
+parent IDs and timestamps. The old viewer requests intervals through resource
+rows, so the adapter still projects activity usages onto one synthetic
+`query_activity_track`. These projected claims are display intervals, not
+measurements of exclusive resource utilization. Original producer track
+references are retained and validated before projection. The same module adapts
+a planless query to the viewer's required root plan; the analyzed model remains
+planless.
+
+The following consumer changes remain upstream work, not implemented here:
+
+- Add a presentation-lane descriptor and a request for its members, separate
+  from the resource-utilization API. The Preparation descriptor uses query
+  identity; members retain nesting and recorded times. Once supported by the
+  pinned viewer, replace untyped resource-row inference with lane requests.
+- Allow a query bundle to represent an absent plan and show lifecycle details
+  and timelines with an empty plan panel. Preserve normal validation and
+  rendering for queries with real plans.
+- Migrate producers away from per-activity tracks only after supported
+  consumers use the lane API. Keep a versioned old-trace adapter and original
+  source-reference validation for traces that contain those tracks. Remove
+  the synthetic lane and plan projections only when these consumer contracts
+  are established.
+
+The response-matrix regression test covers listing filters, paging, query
+isolation, resource and resource-group timelines, and planless bundles. Set
+`SIRIUS_RESPONSE_CAPTURE` to a file path when running that test to capture JSON
+for comparisons across refactoring stages. Captures normalize only the unordered
+resource `used_by` sets. This is response-equivalence
+coverage; it makes no allocation or trace-processing performance claim.
+
 ## 3. Generate telemetry
 
 Run any query with the exporter enabled and telemetry files appear under `output_directory`.
@@ -137,3 +320,46 @@ timeline, so you can see exactly when and where it ran across the resources.
 duration), grouped and sortable, to, for example, quickly find the most expensive operators in the query.
 
 ![Quent operator stats view](quent-screenshots/operator-stats-view.png)
+
+## Query activity timelines
+
+`QueryActivity` records describe producer-defined work and wait intervals under the
+outer query UUID. Each invocation of a phase gets a fresh activity ID; optional parent
+IDs describe nesting, while generation and execution-window fields correlate the
+interval with preparation and admission. They are separate from GPU tasks and operators.
+The viewer projects all of a query's activities onto one **Preparation** lane. Expand
+that lane to see the named steps as compact Gantt bars, like the operator timeline;
+overlapping and nested intervals stack within that chart. Repeated phases remain separate
+bars, and parent IDs, waits, and outcomes remain available in the activity details.
+The analyzer validates recorded per-activity track references before mapping them
+to the shared presentation lane. This projection adds no GPU operators or tasks.
+
+Each interval's `working` or `waiting` state runs from the recorded Started timestamp to
+Finished. Click an interval to inspect its phase, kind, correlations, and recorded
+outcome. Parent durations are inclusive: do not add them to child durations. No timing
+is inferred from phase names or callback order. Planning-only queries have the same
+Preparation lane, even when they have no execution plan.
+
+Scoped cleanup closes an interval on normal return or exception (`success` or `failed`).
+Query completion closes any remaining intervals with the available terminal outcome;
+DuckDB's ambiguous null-error completion remains unknown. A trace missing Finished is
+incomplete: the analyzer warns and omits that activity and its descendants rather than
+inventing a duration. Disabled telemetry skips activity allocation and emission.
+
+### Coverage and interpretation
+
+Transparent SQL records eligibility, observed work between DuckDB hooks, optimizer
+capture, finalize validation, execution admission and preparation, pipeline construction,
+runtime retirement/window cleanup, and CPU replay. Copies and intentional outer replans
+have explicit parents even while internal SQL callbacks are suppressed. Explicit
+`gpu_execution` calls also record their bind and execution-time parse/bind/optimize work.
+Streaming fragment observations start at `run()` and include execution admission;
+fragment building and input staging remain outside that invocation's coverage.
+
+`execution_preparation` ends with decision `validated_plan_reused` or `plan_rebuilt`.
+A reuse decision does not create a synthetic translation interval. Callback intervals
+are observed elapsed time, potentially including other extensions and caller latency;
+activity trees do not claim an exclusive partition of DuckDB's internal phases.
+`wrapper_installed_to_execution` is latency, not a CPU-planning measurement. The coarse
+query-list Planning field displays a phase-start offset in the viewer; inspect
+activity interval lengths on the timeline for measured costs.

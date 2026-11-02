@@ -4,7 +4,9 @@
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, RefTreeEntity,
     ref_tree::RefTreeCollection,
-    resource::{Resource, ResourceTypeDecl, collection::ResourceCollection},
+    resource::{
+        Resource, ResourceTypeDecl, collection::ResourceCollection, tree::ResourceTreeNode,
+    },
 };
 use quent_query_engine_analyzer::{QueryEngineModel, plan_tree::PlanTree};
 use quent_query_engine_ui::EntityRef;
@@ -13,10 +15,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use uuid::Uuid;
 
 use crate::{
-    boilerplate::{
-        DataBatch, DataBatchExt, Engine, Operator, Plan, Port, Query, QueryGroup, Task, TaskExt,
-        Worker,
-    },
+    boilerplate::{Engine, Operator, Plan, Port, Query, QueryGroup, Worker},
+    fsms::{QueryScope, ScopedFsms},
     model::SiriusModel,
 };
 
@@ -39,8 +39,7 @@ pub(crate) struct SiriusModelQueryView<'a> {
     resources: HashMap<Uuid, &'a dyn Resource>,
     resource_groups: HashMap<Uuid, &'a dyn RefTreeEntity>,
     ref_tree_entities: HashMap<Uuid, &'a dyn RefTreeEntity>,
-    tasks: HashMap<Uuid, &'a Task>,
-    data_batches: HashMap<Uuid, &'a DataBatch>,
+    fsms: ScopedFsms<'a>,
 }
 
 impl<'a> SiriusModelQueryView<'a> {
@@ -89,41 +88,23 @@ impl<'a> SiriusModelQueryView<'a> {
             }
         }
 
-        let pipeline_ids = operators.keys().copied().collect::<HashSet<_>>();
-        let tasks = model
-            .tasks
-            .values()
-            .filter(|task| {
-                task.pipeline_uuid()
-                    .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
-            })
-            .map(|task| (task.id(), task))
-            .collect::<HashMap<_, _>>();
-        let data_batches = model
-            .data_batches
-            .values()
-            .filter(|data_batch| data_batch.belongs_to(&pipeline_ids))
-            .map(|data_batch| (data_batch.id(), data_batch))
-            .collect::<HashMap<_, _>>();
+        let operator_ids = operators.keys().copied().collect::<HashSet<_>>();
+        let scope = QueryScope {
+            query_id,
+            operators: &operator_ids,
+        };
+        let fsms = ScopedFsms::new(model, &scope);
+        // The pinned viewer needs the query group for preparation resource rows.
+        if !resources.is_empty() && fsms.activities().next().is_some() {
+            resource_groups.insert(query_group.id(), query_group as &dyn RefTreeEntity);
+        }
+
         let scoped_entity_ids = query_engine_entity_ids
             .iter()
             .copied()
             .chain(resource_groups.keys().copied())
             .chain(resources.keys().copied())
-            .chain(tasks.keys().copied())
-            // Only batches *produced* by this query: a batch's parent in the reference tree is
-            // its producer operator, so a consumer-only batch would dangle outside the view.
-            // Consumer-only batches stay reachable via `try_entity_ref` (`data_batches`).
-            .chain(
-                data_batches
-                    .values()
-                    .filter(|batch| {
-                        batch
-                            .producer_pipeline_uuid()
-                            .is_some_and(|id| pipeline_ids.contains(&id))
-                    })
-                    .map(|batch| batch.id()),
-            );
+            .chain(fsms.reference_tree(&scope).map(Entity::id));
         let ref_tree_entities = scoped_entity_ids
             .map(|id| model.ref_tree_entity(id).map(|entity| (id, entity)))
             .collect::<AnalyzerResult<HashMap<_, _>>>()?;
@@ -150,8 +131,7 @@ impl<'a> SiriusModelQueryView<'a> {
             resources,
             resource_groups,
             ref_tree_entities,
-            tasks,
-            data_batches,
+            fsms,
         })
     }
 
@@ -180,16 +160,7 @@ impl<'a> SiriusModelQueryView<'a> {
                 )));
             }
 
-            let group = model
-                .gpu_devices
-                .get(&parent_id)
-                .map(|group| group as &dyn RefTreeEntity)
-                .or_else(|| {
-                    model
-                        .thread_groups
-                        .get(&parent_id)
-                        .map(|group| group as &dyn RefTreeEntity)
-                });
+            let group = model.registered_group(parent_id);
             let Some(group) = group else {
                 return Ok(false);
             };
@@ -201,12 +172,16 @@ impl<'a> SiriusModelQueryView<'a> {
         }
     }
 
-    pub(crate) fn tasks(&self) -> impl Iterator<Item = &'a Task> + '_ {
-        self.tasks.values().copied()
+    pub(crate) fn resource_tree(&self) -> AnalyzerResult<ResourceTreeNode> {
+        ResourceTreeNode::try_new(self)
     }
 
-    pub(crate) fn data_batches(&self) -> impl Iterator<Item = &'a DataBatch> + '_ {
-        self.data_batches.values().copied()
+    pub(crate) fn fsms(&self) -> impl Iterator<Item = crate::fsms::FsmRef<'a>> + '_ {
+        self.fsms.iter()
+    }
+
+    pub(crate) fn scoped_fsms(&self) -> &ScopedFsms<'a> {
+        &self.fsms
     }
 
     pub(crate) fn sirius_resources(&self) -> impl Iterator<Item = &'a dyn Resource> + '_ {
@@ -262,6 +237,13 @@ impl QueryEngineModel for SiriusModelQueryView<'_> {
         (self.query.id() == query_id)
             .then_some(self.query)
             .ok_or(AnalyzerError::InvalidId(query_id))
+    }
+
+    fn query_plans(&self, query_id: Uuid) -> AnalyzerResult<impl Iterator<Item = &Plan>> {
+        self.query(query_id)?;
+        // try_new already selected and validated this query's plans. An empty
+        // view is valid and must not require a synthetic analyzer plan tree.
+        Ok(self.plans.values().copied())
     }
 
     fn worker(&self, worker_id: Uuid) -> AnalyzerResult<&Worker> {
@@ -340,19 +322,11 @@ impl Model for SiriusModelQueryView<'_> {
         } else if self.resource_groups.contains_key(&entity_id) {
             Ok(EntityRef::ResourceGroup(entity_id))
         } else {
-            self.tasks
-                .get(&entity_id)
-                .map(|task| EntityRef::Application {
-                    type_name: task.type_name().to_owned(),
+            self.fsms
+                .get(entity_id)
+                .map(|fsm| EntityRef::Application {
+                    type_name: fsm.type_name().into(),
                     id: entity_id,
-                })
-                .or_else(|| {
-                    self.data_batches
-                        .get(&entity_id)
-                        .map(|data_batch| EntityRef::Application {
-                            type_name: data_batch.type_name().to_owned(),
-                            id: entity_id,
-                        })
                 })
                 .ok_or(AnalyzerError::InvalidId(entity_id))
         }

@@ -1,3 +1,6 @@
+#[path = "../codegen.rs"]
+mod codegen;
+
 use std::path::Path;
 
 use quent_store_build::{Options, generate};
@@ -22,6 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Options::default()
         },
     )?;
+
+    let (stored, _) = codegen::generate(&parsed.schema, &[])?;
+    codegen::write("analyzed_events.rs", stored)?;
 
     Ok(())
 }
