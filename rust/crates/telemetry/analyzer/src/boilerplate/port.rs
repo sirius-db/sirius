@@ -80,10 +80,7 @@ impl PortEntity for Port {
             instance_name: data.instance_name.clone(),
             statistics: data.statistics.as_ref().map(|statistics| {
                 query_engine_ui::PortStatistics {
-                    custom_statistics: statistics
-                        .iter()
-                        .map(|attribute| (attribute.key.clone(), attribute.value.clone()))
-                        .collect(),
+                    custom_statistics: statistics.0.clone(),
                 }
             }),
         }

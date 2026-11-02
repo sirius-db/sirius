@@ -7,14 +7,14 @@ edition.workspace = true
 collector = ["quent-instrumentation/io-collector"]
 
 [dependencies]
-quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b", features = [
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb", features = [
     "io-ndjson",
 ] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-quent-instrumentation-build = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }
-quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }
+quent-instrumentation-build = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
 # Captures this crate's git provenance into QUENT_SOURCE_* so the generated ModelSource
 # records Sirius (not quent) as the model's source in the model.qmi sidecar.
-quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
