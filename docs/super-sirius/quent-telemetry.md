@@ -184,8 +184,9 @@ Each FSM adapter implements `ScopedFsm`: query visibility, reference-tree inclus
 operator association/filtering, and UI conversion. `QueryScope` contains only the
 query ID and its operator IDs. The family inventory generates `ScopedFsms` with
 typed borrowed maps, accessors, lookup, and iteration, constructed once per query
-view. A borrowed traversal list preserves the model's response ordering across
-map reconstruction. Consumer-only batches remain resolvable but excluded from
+view. Timeline intervals are ordered by start timestamp, with UUID as a tie-breaker
+for reproducibility within a trace, independently of map/set traversal order.
+Consumer-only batches remain resolvable but excluded from
 the scoped reference tree; activities retain their scoped tree exclusion.
 Preparation presentation consumes scoped activities; it does not define ownership.
 Task metrics and batch data flow use the generated typed accessors.
@@ -208,9 +209,9 @@ ownership policy.
 `rust/crates/telemetry/codegen.rs` reads the parsed `model.yaml` schema to generate
 transition validation, usages and ordinary attributes for stored FSM events.
 Optional values stay absent. The analyzer shares mechanical native-FSM
-forwarding and transition conversion. Task and activity diagrams are generated;
-the existing data-batch diagram remains a compatibility declaration. Activity
-state aliases (`working`/`waiting`), legacy attribute order, instance names,
+forwarding and transition conversion. Task, data-batch and activity diagrams are
+generated. Attribute display order follows the schema. Activity state aliases
+(`working`/`waiting`), instance names,
 parents and derived task attributes remain explicit application policies.
 
 The query observer lazily declares one query-owned `QueryActivityTrack` resource,

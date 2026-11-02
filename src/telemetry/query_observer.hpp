@@ -114,10 +114,10 @@ class query_observer {
       }
       auto active = std::move(handle)
                       .started({.query_id           = handle_->id(),
-                                .parent_activity_id = parent,
                                 .track              = {.target = activity_track_->id(), .data = {}},
                                 .phase              = phase,
                                 .kind               = kind,
+                                .parent_activity_id = parent,
                                 .planning_generation = metadata_.planning_generation,
                                 .execution_query_id  = metadata_.execution_query_id})
                       .into_dynamic();

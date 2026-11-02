@@ -195,17 +195,17 @@ fsms:
         initial: true
         attributes:
           query_id: { scope-ref: Query }
-          parent_activity_id: { option: { ref: QueryActivity } }
           track: { uses: QueryActivityTrack }
           phase: string
           kind: string
+          parent_activity_id: { option: { ref: QueryActivity } }
           planning_generation: { option: u64 }
           execution_query_id: { option: u64 }
         to: [ finished ]
       finished:
         attributes:
-          outcome: { option: string }
           decision: { option: string }
+          outcome: { option: string }
 
   Query:
     doc: A query progressing through planning and execution.

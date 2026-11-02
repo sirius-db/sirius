@@ -78,22 +78,18 @@ macro_rules! fsm_families {
             $(if let Some(f) = model.$field.get(&id) { return Some(FsmRef::$variant(f)); })*
             None
         }
-        // Retain source traversal order: rebuilding a map can reorder equal-ranked
-        // intervals in viewer responses. Lookup still uses only the selected maps.
-        pub(crate) struct ScopedFsms<'a> { $($field: HashMap<Uuid, &'a $ty>,)* order: Vec<FsmRef<'a>> }
+        pub(crate) struct ScopedFsms<'a> { $($field: HashMap<Uuid, &'a $ty>,)* }
         impl<'a> ScopedFsms<'a> {
             pub(crate) fn new(model: &'a SiriusModel, scope: &QueryScope<'_>) -> Self {
-                let mut selected = Self { $($field: model.$field.iter()
+                Self { $($field: model.$field.iter()
                     .filter(|(_, f)| ScopedFsm::visible_in(*f, scope))
-                    .map(|(id, f)| (*id, f)).collect(),)* order: Vec::new() };
-                selected.order = std::iter::empty() $(.chain(model.$field.values().filter(|f| selected.$field.contains_key(&f.id())).map(FsmRef::$variant)))*.collect();
-                selected
+                    .map(|(id, f)| (*id, f)).collect(),)* }
             }
             $(pub(crate) fn $field(&self) -> impl Iterator<Item = &'a $ty> + '_ {
                 self.$field.values().copied()
             })*
             pub(crate) fn iter(&self) -> impl Iterator<Item = FsmRef<'a>> + '_ {
-                self.order.iter().copied()
+                std::iter::empty() $(.chain(self.$field.values().copied().map(FsmRef::$variant)))*
             }
             pub(crate) fn get(&self, id: Uuid) -> Option<FsmRef<'a>> {
                 $(if let Some(f) = self.$field.get(&id) { return Some(FsmRef::$variant(f)); })*

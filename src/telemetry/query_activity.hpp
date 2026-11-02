@@ -77,9 +77,8 @@ class query_activity {
       if (finished) return;
       finished = true;
       try {
-        handle.finished(
-          {.outcome  = outcome ? std::optional<std::string>(outcome) : std::nullopt,
-           .decision = decision ? std::optional<std::string>(decision) : std::nullopt});
+        handle.finished({.decision = decision ? std::optional<std::string>(decision) : std::nullopt,
+                         .outcome  = outcome ? std::optional<std::string>(outcome) : std::nullopt});
       } catch (...) {
         sirius::log::log_noexcept([] { SIRIUS_LOG_ERROR("query activity emission failed"); });
       }
