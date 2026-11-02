@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "exec/invocable.hpp"
 #include "scan_manager/preparation.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -39,13 +40,19 @@ enum class admission_reason : uint8_t {
   capacity
 };
 struct unit_envelope {
-  uint64_t blob, footer_parser, roaring, positions;
+  // Independently allocated blocks are rounded separately by the backing allocator.
+  std::vector<uint64_t> temporary;
+  uint64_t retained = 0;
+  // Sum independently rounded blocks, matching admission and runtime accounting.
+  uint64_t temporary_charge(uint64_t allocation_granularity) const;
 };
 struct scan_envelope {
   std::vector<unit_envelope> units;
-  uint64_t retained_descriptors = 0;
-  uint64_t resolver_index       = 0;
-  bool qualified                = false;
+  std::vector<uint64_t> retained;
+  bool qualified = false;
+  // Output may retain temporary credit while waiting for another scan to run.
+  // Such scans contribute a minimum that admission must not reduce.
+  uint32_t minimum_permits = 0;
 };
 struct admission_decision {
   bool deferred           = false;
@@ -169,11 +176,11 @@ class charging_allocator {
 };
 class preparation_ledger {
  public:
-  explicit preparation_ledger(reservation_provider& provider) : provider_(provider) {}
+  explicit preparation_ledger(reservation_provider& provider) : provider_(&provider) {}
   ~preparation_ledger() { close(); }
   preparation_ledger(preparation_ledger const&)            = delete;
   preparation_ledger& operator=(preparation_ledger const&) = delete;
-  // Request bounded parallel work; failed large requests back off to one permit.
+  // Request bounded parallel work; smaller grants must preserve scan progress minima.
   admission_decision admit(std::span<scan_envelope const>,
                            memory_space_id,
                            uint32_t max_permits = 1);
@@ -183,15 +190,25 @@ class preparation_ledger {
   size_t tracked_units() const;
   w_permit acquire_permit(
     unit_key);  // Nonblocking; empty means coordinator must wait for an event.
+  // Atomically register and acquire. Pending leaves neither registration nor budget changes.
+  // temporary_limit is already rounded to the admission allocation granularity.
+  // Omission preserves the query-wide W limit for existing callers.
+  w_permit try_acquire_unit(unit_key,
+                            uint64_t retained_limit,
+                            std::optional<uint64_t> temporary_limit = std::nullopt);
+  // One query coordinator per ledger; callback runs after the ledger lock is released.
+  void bind_wakeup(preparation_wakeup);
   charging_allocator allocator(w_permit const&);
   uint64_t charged_bytes(unit_key) const;
+  // Live temporary plus retained allocations held by this admitted input.
+  uint64_t charged_bytes(w_permit const&) const;
   uint64_t granted_capacity() const;
   uint32_t permits_in_flight() const;
   uint64_t bound_exceeded() const;
   uint64_t allocation_failures() const;
   void close() noexcept;  // Stops admission; existing backing remains alive through its last user.
  private:
-  reservation_provider& provider_;  // Used only by the one lowering-time admit call.
+  reservation_provider* provider_;  // Cleared by admit; runtime owns only reservation backing.
   bool admitted_ = false;
   std::shared_ptr<ledger_state> state_;
 };
@@ -208,6 +225,20 @@ class preparation_admission {
   bool consumed_ = false;
   std::unique_ptr<preparation_ledger> ledger_;
 };
+// Planning-only provider request. No callback or provider reference survives admission.
+struct preparation_request {
+  scan_envelope envelope;
+  std::function<void(preparation_ledger&)> prepare;
+  std::function<void(std::shared_ptr<preparation_admission>)> bind;
+  // Must tolerate requests whose prepare or bind has not run or has only partly completed.
+  exec::invocable<void() noexcept> rollback;
+};
+// Collect all requests before reserving. Prepare arenas before binding the sealed admission;
+// any preparation/binding exception rolls back every participating provider.
+admission_decision prepare_statement_resources(reservation_provider&,
+                                               std::span<preparation_request>,
+                                               memory_space_id,
+                                               uint32_t max_permits = 1);
 struct scan_dv_count {
   op::scan::scan_contract_id contract;
   uint64_t live_positions;

@@ -114,6 +114,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(
     sirius_cuda_fault_test
     test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
+    test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
+    test/cpp/memory/test_device_transfer_fault.cpp
     test/cpp/scan_manager/test_memory_prefetcher_health.cpp
     test/cpp/utils/cuda_status_fault.cpp
     src/sirius_extension_entry.cpp
@@ -135,6 +137,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "LINKER:--allow-multiple-definition"
     "LINKER:--wrap=cudaStreamWaitEvent"
     "LINKER:--wrap=cudaDeviceSynchronize"
+    "LINKER:--wrap=cudaMemPoolGetAccess"
+    "LINKER:--wrap=cudaMemcpyAsync"
+    "LINKER:--wrap=cudaMemcpyBatchAsync"
+    "LINKER:--wrap=cudaStreamSynchronize"
     "LINKER:--wrap=_ZN9cucascade6memory21exclusive_stream_pool14acquire_streamENS1_21stream_acquire_policyE"
   )
   set_target_properties(

@@ -32,7 +32,7 @@
 #include <cudf/utilities/traits.hpp>
 
 // cccl
-#include <cuda/dynamic_filter_probe.cuh>
+#include <cuda/dynamic_filter_fused_probe.cuh>
 #include <thrust/copy.h>
 
 // cucascade
@@ -60,29 +60,6 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-/// @brief Brute-force needle scan, the filter-specific half of detail::membership_probe_functor:
-/// a converted key is a member iff it equals any of the m needles. For the small m this filter
-/// gates on (<= k_max_keys), a compare-all linear scan beats a hash probe and reserves no sentinel
-/// value. String needles are 64-bit fingerprints compared as such (one code path, no byte
-/// compare), so the scan is exact for integers and no-false-negatives for strings.
-template <class KeyT>
-struct needle_lookup {
-  KeyT const* __restrict__ needles;
-  int m;
-  __device__ __forceinline__ bool operator()(KeyT x) const noexcept
-  {
-    bool hit = false;
-    for (int j = 0; j < m; ++j) {
-      hit |= (x == needles[j]);
-    }
-    return hit;
-  }
-};
-
-}  // namespace
-
 namespace sirius::op {
 
 //===----------------------------------------------------------------------===//
@@ -91,7 +68,7 @@ namespace sirius::op {
 
 /// @brief Per-device raw snapshots of the build keys at the key rep. Mirrors
 /// sirius_dynamic_in_list_filter's replica store, but a device_buffer of raw bytes needs no cuco
-/// set / typed variant: the outer class's _domain.rep / _num_keys decode the bytes in compute_mask.
+/// set / typed variant: the outer class's _domain.rep decodes the bytes.
 struct sirius_dynamic_small_in_list_filter::needle_store {
   /// @brief One device-local needle buffer. Frees on its owning device (an rmm::device_buffer
   /// frees on the current device, so teardown must restore that device first — mirrors
@@ -118,7 +95,8 @@ struct sirius_dynamic_small_in_list_filter::needle_store {
     }
   };
 
-  int source_device = -1;
+  int source_device    = -1;
+  std::size_t num_keys = 0;  ///< Keys in every replica; also the filter's size().
   std::vector<std::unique_ptr<needle_replica>> replicas;
 
   [[nodiscard]] needle_replica const* find(int device_id) const noexcept
@@ -128,6 +106,19 @@ struct sirius_dynamic_small_in_list_filter::needle_store {
         return replica->device_id == device_id;
       });
     return it == replicas.end() ? nullptr : it->get();
+  }
+
+  /// The `Store` interface of detail::compute_membership_mask.
+  template <class Fn>
+  void with_lookup(membership_key_domain const& domain, int device_id, Fn&& fn) const
+  {
+    auto const* replica = find(device_id);
+    if (!replica) { return; }
+    detail::dispatch_key_rep(domain.rep, [&](auto tag) {
+      using key_type = decltype(tag);
+      fn(detail::needle_lookup<key_type>{static_cast<key_type const*>(replica->needles.data()),
+                                         static_cast<int>(num_keys)});
+    });
   }
 };
 
@@ -155,15 +146,14 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   // device; `build.compacted` stays alive until the needle copy is queued on `stream`.
   auto const build =
     prepare_membership_build("[sirius_dynamic_small_in_list_filter]", keys, stream, mr);
-  _domain   = build.domain;
-  _num_keys = static_cast<std::size_t>(build.keys.size());
-
+  _domain               = build.domain;
   _store                = std::make_unique<needle_store>();
   _store->source_device = build.source_device;
+  _store->num_keys      = static_cast<std::size_t>(build.keys.size());
 
   // Needles are stored at the rep so one kernel per (adapter, rep) serves every build carrier;
   // a build carrier other than the rep converts per element on the way in.
-  auto const bytes = _num_keys * membership_rep_bytes(_domain.rep);
+  auto const bytes = _store->num_keys * membership_rep_bytes(_domain.rep);
   rmm::device_buffer needles{bytes, stream, mr};
   bool const copied = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
@@ -212,22 +202,23 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask_
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  auto const* replica =
-    _store ? _store->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
-  if (!replica) { return nullptr; }
+  return detail::compute_membership_mask(_store.get(),
+                                         _domain,
+                                         probe,
+                                         prior_mask_words,
+                                         prior_keep,
+                                         device_id,
+                                         stream,
+                                         mr,
+                                         preserves_nulls());
+}
 
-  auto const m = static_cast<int>(_num_keys);
-  return detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
-    using key_type      = decltype(key_tag);
-    auto const* needles = static_cast<key_type const*>(replica->needles.data());
-    return detail::run_membership_probe<key_type>(_domain,
-                                                  probe,
-                                                  prior_mask_words,
-                                                  stream,
-                                                  mr,
-                                                  needle_lookup<key_type>{needles, m},
-                                                  prior_keep);
-  });
+bool sirius_dynamic_small_in_list_filter::prepare_fused_probe(cudf::column_view const& probe,
+                                                              int device_id,
+                                                              detail::fused_probe& out) const
+{
+  return detail::prepare_fused_membership_probe(
+    _store.get(), _domain, probe, device_id, out, preserves_nulls());
 }
 
 void sirius_dynamic_small_in_list_filter::replicate_to_devices(
@@ -258,6 +249,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
     pending;
   pending.reserve(spaces.size());
   _store->replicas.reserve(_store->replicas.size() + spaces.size());
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -289,14 +281,13 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
                                    stream,
                                    target.get_host_staging_space());
       pending.emplace_back(std::move(replica), std::move(stream_lease));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_small_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. That GPU "
-        "will skip this optional filter.",
-        _store->source_device,
-        device_id,
-        e.what());
-      continue;
+    } catch (...) {
+      if (failures.skip_if_recoverable(
+            "[sirius_dynamic_small_in_list_filter]", _store->source_device, device_id)) {
+        continue;
+      }
+      // Earlier destinations still own asynchronous copies; drain them before propagating.
+      break;
     }
     SIRIUS_LOG_DEBUG(
       "[sirius_dynamic_small_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
@@ -310,16 +301,15 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.sync();
-      _store->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_small_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. That GPU "
-        "will skip this optional filter.",
-        _store->source_device,
-        device_id,
-        e.what());
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    } catch (...) {
+      failures.record_fatal(
+        "[sirius_dynamic_small_in_list_filter]", _store->source_device, device_id);
     }
+  }
+  failures.rethrow_if_fatal();
+  for (auto& [replica, stream_lease] : pending) {
+    _store->replicas.push_back(std::move(replica));
   }
 }
 
@@ -331,6 +321,11 @@ bool sirius_dynamic_small_in_list_filter::is_available_on_device(int device_id) 
 std::size_t sirius_dynamic_small_in_list_filter::replica_count() const noexcept
 {
   return _store ? _store->replicas.size() : 0;
+}
+
+std::size_t sirius_dynamic_small_in_list_filter::size() const noexcept
+{
+  return _store ? _store->num_keys : 0;
 }
 
 }  // namespace sirius::op

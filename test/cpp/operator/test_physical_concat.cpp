@@ -1762,40 +1762,6 @@ TEST_CASE("partitioned input replacement preserves partition and device metadata
   CHECK(input->get_data_batches() == std::vector<std::shared_ptr<data_batch>>{original});
 }
 
-TEST_CASE("BUILD_PROBE rejects a missing explicit build concatenation path",
-          "[physical_partition][physical_concat]")
-{
-  bool const probe_initiates = GENERATE(false, true);
-  // MARK requires BUILD_PROBE even when the foldable capability is absent.
-  auto fixture = create_test_hash_join(duckdb::JoinType::MARK, {duckdb::LogicalType::BOOLEAN});
-  auto const types =
-    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
-  sirius_physical_partition build(
-    types, 0, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, true));
-  sirius_physical_partition probe(
-    types, 0, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
-  cucascade::shared_data_repository build_repo;
-  cucascade::shared_data_repository probe_repo;
-  auto attach = [](sirius_physical_operator& op, cucascade::shared_data_repository& repo) {
-    auto port  = std::make_unique<sirius_physical_operator::port>();
-    port->type = MemoryBarrierType::FULL;
-    port->repo = &repo;
-    op.add_port("default", std::move(port));
-  };
-  attach(build, build_repo);
-  attach(probe, probe_repo);
-  auto* space = get_shared_mem_space();
-  build_repo.add_data_batch(make_int32_batch(*space, 1));
-  size_t id = 100;
-  number_operator_tree(build, id);
-  number_operator_tree(probe, id);
-  bind_partition_inputs(*fixture.hash_join, build, probe, nullptr);
-  auto& first = probe_initiates ? probe : build;
-  CHECK_THROWS_WITH(
-    first.get_next_task_input_data(),
-    Catch::Matchers::ContainsSubstring("BUILD_PROBE requires a bound build CONCAT"));
-}
-
 TEST_CASE("sirius_physical_concat counts compressed batches at their decoded size",
           "[physical_concat]")
 {

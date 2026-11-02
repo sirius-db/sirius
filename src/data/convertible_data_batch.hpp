@@ -58,10 +58,18 @@ class convertible_data_batch : public convertible_data {
  public:
   /**
    * @brief Construct from a shared_ptr to a cucascade data_batch.
-   * @param batch The data batch to wrap (shared ownership retained).
+   * @param batch        The data batch to wrap (shared ownership retained).
+   * @param source_space When non-null, convert() only moves the batch while it is still in this
+   *                     space -- the space it was picked to relieve. The batch may have moved
+   *                     since (e.g. spilled and upgraded on another GPU), and converting it with
+   *                     the caller's stream, which belongs to the original device, would then
+   *                     fail inside cuCascade ("stream belongs to CUDA device N but this
+   *                     representation's memory lives on device M"). Leave null to allow
+   *                     conversion from any space.
    */
-  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch)
-    : _batch(std::move(batch))
+  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch,
+                                  cucascade::memory::memory_space const* source_space = nullptr)
+    : _batch(std::move(batch)), _source_space(source_space)
   {
   }
 
@@ -98,8 +106,9 @@ class convertible_data_batch : public convertible_data {
     }
     auto& mut = *mut_opt;
 
-    // Check if the batch is already in the target space
+    // Check if the batch is already in the target space, or has left its source space.
     auto cur_space = mut.get_memory_space();
+    if (_source_space != nullptr && cur_space != _source_space) { return std::nullopt; }
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
       if (cur_space == space) { return std::nullopt; }
@@ -230,6 +239,8 @@ class convertible_data_batch : public convertible_data {
   }
 
   std::shared_ptr<cucascade::data_batch> _batch;
+  /// Non-owning; null converts the batch from any space.
+  cucascade::memory::memory_space const* _source_space{nullptr};
 };
 
 /**
@@ -389,7 +400,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch));
+      return std::make_unique<convertible_data_batch>(std::move(batch), space);
     }
 
     return nullptr;

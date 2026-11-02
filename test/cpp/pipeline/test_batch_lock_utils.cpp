@@ -49,6 +49,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -64,51 +65,7 @@
 
 namespace {
 
-// Enable CUDA driver-level peer access for every GPU pair, idempotently, with sticky-error
-// consumption. Adapted from test/cpp/config/test_context.cpp (anonymous namespace, not
-// reachable from this TU) — these tests build a bare memory manager and bypass the enable
-// loop in SiriusContext::initialize(). Best-effort, mirroring that init loop: pairs that
-// cannot enable peer access are left to cucascade's host-staged copy fallback, which is the
-// production transfer path on such hardware. Returns true only when EVERY ordered pair
-// enabled peer access, so callers can log which flavor a run exercised.
-bool enable_p2p_for_test(int num_gpus)
-{
-  bool all_enabled = true;
-  for (int i = 0; i < num_gpus; ++i) {
-    for (int j = 0; j < num_gpus; ++j) {
-      if (i == j) { continue; }
-      int can_access = 0;
-      if (cudaDeviceCanAccessPeer(&can_access, i, j) != cudaSuccess || !can_access) {
-        (void)cudaGetLastError();
-        all_enabled = false;
-        continue;
-      }
-      (void)cudaSetDevice(i);
-      cudaError_t enable_err = cudaDeviceEnablePeerAccess(j, 0);
-      (void)cudaGetLastError();  // consume sticky state
-      if (enable_err != cudaSuccess && enable_err != cudaErrorPeerAccessAlreadyEnabled) {
-        all_enabled = false;
-      }
-    }
-  }
-  cudaSetDevice(0);
-  (void)cudaGetLastError();
-  return all_enabled;
-}
-
-/// Skip idiom for multi-GPU tests (Catch2): WARN + return true when fewer than two GPUs
-/// are present. These tests validate lock/clone semantics, which hold on both cross-GPU
-/// transfer flavors, so P2P is enabled best-effort rather than required: with it the clone
-/// peer-DMAs, without it cucascade host-stages — exactly as production would on the same
-/// hardware. The WARN records which flavor a run exercised.
-bool skip_if_not_mgpu()
-{
-  if (!sirius::test::has_gpus(2)) { return true; }
-  if (!enable_p2p_for_test(2)) {
-    WARN("GPUs 0 and 1 are not P2P-capable — cross-GPU copies will host-stage");
-  }
-  return false;
-}
+bool skip_if_not_mgpu() { return !sirius::test::has_gpus(2); }
 
 /// Memory manager fixture over `num_gpus` GPU spaces plus NUMA host spaces.
 struct batch_lock_utils_fixture {
@@ -132,6 +89,8 @@ struct batch_lock_utils_fixture {
       auto space_configs = builder.build();
       manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
         std::move(space_configs));
+    } catch (cucascade::cuda_error const&) {
+      throw;
     } catch (const std::exception&) {
       return false;
     }

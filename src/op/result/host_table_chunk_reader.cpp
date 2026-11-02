@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include <cudf/hugeint_carrier.hpp>
+
 #include <helper/type_conversions.hpp>
 #include <helper/utils.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
@@ -576,8 +578,13 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
       // Stored data is fixed-width: read with copy_fixed_width, then cast if needed.
       // Compare logical types, not just physical width: TIMESTAMP_MS and TIMESTAMP are both
       // INT64 but differ by 1000x (Parquet TIMESTAMP_MILLIS vs DuckDB TIMESTAMP microseconds).
-      auto src_duckdb_type = cudf_type_to_duckdb(_column_readers[col_idx].cudf_col_type);
-      if (src_duckdb_type.id() == duckdb::LogicalTypeId::SQLNULL ||
+      auto const cudf_col_type = _column_readers[col_idx].cudf_col_type;
+      auto src_duckdb_type     = cudf_type_to_duckdb(cudf_col_type);
+      // HUGEINT's carrier, DECIMAL128 with scale 0, has duckdb::hugeint_t's layout, so it is copied
+      // as is; DuckDB's DECIMAL(38,0) -> HUGEINT cast would cost ~100x the copy.
+      bool const hugeint_carrier = vec.GetType().id() == duckdb::LogicalTypeId::HUGEINT &&
+                                   cudf_col_type == hugeint_carrier_type();
+      if (hugeint_carrier || src_duckdb_type.id() == duckdb::LogicalTypeId::SQLNULL ||
           src_duckdb_type == vec.GetType()) {
         _column_readers[col_idx].copy_fixed_width(vec, _row_offset, count, _allocation);
       } else {

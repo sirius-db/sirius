@@ -31,7 +31,7 @@ client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "
 
 [feature.be.dependencies]
 # Substrait 0.63 (pinned by substrait-explain 0.9) still invokes protoc during its build.
-libprotobuf = ">=7.35,<8"
+libprotobuf = "7.*"
 # The thrift compiler generates bindings for the thrift IDL under the `doris/` submodule.
 rust = "*"
 thrift-compiler = "0.22.*"
@@ -60,14 +60,14 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 [feature.engine.dependencies]
 cxx-compiler = "*"
 cuda-version = "13.4.*"
-libcudf = "==26.10.00"
+libcudf = "==26.10.02"
 libcuvs = "==26.10.00"
 librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
 duckdb = "=2.0.0"
-spdlog = "1.8.*"
+spdlog = "1.*"
 sqlite = "3.*"
 liburing = "*"
 openssl = "*"
@@ -89,8 +89,8 @@ python = "3.12.*"
 python-duckdb = "=2.0.0"
 # For scripts/build-duckdb-substrait.sh; the C++ compiler stays the system one (as in CI).
 cmake = ">=3.28"
-ninja = ">=1.13.2,<2"
-ccache = ">=4.14,<5"
+ninja = "1.*"
+ccache = "4.*"
 
 [feature.check.tasks]
 duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v2.0.0 with the pinned pre-v2 substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}

@@ -34,6 +34,7 @@
 // it in the first place.
 
 #include "late_mat/prepared_selection.hpp"
+#include "late_mat/transfer_context.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -112,7 +113,8 @@ struct pinned_column_view {
 std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           prepared_selection const& selection,
                                           ::cuda::stream_ref stream,
-                                          rmm::device_async_resource_ref mr);
+                                          rmm::device_async_resource_ref mr,
+                                          transfer_context transfers = {});
 
 /// Batches materialized from a GPU other than the consumer's, process-wide. A
 /// query that lands every port task on the pin's own GPU takes no remote path,

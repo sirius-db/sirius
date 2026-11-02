@@ -49,6 +49,7 @@
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/scan_returned_types.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -828,8 +829,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     // Predicates pushed into table_filters bypass the LogicalFilter guard —
     // reject nested columns here too (e.g. `WHERE items IS NULL`).
     for (auto const& entry : *table_filters) {
-      auto const column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
-      if (column_id < op.returned_types.size()) {
+      auto const column_id      = column_ids[entry.GetIndex()].GetPrimaryIndex();
+      auto const virtual_column = op.virtual_columns.find(column_id);
+      if (virtual_column != op.virtual_columns.end()) {
+        reject_nested_column_type(virtual_column->second.type,
+                                  virtual_column->second.name.GetIdentifierName(),
+                                  "a filter predicate");
+        reject_untranslatable_table_filter(entry.Filter(),
+                                           virtual_column->second.type,
+                                           virtual_column->second.name.GetIdentifierName());
+      } else if (column_id < op.returned_types.size()) {
         auto const column_name = column_id < op.names.size()
                                    ? op.names[column_id].GetIdentifierName()
                                    : std::to_string(column_id);
@@ -1025,7 +1034,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     sirius::from_duckdb_vec(original_types),  // Use original types, not modified
     op.function,
     std::move(op.bind_data),
-    sirius::from_duckdb_vec(op.returned_types),
+    scan_returned_types(op.returned_types, column_ids),
     column_ids,
     duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
     duckdb::IdentifiersToStrings(op.names),

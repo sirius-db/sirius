@@ -19,8 +19,8 @@
  * @brief Verifies that GPU planning rejects the DISTINCT aggregates the GPU does not support.
  *
  * The GPU aggregates support DISTINCT only in COUNT, and ungrouped COUNT(DISTINCT) only on a
- * single column, without a FILTER clause. The other DISTINCT aggregates must fall back to the CPU
- * at plan time and return DuckDB's rows. With the fallback disabled they must fail at plan time.
+ * single column. The other DISTINCT aggregates must fall back to the CPU at plan time and return
+ * DuckDB's rows. With the fallback disabled they must fail at plan time.
  */
 
 #include <catch.hpp>
@@ -56,10 +56,16 @@ TEST_CASE_METHOD(
   {
     expect_plan_fallback_matches_cpu("SELECT g, sum(DISTINCT v) s FROM da_t GROUP BY g;");
   }
-  SECTION("COUNT(DISTINCT) with a FILTER clause")
+  SECTION("SUM(DISTINCT) with a FILTER clause")
   {
     expect_plan_fallback_matches_cpu(
-      "SELECT g, count(DISTINCT v) FILTER (WHERE v < 2) c FROM da_t GROUP BY g;");
+      "SELECT g, sum(DISTINCT v) FILTER (WHERE v < 2) s FROM da_t GROUP BY g;");
+  }
+  SECTION("multi-column COUNT(DISTINCT) with a FILTER clause")
+  {
+    // The FILTER mask would need a NULL STRUCT, which the GPU evaluator cannot build.
+    expect_plan_fallback_matches_cpu(
+      "SELECT g, count(DISTINCT (v, s)) FILTER (WHERE v < 2) c FROM da_t GROUP BY g;");
   }
   SECTION("SUM(DISTINCT) and AVG(DISTINCT) next to COUNT(DISTINCT)")
   {
@@ -82,9 +88,10 @@ TEST_CASE_METHOD(
   {
     expect_plan_fallback_matches_cpu("SELECT count(DISTINCT (g, v)) c FROM da_t;");
   }
-  SECTION("COUNT(DISTINCT) with a FILTER clause")
+  SECTION("multi-column COUNT(DISTINCT) with a FILTER clause")
   {
-    expect_plan_fallback_matches_cpu("SELECT count(DISTINCT v) FILTER (WHERE v < 2) c FROM da_t;");
+    expect_plan_fallback_matches_cpu(
+      "SELECT count(DISTINCT (g, v)) FILTER (WHERE v < 2) c FROM da_t;");
   }
 }
 
@@ -126,7 +133,14 @@ TEST_CASE_METHOD(DistinctAggregateFixture,
                  "[integration][gpu_execution][aggregate][distinct_aggregate_fallback]")
 {
   create_distinct_table(*this);
-  compare_gpu_vs_cpu("SELECT g, count(DISTINCT v) c, sum(w) s FROM da_t GROUP BY g;");
+  SECTION("next to plain aggregates")
+  {
+    compare_gpu_vs_cpu("SELECT g, count(DISTINCT v) c, sum(w) s FROM da_t GROUP BY g;");
+  }
+  SECTION("with a FILTER clause")
+  {
+    compare_gpu_vs_cpu("SELECT g, count(DISTINCT v) FILTER (WHERE v < 2) c FROM da_t GROUP BY g;");
+  }
 }
 
 TEST_CASE_METHOD(DistinctAggregateFixture,
@@ -148,6 +162,10 @@ TEST_CASE_METHOD(DistinctAggregateFixture,
   SECTION("on an empty input")
   {
     compare_gpu_vs_cpu("SELECT count(DISTINCT v) c, count(*) n FROM da_t WHERE w < 0;");
+  }
+  SECTION("with a FILTER clause")
+  {
+    compare_gpu_vs_cpu("SELECT count(DISTINCT v) FILTER (WHERE v < 2) c FROM da_t;");
   }
 }
 

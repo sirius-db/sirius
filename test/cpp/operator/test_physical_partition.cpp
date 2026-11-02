@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "compression/compressed_representation.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "expression/ast/utils.hpp"
 #include "late_mat/column_origin.hpp"
@@ -537,6 +538,8 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   {
     inputs.push_back(in.total_bytes);
     rows.push_back(in.total_rows);
+    measured_rows.push_back(in.measured_rows);
+    resident_bytes.push_back(in.resident_bytes);
     count = natural_num_partitions(in.total_bytes, target_bytes, 1);
     return partition_strategy{
       count, false, false, partition_placement::unpinned(static_cast<std::size_t>(count))};
@@ -546,6 +549,8 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   int count             = 0;
   std::vector<uint64_t> inputs;
   std::vector<uint64_t> rows;
+  std::vector<std::optional<uint64_t>> measured_rows;
+  std::vector<std::optional<uint64_t>> resident_bytes;
 };
 
 /// A one-column INT32 GPU batch of `num_rows` rows on `space`.
@@ -629,8 +634,13 @@ struct partition_sizing_fixture {
     auto const count = inputs.size();
     partition_exchange::bind(
       std::move(inputs), driver, false, [this, driver, count](auto const& stats, bool) {
-        auto strategy = consumer.get_partition_strategy(
-          {stats[driver].bytes, false, false, stats[driver].bytes, stats[driver].rows});
+        auto strategy = consumer.get_partition_strategy({stats[driver].bytes,
+                                                         false,
+                                                         false,
+                                                         stats[driver].bytes,
+                                                         stats[driver].rows,
+                                                         stats[driver].measured_rows,
+                                                         stats[driver].resident_bytes});
         consumer.set_placement(std::make_shared<partition_placement const>(strategy.placement));
         return std::vector<partition_layout>(count, {partition_mode::single, consumer.placement()});
       });
@@ -1282,6 +1292,8 @@ TEST_CASE("partition sizing projects rows with a projected byte total",
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.inputs == std::vector<uint64_t>{4 * f.received_bytes});
   REQUIRE(f.consumer.rows == std::vector<uint64_t>{400});
+  REQUIRE(f.consumer.measured_rows == std::vector<std::optional<uint64_t>>{std::nullopt});
+  REQUIRE(f.consumer.resident_bytes == std::vector<std::optional<uint64_t>>{std::nullopt});
 }
 
 TEST_CASE("sibling partition sizing reports the sizing side's rows", "[physical_partition]")
@@ -1306,6 +1318,48 @@ TEST_CASE("sibling partition sizing reports the sizing side's rows", "[physical_
 
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.rows == std::vector<uint64_t>{drives ? 100u : 30u});
+  REQUIRE(f.consumer.measured_rows == std::vector<std::optional<uint64_t>>{drives ? 100u : 30u});
+}
+
+TEST_CASE("partition sizing measures exact rows and decoded bytes across build batches",
+          "[physical_partition][build_probe]")
+{
+  partition_sizing_fixture f(false);
+  auto* space = f.memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto batch              = make_int_batch(*space, 50);
+  auto const second_bytes = batch->to_read_only().get_data()->get_uncompressed_data_size_in_bytes();
+  f.repo.add_data_batch(batch);
+  f.finish(f.received_bytes + second_bytes);
+
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.measured_rows == std::vector<std::optional<uint64_t>>{150});
+  REQUIRE(f.consumer.resident_bytes ==
+          std::vector<std::optional<uint64_t>>{f.received_bytes + second_bytes});
+}
+
+TEST_CASE("partition sizing counts decoded compressed payload and exact host rows",
+          "[physical_partition][build_probe]")
+{
+  partition_sizing_fixture f(false);
+  auto* host = f.memory_manager->get_memory_space(Tier::HOST, 0);
+  REQUIRE(host != nullptr);
+  // Only metadata is read; the empty blob is never decoded.
+  auto representation = std::make_unique<sirius::compressed_host_representation>(
+    *host,
+    std::make_shared<sirius::pinned_compressed_blob>(),
+    std::vector<std::string>{"k"},
+    10,
+    4000,
+    1000);
+  f.repo.add_data_batch(data_batch::make(sirius::get_next_batch_id(), std::move(representation)));
+  f.finish(f.received_bytes + 4000);
+
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes + 4000});
+  REQUIRE(f.consumer.measured_rows == std::vector<std::optional<uint64_t>>{1100});
+  REQUIRE(f.consumer.resident_bytes ==
+          std::vector<std::optional<uint64_t>>{f.received_bytes + 4000});
 }
 
 TEST_CASE("fixed hash routing and concat-all assemble fragmented input for an opaque consumer",

@@ -121,8 +121,8 @@ std::vector<std::optional<std::uint64_t>> resolve_sum_input_bounds(
     auto const& input = *aggregate.GetChildren()[0];
     auto const& type  = input.GetReturnType();
     // DECIMAL32/64 inputs use the bound to skip widening; DECIMAL128 inputs use it to narrow. Of
-    // the wide integer sums only BIGINT can overflow INT64 within one batch: INTEGER cannot, and
-    // HUGEINT statistics carry no INT64 bound.
+    // the wide integer sums only BIGINT can overflow INT64 within one batch: INTEGER cannot. A
+    // HUGEINT input is a DECIMAL128 carrier, and its statistics carry no INT64 bound.
     bool const wide_bigint = type.id() == duckdb::LogicalTypeId::BIGINT &&
                              op::is_wide_integer_sum(*id, sirius::from_duckdb(type));
     if (type.id() != duckdb::LogicalTypeId::DECIMAL && !wide_bigint) { continue; }

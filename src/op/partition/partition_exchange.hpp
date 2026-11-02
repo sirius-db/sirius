@@ -31,6 +31,9 @@ class sirius_physical_partition;
 struct partition_input_stats {
   uint64_t bytes = 0;
   uint64_t rows  = 0;
+  /// Exact metadata rows and decoded bytes, available only for unprojected measurements.
+  std::optional<uint64_t> measured_rows  = 0;
+  std::optional<uint64_t> resident_bytes = 0;
 };
 
 /// One plan-bound decision, shared by its input routers. No semantic consumer roles live here.

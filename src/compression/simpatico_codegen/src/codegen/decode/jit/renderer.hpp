@@ -225,9 +225,14 @@ using ::codegen::jit::RenderError;
 // arguments positionally, as the doc comment on it states.
 DecodeKernelSpec render_masked_char_copy();
 
+// `out_dtype`, when set, is the element type the write_column consumer stores to `out`, wider than
+// `element_dtype` (e.g. "int64_t" for a DECIMAL32 column restored to DECIMAL64). Decoded values are
+// computed in `element_dtype` and widened by the store's implicit conversion. Only bitpack-rooted
+// mask/index walks request it (see decode_fused_subtree_impl in plan/decompress.cpp).
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
-                        DecodeShape shape = kShapePlain);
+                        DecodeShape shape            = kShapePlain,
+                        const std::string& out_dtype = {});
 
 }  // namespace codegen::decode::jit

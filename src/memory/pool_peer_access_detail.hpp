@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,14 @@
 
 #pragma once
 
-#include <vector>
+#include <cucascade/memory/common.hpp>
 
-namespace sirius {
-namespace parallel {
+namespace sirius::memory::detail {
 
-struct task_executor_config {
-  int num_threads{0};
-  bool retry_on_error{false};
-  std::vector<int> cpu_affinity_list;
-};
+// Shared with policy tests so fatal outcomes need no manufactured GPU fault.
+[[nodiscard]] bool interpret_pool_access_result(cucascade::memory::pool_peer_access_status status,
+                                                cudaError_t error,
+                                                int owner_device,
+                                                int accessor_device);
 
-}  // namespace parallel
-}  // namespace sirius
+}  // namespace sirius::memory::detail
