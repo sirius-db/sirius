@@ -70,6 +70,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -126,6 +127,10 @@ enum class unique_verdict : std::uint8_t {
   proven,            ///< distinct across the whole pinned table
 };
 
+/// GPU bytes to set aside, per byte of a column, for the sort an automatic column's chunk may
+/// undergo: the sorted copy plus the radix sort's own buffers.
+inline constexpr std::size_t sort_scratch_factor = 3;
+
 /// Exact whole-column check, for the columns the cheap per-chunk pass could not
 /// decide: assemble @p chunks into one column, sort it, and count consecutive
 /// equal runs (over sorted data that IS the exact distinct count — nothing
@@ -171,7 +176,13 @@ class unique_probe {
   /// the selection; a mismatch abandons the whole proof (fails closed) rather
   /// than risking a positional misread. Runs on @p stream and synchronizes it
   /// via the scalar reads it performs.
-  void observe(cudf::table_view const& chunk, ::cuda::stream_ref stream);
+  /// An automatic column whose chunk is unsorted is sorted on the spot, which needs about
+  /// sort_scratch_factor times the column's bytes of GPU memory. @p may_sort is asked for that
+  /// many bytes first and is expected to reserve them until its next call; when it declines, or
+  /// the sort fails for want of memory, the column is dropped without a proof and the pin goes on.
+  void observe(cudf::table_view const& chunk,
+               ::cuda::stream_ref stream,
+               std::function<bool(std::size_t bytes)> const& may_sort = {});
 
   /// Per-column verdicts, positional with the selection.
   [[nodiscard]] std::vector<unique_verdict> verdicts() const;

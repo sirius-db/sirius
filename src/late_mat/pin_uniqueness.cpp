@@ -26,13 +26,16 @@
 #include <cudf/sorting.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace sirius::late_mat {
@@ -199,7 +202,9 @@ void unique_probe::drop(std::size_t column_pos, std::string_view why)
   --_live_candidates;
 }
 
-void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref stream)
+void unique_probe::observe(cudf::table_view const& chunk,
+                           ::cuda::stream_ref stream,
+                           std::function<bool(std::size_t bytes)> const& may_sort)
 {
   if (_live_candidates == 0) { return; }
 
@@ -248,21 +253,34 @@ void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref str
     // costs one pass.
     std::unique_ptr<cudf::table> sorted_copy;
     cudf::column_view sorted_col = col;
-    if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
-      // Unsorted says nothing either way — leave it to the exact stage, unless
-      // the column was observed automatically. Most columns of a fact table are
-      // unsorted and repeat values, so an automatic column sorts this one chunk
-      // instead: a repeat refuses it here, before the exact stage retains any of
-      // its values.
-      if (!_columns[i].automatic) {
-        _columns[i].cheap_undecidable = true;
-        continue;
+    cudf::size_type distinct     = 0;
+    try {
+      if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
+        // Unsorted says nothing either way — leave it to the exact stage, unless
+        // the column was observed automatically. Most columns of a fact table are
+        // unsorted and repeat values, so an automatic column sorts this one chunk
+        // instead: a repeat refuses it here, before the exact stage retains any of
+        // its values.
+        if (!_columns[i].automatic) {
+          _columns[i].cheap_undecidable = true;
+          continue;
+        }
+        // The sort is optional. A pin that cannot spare the memory for it loses this proof,
+        // never the pin itself.
+        if (may_sort && !may_sort(static_cast<std::size_t>(col.size()) * cudf::size_of(col.type()) *
+                                  sort_scratch_factor)) {
+          drop(i, "no GPU memory reserved for sorting a chunk");
+          continue;
+        }
+        sorted_copy = cudf::sort(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream);
+        sorted_col  = sorted_copy->view().column(0);
       }
-      sorted_copy = cudf::sort(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream);
-      sorted_col  = sorted_copy->view().column(0);
+      distinct = cudf::unique_count(
+        sorted_col, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+    } catch (std::exception const& e) {
+      drop(i, std::string{"the check failed: "} + e.what());
+      continue;
     }
-    auto const distinct = cudf::unique_count(
-      sorted_col, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
     sorted_copy.reset();
     if (distinct != col.size()) {
       drop(i, "a chunk repeats a value");

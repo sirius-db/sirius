@@ -143,7 +143,9 @@ load-bearing rather than a fallback, because chunk ranges usually overlap.
 The same facts also serve joins: with `pin_table_prove_unique_keys` (on by default), a pinned
 parquet column proven distinct counts as a unique build key, and the pin observes every integer
 column automatically under a stricter standard (an unsorted chunk is sorted on the spot, so a
-column that repeats a value is refused at its first chunk). See
+column that repeats a value is refused at its first chunk). That sort is optional: the pin reserves
+GPU memory for it first, and a column whose sort cannot be reserved, or fails, simply gets no proof
+while the pin goes on. See
 [Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys).
 
 The exact stage is bounded per column in bytes by `pin_table_unique_exact_max_bytes` (default

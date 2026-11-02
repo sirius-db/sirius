@@ -49,6 +49,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -350,6 +351,61 @@ TEST_CASE("an automatic column is settled where an explicit one is only undecide
   REQUIRE_FALSE(probe.candidate(2));
   REQUIRE(probe.candidate(3));
   REQUIRE(probe.candidate(4));
+}
+
+TEST_CASE("an automatic column is dropped, not the pin, when its sort cannot be reserved",
+          "[late_mat][pin_uniqueness]")
+{
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+
+  // An unsorted automatic column that is distinct, a sorted automatic one (needs no sort) and an
+  // unsorted explicit one (never sorted).
+  auto const make_probe = [] {
+    return unique_probe{std::vector<bool>{true, true, true}, std::vector<bool>{true, true, false}};
+  };
+  auto unsorted_distinct = int64_column({12, 10, 11}, stream);
+  auto sorted            = int64_column({10, 11, 12}, stream);
+  auto explicit_unsorted = int64_column({7, 5, 6}, stream);
+  std::vector<cudf::column_view> cols{
+    unsorted_distinct->view(), sorted->view(), explicit_unsorted->view()};
+
+  SECTION("a granted reservation sorts the chunk and proves the column")
+  {
+    auto probe = make_probe();
+    std::vector<std::size_t> asked;
+    probe.observe(cudf::table_view{cols}, stream, [&](std::size_t bytes) {
+      asked.push_back(bytes);
+      return true;
+    });
+    REQUIRE(asked == std::vector<std::size_t>{3 * sizeof(std::int64_t) *
+                                              sirius::late_mat::sort_scratch_factor});
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::proven,
+                                                            unique_verdict::proven,
+                                                            unique_verdict::undecided});
+  }
+
+  SECTION("a declined reservation drops only the column that needed the sort")
+  {
+    auto probe = make_probe();
+    probe.observe(cudf::table_view{cols}, stream, [](std::size_t) { return false; });
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused,
+                                                            unique_verdict::proven,
+                                                            unique_verdict::undecided});
+    REQUIRE_FALSE(probe.candidate(0));
+    REQUIRE(probe.candidate(1));
+  }
+
+  SECTION("a gate that throws costs the column its proof, never the observation")
+  {
+    auto probe = make_probe();
+    REQUIRE_NOTHROW(probe.observe(cudf::table_view{cols}, stream, [](std::size_t) -> bool {
+      throw std::runtime_error("out of memory");
+    }));
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused,
+                                                            unique_verdict::proven,
+                                                            unique_verdict::undecided});
+  }
 }
 
 TEST_CASE("an automatic column with sorted, overlapping chunks is left to the exact stage",

@@ -334,7 +334,13 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // reduce and equally conclusive.
     if (unique_probe.active()) {
       nvtx_scoped_range probe_range{"sirius::pin::unique_probe"};
-      unique_probe.observe(tbl->view(), stream);
+      // The probe may sort a chunk of an automatic column; hold a reservation for each sort, and
+      // let the probe drop the column when the memory space cannot grant one.
+      decltype(target->make_reservation_or_null(std::size_t{})) sort_reservation;
+      unique_probe.observe(tbl->view(), stream, [&](std::size_t bytes) {
+        sort_reservation = target->make_reservation_or_null(bytes);
+        return sort_reservation != nullptr;
+      });
     }
     if (exact_retaining) {
       if (exact_gpu.has_value() && *exact_gpu != gpu_id) {
