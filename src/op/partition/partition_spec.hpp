@@ -46,7 +46,8 @@ struct partition_spec {
   std::vector<cudf::data_type> key_cast_types;
 
   /// Set by the planner when the consumer merges sorted partials, so a sorted batch keeps its
-  /// row order within each partition. Off for joins, which gain nothing from it.
+  /// row order within each partition. Joins leave it off: the current hash joins gain nothing
+  /// from ordered input (a sort-merge join could).
   bool preserve_input_order = false;
 
   partition_spec() = default;
