@@ -27,6 +27,7 @@
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "utils/pool_peer_access_requirement.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cudf/column/column.hpp>
@@ -303,12 +304,15 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
 }
 
 /**
- * @brief `pool_access_available`, warning when a test that needs direct copies must skip.
+ * @brief `pool_access_available`, warning when a test that needs direct copies must skip, or
+ * failing as `sirius::test::fail_if_pool_peer_access_required` describes.
  */
 [[nodiscard]] inline bool has_pool_access(
   std::span<sirius::op::dynamic_filter_replica_space const> spaces)
 {
   if (!pool_access_available(spaces)) {
+    sirius::test::fail_if_pool_peer_access_required(
+      "test needs access to every fixture replica pool");
     WARN("test needs access to every fixture replica pool; skipping");
     return false;
   }

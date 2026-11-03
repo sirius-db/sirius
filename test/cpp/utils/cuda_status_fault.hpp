@@ -74,6 +74,9 @@ class scoped_cuda_status_fault {
   // Distinct recorded streams, including those of injected failures
   std::size_t observed_stream_count() const noexcept;
   bool all_submitted_streams_joined() const noexcept;
+  // Recorded submissions this thread made to other streams while @p delay still held the faulting
+  // call's stream
+  std::size_t submissions_during_delay() const noexcept;
   // Whether a recorded synchronization reported cudaErrorInvalidResourceHandle
   bool invalid_join() const noexcept;
 

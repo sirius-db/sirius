@@ -55,6 +55,10 @@ struct thread_fault {
   bool consumed     = false;
   bool invalid_join = false;
   std::vector<submitted_stream> streams;
+  // The stream a queued delay holds, and whether its callback is still sleeping.
+  cudaStream_t delayed_stream = nullptr;
+  std::shared_ptr<std::atomic<bool>> delay_holding;
+  std::size_t submissions_during_delay = 0;
 };
 thread_local std::optional<thread_fault> armed_fault;
 thread_local std::optional<sirius::test::cuda_transfer_observation> observed_transfers;
@@ -79,17 +83,24 @@ cudaError_t take_status(int operation, cudaStream_t stream = nullptr)
   }
   armed_fault->consumed = true;
   if (armed_fault->delay.count() != 0 && stream != nullptr) {
-    auto duration     = std::make_unique<std::chrono::milliseconds>(armed_fault->delay);
+    struct held_delay {
+      std::chrono::milliseconds duration;
+      std::shared_ptr<std::atomic<bool>> holding;
+    };
+    auto holding      = std::make_shared<std::atomic<bool>>(true);
+    auto payload      = std::make_unique<held_delay>(held_delay{armed_fault->delay, holding});
     auto const status = cudaLaunchHostFunc(
       stream,
       [](void* value) {
-        std::unique_ptr<std::chrono::milliseconds> retained{
-          static_cast<std::chrono::milliseconds*>(value)};
-        std::this_thread::sleep_for(*retained);
+        std::unique_ptr<held_delay> retained{static_cast<held_delay*>(value)};
+        std::this_thread::sleep_for(retained->duration);
+        retained->holding->store(false, std::memory_order_release);
       },
-      duration.get());
+      payload.get());
     if (status != cudaSuccess) { return status; }
-    (void)duration.release();
+    (void)payload.release();
+    armed_fault->delayed_stream = stream;
+    armed_fault->delay_holding  = std::move(holding);
   }
   return armed_fault->status;
 }
@@ -98,6 +109,10 @@ cudaError_t take_status(int operation, cudaStream_t stream = nullptr)
 void record_submission(cudaStream_t stream)
 {
   if (!armed_fault) { return; }
+  if (armed_fault->delay_holding && stream != armed_fault->delayed_stream &&
+      armed_fault->delay_holding->load(std::memory_order_acquire)) {
+    ++armed_fault->submissions_during_delay;
+  }
   auto& streams = armed_fault->streams;
   if (auto const found = std::ranges::find(streams, stream, &submitted_stream::stream);
       found != streams.end()) {
@@ -175,6 +190,11 @@ bool scoped_cuda_status_fault::all_submitted_streams_joined() const noexcept
 {
   auto const* fault = operation_ == acquire_stream ? nullptr : calling_thread_fault();
   return fault == nullptr || std::ranges::all_of(fault->streams, &submitted_stream::joined);
+}
+std::size_t scoped_cuda_status_fault::submissions_during_delay() const noexcept
+{
+  auto const* fault = operation_ == acquire_stream ? nullptr : calling_thread_fault();
+  return fault == nullptr ? 0 : fault->submissions_during_delay;
 }
 bool scoped_cuda_status_fault::invalid_join() const noexcept
 {

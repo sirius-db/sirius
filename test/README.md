@@ -27,6 +27,8 @@ The script runs three steps:
 
 It respects `CUDA_VISIBLE_DEVICES` and shards over the GPUs it lists. Each process writes `unittest.log` and `sirius.log` to its own subdirectory of `build/release/test/cpp/log/`, for example `shard-0/` or `late_mat/`.
 
+Multi-GPU tests of direct peer copies skip when a GPU's memory pool does not grant the other GPUs access, as on some PCIe topologies. On a machine whose GPUs must support those copies, set `SIRIUS_TEST_REQUIRE_POOL_PEER_ACCESS=1` so these tests fail instead of skipping.
+
 To run specific tests, call the test binary directly with a Catch2 tag or test name:
 ```bash
 pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"

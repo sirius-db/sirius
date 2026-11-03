@@ -1146,7 +1146,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
       } else {
         // The root's task stream owns scratch allocation; all other root work follows this join.
         check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(staged allocation)");
-        auto const stage =
+        auto const submit =
           [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
             rmm::cuda_set_device_raii guard{rmm::cuda_device_id{owner.device_id}};
             copies.clear();
@@ -1163,8 +1163,15 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
             }
             auto const status = copies.enqueue(owner.stream_ref());
             check_cuda(status, "device_copy_batch::enqueue(accumulated staging)");
-            check_cuda(cudaStreamSynchronize(owner.stream->value()),
-                       "cudaStreamSynchronize(accumulated staging)");
+          };
+        auto const wait = [](impl::partial const& owner) {
+          check_cuda(cudaStreamSynchronize(owner.stream->value()),
+                     "cudaStreamSynchronize(accumulated staging)");
+        };
+        auto const stage =
+          [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
+            submit(owner, device_bytes, bytes, to_host);
+            wait(owner);
           };
         for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
           for (std::size_t offset = 0; offset < geometry.raw_bytes;
@@ -1188,11 +1195,16 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
             }
             if (!targets.empty()) {
               stage(*root, root_chunk, bytes, true);
+              // Every upload only reads the merged chunk in the window, so all of them run
+              // together; the window is refilled only after the last one retires.
               for (auto* target : targets) {
-                stage(*target,
-                      static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
-                      bytes,
-                      false);
+                submit(*target,
+                       static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
+                       bytes,
+                       false);
+              }
+              for (auto const* target : targets) {
+                wait(*target);
               }
             }
           }

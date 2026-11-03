@@ -23,6 +23,9 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
+#include <optional>
+#include <vector>
 
 namespace {
 namespace acc = sirius::test::accumulation;
@@ -169,6 +172,61 @@ TEST_CASE(
   using transport = sirius::op::detail::accumulated_bloom_builder::publication_transport;
   REQUIRE(published->transport == (point.staged ? transport::HOST_STAGED : transport::PEER_COPY));
   acc::require_exact_union(published->filters, expected, 2);
+}
+
+TEST_CASE("HOST publication submits every target upload before waiting for any",
+          "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
+{
+  if (auto const visible = acc::visible_gpus(); visible < 3) {
+    WARN("HOST upload overlap test needs 3 GPUs, " << visible << " visible; skipping");
+    return;
+  }
+  acc::fixture fixture({.devices = 3});
+  // Three chunks per key, so later chunks refill the HOST window after the held upload retires.
+  auto const geometry = acc::bloom_geometry(2'097'153);
+  REQUIRE(geometry.chunks_per_key() == 3);
+  auto builder = acc::make_builder(fixture, geometry);
+  std::vector<acc::batch_ptr> batches;
+  for (int device = 0; device < 3; ++device) {
+    batches.push_back(fixture.make_batch(device, std::int64_t{1000} * device, 100));
+    acc::add_to_builder(builder, fixture, batches.back());
+  }
+  auto const expected = acc::partial_union(builder, 2, 3);
+  auto* host          = fixture.spaces[0]
+                 .get_host_staging_space()
+                 .get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host);
+  auto const host_before = host->get_total_allocated_bytes();
+  auto const baseline    = fixture.allocated_bytes();
+  acc::builder_access::workspace_observation workspace;
+  std::optional<sirius::op::detail::accumulated_bloom_builder::publication> published;
+  {
+    // The first chunk passes each of its two sources through HOST to GPU 0 (four batches) and
+    // copies the merged chunk to HOST (one batch) before its two uploads, so the delay holds the
+    // sixth batch: the first upload.
+    fault injection{
+      fault::enqueue_copy_batch, cudaSuccess, 5, nullptr, std::chrono::milliseconds{200}};
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+    published = acc::builder_access::finish(builder,
+                                            rmm::cuda_device_id{0},
+                                            fixture.publication_stream(0),
+                                            fixture.gpu(0).get_default_allocator(),
+                                            true,
+                                            &workspace);
+    REQUIRE(injection.consumed());
+    REQUIRE_FALSE(injection.invalid_join());
+    REQUIRE(injection.all_submitted_streams_joined());
+    // The second upload was submitted while the first was held.
+    REQUIRE(injection.submissions_during_delay() == 1);
+  }
+  REQUIRE(published);
+  using transport = sirius::op::detail::accumulated_bloom_builder::publication_transport;
+  REQUIRE(published->transport == transport::HOST_STAGED);
+  acc::require_exact_union(published->filters, expected, 3);
+  auto const block = host->get_block_size();
+  REQUIRE(workspace.host_staging_bytes == ((geometry.chunk_bytes + block - 1) / block) * block);
+  REQUIRE(host->get_total_allocated_bytes() == host_before);
+  REQUIRE(fixture.allocated_bytes() == baseline);
 }
 
 TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
