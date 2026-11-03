@@ -82,6 +82,7 @@ set(TEST_SOURCES
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
+    test/cpp/expression_evaluator/test_checked_division.cpp
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
@@ -115,6 +116,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_grouping_sets.cpp
+    test/cpp/integration/test_gpu_execution_division.cpp
     test/cpp/integration/test_gpu_execution_hugeint.cpp
     test/cpp/integration/test_gpu_execution_integer_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
@@ -150,6 +152,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_union.cpp
     test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
+    test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
@@ -233,6 +236,7 @@ set(TEST_SOURCES
     test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+    test/cpp/operator/aggregate/test_sorted_keys.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
     test/cpp/operator/aggregate/test_low_cardinality_groupby.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
@@ -284,6 +288,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_scan_column_origin.cpp
     test/cpp/planner/test_join_key_nullability.cpp
     test/cpp/planner/test_scan_filter_projection.cpp
+    test/cpp/planner/test_scan_returned_types.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
     test/cpp/planner/test_dynamic_filter_target_discovery.cpp
@@ -297,6 +302,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
+    test/cpp/planner/test_window_plan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
