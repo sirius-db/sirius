@@ -41,13 +41,11 @@ jobs:
       - name: Lint binding generation
         env:
           DOCS_RS: "1"
-          LIBCLANG_PATH: ${{ github.workspace }}/.pixi/envs/bindings/lib
         run: pixi run --locked -e bindings cargo clippy --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings -- -D warnings
       - name: Install Miri
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        uses: dtolnay/rust-toolchain@0c5191052c6bf2ba7dee1704a526ce23acd9a454 # miri
         with:
           toolchain: nightly-2026-11-01
-          components: miri, rust-src
       - name: Check public Rust ownership with Miri
         run: cargo +nightly-2026-11-01 miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
 
