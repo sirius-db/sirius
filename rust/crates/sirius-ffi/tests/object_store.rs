@@ -1,7 +1,7 @@
 // Exercises only the public cxx bridge. The snapshot test requires one GPU; CI's
 // cargo test --no-run checks that the bridge and the selected Sirius artifact link.
 use cxx::{SharedPtr, let_cxx_string};
-use sirius_sys::{
+use sirius_ffi::{
     ObjectStoreConfigArgs, SigningMode, Transport, drop_object_store_prefix,
     make_context_from_config_with_object_store, make_object_store_config,
     object_store_config_for_uri,
