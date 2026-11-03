@@ -16,9 +16,6 @@
 
 #include <cuda_runtime.h>
 
-#include <duckdb.hpp>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>

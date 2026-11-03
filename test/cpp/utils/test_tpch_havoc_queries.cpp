@@ -12,7 +12,6 @@
 #include "util/env_guard.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/tpch_havoc_queries.hpp>
 

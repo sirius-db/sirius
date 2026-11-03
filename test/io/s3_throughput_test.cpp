@@ -33,7 +33,6 @@
 //       --repeat       3                    \
 //       --config       sirius_s3.yml
 
-#include "exec/semi_future.hpp"
 #include "io/types.hpp"
 #include "s3_bench_common.hpp"
 

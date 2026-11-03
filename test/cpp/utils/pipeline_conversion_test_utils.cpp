@@ -27,11 +27,9 @@
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
 
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
-#include <duckdb/main/database.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>

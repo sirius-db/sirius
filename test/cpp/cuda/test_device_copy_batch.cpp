@@ -33,7 +33,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <vector>
 
 TEST_CASE("device_copy_batch filters empty descriptors and resets for reuse",
           "[cuda][device_copy_batch][gpu_execution]")

@@ -23,10 +23,8 @@
 #include <sirius/exception.hpp>
 
 // cudf
-#include <cudf/ast/ast_operator.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/scalar/scalar.hpp>
 
 // standard library
 #include <memory>

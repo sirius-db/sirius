@@ -15,18 +15,12 @@
  */
 
 // sirius
-#include <expression/ast/node.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
-// duckdb
-#include <duckdb/common/exception.hpp>
-
 // cudf
-#include "cudf/ast_compat.hpp"
-
 #include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/types.hpp>

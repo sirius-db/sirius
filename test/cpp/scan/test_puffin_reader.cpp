@@ -25,7 +25,7 @@
 // No GPU: file IO and parsing only.
 
 #include "io/io_errors.hpp"
-#include "op/scan/iceberg_delete_set.hpp"
+#include "op/scan/iceberg_delete_set.hpp"  // IWYU pragma: keep
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "utils/puffin_test_utils.hpp"

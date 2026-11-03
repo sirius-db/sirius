@@ -61,13 +61,11 @@
 
 #include "api/simpatico_codegen.hpp"
 #include "codegen/jit/kernel_cache.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "explore/compression_explorer.hpp"
 #include "test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -92,7 +90,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>

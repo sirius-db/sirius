@@ -36,7 +36,6 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
 
 #include <cstdint>

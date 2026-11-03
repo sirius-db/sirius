@@ -27,7 +27,6 @@
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
-#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include <catch.hpp>

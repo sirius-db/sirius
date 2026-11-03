@@ -13,8 +13,6 @@
 #include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
-#include <duckdb.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -24,7 +22,6 @@
 #include <fstream>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>

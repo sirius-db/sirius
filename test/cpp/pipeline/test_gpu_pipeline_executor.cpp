@@ -17,7 +17,6 @@
 #include "catch.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
-#include "log/logging.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_build_context.hpp"

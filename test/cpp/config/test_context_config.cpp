@@ -19,7 +19,7 @@
 
 #include <sirius/context/config_builder.hpp>
 #include <unistd.h>
-#include <yaml-cpp/yaml.h>
+#include <yaml-cpp/yaml.h>  // IWYU pragma: keep
 
 #include <algorithm>
 #include <atomic>

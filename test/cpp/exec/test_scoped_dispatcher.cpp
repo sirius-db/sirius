@@ -23,7 +23,6 @@
 #include <chrono>
 #include <future>
 #include <memory>
-#include <stdexcept>
 #include <thread>
 #include <vector>
 

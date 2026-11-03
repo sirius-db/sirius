@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_partition.hpp"
 
-#include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
@@ -25,7 +24,6 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/nvtx.hpp"
 

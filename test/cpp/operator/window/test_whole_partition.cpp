@@ -26,7 +26,6 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 
 #include <cmath>
 #include <limits>
