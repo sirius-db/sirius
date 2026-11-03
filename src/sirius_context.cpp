@@ -695,7 +695,7 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   try {
     retire_query_work(query_id, query_retirement_mode::cancelled);
   } catch (...) {
-    // Health was latched by the caller. Resources remain owned until terminate().
+    // Health was latched by the caller. Resources remain owned until release_resources().
   }
 }
 
@@ -894,10 +894,8 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
 
 void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
 {
-  // Guarded by prev_pinned_mr_ so this is a no-op when initialize() threw before
-  // installing the resource (or after terminate() already restored it), which is
-  // what makes it safe to call from every teardown and rollback path. noexcept:
-  // runs during stack unwinding and in ~SiriusContext.
+  // Called by release_resources() during rollback and destruction. The guard makes
+  // restoration a no-op before installation and after the first restoration.
   if (!prev_pinned_mr_.has_value()) { return; }
   cudf::set_pinned_memory_resource(*prev_pinned_mr_);
   cudf::set_allocate_host_as_pinned_threshold(prev_pinned_threshold_);
@@ -1156,12 +1154,6 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   runtime_unavailable_.store(false, std::memory_order_release);
   is_initialized_    = true;
   rollback.committed = true;
-}
-
-void SiriusContext::terminate()
-{
-  throw_if_not_initialized();
-  release_resources();
 }
 
 void SiriusContext::release_resources() noexcept
