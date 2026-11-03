@@ -483,6 +483,27 @@ TEST_CASE("an explicit column keeps its chances when the exact stage becomes una
   REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
 }
 
+TEST_CASE("an optional retained copy yields to the batches the pin still has to store",
+          "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::retention_has_headroom;
+  using sirius::late_mat::retention_headroom_batches;
+  constexpr std::size_t mib = 1024 * 1024;
+  // The reviewer's example: 100 MiB of capacity, four 19 MiB batches stored and 8 MiB of key copies
+  // retained leave 16 MiB free. The fifth batch needs 19 MiB, so no further copy may be kept, and
+  // the 8 MiB copy itself would already have left too little.
+  REQUIRE_FALSE(
+    retention_has_headroom(/*available=*/16 * mib, /*copy=*/8 * mib, /*batch=*/19 * mib));
+  // With room for a copy and the headroom beside it, the copy is kept.
+  REQUIRE(retention_has_headroom(
+    /*available=*/8 * mib + retention_headroom_batches * 19 * mib, 8 * mib, 19 * mib));
+  // One byte short of that is not enough.
+  REQUIRE_FALSE(
+    retention_has_headroom(8 * mib + retention_headroom_batches * 19 * mib - 1, 8 * mib, 19 * mib));
+  // Nothing to protect: an empty batch needs only the copy itself.
+  REQUIRE(retention_has_headroom(8 * mib, 8 * mib, 0));
+}
+
 TEST_CASE("an automatic column with sorted, overlapping chunks is left to the exact stage",
           "[late_mat][pin_uniqueness]")
 {

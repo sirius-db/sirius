@@ -134,6 +134,21 @@ enum class unique_verdict : std::uint8_t {
 /// undergo: the sorted copy plus the radix sort's own buffers.
 inline constexpr std::size_t sort_scratch_factor = 3;
 
+/// How many batches' worth of free GPU memory the pin keeps beside an optional retained copy: the
+/// next required batch and its working data (narrowing and compression buffers).
+inline constexpr std::size_t retention_headroom_batches = 2;
+
+/// Whether a copy of @p copy_bytes may be retained for the exact stage while @p available_bytes
+/// of GPU memory are free and a decoded batch is @p batch_bytes. The copy is optional and the
+/// batches the pin still has to decode and store are not, so the copy yields when it would leave
+/// less than retention_headroom_batches batches free.
+[[nodiscard]] constexpr bool retention_has_headroom(std::size_t available_bytes,
+                                                    std::size_t copy_bytes,
+                                                    std::size_t batch_bytes) noexcept
+{
+  return available_bytes >= copy_bytes + retention_headroom_batches * batch_bytes;
+}
+
 /// Exact whole-column check, for the columns the cheap per-chunk pass could not
 /// decide: assemble @p chunks into one column, sort it, and count consecutive
 /// equal runs (over sorted data that IS the exact distinct count — nothing

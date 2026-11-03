@@ -372,6 +372,12 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
           exact_byte_cap = late_mat::exact_uniqueness_byte_cap(options.unique_exact_max_bytes,
                                                                target->get_max_memory());
         }
+        // The optional copies must not crowd out the batches the pin still has to decode and
+        // store, so each one is kept only if room for the next batch is left beside it.
+        std::size_t batch_bytes = 0;
+        for (cudf::size_type c = 0; c < tbl->num_columns(); ++c) {
+          batch_bytes += tbl->get_column(c).alloc_size();
+        }
         for (std::size_t i = 0; i < options.probe_unique_columns.size(); ++i) {
           // Retain only what the exact stage may still need: a column the probe already
           // refused releases what it retained so far, and so does a column that no longer fits.
@@ -402,6 +408,11 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
             decline(i,
                     "more than " + std::to_string(*exact_byte_cap) +
                       " bytes retained across columns (pin_table_unique_exact_max_bytes)");
+            continue;
+          }
+          if (!late_mat::retention_has_headroom(
+                target->get_available_memory(), chunk_bytes, batch_bytes)) {
+            decline(i, "not enough free GPU memory would be left for the next required batch");
             continue;
           }
           auto reservation = target->make_reservation_or_null(chunk_bytes);
