@@ -100,17 +100,23 @@ installed yet, `LOAD sirius` downloads it from DuckDB's community repository (or
 the configured auto-install repository); without a usable driver it does no
 network I/O. The loader does not retry with the other CUDA version.
 
-`LOAD sirius` always succeeds unless the database already has the other backend
-loaded or the loader is loaded under a backend name. If the driver is missing,
-supports a CUDA version below 12, or cannot report its version, or the backend
-cannot be installed or loaded, the loader leaves DuckDB's CPU execution
-untouched: it registers no optimizer hook and `gpu_execution` defaults to
-`false`. Explicit requests for the GPU, `SET gpu_execution = true` or the
+If the driver is missing, supports a CUDA version below 12, or cannot report its
+version, or the selected backend is not installed, cannot be installed, or its
+file cannot be loaded, `LOAD sirius` still succeeds and the loader leaves
+DuckDB's CPU execution untouched: it registers no optimizer hook and
+`gpu_execution` defaults to `false`. Explicit requests for the GPU, `SET gpu_execution = true` or the
 `gpu_execution(...)` table function, then fail with the recorded reason, such as
 `Sirius requires an NVIDIA driver supporting CUDA 12 or newer: cannot open
 libcuda.so.1 (...)`. The fallback is logged once at `INFO` level to
 `duckdb_logs`, and the loader prints nothing. The result is cached per database:
 loading the backend after a fallback needs a new database instance.
+
+`LOAD sirius` still fails if the database already has the other backend loaded,
+if the loader is loaded under a backend name, or if the backend fails once its
+own initialization has started (for example a GPU or configuration error). The
+backend entry point records that start in the database's object cache under
+`sirius_backend_init_started`, so such failures are reported rather than turned
+into a silent CPU fallback.
 
 `sirius_status()` returns one row describing that outcome:
 

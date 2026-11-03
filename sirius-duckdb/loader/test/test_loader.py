@@ -141,6 +141,16 @@ class LoaderTests(unittest.TestCase):
         self.assertTrue(status["backend_loaded"])
         self.assertFalse(status["gpu_execution"])
 
+    def test_prepared_status_reads_current_setting(self):
+        result = self.query(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};"
+            "SET gpu_execution = false;"
+            "PREPARE status AS SELECT gpu_execution FROM sirius_status();"
+            "SET gpu_execution = true;"
+            "EXECUTE status;"
+        )
+        self.assertEqual(self.rows(result), [{"gpu_execution": True}])
+
     def test_loaded_backend_owns_gpu_execution(self):
         result = self.query(
             f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};"
@@ -245,27 +255,18 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(self.rows(result), [{"backend": 13, "backend_loaded": True}])
 
     def test_backend_initialization_error(self):
+        # Once the backend starts initializing, a failure is reported rather than hidden.
         for autoinstall in [False, True]:
             with self.subTest(autoinstall=autoinstall):
-                status = self.assert_fallback(
+                result = self.query(
                     f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
-                    "Backend initialization failed for test",
                     env={"SIRIUS_TEST_BACKEND_FAILURE": "1"},
                     autoinstall=autoinstall,
                 )
-                self.assertIn(
-                    "Sirius selected sirius_cuda13", status["fallback_reason"]
-                )
-                self.assertNotIn("run INSTALL", status["fallback_reason"])
-                self.assertNotIn("automatically install", status["fallback_reason"])
-
-    def test_backend_partial_initialization_error(self):
-        result = self.query(
-            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
-            env={"SIRIUS_TEST_BACKEND_FAILURE": "late"},
-        )
-        self.assert_failure(result, "Backend initialization failed for test")
-        self.assertIn("Sirius selected sirius_cuda13", result.stderr)
+                self.assert_failure(result, "Backend initialization failed for test")
+                self.assertIn("Sirius selected sirius_cuda13", result.stderr)
+                self.assertNotIn("run INSTALL", result.stderr)
+                self.assertNotIn("automatically install", result.stderr)
 
     def test_backends_reject_aliases_before_registration(self):
         for backend, other in [(12, 13), (13, 12)]:

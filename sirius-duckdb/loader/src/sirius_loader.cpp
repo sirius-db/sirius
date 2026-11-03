@@ -31,6 +31,7 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <dlfcn.h>
 
@@ -41,6 +42,8 @@
 namespace {
 
 constexpr char const* gpu_execution_setting = "gpu_execution";
+// Set by the backend entry point (sirius-duckdb/src/sirius/sirius_extension.cpp).
+constexpr char const* backend_init_started_key = "sirius_backend_init_started";
 
 /// Outcome of looking for a CUDA 12+ driver. Probed once per process.
 struct cuda_driver {
@@ -117,7 +120,14 @@ struct fallback_gpu_execution_option : duckdb::ExtensionOptionInfo {
              duckdb::Value& parameter,
              bool) const override
   {
-    if (!parameter.IsNull() && parameter.GetValue<bool>()) { status->require_gpu(); }
+    reject_enable(*status, parameter);
+  }
+
+  static void reject_enable(loader_status const& status, duckdb::Value const& value)
+  {
+    if (!value.IsNull() && value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>()) {
+      status.require_gpu();
+    }
   }
 
   loader_status_ptr status;
@@ -131,23 +141,8 @@ struct status_function_info : duckdb::TableFunctionInfo {
 
 /// sirius_status(): one row describing the driver probe and the backend.
 struct status_function {
-  struct row_data : duckdb::FunctionData {
-    explicit row_data(duckdb::vector<duckdb::Value> row) : row(std::move(row)) {}
-
-    duckdb::unique_ptr<duckdb::FunctionData> Copy() const override
-    {
-      return duckdb::make_uniq<row_data>(row);
-    }
-
-    bool Equals(duckdb::FunctionData const& other) const override
-    {
-      return row == other.Cast<row_data>().row;
-    }
-
-    duckdb::vector<duckdb::Value> row;
-  };
-
   struct state : duckdb::GlobalTableFunctionState {
+    duckdb::vector<duckdb::Value> row;
     bool done = false;
   };
 
@@ -159,7 +154,23 @@ struct status_function {
   }
 
  private:
-  static duckdb::unique_ptr<duckdb::FunctionData> bind(duckdb::ClientContext& context,
+  struct status_data : duckdb::FunctionData {
+    explicit status_data(loader_status_ptr status) : status(std::move(status)) {}
+
+    duckdb::unique_ptr<duckdb::FunctionData> Copy() const override
+    {
+      return duckdb::make_uniq<status_data>(status);
+    }
+
+    bool Equals(duckdb::FunctionData const& other) const override
+    {
+      return status == other.Cast<status_data>().status;
+    }
+
+    loader_status_ptr status;
+  };
+
+  static duckdb::unique_ptr<duckdb::FunctionData> bind(duckdb::ClientContext&,
                                                        duckdb::TableFunctionBindInput& input,
                                                        duckdb::vector<duckdb::LogicalType>& types,
                                                        duckdb::vector<duckdb::Identifier>& names)
@@ -174,8 +185,14 @@ struct status_function {
     add("backend_loaded", duckdb::LogicalType::BOOLEAN);
     add("gpu_execution", duckdb::LogicalType::BOOLEAN);
     add("fallback_reason", duckdb::LogicalType::VARCHAR);
+    return duckdb::make_uniq<status_data>(input.info->Cast<status_function_info>().status);
+  }
 
-    auto const& status = *input.info->Cast<status_function_info>().status;
+  // Runs per execution, so a prepared statement sees the current gpu_execution setting.
+  static duckdb::unique_ptr<duckdb::GlobalTableFunctionState> init(
+    duckdb::ClientContext& context, duckdb::TableFunctionInitInput& input)
+  {
+    auto const& status = *input.bind_data->Cast<status_data>().status;
     auto optional      = [](bool present, std::string const& value) {
       return present ? duckdb::Value(value) : duckdb::Value(duckdb::LogicalType::VARCHAR);
     };
@@ -184,33 +201,26 @@ struct status_function {
     auto const active = status.backend_loaded &&
                         context.TryGetCurrentSetting(gpu_execution_setting, enabled) &&
                         !enabled.IsNull() && enabled.GetValue<bool>();
-    duckdb::vector<duckdb::Value> row;
-    row.push_back(duckdb::Value::BOOLEAN(status.driver.found));
-    row.push_back(optional(status.driver.version_known, status.driver.version_string()));
-    row.push_back(optional(!status.backend.empty(), status.backend));
-    row.push_back(duckdb::Value::BOOLEAN(status.backend_loaded));
-    row.push_back(duckdb::Value::BOOLEAN(active));
-    row.push_back(optional(!status.fallback_reason.empty(), status.fallback_reason));
-    return duckdb::make_uniq<row_data>(std::move(row));
-  }
-
-  static duckdb::unique_ptr<duckdb::GlobalTableFunctionState> init(duckdb::ClientContext&,
-                                                                   duckdb::TableFunctionInitInput&)
-  {
-    return duckdb::make_uniq<state>();
+    auto result = duckdb::make_uniq<state>();
+    result->row.push_back(duckdb::Value::BOOLEAN(status.driver.found));
+    result->row.push_back(optional(status.driver.version_known, status.driver.version_string()));
+    result->row.push_back(optional(!status.backend.empty(), status.backend));
+    result->row.push_back(duckdb::Value::BOOLEAN(status.backend_loaded));
+    result->row.push_back(duckdb::Value::BOOLEAN(active));
+    result->row.push_back(optional(!status.fallback_reason.empty(), status.fallback_reason));
+    return std::move(result);
   }
 
   static void scan(duckdb::ClientContext&,
                    duckdb::TableFunctionInput& input,
                    duckdb::DataChunk& output)
   {
-    auto& done = input.global_state->Cast<state>().done;
-    if (done) { return; }
-    auto const& row = input.bind_data->Cast<row_data>().row;
-    for (duckdb::idx_t i = 0; i < row.size(); i++) {
-      output.data[i].Append(row[i]);
+    auto& data = input.global_state->Cast<state>();
+    if (data.done) { return; }
+    for (duckdb::idx_t i = 0; i < data.row.size(); i++) {
+      output.data[i].Append(data.row[i]);
     }
-    done = true;
+    data.done = true;
   }
 };
 
@@ -281,10 +291,11 @@ class sirius_loader {
           status.backend,
           status.driver.version_string());
         duckdb::ErrorData data(error);
-        // A fatal error or a backend that failed after registering its settings leaves state the
-        // CPU fallback cannot vouch for.
+        // Fall back only when the backend never started initializing (not installed, install
+        // failed, unloadable file). A failure inside its initialization is a real GPU problem and
+        // may leave state behind, so report it.
         if (data.Type() == duckdb::ExceptionType::FATAL ||
-            duckdb::DBConfig::GetConfig(db).HasExtensionOption(gpu_execution_setting)) {
+            db.GetObjectCache().GetObject(backend_init_started_key)) {
           data.Throw(prefix);
         }
         status.fallback_reason = prefix + data.RawMessage();
@@ -323,9 +334,8 @@ class sirius_loader {
     // A value configured before the load is still an explicit request; check it before
     // registering anything so a failed LOAD can be retried.
     auto configured = config.options.unrecognized_options.find(gpu_execution_setting);
-    if (configured != config.options.unrecognized_options.end() &&
-        configured->second.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>()) {
-      status->require_gpu();
+    if (configured != config.options.unrecognized_options.end()) {
+      fallback_gpu_execution_option::reject_enable(*status, configured->second);
     }
     duckdb::ExtensionOption option(
       "Whether to transparently intercept SQL queries and execute them on GPU",
