@@ -22,6 +22,8 @@
 #include "ducklake/inline_reader.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "io/io_errors.hpp"
+#include "io/object_identity.hpp"
+#include "op/scan/parquet_delete_reader.hpp"
 #include "planner/connector_registry.hpp"
 
 #include <stdexcept>
@@ -467,108 +469,66 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   };
   check_stop();
-  // Construct the host implementation directly: no catalog callback lookup,
-  // SQL rebind, new connection, or access to the saved CPU reader.
-  ParquetReader reader(*context, OpenFileInfo(unit->delete_path), ParquetOptions(*context));
-  auto& opened  = reader.GetHandle();
-  auto identity = opened.GetFileHandle()->Stats();
-  if (identity.file_type != FileType::FILE_TYPE_REGULAR || !identity.device_id.IsValid() ||
-      !identity.file_id.IsValid() || identity.file_size < 0 ||
-      static_cast<uint64_t>(identity.file_size) != unit->delete_file_size ||
-      opened.GetFileSize() != unit->delete_file_size ||
-      opened.GetLastModifiedTime() != identity.last_modification_time)
-    throw io::descriptor_mismatch_error("DuckLake Parquet delete object differs from binding");
-  auto verify = [&](CachingFileHandle& handle) {
-    auto current = handle.GetFileHandle()->Stats();
-    if (!current.device_id.IsValid() || !current.file_id.IsValid() ||
-        current.device_id.GetIndex() != identity.device_id.GetIndex() ||
-        current.file_id.GetIndex() != identity.file_id.GetIndex() ||
-        current.file_size != identity.file_size ||
-        current.last_modification_time != identity.last_modification_time ||
-        current.version_tag != identity.version_tag)
-      throw io::object_changed_error(unit->delete_path,
-                                     std::to_string(identity.file_size) + ":" +
-                                       std::to_string(identity.last_modification_time.value),
-                                     std::to_string(current.file_size) + ":" +
-                                       std::to_string(current.last_modification_time.value));
+  op::scan::parquet_delete_read_options options;
+  options.expected_size          = unit->delete_file_size;
+  options.expected_footer_size   = unit->delete_footer_size;
+  options.verify_unbound_trailer = true;
+  options.check_stop             = check_stop;
+  options.verify_remote          = [](CachingFileHandle&) {
+    throw io::descriptor_mismatch_error("DuckLake Parquet deletes require a local regular file");
   };
-  uint8_t tail[8];
-  if (unit->delete_file_size < 12)
-    throw io::descriptor_mismatch_error("DuckLake Parquet delete file is truncated");
-  opened.GetFileHandle()->Read(tail, 8, unit->delete_file_size - 8);
-  verify(opened);
-  uint64_t footer_bytes = uint64_t(tail[0]) | (uint64_t(tail[1]) << 8) | (uint64_t(tail[2]) << 16) |
-                          (uint64_t(tail[3]) << 24);
-  if (tail[4] != 'P' || tail[5] != 'A' || tail[6] != 'R' || tail[7] != '1' ||
-      footer_bytes > unit->delete_file_size - 12 ||
-      (unit->delete_footer_size && *unit->delete_footer_size != footer_bytes))
-    throw io::descriptor_mismatch_error("DuckLake Parquet delete footer differs from binding");
-  auto const& columns = reader.GetColumns();
-  if ((columns.size() != 2 && columns.size() != 3) ||
-      columns[0].type != duckdb::LogicalType::VARCHAR ||
-      columns[1].type != duckdb::LogicalType::BIGINT)
-    throw std::runtime_error(
-      "DuckLake Parquet delete schema requires file name and BIGINT position");
-  if (columns.size() == 3 && columns[2].name == "_ducklake_internal_snapshot_id")
-    throw std::runtime_error(
-      "DuckLake snapshot-bearing Parquet deletes are outside the local scan profile");
-  if (reader.NumRows() > dv_max_positions)
-    throw scan_manager::preparation_resource_error("DuckLake Parquet delete positions exceed limit",
-                                                   true);
-  auto result     = std::make_shared<dv_visibility>();
-  result->merged  = allocator.allocate_retained(reader.NumRows() * sizeof(int64_t));
-  auto* positions = reinterpret_cast<int64_t*>(result->merged.data());
-  reader.column_indexes.emplace_back(1);
-  reader.column_ids.emplace_back(1);
-  ParquetReadGlobalState global(nullptr);
-  ParquetReadLocalState local;
-  DataChunk chunk;
-  chunk.Initialize(*context, {duckdb::LogicalType::BIGINT});
-  size_t count     = 0;
+  auto result = std::make_shared<dv_visibility>();
+  std::span<int64_t> positions;
   int64_t previous = -1;
-  while (reader.TryInitializeScan(*context, global, local)) {
-    check_stop();
-    reader.PrepareScan(*context, global, local);
-    verify(*local.scan_state.file_handle);
-    auto io = reader.ScheduleIO(*context, global, local);
-    if (io.HasTasks()) io.ExecuteTasksSynchronously();
-    if (io.GetResultType() != AsyncResultType::HAVE_MORE_OUTPUT)
-      throw std::runtime_error("DuckLake Parquet delete I/O did not complete");
-    while (true) {
-      check_stop();
-      verify(*local.scan_state.file_handle);
-      chunk.Reset();
-      auto scan = reader.Scan(*context, global, local, chunk);
-      if (scan.HasTasks()) {
-        scan.ExecuteTasksSynchronously();
-        continue;
-      }
-      auto status = scan.GetResultType();
-      verify(*local.scan_state.file_handle);
-      if (status != AsyncResultType::HAVE_MORE_OUTPUT && status != AsyncResultType::FINISHED)
-        throw std::runtime_error("DuckLake Parquet deletes require synchronous native decoding");
-      for (idx_t row = 0; row < chunk.size(); ++row) {
-        auto value = chunk.GetValue(0, row);
-        if (value.IsNull())
-          throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
-        auto position = value.GetValue<int64_t>();
-        validate_delete_position(position, previous);
-        if (count >= reader.NumRows())
-          throw std::runtime_error("DuckLake Parquet deletes exceed footer coverage");
-        positions[count++] = position;
-      }
-      if (status == AsyncResultType::FINISHED) break;
+  bool ordered     = false;
+  op::scan::read_parquet_delete_batches(
+    *context,
+    OpenFileInfo(unit->delete_path),
+    options,
+    [&](auto const& columns, uint64_t rows) {
+      if ((columns.size() != 2 && columns.size() != 3) ||
+          columns[0].type != duckdb::LogicalType::VARCHAR ||
+          columns[1].type != duckdb::LogicalType::BIGINT)
+        throw std::runtime_error(
+          "DuckLake Parquet delete schema requires file name and BIGINT position");
+      if (columns.size() == 3 &&
+          StringUtil::CIEquals(columns[2].name, "_ducklake_internal_snapshot_id"))
+        throw std::runtime_error(
+          "DuckLake snapshot-bearing Parquet deletes are outside the local scan profile");
+      if (rows > dv_max_positions)
+        throw scan_manager::preparation_resource_error(
+          "DuckLake Parquet delete positions exceed limit", true);
+      result->merged = allocator.allocate_retained(rows * sizeof(int64_t));
+      positions = {reinterpret_cast<int64_t*>(result->merged.data()), static_cast<size_t>(rows)};
+      return std::vector<uint64_t>{1};
+    },
+    [&](bool in_file_order) {
+      ordered = in_file_order;
+      return [&, in_file_order](uint64_t offset, DataChunk& chunk) {
+        UnifiedVectorFormat pos;
+        chunk.data[0].ToUnifiedFormat(pos);
+        auto values = pos.GetData<int64_t>();
+        for (idx_t row = 0; row < chunk.size(); ++row) {
+          auto index = pos.sel->get_index(row);
+          if (!pos.validity.RowIsValid(index))
+            throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
+          auto value = values[index];
+          if (in_file_order) validate_delete_position(value, previous);
+          positions[offset + row] = value;
+        }
+      };
+    });
+  validate_statement();
+  if (!ordered) {
+    for (size_t row = 0; row < positions.size(); ++row) {
+      if (row % STANDARD_VECTOR_SIZE == 0) check_stop();
+      validate_delete_position(positions[row], previous);
     }
   }
-  verify(opened);
   check_stop();
-  if (count != reader.NumRows())
-    throw std::runtime_error("DuckLake Parquet deletes have incomplete footer coverage");
   result->delete_identity =
-    "duckdb.local.parquet:" + std::to_string(identity.device_id.GetIndex()) + ":" +
-    std::to_string(identity.file_id.GetIndex()) + ":" + std::to_string(identity.file_size) + ":" +
-    std::to_string(identity.last_modification_time.value) + ":" + identity.version_tag;
-  result->positions         = {positions, count};
+    "duckdb.local.parquet.read:" + std::to_string(io::next_open_generation());
+  result->positions         = positions;
   result->parquet_validated = true;
   return result;
 #else

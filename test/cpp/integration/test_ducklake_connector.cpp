@@ -187,6 +187,7 @@ struct observed_host_reservations : sirius::scan_manager::reservation_provider {
     uint64_t grants = 0, live = 0, peak_live = 0, peak_grants = 0, host_capacity = 0;
     size_t active = 0, peak_active = 0;
     bool exceeded = false;
+    std::function<void(uint64_t)> on_allocate;
   };
   struct backing : sirius::scan_manager::reservation_backing,
                    std::enable_shared_from_this<backing> {
@@ -216,7 +217,8 @@ struct observed_host_reservations : sirius::scan_manager::reservation_provider {
     sirius::scan_manager::backing_allocation allocate(uint64_t bytes) override
     {
       auto allocation = original->allocate(bytes);
-      auto charge     = charge_size(bytes);
+      if (seen->on_allocate) seen->on_allocate(bytes);
+      auto charge = charge_size(bytes);
       {
         std::lock_guard lock(seen->mutex);
         live += charge;
@@ -2275,4 +2277,149 @@ TEST_CASE_METHOD(ducklake_fixture,
       CHECK(read_width <= width);
   }
   if (local) query(con, "ROLLBACK");
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake validates local Parquet deletes across parallel row group boundaries",
+                 "[ducklake][ducklake_parallel_deletes][isolated_context]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  run("SET gpu_execution=false");
+  run("SET threads=1");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  run("CALL lake.set_option('write_deletion_vectors',false)");
+  run("CREATE TABLE lake.q AS SELECT i::BIGINT id FROM range(16384) t(i)");
+  run("DELETE FROM lake.q WHERE id % 2 = 0");
+  auto files = run("SELECT delete_file FROM ducklake_list_files('lake','q')");
+  REQUIRE(files->RowCount() == 1);
+  auto source           = files->Collection().GetValue(0, 0).ToSQLString();
+  const std::string sql = "SELECT sum(id) FROM lake.q";
+  auto expected         = ducklake_result_bag(*run(sql));
+  for (int delta : {0, 2, 4}) {
+    CAPTURE(delta);
+    run("SET gpu_execution=false");
+    run("SET threads=1");
+    auto path =
+      std::filesystem::path(disk.directory) / ("deletes-" + std::to_string(delta) + ".parquet");
+    auto dest       = duckdb::Value(path.string()).ToSQLString();
+    std::string pos = "CASE WHEN pos=4096 THEN pos-" + std::to_string(delta) + " ELSE pos END";
+    run("COPY (SELECT file_path," + pos + " AS pos FROM read_parquet(" + source +
+        ") t ORDER BY t.pos) TO " + dest + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE(run("SELECT count(DISTINCT row_group_id) FROM parquet_metadata(" + dest + ")")
+              ->Collection()
+              .GetValue(0, 0)
+              .GetValue<int64_t>() == 4);
+    run("UPDATE __ducklake_metadata_lake.ducklake_delete_file SET path=" + dest +
+        ",path_is_relative=false,footer_size=NULL,file_size_bytes=" +
+        std::to_string(std::filesystem::file_size(path)));
+    run("SET threads=4");
+    run("SET enable_duckdb_fallback=false");
+    run("SET gpu_execution=true");
+    if (delta) {
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      REQUIRE(result->HasError());
+      CHECK(result->GetError().find("strictly increasing") != std::string::npos);
+    } else {
+      check_gpu_result(sql, expected);
+    }
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Interrupting a DuckLake Parquet delete read preserves cancellation",
+                 "[isolated_context][ducklake][ducklake_delete_interrupt]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  run("CALL lake.set_option('write_deletion_vectors',false)");
+  run("CREATE TABLE lake.q AS SELECT range id FROM range(4096)");
+  run("DELETE FROM lake.q WHERE id < 1234");
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=true");
+  run("SET sirius_test_sync_cpu_replay=true");
+  auto runtime  = sirius::test::get_registered_sirius_context(con);
+  auto counters = runtime->physical_counters();
+  auto observed = std::make_shared<observed_host_reservations>(runtime->get_memory_manager());
+  std::atomic<unsigned> interrupts{0}, replays{0};
+  // The delete reader has bound the footer and is reserving its position vector.
+  observed->seen->on_allocate = [&](uint64_t bytes) {
+    if (bytes == 1234 * sizeof(int64_t)) {
+      ++interrupts;
+      con.Interrupt();
+    }
+  };
+  counters->track_units                      = true;
+  counters->preparation_provider_for_testing = observed;
+  runtime->cpu_replay_hook_for_testing       = [&] { ++replays; };
+  auto cleanup                               = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->preparation_provider_for_testing.reset();
+    runtime->cpu_replay_hook_for_testing = {};
+  });
+  SECTION("the query returns cancellation without replay")
+  {
+    auto result = con.Query("SELECT sum(id) FROM lake.q");
+    REQUIRE(interrupts == 1);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetErrorObject().Type() == duckdb::ExceptionType::INTERRUPT);
+    CHECK(replays == 0);
+  }
+  SECTION("the delete preparation job preserves the original exception")
+  {
+    namespace dl = sirius::ducklake;
+    namespace sm = sirius::scan_manager;
+    run("SET gpu_execution=false");
+    auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+    bool interrupted_job   = false;
+    observer->inspect_plan = [&](duckdb::ClientContext& ctx, duckdb::LogicalOperator& plan) {
+      if (&ctx != con.context.get()) return;
+      auto visit = [&](auto&& self, duckdb::LogicalOperator& node) -> void {
+        if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+          auto& get = node.Cast<duckdb::LogicalGet>();
+          if (get.function.GetName() == "ducklake_scan") {
+            auto binding = dl::binding_handle::capture(get.function, get.bind_data.get(), ctx);
+            binding->bind_execution_owner();
+            binding->configure_scan({0}, nullptr);
+            auto budget = std::make_unique<sm::preparation_ledger>(*observed);
+            std::vector<sm::scan_envelope> envelopes{
+              {{dl::scan_ingestible::envelope(1, 0)}, {}, true, 1}};
+            auto decision = budget->admit(envelopes, observed->space);
+            auto admission =
+              std::make_shared<sm::preparation_admission>(std::move(budget), decision);
+            auto source = binding->make_parquet_unit(0, 1, 1, admission, {0});
+            source->attach_preparation_ledger(
+              std::shared_ptr<sm::preparation_ledger>(admission->consume()));
+            auto lanes = source->make_preparation_sources({});
+            auto claim = lanes.front().try_claim();
+            auto job   = std::get<sm::preparation_job>(std::move(claim));
+            try {
+              job.run({});
+            } catch (duckdb::InterruptException const&) {
+              interrupted_job = true;
+              throw;
+            }
+          }
+        }
+        for (auto& child : node.children)
+          self(self, *child);
+      };
+      visit(visit, plan);
+    };
+    duckdb::OptimizerExtension hook;
+    hook.optimizer_info        = observer;
+    hook.pre_optimize_function = observe_provider_query;
+    duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context),
+                                         std::move(hook));
+    auto detach = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+    auto result = con.Query("SELECT sum(id) FROM lake.q");
+    REQUIRE(result->HasError());
+    REQUIRE(interrupts == 1);
+    CHECK(interrupted_job);
+  }
+  CHECK(observed->seen->live == 0);
+  CHECK(observed->seen->grants == 0);
 }
