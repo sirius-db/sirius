@@ -278,6 +278,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
+    test/cpp/planner/test_connector_overrides.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_gpu_admission.cpp
