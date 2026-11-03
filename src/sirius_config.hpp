@@ -134,9 +134,9 @@ constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 10
 /// 0 = auto: a share of the pinning GPU memory space's capacity, below.
 constexpr uint64_t DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES = 0;
 
-/// Share of the GPU memory space capacity one column may occupy in the pin-time exact uniqueness
-/// check when its cap is auto. The check's peak is about three times the column, so this keeps it
-/// near 30% of the space.
+/// Share of the GPU memory space capacity that the values retained across all columns may occupy
+/// in the pin-time exact uniqueness check when its cap is auto. The check's peak is about three
+/// times the retained bytes, so this keeps it near 30% of the space.
 constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 
 }  // namespace config

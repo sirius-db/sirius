@@ -100,10 +100,11 @@ namespace sirius::late_mat {
 ///
 /// An automatic column is held to a stricter standard than an explicit one: it must be an integer
 /// column, and a chunk that is not sorted is sorted on the spot to count its distinct values, so a
-/// column that repeats a value is refused on its first chunk instead of being retained for the
-/// exact stage. Observing every column of a wide fact table therefore costs at most one sort of one
-/// chunk per integer column. Join keys of TPC-H pins (`o_orderkey`, `p_partkey`, `s_suppkey`, ...)
-/// pass.
+/// value repeated within a chunk refuses the column at once instead of retaining it for the exact
+/// stage. A column that stays a candidate is sorted again on each of its unsorted chunks; a
+/// repeat across chunks is caught only by the exact stage. Most columns of a fact table repeat a
+/// value in their first chunk and are refused there. Join keys of TPC-H pins (`o_orderkey`,
+/// `p_partkey`, `s_suppkey`, ...) pass.
 [[nodiscard]] std::vector<bool> pin_unique_automatic_selection(
   std::vector<bool> const& explicitly_selected, bool prove_unique_keys);
 
