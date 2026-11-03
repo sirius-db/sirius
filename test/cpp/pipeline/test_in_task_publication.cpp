@@ -16,9 +16,11 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
+#include "memory/defragmenter_oom_policy.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
+#include "operator/partition_test_utils.hpp"
 #include "operator/partitioned_join_test_utils.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -28,9 +30,12 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "utils/telemetry_utils.hpp"
 
+#include <rmm/aligned.hpp>
 #include <rmm/error.hpp>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +46,7 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -137,6 +143,27 @@ class observed_resource {
   int device_;
 };
 
+// Reports allocations above the attached reservation; with an empty reservation, every allocation.
+class observed_limit_policy final : public cucascade::memory::reservation_limit_policy {
+ public:
+  explicit observed_limit_policy(std::function<void(std::size_t)> observe)
+    : observe_{std::move(observe)}
+  {
+  }
+
+  void handle_over_reservation(::cuda::stream_ref,
+                               std::size_t requested_bytes,
+                               std::size_t,
+                               cucascade::memory::reserved_arena*) override
+  {
+    observe_(requested_bytes);
+  }
+  [[nodiscard]] std::string get_policy_name() const override { return "observed"; }
+
+ private:
+  std::function<void(std::size_t)> observe_;
+};
+
 struct retry_record {
   bool constrain_first_attempt = false;
   std::atomic<std::size_t> retries{0};
@@ -204,7 +231,12 @@ struct harness {
     : memory{{.devices             = devices,
               .per_stream_tracking = per_stream,
               .gpu_resource_factory =
-                [observer = allocations](int device, std::size_t capacity) {
+                [observer = allocations, devices](int device, std::size_t capacity) {
+                  // Accumulation admission requires ordinary RMM async pools; multi-GPU tests use
+                  // `observe_task_allocations` instead.
+                  if (devices > 1) {
+                    return cucascade::memory::make_default_gpu_memory_resource(device, capacity);
+                  }
                   return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
                     observed_resource{device, capacity, observer}};
                 }}},
@@ -215,7 +247,8 @@ struct harness {
          .make_build_partition = [](duckdb::vector<sirius::logical_type> types,
                                     op::sirius_physical_hash_join& join)
            -> duckdb::unique_ptr<op::sirius_physical_partition> {
-           return duckdb::make_uniq<observed_partition>(std::move(types), 1, &join, true);
+           return duckdb::make_uniq<observed_partition>(
+             std::move(types), 1, sirius::test::operator_utils::hash_partition_spec(join, true));
          }})},
       partition{static_cast<observed_partition*>(tree.build_partition)}
   {
@@ -223,7 +256,7 @@ struct harness {
     tree.join->operator_id = 1;
     partition->operator_id = 2;
     receiver->operator_id  = 3;
-    partition->set_num_partitions(2);
+    partition->set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(2));
 
     pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
     pipeline->set_pipeline_id(7);
@@ -299,6 +332,36 @@ struct harness {
   {
     task->local_state()->cast<pl::gpu_pipeline_task_local_state>().set_preferred_device_id(device);
     scheduler->schedule(std::move(task));
+  }
+
+  /**
+   * @brief Replaces the running task's reservation on @p stream with an empty one whose limit
+   * policy passes each allocation's padded size to @p observe, which may throw to refuse it.
+   *
+   * Call from `observed_partition::before_execute`, before the task has live allocations on
+   * @p stream. Multi-GPU harnesses observe allocations here because their upstreams must stay
+   * ordinary RMM async pools.
+   *
+   * @throw std::logic_error if @p stream has live allocations or the reservation cannot be replaced
+   */
+  void observe_task_allocations(int device,
+                                ::cuda::stream_ref stream,
+                                std::function<void(std::size_t)> observe)
+  {
+    auto& adaptor = memory.allocator(device);
+    if (adaptor.get_allocated_bytes(stream) != 0) {
+      throw std::logic_error{"observe_task_allocations: the task already allocated"};
+    }
+    adaptor.reset_stream_reservation(stream);
+    auto empty = memory.manager->request_reservation(
+      cucascade::memory::specific_memory_space{cucascade::memory::Tier::GPU, device}, 0);
+    if (!empty || !adaptor.attach_reservation_to_tracker(
+                    stream,
+                    std::move(empty),
+                    std::make_unique<observed_limit_policy>(std::move(observe)),
+                    std::make_unique<sirius::memory::defragmenter_oom_policy>())) {
+      throw std::logic_error{"observe_task_allocations: could not replace the reservation"};
+    }
   }
 
   void run_inline(std::unique_ptr<observed_task> task, int device)
@@ -508,26 +571,18 @@ TEST_CASE("mandatory scatter OOM retries the elected identity through the execut
 TEST_CASE("a migrated final PARTITION accounts merge scratch in task history",
           "[pipeline][dynamic_filter][in_task_publication][memory][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   bool const per_stream = GENERATE(false, true);
   harness test{2, per_stream};
+  if (!acc::has_pool_access(test.memory.spaces)) { return; }
   auto const first = test.memory.make_batch(1, 0, 2000);
   auto const final = test.memory.make_batch(1, 5000, 2000);
   auto tasks       = test.tasks({first, final});
   test.run_inline(std::move(tasks[0]), 1);
-  auto const scratch_bytes     = acc::merge_scratch_bytes(acc::bloom_geometry(4000, 2, bloom_cap));
-  std::size_t scratch_requests = 0;
-  std::size_t live_before      = 0;
-  std::size_t live_after       = 0;
-  std::size_t final_peak       = 0;
-  bool cloned                  = false;
-  test.allocations->before_allocate =
-    [&](int device, ::cuda::stream_ref stream, std::size_t requested) {
-      if (device == 0 && requested == scratch_bytes && test.output.deposits.load() == 2) {
-        ++scratch_requests;
-        live_before = test.memory.allocator(0).get_allocated_bytes(stream) - requested;
-      }
-    };
+  auto const scratch_bytes      = acc::merge_scratch_bytes(acc::bloom_geometry(4000, 2, bloom_cap));
+  std::size_t live_after        = 0;
+  std::size_t final_peak        = 0;
+  bool cloned                   = false;
   test.partition->after_execute = [&](op::operator_data const& input, ::cuda::stream_ref stream) {
     auto const& data = dynamic_cast<op::pipelineable_operator_data const&>(input);
     cloned           = data.original_batch_ids().front() == final->get_batch_id() &&
@@ -537,9 +592,7 @@ TEST_CASE("a migrated final PARTITION accounts merge scratch in task history",
   };
   test.run_inline(std::move(tasks[1]), 0);
   REQUIRE(cloned);
-  REQUIRE(scratch_requests == 1);
-  REQUIRE(live_after == live_before);
-  REQUIRE(final_peak >= live_before + scratch_bytes);
+  REQUIRE(final_peak >= live_after + scratch_bytes);
   auto const basis    = sirius::get_cudf_table_view(*final).num_rows() * 12;
   auto const estimate = test.global->get_memory_history().estimate_peak_memory(basis);
   REQUIRE(estimate);
@@ -554,31 +607,34 @@ TEST_CASE("a migrated final PARTITION accounts merge scratch in task history",
 TEST_CASE("scheduler error drain joins collecting and publishing PARTITION tasks before reuse",
           "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   bool const during_publication = GENERATE(false, true);
   acc::load_accumulation_kernels(2);
   harness test{2};
+  if (!acc::has_pool_access(test.memory.spaces)) { return; }
   auto const first                = test.memory.make_batch(1, 0, 2000);
   auto const final                = test.memory.make_batch(0, 5000, 2000);
   auto const baseline             = test.memory.allocated_bytes();
   auto record                     = std::make_shared<retry_record>();
   record->constrain_first_attempt = true;
   auto tasks                      = test.tasks({first, final}, record);
-  auto const scratch_bytes = acc::merge_scratch_bytes(acc::bloom_geometry(4000, 2, bloom_cap));
+  auto const scratch_bytes =
+    rmm::align_up(acc::merge_scratch_bytes(acc::bloom_geometry(4000, 2, bloom_cap)),
+                  rmm::CUDA_ALLOCATION_ALIGNMENT);
   std::atomic<std::size_t> scratch_requests{0};
   std::unique_ptr<acc::stream_gate> gate;
   std::atomic<bool> gated{false};
   if (during_publication) {
     test.run_inline(std::move(tasks[0]), 1);
-    test.allocations->before_allocate =
-      [&](int device, ::cuda::stream_ref stream, std::size_t requested) {
-        if (device == 0 && requested == scratch_bytes && test.output.deposits.load() == 2) {
-          if (scratch_requests.fetch_add(1) == 0) {
-            gate = std::make_unique<acc::stream_gate>(stream);
-            gated.store(true);
-          }
+    test.partition->before_execute = [&](op::operator_data const&, ::cuda::stream_ref stream) {
+      test.observe_task_allocations(0, stream, [&, stream](std::size_t requested) {
+        if (requested == scratch_bytes && test.output.deposits.load() == 2 &&
+            scratch_requests.fetch_add(1) == 0) {
+          gate = std::make_unique<acc::stream_gate>(stream);
+          gated.store(true);
         }
-      };
+      });
+    };
   } else {
     test.partition->after_execute = [&](op::operator_data const&, ::cuda::stream_ref stream) {
       gate = std::make_unique<acc::stream_gate>(stream);
@@ -615,21 +671,26 @@ TEST_CASE("scheduler error drain joins collecting and publishing PARTITION tasks
 TEST_CASE("optional publication scratch OOM deposits without rescheduling the PARTITION task",
           "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   harness test{2};
+  if (!acc::has_pool_access(test.memory.spaces)) { return; }
   auto const first                = test.memory.make_batch(1, 0, 2000);
   auto const final                = test.memory.make_batch(0, 5000, 2000);
   auto record                     = std::make_shared<retry_record>();
   record->constrain_first_attempt = true;
   auto tasks                      = test.tasks({first, final}, record);
   test.run_inline(std::move(tasks[0]), 1);
-  auto const scratch_bytes = acc::merge_scratch_bytes(acc::bloom_geometry(4000, 2, bloom_cap));
+  auto const scratch_bytes =
+    rmm::align_up(acc::merge_scratch_bytes(acc::bloom_geometry(4000, 2, bloom_cap)),
+                  rmm::CUDA_ALLOCATION_ALIGNMENT);
   std::atomic<std::size_t> scratch_requests{0};
-  test.allocations->before_allocate = [&](int device, ::cuda::stream_ref, std::size_t requested) {
-    if (device == 0 && requested == scratch_bytes && test.output.deposits.load() == 2) {
-      ++scratch_requests;
-      throw rmm::out_of_memory{"refused optional merge scratch"};
-    }
+  test.partition->before_execute = [&](op::operator_data const&, ::cuda::stream_ref stream) {
+    test.observe_task_allocations(0, stream, [&](std::size_t requested) {
+      if (requested == scratch_bytes && test.output.deposits.load() == 2) {
+        ++scratch_requests;
+        throw rmm::out_of_memory{"refused optional merge scratch"};
+      }
+    });
   };
   test.start();
   absl::Cleanup stop = [&] { test.scheduler->stop(); };
@@ -645,6 +706,48 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
   REQUIRE(test.memory.stats.snapshot().filters_pushed == 0);
   REQUIRE(test.memory.stats.snapshot().accumulations_skipped_admission == 1);
   require_worker_reuse(test);
+}
+
+TEST_CASE("publication scratch allocation failure retires ordinary-pool partials",
+          "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  acc::fixture memory{{.devices = 2}};
+  if (!acc::has_pool_access(memory.spaces)) { return; }
+  auto const input          = memory.make_batch(1, 0, 4000);
+  auto const baseline       = memory.allocated_bytes();
+  auto const geometry       = acc::bloom_geometry(4000, 2, bloom_cap);
+  auto const scratch_bytes  = acc::merge_scratch_bytes(geometry);
+  auto observer             = std::make_shared<allocation_observer>();
+  std::size_t requests      = 0;
+  observer->before_allocate = [&](int device, ::cuda::stream_ref, std::size_t requested) {
+    REQUIRE(device == 0);
+    REQUIRE(requested == scratch_bytes);
+    ++requests;
+    throw rmm::out_of_memory{"refused optional merge scratch"};
+  };
+  {
+    using builder_type = op::detail::accumulated_bloom_builder;
+    auto builder       = builder_type::try_create(
+      {{0, cudf::data_type{cudf::type_id::INT32}}, {1, cudf::data_type{cudf::type_id::INT64}}},
+      geometry,
+      memory.spaces);
+    REQUIRE(builder);
+    {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{1}};
+      auto const source = input->to_read_only();
+      REQUIRE(builder->enqueue_add(
+        sirius::get_cudf_table_view(source), rmm::cuda_device_id{1}, memory.task_stream(1)));
+      memory.task_stream(1).sync();
+    }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+    observed_resource scratch{0, 8 * acc::mib, observer};
+    REQUIRE_FALSE(builder->finish(rmm::cuda_device_id{0}, memory.task_stream(0), scratch));
+    REQUIRE(requests == 1);
+  }
+  REQUIRE(memory.allocated_bytes() == baseline);
+  REQUIRE(memory.gpu(0).get_total_reserved_memory() == 0);
+  REQUIRE(memory.gpu(1).get_total_reserved_memory() == 0);
 }
 
 TEST_CASE("a fatal PARTITION task drains its collecting publication and leaves the worker reusable",

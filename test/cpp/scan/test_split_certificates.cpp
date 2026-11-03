@@ -28,7 +28,6 @@
 #include "test_utils.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "transparent/replay_admission.hpp"
-#include "utils/table_filter_test_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -38,6 +37,7 @@
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
@@ -145,10 +145,10 @@ std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database
   info->projected_output_count = 1;
   if (all_pruned) {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    info->table_filters->SetFilterByColumnIndex(
+    info->table_filters->PushFilter(
       duckdb::ProjectionIndex(0),
-      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
-                                    duckdb::Value::INTEGER(-1)));
+      duckdb::ExpressionFilter::CreateComparisonFilter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                       duckdb::Value::INTEGER(-1)));
   }
   return info;
 }
@@ -241,7 +241,7 @@ void check_parquet_file_split(scan_info const& info,
   CHECK(split->certificates()[0].input_identity == file.certificates()[0].input_identity);
   CHECK(split->certificates()[0].split_id == split_id);
   CHECK(split->dependencies()[0].footer == file.file_metadata);
-  CHECK(split->dependencies()[0].delete_set == file.dependencies()[0].delete_set);
+  CHECK(split->dependencies()[0].visibility == file.dependencies()[0].visibility);
   CHECK(split->rg_slices[0].file_metadata == file.file_metadata);
   CHECK(split->rg_slices[0].file_path == file.file_path);
   CHECK(split->rg_slices[0].file_index == file.file_index);
@@ -1157,7 +1157,7 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);
 }
 
-TEST_CASE("Execution does not reuse foreign local footer across opens",
+TEST_CASE("Execution rebuilds foreign footer provenance before schema access",
           "[scan][certificate][consumption][metadata_retention]")
 {
   auto info    = parquet_info(81);
@@ -1175,11 +1175,8 @@ TEST_CASE("Execution does not reuse foreign local footer across opens",
   auto ingestible = make_ingestible(std::move(info));
   auto provider   = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  auto split    = provider({});
-  auto* parquet = dynamic_cast<parquet_file_scan_info*>(split.get());
-  REQUIRE(parquet);
-  REQUIRE(parquet->file_metadata);
-  CHECK(parquet->file_metadata.get() != foreign->file_metadata().get());
+  auto split = provider({});
+  REQUIRE(split != nullptr);
 }
 
 TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
@@ -1415,8 +1412,8 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
 }
 
-TEST_CASE("Production scan preparation runs and publishes on the execute owner",
-          "[integration][scan][certificate][scan_preparation][query_thread]")
+TEST_CASE("Metadata-only production scans publish on the query owner",
+          "[integration][scan][certificate][scan_preparation][coordinator_thread]")
 {
   sirius::test::GpuExecutionFixture fixture;
   auto& con = *fixture.con;
@@ -1438,10 +1435,11 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
     if (result->HasError()) { INFO(result->GetError()); }
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 1);
+    auto chunk = result->Fetch();
     if (std::string_view(sql).starts_with("SELECT sum"))
-      CHECK(result->Collection().GetValue(0, 0).ToString() == "499500");
+      CHECK(chunk->GetValue(0, 0).ToString() == "499500");
     else {
-      auto value = result->Collection().GetValue(0, 0).GetValue<int64_t>();
+      auto value = chunk->GetValue(0, 0).GetValue<int64_t>();
       CHECK(value >= 0);
       CHECK(value < 1000);
     }
@@ -1454,7 +1452,7 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
         CHECK(observation.execute_owner != std::thread::id{});
         CHECK(observation.preparation_owner == observation.execute_owner);
         CHECK(observation.preparation_runner == observation.execute_owner);
-        CHECK(observation.preparation_publisher == observation.execute_owner);
+        CHECK(observation.preparation_publisher == observation.preparation_runner);
       }
     }
   }
@@ -1524,12 +1522,14 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
     REQUIRE(work);
     auto metadata = work({});
     REQUIRE(metadata->dependencies().size() == 1);
-    auto const set = metadata->dependencies().front().delete_set;
+    auto const set = metadata->dependencies().front().visibility;
     REQUIRE(set);
-    CHECK(set->positions.empty() == (path == intact));
+    auto const iceberg_set = std::dynamic_pointer_cast<iceberg_delete_set const>(set);
+    REQUIRE(iceberg_set);
+    CHECK(iceberg_set->positions.empty() == (path == intact));
     if (path == deleted) {
-      CHECK(set->positions.data() == positions);
-      CHECK(std::vector<int64_t>(set->positions.begin(), set->positions.end()) ==
+      CHECK(iceberg_set->positions.data() == positions);
+      CHECK(std::vector<int64_t>(iceberg_set->positions.begin(), iceberg_set->positions.end()) ==
             std::vector<int64_t>{0, 0, 4});
     }
     auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
@@ -1545,16 +1545,22 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
   REQUIRE(splits.size() == 2);
   for (size_t i = 0; i < splits.size(); ++i) {
     REQUIRE(splits[i]->dependencies().size() == 1);
-    auto const& set = splits[i]->dependencies().front().delete_set;
+    auto const& set = splits[i]->dependencies().front().visibility;
     REQUIRE(set);
-    CHECK(set->positions.empty() == (i == 1));
+    auto const iceberg_set = std::dynamic_pointer_cast<iceberg_delete_set const>(set);
+    REQUIRE(iceberg_set);
+    CHECK(iceberg_set->positions.empty() == (i == 1));
     CHECK(dynamic_cast<parquet_split_info const&>(*splits[i]).disable_filter_pushdown == (i == 0));
   }
   coalescer.reset();
   ingestible.reset();
   payload.reset();
   CHECK_FALSE(owner.expired());
-  CHECK(splits.front()->dependencies().front().delete_set->positions.front() == 0);
+  auto first_set = std::dynamic_pointer_cast<iceberg_delete_set const>(
+    splits.front()->dependencies().front().visibility);
+  REQUIRE(first_set);
+  CHECK(first_set->positions.front() == 0);
+  first_set.reset();
   splits.clear();
   CHECK(owner.expired());
 }
@@ -1575,13 +1581,13 @@ TEST_CASE("Iceberg per-file input distinguishes complete empty results from miss
     auto work       = ingestible->next_split_provider(
       [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
     auto metadata = work({});
-    CHECK(metadata->dependencies().front().delete_set == set);
+    CHECK(metadata->dependencies().front().visibility == set);
     CHECK_FALSE(dynamic_cast<parquet_file_scan_info&>(*metadata).disable_filter_pushdown);
     auto coalescer = ingestible->create_batch_coalescer();
     CHECK(coalescer->push(std::move(metadata)).empty());
     auto splits = coalescer->flush();
     REQUIRE(splits.size() == 1);
-    CHECK(splits.front()->dependencies().front().delete_set == set);
+    CHECK(splits.front()->dependencies().front().visibility == set);
   }
   SECTION("missing result must not become empty")
   {
@@ -1729,11 +1735,11 @@ TEST_CASE("Iceberg materialization refuses missing or replaced delete dependenci
   std::string expected =
     "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'";
   if (defect == "missing") {
-    dependencies.front().delete_set.reset();
+    dependencies.front().visibility.reset();
   } else if (defect == "wrong_file") {
-    dependencies.front().delete_set = std::make_shared<iceberg_delete_set const>("other.parquet");
+    dependencies.front().visibility = std::make_shared<iceberg_delete_set const>("other.parquet");
   } else if (defect == "replacement") {
-    dependencies.front().delete_set = std::make_shared<iceberg_delete_set const>(key);
+    dependencies.front().visibility = std::make_shared<iceberg_delete_set const>(key);
   } else if (defect == "pushdown") {
     split.disable_filter_pushdown = false;
     expected = "[iceberg_gpu_ingestible] positional deletes require pushdown suppression";

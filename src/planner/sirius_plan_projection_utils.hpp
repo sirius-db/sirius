@@ -61,6 +61,21 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_projection(
   std::size_t estimated_cardinality);
 
 /**
+ * @brief Project all of @p child's columns unchanged, followed by @p appended.
+ *
+ * @param child Subtree whose columns are passed through.
+ * @param appended Expressions evaluated over @p child's columns, added after them.
+ * @param appended_types Types of @p appended, one per expression.
+ * @param estimated_cardinality Cardinality estimate carried on the projection operator.
+ * @return The projection (see push_projection), or @p child if @p appended is empty.
+ */
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_appending_projection(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> appended,
+  duckdb::vector<sirius::logical_type> appended_types,
+  std::size_t estimated_cardinality);
+
+/**
  * @brief Recursively fold PROJECTION → PROJECTION chains anywhere in a finished plan.
  *
  * @param plan Root of the physical operator tree to optimize in place.

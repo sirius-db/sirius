@@ -1,6 +1,7 @@
 #include "codegen/jit/kernel_cache.hpp"
 
 #include "compilation_request.hpp"
+#include "disk_cache.hpp"
 
 #include <unistd.h>
 
@@ -9,11 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <string>
-#include <system_error>
 #include <vector>
 
 namespace codegen::jit {
@@ -60,45 +58,14 @@ const std::string& disk_cache_dir()
   return dir;
 }
 
-bool read_cubin_file(const std::string& path, std::vector<char>& out)
-{
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f) return false;
-  const std::streamsize n = f.tellg();
-  if (n <= 0) return false;
-  out.resize(static_cast<std::size_t>(n));
-  f.seekg(0);
-  return static_cast<bool>(f.read(out.data(), n));
-}
-
-// Atomic publish: write to a pid-unique temp then rename into place, so
-// concurrent shard processes can never observe a half-written cubin.
-void write_cubin_file_atomic(const std::string& path, const std::vector<char>& bytes)
-{
-  std::error_code ec;
-  std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-  const std::string tmp = path + ".tmp." + std::to_string(static_cast<long>(::getpid()));
-  {
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if (!f) return;
-    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    if (!f) {
-      f.close();
-      std::remove(tmp.c_str());
-      return;
-    }
-  }
-  if (std::rename(tmp.c_str(), path.c_str()) != 0) std::remove(tmp.c_str());
-}
 }  // namespace
 
 void clear_jit_disk_cache()
 {
-  const std::string& d = disk_cache_dir();
-  if (d.empty()) return;
-  std::error_code ec;
-  for (auto const& entry : std::filesystem::directory_iterator(d, ec)) {
-    if (entry.path().extension() == ".cubin") std::filesystem::remove(entry.path(), ec);
+  try {
+    detail::clear_disk_cache(disk_cache_dir());
+  } catch (...) {
+    // Even resolving the configured path is best effort.
   }
 }
 
@@ -122,26 +89,43 @@ std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
   }
 
   // On-disk cache: a shape another process/run already compiled loads from its
-  // cubin (skips nvrtc). A reported load error falls through to a fresh compile;
-  // raw cubins are not validated here before reaching the CUDA loader.
-  const std::string& cdir = disk_cache_dir();
+  // cubin (skips requested-kernel compilation). Invalid storage records and
+  // reported CUDA load errors fall through to a fresh compile.
+  const std::string* cdir = nullptr;
+  try {
+    cdir = &disk_cache_dir();
+  } catch (...) {
+    // Resolving storage is best effort; an identity-query failure below is not.
+  }
   std::string path;
-  if (!cdir.empty()) {
+  if (cdir && !cdir->empty()) {
+    // Do not swallow an NVRTC version error in the storage-miss fallback.
     const detail::CompilationIdentity identity{detail::cache_environment(), key};
-    path = cdir + "/" + identity.relative_path();
-    std::vector<char> bytes;
-    if (read_cubin_file(path, bytes)) {
-      try {
-        auto loaded = std::make_shared<const CompiledKernel>(
-          load_kernel_from_cubin(std::move(bytes), entry_symbol, source));
-        ++g_jit_disk_hits;
-        std::lock_guard<std::mutex> lock(mu_);
-        auto [it, inserted] = table_.emplace(std::move(key), std::move(loaded));
-        (void)inserted;
-        return it->second;
-      } catch (...) {
-        // fall through to recompile below
+    try {
+      // One best-effort maintenance pass per process, including first-use disk
+      // hits. The static initializer serializes concurrent cold callers.
+      static const bool maintained = [&] {
+        detail::prune_disk_cache(*cdir, identity.environment);
+        return true;
+      }();
+      (void)maintained;
+      path = *cdir + "/" + identity.relative_path();
+      std::vector<char> bytes;
+      if (detail::read_cubin_file(path, bytes)) {
+        try {
+          auto loaded = std::make_shared<const CompiledKernel>(
+            load_kernel_from_cubin(std::move(bytes), entry_symbol, source));
+          ++g_jit_disk_hits;
+          std::lock_guard<std::mutex> lock(mu_);
+          auto [it, inserted] = table_.emplace(std::move(key), std::move(loaded));
+          (void)inserted;
+          return it->second;
+        } catch (...) {
+          // fall through to recompile below
+        }
       }
+    } catch (...) {
+      path.clear();
     }
   }
 
@@ -153,7 +137,7 @@ std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
   g_jit_compiles.fetch_add(1, std::memory_order_relaxed);
   g_jit_compile_us.fetch_add(static_cast<uint64_t>(_us), std::memory_order_relaxed);
 
-  if (!path.empty()) write_cubin_file_atomic(path, fresh.cubin);
+  if (!path.empty()) detail::write_cubin_file_atomic(path, fresh.cubin);
 
   auto kernel = std::make_shared<const CompiledKernel>(std::move(fresh));
   std::lock_guard<std::mutex> lock(mu_);

@@ -32,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::io {
@@ -96,6 +97,11 @@ struct inventory_query_error : std::runtime_error {
   }
   bool missing_result;
 };
+// Inspect only Avro manifest schemas (LIMIT 0), once per data manifest. Empty
+// partition records prove missing columns cannot be supplied by partition metadata.
+std::unordered_set<std::string> iceberg_files_without_partition_values(
+  duckdb::ClientContext&, iceberg_delete_inventory const&);
+
 inventory_result read_delete_inventory(duckdb::ClientContext&,
                                        std::string const&,
                                        std::optional<int64_t>,

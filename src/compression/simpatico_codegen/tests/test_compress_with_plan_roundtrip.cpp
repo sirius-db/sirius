@@ -13,6 +13,8 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <nvcomp/version.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -520,8 +522,8 @@ int main()
     }
 
     {
-      // ZigZag leaf at the region root — stored as its own fixed-stride
-      // `zigzag` channel.  int32 and int64.
+      // ZigZag at the region root with nothing fused below — its codes are
+      // stored by a fixed-stride Raw passthrough.  int32 and int64.
       auto t32 = make_int32_table(2, 4096, 71);
       std::string dsl32 =
         "input -> zigzag -> zigzag\n"
@@ -592,9 +594,9 @@ int main()
     }
 
     {
-      // Delta -> ZigZag: delta is the region root (inline scan), ZigZag is the
-      // covered leaf that stores the ZigZagged differences.  This is the
-      // canonical signed-residual pipeline.
+      // Delta -> ZigZag: delta is the region root (inline scan), ZigZag is
+      // covered and a Raw passthrough stores the ZigZagged differences.  This
+      // is the canonical signed-residual pipeline.
       auto t = make_int32_table(2, 4096, 77);
       std::string dsl =
         "input -> delta -> differences\n"
@@ -607,8 +609,8 @@ int main()
     }
 
     {
-      // Delta -> ZigZag -> ANS: the headline use case.  ZigZag's stored
-      // channel is entropy-tail-routed to ANS (small signed deltas become
+      // Delta -> ZigZag -> ANS: the headline use case.  ZigZag's Raw
+      // passthrough is entropy-tail-routed to ANS (small signed deltas become
       // small unsigned codes that the entropy coder compresses well).
       auto t = make_int32_table(2, 4096, 83);
       std::string dsl =
@@ -1150,7 +1152,18 @@ int main()
                      "delta.differences -> bitpack\n",
                      1,
                      "timestamp_us_delta_bitpack");
+#if NVCOMP_VER_MAJOR >= 6
+      bool cascaded_threw = false;
+      try {
+        roundtrip_once(tu->view(), "input -> nvcomp_cascaded\n", 1, "timestamp_us_cascaded");
+      } catch (std::runtime_error const& e) {
+        cascaded_threw =
+          std::string(e.what()).find("unavailable with nvCOMP 6") != std::string::npos;
+      }
+      expect(cascaded_threw, "nvCOMP 6 Cascaded must report unsupported options");
+#else
       roundtrip_once(tu->view(), "input -> nvcomp_cascaded\n", 1, "timestamp_us_cascaded");
+#endif
     }
 
     test_async_mr_free_safety();

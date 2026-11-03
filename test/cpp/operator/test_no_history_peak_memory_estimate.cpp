@@ -21,6 +21,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "operator/partition_test_utils.hpp"
 
 #include <cudf/types.hpp>
 
@@ -104,8 +105,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 0 batches returns 0",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), /*is_build=*/false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({0, 500}) == 0);
 }
 
@@ -113,8 +113,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 1 batch returns 0",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({1, 500}) == 0);
 }
 
@@ -122,8 +121,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 2 batches returns bytes",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({2, 500}) == 500);
 }
 
@@ -131,8 +129,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: many batches returns bytes",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({10, 1024}) == 1024);
 }
 
@@ -148,7 +145,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: num_partitions unset retur
   sirius_physical_partition part{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
-    f.hash_join.get()};
+    sirius::test::operator_utils::hash_partition_spec(*f.hash_join, false)};
   REQUIRE(part.no_history_peak_memory_estimate({1, 1000}) == 2000);
 }
 
@@ -159,8 +156,8 @@ TEST_CASE("partition no_history_peak_memory_estimate: 1 partition returns 0",
   sirius_physical_partition part{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
-    f.hash_join.get()};
-  part.set_num_partitions(1);
+    sirius::test::operator_utils::hash_partition_spec(*f.hash_join, false)};
+  part.set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(1));
   REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 0);
 }
 
@@ -171,8 +168,8 @@ TEST_CASE("partition no_history_peak_memory_estimate: 2 partitions returns bytes
   sirius_physical_partition part{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
-    f.hash_join.get()};
-  part.set_num_partitions(2);
+    sirius::test::operator_utils::hash_partition_spec(*f.hash_join, false)};
+  part.set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(2));
   REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 4000);
 }
 
@@ -183,8 +180,8 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
   sirius_physical_partition part{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
-    f.hash_join.get()};
-  part.set_num_partitions(8);
+    sirius::test::operator_utils::hash_partition_spec(*f.hash_join, false)};
+  part.set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(8));
   REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 8192);
 }
 

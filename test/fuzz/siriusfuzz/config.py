@@ -42,7 +42,7 @@ def gap_switch(default: Any, on: Any = True) -> Any:
 @dataclass
 class SetOps:
     union_all: bool = True
-    union: bool = gap_switch(False)
+    union: bool = True
     except_: bool = gap_switch(False)
     intersect: bool = gap_switch(False)
 
@@ -163,7 +163,7 @@ class Complexity:
 @dataclass
 class Features:
     window_functions: bool = gap_switch(False)
-    distinct: bool = gap_switch(False)
+    distinct: bool = True
     grouping_sets: bool = gap_switch(False)
     full_join: bool = gap_switch(False)
     cross_join: bool = gap_switch(False)

@@ -19,8 +19,14 @@
 #include "catch.hpp"
 #include "util/env_guard.hpp"
 
+#include <rmm/mr/cuda_async_managed_memory_resource.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/cuda_async_view_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+
 #include <cuda_runtime.h>
 
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <duckdb/main/config.hpp>
 
 #include <cstdlib>
@@ -38,7 +44,7 @@ std::filesystem::path integration_config_path()
 
 namespace {
 
-void trim_cuda_memory_pools()
+void trim_cuda_memory_pools_impl()
 {
   int original_device{};
   int device_count{};
@@ -49,15 +55,48 @@ void trim_cuda_memory_pools()
 
   for (int device = 0; device < device_count; ++device) {
     if (cudaSetDevice(device) != cudaSuccess) { continue; }
+    (void)cudaDeviceSynchronize();
     cudaMemPool_t pool{};
     if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
       (void)cudaMemPoolTrimTo(pool, /*minBytesToKeep=*/0);
     }
+
+    // Sirius and a number of test fixtures use RMM resources with their own
+    // non-default async pool.  Trimming only the CUDA default pool leaves
+    // those allocations resident and can starve an isolated child process.
+    auto current               = rmm::mr::get_current_device_resource_ref();
+    cudaMemPool_t current_pool = nullptr;
+    if (auto* adaptor =
+          ::cuda::mr::resource_cast<cucascade::memory::reservation_aware_resource_adaptor>(
+            &current)) {
+      auto upstream = adaptor->get_upstream_resource();
+      if (auto* mr = ::cuda::mr::resource_cast<rmm::mr::cuda_async_memory_resource>(&upstream)) {
+        current_pool = mr->pool_handle();
+      } else if (auto* mr =
+                   ::cuda::mr::resource_cast<rmm::mr::cuda_async_view_memory_resource>(&upstream)) {
+        current_pool = mr->pool_handle();
+      } else if (auto* mr = ::cuda::mr::resource_cast<rmm::mr::cuda_async_managed_memory_resource>(
+                   &upstream)) {
+        current_pool = mr->pool_handle();
+      }
+    } else if (auto* mr =
+                 ::cuda::mr::resource_cast<rmm::mr::cuda_async_memory_resource>(&current)) {
+      current_pool = mr->pool_handle();
+    } else if (auto* mr =
+                 ::cuda::mr::resource_cast<rmm::mr::cuda_async_view_memory_resource>(&current)) {
+      current_pool = mr->pool_handle();
+    } else if (auto* mr =
+                 ::cuda::mr::resource_cast<rmm::mr::cuda_async_managed_memory_resource>(&current)) {
+      current_pool = mr->pool_handle();
+    }
+    if (current_pool != nullptr) { (void)cudaMemPoolTrimTo(current_pool, 0); }
   }
   (void)cudaSetDevice(original_device);
 }
 
 }  // namespace
+
+void trim_cuda_memory_pools_for_testing() { trim_cuda_memory_pools_impl(); }
 
 shared_test_env* g_shared_env           = nullptr;
 shared_test_env* g_integration_env      = nullptr;
@@ -105,7 +144,7 @@ void shared_test_env::pause()
   // Destroy DuckDB — releases SiriusContext so isolated tests
   // can create their own DuckDB with a different config.
   db_.reset();
-  trim_cuda_memory_pools();
+  trim_cuda_memory_pools_impl();
 }
 
 void shared_test_env::resume()

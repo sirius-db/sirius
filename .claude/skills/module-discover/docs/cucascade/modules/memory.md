@@ -8,6 +8,10 @@
 
 The memory module implements cuCascade's tiered memory management system. It provides memory spaces (GPU, Host, Disk), a reservation system to prevent OOM, and resource adaptors that integrate with RMM. Sirius uses this module to manage all GPU and pinned host memory, schedule downgrades when GPU memory is constrained, and provide per-stream memory tracking.
 
+## Pool peer access
+
+`reservation_aware_resource_adaptor::pool_handle() const noexcept` returns a nullable, borrowed handle. `grant_pool_peer_access(pool, owner, accessor)` verifies private ordinary async pools in both directions, then grants the supplied pool; inspect `status()` and `error()` (`GRANTED`, `UNSUPPORTED`, `VERIFICATION_FAILED`, `CUDA_ERROR`). It does not enable ordinary peer access, measure the physical route, or verify different allocation properties. Sirius's `try_grant_pool_access` admits only the concrete ordinary RMM async resource and throws on CUDA errors.
+
 ## API Reference
 
 ### `cucascade::memory::Tier` (enum)
@@ -204,6 +208,7 @@ public:
 
   // Memory queries
   rmm::device_async_resource_ref get_upstream_resource() const noexcept;
+  cudaMemPool_t pool_handle() const noexcept;
   std::size_t get_available_memory() const noexcept;
   std::size_t get_available_memory(rmm::cuda_stream_view stream) const noexcept;
 
@@ -372,12 +377,12 @@ public:
   explicit exclusive_stream_pool(rmm::cuda_device_id device_id = {},
                                  std::size_t pool_size = default_size,
                                  rmm::cuda_stream::flags flags = rmm::cuda_stream::flags::non_blocking);
-  borrowed_stream acquire_stream(stream_acquire_policy policy = stream_acquire_policy::BLOCK) noexcept;
+  borrowed_stream acquire_stream(stream_acquire_policy policy = stream_acquire_policy::BLOCK);
   std::size_t size() const noexcept;
 };
 ```
 
-**Description**: Pool of exclusive CUDA streams. `acquire_stream()` returns a `borrowed_stream` RAII handle that returns the stream to the pool on destruction. Supports blocking or growing policy when pool is exhausted.
+**Description**: Pool of exclusive CUDA streams. `acquire_stream()` returns a `borrowed_stream` RAII handle that returns the stream to the pool on destruction. Supports blocking or growing policy when pool is exhausted. `acquire_stream()` can throw; `GROW` callers need exception boundaries and must drain live workers.
 
 **Our usage**:
 - `src/pipeline/gpu_pipeline_executor.cpp:20` — pipeline executor acquires streams for GPU work

@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow_array::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
 use cxx::{Exception, UniquePtr, let_cxx_string};
@@ -94,7 +94,7 @@ impl SiriusContext {
                 .map_err(SiriusError::Engine)?;
         }
         // Drain fully while `self` is alive (conversion dereferences the context).
-        let reader = ArrowArrayStreamReader::try_new(stream).map_err(SiriusError::Arrow)?;
+        let reader = RecordBatchStreamReader::try_new(stream).map_err(SiriusError::Arrow)?;
         let schema = reader.schema();
         let batches = reader
             .collect::<Result<Vec<_>, _>>()

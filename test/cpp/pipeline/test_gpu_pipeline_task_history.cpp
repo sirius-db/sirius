@@ -20,6 +20,8 @@
 #include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
+#include "op/scan/detail/read_retirement.hpp"
+#include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/scan_output_operator_data.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
@@ -30,6 +32,7 @@
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "sirius/exception.hpp"
 #include "utils/telemetry_utils.hpp"
 #include "utils/utils.hpp"
 
@@ -160,7 +163,9 @@ class fake_compressed_representation : public sirius::simpatico_compressed_repre
   {
     return uncompressed_;
   }
-  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
+  [[nodiscard]] std::int64_t num_rows() const noexcept override { return 0; }
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
+    ::cuda::stream_ref) const override
   {
     return nullptr;
   }
@@ -183,7 +188,8 @@ class fake_noncompressed_representation : public cucascade::idata_representation
   {
     return logical_;
   }
-  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
+    ::cuda::stream_ref) const override
   {
     return nullptr;
   }
@@ -211,13 +217,13 @@ struct pipeline_task_history_fixture {
   cucascade::memory::memory_space* gpu_space  = nullptr;
   cucascade::memory::memory_space* host_space = nullptr;
 
-  bool setup()
+  bool setup(double gpu_reservation_fraction = 0.95)
   {
     try {
       cucascade::memory::reservation_manager_configurator builder;
       builder.set_number_of_gpus(1)
         .set_gpu_usage_limit(kGpuCapacity)
-        .set_reservation_fraction_per_gpu(0.95)
+        .set_reservation_fraction_per_gpu(gpu_reservation_fraction)
         .set_per_numa_region_capacity(1ULL * 1024 * 1024 * 1024)
         .use_gpu_id_as_host_id()
         .track_reservation_per_stream(false)
@@ -730,6 +736,96 @@ TEST_CASE("gpu pipeline reservation estimates saturate instead of wrapping",
       std::move(global_state));
     CHECK(task->get_input_size() == max_size);
   }
+}
+
+TEST_CASE("position reservation follows the frozen reader decision on the target device",
+          "[gpu_pipeline_task][history][scan][row_positions]")
+{
+  namespace scan = sirius::op::scan;
+  using namespace sirius::op;
+  auto const mode = std::string(GENERATE("pending", "ready", "static", "other_device"));
+  CAPTURE(mode);
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+  class target_reader_filter final : public sirius_dynamic_filter, public sirius_ast_lowerable {
+   public:
+    explicit target_reader_filter(int device) : device_(device) {}
+    sirius_dynamic_filter_kind kind() const override
+    {
+      return sirius_dynamic_filter_kind::ZONE_MAP;
+    }
+    bool is_available_on_device(int device) const noexcept override { return device == device_; }
+    cudf::ast::expression const& to_ast(cudf::ast::tree&,
+                                        cudf::ast::expression const& column,
+                                        int) const override
+    {
+      return column;
+    }
+
+   private:
+    int device_;
+  };
+  auto plan = std::make_shared<scan::scan_plan>();
+  plan->data_columns.push_back({0, "x"});
+  plan->output_layout.push_back({scan::scan_plan::output_entry::DATA, 0});
+  plan->virtual_columns.push_back({1,
+                                   "file_row_number",
+                                   sirius::logical_type::make(sirius::type_id::BIGINT),
+                                   scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER,
+                                   1});
+  auto split =
+    std::make_shared<scan::parquet_split_info>(std::vector<scan::scan_info::fadvise_entry>{});
+  split->plan                       = plan;
+  split->requires_row_positions     = true;
+  split->static_reader_filter_ready = mode == "static";
+  split->unfiltered_working_bytes   = 1000;
+  split->rg_slices.emplace_back(
+    nullptr, "input.parquet", std::vector<cudf::size_type>{}, 1000, 3000, 0, nullptr);
+  sirius_dynamic_filter_set filters;
+  auto producer = filters.register_producer({0});
+  auto publish  = [&] {
+    REQUIRE(producer.push_filter(
+      0,
+      std::make_shared<target_reader_filter>(f.gpu_space->get_device_id() +
+                                             (mode == "other_device" ? 1 : 0))));
+    producer.finish(sirius_dynamic_filter_set::completion::PUBLISHED);
+  };
+  if (mode == "ready" || mode == "other_device") publish();
+  split->position_filter_snapshot =
+    std::make_shared<dynamic_filter_snapshot const>(filters.snapshot());
+  if (mode == "pending" || mode == "static")
+    publish();  // Later publication cannot change admission.
+  auto ctx    = create_cached_scan_pipeline_context();
+  auto global = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  auto input = std::make_unique<scan::scan_operator_input>(
+    split, nullptr, 0, std::nullopt, scan::scan_operator_input::prefetch_start::deferred);
+  sirius::pipeline::gpu_pipeline_task task(
+    1,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input)),
+    global);
+  bool const uses_positions = mode == "ready" || mode == "static";
+  auto cold                 = task.get_estimated_reservation_size_info(f.gpu_space);
+  CHECK_FALSE(cold.had_history);
+  CHECK(split->preparation_bytes() == 3000);
+  CHECK(split->estimated_working_set_bytes_for_device(f.gpu_space->get_device_id()) ==
+        (uses_positions ? 3000 : 1000));
+  // Compare against the same scan's baseline without a position consumer.
+  split->requires_row_positions                           = false;
+  split->rg_slices.front().estimated_decode_working_bytes = 1000;
+  auto baseline                 = task.get_estimated_reservation_size_info(f.gpu_space);
+  split->requires_row_positions = true;
+  split->rg_slices.front().estimated_decode_working_bytes = 3000;
+  CHECK(cold.reservation_size == baseline.reservation_size + (uses_positions ? 2000 : 0));
+  global->get_memory_history().record({1000, 500, 1000});
+  auto warm = task.get_estimated_reservation_size_info(f.gpu_space);
+  CHECK(warm.had_history);
+  CHECK(warm.peak_memory_estimate == (uses_positions ? 3000 : 1000));
+  CHECK(warm.reservation_size == warm.peak_memory_estimate + warm.bytes_to_materialize_input);
 }
 
 TEST_CASE("cached scan input materialization contributes to task reservations",
@@ -1307,7 +1403,7 @@ TEST_CASE("gpu_pipeline_task does not reschedule dynamic filter cleanup with unj
   REQUIRE(local != nullptr);
   local->set_reservation(std::move(reservation), info);
   advance_to_reserving(*task);
-  REQUIRE_THROWS_AS(task->execute(stream), sirius::op::detail::unjoined_gpu_work);
+  REQUIRE_THROWS_AS(task->execute(stream), sirius::unjoined_gpu_work);
   REQUIRE(execute_calls == 1);
   REQUIRE(sink_calls == 0);
   REQUIRE(global->get_memory_history().size() == 0);
@@ -1836,4 +1932,164 @@ TEST_CASE("retry reservation floor grows and survives reschedule",
   auto const retry_estimate = retry_task->get_estimated_reservation_size_info(nullptr);
   CHECK(retry_estimate.retry_reservation_floor == second_floor);
   CHECK(retry_estimate.reservation_size == second_floor);
+}
+
+TEST_CASE(
+  "dynamic filter safely retired OOM preserves input and raises the retry reservation floor",
+  "[gpu_pipeline_task][consumer_retirement][reservation][retry]")
+{
+  using namespace sirius::op::scan;
+  using consumer_access = detail::consumer_test_access;
+  pipeline_task_history_fixture fixture;
+  REQUIRE(fixture.setup(1.0));
+  rmm::cuda_stream stream;
+  auto context = create_pipeline_context();
+  auto global  = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    context.pipeline, sirius::test::make_test_telemetry_context());
+  auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto producer = channel->register_producer({0});
+  auto batch    = fixture.create_gpu_data_batch(100, stream);
+  for (int i = 0; i < 2; ++i) {
+    auto source = batch->to_read_only();
+    auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+      sirius::get_cudf_table_view(source).column(0),
+      stream,
+      fixture.gpu_space->get_default_allocator());
+    REQUIRE(producer.push_filter(0, std::move(filter)));
+  }
+  channel->freeze_registration();
+  dynamic_filter_consumer consumer{
+    channel,
+    {.strategy_override = detail::compaction_strategy::GATHER_ONCE, .force_counts = true},
+    {}};
+  bool inject_submitted_oom       = false;
+  bool exhaust_capacity           = false;
+  std::size_t initial_reservation = 64;
+  SECTION("actual allocator under-reservation retries successfully") {}
+  SECTION("OOM after count submission retires source and readback before retry")
+  {
+    initial_reservation  = 1ULL << 20;
+    inject_submitted_oom = true;
+  }
+  SECTION("capacity exhaustion rejects the raised reservation without publishing")
+  {
+    initial_reservation = kGpuCapacity / 2 + 1;
+    exhaust_capacity    = true;
+  }
+  auto* allocator =
+    fixture.gpu_space
+      ->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(allocator != nullptr);
+  int attempts = 0;
+  int sinks    = 0;
+  context.stub_op->on_execute =
+    [&](sirius::op::operator_data const& input,
+        ::cuda::stream_ref task_stream) -> std::unique_ptr<sirius::op::operator_data> {
+    ++attempts;
+    auto const& original = dynamic_cast<scan_output_operator_data const&>(input);
+    auto leases          = original.get_read_only_batches();
+    REQUIRE(leases.size() == 1);
+    std::array<binding, 1> bindings{{{0, 0}}};
+    auto program = consumer.prepare({.source      = sirius::get_cudf_table_view(leases.front()),
+                                     .bindings    = bindings,
+                                     .input_bytes = leases.front().get_data()->get_size_in_bytes(),
+                                     .prior       = &original.receipt(),
+                                     .device_id   = fixture.gpu_space->get_device_id()});
+    REQUIRE(program.has_value());
+    std::optional<detail::read_retirement_test_hooks> fault;
+    if (inject_submitted_oom && attempts == 1) {
+      fault.emplace(detail::read_checkpoint::COUNTS_COPY);
+    }
+    auto result = consumer.apply(
+      std::move(*program), leases.front(), task_stream, fixture.gpu_space->get_default_allocator());
+    if (exhaust_capacity) {
+      rmm::device_buffer impossible(
+        kGpuCapacity + 1, task_stream, fixture.gpu_space->get_default_allocator());
+      FAIL("allocation above the software capacity unexpectedly succeeded");
+    }
+    auto table = result.take_output();
+    REQUIRE(table != nullptr);
+    auto output_batch = sirius::make_data_batch(
+      std::move(table), *fixture.gpu_space, task_stream, sirius::telemetry::batch_telemetry_info{});
+    auto output = std::make_unique<sirius::op::pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
+    consumer.commit(std::move(result));
+    return output;
+  };
+  context.stub_op->on_sink = [&](sirius::op::operator_data const& output, ::cuda::stream_ref) {
+    auto const& batches = dynamic_cast<sirius::op::pipelineable_operator_data const&>(output);
+    REQUIRE(sirius::get_cudf_table_view(batches.get_read_only_batches().front()).num_rows() == 100);
+    ++sinks;
+  };
+  auto input = std::make_unique<scan_output_operator_data>(batch);
+  input->install_receipt({channel, batch->get_batch_id(), {}, {}});
+  auto const* original_input                           = input.get();
+  std::weak_ptr<cucascade::data_batch> source_lifetime = batch;
+  auto state  = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input));
+  auto* local = state.get();
+  auto task   = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    1, std::vector<cucascade::shared_data_repository*>{}, std::move(state), global);
+  batch.reset();
+  auto attach = [&](auto& current, std::size_t reservation_bytes) {
+    auto info        = current.get_estimated_reservation_size_info(fixture.gpu_space);
+    auto reservation = fixture.manager->request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, reservation_bytes);
+    REQUIRE(reservation != nullptr);
+    current.local_state()
+      ->template cast<sirius::pipeline::gpu_pipeline_task_local_state>()
+      .set_reservation(std::move(reservation), info);
+    advance_to_reserving(current);
+  };
+  attach(*task, initial_reservation);
+  std::unique_ptr<cucascade::memory::reservation> capacity_pressure;
+  if (!inject_submitted_oom && !exhaust_capacity) {
+    // The task may exceed its reservation only while shared capacity remains available.
+    auto const available = allocator->get_available_memory();
+    REQUIRE(available > 0);
+    capacity_pressure = fixture.gpu_space->make_reservation_or_null(available);
+    REQUIRE(capacity_pressure != nullptr);
+    REQUIRE(capacity_pressure->size() == available);
+    REQUIRE(allocator->get_available_memory() == 0);
+  }
+  CAPTURE(initial_reservation, inject_submitted_oom, exhaust_capacity);
+  std::unique_ptr<sirius::op::operator_data> retry_input;
+  try {
+    task->execute(stream);
+    FAIL("undersized or injected attempt unexpectedly completed");
+  } catch (sirius::pipeline::oom_reschedule_exception& error) {
+    REQUIRE(error.get_resume_operator_index() == 0);
+    retry_input = error.release_intermediate_data();
+  }
+  REQUIRE(retry_input.get() == original_input);
+  REQUIRE_FALSE(source_lifetime.expired());
+  REQUIRE(sinks == 0);
+  REQUIRE(attempts == 1);
+  REQUIRE(local->get_retry_reservation_floor() > initial_reservation);
+  REQUIRE(detail::gate_test_access::needs_combined_sample(consumer_access::gate(consumer),
+                                                          channel->snapshot()));
+  capacity_pressure.reset();
+  auto retry_state =
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(retry_input));
+  retry_state->inherit_retry_reservation_floor(*local);
+  auto const floor = retry_state->get_retry_reservation_floor();
+  task.reset();
+  auto retry = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    2, std::vector<cucascade::shared_data_repository*>{}, std::move(retry_state), global);
+  auto const estimate = retry->get_estimated_reservation_size_info(fixture.gpu_space);
+  REQUIRE(estimate.had_history);
+  REQUIRE(estimate.retry_reservation_floor == floor);
+  REQUIRE(estimate.reservation_size >= floor);
+  if (exhaust_capacity) {
+    REQUIRE(floor > kGpuCapacity);
+    REQUIRE(fixture.gpu_space->make_reservation_or_null(floor) == nullptr);
+    REQUIRE(sinks == 0);
+    REQUIRE(attempts == 1);
+  } else {
+    attach(*retry, estimate.reservation_size);
+    retry->execute(stream);
+    REQUIRE(attempts == 2);
+    REQUIRE(sinks == 1);
+  }
+  retry.reset();
+  REQUIRE(source_lifetime.expired());
 }

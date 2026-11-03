@@ -30,6 +30,8 @@
 #include <duckdb/main/settings.hpp>
 
 // sirius — node accessors and per-node struct types
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_expr.hpp"
 #include "expression/ast/cast.hpp"
@@ -45,16 +47,20 @@
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type
 #include "expression/substring_slice.hpp"
+#include "helper/type_conversions.hpp"  // sirius::from_duckdb(LogicalType const&)
+#include "sirius/exception.hpp"
 
 // duckdb — direct-ctor construction surface
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types/value.hpp>
+#include <duckdb/function/aggregate_function.hpp>
 #include <duckdb/function/scalar_function.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/optimizer/expression_rewriter.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
 #include <duckdb/planner/expression/bound_case_expression.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -77,6 +83,9 @@
 #include <variant>
 #include <vector>
 
+using duckdb::AggregateFunction;
+using duckdb::AggregateType;
+using duckdb::BoundAggregateExpression;
 using duckdb::BoundBetweenExpression;
 using duckdb::BoundCaseCheck;
 using duckdb::BoundCaseExpression;
@@ -478,8 +487,8 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nul
 TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range",
           "[ast_from_duckdb][unsigned_narrowing]")
 {
-  // Counts are value bits: signed carriers reserve one bit for the sign, and
-  // Sirius represents HUGEINT/UHUGEINT using INT64/UINT64 rather than 128-bit storage.
+  // Counts are value bits: signed carriers reserve one bit for the sign. Sirius represents HUGEINT
+  // as DECIMAL128 (127 value bits) and UHUGEINT as UINT64.
   using domain = std::pair<LogicalTypeId, int>;
   for (auto [source, source_bits] : {domain{LogicalTypeId::UTINYINT, 8},
                                      domain{LogicalTypeId::USMALLINT, 16},
@@ -490,7 +499,7 @@ TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range"
                                        domain{LogicalTypeId::SMALLINT, 15},
                                        domain{LogicalTypeId::INTEGER, 31},
                                        domain{LogicalTypeId::BIGINT, 63},
-                                       domain{LogicalTypeId::HUGEINT, 63},
+                                       domain{LogicalTypeId::HUGEINT, 127},
                                        domain{LogicalTypeId::UTINYINT, 8},
                                        domain{LogicalTypeId::USMALLINT, 16},
                                        domain{LogicalTypeId::UINTEGER, 32},
@@ -508,8 +517,9 @@ TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range"
     }
   }
 
-  // The nested cast must reject its parent comparison too, including a join predicate.
-  auto left  = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UBIGINT),
+  // The nested cast must reject its parent comparison too, including a join predicate. UHUGEINT
+  // needs 128 value bits, one more than HUGEINT holds.
+  auto left  = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UHUGEINT),
                                                         LogicalType::HUGEINT);
   auto right = BoundCastExpression::AddDefaultCastToType(make_bound_ref(1, LogicalTypeId::BIGINT),
                                                          LogicalType::HUGEINT);
@@ -560,6 +570,138 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION '+' resolves to function_id::add", "
   REQUIRE(fc.function() == sirius::function_id::add);
   REQUIRE(fc.arguments().size() == 2);
   REQUIRE(fc.return_type().id() == sirius::type_id::INTEGER);
+}
+
+namespace {
+
+// DuckDB binds unary minus and unary plus as one-argument "-" and "+" on the operand's type.
+duckdb::unique_ptr<BoundFunctionExpression> make_unary_arithmetic(std::string const& name,
+                                                                  LogicalType const& type,
+                                                                  LogicalType const& return_type)
+{
+  auto expr = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(
+      ScalarFunction(duckdb::Identifier(name), {type}, return_type, nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expr->GetChildrenMutable().push_back(duckdb::make_uniq<BoundReferenceExpression>(type, 0));
+  return expr;
+}
+
+duckdb::unique_ptr<BoundFunctionExpression> make_unary_arithmetic(std::string const& name,
+                                                                  LogicalType const& type)
+{
+  return make_unary_arithmetic(name, type, type);
+}
+
+}  // namespace
+
+TEST_CASE("ast_from_duckdb - one-argument '-' translates to function_id::negate",
+          "[ast_from_duckdb][negate]")
+{
+  auto const type = GENERATE(LogicalType(LogicalType::TINYINT),
+                             LogicalType(LogicalType::SMALLINT),
+                             LogicalType(LogicalType::INTEGER),
+                             LogicalType(LogicalType::BIGINT),
+                             LogicalType(LogicalType::FLOAT),
+                             LogicalType(LogicalType::DOUBLE),
+                             LogicalType::DECIMAL(4, 1),
+                             LogicalType::DECIMAL(15, 2),
+                             LogicalType::DECIMAL(38, 9));
+  CAPTURE(type.ToString());
+  for (auto const* name : {"-", "subtract"}) {
+    CAPTURE(name);
+    auto out = sirius::ast::from_duckdb(*make_unary_arithmetic(name, type));
+    REQUIRE(out);
+    REQUIRE(out->holds<function_call>());
+    auto const& fc = out->get<function_call>();
+    REQUIRE(fc.function() == sirius::function_id::negate);
+    REQUIRE(fc.arguments().size() == 1);
+    REQUIRE(fc.arguments()[0]->holds<reference>());
+    REQUIRE(fc.return_type() == sirius::from_duckdb(type));
+    REQUIRE(out->cudf_ast_op_count() == 0);
+  }
+}
+
+TEST_CASE("ast_from_duckdb - one-argument '-' on a type the GPU cannot negate returns nullptr",
+          "[ast_from_duckdb][negate]")
+{
+  // DuckDB rejects negating a nonzero unsigned value, HUGEINT rides an INT64 carrier on the GPU,
+  // and INTERVAL has no GPU representation.
+  auto const type = GENERATE(LogicalType(LogicalType::UTINYINT),
+                             LogicalType(LogicalType::UINTEGER),
+                             LogicalType(LogicalType::UBIGINT),
+                             LogicalType(LogicalType::HUGEINT),
+                             LogicalType(LogicalType::INTERVAL));
+  CAPTURE(type.ToString());
+  REQUIRE_FALSE(sirius::ast::from_duckdb(*make_unary_arithmetic("-", type)));
+}
+
+TEST_CASE(
+  "ast_from_duckdb - one-argument '-' with a result type wider than its operand returns "
+  "nullptr",
+  "[ast_from_duckdb][negate]")
+{
+  // cuDF's negation keeps the operand type, so it cannot produce a wider result.
+  REQUIRE_FALSE(sirius::ast::from_duckdb(
+    *make_unary_arithmetic("-", LogicalType::TINYINT, LogicalType::SMALLINT)));
+}
+
+TEST_CASE("ast_from_duckdb - one-argument '+' translates to its operand",
+          "[ast_from_duckdb][negate]")
+{
+  auto const type = GENERATE(LogicalType(LogicalType::INTEGER), LogicalType::DECIMAL(15, 2));
+  CAPTURE(type.ToString());
+  auto out = sirius::ast::from_duckdb(*make_unary_arithmetic("+", type));
+  REQUIRE(out);
+  REQUIRE(out->holds<reference>());
+  REQUIRE(out->get<reference>().return_type() == sirius::from_duckdb(type));
+}
+
+TEST_CASE(
+  "ast_from_duckdb - BOUND_FUNCTION with an arity its GPU handler does not take returns "
+  "nullptr",
+  "[ast_from_duckdb][negate]")
+{
+  // DuckDB's regexp_replace takes an optional options string the GPU handler does not apply.
+  auto expr = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(ScalarFunction(
+      "regexp_replace",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+      LogicalType::VARCHAR,
+      nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
+  for (auto const* argument : {"a", "b", "g"}) {
+    expr->GetChildrenMutable().push_back(
+      duckdb::make_uniq<BoundConstantExpression>(Value(argument)));
+  }
+  REQUIRE_FALSE(sirius::ast::from_duckdb(*expr));
+
+  // A three-argument "*" has no GPU handler either.
+  auto mul = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(
+      ScalarFunction("*",
+                     {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER},
+                     LogicalType::INTEGER,
+                     nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  for (uint32_t i = 0; i < 3; ++i) {
+    mul->GetChildrenMutable().push_back(make_bound_ref(i));
+  }
+  REQUIRE_FALSE(sirius::ast::from_duckdb(*mul));
+}
+
+TEST_CASE("ast_from_duckdb - function_call rejects an arity its GPU handler does not take",
+          "[ast_from_duckdb][negate]")
+{
+  auto const integer = sirius::logical_type::make(sirius::type_id::INTEGER);
+  std::vector<std::unique_ptr<node>> one_argument;
+  one_argument.push_back(std::make_unique<node>(reference{0, integer}));
+  REQUIRE_THROWS_AS(function_call(sirius::function_id::sub, std::move(one_argument), integer),
+                    sirius::internal_exception);
 }
 
 namespace {
@@ -935,6 +1077,114 @@ TEST_CASE("ast_from_duckdb - BOUND_PARAMETER returns nullptr", "[ast_from_duckdb
 {
   auto param_expr = duckdb::make_uniq<BoundParameterExpression>(duckdb::Identifier{"p1"});
   REQUIRE(sirius::ast::from_duckdb(*param_expr) == nullptr);
+}
+
+// ============================================================================
+// BOUND_AGGREGATE: generic translation accepts only filter-free aggregates.
+// The planner consumes all supported FILTER clauses before this boundary.
+// ============================================================================
+
+namespace {
+
+// Minimal AggregateFunction stub: only `.name` is read by from_duckdb; the
+// callback function pointers are never invoked during translation.
+AggregateFunction make_dummy_aggregate(std::string const& name,
+                                       duckdb::vector<LogicalType> const& args,
+                                       LogicalType const& ret_type)
+{
+  return AggregateFunction(duckdb::Identifier(name),
+                           args,
+                           ret_type,
+                           0,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr);
+}
+
+}  // namespace
+
+TEST_CASE("ast_from_duckdb - count_star with a raw reference filter declines",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  auto fn   = make_dummy_aggregate("count_star", {}, LogicalType{LogicalTypeId::BIGINT});
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
+    duckdb::BoundAggregateFunction(fn),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    make_bound_ref(7, LogicalTypeId::BOOLEAN),
+    nullptr,
+    AggregateType::NON_DISTINCT);
+
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - child-bearing aggregate with an unconsumed filter declines",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(make_bound_ref(0));
+  auto fn = make_dummy_aggregate(
+    "sum", {LogicalType{LogicalTypeId::INTEGER}}, LogicalType{LogicalTypeId::BIGINT});
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          make_bound_ref(1, LogicalTypeId::BOOLEAN),
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
+
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - count_star with a non-reference filter declines",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  auto fn   = make_dummy_aggregate("count_star", {}, LogicalType{LogicalTypeId::BIGINT});
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
+    duckdb::BoundAggregateFunction(fn),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    duckdb::make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)),
+    nullptr,
+    AggregateType::NON_DISTINCT);
+
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - filter-free unary count translates normally",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(make_bound_ref(7, LogicalTypeId::BOOLEAN));
+  auto fn   = make_dummy_aggregate("count", {LogicalType::BOOLEAN}, LogicalType::BIGINT);
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
+  auto out  = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  auto const& agg = out->get<sirius::ast::aggregate>();
+  CHECK(agg.function() == sirius::aggregate_id::count);
+  CHECK_FALSE(agg.distinct());
+  CHECK(agg.return_type().id() == sirius::type_id::BIGINT);
+  REQUIRE(agg.arguments().size() == 1);
+  CHECK(agg.arguments()[0]->get<reference>().column_index == 7);
+}
+
+TEST_CASE("ast_from_duckdb - count_star with a compound filter declines",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  auto fn     = make_dummy_aggregate("count_star", {}, LogicalType::BIGINT);
+  auto filter = BoundComparisonExpression::Create(
+    ExpressionType::COMPARE_GREATERTHAN, make_bound_ref(0), make_bound_int_const(0));
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
+    duckdb::BoundAggregateFunction(fn),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    std::move(filter),
+    nullptr,
+    AggregateType::NON_DISTINCT);
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
 }
 
 // ============================================================================

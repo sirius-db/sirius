@@ -110,10 +110,16 @@ struct read_view_capture_metrics {
   std::size_t sort_index_capacity = 0;
 };
 
+/// Bound provider semantics independent of lazy file discovery. The key is an
+/// immutable, length-delimited descriptor supplied by a verified connector.
+struct provider_read_identity {
+  std::string key;
+};
 /// Stable read identity shared after an equal comparison; evidence remains capture-specific.
 struct bound_read_identity {
   verified_source_identity source;
-  std::variant<native_table_identity, file_inventory, stream_identity> data_view;
+  std::variant<native_table_identity, file_inventory, stream_identity, provider_read_identity>
+    data_view;
   duckdb::vector<duckdb::LogicalType> bound_types;
   duckdb::vector<std::string> bound_names;
   /// Canonical bound reader options participating in stable identity.

@@ -8,9 +8,11 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  6de1221cd89a359548653682b648c869c040d75d501a60d1412810e696ea8ef042cc32bcb47bc345123efb622eb858dfbc051024d6dc510a6c7dfefd41d2334d
+  188c68787e667fe067cfacd29f57b03ed175afc8baa94b4a03efa93f19e8e5f15c23b2afdbf9589302d37a852eade9d6f982cfa180da1c24b0ea9d6790c7c292
   HEAD_REF
   main)
+
+include("${CMAKE_CURRENT_LIST_DIR}/../rapids_common.cmake")
 
 vcpkg_from_github(
   OUT_SOURCE_PATH
@@ -18,9 +20,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.08.00
+  v26.10.00
   SHA512
-  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
+  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
   HEAD_REF
   main)
 
@@ -70,6 +72,8 @@ vcpkg_cmake_configure(
   "${SOURCE_PATH}/cpp"
   OPTIONS
   -DFETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE=${RAPIDS_CMAKE_PATH}
+  -DCPM_DOWNLOAD_LOCATION=${CPM_CMAKE_PATH}
+  -DCPM_LOCAL_PACKAGES_ONLY=ON
   -DCPM_bs_thread_pool_SOURCE=${BS_THREAD_POOL_PATH}
   -DKvikIO_BUILD_EXAMPLES=OFF
   -DKvikIO_BUILD_TESTS=OFF
@@ -98,6 +102,13 @@ execute_process(
     "${CURRENT_PACKAGES_DIR}/share/bs_thread_pool/bs_thread_pool-targets.cmake")
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME kvikio CONFIG_PATH lib/cmake/kvikio)
+
+# KvikIO's exported target references CURL::libcurl because remote support is
+# on.
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/kvikio/kvikio-dependencies.cmake"
+  "include(CMakeFindDependencyMacro)"
+  "include(CMakeFindDependencyMacro)\nfind_dependency(CURL CONFIG)")
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")

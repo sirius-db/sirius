@@ -36,8 +36,7 @@ namespace sirius::op {
 class build_arrival_ledger;
 
 /**
- * @brief The certified set of original batches that one build PARTITION received through its FULL
- * input.
+ * @brief The certified set of original batches received through one complete build input.
  *
  * `dynamic_filter_publication_session` accumulates a Bloom filter against this inventory: every
  * listed batch must contribute exactly once before the filter can be published. Batch IDs are
@@ -75,13 +74,10 @@ class complete_build_inventory final {
   /**
    * @brief Sorts @p batches and builds the inventory.
    *
-   * @return nullopt for fewer than two partitions, no batches, duplicate IDs, or a row total that
-   * overflows
+   * @return nullopt for no batches, duplicate IDs, or a row total that overflows
    */
   [[nodiscard]] static std::optional<complete_build_inventory> try_create(
-    std::vector<batch_entry> batches,
-    std::vector<std::optional<cudf::data_type>> schema,
-    std::size_t partition_count);
+    std::vector<batch_entry> batches, std::vector<std::optional<cudf::data_type>> schema);
 
   complete_build_inventory(std::vector<batch_entry> batches,
                            std::vector<std::optional<cudf::data_type>> schema,
@@ -93,9 +89,10 @@ class complete_build_inventory final {
 };
 
 /**
- * @brief Records the metadata of every batch pushed into one build PARTITION's FULL input.
+ * @brief Records the metadata of every batch pushed into one build publication boundary's FULL
+ * input.
  *
- * `sirius_physical_partition` records each arrival from `on_input_batch_pushed`, before the batch
+ * PARTITION or BUILD_FILTER records each arrival from `on_input_batch_pushed`, before the batch
  * becomes poppable, and certifies the ledger once its source pipeline has finished. The ledger
  * records `(id, rows)` and consistent top-level column types. An unreadable or non-GPU arrival
  * closes the ledger, which then cannot certify; a missing or changed column only makes that ordinal
@@ -113,7 +110,6 @@ class build_arrival_ledger final {
    */
   struct certification {
     std::size_t repository_batches;  ///< Batches currently queued in the input repository
-    std::size_t partition_count;     ///< Physical partitions of the build PARTITION
   };
 
   /**

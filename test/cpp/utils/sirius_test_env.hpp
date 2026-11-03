@@ -27,6 +27,8 @@ namespace sirius::test {
 
 // SIRIUS_TEST_INTEGRATION_CONFIG selects the config for shared and child-process fixtures.
 std::filesystem::path integration_config_path();
+// Return unused CUDA async-pool blocks to the driver between test cases.
+void trim_cuda_memory_pools_for_testing();
 
 /**
  * @brief Open a DuckDB database with Sirius enabled and configured from @p config_path.

@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "op/scan/field_id_mapping.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
@@ -36,17 +37,20 @@
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/extension/external_extension_provider.hpp>
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/main/extension_manager.hpp>
 #include <duckdb/main/settings.hpp>
+#include <duckdb/parser/tableref/table_function_ref.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <parquet_extension.hpp>
+#include <parquet_multi_file_info.hpp>
 
 #include <array>
 #include <mutex>
@@ -67,14 +71,50 @@ bool matches_bind(duckdb::FunctionData const* bind)
   return dynamic_cast<T const*>(bind) != nullptr;
 }
 
-bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns)
+bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
+                               std::unordered_set<int32_t>& field_ids)
 {
   if (columns.empty()) return false;
   for (auto const& column : columns) {
     if (column.identifier.IsNull() ||
         column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER)
       return false;
-    if (!column.children.empty() && !collect_iceberg_field_ids(column.children)) return false;
+    auto const field_id = column.identifier.GetValue<int32_t>();
+    if (field_id <= 0 || !field_ids.insert(field_id).second) return false;
+    if (!column.children.empty() && !collect_iceberg_field_ids(column.children, field_ids))
+      return false;
+  }
+  return true;
+}
+
+bool iceberg_mapping_leaf_types_supported(
+  std::vector<duckdb::MultiFileColumnDefinition> const& columns, bool& saw_leaf)
+{
+  for (auto const& column : columns) {
+    if (!column.children.empty()) {
+      // Nested definitions are outside the flat v1 mapper's capability
+      // profile. They are checked only if a scan actually requests them.
+      continue;
+    }
+    saw_leaf = true;
+    // Generic mapping codecs do not widen this connector's qualified profile.
+    // Temporal/decimal support requires separate Iceberg policy and evidence.
+    using D = duckdb::LogicalTypeId;
+    switch (column.type.id()) {
+      case D::BOOLEAN:
+      case D::TINYINT:
+      case D::SMALLINT:
+      case D::INTEGER:
+      case D::BIGINT:
+      case D::UTINYINT:
+      case D::USMALLINT:
+      case D::UINTEGER:
+      case D::UBIGINT:
+      case D::FLOAT:
+      case D::DOUBLE:
+      case D::VARCHAR: break;
+      default: return false;
+    }
   }
   return true;
 }
@@ -337,7 +377,8 @@ duckdb_extension_describe_t host_parquet_descriptor(duckdb::DatabaseInstance& db
 }
 
 duckdb::vector<duckdb::TableFunction> parquet_reference_functions(duckdb::DatabaseInstance& db,
-                                                                  std::string const& name)
+                                                                  std::string const& name,
+                                                                  bool reader_interface = false)
 {
   auto init = host_parquet_descriptor(db);
   if (!init) return {};
@@ -349,8 +390,33 @@ duckdb::vector<duckdb::TableFunction> parquet_reference_functions(duckdb::Databa
   reference.LoadStaticExtension(init);
   duckdb::ExtensionLoader loader(*reference.instance, "parquet");
   auto entry = loader.TryGetTableFunction(duckdb::Identifier(name));
-  return entry ? copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions)
-               : duckdb::vector<duckdb::TableFunction>{};
+  if (!entry) return {};
+  auto functions = copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions);
+  if (!reader_interface || functions.empty()) return functions;
+
+  // Parquet's custom bind leaves function_info empty. Bind the independently
+  // registered callback against an empty file list to obtain its nested reader
+  // and settings without opening a file or consulting the caller's catalog.
+  duckdb::Connection connection(reference);
+  auto trusted = functions.front();
+  duckdb::BoundTableFunction bound(trusted);
+  duckdb::vector<duckdb::Value> inputs{duckdb::Value::LIST(duckdb::LogicalType::VARCHAR, {})};
+  duckdb::named_argument_map_t options;
+  options["allow_empty"] = duckdb::Value::BOOLEAN(true);
+  duckdb::vector<duckdb::LogicalType> input_types, result_types;
+  duckdb::vector<duckdb::Identifier> input_names, result_names;
+  duckdb::TableFunctionRef ref;
+  duckdb::TableFunctionBindInput input(
+    inputs, options, input_types, input_names, nullptr, nullptr, bound, ref);
+  auto data        = trusted.bind(*connection.context, input, result_types, result_names);
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(data.get());
+  auto const* wrapper =
+    bind ? dynamic_cast<duckdb::TableFunctionMultiFileWrapper const*>(bind->interface.get())
+         : nullptr;
+  if (!wrapper || bind->initial_reader) return {};
+  trusted.function_info = duckdb::make_shared_ptr<duckdb::TableFunctionMultiFileInfo>(
+    wrapper->function, wrapper->settings);
+  return {std::move(trusted)};
 }
 
 duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
@@ -428,7 +494,9 @@ struct verified_callbacks {
   duckdb::TableFunction const& reference;
 
   template <class Function>
-  bool matches(Function const& candidate, unsigned depth = 0) const
+  bool matches(Function const& candidate,
+               unsigned depth              = 0,
+               bool verified_provider_info = false) const
   {
     // Initialization, binding/copy, and optimizer callbacks can change the reader's semantics
     // even when its scan body is unchanged. Only presentation/profiling callbacks are excluded.
@@ -507,7 +575,7 @@ struct verified_callbacks {
                                                        candidate.is_repeatable,
                                                        candidate.set_partitions_to_scan,
                                                        candidate.parallelism) &&
-           matches_info(candidate.function_info.get(), depth);
+           (verified_provider_info || matches_info(candidate.function_info.get(), depth));
   }
 
   bool matches_info(duckdb::TableFunctionInfo const* candidate, unsigned depth) const
@@ -530,6 +598,7 @@ struct verified_callbacks {
                     a.sample_files_parameter,
                     a.sampled_schema_is_union,
                     a.claim_batch,
+                    a.prepare_batch,
                     a.finish_batch,
                     a.supports_read_ahead,
                     a.schedule_io,
@@ -545,6 +614,7 @@ struct verified_callbacks {
                                                      b.sample_files_parameter,
                                                      b.sampled_schema_is_union,
                                                      b.claim_batch,
+                                                     b.prepare_batch,
                                                      b.finish_batch,
                                                      b.supports_read_ahead,
                                                      b.schedule_io,
@@ -602,12 +672,28 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
 
 std::span<connector const> registered_connectors() { return entries; }
 
+bool iceberg_flat_mapping_supported(duckdb::FunctionData const* bind_data)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  if (!bind) return false;
+  auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  std::unordered_set<int32_t> field_ids;
+  if (!collect_iceberg_field_ids(columns, field_ids)) return false;
+  // This is a connector capability profile, not a claim that every bound
+  // column will be materialized by this scan. Nested or otherwise irrelevant
+  // fields therefore do not veto a query; the mapper validates the actual
+  // output/filter/carrier requirements later.
+  bool saw_leaf = false;
+  return iceberg_mapping_leaf_types_supported(columns, saw_leaf) && saw_leaf;
+}
+
 bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data)
 {
   auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
   if (bind == nullptr) return false;
   auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
-  return collect_iceberg_field_ids(columns);
+  std::unordered_set<int32_t> field_ids;
+  return collect_iceberg_field_ids(columns, field_ids);
 }
 
 void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
@@ -617,6 +703,29 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   duckdb::DBConfig::GetConfig(db).GetCallbackManager().Register(
     duckdb::make_shared_ptr<scan_source_extension_callback>());
   initialize_iceberg_callbacks(db);
+}
+
+bool verified_parquet_interface(duckdb::FunctionData const* data, duckdb::ClientContext& context)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(data);
+  auto const* wrapper =
+    bind ? dynamic_cast<duckdb::TableFunctionMultiFileWrapper const*>(bind->interface.get())
+         : nullptr;
+  if (!wrapper) return false;
+  auto& db         = duckdb::DatabaseInstance::GetDatabase(context);
+  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
+  // The host exports its registration entry point, but may hide individual Parquet
+  // factories. Resolve the nested reader through the same independent catalog used
+  // for top-level callbacks, never through the caller's mutable catalog.
+  static accepted_callbacks cache;
+  std::lock_guard lock(cache.mutex);
+  auto const& references = cache.reference.get_or_resolve(
+    host, [&] { return parquet_reference_functions(db, "parquet_scan", true); });
+  duckdb::TableFunctionMultiFileInfo candidate(wrapper->function, wrapper->settings);
+  for (auto const& reference : references) {
+    if (verified_callbacks(reference).matches_info(&candidate, 0)) return true;
+  }
+  return false;
 }
 
 template <class Function>
@@ -629,6 +738,7 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
     auto const& entry = entries[i];
     if (entry.function_name != function.GetName()) continue;
     function_known = true;
+
     if (!entry.bind_data_matches(bind)) continue;
     // The catalog's destructor identifies its host without a loader lookup per scan.
     auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(context));
@@ -662,9 +772,11 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
       }
       return {nullptr, lookup_decline::no_trusted_reference};
     }
+    if (entry.verify_binding && !entry.verify_binding(function, bind, context))
+      return {nullptr, lookup_decline::bind_data_mismatch};
     for (auto const& reference : references) {
       verified_callbacks const callbacks(reference);
-      if (!callbacks.matches(function)) continue;
+      if (!callbacks.matches(function, 0, entry.verify_binding != nullptr)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
         if (callbacks.matches(*registered)) return {&entry, lookup_decline::none};
       }

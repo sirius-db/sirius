@@ -6,13 +6,15 @@ The host-only identity API is in [cache_identity.hpp](src/jit/cache_identity.hpp
 
 One cache-format version, `kCacheFormatVersion` in
 [cache_identity.hpp](src/jit/cache_identity.hpp), controls both identity domains
-and the disk namespace. They always advance together.
+and the disk namespace. The record marker's version must match; they always
+advance together.
 
 | Component | Current version | Canonical definition |
 | --- | --- | --- |
 | Request identity | `simpatico-request-v2` | `request_identity()` |
 | Environment identity | `simpatico-environment-v2` | `environment_identity()` |
 | Disk path layout | `v2/` | `CompilationIdentity::relative_path()` |
+| Disk record marker | `SIMPJIT2` | `disk_cache.cpp` (compile-time version check) |
 
 The domains and path are derived from that constant in
 [cache_identity.cpp](src/jit/cache_identity.cpp).
@@ -103,15 +105,89 @@ Physical paths are excluded. Include-root reordering matters only when selected
 contents change. Directory dependencies track unsuccessful searches too, so newly
 shadowing headers regenerate the table.
 
+## Storage and maintenance
+
+Each `.cubin` file is a checked record, not a raw ELF image: eight ASCII bytes
+`SIMPJIT2`, an unsigned 64-bit big-endian payload length, 16 canonical bytes of
+payload XXH3-128, then that many cubin bytes. A zero-length payload, length/file-size
+mismatch, checksum mismatch, non-regular file, or cubin over 256 MiB is a miss.
+The cap bounds allocation on corrupt input; larger kernels still compile and
+reuse memory normally. CUDA loading remains the final compatibility check.
+Raw legacy/intermediate records are never accepted by this reader.
+
+Writers use `mkostemp` in the destination directory, handle short writes and
+`EINTR`, check close, and atomically rename the complete record into place.
+After writing, records get mode bits `0666 & ~umask`; the mask is read from Linux
+`/proc/self/status` per publication without changing process-wide state. If the
+mask is unavailable, the owner-only temporary mode is left unchanged. A failed
+permission change aborts publication and removes only that writer's temporary.
+Each writer owns only its unique temporary file. Failure removes that temporary,
+not the destination: another writer may already have repaired it. Redundant
+compilation is allowed. No `fsync` or power-failure durability is promised;
+damaged records are rebuilt. Checksums are not authentication: the configured
+cache directory must be trusted.
+
+The record marker follows the shared cache-format version. Header
+digests and NVRTC major/minor select the directory; payload validation and atomic
+publication are unchanged. A version-query error is propagated outside the
+best-effort storage fallback, not treated as an unreadable cache file.
+
+The payload checksum does not bind a record to its request/environment filename:
+moving a complete valid record to another request path still passes validation.
+There is no record-binding or authentication guarantee.
+
+Automatic retention and explicit cleanup recognize only these regular files
+under the configured root:
+
+- Legacy `<16 lowercase hex>_a<digits>_c<digits>_d<digits>.cubin`, and their
+  `.tmp.<digits>` remnants.
+- `v2/<32 lowercase hex>/<32 lowercase hex>.cubin`, and their
+  `.tmp.<six alphanumeric characters>` remnants.
+
+The configured root is trusted and may be a symlink to a directory. Both prune
+empty recognized directories but never remove that root or its alias, follow
+symlinks below it, traverse arbitrary nested directories, or remove unknown
+versions/unrelated names. Maintenance assumes a trusted directory, not a security
+boundary against a process actively replacing directories.
+
+Automatic pruning runs once per process on first disk-cache use, including a
+first-use disk hit. It creates/touches the current environment directory, removes
+recognized legacy flat files, and keeps the current environment plus the three
+newest other environments by directory modification time. Other environments
+also survive while their timestamp is within one hour (or in the future). Only
+older environments beyond that retained set have their recognized entries removed.
+A candidate's timestamp is checked again before deletion. Failures are best effort
+and do not prevent compilation or disk reuse. Disabled caching performs no scan.
+
+This is not a live-process lease or a strict directory/byte cap. Memory hits and
+later disk hits do not refresh timestamps or rerun pruning; publication normally
+updates directory timestamps through file creation/rename. A long-running older
+process can lose disk reuse or a pending publication if another process prunes its
+environment. Such races are misses or skipped writes, not partial cache records;
+already-loaded kernels remain usable. Grace periods and unrelated files can keep
+more than four directories, and there is no per-environment size bound.
+
+With writers stopped, `clear_jit_disk_cache()` explicitly removes recognized
+entries across all environments, including the current one, regardless of age.
+It does not query NVRTC and can also remove abandoned temporary files left after
+automatic maintenance. Unlike automatic retention, this is a quiescent operation.
+
+The host storage suite links the same implementation as production. Linker-level
+syscall fault injection tests partial/zero/interrupted writes, permission changes,
+close and rename failures without adding production test hooks. Threads and child
+processes stress same-key publication. Pruning tests cover retention/grace, future
+timestamps, unrelated files/symlinks, and concurrent publication/read/prune races.
+All maintenance tests operate only in owned temporary directories.
+
 ## Coverage
 
 Host tests need no CUDA driver and exercise the production embedders, relocation,
 include ordering, and incremental content/shadowing changes:
 
 ```sh
-pixi run cmake -S src/compression/simpatico_codegen/tests/cache -B build/cache-host -G Ninja
-pixi run cmake --build build/cache-host
-pixi run ctest --test-dir build/cache-host -L cache_host --output-on-failure --no-tests=error
+pixi run env CMAKE_BUILD_PARALLEL_LEVEL=16 cmake -S src/compression/simpatico_codegen/tests/cache -B build/cache-host -G Ninja
+pixi run cmake --build build/cache-host --parallel 16
+pixi run env CMAKE_BUILD_PARALLEL_LEVEL=16 ctest --test-dir build/cache-host -L cache_host --parallel 1 --output-on-failure --no-tests=error
 ```
 
 For GPU coverage, build `simpatico_cache_gpu_tests` and run CTest with
@@ -125,3 +201,11 @@ wrap the query while compilation still uses real NVRTC.
 The Test workflow runs host and GPU coverage using its configured CUDA matrix,
 independently of Sirius's Catch2 suite. Disk hits perform no compiler-file scan
 or builtins-loading probe.
+
+The storage suite also uses real `CompilationIdentity` paths for changed project
+headers, CCCL headers and both NVRTC version components. It checks record isolation
+and narrow explicit cleanup across those environments. The fresh-process tests
+verify pruning on a first-use disk hit, current-directory refresh, one-time
+scheduling even after clearing memory, and safe reuse/recompilation in an older
+live process whose disk environment another process prunes. Explicit cleanup is
+also tested without a successful NVRTC version query.

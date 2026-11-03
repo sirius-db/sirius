@@ -18,9 +18,11 @@
 
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/aggregate/wide_integer_sum.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
+#include <functional>
 
 namespace sirius {
 namespace op {
@@ -95,6 +97,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
       cudf_aggregate_input_max_abs[aggregate_slots[i].cudf_idx] = aggregate_input_max_abs[i];
     }
   }
+  cudf_aggregate_is_wide_integer_sum =
+    wide_integer_sum_mask(aggregate_slots, cudf_aggregates.size());
 }
 
 duckdb::vector<sirius::logical_type>
@@ -120,6 +124,29 @@ bool sirius_physical_grouped_aggregate::has_stddev_samp() const
   return std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
 }
 
+std::vector<std::optional<cudf::data_type>>
+sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
+{
+  auto const aggregate_offset = num_output_group_columns();
+  auto const has_two_carriers = [](AggregateSlot const& slot) {
+    return slot.is_wide_integer_sum || slot.returns_hugeint;
+  };
+  if (std::ranges::none_of(aggregate_slots, has_two_carriers) ||
+      types.size() != aggregate_offset + cudf_aggregates.size()) {
+    return {};
+  }
+  // The partial is INT64 or DECIMAL128 with scale 0; the alternate is whichever is not native.
+  std::vector<std::optional<cudf::data_type>> alternates(types.size());
+  for (auto const& slot : aggregate_slots) {
+    if (!has_two_carriers(slot)) { continue; }
+    auto const column  = aggregate_offset + slot.cudf_idx;
+    alternates[column] = sirius::require_cudf_type(types[column]) == wide_integer_sum_type()
+                           ? cudf::data_type{cudf::type_id::INT64}
+                           : wide_integer_sum_type();
+  }
+  return alternates;
+}
+
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
@@ -142,10 +169,14 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                           stream,
                                                           *space,
                                                           batch_telemetry(),
-                                                          cudf_aggregate_input_max_abs));
+                                                          cudf_aggregate_input_max_abs,
+                                                          cudf_aggregate_is_wide_integer_sum));
       continue;
     }
-    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+    auto const last_groups     = _last_batch_groups.load(std::memory_order_relaxed);
+    bool const split_wide_sums = last_groups <= split_wide_sum_max_groups;
+    cudf::size_type num_groups = 0;
+    auto result                = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
@@ -153,7 +184,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               stream,
                                                               *space,
                                                               batch_telemetry(),
-                                                              cudf_aggregate_input_max_abs);
+                                                              cudf_aggregate_input_max_abs,
+                                                              cudf_aggregate_is_wide_integer_sum,
+                                                              split_wide_sums,
+                                                              &num_groups);
+    _last_batch_groups.store(num_groups, std::memory_order_relaxed);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

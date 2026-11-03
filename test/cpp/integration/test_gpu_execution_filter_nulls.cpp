@@ -25,6 +25,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>
@@ -66,6 +67,30 @@ class NullDataFixture : public sirius::test::GpuExecutionFixture {
 };
 
 const std::vector<std::string> kNullableColumns = {"i", "b", "dec", "dbl", "s", "dt"};
+
+// The integration database is shared across tests, so a strategy SET must not outlive the test.
+struct evaluator_strategy_guard {
+  evaluator_strategy_guard(duckdb::Connection& c, const std::string& strategy) : con(c)
+  {
+    auto current = con.Query("SELECT current_setting('expression_evaluator_strategy');");
+    REQUIRE(current);
+    REQUIRE_FALSE(current->HasError());
+    original    = current->Collection().GetValue(0, 0).ToString();
+    auto result = con.Query("SET expression_evaluator_strategy = '" + strategy + "';");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  ~evaluator_strategy_guard()
+  {
+    con.Query("SET expression_evaluator_strategy = '" + original + "';");
+  }
+
+  evaluator_strategy_guard(const evaluator_strategy_guard&)            = delete;
+  evaluator_strategy_guard& operator=(const evaluator_strategy_guard&) = delete;
+
+  duckdb::Connection& con;
+  std::string original;
+};
 
 }  // namespace
 
@@ -155,6 +180,40 @@ TEST_CASE_METHOD(NullDataFixture,
   compare_gpu_vs_cpu("SELECT id FROM nt WHERE i IN (10, 20)");
   compare_gpu_vs_cpu("SELECT id FROM nt WHERE i NOT IN (10, 20)");
   compare_gpu_vs_cpu("SELECT id FROM nt WHERE s IN ('apple', 'cherry')");
+}
+
+// A NULL list entry never matches but turns a non-match into NULL: `x IN (NULL, 10)` is TRUE
+// for 10 and NULL otherwise, never FALSE.
+TEST_CASE_METHOD(NullDataFixture,
+                 "gpu_execution IN / NOT IN with a NULL list entry",
+                 "[integration][gpu_execution][filter][nulls]")
+{
+  // Booleans are projected so NULL and FALSE stay distinguishable. Column entries take the
+  // comparison-chain path, where a NULL row of `i` must not hide a match on another entry.
+  const std::vector<std::string> queries = {
+    "SELECT id, i IN (NULL, 10, 20) AS r FROM nt",
+    "SELECT id, i IN (NULL, NULL) AS r FROM nt",
+    "SELECT id, i NOT IN (NULL, NULL) AS r FROM nt",
+    "SELECT id, i IN (NULL, NULL) AS r FROM nt WHERE FALSE",
+    "SELECT id, i NOT IN (10, NULL) AS r FROM nt",
+    "SELECT id, s IN ('apple', NULL, 'cherry') AS r FROM nt",
+    "SELECT id, dec IN (10.50, NULL) AS r FROM nt",
+    "SELECT id, dt IN (NULL, DATE '2021-01-15') AS r FROM nt",
+    "SELECT id, b IN (i, 100) AS r FROM nt",
+    "SELECT id, b NOT IN (NULL, i, 200) AS r FROM nt",
+    "SELECT id FROM nt WHERE i IN (NULL, 10)",
+    "SELECT id, CASE WHEN s IN (NULL, 'apple') THEN -906929.2003 ELSE 0.5000 END AS r FROM nt"};
+  for (auto const* strategy : {"materialize", "ast_interpret", "ast_jit"}) {
+    for (auto const& query : queries) {
+      DYNAMIC_SECTION(strategy << ": " << query)
+      {
+        // Keep the IN lists as IN expressions rather than letting DuckDB rewrite them.
+        sirius::test::disabled_optimizers_guard optimizer_guard{*con, "in_clause"};
+        evaluator_strategy_guard strategy_guard{*con, strategy};
+        compare_gpu_vs_cpu(query);
+      }
+    }
+  }
 }
 
 TEST_CASE_METHOD(NullDataFixture,

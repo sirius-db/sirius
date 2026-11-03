@@ -8,6 +8,7 @@ target_sources(
           dynamic_filter/dynamic_filter_key_admission.cpp
           dynamic_filter/dynamic_filter_target_discovery.cpp
           gpu_admission.cpp
+          join_key_nullability.cpp
           query.cpp
           query_index.cpp
           scan_column_origin.cpp
@@ -34,4 +35,5 @@ target_sources(
           sirius_plan_projection_utils.cpp
           sirius_plan_recursive_cte.cpp
           sirius_plan_set_operation.cpp
-          sirius_plan_top_n.cpp)
+          sirius_plan_top_n.cpp
+          sirius_plan_window.cpp)

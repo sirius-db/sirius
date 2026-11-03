@@ -201,13 +201,13 @@ TEST_CASE("stateless single-partition consumers leave task placement to locality
     logical_join, child(), child(), {}, duckdb::JoinType::INNER, 0);
   sirius_physical_grouped_aggregate_merge merge(types(), {}, {}, {}, {}, {}, false, false, 0);
   sirius_physical_dense_count_join dense(types(), 0, 0, 0, std::nullopt, 1024);
-  for (auto* consumer :
-       std::vector<sirius_physical_partition_consumer_operator*>{&nlj, &merge, &dense}) {
-    consumer->set_active_gpu_ids({3, 7});
-    partition_sizing_input in{};
-    in.total_bytes          = 1024;
-    in.combined_total_bytes = 2048;
-    auto const strategy     = consumer->get_partition_strategy(in);
+  nlj.set_active_gpu_ids({3, 7});
+  merge.set_active_gpu_ids({3, 7});
+  dense.set_active_gpu_ids({3, 7});
+  partition_sizing_input small{1024, false, false, 2048};
+  for (auto const& strategy : {nlj.get_partition_strategy(small),
+                               merge.get_partition_strategy(small),
+                               dense.get_partition_strategy(small)}) {
     REQUIRE(strategy.num_partitions == 1);
     REQUIRE_FALSE(strategy.broadcast);
     REQUIRE_FALSE(strategy.build_probe);
@@ -217,11 +217,12 @@ TEST_CASE("stateless single-partition consumers leave task placement to locality
   }
 
   // Large inputs retain the existing distribution; NLJ always has one partition.
-  for (auto* consumer : std::vector<sirius_physical_partition_consumer_operator*>{&merge, &dense}) {
-    partition_sizing_input in{};
-    in.total_bytes          = 24 * sirius::config::DEFAULT_HASH_PARTITION_BYTES;
-    in.combined_total_bytes = in.total_bytes;
-    auto const strategy     = consumer->get_partition_strategy(in);
+  partition_sizing_input large{24 * sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+                               false,
+                               false,
+                               24 * sirius::config::DEFAULT_HASH_PARTITION_BYTES};
+  for (auto const& strategy :
+       {merge.get_partition_strategy(large), dense.get_partition_strategy(large)}) {
     REQUIRE(strategy.num_partitions > 1);
     CHECK(strategy.placement == partition_placement::round_robin(strategy.num_partitions, {3, 7}));
   }

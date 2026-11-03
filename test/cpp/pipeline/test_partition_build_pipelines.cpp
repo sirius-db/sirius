@@ -165,16 +165,15 @@ TEST_CASE_METHOD(partition_build_fixture,
 
     for (const auto& pipeline : partitions) {
       auto& partition = pipeline->get_sink()->Cast<sirius::op::sirius_physical_partition>();
-      INFO((partition.is_build_partition() ? "build" : "probe") << "-side PARTITION pipeline");
+      INFO("PARTITION pipeline with declared ingress barrier "
+           << static_cast<int>(partition.input_barrier()));
 
       require_partition_pipeline_shape(result, pipeline);
 
       // Probe-side partitions stream batches (PARTIAL); the build side must accumulate
       // every partition before the join can run (FULL).
       auto inputs                 = wirings_into(result, pipeline.get());
-      const auto expected_barrier = partition.is_build_partition()
-                                      ? sirius::op::MemoryBarrierType::FULL
-                                      : sirius::op::MemoryBarrierType::PARTIAL;
+      const auto expected_barrier = partition.input_barrier();
       CHECK(inputs[0]->barrier_type == expected_barrier);
 
       // PARTITION output routes to its parent CONCAT: a single-operator [CONCAT] pipeline
@@ -206,12 +205,12 @@ TEST_CASE_METHOD(partition_build_fixture,
     auto* build_sink = join_pipeline->dependencies[0]->get_sink().get();
     REQUIRE(build_sink != nullptr);
     REQUIRE(build_sink->type == SiriusPhysicalOperatorType::CONCAT);
-    CHECK(build_sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat());
+    CHECK(join_pipeline->get_source()->input_port_for(*build_sink) == "build");
     bool has_probe_concat_dep = false;
     for (const auto& dep : join_pipeline->dependencies) {
       auto* sink = dep->get_sink().get();
       if (sink != nullptr && sink->type == SiriusPhysicalOperatorType::CONCAT &&
-          !sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat()) {
+          join_pipeline->get_source()->input_port_for(*sink) == "default") {
         has_probe_concat_dep = true;
       }
     }

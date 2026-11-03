@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "compression/compressed_disk_representation.hpp"
+#include "compression/compressed_representation.hpp"
+#include "compression/spill_compression.hpp"
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
@@ -55,10 +58,18 @@ class convertible_data_batch : public convertible_data {
  public:
   /**
    * @brief Construct from a shared_ptr to a cucascade data_batch.
-   * @param batch The data batch to wrap (shared ownership retained).
+   * @param batch        The data batch to wrap (shared ownership retained).
+   * @param source_space When non-null, convert() only moves the batch while it is still in this
+   *                     space -- the space it was picked to relieve. The batch may have moved
+   *                     since (e.g. spilled and upgraded on another GPU), and converting it with
+   *                     the caller's stream, which belongs to the original device, would then
+   *                     fail inside cuCascade ("stream belongs to CUDA device N but this
+   *                     representation's memory lives on device M"). Leave null to allow
+   *                     conversion from any space.
    */
-  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch)
-    : _batch(std::move(batch))
+  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch,
+                                  cucascade::memory::memory_space const* source_space = nullptr)
+    : _batch(std::move(batch)), _source_space(source_space)
   {
   }
 
@@ -95,14 +106,22 @@ class convertible_data_batch : public convertible_data {
     }
     auto& mut = *mut_opt;
 
-    // Check if the batch is already in the target space
+    // Check if the batch is already in the target space, or has left its source space.
     auto cur_space = mut.get_memory_space();
+    if (_source_space != nullptr && cur_space != _source_space) { return std::nullopt; }
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
       if (cur_space == space) { return std::nullopt; }
     }
 
-    auto data_size = mut.get_data()->get_size_in_bytes();
+    // A batch going to the GPU needs room for its decoded form, which for a compressed
+    // batch is larger than what it occupies now.
+    auto const data_size = [&] {
+      auto const* data = mut.get_data();
+      auto const going_to_gpu =
+        !target_spaces.empty() && target_spaces.front()->get_tier() == cucascade::memory::Tier::GPU;
+      return going_to_gpu ? data->get_uncompressed_data_size_in_bytes() : data->get_size_in_bytes();
+    }();
 
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
@@ -138,10 +157,25 @@ class convertible_data_batch : public convertible_data {
             converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::HOST:
+          if (try_spill_compressed<compressed_host_representation>(mut, *reservation, stream)) {
+            break;
+          }
+          // A compressed batch has no raw host form to fall back to.
+          if (is_simpatico_compressed_representation(mut.get_data())) { continue; }
           mut.convert_to<cucascade::host_data_representation>(
             converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::DISK:
+          if (dynamic_cast<compressed_host_representation const*>(mut.get_data()) != nullptr) {
+            // Already compressed: write it out as is.
+            mut.convert_to<compressed_disk_representation>(
+              converter_registry, *reservation, stream);
+            break;
+          }
+          if (try_spill_compressed<compressed_disk_representation>(mut, *reservation, stream)) {
+            break;
+          }
+          if (is_simpatico_compressed_representation(mut.get_data())) { continue; }
           mut.convert_to<cucascade::disk_data_representation>(
             converter_registry, *reservation, stream);
           break;
@@ -175,7 +209,38 @@ class convertible_data_batch : public convertible_data {
   }
 
  private:
+  /**
+   * @brief Spill a GPU batch in its Simpatico-compressed form, when spill compression
+   *        applies to it.
+   *
+   * @return true when the batch now holds a @p Compressed representation; false when
+   *         it was not a candidate, or the encode declined or failed, in which case the
+   *         batch is unchanged and the caller spills it uncompressed.
+   */
+  template <typename Compressed>
+  static bool try_spill_compressed(cucascade::mutable_data_batch& mut,
+                                   cucascade::memory::reservation& reservation,
+                                   ::cuda::stream_ref stream)
+  {
+    auto* data = mut.get_data();
+    if (dynamic_cast<cucascade::gpu_table_representation*>(data) == nullptr ||
+        !compression::spill_compression_applies(data->get_size_in_bytes())) {
+      return false;
+    }
+    try {
+      mut.convert_to<Compressed>(sirius::converter_registry::get(), reservation, stream);
+      return true;
+    } catch (compression::spill_compression_declined const& e) {
+      SIRIUS_LOG_DEBUG("[spill_compression] spilling uncompressed: {}", e.what());
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_DEBUG("[spill_compression] encode failed, spilling uncompressed: {}", e.what());
+    }
+    return false;
+  }
+
   std::shared_ptr<cucascade::data_batch> _batch;
+  /// Non-owning; null converts the batch from any space.
+  cucascade::memory::memory_space const* _source_space{nullptr};
 };
 
 /**
@@ -335,7 +400,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch));
+      return std::make_unique<convertible_data_batch>(std::move(batch), space);
     }
 
     return nullptr;

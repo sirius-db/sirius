@@ -1,5 +1,12 @@
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+if(NOT VCPKG_BUILD)
+  # TODO: Remove with ast_compat.hpp and the cudf port patch after cudf#24173
+  # ships. Cover transitive AST includes regardless of source header order.
+  target_compile_options(
+    cudf::cudf
+    INTERFACE "$<$<COMPILE_LANGUAGE:CXX,CUDA>:SHELL:-include variant>")
+endif()
 find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)

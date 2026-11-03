@@ -202,9 +202,9 @@ accidental collisions unlikely, not impossible.
    environment is fixed within the binary, so it is not copied or rehashed on warm lookups.
 2. **On-disk** (persistent, shared across processes and runs): each cubin is stored as
    `<dir>/v2/<environment-id>/<request-id>.cubin`. On a hit the cubin is loaded directly,
-   skipping compilation of the requested kernel. A reported CUDA load error falls through
-   to a fresh compile. This layer still stores raw cubins; malformed files are not
-   validated before CUDA loading. Record validation is the separate storage-hardening layer.
+   skipping compilation of the requested kernel. The reader validates the record's length,
+   size limit and payload checksum before CUDA loading. Invalid storage records and
+   reported CUDA load errors fall through to a fresh compile.
 
 Lookup order per shape: in-memory → on-disk → NVRTC compile (a fresh compile then populates
 both levels). Concurrent cold requests may compile redundantly.
@@ -216,11 +216,34 @@ provider/linkage labels, and host-object epochs are not identity inputs. The tar
 already keyed through the effective compiler options; a compatible CUDA driver is still
 required. A version-query failure reports the NVRTC error, rather than identifying the
 compiler as version zero. Disk-disabled compilation and memory hits do not query the version.
+Storage errors remain best-effort cache misses; they do not suppress a version-query error.
 Replacing the compiler or runtime while a process is running is not supported.
 
-Old flat cache entries are ignored but not deleted; nothing reclaims their space, since other
-builds may still use them. Header providers remain embedded and libcudf-aligned on CUDA 12
-and 13; NVRTC bundled-header adoption is separate work.
+First disk use in each process touches the current environment, removes recognized legacy
+flat entries, and prunes old environments. Keep the current environment plus the three newest
+others, with a one-hour grace period for additional environments. Only recognized v2 records
+and cache temporaries are removed; unrelated files, nested content, unknown versions, and
+symlinks are preserved. Pruning is best effort, not a strict directory/byte cap or live-process
+lease: a long-running older process can lose disk reuse or a pending publication and recompile.
+Memory hits and later disk hits neither refresh timestamps nor rerun pruning.
+
+`codegen::jit::clear_jit_disk_cache()` remains explicit maintenance with writers stopped.
+It removes recognized legacy/v2 records and abandoned temporaries across all environments,
+including the current one, regardless of age. Already-loaded kernels are unaffected.
+
+Disk records carry a length and payload checksum, validated before CUDA loading.
+Publication uses an exclusively created, unique temporary file followed by rename.
+Failed writes/close/rename remove only that writer's temporary file. Missing, unreadable,
+truncated, corrupt, or incompatible entries are misses; successful compilation repairs
+the entry without first deleting another writer's destination. No power-loss durability
+is promised. Cubins larger than 256 MiB skip persistence but remain usable in memory.
+Use a trusted cache directory: checksums detect corruption, not malicious tampering.
+A complete valid record copied under the wrong request filename still passes the payload
+checksum; the record does not embed or verify the requested compilation identity.
+
+The format and cleanup details are in [CACHE_FORMAT.md](CACHE_FORMAT.md). Header providers
+remain embedded and libcudf-aligned on CUDA 12 and 13; NVRTC bundled-header adoption is
+separate work.
 
 ### Self-contained JIT (no header tree at runtime)
 

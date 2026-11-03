@@ -16,11 +16,12 @@
 
 #pragma once
 
-#include <cudf/version_config.hpp>
-#define CUDF_VERSION_NUM (CUDF_VERSION_MAJOR * 100 + CUDF_VERSION_MINOR)
-
+#include "cudf/ast_compat.hpp"
+#include "cudf/hugeint_carrier.hpp"
+#include "helper/hugeint.hpp"
 #include "helper/logical_type.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -58,18 +59,14 @@
 namespace sirius {
 
 /**
- * @brief Apply a boolean retention mask using the cuDF 26.08 API.
+ * @brief Apply a boolean retention mask.
  */
 inline std::unique_ptr<cudf::table> apply_retention_mask(cudf::table_view const& input,
                                                          cudf::column_view const& retention_mask,
                                                          ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
-#if CUDF_VERSION_NUM >= 2610
   return cudf::apply_retention_mask(input, retention_mask, stream, mr);
-#else
-  return cudf::apply_boolean_mask(input, retention_mask, stream, mr);
-#endif
 }
 
 /**
@@ -217,9 +214,7 @@ inline std::size_t estimate_referenced_column_bytes(
     case type_id::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case type_id::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case type_id::BIGINT: return cudf::data_type(cudf::type_id::INT64);
-    case type_id::HUGEINT:
-      // FIXME: Unsafe 128-to-64-bit narrowing can corrupt values outside the INT64 range.
-      return cudf::data_type(cudf::type_id::INT64);
+    case type_id::HUGEINT: return hugeint_carrier_type();
     case type_id::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case type_id::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case type_id::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
@@ -272,8 +267,8 @@ inline std::size_t estimate_referenced_column_bytes(
 /**
  * @brief Convert a non-null DuckDB value to a cuDF scalar.
  *
- * The value must have type @p t. DECIMAL128 and nested types return STRING using `val.ToString()`;
- * unmappable types throw `InvalidInputException`.
+ * The value must have type @p t. Nested types return STRING using `val.ToString()`; unmappable
+ * types throw `InvalidInputException`.
  */
 [[nodiscard]] inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& val,
                                                                         logical_type const& t,
@@ -315,6 +310,14 @@ inline std::size_t estimate_referenced_column_bytes(
         numeric::scale_type{-static_cast<int32_t>(t.decimal_scale())},
         true,
         stream);
+    case cudf::type_id::DECIMAL128: {
+      // HUGEINT and DECIMAL(19..38) both store a duckdb::hugeint_t.
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+        to_int128(val.GetValueUnsafe<duckdb::hugeint_t>()),
+        numeric::scale_type{cudf_type.scale()},
+        true,
+        stream);
+    }
     default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
   }
 }
@@ -392,10 +395,8 @@ inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::dat
     case LogicalTypeId::TINYINT: return cudf::data_type(cudf::type_id::INT8);
     case LogicalTypeId::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case LogicalTypeId::INTEGER: return cudf::data_type(cudf::type_id::INT32);
-    case LogicalTypeId::BIGINT:
-    case LogicalTypeId::HUGEINT:  // FIXME: unsafe conversion from duckdb HugeInt to cudf Int64,
-                                  // since cudf does not support Int128.
-      return cudf::data_type(cudf::type_id::INT64);
+    case LogicalTypeId::BIGINT: return cudf::data_type(cudf::type_id::INT64);
+    case LogicalTypeId::HUGEINT: return hugeint_carrier_type();
     case LogicalTypeId::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case LogicalTypeId::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case LogicalTypeId::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);

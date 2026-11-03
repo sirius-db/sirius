@@ -72,7 +72,7 @@ TEST_CASE("arrival ledger certifies exactly the pushed batches as a sorted inven
   arrivals.record(*first);
   arrivals.record(*second);
 
-  auto certified = arrivals.certify({.repository_batches = 3, .partition_count = 4});
+  auto certified = arrivals.certify({.repository_batches = 3});
   REQUIRE(certified);
   REQUIRE(certified->total_rows() == 20);
   REQUIRE(certified->batches().size() == 3);
@@ -88,7 +88,7 @@ TEST_CASE("arrival ledger certifies exactly the pushed batches as a sorted inven
 
   SECTION("certification happens at most once")
   {
-    REQUIRE_FALSE(arrivals.certify({.repository_batches = 3, .partition_count = 4}));
+    REQUIRE_FALSE(arrivals.certify({.repository_batches = 3}));
   }
   SECTION("a push after certification is an invariant violation")
   {
@@ -122,10 +122,10 @@ TEST_CASE("arrival ledger declines when the repository holds a batch it never sa
   auto const recorded = fixture.make_batch(0, 0, 4);
   ledger arrivals;
   arrivals.record(*recorded);
-  REQUIRE_FALSE(arrivals.certify({.repository_batches = 2, .partition_count = 2}));
+  REQUIRE_FALSE(arrivals.certify({.repository_batches = 2}));
   // A declined ledger ignores later arrivals rather than failing the pushing task.
   REQUIRE_NOTHROW(arrivals.record(*fixture.make_batch(0, 10, 4)));
-  REQUIRE_FALSE(arrivals.certify({.repository_batches = 2, .partition_count = 2}));
+  REQUIRE_FALSE(arrivals.certify({.repository_batches = 2}));
 }
 
 TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
@@ -158,10 +158,10 @@ TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
     REQUIRE(recorded.wait_for(std::chrono::seconds{10}) == std::future_status::ready);
     recorded.get();
   }
-  REQUIRE_FALSE(arrivals.certify({.repository_batches = 2, .partition_count = 2}));
+  REQUIRE_FALSE(arrivals.certify({.repository_batches = 2}));
 }
 
-TEST_CASE("certified inventories reject a single partition and transfer on move",
+TEST_CASE("certified inventories need no downstream partition count and transfer on move",
           "[dynamic_filter][multi_partition][inventory]")
 {
   acc::fixture fixture;
@@ -169,11 +169,11 @@ TEST_CASE("certified inventories reject a single partition and transfer on move"
   {
     ledger single;
     single.record(*batch);
-    REQUIRE_FALSE(single.certify({.repository_batches = 1, .partition_count = 1}));
+    REQUIRE(single.certify({.repository_batches = 1}));
   }
   ledger arrivals;
   arrivals.record(*batch);
-  auto source = arrivals.certify({.repository_batches = 1, .partition_count = 3});
+  auto source = arrivals.certify({.repository_batches = 1});
   REQUIRE(source);
   inventory moved{std::move(*source)};
   REQUIRE(moved.total_rows() == 9);
@@ -203,7 +203,7 @@ TEST_CASE("inventory records top-level key types without constraining payload ch
   ledger arrivals;
   arrivals.record(*first);
   arrivals.record(*second);
-  auto certified = arrivals.certify({.repository_batches = 2, .partition_count = 2});
+  auto certified = arrivals.certify({.repository_batches = 2});
   REQUIRE(certified);
   REQUIRE(certified->consistent_type_at(0) == integer.type());
   REQUIRE(certified->consistent_type_at(1) == nested.type());
@@ -231,7 +231,7 @@ TEST_CASE("a missing or changed key type stays unavailable while siblings remain
   for (auto const& batch : {first, second, third}) {
     arrivals.record(*batch);
   }
-  auto certified = arrivals.certify({.repository_batches = 3, .partition_count = 2});
+  auto certified = arrivals.certify({.repository_batches = 3});
   REQUIRE(certified);
   REQUIRE(certified->consistent_type_at(0) == integer.type());
   REQUIRE_FALSE(certified->consistent_type_at(1));

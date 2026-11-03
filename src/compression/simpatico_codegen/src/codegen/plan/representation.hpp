@@ -3,10 +3,12 @@
 #include "codegen/plan/bit_spec.hpp"
 #include "codegen/plan/leaf_desc.hpp"
 #include "codegen/util/dictionary_view_helper.hpp"
+#include "util/nvcomp_payload_format.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -81,7 +83,8 @@ inline rmm::device_buffer copy_bitmask_as_data(cudf::column_view const& source,
 {
   auto mask = cudf::copy_bitmask(source, stream, mr);
 #if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
-  return rmm::device_buffer(mask.data(), mask.size(), stream, mr);
+  // CUDA mask buffers count elements, while the sidecar and column data count bytes.
+  return rmm::device_buffer(mask.data(), mask.size() * sizeof(*mask.data()), stream, mr);
 #else
   return mask;
 #endif
@@ -449,9 +452,9 @@ struct nvcomp_payload_rep : standalone_compressed_representation {
 };
 
 // Template base for nvcomp codecs whose leaf metadata is exactly
-// (uncompressed_size, type_id): snappy, lz4, deflate, ans. Fixes
-// kind()/describe_meta() from its parameters; each concrete struct supplies its
-// own decompress() (.cu file).
+// (uncompressed_size, type_id): snappy, lz4, deflate. Fixes kind()/describe_meta()
+// from its parameters; ANS overrides describe_meta() to add its payload format.
+// Each concrete struct supplies its own decompress() (.cu file).
 // bitcomp/cascaded carry extra compress opts and derive from nvcomp_payload_rep.
 template <OpId K, typename MetaT>
 struct nvcomp_simple_rep_base : nvcomp_payload_rep {
@@ -472,6 +475,12 @@ struct nvcomp_simple_rep_base : nvcomp_payload_rep {
 
 struct ans_compressed_representation : nvcomp_simple_rep_base<OpId::Ans, leaf_meta::ans> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
+  std::uint8_t payload_format = detail::kNvcompPayloadFormat;
+  leaf_meta_v describe_meta() const override
+  {
+    return leaf_meta::ans{
+      uncompressed_size, static_cast<std::int32_t>(original_type.id()), payload_format};
+  }
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 };
 
@@ -550,6 +559,7 @@ struct cascaded_compressed_representation : nvcomp_payload_rep {
   int compress_num_deltas;
   int compress_num_RLEs;
   int compress_use_bp;
+  std::uint8_t payload_format;
 
   cascaded_compressed_representation(cudf::data_type t,
                                      cudf::size_type n,
@@ -558,11 +568,13 @@ struct cascaded_compressed_representation : nvcomp_payload_rep {
                                      size_t uncomp_size,
                                      int num_deltas,
                                      int num_RLEs,
-                                     int use_bp)
+                                     int use_bp,
+                                     std::uint8_t format = detail::kNvcompPayloadFormat)
     : nvcomp_payload_rep(t, n, std::move(data), comp_size, uncomp_size),
       compress_num_deltas(num_deltas),
       compress_num_RLEs(num_RLEs),
-      compress_use_bp(use_bp)
+      compress_use_bp(use_bp),
+      payload_format(format)
   {
   }
 
@@ -575,7 +587,8 @@ struct cascaded_compressed_representation : nvcomp_payload_rep {
                                       static_cast<std::int32_t>(original_type.id()),
                                       compress_num_deltas,
                                       compress_num_RLEs,
-                                      compress_use_bp};
+                                      compress_use_bp,
+                                      payload_format};
   }
 };
 
