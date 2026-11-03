@@ -291,29 +291,45 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
   }
 }
 
-void SiriusContext::QueryBegin(ClientContext& context)
+SiriusConnectionState::~SiriusConnectionState() { finish_observation("abandoned"); }
+
+void SiriusConnectionState::finish_observation(const char* outcome) noexcept
 {
-  // Suppress logging for internal connections (e.g. internal metadata lookups).
-  if (is_internal_query_active(context)) { return; }
+  if (auto observer = std::exchange(observer_, nullptr)) { observer->complete(outcome); }
+  frontend_interval_.finish(outcome);
+}
 
-  // Advance the per-connection query ordinal FIRST, before any best-effort
-  // observation: even if the SQL capture or logging below fails, the next
-  // execution window must see a FRESH ordinal — a stale one would correlate
-  // that window to the PREVIOUS query's SQL line instead of standing alone as
-  // a window without SQL. next_query_ordinal() is noexcept.
-  shared_ptr<SiriusConnectionState> conn_state;
-  uint64_t query_ordinal = 0;
-  try {
-    conn_state = get_sirius_connection_state(context);
-  } catch (...) {  // resolution failure: fall through to keyless logging
+void SiriusConnectionState::QueryBegin(ClientContext& context)
+{
+  if (is_internal_query_active()) return;
+  finish_observation("abandoned");
+  captured_plan_.reset();
+  captured_original_views_.reset();
+  pinned_update_guard_.reset();
+  {
+    std::lock_guard lock(cpu_replay_error_mutex_);
+    cpu_replay_error_.reset();
   }
-  if (conn_state) { query_ordinal = conn_state->next_query_ordinal(); }
+  auto const query_ordinal = next_query_ordinal();
+  shared_ptr<SiriusContext> runtime;
+  try {
+    runtime = context.registered_state->Get<SiriusContext>("sirius_state");
+  } catch (...) {  // Best-effort observation, including registry lookup.
+  }
+  try {
+    if (runtime && runtime->is_initialized()) {
+      observer_ = std::make_shared<sirius::telemetry::query_observer>(
+        runtime->get_telemetry_context(), std::nullopt, session_label_);
+      observer_->correlate(connection_id(), query_ordinal);
+      observer_->planning();
+      frontend_interval("query_begin_to_pre_hook_or_end");
+    }
+  } catch (...) {  // Observation must not fail the query it decorates.
+  }
 
-  // QueryBegin holds no lock and mutates no shared state: slot ownership is
-  // scope-bound (StandaloneQueryScope/SlotGuard) and the begin mutations run
-  // inside the execution window. Everything below is observation only and
-  // best-effort; a logging or allocation failure must not fail the query it
-  // decorates.
+  // No admission or runtime work is acquired here. Execution-window mutations
+  // remain scope-bound (StandaloneQueryScope/SlotGuard). Logging below is
+  // best-effort; a logging or allocation failure must not fail the query it decorates.
   try {
     auto query = context.GetCurrentQuery();
     // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
@@ -339,10 +355,10 @@ void SiriusContext::QueryBegin(ClientContext& context)
     // could interleave with another connection's logging); execution windows and
     // pool lines carry the same instance/connection key. The trailing
     // "SQL: <sql>" form is preserved for log-analyzer text correlation.
-    if (conn_state) {
+    if (runtime) {
       SIRIUS_LOG_INFO("QueryBegin: instance={} connection={} query={} SQL: {}",
-                      static_cast<const void*>(this),
-                      conn_state->connection_id(),
+                      static_cast<const void*>(runtime.get()),
+                      connection_id(),
                       query_ordinal,
                       normalized_query);
     } else {
@@ -350,24 +366,6 @@ void SiriusContext::QueryBegin(ClientContext& context)
     }
   } catch (...) {  // best-effort observability
   }
-}
-
-void SiriusContext::QueryEnd()
-{
-  // The DuckDB query-end callback releases no slot or repository state: slot ownership is
-  // scope-bound and the mandatory cleanup runs inside the execution window
-  // (StandaloneQueryScope::finish), before the result is exposed.
-}
-
-void SiriusContext::QueryEnd(ClientContext& context)
-{
-  if (is_internal_query_active(context)) { return; }
-  QueryEnd();
-}
-
-void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
-{
-  QueryEnd(context);
 }
 
 bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
@@ -1424,6 +1422,7 @@ void SiriusConnectionState::record_cpu_replay_error(ErrorData error, string quer
 
 void SiriusConnectionState::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
 {
+  if (is_internal_query_active()) return;
   std::optional<cpu_replay_error> replay;
   {
     std::lock_guard lock(cpu_replay_error_mutex_);
@@ -1438,6 +1437,11 @@ void SiriusConnectionState::QueryEnd(ClientContext& context, optional_ptr<ErrorD
       // Keep the interrupt: DuckDB must still end the query.
     }
   }
+  // DuckDB supplies a null error for both success and abandonment, after clearing
+  // the active query. Leave the outcome unknown in that case.
+  finish_observation(error && error->HasError()
+                       ? (error->Type() == ExceptionType::INTERRUPT ? "cancelled" : "failed")
+                       : nullptr);
   ClientContextState::QueryEnd(context, error);
 }
 
@@ -1770,6 +1774,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
+  if (conn_state) conn_state->end_frontend_interval();
+  auto observe = [&](const char* phase,
+                     const char* kind = "work",
+                     std::optional<sirius::telemetry::query_activity::id_type> parent =
+                       std::nullopt) {
+    return conn_state ? conn_state->activity(phase, kind, parent)
+                      : sirius::telemetry::query_activity{};
+  };
+  auto finalize = observe("finalize_prepare");
+  auto setup    = observe("finalize_setup", "work", finalize.id());
 
   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
   // A generation mismatch (e.g. a leftover from Connection::ExtractPlan, which
@@ -1832,9 +1846,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                   prepared.physical_plan->Root(), context)
                                               : sirius::transparent::plan_source_policy{{}, false};
 
+  setup.finish();
   if (!logical_plan) {
     if (current_query_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
     try {
+      auto replan = observe("finalize_replan", "work", finalize.id());
       InternalQueryGuard guard(context);  // suppress recursive optimizer hooks
       duckdb::Value churn_setting;
       if (context.TryGetCurrentSetting("sirius_test_read_view_churn_path", churn_setting) &&
@@ -1854,12 +1870,18 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
         std::filesystem::copy_file(*source, destination);
       }
       Parser parser(context);
+      auto parse = observe("parse", "work", replan.id());
       parser.ParseQuery(current_query_sql);
+      parse.finish();
       if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
       Planner planner(context);
+      auto bind = observe("bind", "work", replan.id());
       planner.CreatePlan(std::move(parser.statements[0]));
+      bind.finish();
       Optimizer optimizer(*planner.binder, context);
-      logical_plan = optimizer.Optimize(std::move(planner.plan));
+      auto optimize = observe("optimize", "work", replan.id());
+      logical_plan  = optimizer.Optimize(std::move(planner.plan));
+      optimize.finish();
     } catch (InterruptException&) {
       // Cancellation is never a fallback candidate — propagate as-is.
       throw;
@@ -1909,7 +1931,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
     try {
-      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
+      validation_plan =
+        sirius::transparent::copy_logical_plan(*logical_plan, context, finalize.id());
     } catch (NotImplementedException&) {
       plan_is_copyable = false;
     }
@@ -1917,11 +1940,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // Protect pin-registry reads and GPU plan validation against maintenance. Both SQL
     // replanning and logical-plan copying must finish before entering this window.
     // Keep acquisition inside this try so runtime-unavailable errors use the fallback below.
+    auto admission = observe("planning_admission", "wait", finalize.id());
     SlotGuard plan_window(*this, context, sirius::exec::query_admission::access::planning);
+    admission.finish();
+    auto physical_views = observe("physical_read_view_capture", "work", finalize.id());
     auto physical_original_views =
       prepared.physical_plan
         ? sirius::op::scan::capture_bound_read_views(prepared.physical_plan->Root(), context)
         : std::vector<sirius::op::scan::bound_read_view>{};
+    physical_views.finish();
+    auto translation = observe("gpu_translation", "work", finalize.id());
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
     //
@@ -1950,6 +1978,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       validated_sirius_plan = planner->create_plan(std::move(logical_plan));
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
+
+    translation.finish();
+    auto validation = observe("read_view_validation", "work", finalize.id());
 
     duckdb::Value read_view_injection;
     if (context.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",
@@ -1984,6 +2015,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       comparison.correspondence,
       physical_original_views);
 
+    validation.finish();
+    auto installation = observe("wrapper_installation", "work", finalize.id());
     SIRIUS_LOG_INFO("Transparent execution: Sirius physical plan generated successfully");
 
     // Stash DuckDB's CPU plan before overwriting it, wrapped in a minimal
@@ -2017,6 +2050,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // Replace the DuckDB CPU physical plan.
     prepared.physical_plan = std::move(new_physical_plan);
     record_transparent_rebind_success();
+    installation.finish();
+    finalize.finish();
+    if (conn_state) conn_state->frontend_interval("wrapper_installed_to_execution", "wait");
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
   } catch (InterruptException&) {

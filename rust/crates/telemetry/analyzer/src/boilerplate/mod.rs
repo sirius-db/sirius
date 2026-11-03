@@ -25,6 +25,11 @@ use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, try_to_secs_
 use sirius_telemetry_store as schema;
 use uuid::Uuid;
 
+mod fsm;
+use fsm::{
+    data_batch_declaration, native_fsm, query_activity_declaration, task_declaration, ui_transition,
+};
+
 mod channel;
 mod data_batch;
 mod engine;
@@ -61,3 +66,8 @@ pub(crate) use task_manager_loop_thread::TaskManagerLoopThread;
 pub(crate) use task_queue::TaskQueue;
 pub(crate) use thread_group::ThreadGroup;
 pub use worker::Worker;
+
+mod query_activity;
+mod query_activity_track;
+pub(crate) use query_activity::{QueryActivity, QueryActivityBuilder};
+pub(crate) use query_activity_track::QueryActivityTrack;

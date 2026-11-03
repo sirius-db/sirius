@@ -62,12 +62,12 @@ sirius_prepared_statement_data::sirius_prepared_statement_data(
 }
 
 sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
-                                   std::optional<std::string> query_label,
-                                   std::optional<std::string> session_label)
-  : client_context(client_context),
-    query_label(std::move(query_label)),
-    session_label(std::move(session_label))
+                                   std::shared_ptr<telemetry::query_observer> observer)
+  : client_context(client_context), observer(std::move(observer))
 {
+  if (!this->observer) {
+    throw std::invalid_argument("Sirius execution requires an invocation observer");
+  }
 }
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
@@ -99,9 +99,15 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     duckdb::identifier_map_t<duckdb::BoundParameterData> empty_parameters;
     prepared.prepared->Bind(context, empty_parameters);
 
-    sirius_active_query->engine =
-      duckdb::make_uniq<sirius_engine>(context, query_id, query_label, session_label);
-    auto& engine = *sirius_active_query->engine;
+    if (!context.registered_state) {
+      throw invalid_input_exception("Sirius context is not registered.");
+    }
+    auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!runtime || !runtime->is_initialized()) {
+      throw invalid_input_exception("Sirius context is not initialized.");
+    }
+    sirius_active_query->engine = duckdb::make_uniq<sirius_engine>(context, query_id, *observer);
+    auto& engine                = *sirius_active_query->engine;
     auto collector =
       duckdb::make_uniq<op::sirius_physical_materialized_collector>(prepared, context);
     D_ASSERT(collector->result_column_types == prepared.prepared->types);

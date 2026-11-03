@@ -6,63 +6,20 @@
 use quent_analyzer::{
     AnalyzerResult, Entity, RefTreeEntity,
     fsm::{
-        Fsm, FsmUsages, Transition,
+        Fsm, FsmUsages,
         native::{AnalyzedFsm, AnalyzedFsmBuilder, AnalyzedTransition},
     },
     resource::{Usage, Using},
 };
-use quent_dynamic_attributes::DynamicAttribute;
 use quent_query_engine_ui::OperatorFilter;
-use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
+use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec};
 use quent_ui::{
-    FiniteStateMachine, FsmTransition, FsmUsage,
-    fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration},
+    FiniteStateMachine,
+    fsm::{FsmTypeDecl, FsmTypeDeclaration},
 };
 use rustc_hash::FxHashSet as HashSet;
 use sirius_telemetry_store as schema;
 use uuid::Uuid;
-
-fn transition_attributes(event: &schema::DataBatchEvent) -> Vec<DynamicAttribute> {
-    match event {
-        schema::DataBatchEvent::Constructed {
-            data_batch_id,
-            producer_pipeline_id,
-            ..
-        } => vec![
-            DynamicAttribute::u64("data_batch_id", *data_batch_id),
-            DynamicAttribute::string(
-                "producer_pipeline_id",
-                producer_pipeline_id.target.to_string(),
-            ),
-        ],
-        _ => Vec::new(),
-    }
-}
-
-fn declaration() -> FsmTypeDecl {
-    let state = |name: &str, usages: &[&str]| FsmStateTypeDecl {
-        name: name.to_owned(),
-        usages: usages.iter().map(|usage| (*usage).to_owned()).collect(),
-    };
-    FsmTypeDecl {
-        name: "data_batch".to_owned(),
-        states: vec![
-            state("constructed", &[]),
-            state("stationary", &["memory"]),
-            state("in_transit", &["source_memory", "dest_memory", "channel"]),
-            state("destructed", &[]),
-        ],
-        transitions: vec![
-            FsmTransitionDecl::Entry("constructed".to_owned()),
-            FsmTransitionDecl::Transition("constructed".to_owned(), "stationary".to_owned()),
-            FsmTransitionDecl::Transition("stationary".to_owned(), "in_transit".to_owned()),
-            FsmTransitionDecl::Transition("in_transit".to_owned(), "stationary".to_owned()),
-            FsmTransitionDecl::Transition("stationary".to_owned(), "stationary".to_owned()),
-            FsmTransitionDecl::Transition("stationary".to_owned(), "destructed".to_owned()),
-            FsmTransitionDecl::Exit("destructed".to_owned()),
-        ],
-    }
-}
 
 /// The reconstructed data-batch FSM.
 #[derive(Debug)]
@@ -104,23 +61,7 @@ impl DataBatch {
 /// Builder for data-batch FSMs.
 pub type DataBatchBuilder = AnalyzedFsmBuilder<schema::DataBatchEvent>;
 
-impl Entity for DataBatch {
-    fn id(&self) -> Uuid {
-        self.fsm.id()
-    }
-
-    fn type_name(&self) -> &str {
-        "data_batch"
-    }
-
-    fn earliest_timestamp(&self) -> TimeUnixNanoSec {
-        self.fsm.earliest_timestamp()
-    }
-
-    fn latest_timestamp(&self) -> TimeUnixNanoSec {
-        self.fsm.latest_timestamp()
-    }
-}
+super::native_fsm!(DataBatch, schema::DataBatchEvent, fsm);
 
 impl RefTreeEntity for DataBatch {
     fn parent_id(&self) -> Option<Uuid> {
@@ -128,33 +69,9 @@ impl RefTreeEntity for DataBatch {
     }
 }
 
-impl Fsm for DataBatch {
-    type TransitionType = AnalyzedTransition<schema::DataBatchEvent>;
-
-    fn len(&self) -> usize {
-        self.fsm.len()
-    }
-
-    fn transition(&self, index: usize) -> Option<&Self::TransitionType> {
-        self.fsm.transition(index)
-    }
-}
-
-impl<'a> FsmUsages<'a> for DataBatch {
-    fn usages_with_state_names(&'a self) -> impl Iterator<Item = (&'a str, impl Usage<'a>)> {
-        self.fsm.usages_with_state_names()
-    }
-}
-
-impl Using for DataBatch {
-    fn usages(&self) -> impl Iterator<Item = impl Usage<'_>> {
-        self.fsm.usages()
-    }
-}
-
 impl FsmTypeDeclaration for DataBatch {
     fn fsm_type_declaration() -> FsmTypeDecl {
-        declaration()
+        super::data_batch_declaration()
     }
 }
 
@@ -225,24 +142,12 @@ impl DataBatchExt for DataBatch {
             .transitions()
             .iter()
             .map(|transition| {
-                Ok(FsmTransition {
-                    name: transition.name().to_owned(),
-                    usages: transition
-                        .usages()
-                        .iter()
-                        .map(|usage| FsmUsage {
-                            resource: usage.resource_id,
-                            capacities: usage
-                                .capacities
-                                .iter()
-                                .map(|capacity| (capacity.name.to_owned(), capacity.value))
-                                .collect(),
-                        })
-                        .collect(),
-                    timestamp: to_secs_relative(transition.timestamp(), epoch),
-                    attributes: transition_attributes(&transition.data),
-                    derived_attributes: Vec::new(),
-                })
+                Ok(super::ui_transition(
+                    transition,
+                    epoch,
+                    transition.data.attributes(),
+                    Vec::new(),
+                ))
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
 
@@ -252,5 +157,32 @@ impl DataBatchExt for DataBatch {
             instance_name: self.instance_name(),
             transitions,
         })
+    }
+}
+
+use crate::{
+    fsms::{QueryScope, ScopedFsm},
+    model::SiriusModel,
+};
+impl ScopedFsm for DataBatch {
+    fn visible_in(&self, scope: &QueryScope<'_>) -> bool {
+        DataBatchExt::belongs_to(self, scope.operators)
+    }
+    fn in_reference_tree(&self, scope: &QueryScope<'_>) -> bool {
+        self.producer_pipeline_uuid()
+            .is_some_and(|id| scope.operators.contains(&id))
+    }
+    fn operator_in_scope(&self, scope: &QueryScope<'_>) -> Option<Uuid> {
+        DataBatchExt::operator_in(self, scope.operators)
+    }
+    fn matches_operator_filter(&self, filter: &quent_query_engine_ui::OperatorFilter) -> bool {
+        self.matches_filter(filter)
+    }
+    fn to_ui(
+        &self,
+        _model: &SiriusModel,
+        epoch: TimeUnixNanoSec,
+    ) -> AnalyzerResult<FiniteStateMachine> {
+        self.try_to_ui_fsm(epoch)
     }
 }

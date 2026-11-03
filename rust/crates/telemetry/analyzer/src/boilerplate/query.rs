@@ -7,24 +7,96 @@ use quent_dynamic_attributes::DynamicAttribute;
 
 pub(crate) const QUERY_GROUP_ATTRIBUTE: &str = "query_group";
 
-pub(crate) type QueryBuilder = AnalyzedFsmBuilder<schema::QueryEvent>;
+pub(crate) struct QueryBuilder {
+    fsm: AnalyzedFsmBuilder<schema::QueryEvent>,
+    metadata_stream: Option<Uuid>,
+    metadata: Option<(u64, schema::QueryMetadata)>,
+}
+
+impl QueryBuilder {
+    pub(crate) fn try_new(id: Uuid) -> AnalyzerResult<Self> {
+        Ok(Self {
+            fsm: AnalyzedFsmBuilder::try_new(id)?,
+            metadata_stream: None,
+            metadata: None,
+        })
+    }
+
+    pub(crate) fn push_transition(&mut self, event: Event<schema::QueryEvent>) {
+        self.fsm.push_transition(event);
+    }
+
+    pub(crate) fn push_metadata(
+        &mut self,
+        stream: Uuid,
+        revision: u64,
+        metadata: schema::QueryMetadata,
+    ) -> AnalyzerResult<()> {
+        if revision == 0 || self.metadata_stream.is_some_and(|id| id != stream) {
+            return Err(quent_analyzer::AnalyzerError::Validation(
+                "query metadata requires one stream with positive revisions".into(),
+            ));
+        }
+        self.metadata_stream = Some(stream);
+        if self
+            .metadata
+            .as_ref()
+            .is_none_or(|(previous, _)| revision > *previous)
+        {
+            self.metadata = Some((revision, metadata));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct Query {
     fsm: AnalyzedFsm<schema::QueryEvent>,
     group_label: Option<String>,
+    metadata: Option<schema::QueryMetadata>,
 }
 
 impl Query {
     pub(crate) fn try_from_builder(builder: QueryBuilder) -> AnalyzerResult<Self> {
         Ok(Self {
-            fsm: builder.try_build()?,
+            fsm: builder.fsm.try_build()?,
             group_label: None,
+            metadata: builder.metadata.map(|(_, metadata)| metadata),
         })
     }
 
     pub(crate) fn set_group_label(&mut self, label: Option<String>) {
         self.group_label = label;
+    }
+
+    /// The catalog shows named queries and queries that reached execution. Keep
+    /// unnamed setup observations in the model for direct lookup and diagnostics.
+    pub(crate) fn show_in_query_list(&self) -> bool {
+        let named = match self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.instance_name.as_deref())
+        {
+            // This is an explicit label, even if it equals the default placeholder.
+            Some(name) => !name.trim().is_empty(),
+            None => self
+                .initial_name()
+                .is_some_and(|name| !name.trim().is_empty() && name != "unnamed_query"),
+        };
+        named
+            || self
+                .transitions()
+                .iter()
+                .any(|transition| matches!(transition.data, schema::QueryEvent::Executing { .. }))
+    }
+
+    fn initial_name(&self) -> Option<&String> {
+        self.transitions()
+            .first()
+            .and_then(|transition| match &transition.data {
+                schema::QueryEvent::Init { instance_name, .. } => Some(instance_name),
+                _ => None,
+            })
     }
 
     pub(crate) fn transitions(&self) -> &[AnalyzedTransition<schema::QueryEvent>] {
@@ -96,37 +168,64 @@ impl QueryEntity for Query {
         let mut completed_s = None;
 
         if let Some(epoch) = epoch {
-            for (index, transition) in transitions.iter().enumerate() {
+            for transition in transitions {
                 match transition.data {
                     schema::QueryEvent::Planning { .. } => {
                         planning_s = Some(try_to_secs_relative(transition.timestamp(), epoch)?);
                     }
                     schema::QueryEvent::Executing { .. } => {
                         executing_s = Some(try_to_secs_relative(transition.timestamp(), epoch)?);
-                        if let Some(next) = transitions.get(index + 1) {
-                            completed_s = Some(try_to_secs_relative(next.timestamp(), epoch)?);
-                        }
+                    }
+                    schema::QueryEvent::Finished { .. } => {
+                        completed_s = Some(try_to_secs_relative(transition.timestamp(), epoch)?);
                     }
                     _ => {}
                 }
             }
         }
 
+        let mut custom_attributes = Vec::new();
+        if let Some(label) = &self.group_label {
+            custom_attributes.push(DynamicAttribute::string(
+                QUERY_GROUP_ATTRIBUTE,
+                label.clone(),
+            ));
+        }
+        if let Some(metadata) = &self.metadata {
+            for (key, value) in [
+                ("connection_id", metadata.connection_id),
+                ("query_ordinal", metadata.query_ordinal),
+                ("planning_generation", metadata.planning_generation),
+                ("execution_query_id", metadata.execution_query_id),
+            ] {
+                if let Some(value) = value {
+                    custom_attributes.push(DynamicAttribute::u64(key, value));
+                }
+            }
+            for (key, value) in [
+                ("disposition", metadata.disposition.as_ref()),
+                ("outcome", metadata.outcome.as_ref()),
+            ] {
+                if let Some(value) = value {
+                    custom_attributes.push(DynamicAttribute::string(key, value.clone()));
+                }
+            }
+            if let Some(worker) = &metadata.worker_id {
+                custom_attributes.push(DynamicAttribute::string(
+                    "worker_id",
+                    worker.target.to_string(),
+                ));
+            }
+        }
+        let name = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.instance_name.as_ref())
+            .or_else(|| self.initial_name());
         Ok(query_engine_ui::Query {
             id: self.id(),
-            // Preserve session grouping through Quent's generic query attributes.
-            custom_attributes: self.group_label.as_ref().map_or_else(Vec::new, |label| {
-                vec![DynamicAttribute::string(
-                    QUERY_GROUP_ATTRIBUTE,
-                    label.clone(),
-                )]
-            }),
-            instance_name: transitions
-                .first()
-                .and_then(|transition| match &transition.data {
-                    schema::QueryEvent::Init { instance_name, .. } => Some(instance_name.clone()),
-                    _ => None,
-                }),
+            custom_attributes,
+            instance_name: name.cloned(),
             start_unix_ns: epoch,
             planning_s,
             executing_s,
