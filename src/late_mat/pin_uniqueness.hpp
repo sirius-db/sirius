@@ -71,6 +71,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -147,6 +148,23 @@ inline constexpr std::size_t retention_headroom_batches = 2;
                                                     std::size_t batch_bytes) noexcept
 {
   return available_bytes >= copy_bytes + retention_headroom_batches * batch_bytes;
+}
+
+/// Runs @p required, work the pin cannot do without, and survives an out-of-memory failure caused
+/// by optional copies. When @p required throws std::bad_alloc (which covers rmm::out_of_memory) and
+/// @p release_optional returns true, having given the optional memory back, @p required runs once
+/// more. A second failure, a failure with nothing to release (@p release_optional returns false)
+/// and any other exception propagate unchanged. Only for work that leaves nothing behind when it
+/// fails, so that repeating it is safe.
+template <typename Required, typename ReleaseOptional>
+auto retry_after_releasing_optional(Required&& required, ReleaseOptional&& release_optional)
+{
+  try {
+    return required();
+  } catch (std::bad_alloc const&) {
+    if (!release_optional()) { throw; }
+  }
+  return required();
 }
 
 /// Exact whole-column check, for the columns the cheap per-chunk pass could not

@@ -33,6 +33,8 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/error.hpp>
+
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
@@ -48,6 +50,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -502,6 +505,94 @@ TEST_CASE("an optional retained copy yields to the batches the pin still has to 
     retention_has_headroom(8 * mib + retention_headroom_batches * 19 * mib - 1, 8 * mib, 19 * mib));
   // Nothing to protect: an empty batch needs only the copy itself.
   REQUIRE(retention_has_headroom(8 * mib, 8 * mib, 0));
+}
+
+TEST_CASE("required work is retried once after the optional copies are given back",
+          "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::retry_after_releasing_optional;
+  int runs     = 0;
+  int releases = 0;
+
+  SECTION("work that succeeds is run once and nothing is released")
+  {
+    auto const result = retry_after_releasing_optional(
+      [&] {
+        ++runs;
+        return 7;
+      },
+      [&] {
+        ++releases;
+        return true;
+      });
+    REQUIRE(result == 7);
+    REQUIRE(runs == 1);
+    REQUIRE(releases == 0);
+  }
+
+  SECTION("an out-of-memory failure releases the copies and runs the work again")
+  {
+    auto const result = retry_after_releasing_optional(
+      [&] {
+        if (++runs == 1) { throw rmm::out_of_memory("the pin's decode"); }
+        return 7;
+      },
+      [&] {
+        ++releases;
+        return true;
+      });
+    REQUIRE(result == 7);
+    REQUIRE(runs == 2);
+    REQUIRE(releases == 1);
+  }
+
+  SECTION("with nothing to release the original failure propagates without a retry")
+  {
+    REQUIRE_THROWS_AS(retry_after_releasing_optional(
+                        [&]() -> int {
+                          ++runs;
+                          throw std::bad_alloc();
+                        },
+                        [&] {
+                          ++releases;
+                          return false;
+                        }),
+                      std::bad_alloc);
+    REQUIRE(runs == 1);
+    REQUIRE(releases == 1);
+  }
+
+  SECTION("a second failure propagates and the copies are released only once")
+  {
+    REQUIRE_THROWS_AS(retry_after_releasing_optional(
+                        [&]() -> int {
+                          ++runs;
+                          throw rmm::out_of_memory("the pin's decode");
+                        },
+                        [&] {
+                          ++releases;
+                          return true;
+                        }),
+                      rmm::out_of_memory);
+    REQUIRE(runs == 2);
+    REQUIRE(releases == 1);
+  }
+
+  SECTION("a failure that is not about memory is not retried")
+  {
+    REQUIRE_THROWS_AS(retry_after_releasing_optional(
+                        [&]() -> int {
+                          ++runs;
+                          throw std::runtime_error("corrupt file");
+                        },
+                        [&] {
+                          ++releases;
+                          return true;
+                        }),
+                      std::runtime_error);
+    REQUIRE(runs == 1);
+    REQUIRE(releases == 0);
+  }
 }
 
 TEST_CASE("an automatic column with sorted, overlapping chunks is left to the exact stage",

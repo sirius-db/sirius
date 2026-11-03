@@ -326,9 +326,27 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // post_filter_and_project (which would only apply a row filter or re-project to a
     // query's output layout, neither of which a pin needs). `batch` is borrowed by const
     // ref and outlives the call.
-    auto materialized = ingestible.materialize_metadata_to_table(
-      *batch, *target, stream, false, nullptr, options.expression_policy);
-    auto tbl              = materialized.table.release(stream, target->get_default_allocator());
+    // The optional uniqueness copies retained so far share this memory space, so if the decode runs
+    // out of memory they are given back and the decode runs once more. A decode stores nothing
+    // when it fails, so repeating it is safe; the proofs those copies were for stay UNKNOWN.
+    auto tbl = late_mat::retry_after_releasing_optional(
+      [&] {
+        auto materialized = ingestible.materialize_metadata_to_table(
+          *batch, *target, stream, false, nullptr, options.expression_policy);
+        return materialized.table.release(stream, target->get_default_allocator());
+      },
+      [&] {
+        if (exact_total_bytes == 0) { return false; }
+        SIRIUS_LOG_WARN(
+          "[late-mat] the pin ran out of memory decoding a batch; releasing the {} bytes retained "
+          "for the uniqueness check and retrying once",
+          exact_total_bytes);
+        // The copies were made on other streams; let that work finish before their memory is
+        // handed back.
+        CUDF_CUDA_TRY(cudaDeviceSynchronize());
+        abandon_exact("the required decode ran out of memory");
+        return true;
+      });
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
