@@ -192,6 +192,12 @@ class unique_probe {
   /// Per-column verdicts, positional with the selection.
   [[nodiscard]] std::vector<unique_verdict> verdicts() const;
 
+  /// Tells the probe that the exact stage can no longer settle @p column_pos: it was declined for
+  /// want of budget, or the pin abandoned the stage. An automatic column that only chunk ranges
+  /// that never overlap could still prove is then dropped as soon as a chunk's range overlaps an
+  /// earlier one, before that chunk is sorted. Explicit columns are left alone.
+  void exact_unavailable(std::size_t column_pos);
+
   /// True while the column is still possibly unique. The pin driver retains values for the exact
   /// stage only for these columns.
   [[nodiscard]] bool candidate(std::size_t column_pos) const
@@ -224,6 +230,8 @@ class unique_probe {
     /// min/max could not be read). Not a refusal — the exact check may still
     /// decide it, so the verdict is `undecided` rather than `refused`.
     bool cheap_undecidable{false};
+    /// The exact stage may still settle this column. Cleared by exact_unavailable().
+    bool exact_available{true};
     std::vector<range> ranges;  ///< one per observed non-empty chunk
   };
 

@@ -202,6 +202,11 @@ void unique_probe::drop(std::size_t column_pos, std::string_view why)
   --_live_candidates;
 }
 
+void unique_probe::exact_unavailable(std::size_t column_pos)
+{
+  if (column_pos < _columns.size()) { _columns[column_pos].exact_available = false; }
+}
+
 void unique_probe::observe(cudf::table_view const& chunk,
                            ::cuda::stream_ref stream,
                            std::function<bool(std::size_t bytes)> const& try_reserve_sort_memory)
@@ -221,6 +226,19 @@ void unique_probe::observe(cudf::table_view const& chunk,
     }
     return;
   }
+
+  // The chunk's value range, or nothing when it cannot be read (including for want of memory).
+  auto const chunk_range = [&](cudf::column_view const& values) -> std::optional<range> {
+    try {
+      auto const [min_s, max_s] = cudf::minmax(values, stream);
+      auto const lo             = integer_scalar_value(*min_s, stream);
+      auto const hi             = integer_scalar_value(*max_s, stream);
+      if (!lo || !hi) { return std::nullopt; }
+      return range{*lo, *hi};
+    } catch (std::exception const&) {
+      return std::nullopt;
+    }
+  };
 
   for (std::size_t i = 0; i < _columns.size() && _live_candidates > 0; ++i) {
     if (!_columns[i].candidate) { continue; }
@@ -254,7 +272,26 @@ void unique_probe::observe(cudf::table_view const& chunk,
     std::unique_ptr<cudf::table> sorted_copy;
     cudf::column_view sorted_col = col;
     cudf::size_type distinct     = 0;
+    std::optional<range> early_range;
     try {
+      // With the exact stage out of reach, an automatic column can only be proven by chunks whose
+      // ranges never overlap, so a chunk that overlaps an earlier one ends its chances and is not
+      // worth sorting.
+      if (_columns[i].automatic && !_columns[i].exact_available) {
+        early_range = chunk_range(col);
+        if (!early_range) {
+          drop(i, "its range cannot be read and the exact stage cannot settle it");
+          continue;
+        }
+        auto const overlaps = std::any_of(
+          _columns[i].ranges.begin(), _columns[i].ranges.end(), [&](range const& earlier) {
+            return earlier.min <= early_range->max && early_range->min <= earlier.max;
+          });
+        if (overlaps) {
+          drop(i, "its chunks overlap in range and the exact stage cannot settle it");
+          continue;
+        }
+      }
       if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
         // Unsorted says nothing either way — leave it to the exact stage, unless
         // the column was observed automatically. Most columns of a fact table are
@@ -288,14 +325,12 @@ void unique_probe::observe(cudf::table_view const& chunk,
       continue;
     }
 
-    auto const [min_s, max_s] = cudf::minmax(col, stream);
-    auto const lo             = integer_scalar_value(*min_s, stream);
-    auto const hi             = integer_scalar_value(*max_s, stream);
-    if (!lo || !hi) {
+    auto const observed_range = early_range ? early_range : chunk_range(col);
+    if (!observed_range) {
       _columns[i].cheap_undecidable = true;
       continue;
     }
-    _columns[i].ranges.push_back(range{*lo, *hi});
+    _columns[i].ranges.push_back(*observed_range);
   }
 }
 

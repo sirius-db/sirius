@@ -295,6 +295,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     exact_retaining = false;
     for (std::size_t i = 0; i < exact_chunks.size(); ++i) {
       release_exact_column(i);
+      unique_probe.exact_unavailable(i);
     }
     SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check abandoned: {}", why);
   };
@@ -384,6 +385,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
                              why);
             exact_declined[column_pos] = true;
             release_exact_column(column_pos);
+            unique_probe.exact_unavailable(column_pos);
           };
           auto const chunk_bytes = tbl->get_column(static_cast<cudf::size_type>(i)).alloc_size();
           // Earlier columns take priority: make room by giving up the highest columns first, so

@@ -408,6 +408,81 @@ TEST_CASE("an automatic column is dropped, not the pin, when its sort cannot be 
   }
 }
 
+TEST_CASE(
+  "an automatic column the exact stage cannot settle is not sorted again once chunks overlap",
+  "[late_mat][pin_uniqueness]")
+{
+  // Unsorted, distinct chunks: each one costs a sort. Once the exact stage is out of reach only
+  // chunks that never overlap in range can prove the column, so an overlapping chunk is dropped
+  // before it is sorted.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+
+  auto const observe_two =
+    [&](bool exact_available, std::vector<std::int64_t> const& second, std::size_t& sorts) {
+      unique_probe probe{std::vector<bool>{true}, std::vector<bool>{true}};
+      auto const count_sorts = [&](std::size_t) {
+        ++sorts;
+        return true;
+      };
+      auto first_chunk  = int64_column({12, 10, 11}, stream);
+      auto second_chunk = int64_column(second, stream);
+      {
+        std::vector<cudf::column_view> cols{first_chunk->view()};
+        probe.observe(cudf::table_view{cols}, stream, count_sorts);
+      }
+      if (!exact_available) { probe.exact_unavailable(0); }
+      {
+        std::vector<cudf::column_view> cols{second_chunk->view()};
+        probe.observe(cudf::table_view{cols}, stream, count_sorts);
+      }
+      return probe;
+    };
+
+  SECTION("with the exact stage available an overlapping chunk is sorted and left undecided")
+  {
+    std::size_t sorts = 0;
+    auto probe        = observe_two(/*exact_available=*/true, {11, 13, 9}, sorts);
+    REQUIRE(sorts == 2);
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
+  }
+
+  SECTION("without it an overlapping chunk is dropped before its sort")
+  {
+    std::size_t sorts = 0;
+    auto probe        = observe_two(/*exact_available=*/false, {11, 13, 9}, sorts);
+    REQUIRE(sorts == 1);
+    REQUIRE_FALSE(probe.candidate(0));
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused});
+  }
+
+  SECTION("without it a chunk that does not overlap is still sorted and the column is proven")
+  {
+    std::size_t sorts = 0;
+    auto probe        = observe_two(/*exact_available=*/false, {22, 20, 21}, sorts);
+    REQUIRE(sorts == 2);
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::proven});
+  }
+}
+
+TEST_CASE("an explicit column keeps its chances when the exact stage becomes unavailable",
+          "[late_mat][pin_uniqueness]")
+{
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+  unique_probe probe{std::vector<bool>{true}};
+  auto first  = int64_column({1, 5, 9}, stream);
+  auto second = int64_column({2, 6, 8}, stream);
+  probe.exact_unavailable(0);
+  for (auto const* column : {&first, &second}) {
+    std::vector<cudf::column_view> cols{(*column)->view()};
+    probe.observe(cudf::table_view{cols}, stream);
+  }
+  // Overlapping ranges: not provable by chunks alone, but not refused either.
+  REQUIRE(probe.candidate(0));
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
+}
+
 TEST_CASE("an automatic column with sorted, overlapping chunks is left to the exact stage",
           "[late_mat][pin_uniqueness]")
 {
