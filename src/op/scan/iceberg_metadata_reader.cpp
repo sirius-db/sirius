@@ -457,13 +457,26 @@ void read_positional_delete_file(duckdb::ClientContext& context,
     [&] {
       auto& positions = partials.emplace_back();
       return [&positions](duckdb::DataChunk& chunk) {
+        duckdb::UnifiedVectorFormat paths;
+        duckdb::UnifiedVectorFormat offsets;
+        chunk.data[0].ToUnifiedFormat(chunk.size(), paths);
+        chunk.data[1].ToUnifiedFormat(chunk.size(), offsets);
+        auto const* path_data = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(paths);
+        auto const* pos_data  = duckdb::UnifiedVectorFormat::GetData<int64_t>(offsets);
+        std::vector<int64_t>* target = nullptr;
+        duckdb::string_t target_key;
         for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
-          auto path = chunk.GetValue(0, i);
-          auto pos  = chunk.GetValue(1, i);
-          if (path.IsNull() || pos.IsNull())
+          auto const path_idx = paths.sel->get_index(i);
+          auto const pos_idx  = offsets.sel->get_index(i);
+          if (!paths.validity.RowIsValid(path_idx) || !offsets.validity.RowIsValid(pos_idx))
             throw std::runtime_error("[iceberg] Invalid null position delete");
+          auto const& key = path_data[path_idx];
+          if (target == nullptr || !(key == target_key)) {
+            target     = &positions[key.GetString()];
+            target_key = key;
+          }
           // Preserve signed legacy positions; visibility filtering excludes out-of-range values.
-          positions[path.GetValue<std::string>()].push_back(pos.GetValue<int64_t>());
+          target->push_back(pos_data[pos_idx]);
         }
       };
     });
