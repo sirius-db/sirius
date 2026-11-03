@@ -19,6 +19,6 @@
 // TODO: Remove with the cudf port patch and CMake workaround after cudf#24173 ships.
 // cuDF 26.10 needs <variant> before its AST header.
 // clang-format off
-#include <variant>
-#include <cudf/ast/expressions.hpp>
+#include <variant>  // IWYU pragma: keep
+#include <cudf/ast/expressions.hpp>  // IWYU pragma: export
 // clang-format on

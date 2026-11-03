@@ -17,7 +17,6 @@
 #include "dynamic_filter_accumulation_test_utils.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -29,7 +28,6 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <future>
 #include <limits>
 #include <memory>

@@ -16,7 +16,6 @@
 
 #include <catch.hpp>
 #include <core_functions_extension.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -26,7 +25,6 @@
 #include <op/scan/parquet_delete_reader.hpp>
 #include <parquet_extension.hpp>
 #include <parquet_reader.hpp>
-#include <unistd.h>
 #include <utils/s3_backend.hpp>
 
 #include <algorithm>

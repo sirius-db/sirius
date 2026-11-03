@@ -18,8 +18,6 @@
 
 #include "op/scan/arrow/arrow_staging_resource.hpp"
 
-#include <cudf/utilities/traits.hpp>
-
 #include <duckdb/common/exception.hpp>
 
 #include <charconv>

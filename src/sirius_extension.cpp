@@ -15,8 +15,6 @@
  */
 
 #include "config.hpp"
-#include "cuda/device_health.hpp"
-#include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"

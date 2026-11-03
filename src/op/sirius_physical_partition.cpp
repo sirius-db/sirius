@@ -24,7 +24,6 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/nvtx.hpp"
 

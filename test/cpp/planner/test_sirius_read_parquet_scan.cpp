@@ -27,7 +27,6 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/planner/logical_operator.hpp>
@@ -36,7 +35,6 @@
 #include <op/input_free_operator_data.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
-#include <op/sirius_physical_gpu_values.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <sirius_context.hpp>

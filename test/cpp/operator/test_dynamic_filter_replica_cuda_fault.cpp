@@ -36,7 +36,6 @@
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <memory/pool_peer_access.hpp>
 #include <memory/pool_peer_access_detail.hpp>
 

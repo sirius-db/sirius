@@ -18,18 +18,15 @@
 #include "sirius_config.hpp"
 #include "yaml_reader.hpp"
 
-#include <yaml-cpp/yaml.h>
+#include <yaml-cpp/yaml.h>  // IWYU pragma: keep
 
 #include <chrono>
-#include <cstdlib>
-#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <new>
 #include <optional>
 #include <stdexcept>
-#include <variant>
 
 using namespace sirius;
 

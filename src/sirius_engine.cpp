@@ -16,7 +16,6 @@
 
 #include "sirius_engine.hpp"
 
-#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"

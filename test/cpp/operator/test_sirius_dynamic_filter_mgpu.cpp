@@ -26,7 +26,6 @@
 #include "operator_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>

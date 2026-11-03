@@ -28,7 +28,6 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_data_batch.hpp>
-#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
 #include <cstdint>

@@ -24,7 +24,6 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
-#include "op/scan/table_scan/parquet_physical_profile.hpp"
 #include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -33,18 +32,9 @@
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
-#include <cudf/io/datasource.hpp>
-#include <cudf/io/experimental/hybrid_scan.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
-
-#include <rmm/cuda_stream.hpp>
-#include <rmm/device_buffer.hpp>
-
-#include <arpa/inet.h>
-#include <cucascade/memory/topology_discovery.hpp>
+#include <arpa/inet.h>  // IWYU pragma: keep
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>

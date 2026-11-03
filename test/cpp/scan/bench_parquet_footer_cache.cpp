@@ -5,7 +5,7 @@
 // Hidden integration microbenchmark: real local files and the production footer
 // resolver. Copies share the same small schema; this is not a TPC benchmark.
 #include "io/kvikio/kvikio_context.hpp"
-#include "io/sirius_datasource.hpp"
+#include "io/sirius_datasource.hpp"  // IWYU pragma: keep
 #include "op/scan/parquet_metadata.hpp"
 
 #include <catch2/catch_test_macros.hpp>

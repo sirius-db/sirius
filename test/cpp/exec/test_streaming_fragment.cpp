@@ -26,9 +26,7 @@
 #include <cudf/unary.hpp>
 
 #include <catch.hpp>
-#include <cucascade/data/data_batch.hpp>
 #include <data/data_batch_utils.hpp>
-#include <duckdb.hpp>
 #include <duckdb/main/query_result.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/parquet_fixture_utils.hpp>

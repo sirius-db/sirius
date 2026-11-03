@@ -33,7 +33,6 @@
 #include <cudf/utilities/traits.hpp>
 
 // standard library
-#include <algorithm>
 #include <limits>
 
 namespace sirius {

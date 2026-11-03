@@ -8,7 +8,6 @@
 #include "catch.hpp"
 #include "io/io_errors.hpp"
 #include "io/kvikio/kvikio_context.hpp"
-#include "io/rest/rest_ioctx.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
@@ -18,12 +17,10 @@
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
-#include <arpa/inet.h>
-#include <duckdb.hpp>
+#include <arpa/inet.h>  // IWYU pragma: keep
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
 #include <duckdb/common/virtual_file_system.hpp>
-#include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/external_file_cache/caching_file_system.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>

@@ -51,7 +51,6 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
-#include <stop_token>
 #include <system_error>
 #include <utility>
 #include <vector>

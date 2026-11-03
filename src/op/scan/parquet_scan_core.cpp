@@ -46,8 +46,6 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <transparent/read_view_registry.hpp>
 
-#include <ranges>
-
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -55,7 +53,6 @@
 #include <cudf/filling.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/null_mask.hpp>
@@ -66,15 +63,12 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <cudf/utilities/span.hpp>
 #include <cudf/version_config.hpp>
 
 #include <cuda/std/utility>
 
 // rmm
 #include <rmm/device_buffer.hpp>
-
-#include <cucascade/memory/error.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -87,19 +81,12 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/null_filter.hpp>
-
-// uring_reactor MUST be included last among sirius headers: liburing.h,
-// pulled in transitively, defines a BLOCK_SIZE macro that collides with the
-// BLOCK_SIZE static member in <blockingconcurrentqueue.h>.
-#include <io/uring/uring_reactor.hpp>
 
 // standard library
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
-#include <future>
 #include <iterator>
 #include <memory>
 #include <new>

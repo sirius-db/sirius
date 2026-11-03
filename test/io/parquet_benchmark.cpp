@@ -1,12 +1,9 @@
-#include "io/cache/prefetching_cache.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
+#include "io/sirius_datasource.hpp"  // IWYU pragma: keep
 #include "io/uring/uring_ioctx.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
-#include <cudf/io/parquet_metadata.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
@@ -21,7 +18,6 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
 #include <glob.h>
-#include <log/logging.hpp>
 #include <log/spdlog_owning_sink.hpp>
 #include <unistd.h>
 

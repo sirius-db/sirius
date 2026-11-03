@@ -16,12 +16,11 @@
 
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 
-#include "exec/try.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "sirius_context.hpp"
-#include "transparent/read_view_registry.hpp"
+#include "transparent/read_view_registry.hpp"  // IWYU pragma: keep
 
 #include <stdexcept>
 #include <stop_token>

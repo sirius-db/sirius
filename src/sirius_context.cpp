@@ -19,7 +19,6 @@
 #include "compression/spill_compression.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
-#include "cuda/device_health.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -81,7 +80,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 namespace duckdb {

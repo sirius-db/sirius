@@ -16,11 +16,7 @@
 
 #include "op/scan/positional_visibility.hpp"
 
-#include <cudf/column/column_factories.hpp>
-#include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
-
-#include <rmm/detail/error.hpp>
 
 #include <cuda_runtime_api.h>
 

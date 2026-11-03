@@ -20,7 +20,6 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
-#include "op/scan/field_id_mapping.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"

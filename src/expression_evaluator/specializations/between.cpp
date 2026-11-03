@@ -23,7 +23,6 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/cudf_utils.hpp>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;

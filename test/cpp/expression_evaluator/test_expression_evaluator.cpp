@@ -36,7 +36,6 @@
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
@@ -53,7 +52,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 

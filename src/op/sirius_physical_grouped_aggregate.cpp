@@ -22,7 +22,6 @@
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
-#include <functional>
 
 namespace sirius {
 namespace op {

@@ -81,9 +81,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 
 #include <cuda_runtime.h>
 
-#include <compression/compressed_representation.hpp>
 #include <compression/decompression_pushdown_policy.hpp>
-#include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <unistd.h>
 #include <utils/dynamic_filter_test_utils.hpp>

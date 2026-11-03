@@ -16,7 +16,7 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/planner/logical_operator.hpp>
 #include <exec/stream_bind_catalog.hpp>
 #include <exec/stream_plan_bindings.hpp>

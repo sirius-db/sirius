@@ -16,7 +16,6 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <unistd.h>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
