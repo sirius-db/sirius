@@ -23,9 +23,14 @@
 #include <io/uring/config.hpp>
 #include <io/uring/types.hpp>
 #include <io/uring/uring_reactor.hpp>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +39,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -381,4 +387,56 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[uring_rea
   REQUIRE(watchdog.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
   CHECK(*outer_canceled);
   CHECK(*inner_canceled);
+}
+
+TEST_CASE("io_uring init failures explain the likely cause", "[uring_readv]")
+{
+  using Catch::Matchers::ContainsSubstring;
+  auto const eperm = uring_reactor::init_error_hint(EPERM);
+  CHECK_THAT(eperm, ContainsSubstring("Operation not permitted"));
+  CHECK_THAT(eperm, ContainsSubstring("seccomp"));
+  CHECK_THAT(eperm, ContainsSubstring("kernel.io_uring_disabled"));
+  CHECK_THAT(eperm, ContainsSubstring("backend: kvikio"));
+  CHECK_THAT(uring_reactor::init_error_hint(ENOSYS),
+             ContainsSubstring("does not provide io_uring"));
+  CHECK_THAT(uring_reactor::init_error_hint(ENOMEM), ContainsSubstring("RLIMIT_MEMLOCK"));
+  CHECK_THAT(uring_reactor::init_error_hint(EIO), ContainsSubstring("backend: kvikio"));
+}
+
+TEST_CASE("io_uring blocked by seccomp fails start() with an actionable error", "[uring_readv]")
+{
+  constexpr std::size_t block_size = 1UL << 20;
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, 128UL << 20, 128UL << 20, block_size, 4, 0};
+  auto ctx = std::make_shared<uring_reactor::reactor_context>(sirius::io::uring::config{}, &mr);
+
+  // Seccomp filters without TSYNC bind only the calling thread and threads it spawns, so this
+  // confines the denial to the reactor started below, like a container's default profile.
+  bool filtered = false;
+  std::string error;
+  std::thread{[&] {
+    std::array<sock_filter, 4> filter{{
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    }};
+    sock_fprog prog{static_cast<unsigned short>(filter.size()), filter.data()};
+    filtered = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 &&
+               prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == 0;
+    if (!filtered) return;
+    uring_reactor reactor{ctx, ""};
+    try {
+      reactor.start();
+    } catch (std::exception const& e) {
+      error = e.what();
+    }
+  }}.join();
+
+  if (!filtered) SKIP("cannot install a seccomp filter here");
+  CHECK_THAT(error, Catch::Matchers::ContainsSubstring("Operation not permitted"));
+  CHECK_THAT(error, Catch::Matchers::ContainsSubstring("seccomp"));
+  // The failed start() returned its pinned staging.
+  CHECK(mr.get_total_allocated_bytes() == 0);
 }
