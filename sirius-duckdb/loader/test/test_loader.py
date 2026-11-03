@@ -103,7 +103,7 @@ class LoaderTests(unittest.TestCase):
 
     def test_driver_boundaries_and_repeated_load(self):
         for version, backend in [
-            (12000, 12),
+            (12080, 12),
             (12090, 12),
             (12999, 12),
             (13000, 13),
@@ -170,11 +170,11 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(self.rows(result), [{"stubs": 0}])
 
     def test_unsupported_driver(self):
-        for version in [0, 11080, 11999]:
+        for version in [0, 11080, 11999, 12000, 12070]:
             with self.subTest(version=version):
                 status = self.assert_fallback(
                     f"LOAD {quote(self.loader)};",
-                    "Sirius requires an NVIDIA driver supporting CUDA 12 or newer: "
+                    "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: "
                     f"reported CUDA version {version // 1000}.{version % 1000 // 10}",
                     version=version,
                 )
@@ -204,7 +204,7 @@ class LoaderTests(unittest.TestCase):
     def test_missing_driver(self):
         status = self.assert_fallback(
             f"LOAD {quote(self.loader)};",
-            "Sirius requires an NVIDIA driver supporting CUDA 12 or newer: "
+            "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: "
             "cannot open libcuda.so.1",
             env={"LD_PRELOAD": str(self.fixtures / "libsirius_test_hide_driver.so")},
         )
@@ -229,7 +229,7 @@ class LoaderTests(unittest.TestCase):
         self.assertRegex(
             entry["message"],
             r"^Sirius GPU execution is unavailable; queries run on DuckDB's CPU engine\. "
-            r"Sirius requires an NVIDIA driver supporting CUDA 12 or newer: cannot open",
+            r"Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: cannot open",
         )
 
     def test_does_not_fall_back_to_cuda12(self):

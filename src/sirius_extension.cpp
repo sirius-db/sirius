@@ -117,6 +117,8 @@ extern "C" int cudaProfilerStop();
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -3634,6 +3636,22 @@ static void default_to_explicit_delim_joins(DBConfig& config)
   Settings::Set<DelimJoinAsCteSetting>(config, SetScope::GLOBAL, Value::BOOLEAN(false));
 }
 
+// CUDA 12.8+ builds call cudaMemcpyBatchAsync, which older drivers lack. The sirius loader checks
+// this too, but a backend loaded directly bypasses it.
+static void check_cuda_driver_version()
+{
+#if CUDART_VERSION >= 12080 && CUDART_VERSION < 13000
+  int version = 0;
+  if (cudaDriverGetVersion(&version) != cudaSuccess || version < 12080) {
+    throw InvalidInputException(
+      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer (reported CUDA version: "
+      "%d.%d)",
+      version / 1000,
+      (version % 1000) / 10);
+  }
+#endif
+}
+
 static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
@@ -3648,6 +3666,7 @@ static void LoadInternal(ExtensionLoader& loader)
   bool const sirius_disabled = callback_ptr->is_disabled();
 
   if (!sirius_disabled) {
+    check_cuda_driver_version();
     // Config parsing above must remain NVTX-free. initialize_context creates Quent
     // before resolving hardware or constructing any instrumented runtime objects.
     callback_ptr->initialize_context();

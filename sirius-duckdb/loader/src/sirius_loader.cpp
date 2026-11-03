@@ -46,7 +46,7 @@ constexpr char const* gpu_execution_setting = "gpu_execution";
 constexpr char const* backend_init_started_key = "sirius_backend_init_started";
 constexpr char const* runtime_ready_key        = "sirius_runtime_ready";
 
-/// Outcome of looking for a CUDA 12+ driver. Probed once per process.
+/// Outcome of looking for a CUDA 12.8+ driver. Probed once per process.
 struct cuda_driver {
   bool found         = false;  ///< libcuda.so.1 could be opened
   bool version_known = false;  ///< cuDriverGetVersion succeeded
@@ -71,7 +71,7 @@ struct cuda_driver {
   {
     cuda_driver result;
     auto fail = [&](std::string const& detail) {
-      result.error = "Sirius requires an NVIDIA driver supporting CUDA 12 or newer: " + detail;
+      result.error = "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: " + detail;
       return result;
     };
     auto close = [](void* handle) { dlclose(handle); };
@@ -91,7 +91,8 @@ struct cuda_driver {
     }
     result.version_known = true;
     result.version       = version;
-    if (version < 12000) { return fail("reported CUDA version " + result.version_string()); }
+    // The CUDA 12 backend calls cudaMemcpyBatchAsync, which needs a CUDA 12.8 driver.
+    if (version < 12080) { return fail("reported CUDA version " + result.version_string()); }
     return result;
   }
 };
