@@ -267,12 +267,14 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   // outright. So retain the observed columns as they pass and finish the proof
   // before returning. Retention is bounded in bytes across ALL columns together
   // (options.unique_exact_max_bytes, see late_mat::exact_uniqueness_byte_cap), each
-  // retained chunk holds a GPU reservation, and a column that no longer fits, or whose
-  // copy fails, leaves the exact stage and stays UNKNOWN. Retention is abandoned
+  // retained chunk is allocated from its own GPU reservation, and a column that no longer
+  // fits, or whose copy fails, leaves the exact stage and stays UNKNOWN. Retention is abandoned
   // outright if the pin spreads across devices.
-  std::vector<std::vector<std::unique_ptr<cudf::column>>> exact_chunks(
-    options.probe_unique_columns.size());
+  // The reservations are declared first, so a retained chunk is always freed before the
+  // reservation it was allocated from is released.
   std::vector<std::vector<std::unique_ptr<cucascade::memory::reservation>>> exact_reservations(
+    options.probe_unique_columns.size());
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> exact_chunks(
     options.probe_unique_columns.size());
   std::vector<std::size_t> exact_bytes(options.probe_unique_columns.size(), 0);
   std::size_t exact_total_bytes = 0;
@@ -407,10 +409,12 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
             continue;
           }
           try {
+            // Allocate from the reservation, so the bytes are charged to it instead of being
+            // counted again on top of it.
             exact_chunks[i].push_back(
               std::make_unique<cudf::column>(tbl->view().column(static_cast<cudf::size_type>(i)),
                                              stream,
-                                             target->get_default_allocator()));
+                                             reservation->get_memory_resource()));
           } catch (std::exception const& e) {
             // A failed copy must cost the optimization, never the pin.
             decline(i, std::string{"copying the chunk failed: "} + e.what());

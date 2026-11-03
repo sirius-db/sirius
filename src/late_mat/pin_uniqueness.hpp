@@ -183,7 +183,8 @@ class unique_probe {
   /// sort_scratch_factor times the column's bytes of GPU memory. @p try_reserve_sort_memory is
   /// asked for that many bytes first and is expected to reserve them until its next call; when it
   /// declines, or the sort fails for want of memory, the column is dropped without a proof and the
-  /// pin goes on.
+  /// pin goes on. The reservation is a pledge only: cuDF's sort takes its temporary buffers from
+  /// the current device resource, so they cannot be allocated from it.
   void observe(cudf::table_view const& chunk,
                ::cuda::stream_ref stream,
                std::function<bool(std::size_t bytes)> const& try_reserve_sort_memory = {});
