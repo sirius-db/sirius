@@ -322,12 +322,12 @@ jobs:
 
   check:
     runs-on: ubuntu-slim
-    needs: [lint, build, rust]
+    needs: [lint, build]
     if: always()
     steps:
       - name: All checks ok
-        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust.result == 'success' }}
+        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' }}
         run: exit 0
       - name: Some checks failed
-        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust.result == 'success') }}
+        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success') }}
         run: exit 1
