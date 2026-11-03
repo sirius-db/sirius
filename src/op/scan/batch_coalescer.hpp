@@ -38,6 +38,8 @@ namespace sirius::op::scan {
 
 class batch_coalescer {
  public:
+  // Opt in only when all coalescer operations and retained inputs are thread-neutral.
+  virtual bool asynchronous_preparation() const noexcept { return false; }
   using clock = std::chrono::steady_clock;
   virtual std::size_t target_batch_bytes() const noexcept { return 0; }
   // Same byte accounting as target_batch_bytes(), for the current accumulator only.

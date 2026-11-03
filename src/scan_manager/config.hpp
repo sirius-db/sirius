@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -40,8 +41,8 @@ namespace sirius::scan_manager {
 /// Default uring reactor count; counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 4;
 
-/// Default scan-manager pool size: every core left after the other default pools
-/// (downgrade, task_creator, pipeline, uring reactor), never below 4.
+/// Initial automatic scan-manager pool size: cores left after the other default
+/// pools, never below 4. Runtime resolution also covers every eligible NUMA domain.
 [[nodiscard]] inline int default_scan_manager_num_threads()
 {
   constexpr int reserved =
@@ -209,6 +210,9 @@ struct scan_manager_config {
   preparation_config preparation;
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
+  /// YAML preserves explicit values even when numerically equal to the default.
+  /// C++ callers assigning that same value should also set this flag to request a hard limit.
+  bool num_threads_explicit{false};
   /// Admission limit, also accepted through the legacy scan-manager configuration path.
   int max_concurrent_queries{1};
   /// IO backend that serves managed reads.
@@ -308,6 +312,23 @@ struct scan_manager_config {
     return plan;
   }
 };
+
+// Resolve only after GPU topology and CPU restrictions determine eligible domains.
+// Preserve direct C++ overrides as well as explicitly supplied YAML values.
+inline int resolve_scan_manager_num_threads(scan_manager_config const& config, size_t domains)
+{
+  auto workers   = config.thread_pool.num_threads;
+  auto automatic = default_scan_manager_num_threads();
+  if (workers <= 0) throw std::invalid_argument("scan_manager.num_threads must be positive");
+  if (config.num_threads_explicit || workers != automatic) {
+    if (static_cast<size_t>(workers) < domains)
+      throw std::invalid_argument("scan_manager.num_threads must cover each eligible NUMA domain");
+    return workers;
+  }
+  if (domains > static_cast<size_t>(std::numeric_limits<int>::max()))
+    throw std::invalid_argument("too many scan metadata NUMA domains");
+  return std::max(workers, static_cast<int>(domains));
+}
 
 // Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)

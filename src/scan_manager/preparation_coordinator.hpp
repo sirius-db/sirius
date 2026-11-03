@@ -68,7 +68,8 @@ class preparation_coordinator {
   enum class lifecycle { constructed, armed, running, quiescent };
   struct statistics {
     size_t runs = 0, jobs_peak = 0, results_peak = 0, output_peak = 0, wakes = 0,
-           partial_emissions = 0, size_emissions = 0, normal_emissions = 0;
+           partial_emissions = 0, size_emissions = 0, normal_emissions = 0,
+           coalescing_submitted = 0;
     std::thread::id owner, runner, publisher;
     std::chrono::microseconds max_residence{0}, max_deadline_lateness{0};
 
@@ -77,8 +78,9 @@ class preparation_coordinator {
   preparation_coordinator(pipeline::completion_handler&,
                           exec::scoped_dispatcher&,
                           preparation_options,
-                          native_reader_executor* native = nullptr,
-                          coordinator_pool* pool         = nullptr);
+                          native_reader_executor* native    = nullptr,
+                          coordinator_pool* pool            = nullptr,
+                          std::vector<int> metadata_domains = {});
   ~preparation_coordinator();
   preparation_coordinator(preparation_coordinator const&)            = delete;
   preparation_coordinator& operator=(preparation_coordinator const&) = delete;
@@ -93,7 +95,8 @@ class preparation_coordinator {
   void arm();
   // Arm selects the driver; start opens its gate after consumers are ready.
   void start();
-  // On Q: advance metadata-only control work, or run one provider operation/close.
+  // On Q: advance synchronous-only control work, or run one provider operation/close.
+  // Parquet coalescing uses metadata workers and independent coordination.
   // If idle, wait up to idle_wait for progress. External threads only stop/wait.
   bool advance(std::chrono::milliseconds idle_wait = std::chrono::milliseconds{0});
   // Close admission/publication and signal running jobs; the control driver retires queues.

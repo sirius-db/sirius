@@ -1408,7 +1408,7 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
 }
 
-TEST_CASE("Metadata-only production scans publish on the query owner",
+TEST_CASE("Production scans publish on their configured preparation driver",
           "[integration][scan][certificate][scan_preparation][coordinator_thread]")
 {
   sirius::test::GpuExecutionFixture fixture;
@@ -1416,6 +1416,14 @@ TEST_CASE("Metadata-only production scans publish on the query owner",
   exec_ok(con, "SET gpu_execution=false");
   exec_ok(con, "CREATE TABLE owner_items AS SELECT i FROM range(1000) t(i)");
   exec_ok(con, "CHECKPOINT");
+  auto parquet = GENERATE(false, true);
+  temporary_directory files;
+  if (parquet) {
+    auto path = (files.path / "owner_items.parquet").string();
+    exec_ok(con, "COPY owner_items TO '" + path + "' (FORMAT PARQUET)");
+    exec_ok(con, "DROP TABLE owner_items");
+    exec_ok(con, "CREATE VIEW owner_items AS SELECT * FROM read_parquet('" + path + "')");
+  }
   auto context          = sirius::test::get_registered_sirius_context(con);
   auto counters         = context->physical_counters();
   counters->track_units = true;
@@ -1447,7 +1455,7 @@ TEST_CASE("Metadata-only production scans publish on the query owner",
         REQUIRE(observation.preparation_runs == 1);
         CHECK(observation.execute_owner != std::thread::id{});
         CHECK(observation.preparation_owner == observation.execute_owner);
-        CHECK(observation.preparation_runner == observation.execute_owner);
+        CHECK((observation.preparation_runner == observation.execute_owner) == !parquet);
         CHECK(observation.preparation_publisher == observation.preparation_runner);
       }
     }

@@ -1329,9 +1329,15 @@ sirius_scan_manager::sirius_scan_manager(
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
+    _metadata_placement(
+      _topology_index
+        ? resolve_metadata_placement(*_topology_index, metadata_allowed_cpus(), _config)
+        : throw std::invalid_argument("scan manager requires topology")),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
-                 _config.thread_pool.cpu_affinity_list),
+                 {},
+                 nullptr,
+                 _metadata_placement.cpus),
     _native_readers(_config.preparation.resolved_native_workers(),
                     _config.preparation.resolved_native_readers()),
     _coordinators(_config.preparation.resolved_coordinator_workers()),
@@ -1339,6 +1345,18 @@ sirius_scan_manager::sirius_scan_manager(
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
+  }
+
+  for (size_t domain = 0; domain < _metadata_placement.cpus.size(); ++domain) {
+    std::string cpus;
+    for (int cpu : _metadata_placement.cpus[domain]) {
+      if (!cpus.empty()) cpus += ",";
+      cpus += std::to_string(cpu);
+    }
+    SIRIUS_LOG_INFO("scan metadata domain={} numa_node={} cpus={}",
+                    domain,
+                    _metadata_placement.nodes[domain],
+                    cpus);
   }
 
   // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
@@ -2040,12 +2058,24 @@ void sirius_scan_manager::prepare_for_query(
 std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_coordinator(
   query_scan_manager_state& state)
 {
+  std::vector<int> domains;
+  for (int gpu : state.active_gpu_ids) {
+    auto node = _topology_index->numa_node_of(gpu);
+    auto it   = std::find(_metadata_placement.nodes.begin(), _metadata_placement.nodes.end(), node);
+    if (it != _metadata_placement.nodes.end()) {
+      auto domain = static_cast<int>(it - _metadata_placement.nodes.begin());
+      if (std::find(domains.begin(), domains.end(), domain) == domains.end())
+        domains.push_back(domain);
+    }
+  }
+  if (domains.empty()) domains.push_back(0);  // Explicit fallback placement from initialization.
   return std::make_unique<preparation_coordinator>(
     *state.completion,
     *state.dispatcher,
     state.preparation,
     &_native_readers,
-    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr);
+    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr,
+    std::move(domains));
 }
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
