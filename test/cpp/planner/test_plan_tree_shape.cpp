@@ -45,7 +45,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
-#include "pipeline/sirius_pipeline_converter.hpp"
+#include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
@@ -58,7 +58,6 @@
 #include <cudf/types.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
@@ -1338,12 +1337,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto const int64      = cudf::data_type{cudf::type_id::INT64};
     auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
+    // HUGEINT's native carrier is DECIMAL128, so INT64 is the alternate.
     for (auto const* op : {local, partition}) {
       REQUIRE(op->get_types().size() == 2);
       CHECK(op->get_types()[1].id() == sirius::type_id::HUGEINT);
-      CHECK(op->is_alternate_physical_type(1, decimal128));
-      CHECK_FALSE(op->is_alternate_physical_type(1, int64));
-      CHECK_FALSE(op->is_alternate_physical_type(0, decimal128));
+      CHECK(op->is_alternate_physical_type(1, int64));
+      CHECK_FALSE(op->is_alternate_physical_type(1, decimal128));
+      CHECK_FALSE(op->is_alternate_physical_type(0, int64));
     }
   }
 

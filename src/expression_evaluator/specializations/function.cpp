@@ -15,12 +15,10 @@
  */
 
 // sirius
-#include <config.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
 #include <expression/substring_slice.hpp>
-#include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
@@ -28,6 +26,7 @@
 #include <expression_evaluator/regex/regex_playground.hpp>
 #include <expression_evaluator/round_floating_point.hpp>
 #include <helper/logical_type.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <helper/timestamp_semantics.hpp>
 #include <sirius/exception.hpp>
 
@@ -70,13 +69,179 @@
 #include <regex>
 #include <string>
 #include <tuple>
-#include <variant>
 #include <vector>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
+
+/**
+ * @brief Read-only preflight for // and %; the caller performs the arithmetic.
+ *
+ * Safe pairs and pairs containing NULL return normally. A valid zero divisor or
+ * signed-minimum/-1 pair throws not_implemented_exception before cuDF arithmetic,
+ * requesting runtime CPU replay when enabled or safe query failure otherwise.
+ * This guard neither mutates operands nor produces an arithmetic result. Replay
+ * supplies DuckDB's errors/settings and guarded CASE semantics; the guard does not.
+ */
+void require_safe_division(evaluate_result const& left_result,
+                           evaluate_result const& right_result,
+                           ::cuda::stream_ref stream,
+                           rmm::device_async_resource_ref mr)
+{
+  if ((!left_result.is_scalar() && left_result.get_column_view().is_empty()) ||
+      (!right_result.is_scalar() && right_result.get_column_view().is_empty())) {
+    return;
+  }
+  // Integer bounds can exclude both exceptional divisors without materializing row predicates.
+  // HUGEINT uses a scale-zero DECIMAL128 carrier; scaled decimals need their existing checks.
+  // Inconclusive bounds still need the exact guard, which accounts for paired NULLs and minima.
+  if (!right_result.is_scalar()) {
+    auto const divisor = right_result.get_column_view();
+    auto const type    = divisor.type();
+    if (cudf::is_integral_not_bool(type) ||
+        (type.id() == cudf::type_id::DECIMAL128 && type.scale() == 0)) {
+      auto const range = compute_exact_numeric_range(divisor, stream, mr);
+      if (range && (range->minimum > 0 || range->maximum < -1)) { return; }
+    }
+  }
+  // Comparisons need a column on one side. Retain only one row for a scalar; the caller
+  // keeps the original scalar for cuDF's scalar-column arithmetic overload.
+  auto left_scalar        = left_result.is_scalar()
+                              ? cudf::make_column_from_scalar(left_result.get_scalar(), 1, stream, mr)
+                              : nullptr;
+  auto right_scalar       = right_result.is_scalar()
+                              ? cudf::make_column_from_scalar(right_result.get_scalar(), 1, stream, mr)
+                              : nullptr;
+  auto const left         = left_scalar ? left_scalar->view() : left_result.get_column_view();
+  auto const right        = right_scalar ? right_scalar->view() : right_result.get_column_view();
+  auto const boolean_type = cudf::data_type{cudf::type_id::BOOL8};
+  // A one-row predicate represents a scalar operand. Broadcast it with the scalar overload,
+  // preserving its validity; scalar_column_view is supported by transform, not binary_operation.
+  auto combine = [&](cudf::column_view lhs, cudf::column_view rhs, cudf::binary_operator op) {
+    if (lhs.size() == rhs.size()) {
+      return cudf::binary_operation(lhs, rhs, op, boolean_type, stream, mr);
+    }
+    auto const scalar = cudf::get_element(lhs.size() == 1 ? lhs : rhs, 0, stream, mr);
+    return lhs.size() == 1 ? cudf::binary_operation(*scalar, rhs, op, boolean_type, stream, mr)
+                           : cudf::binary_operation(lhs, *scalar, op, boolean_type, stream, mr);
+  };
+  auto const zero = cudf::numeric_scalar<int32_t>(0, true, stream, mr);
+  auto invalid =
+    cudf::binary_operation(right, zero, cudf::binary_operator::EQUAL, boolean_type, stream, mr);
+
+  std::unique_ptr<cudf::scalar> minimum;
+  if (left.type().id() == cudf::type_id::DECIMAL128 && left.type().scale() == 0) {
+    // HUGEINT uses this physical carrier. SQL DECIMAL(38, 0) cannot reach its minimum.
+    minimum = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+      std::numeric_limits<__int128_t>::min(), numeric::scale_type{0}, true, stream, mr);
+  } else if (cudf::is_integral_not_bool(left.type()) && !cudf::is_unsigned(left.type())) {
+    minimum =
+      cudf::type_dispatcher(left.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
+        if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+          return std::make_unique<cudf::numeric_scalar<T>>(
+            std::numeric_limits<T>::min(), true, stream, mr);
+        } else {
+          throw internal_exception("division minimum needs a signed integer type");
+        }
+      });
+  }
+  if (minimum) {
+    auto const minus_one = cudf::numeric_scalar<int32_t>(-1, true, stream, mr);
+    auto is_minimum      = cudf::binary_operation(
+      left, *minimum, cudf::binary_operator::EQUAL, boolean_type, stream, mr);
+    auto is_minus_one = cudf::binary_operation(
+      right, minus_one, cudf::binary_operator::EQUAL, boolean_type, stream, mr);
+    auto overflow =
+      combine(is_minimum->view(), is_minus_one->view(), cudf::binary_operator::LOGICAL_AND);
+    invalid = combine(invalid->view(), overflow->view(), cudf::binary_operator::LOGICAL_OR);
+  }
+  // A zero divisor is harmless when the numerator is NULL. Right-side NULLs have already
+  // propagated through the comparisons; contains ignores every invalid predicate row.
+  auto left_valid = cudf::is_valid(left, stream, mr);
+  invalid = combine(invalid->view(), left_valid->view(), cudf::binary_operator::LOGICAL_AND);
+  auto const true_value = cudf::numeric_scalar<bool>(true, true, stream, mr);
+  if (cudf::contains(invalid->view(), true_value, stream)) {
+    throw not_implemented_exception(
+      "[expression_evaluator:function] Division by zero or signed division overflow; "
+      "falling back to DuckDB");
+  }
+}
+
+// The largest magnitude a HUGEINT result may have; the minimum's 2^127 is excluded with it, since
+// DuckDB cannot negate or divide it by -1 either.
+constexpr unsigned __int128 hugeint_max_magnitude = std::numeric_limits<__int128_t>::max();
+
+constexpr unsigned __int128 magnitude(__int128_t v)
+{
+  auto const bits = static_cast<unsigned __int128>(v);
+  return v < 0 ? static_cast<unsigned __int128>(0) - bits : bits;
+}
+
+// The largest magnitude among an integer type's values; nullopt for any other type.
+std::optional<unsigned __int128> integer_type_magnitude(logical_type const& type)
+{
+  switch (type.id()) {
+    case type_id::TINYINT: return magnitude(std::numeric_limits<int8_t>::min());
+    case type_id::SMALLINT: return magnitude(std::numeric_limits<int16_t>::min());
+    case type_id::INTEGER: return magnitude(std::numeric_limits<int32_t>::min());
+    case type_id::BIGINT: return magnitude(std::numeric_limits<int64_t>::min());
+    case type_id::UTINYINT: return std::numeric_limits<uint8_t>::max();
+    case type_id::USMALLINT: return std::numeric_limits<uint16_t>::max();
+    case type_id::UINTEGER: return std::numeric_limits<uint32_t>::max();
+    case type_id::UBIGINT: return std::numeric_limits<uint64_t>::max();
+    default: return std::nullopt;
+  }
+}
+
+// The magnitude of an integer or scale-0 DECIMAL128 (HUGEINT) literal; nullopt otherwise.
+std::optional<unsigned __int128> constant_magnitude(value const& payload)
+{
+  return std::visit(
+    []<typename T>(T const& v) -> std::optional<unsigned __int128> {
+      if constexpr (std::is_same_v<T, null_value>) {
+        return 0;
+      } else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        if constexpr (std::is_signed_v<T>) {
+          return magnitude(v);
+        } else {
+          return v;
+        }
+      } else if constexpr (std::is_same_v<T, decimal128>) {
+        if (v.scale != 0) { return std::nullopt; }
+        return magnitude(v.value);
+      } else {
+        return std::nullopt;
+      }
+    },
+    payload);
+}
+
+// The largest magnitude among @p column's values, 0 when it has none. Synchronizes the stream.
+std::optional<unsigned __int128> column_magnitude(cudf::column_view const& column,
+                                                  ::cuda::stream_ref stream,
+                                                  rmm::device_async_resource_ref mr)
+{
+  if (column.is_empty() || column.null_count() == column.size()) { return 0; }
+  auto const range = compute_exact_numeric_range(column, stream, mr);
+  if (!range) { return std::nullopt; }
+  return std::max(magnitude(range->minimum), magnitude(range->maximum));
+}
+
+// a + b and a * b, or nullopt when the result passes hugeint_max_magnitude.
+std::optional<unsigned __int128> bounded_sum(unsigned __int128 a, unsigned __int128 b)
+{
+  if (a > hugeint_max_magnitude || b > hugeint_max_magnitude - a) { return std::nullopt; }
+  return a + b;
+}
+
+std::optional<unsigned __int128> bounded_product(unsigned __int128 a, unsigned __int128 b)
+{
+  if (a > hugeint_max_magnitude || b > hugeint_max_magnitude) { return std::nullopt; }
+  if (a != 0 && b > hugeint_max_magnitude / a) { return std::nullopt; }
+  return a * b;
+}
 
 // Whether a signed integer column holds its type's minimum, whose negation and abs overflow.
 // Synchronizes the stream.
@@ -101,6 +266,80 @@ bool holds_signed_minimum(cudf::column_view const& column,
 
 }  // namespace
 
+std::optional<unsigned __int128> expression_evaluator::hugeint_magnitude_bound(
+  sirius::ast::node const& node)
+{
+  if (node.holds<sirius::ast::constant>()) {
+    return constant_magnitude(node.get<sirius::ast::constant>().payload);
+  }
+  if (node.holds<sirius::ast::cast>()) {
+    auto const& cast  = node.get<sirius::ast::cast>();
+    auto const source = cast.child->return_type();
+    if (auto const bound = integer_type_magnitude(source)) { return bound; }
+    if (source.id() == type_id::HUGEINT) { return hugeint_magnitude_bound(*cast.child); }
+    return std::nullopt;
+  }
+  if (node.holds<sirius::ast::reference>()) {
+    auto const& ref = node.get<sirius::ast::reference>();
+    if (ref.return_type().id() != type_id::HUGEINT) { return std::nullopt; }
+    auto const cached = std::ranges::find(_hugeint_reference_bounds,
+                                          ref.column_index,
+                                          &decltype(_hugeint_reference_bounds)::value_type::first);
+    if (cached != _hugeint_reference_bounds.end()) { return cached->second; }
+    auto const bound = column_magnitude(_input_table.column(ref.column_index), _stream, _mr);
+    _hugeint_reference_bounds.emplace_back(ref.column_index, bound);
+    return bound;
+  }
+  if (node.holds<sirius::ast::function_call>()) {
+    auto const& call = node.get<sirius::ast::function_call>();
+    auto const& args = call.arguments();
+    if (call.return_type().id() != type_id::HUGEINT || args.size() != 2) { return std::nullopt; }
+    auto const left = hugeint_magnitude_bound(*args[0]);
+    if (!left) { return std::nullopt; }
+    switch (call.function()) {
+      // |a // b| and |a % b| are at most |a|; evaluation guards zero and signed overflow.
+      case function_id::int_div:
+      case function_id::mod: return left;
+      case function_id::add:
+      case function_id::sub:
+      case function_id::mul: {
+        auto const right = hugeint_magnitude_bound(*args[1]);
+        if (!right) { return std::nullopt; }
+        return call.function() == function_id::mul ? bounded_product(*left, *right)
+                                                   : bounded_sum(*left, *right);
+      }
+      default: return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+void expression_evaluator::require_hugeint_arithmetic_in_range(
+  sirius::ast::function_call const& call, evaluate_result const& left, evaluate_result const& right)
+{
+  // An operand without a static bound, such as a CASE, is measured after evaluation.
+  auto const operand_bound = [&](
+                               sirius::ast::node const& node,
+                               evaluate_result const& operand) -> std::optional<unsigned __int128> {
+    if (auto const bound = hugeint_magnitude_bound(node)) { return bound; }
+    if (operand.is_scalar()) {
+      auto const column = cudf::make_column_from_scalar(operand.get_scalar(), 1, _stream, _mr);
+      return column_magnitude(column->view(), _stream, _mr);
+    }
+    return column_magnitude(operand.get_column_view(), _stream, _mr);
+  };
+  auto const& args = call.arguments();
+  auto const a     = operand_bound(*args[0], left);
+  auto const b     = operand_bound(*args[1], right);
+  auto const bound = !a || !b                              ? std::nullopt
+                     : call.function() == function_id::mul ? bounded_product(*a, *b)
+                                                           : bounded_sum(*a, *b);
+  if (!bound) {
+    throw not_implemented_exception(
+      "[expression_evaluator:function] HUGEINT arithmetic may overflow; falling back to DuckDB");
+  }
+}
+
 like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
   std::string_view pattern)
 {
@@ -121,15 +360,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
 
-  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
-  // Standalone ASTs cannot implement DATE infinity and overflow checks.
-  auto const date_operation = alt.date_operation();
-  auto const skip_ast =
-    alt.return_type().is_decimal() || date_operation.has_value() ||
-    std::ranges::any_of(args, [](auto const& arg) { return arg->return_type().is_decimal(); });
-  auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
-                                                    supported_ast_functions.end(),
-                                                    resolved_id) != supported_ast_functions.end();
+  auto const ast_supported = ast_supports_function(alt);
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
@@ -221,6 +452,12 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
     // cuDF has no scalar-scalar binary operation; broadcast one side when both are constants.
     auto right = left.is_scalar() ? evaluate_as_column(*args[1])
                                   : evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    if (division_requires_check(alt)) { require_safe_division(left, right, _stream, _mr); }
+    if (alt.return_type().id() == type_id::HUGEINT &&
+        (op == cudf::binary_operator::ADD || op == cudf::binary_operator::SUB ||
+         op == cudf::binary_operator::MUL)) {
+      require_hugeint_arithmetic_in_range(alt, left, right);
+    }
     if (left.is_scalar()) {
       return evaluate_result(cudf::binary_operation(
         left.get_scalar(), right.get_column_view(), op, output_type, _stream, _mr));

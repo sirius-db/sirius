@@ -19,13 +19,8 @@
 #include "transparent/read_view_registry.hpp"
 #include "utils/dynamic_filter_test_utils.hpp"
 #include "utils/gpu_execution_fixture.hpp"
-#include "utils/log_test_utils.hpp"
-#include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
-#include <duckdb/main/client_config.hpp>
-#include <duckdb/main/config.hpp>
-#include <duckdb/planner/logical_operator.hpp>
 
 #include <set>
 

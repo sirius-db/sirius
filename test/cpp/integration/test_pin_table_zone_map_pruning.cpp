@@ -26,9 +26,6 @@
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
-#include <cucascade/memory/memory_space.hpp>
-#include <duckdb.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <utils/parquet_fixture_utils.hpp>

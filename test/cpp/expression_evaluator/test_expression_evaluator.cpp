@@ -36,7 +36,6 @@
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
@@ -53,7 +52,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -1179,10 +1177,15 @@ TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
     auto const view = output->view();
     REQUIRE(view.num_rows() == row_count);
     REQUIRE(view.num_columns() == 5);
-    for (int i = 0; i < 4; ++i) {
+    // HUGEINT is carried as DECIMAL128 with scale 0.
+    for (int i : {0, 2}) {
+      REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+    }
+    for (int i : {1, 3}) {
       REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::INT64});
     }
-    REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>(row_count, -42));
+    REQUIRE(copy_column_to_host<__int128_t>(view.column(0)) ==
+            std::vector<__int128_t>(row_count, -42));
     REQUIRE(copy_column_to_host<int64_t>(view.column(1)) == std::vector<int64_t>(row_count, 1));
     REQUIRE(view.column(0).null_count() == 0);
     REQUIRE(view.column(1).null_count() == 0);
@@ -4396,4 +4399,16 @@ TEMPLATE_TEST_CASE("MATERIALIZE floating IN with only NULL constants returns NUL
   auto output = evaluator.evaluate(cudf::table_view{{input->view()}});
   REQUIRE(output->num_rows() == 3);
   REQUIRE(copy_valids_to_host(output->view().column(0)) == std::vector<bool>{false, false, false});
+}
+
+TEST_CASE("a constant of an unsupported scalar type names the type",
+          "[expression_evaluator][constant]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
+  REQUIRE_THROWS_WITH(
+    run_execute(*space, input, one(make_null_const(logical_type::make(type_id::STRUCT)))),
+    Catch::Matchers::ContainsSubstring("Unsupported scalar type: STRUCT"));
 }

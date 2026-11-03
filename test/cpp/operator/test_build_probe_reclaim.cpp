@@ -19,7 +19,6 @@
 #include "data/sirius_converter_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
-#include "utils/data_utils.hpp"
 #include "utils/scoped_temp_directory.hpp"
 
 #include <catch.hpp>

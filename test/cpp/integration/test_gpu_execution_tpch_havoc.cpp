@@ -11,7 +11,6 @@
 // everything else must run on the GPU. See test/README.md.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/sirius_test_env.hpp>

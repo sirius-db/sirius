@@ -23,7 +23,6 @@
 // once on DuckDB CPU, then compares the results (order-insensitive).
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>

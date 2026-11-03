@@ -27,7 +27,6 @@
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
-#include <duckdb.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>

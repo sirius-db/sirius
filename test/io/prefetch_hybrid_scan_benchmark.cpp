@@ -48,7 +48,6 @@
 
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/cache/config.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -65,11 +64,9 @@
 
 #include <rmm/device_buffer.hpp>
 
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 #include <glob.h>
-#include <log/logging.hpp>
 #include <log/spdlog_owning_sink.hpp>
 
 #include <algorithm>

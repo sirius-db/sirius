@@ -41,7 +41,6 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
-#include <duckdb/common/multi_file/multi_file_function.hpp>
 #include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/function/table/table_scan.hpp>
@@ -59,7 +58,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <csignal>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1339,4 +1337,67 @@ TEST_CASE("Sorted read-view files use an implicit evidence index", "[scan][contr
                         std::vector<std::string>{"a", "b", "c"},
                         std::vector<std::string>{"a", "a", "b", "b"});
   CHECK(make_read_view_evidence_index(paths).empty());
+}
+
+TEST_CASE("Generic temporal mapping does not widen Iceberg admission", "[scan][contracts]")
+{
+  using duckdb::LogicalType;
+  duckdb::MultiFileBindData bind;
+  bind.columns.emplace_back("x", LogicalType::INTEGER);
+  bind.columns.back().identifier = duckdb::Value::INTEGER(1);
+  CHECK(sirius::planner::iceberg_flat_mapping_supported(&bind));
+  for (auto const& type : std::vector<LogicalType>{
+         LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::DECIMAL(18, 2)}) {
+    bind.columns.back().type = type;
+    CHECK_FALSE(sirius::planner::iceberg_flat_mapping_supported(&bind));
+  }
+}
+
+TEST_CASE("Parquet binding verification rejects altered nested readers",
+          "[scan][parquet_interface][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  sirius::test::scratch_dir files("reader_verification");
+  auto const path = sirius::test::sql_literal((files.path() / "data.parquet").string());
+  REQUIRE_FALSE(con.Query("COPY (SELECT 1 AS id) TO " + path + " (FORMAT PARQUET)")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto plan     = con.ExtractPlan("SELECT * FROM read_parquet(" + path + ")");
+  auto& get     = first_get(*plan);
+  auto& bind    = get.bind_data->Cast<duckdb::MultiFileBindData>();
+  auto* wrapper = dynamic_cast<duckdb::TableFunctionMultiFileWrapper*>(bind.interface.get());
+  REQUIRE(wrapper);
+  auto verify = [&] {
+    return sirius::planner::verified_parquet_interface(get.bind_data.get(), *con.context);
+  };
+  REQUIRE(verify());
+  auto const function        = wrapper->function;
+  auto const settings        = wrapper->settings;
+  wrapper->function.function = fake_scan;
+  CHECK_FALSE(verify());
+  wrapper->function      = function;
+  wrapper->function.bind = fake_bind;
+  CHECK_FALSE(verify());
+  wrapper->function             = function;
+  wrapper->settings.claim_batch = nullptr;
+  CHECK_FALSE(verify());
+  wrapper->settings = settings;
+  REQUIRE(settings.prepare_batch != nullptr);
+  wrapper->settings.prepare_batch = nullptr;
+  CHECK_FALSE(verify());
+  wrapper->settings               = settings;
+  wrapper->settings.prepare_batch = [](duckdb::ClientContext&, duckdb::TableFunctionInput&) {};
+  REQUIRE(wrapper->settings.prepare_batch != settings.prepare_batch);
+  CHECK_FALSE(verify());
+  wrapper->settings                    = settings;
+  wrapper->settings.reuses_local_state = !settings.reuses_local_state;
+  CHECK_FALSE(verify());
+  wrapper->settings                        = settings;
+  wrapper->settings.glob_input.allow_empty = !settings.glob_input.allow_empty;
+  CHECK_FALSE(verify());
+  wrapper->settings = settings;
+  CHECK(verify());
+  CHECK_FALSE(sirius::planner::verified_parquet_interface(nullptr, *con.context));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }

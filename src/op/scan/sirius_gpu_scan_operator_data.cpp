@@ -22,7 +22,6 @@
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -583,9 +582,16 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 
 std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
 {
+  return get_estimated_working_set_size_in_bytes(std::nullopt);
+}
+
+std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
+  std::optional<int> device) const
+{
   if (std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info)) {
-    auto const decode_bytes =
-      std::get<std::shared_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
+    auto const& metadata    = std::get<std::shared_ptr<scan_info>>(materialization_info);
+    auto const decode_bytes = device ? metadata->estimated_working_set_bytes_for_device(*device)
+                                     : metadata->estimated_working_set_bytes();
     if (mvcc_keep_mask.has_mask()) {
       // A partially visible insert-delta split is mask-filtered right after
       // decode: the decoded input and the compacted output (up to input-sized)

@@ -38,7 +38,6 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
@@ -55,7 +54,6 @@
 #include <cucascade/memory/null_device_memory_resource.hpp>
 #include <data/data_batch_utils.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <expression/ast/utils.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
 #include <op/dynamic_filter/detail/accumulation_failure.hpp>

@@ -600,7 +600,7 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
-| `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT and REPLICATE (`EXCEPT ALL` / `INTERSECT ALL`). REPLICATE may exceed the byte target by one row. A small value splits REPLICATE output into many small batches and slows those queries. 0 disables ordinary CONCAT coalescing and REPLICATE's byte target; CONCAT's `concat_all` mode still combines the whole partition |
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission). 0 disables BUILD_PROBE. |
@@ -959,6 +959,16 @@ still an experimental optimization, not a normal session choice.
 Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
+
+### Grouped Aggregation (experimental)
+
+Off by default, and gated by an environment variable rather than `sirius_config`/`SET`, like late materialization. The path applies only to batches it can handle and falls back to cuDF's group-by for anything else, so the variable never changes query results.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIRIUS_EXP_LOWCARD_GROUPBY` | off | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. Set to `1` to enable; any other value leaves it off. |
+
+See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
 
 ### Runtime Data Size Estimation
 

@@ -262,6 +262,18 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
+### HUGEINT
+
+HUGEINT is carried as cuDF DECIMAL128 with scale 0, an exact 128-bit integer with the layout of
+`duckdb::hugeint_t`; its constants are `sirius::decimal128` values with scale 0. Like DECIMAL
+(`logical_type::has_fixed_point_carrier`), HUGEINT arithmetic is materialized rather than lowered
+to the cuDF AST. `//` and `%` accept column divisors on the GPU after the checks described below.
+A cast from HUGEINT to a narrower integer or DECIMAL first checks the
+column's range and throws `not_implemented_exception` when a value does not fit, so the query falls
+back and DuckDB raises its conversion error (or returns NULL under `TRY_CAST`). Such casts never
+lower to the AST, whose integer casts wrap (`ast_supports_cast`); a cast to DOUBLE does. A cast to
+VARCHAR uses `cudf::strings::from_fixed_point`. Tests are tagged `[hugeint]`.
+
 `DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
 match their already-bound signatures and execute through `date_arithmetic_checked()`.
 The helper uses a libcudf JIT transform with public CCCL overflow helpers and error
@@ -273,6 +285,32 @@ collisions. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
+
+### DECIMAL to integer casts
+
+DECIMAL-to-integer casts round to the nearest integer, with ties away from zero, then check the
+destination range. NULLs remain NULL. On overflow, `TRY_CAST` returns NULL and `CAST` replays on
+the CPU. A UHUGEINT result above UINT64 also replays on the CPU, including under `TRY_CAST`.
+Tests are tagged `[decimal_integer_cast]`.
+
+### Division and modulo
+
+`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
+calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
+either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
+which preserves DuckDB's `error_on_division_by_zero` setting and guarded `CASE` semantics. With
+fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
+`TRY(...)` continues to use plan-time CPU fallback.
+
+Integer column divisors, including HUGEINT, first use an exact non-NULL range reduction. A minimum
+above zero or a maximum below -1 rules out both exceptional divisors and skips the row checks.
+Inconclusive ranges retain the exact checks, including their paired-NULL semantics.
+
+A proven nonzero constant divisor other than -1 can use the existing cuDF AST path. Other divisors
+materialize under every evaluation strategy; the standalone translator declines them as well, so
+join and scan predicates cannot bypass the checks. The shared `ast_supports_function` predicate
+keeps those decisions aligned. Ordinary floating-point `/` retains its existing route. Regression
+tests are tagged `[checked_division]`.
 
 ### Arity and negation
 
@@ -325,7 +363,7 @@ The following translate directly into cuDF AST nodes:
 | Comparison | `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NOT DISTINCT FROM` (via `NULL_EQUALS`) |
 | Logical | `AND`, `OR` (Kleene `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR`), `NOT` |
 | BETWEEN | Translated to `(val >= lower) AND (val <= upper)` |
-| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`) |
+| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`); from HUGEINT only `DOUBLE` (`ast_supports_cast`) |
 
 Anything outside this set is an AST breaker and forces materialization at that node.
 
@@ -358,7 +396,7 @@ A second overload, `translate_expression_with_names`, produces `cudf::ast::colum
 These return `nullopt`, causing the caller to fall back to row-by-row evaluation:
 - `case_expr` nodes
 - `coalesce` nodes and `TRY`
-- `cast` with non-fixed-width target types (e.g., VARCHAR)
+- `cast` with non-fixed-width target types (e.g., VARCHAR), and a HUGEINT cast to anything but DOUBLE
 - `IS DISTINCT FROM` (throws `NotImplementedException`)
 
 ### Join Condition Translation

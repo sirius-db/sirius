@@ -23,7 +23,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/sirius_converter_registry.hpp>

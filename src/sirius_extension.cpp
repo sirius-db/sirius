@@ -15,22 +15,16 @@
  */
 
 #include "config.hpp"
-#include "cuda/device_health.hpp"
-#include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/io/parquet.hpp>
-#include <cudf/io/types.hpp>
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <absl/cleanup/cleanup.h>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
@@ -41,8 +35,6 @@
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
-#include "compression/compressed_representation.hpp"
-#include "compression/compression_converters.hpp"
 #include "compression/plan_utils.hpp"
 #include "compression/spill_compression.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -74,6 +66,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -84,12 +77,6 @@ extern "C" int cudaProfilerStop();
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <cudf/types.hpp>
-#include <cudf/utilities/traits.hpp>
-
-#include <rmm/mr/per_device_resource.hpp>
-
-#include <api/compressed_table_io.hpp>
-#include <api/simpatico_codegen.hpp>
 
 #include <array>
 #include <chrono>
@@ -121,33 +108,20 @@ extern "C" int cudaProfilerStop();
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/memory_resource.hpp>
-
 // PinTableFunction routes parquet reads through the scan manager's ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
 // and binds to a single CUDA context). This is mandatory in multi-GPU
 // configurations (enforced by sirius_config::enforce_sirius_backend_for_multi_gpu()).
 // Single-GPU users may still opt out via backend=kvikio; the
 // pin pipeline always routes through ioctx when one is available.
-//
-// Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
-// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
-// macro that collides with the BLOCK_SIZE static member in
-// <blockingconcurrentqueue.h> (used by pipeline / duckdb
-// connection_manager). All consumers of blockingconcurrentqueue.h must
-// precede this include.
 #include "io/s3/duckdb_secret_config.hpp"
-#include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
-#include "io/types.hpp"                // sirius::io::ioctx
-#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
-
-#include <dlfcn.h>
+#include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -1208,6 +1182,16 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       if (file_paths.empty()) {
         throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
       }
+      // GlobFiles returns local files in directory order, and pinned chunks pack several
+      // files each, so a table stored sorted across numbered files (part.0, part.1, ...) would
+      // pin into chunks whose rows are not in order. Sorting the names with digit runs compared
+      // numerically (part.2 before part.10) keeps such tables sorted within and across chunks,
+      // which lets sorted-key aggregation apply to their scans. The full paths are compared, not
+      // the file names, so a glob spanning directories keeps each directory's files together.
+      // Nothing relies on this order for correctness.
+      std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
+        return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
+      });
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -3599,6 +3583,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 // serial, quiescent override — concurrent optimizer runs while it changes
 // are unsupported; transparent execution then falls back to CPU on the
 // affected plan shapes instead of re-inserting.
+// Tells the sirius loader that the runtime initialized, so transparent execution is active. The
+// loader looks the key up by name.
+struct SiriusRuntimeReady : ObjectCacheEntry {
+  static constexpr char const* KEY = "sirius_runtime_ready";
+  std::string GetObjectType() override { return KEY; }
+  optional_idx GetEstimatedCacheMemory() const override { return optional_idx(); }
+};
+
 static void publish_transparent_optimizer_mask(DBConfig& config)
 {
   auto& live = config.options.disabled_optimizers;
@@ -3710,6 +3702,7 @@ static void LoadInternal(ExtensionLoader& loader)
   if (!sirius_disabled) {
     publish_transparent_optimizer_mask(config);
     default_to_explicit_delim_joins(config);
+    db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
 }
 

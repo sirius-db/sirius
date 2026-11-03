@@ -25,10 +25,8 @@
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column_view.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/convert/convert_integers.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_device.hpp>

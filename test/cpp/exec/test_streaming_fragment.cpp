@@ -26,9 +26,7 @@
 #include <cudf/unary.hpp>
 
 #include <catch.hpp>
-#include <cucascade/data/data_batch.hpp>
 #include <data/data_batch_utils.hpp>
-#include <duckdb.hpp>
 #include <duckdb/main/query_result.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/parquet_fixture_utils.hpp>
@@ -139,18 +137,19 @@ std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
   return rows;
 }
 
-//! region → SUM(amount) from a gather stream of VARCHAR + BIGINT.
+//! region → SUM(amount) from a gather stream of VARCHAR + HUGEINT (DECIMAL128 with scale 0).
 std::map<std::string, std::int64_t> drain_groups(streaming_fragment& fragment, stream_id_t id)
 {
   std::map<std::string, std::int64_t> groups;
   while (auto batch = fragment.pull(id)) {
     auto view = sirius::get_cudf_table_view(**batch);
     REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(1).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
     auto regions = sirius::test::operator_utils::copy_column_to_host<std::string>(view.column(0));
-    auto amounts = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(view.column(1));
+    auto amounts = sirius::test::operator_utils::copy_column_to_host<__int128_t>(view.column(1));
     REQUIRE(regions.size() == amounts.size());
     for (std::size_t i = 0; i < regions.size(); ++i) {
-      groups[regions[i]] += amounts[i];
+      groups[regions[i]] += static_cast<std::int64_t>(amounts[i]);
     }
   }
   return groups;

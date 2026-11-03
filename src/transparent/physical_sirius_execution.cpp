@@ -16,7 +16,6 @@
 
 #include "transparent/physical_sirius_execution.hpp"
 
-#include "cuda/device_health.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"

@@ -15,12 +15,10 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 // Reaching a join operator through the pipeline headers instantiates
 // `vector<join_condition>`'s destructor, which needs the AST node definition.
-#include <expression/ast/node.hpp>
+#include <expression/ast/node.hpp>  // IWYU pragma: keep
 #include <op/sirius_physical_operator.hpp>
-#include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_converter.hpp>
 #include <sirius_config.hpp>
 #include <sirius_context.hpp>

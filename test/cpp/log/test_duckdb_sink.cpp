@@ -18,7 +18,7 @@
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 
 #include <memory>
 #include <source_location>

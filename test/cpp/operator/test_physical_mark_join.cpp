@@ -18,10 +18,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 
-#include <cudf/transform.hpp>
-
 #include <catch.hpp>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>

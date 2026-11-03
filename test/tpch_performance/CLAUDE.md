@@ -82,6 +82,14 @@ empty. At SF1 that holds the staging directory to 725 MB against roughly 1 GB fo
 SF1000 it is the difference between about 890 GiB and 1.3 TB, which is what makes that scale
 factor reachable at all.
 
+DuckDB key widths match tpchgen-rs's adaptive Parquet defaults. Keys use `INTEGER` while
+their full dataset range fits; every primary and foreign key in a family widens to `BIGINT`
+together. The first integer scale factors requiring `BIGINT` are 358 for order keys,
+10,738 for part keys, 14,317 for customer keys, and 214,749 for supplier keys. Nation and
+region keys remain `INTEGER`. This also applies to `--cluster` datasets. To inspect the
+DDL without generating data, run `pixi run python test/tpch_performance/tpch_schema.py 1000`
+from the project root. Existing databases keep their types until regenerated.
+
 Generation prefers `tpchgen-rs`, which emits byte-identical `.tbl` output to the classic `dbgen`
 but generates in parallel: SF1 takes 1.2s against dbgen's 10.3s. `dbgen` is the fallback when it
 cannot be built, and it pays a second pass over the order generator since `-T O` and `-T L` each
@@ -734,7 +742,8 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `run_tpch_duckdb.sh` | Query runner over a `.duckdb` file (native tables); `--duckdb-file`; `--gpu-native-scan` is a no-op alias |
 | `run_tpch_parquet_duckdb.sh` | DuckDB-only baseline runner |
 | `generate_tpch_data.sh` | Generate TPC-H parquet (tpchgen-rs) or duckdb (`--format duckdb`, classic dbgen + `tpch_schema.sql`) data |
-| `tpch_schema.sql` | TPC-H DDL for loading dbgen `.tbl` output, typed to match what DuckDB's tpch extension creates |
+| `tpch_schema.sql` | Base TPC-H DDL for loading dbgen `.tbl` output |
+| `tpch_schema.py` | Select key widths from the scale factor before loading DuckDB datasets |
 | `sweep_threads.sh` | Thread configuration sweep (Sirius-only) |
 | `profile_tpch_nsys.sh` | Profile queries with nsys, producing .nsys-rep and .sqlite per query |
 | `nsys_analyze.sh` | Analyze nsys SQLite profiles (kernels, memory, NVTX, I/O) |

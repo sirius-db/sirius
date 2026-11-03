@@ -95,9 +95,10 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
    *        cannot represent faithfully, triggering DuckDB CPU fallback.
    *
    * Called by the plan generator's replace_with_gpu_values BEFORE the operator
-   * is built and before the source's ColumnDataCollection is moved out. HUGEINT/UHUGEINT
-   * are 16 bytes in DuckDB but map to 8-byte cuDF types (silent value
-   * corruption); sub-int32 decimals and nested types have no cuDF-compatible
+   * is built and before the source's ColumnDataCollection is moved out. UHUGEINT maps to
+   * the 8-byte UINT64 (silent value corruption); HUGEINT has a 16-byte DECIMAL128 carrier,
+   * but this operator's row copy is not validated for it; sub-int32 decimals and nested
+   * types have no cuDF-compatible
    * layout (conversion would fail inside the row-copy loop, failing the
    * query mid-flight instead of falling back).
    */

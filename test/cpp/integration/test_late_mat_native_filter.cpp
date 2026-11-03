@@ -23,13 +23,10 @@
 // Requires SIRIUS_EXP_LATE_MAT=1 in the ENVIRONMENT: the gate is read per process.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <late_mat/defer_directive.hpp>
-#include <late_mat/defer_policy.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <cstdint>
-#include <cstdlib>
 #include <string>
 #include <vector>
 

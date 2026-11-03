@@ -36,7 +36,6 @@
 #include <catch.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>

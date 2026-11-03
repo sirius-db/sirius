@@ -1,83 +1,65 @@
 # Sirius Rust bindings
 
-Crates for driving [Sirius](https://github.com/sirius-db/sirius) from Rust
-(sirius-db/sirius #835).
+[`sirius-ffi`](crates/sirius-ffi) provides the existing C++ FFI bridge, safe query
+execution wrappers, and object-store bindings for Sirius. StarRocks and Doris
+use this crate. It remains supported without deprecation warnings while the
+public C API gains execution support.
 
-| Crate | Role |
-|-------|------|
-| [`sirius-sys`](crates/sirius-sys) | Low-level [`cxx`](https://cxx.rs) bindings to Sirius's public C-ABI (`include/sirius/ffi.hpp`). |
-| [`sirius`](crates/sirius) | Safe, idiomatic wrapper over `sirius-sys`. |
+The `telemetry/*` crates are unrelated: CMake links those into the engine.
 
-(The `telemetry/*` crates are unrelated — Rust linked *into* the C++ extension via
-CMake/Corrosion, the opposite direction.)
+## Migrating imports
 
-## Building & testing
+The safe wrappers previously in `sirius` now live in `sirius-ffi`:
 
-The crates compile a small cxx shim against Sirius's headers and **link a Sirius
-library artifact**, so build Sirius first, then use cargo:
-
-```bash
-pixi run make                       # builds the Sirius extension (+ artifact + headers)
-# build + link the tests (no GPU needed):
-pixi run cargo test --no-run --manifest-path rust/Cargo.toml -p sirius -p sirius-sys
+```rust
+use sirius_ffi::SiriusContext;
 ```
 
-`SiriusContext::new()` brings up a **fully initialized** engine (it calls the C++
-`initialize()`, which does GPU bring-up) and tears it down on drop — pure RAII via
-`cxx::UniquePtr`, no uninitialized state. So **running** the proof-of-life test
-needs a GPU, and the runtime loader must find the linked library; until a
-dedicated `libsirius` is installed, point it at the build tree:
+The raw C++ bridge previously in `sirius-sys` is available through
+`sirius_ffi::bridge`. Its context factories and object-store types are also
+re-exported at the crate root.
+
+## Building and testing
+
+Build Sirius first. The bridge requires a C++20 compiler matching the engine's
+C++ toolchain:
 
 ```bash
-LD_LIBRARY_PATH="$PWD/build/release:$LD_LIBRARY_PATH" \
-  pixi run cargo test --manifest-path rust/Cargo.toml -p sirius -p sirius-sys
+pixi run make
+pixi run cargo test --locked --no-run --manifest-path rust/Cargo.toml -p sirius-ffi
+```
+
+Context construction and execution tests require a GPU:
+
+```bash
+LD_LIBRARY_PATH="$PWD/build/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  pixi run cargo test --locked --manifest-path rust/Cargo.toml -p sirius-ffi
 ```
 
 ## Documentation
-
-Build with the isolated Pixi docs environment:
 
 ```bash
 pixi run -e docs docs-rust
 ```
 
-Open `build/docs/rust-target/doc/sirius/index.html`. This task installs the Rust
-and C++ toolchains and sets `DOCS_RS` for the documentation build.
-
-Generate the `sirius` API reference without building or linking `libsirius`:
-
-```bash
-DOCS_RS=1 cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps
-```
-
-Open `rust/target/doc/sirius/index.html`. This requires a Rust toolchain and a C++
-compiler for the `cxx` dependency, but no Sirius build, CUDA toolkit, or GPU.
-`DOCS_RS` skips Sirius's native bridge compilation and library lookup; use it
-only for documentation, leaving it unset for normal builds and tests.
+Open `build/docs/rust-target/doc/sirius_ffi/index.html`. The task sets
+`DOCS_RS=1` to skip native compilation and linking. Use that variable only for
+documentation builds.
 
 ## Linkage
 
-`build.rs` discovers the Sirius artifact under `$SIRIUS_BUILD_DIR` (default
-`build/release`) and links **one self-contained library** — no hand-maintained
-dependency list:
+The build script compiles the bridge against `include/` and links a Sirius
+artifact under `SIRIUS_BUILD_DIR` (default `build/release`):
 
-- **default** → `libsirius.so` (shared; pulls its deps via `DT_NEEDED`). Until a
-  real `libsirius.so` exists, `build.rs` symlinks the DuckDB extension
-  (`sirius.duckdb_extension`) to it.
-- **`--features static`** → `libsirius.a` (self-contained, no runtime deps — the
-  fully static vcpkg build). Requires that bundled archive to exist.
+- By default, `libsirius.so` supplies its dependencies through `DT_NEEDED`.
+- The `static` feature requires an externally bundled `libsirius.a`. The current
+  CMake build does not produce that bundle, so its raw static archive is not
+  supported by this feature. With a suitable bundle, the C++ runtime is
+  linked separately. Applications must supply native dependencies not included
+  in their archive, including NVIDIA driver libraries. Bundles with duplicate
+  DuckDB symbols also require `-C link-arg=-Wl,--allow-multiple-definition` on
+  the final application. The crate sets this flag for its own targets, but
+  Cargo does not propagate it to dependent applications.
 
-`build.rs` only needs `include` to compile the shim, because the bound
-surface is the lightweight `sirius/ffi.hpp`. That header is the seed of the public
-C++ API `libsirius` will expose; today it is compiled into the DuckDB extension,
-which the bindings link until a dedicated `libsirius` ships (at which point the
-symlink stopgap is no longer used).
-
-## Environment
-
-- `DOCS_RS` — when set, skip Sirius's native build and link steps for documentation.
-- `SIRIUS_BUILD_DIR` — Sirius build tree (default `build/release`).
-- `CONDA_PREFIX` — set by `pixi`; used to find the headers and the shared lib's deps.
-- `CARGO_NET_GIT_FETCH_WITH_CLI=true` — only on machines whose git config rewrites
-  `https://github.com/` to SSH (the telemetry crate's `quent` git dep otherwise
-  fails libgit2's ssh-agent path). CI is unaffected.
+The build script searches the build root, then `extension/sirius`.
+`CONDA_PREFIX`, set by Pixi, supplies search paths for CUDA/RAPIDS dependencies.

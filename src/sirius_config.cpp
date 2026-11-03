@@ -25,7 +25,6 @@
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cmath>
@@ -772,6 +771,11 @@ const compression_config& parsed_sirius_config::get_compression_config() const n
 const telemetry_config& parsed_sirius_config::get_telemetry_config() const noexcept
 {
   return impl_->settings.get_telemetry_config();
+}
+const scan_manager::scan_manager_config& parsed_sirius_config::get_scan_manager_config()
+  const noexcept
+{
+  return impl_->settings.get_scan_manager_config();
 }
 
 namespace {

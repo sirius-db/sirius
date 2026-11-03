@@ -34,12 +34,10 @@
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <set>

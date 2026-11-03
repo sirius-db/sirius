@@ -55,7 +55,6 @@
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/function/aggregate_function.hpp>
 #include <duckdb/function/scalar_function.hpp>
-#include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
@@ -487,8 +486,8 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nul
 TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range",
           "[ast_from_duckdb][unsigned_narrowing]")
 {
-  // Counts are value bits: signed carriers reserve one bit for the sign, and
-  // Sirius represents HUGEINT/UHUGEINT using INT64/UINT64 rather than 128-bit storage.
+  // Counts are value bits: signed carriers reserve one bit for the sign. Sirius represents HUGEINT
+  // as DECIMAL128 (127 value bits) and UHUGEINT as UINT64.
   using domain = std::pair<LogicalTypeId, int>;
   for (auto [source, source_bits] : {domain{LogicalTypeId::UTINYINT, 8},
                                      domain{LogicalTypeId::USMALLINT, 16},
@@ -499,7 +498,7 @@ TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range"
                                        domain{LogicalTypeId::SMALLINT, 15},
                                        domain{LogicalTypeId::INTEGER, 31},
                                        domain{LogicalTypeId::BIGINT, 63},
-                                       domain{LogicalTypeId::HUGEINT, 63},
+                                       domain{LogicalTypeId::HUGEINT, 127},
                                        domain{LogicalTypeId::UTINYINT, 8},
                                        domain{LogicalTypeId::USMALLINT, 16},
                                        domain{LogicalTypeId::UINTEGER, 32},
@@ -517,8 +516,9 @@ TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range"
     }
   }
 
-  // The nested cast must reject its parent comparison too, including a join predicate.
-  auto left  = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UBIGINT),
+  // The nested cast must reject its parent comparison too, including a join predicate. UHUGEINT
+  // needs 128 value bits, one more than HUGEINT holds.
+  auto left  = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UHUGEINT),
                                                         LogicalType::HUGEINT);
   auto right = BoundCastExpression::AddDefaultCastToType(make_bound_ref(1, LogicalTypeId::BIGINT),
                                                          LogicalType::HUGEINT);
