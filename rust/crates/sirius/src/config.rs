@@ -6,8 +6,9 @@ use crate::diagnostic::Diagnostic;
 use sirius_sys::c_api;
 use std::ptr::NonNull;
 
-/// A failure while constructing or copying a configuration.
+/// A failure while constructing a configuration.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The native library reported allocation failure.
     AllocationFailure,
@@ -27,9 +28,17 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AllocationFailure => f.write_str("allocation failed"),
+            Self::Io(message) if message.is_empty() => f.write_str("configuration I/O error"),
+            Self::MalformedYaml(message) if message.is_empty() => f.write_str("malformed YAML"),
+            Self::InvalidConfiguration(message) if message.is_empty() => {
+                f.write_str("invalid configuration")
+            }
             Self::Io(message)
             | Self::MalformedYaml(message)
             | Self::InvalidConfiguration(message) => f.write_str(message),
+            Self::Unexpected { status, message } if message.is_empty() => {
+                write!(f, "Sirius status {status}")
+            }
             Self::Unexpected { status, message } => write!(f, "Sirius status {status}: {message}"),
             Self::InvalidPath => f.write_str("configuration path cannot be represented"),
         }
@@ -62,21 +71,21 @@ pub struct ContextConfig {
     inner: NonNull<c_api::SiriusContextConfig>,
 }
 
-impl ContextConfig {
+impl Clone for ContextConfig {
     /// Share the immutable settings through a new owned handle.
     ///
     /// ```no_run
     /// # use sirius::{ConfigError, ContextConfigBuilder};
     /// # fn example() -> Result<(), ConfigError> {
     /// let config = ContextConfigBuilder::new()?.build()?;
-    /// let copy = config.try_clone()?;
+    /// let copy = config.clone();
     /// # Ok(())
     /// # }
     /// ```
-    pub fn try_clone(&self) -> Result<Self, ConfigError> {
+    fn clone(&self) -> Self {
         // SAFETY: self keeps the immutable handle live; the new owner releases the added reference.
         unsafe { c_api::sirius_context_config_retain(self.inner.as_ptr()) };
-        Ok(Self { inner: self.inner })
+        Self { inner: self.inner }
     }
 }
 
@@ -186,23 +195,38 @@ impl ContextConfigBuilder {
             inner: NonNull::new(value).expect("successful configuration build"),
         })
     }
+}
 
+impl Clone for ContextConfigBuilder {
     /// Share the loaded settings through an independently owned builder handle.
     ///
     /// ```no_run
     /// # use sirius::{ConfigError, ContextConfigBuilder};
     /// # fn example() -> Result<(), ConfigError> {
     /// let builder = ContextConfigBuilder::from_yaml("sirius.yaml")?;
-    /// let copy = builder.try_clone()?;
+    /// let copy = builder.clone();
     /// drop(builder);
     /// let config = copy.build()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn try_clone(&self) -> Result<Self, ConfigError> {
+    fn clone(&self) -> Self {
         // SAFETY: self keeps the immutable handle live; the new owner releases the added reference.
         unsafe { c_api::sirius_context_config_builder_retain(self.inner.as_ptr()) };
-        Ok(Self { inner: self.inner })
+        Self { inner: self.inner }
+    }
+}
+
+impl std::fmt::Debug for ContextConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextConfig").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ContextConfigBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextConfigBuilder")
+            .finish_non_exhaustive()
     }
 }
 
@@ -227,10 +251,10 @@ mod tests {
     fn defaults_and_copies_own_their_handles() {
         assert_eq!(c_api::sirius_abi_version(), c_api::SIRIUS_ABI_VERSION);
         let builder = ContextConfigBuilder::new().unwrap();
-        let copy = builder.try_clone().unwrap();
+        let copy = builder.clone();
         drop(builder);
         let config = copy.build().unwrap();
-        let config_copy = config.try_clone().unwrap();
+        let config_copy = config.clone();
         drop(copy);
         drop(config);
         drop(config_copy);

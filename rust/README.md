@@ -25,7 +25,7 @@ fn load_config() -> Result<sirius::ContextConfig, ConfigError> {
 ```
 
 Use `ContextConfigBuilder::new()?.build()?` for built-in defaults. Both the
-builder and configuration offer `try_clone()` to create independent handles
+builder and configuration implement `Clone` to create independent handles
 sharing immutable settings. The file is read only by `from_yaml()`; later file
 changes do not affect a loaded builder. Configuration errors retain their
 I/O, YAML syntax, or invalid-setting category in `ConfigError`.

@@ -9,12 +9,12 @@ use sirius_sys::c_api::*;
 #[test]
 fn independent_handles_and_repeated_builds() {
     let builder = ContextConfigBuilder::new().unwrap();
-    let copy = builder.try_clone().unwrap();
+    let copy = builder.clone();
     drop(builder);
     let first = copy.build().unwrap();
     let second = copy.build().unwrap();
     drop(copy);
-    let retained = first.try_clone().unwrap();
+    let retained = first.clone();
     drop(first);
     drop(second);
     drop(retained);
@@ -29,9 +29,7 @@ fn diagnostics_are_copied_before_release() {
         (999, b"unexpected".as_slice()),
     ] {
         backend::fail_next(status, Some(message));
-        let error = ContextConfigBuilder::from_yaml("config.yaml")
-            .err()
-            .unwrap();
+        let error = ContextConfigBuilder::from_yaml("config.yaml").unwrap_err();
         let text = match error {
             ConfigError::Io(s)
             | ConfigError::MalformedYaml(s)
@@ -44,9 +42,20 @@ fn diagnostics_are_copied_before_release() {
         };
         assert_eq!(text, String::from_utf8_lossy(message));
     }
+    for (status, expected) in [
+        (SIRIUS_CONFIGURATION_IO, "configuration I/O error"),
+        (SIRIUS_MALFORMED_YAML, "malformed YAML"),
+        (SIRIUS_INVALID_CONFIGURATION, "invalid configuration"),
+    ] {
+        backend::fail_next(status, None);
+        let error = ContextConfigBuilder::from_yaml("config.yaml").unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
     backend::fail_next(999, None);
-    assert!(matches!(ContextConfigBuilder::new(),
-        Err(ConfigError::Unexpected { message, .. }) if message.is_empty()));
+    let error = ContextConfigBuilder::new().unwrap_err();
+    assert_eq!(error.to_string(), "Sirius status 999");
+    assert!(matches!(error,
+        ConfigError::Unexpected { status: 999, message } if message.is_empty()));
 }
 
 #[test]
