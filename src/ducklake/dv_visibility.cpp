@@ -16,9 +16,10 @@
 
 #include "ducklake/dv_visibility.hpp"
 
-#include "io/path_utils.hpp"
-
 #include <cucascade/io/io_errors.hpp>
+#include "io/path_utils.hpp"
+#include <cucascade/io/uri_parser.hpp>
+#include "op/scan/puffin_io.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -29,15 +30,21 @@ namespace sirius::ducklake {
 namespace scan = op::scan;
 namespace sm   = scan_manager;
 namespace {
-char const* parquet_dependency_error(unit_descriptor const& unit)
+char const* parquet_dependency_error(unit_descriptor const& unit, dependency_scope scope)
 {
   if (unit.kind != unit_kind::parquet) return "DuckLake Parquet reader requires a Parquet unit";
   auto gate = assess_local_scope(unit);
   for (auto reason : gate.reasons) {
     switch (reason) {
       case unit_gate_reason::remote_data:
+        if (scope == dependency_scope::s3_deletes && cucascade::io::parse(unit.input.path).scheme == "s3")
+          break;
         return "DuckLake remote data is outside the local scan profile";
       case unit_gate_reason::remote_delete:
+        if (scope == dependency_scope::s3_deletes &&
+            (unit.deletes == delete_format::puffin || unit.deletes == delete_format::parquet) &&
+            cucascade::io::parse(unit.delete_path).scheme == "s3")
+          break;
         return "DuckLake remote deletes are outside the local scan profile";
       case unit_gate_reason::invalid_locator: return "DuckLake data or delete locator is invalid";
       case unit_gate_reason::encrypted_data:
@@ -53,23 +60,22 @@ char const* parquet_dependency_error(unit_descriptor const& unit)
       default: return "DuckLake unit scope is unsupported";
     }
   }
-  if (gate.outside_local_scope) return "DuckLake unit is outside the local scan profile";
   if (unit.mapping_id)
     return "DuckLake external field mappings are outside the supported scan profile";
   return nullptr;
 }
 }  // namespace
-bool parquet_unit_dependencies_supported(unit_descriptor const& unit)
+bool parquet_unit_dependencies_supported(unit_descriptor const& unit, dependency_scope scope)
 {
-  return !parquet_dependency_error(unit);
+  return !parquet_dependency_error(unit, scope);
 }
-void validate_parquet_unit_dependencies(unit_descriptor const& unit)
+void validate_parquet_unit_dependencies(unit_descriptor const& unit, dependency_scope scope)
 {
-  if (auto error = parquet_dependency_error(unit)) throw std::invalid_argument(error);
+  if (auto error = parquet_dependency_error(unit, scope)) throw std::invalid_argument(error);
 }
-sm::unit_envelope parquet_unit_envelope(unit_descriptor const& unit)
+sm::unit_envelope parquet_unit_envelope(unit_descriptor const& unit, dependency_scope scope)
 {
-  validate_parquet_unit_dependencies(unit);
+  validate_parquet_unit_dependencies(unit, scope);
   if (unit.inline_delete_count > dv_max_positions)
     throw sm::preparation_resource_error("DuckLake inline delete positions exceed limit", true);
   if (unit.deletes == delete_format::none)
@@ -114,9 +120,10 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
                                                            scan::puffin_byte_source& source,
                                                            sm::charging_allocator& allocator,
                                                            sm::preparation_stop_token stop,
-                                                           std::string delete_identity)
+                                                           std::string delete_identity,
+                                                           dependency_scope scope)
 {
-  (void)parquet_unit_envelope(unit);
+  (void)parquet_unit_envelope(unit, scope);
   if (unit.deletes != delete_format::puffin || file_rows < 0 || data_identity.empty())
     throw std::invalid_argument("DuckLake DV requires original data evidence");
   check_stop(stop);
@@ -236,31 +243,15 @@ void validate_delete_position(int64_t position, int64_t& previous)
 void parquet_delete_accumulator::append(std::optional<int64_t> position,
                                         std::optional<int64_t> snapshot)
 {
-  stage(validated_, position, snapshot);
-  consume_staged(validated_);
-}
-void parquet_delete_accumulator::stage(size_t offset,
-                                       std::optional<int64_t> position,
-                                       std::optional<int64_t> snapshot) const
-{
   if (!position) throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
-  if (*position < 0)
-    throw std::runtime_error(
-      "DuckLake Parquet delete positions must be nonnegative and strictly increasing");
-  if (offset >= output_.size())
+  validate_delete_position(*position, previous_);
+  if (validated_ >= output_.size())
     throw std::runtime_error("DuckLake Parquet deletes exceed footer coverage");
   if (embedded_ && (!snapshot || *snapshot < 0))
     throw std::runtime_error("DuckLake Parquet delete snapshot must be nonnegative and non-NULL");
-  // Use the sign bit to mark future deletes within the existing position budget.
-  bool visible    = !embedded_ || local_ || static_cast<uint64_t>(*snapshot) <= snapshot_;
-  output_[offset] = visible ? *position : ~*position;
-}
-void parquet_delete_accumulator::consume_staged(size_t offset)
-{
-  auto value = output_[offset];
-  validate_delete_position(value < 0 ? ~value : value, previous_);
   ++validated_;
-  if (value >= 0) output_[effective_++] = value;
+  if (!embedded_ || local_ || static_cast<uint64_t>(*snapshot) <= snapshot_)
+    output_[effective_++] = *position;
 }
 std::shared_ptr<dv_visibility const> bind_parquet_visibility(
   std::shared_ptr<dv_visibility const> source, std::string data_identity, int64_t file_rows)
@@ -319,12 +310,9 @@ std::shared_ptr<dv_visibility const> read_dv_visibility(unit_descriptor const& u
                                                         sm::preparation_stop_token stop)
 {
   check_stop(stop);
-  std::unique_ptr<cucascade::io::datasource> datasource;
+  scan::opened_puffin_source opened;
   try {
-    auto context = resolve(unit.delete_path);
-    if (!context) throw std::runtime_error("DuckLake DV has no I/O context");
-    datasource = io::open_datasource(context, unit.delete_path, cucascade::io::open_hint::generic);
-    if (!datasource) throw std::runtime_error("DuckLake DV has no datasource");
+    opened = scan::open_puffin_source(unit.delete_path, resolve, stop);
   } catch (transparent::classified_execution_error const&) {
     throw;
   } catch (std::bad_alloc const&) {
@@ -337,9 +325,13 @@ std::shared_ptr<dv_visibility const> read_dv_visibility(unit_descriptor const& u
     throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                   e.what());
   }
-  auto identity = datasource->get_io_object().identity_cache_key();
-  auto source   = scan::make_puffin_byte_source(std::move(datasource));
-  return prepare_dv_visibility(
-    unit, file_rows, std::move(data_identity), *source, allocator, stop, std::move(identity));
+  return prepare_dv_visibility(unit,
+                               file_rows,
+                               std::move(data_identity),
+                               *opened.source,
+                               allocator,
+                               stop,
+                               std::move(opened.identity),
+                               dependency_scope::s3_deletes);
 }
 }  // namespace sirius::ducklake

@@ -184,6 +184,7 @@ planner::connector scan_connector()
             },
           .verify_binding = binding_matches,
           .capture        = capture_read_view,
-          .prepare        = prepare_scan};
+          .prepare        = prepare_scan,
+          .source_policy  = classify_bound_sources};
 }
 }  // namespace sirius::ducklake

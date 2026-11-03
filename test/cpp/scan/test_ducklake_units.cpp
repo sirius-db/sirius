@@ -18,7 +18,9 @@
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_varchar.hpp"
+#include "ducklake/remote_io.hpp"
 #include "ducklake/scan_ingestible.hpp"
+#include "ducklake/source_policy.hpp"
 #include "ducklake/unit_descriptor.hpp"
 #include "helper/hugeint.hpp"
 #include "planner/connector_registry.hpp"
@@ -1182,4 +1184,88 @@ TEST_CASE("DuckLake partial data requires exact snapshot identity and type",
   if (mode == 4) column.num_children = 1;
   CHECK_THROWS(compile_test(footer, {snapshot}, true));
   CHECK_THROWS(compile_test(mapping_footer(), {}, true));
+}
+
+TEST_CASE("DuckLake source policy includes remote-only delete dependencies",
+          "[ducklake_units][ducklake_source_policy]")
+{
+  using namespace sirius::ducklake;
+  using sirius::transparent::byte_source_class;
+  dependency_source_policy local;
+  local.observe("/tmp/data.parquet");
+  local.observe("file:///tmp/deletes.puffin");
+  CHECK(local.finish().source == byte_source_class::local_file);
+  CHECK(local.finish().permits_cpu_replay);
+  for (auto const* delete_path : {"s3://deletes/a.puffin", "S3://deletes/a.parquet"}) {
+    dependency_source_policy policy;
+    policy.observe("/tmp/data.parquet");
+    policy.observe(delete_path);
+    CHECK(policy.finish().source == byte_source_class::sirius_owned_s3);
+    CHECK_FALSE(policy.finish().permits_cpu_replay);
+  }
+  dependency_source_policy inline_only;
+  inline_only.observe("");
+  CHECK(inline_only.finish().permits_cpu_replay);
+}
+
+TEST_CASE("DuckLake unknown dependencies cannot hide the S3 replay veto",
+          "[ducklake_units][ducklake_source_policy]")
+{
+  using namespace sirius::ducklake;
+  using sirius::transparent::byte_source_class;
+  for (bool s3_first : {false, true}) {
+    dependency_source_policy policy;
+    if (s3_first) policy.observe("s3://bucket/data.parquet");
+    policy.observe("https://host/deletes.puffin");
+    if (!s3_first) {
+      CHECK(policy.finish().source == byte_source_class::unclassified);
+      CHECK(policy.finish().permits_cpu_replay);
+      policy.observe("s3://bucket/deletes.puffin");
+    }
+    CHECK(policy.finish().source == byte_source_class::sirius_owned_s3);
+    CHECK_FALSE(policy.finish().permits_cpu_replay);
+  }
+}
+
+TEST_CASE("DuckLake remote delete admission checks selected dependencies before I/O",
+          "[ducklake_units][ducklake_remote_admission]")
+{
+  using namespace sirius::ducklake;
+  using cucascade::io::io_context_type;
+  unit_descriptor unit;
+  unit.kind                              = unit_kind::parquet;
+  unit.input.path                        = "/tmp/data.parquet";
+  unit.delete_path                       = "s3://bucket/deletes.puffin";
+  unit.deletes                           = delete_format::puffin;
+  unit.delete_file_size                  = 128;
+  std::optional<io_context_type> backend = io_context_type::restful;
+  size_t lookups                         = 0;
+  auto lookup                            = [&](std::string const& path) {
+    ++lookups;
+    CHECK(path == unit.delete_path);
+    return backend;
+  };
+  CHECK_NOTHROW(validate_unit_io(unit, true, lookup));
+  CHECK(lookups == 1);
+  CHECK_FALSE(parquet_unit_dependencies_supported(unit));
+  CHECK(parquet_unit_dependencies_supported(unit, dependency_scope::s3_deletes));
+  CHECK_THROWS_WITH(validate_unit_io(unit, false, lookup),
+                    "DuckLake remote dependencies require deferred preparation");
+  backend.reset();
+  CHECK_THROWS(validate_unit_io(unit, true, lookup));
+  backend = io_context_type::kvikio;
+  CHECK_THROWS(validate_unit_io(unit, true, lookup));
+  backend      = io_context_type::restful;
+  unit.deletes = delete_format::parquet;
+  lookups      = 0;
+  CHECK_NOTHROW(validate_unit_io(unit, true, lookup));
+  CHECK(lookups == 1);
+  CHECK_FALSE(parquet_unit_dependencies_supported(unit));
+  CHECK_THROWS_WITH(validate_unit_io(unit, false, lookup),
+                    "DuckLake remote dependencies require deferred preparation");
+  lookups          = 0;
+  unit.deletes     = delete_format::puffin;
+  unit.delete_path = "https://host/deletes.puffin";
+  CHECK_THROWS(validate_unit_io(unit, true, lookup));
+  CHECK(lookups == 0);
 }

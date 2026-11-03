@@ -39,7 +39,8 @@ struct parquet_delete_column {
 
 struct parquet_delete_read_options {
   std::optional<uint64_t> expected_size;
-  // Validate the physical trailer whenever a footer size is bound.
+  // Only a bound footer size triggers an explicit trailer read. The opened handle's
+  // identity is always rechecked after ParquetReader construction.
   std::optional<uint64_t> expected_footer_size;
   // Called on scan workers and before queued I/O. Throw to cancel the read.
   std::function<void()> check_stop;
@@ -52,7 +53,6 @@ struct parquet_delete_read_options {
   std::function<void(duckdb::CachingFileHandle&)> verify_remote;
   // Test rendezvous after decoding a nonempty batch, before reserving its rows.
   std::function<void()> after_decode_for_testing;
-  bool verify_unbound_trailer = false;
 };
 
 // Called before decoding: validate format-specific schema, reserve output budget,

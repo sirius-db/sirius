@@ -5,6 +5,7 @@
  * See the LICENSE file at the repo root for the full text.
  */
 
+#include "io/path_utils.hpp"
 #include "catch.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
@@ -27,11 +28,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -741,4 +744,121 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
   for (int64_t i = 0; i < 10000; ++i)
     REQUIRE(new_positions[i] == i + 10000);
   fixture.con.Commit();
+}
+
+TEST_CASE("Native auxiliary S3 reads require strong identity and bypass native caches",
+          "[.][s3][filesystem][s3_native_identity]")
+{
+  auto tag = GENERATE(std::string{}, std::string{"W/\"weak\""}, std::string{"\"strong\""});
+  CAPTURE(tag);
+  head_http_server server(4096, tag);
+  s3_test_env env{server.endpoint(), "us-east-1", "access", "secret", "bucket"};
+  sirius_httpfs_fixture fixture(env);
+  set_gpu_execution(fixture.con, true);
+  auto& fs = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+  duckdb::OpenFileInfo file("s3://bucket/auxiliary.parquet");
+  file.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
+  file.extended_info->options["sirius_require_strong_identity"] = duckdb::Value::BOOLEAN(true);
+  if (tag != "\"strong\"") {
+    CHECK_THROWS_AS(fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ),
+                    cucascade::io::descriptor_mismatch_error);
+    CHECK(server.head_count() == 1);
+    return;
+  }
+  auto first          = fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ);
+  auto second         = fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ);
+  auto first_identity = sirius::io::s3::validated_identity(*first);
+  CHECK(first_identity == sirius::io::s3::validated_identity(*second));
+  CHECK(first->file_system.GetVersionTag(*first).empty());
+  CHECK(second->file_system.GetVersionTag(*second).empty());
+  CHECK_FALSE(first->file_system.GetLastModifiedTime(*first).IsFinite());
+  auto deadline = first->file_system.GetCacheValidUntil(*first);
+  REQUIRE(deadline);
+  CHECK(*deadline == duckdb::timestamp_t::ninfinity());
+  auto& runtime        = require_sirius_context(fixture);
+  auto config          = runtime.get_config().get_scan_manager_config().object_store;
+  config.session_token = "different-access-scope";
+  runtime.get_config().set_object_store_config(config);
+  auto third          = fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ);
+  auto third_identity = sirius::io::s3::validated_identity(*third);
+  CHECK(first_identity.object_key == third_identity.object_key);
+  CHECK(first_identity.access_scope != third_identity.access_scope);
+  CHECK(server.head_count() == 3);
+  file.extended_info->options["sirius_expected_size"] = duckdb::Value::UBIGINT(4095);
+  CHECK_THROWS_AS(fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ),
+                  cucascade::io::descriptor_mismatch_error);
+  CHECK(server.head_count() == 4);
+}
+
+TEST_CASE("Captured S3 contexts isolate native readers across connections",
+          "[.][s3][filesystem][s3_captured_context]")
+{
+  head_http_server first_server(4096, "\"first\"");
+  head_http_server second_server(8192, "\"second\"");
+  s3_test_env env{first_server.endpoint(), "us-east-1", "access", "secret", "bucket"};
+  sirius_httpfs_fixture fixture(env);
+  duckdb::Connection other(fixture.db);
+  set_gpu_execution(fixture.con, true);
+  set_gpu_execution(other, true);
+  auto& runtime          = require_sirius_context(fixture);
+  auto& manager          = runtime.get_scan_manager();
+  auto first_config      = runtime.get_config().get_scan_manager_config().object_store;
+  auto second_config     = first_config;
+  second_config.endpoint = second_server.endpoint();
+  duckdb::OpenFileInfo file("s3://bucket/captured.parquet");
+  file.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
+  file.extended_info->options["sirius_require_strong_identity"] = duckdb::Value::BOOLEAN(true);
+  auto first  = manager.capture_s3_context(file.path, first_config);
+  auto second = manager.capture_s3_context(file.path, second_config);
+  REQUIRE(first != second);
+  REQUIRE(manager.create_datasource(file.path)->io_ctx() == second);
+  for (int round = 0; round < 4; ++round) {
+    std::barrier captured(2);
+    auto open_after_both_captured = [&](auto config) {
+      std::shared_ptr<cucascade::io::ioctx> context;
+      try {
+        context = manager.capture_s3_context(file.path, std::move(config));
+      } catch (...) {
+        captured.arrive_and_drop();
+        throw;
+      }
+      captured.arrive_and_wait();
+      return sirius::io::open_datasource(context, file.path, cucascade::io::open_hint::generic)->size();
+    };
+    auto a = std::async(std::launch::async, open_after_both_captured, first_config);
+    auto b = std::async(std::launch::async, open_after_both_captured, second_config);
+    CHECK(a.get() == 4096);
+    CHECK(b.get() == 8192);
+  }
+  {
+    sirius::io::s3::scoped_native_read_context a(*fixture.con.context, file.path, first);
+    sirius::io::s3::scoped_native_read_context b(*other.context, file.path, second);
+    auto open = [&](duckdb::Connection& con) {
+      return duckdb::FileSystem::GetFileSystem(*con.context)
+        .OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ);
+    };
+    for (int round = 0; round < 3; ++round) {
+      manager.install_s3_config(file.path, round % 2 ? first_config : second_config);
+      auto left  = open(fixture.con);
+      auto right = open(other);
+      CHECK(left->GetFileSize() == 4096);
+      CHECK(right->GetFileSize() == 8192);
+      CHECK(sirius::io::s3::validated_identity(*left).access_scope == first);
+      CHECK(sirius::io::s3::validated_identity(*right).access_scope == second);
+    }
+    CHECK_THROWS_AS(
+      sirius::io::s3::scoped_native_read_context(*fixture.con.context, file.path, second),
+      std::logic_error);
+    set_gpu_execution(other, false);
+    CHECK_THROWS(open(other));
+  }
+  // Exception unwinding releases the connection override as well.
+  try {
+    sirius::io::s3::scoped_native_read_context scope(*fixture.con.context, file.path, second);
+    throw std::runtime_error("consumer failed");
+  } catch (std::runtime_error const&) {
+  }
+  auto ordinary = duckdb::FileSystem::GetFileSystem(*fixture.con.context)
+                    .OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ);
+  CHECK(ordinary->GetFileSize() == 4096);
 }

@@ -29,6 +29,10 @@ class preparation_admission;
 class charging_allocator;
 class preparation_stop_token;
 }  // namespace sirius::scan_manager
+namespace cucascade::io {
+class ioctx;
+}
+
 namespace sirius::ducklake {
 class parquet_unit_ingestible;
 class inline_reader;
@@ -71,9 +75,11 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
     unit_scan_options options            = {});
 
   // Independent native delete reader; called only on the captured owner lane.
-  std::shared_ptr<dv_visibility const> read_parquet_deletes(uint64_t original_file_index,
-                                                            scan_manager::charging_allocator&,
-                                                            scan_manager::preparation_stop_token);
+  std::shared_ptr<dv_visibility const> read_parquet_deletes(
+    uint64_t original_file_index,
+    scan_manager::charging_allocator&,
+    scan_manager::preparation_stop_token,
+    std::shared_ptr<cucascade::io::ioctx> delete_context = {});
 
   op::scan::bound_read_view const& view() const noexcept;
   void validate_statement() const;
@@ -96,6 +102,9 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
   explicit binding_handle(std::unique_ptr<impl>);
   std::unique_ptr<impl> impl_;
 };
+transparent::scan_source_policy classify_bound_sources(duckdb::BoundTableFunction const&,
+                                                       duckdb::FunctionData const*,
+                                                       duckdb::ClientContext&);
 op::scan::bound_read_view capture_read_view(duckdb::BoundTableFunction const&,
                                             duckdb::FunctionData const*,
                                             duckdb::ClientContext&);

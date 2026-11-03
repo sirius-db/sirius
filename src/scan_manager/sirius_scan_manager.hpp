@@ -526,6 +526,11 @@ class sirius_scan_manager {
   /// reuse this snapshot; subsequent replacement affects only future lookups.
   void install_s3_config(std::string_view path, cucascade::io::object_store_config config);
 
+  /// Atomically install and retain this caller's resolved access scope. The returned
+  /// context remains valid when another connection replaces the same URI's config.
+  std::shared_ptr<cucascade::io::ioctx> capture_s3_context(std::string_view path,
+                                                        cucascade::io::object_store_config config);
+
   /// \brief Prepare per-scan state for the given query.
   ///
   /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
@@ -1155,6 +1160,12 @@ class sirius_scan_manager {
   /// (reactor threads + cache allocation happen outside the map mutex), while
   /// `_routed_io_ctxs_mtx` guards only map lookup/insert; drained + torn down
   /// in the dtor.
+  // Both helpers require _routed_io_ctxs_build_mtx; retire contexts after unlocking.
+  std::shared_ptr<cucascade::io::ioctx> ioctx_for_type_locked(cucascade::io::io_context_type type,
+                                                           std::string_view path);
+  void install_s3_config_locked(std::string_view path,
+                                cucascade::io::object_store_config config,
+                                std::vector<std::shared_ptr<cucascade::io::ioctx>>& retired);
   std::mutex _routed_io_ctxs_build_mtx;
   mutable std::mutex _routed_io_ctxs_mtx;
   sirius::io::scoped_object_store_configs _s3_configs;
