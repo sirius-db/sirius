@@ -16,7 +16,7 @@
 
 /*
  * Public C++ surface for embedding Sirius (`Context` and `Fragment`).
- * The embedder is the process that links it: Rust `sirius-sys` or C++ tests.
+ * The embedder is the process that links it: Rust `sirius-ffi` or C++ tests.
  *
  * Intentionally lightweight — a small RAII wrapper that
  * forward-declares the heavy internal type — so consumers bind it without

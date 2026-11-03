@@ -131,8 +131,9 @@ struct EqualityDeleteGroup {
 /**
  * @brief Fully materialized Iceberg delete data for one table.
  *
- * Legacy producer output, materialized at plan time on internal connections bracketed by
- * InternalQueryGuard. Each scan owns its supplied discovery and result; no global memo.
+ * Legacy producer output, materialized at plan time. Manifest queries use internal
+ * connections; Parquet position deletes use the original context and native reader. Each scan owns
+ * its supplied discovery and result; no global memo.
  */
 struct IcebergDeleteData {
   /// V2 positional deletes and V3 deletion vectors merged: data_file_path -> sorted positions.

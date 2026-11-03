@@ -154,6 +154,8 @@ Row mapping is a **list of runs, not one offset**. `build_batch_layout` emits on
 
 **Delete discovery** (`iceberg_metadata_reader.{hpp,cpp}`) delegates manifest parsing to DuckDB's `iceberg` and `avro` extensions. `iceberg_metadata()` covers everything except the three V3 deletion-vector fields it does not expose (`content_offset`, `content_size_in_bytes`, `referenced_data_file`), which a `read_avro` query over the containing manifest supplies. Results are memoized per query, keyed on transaction id plus table path plus snapshot, because one query reads delete data more than once — `iceberg_scan` is not serializable, so the plan is generated twice. `read_deletion_vector` (`puffin_reader.cpp`) validates the Puffin container's leading and trailing magic before seeking to a blob offset inside it, then checks the deletion-vector blob's own magic and CRC-32.
 
+Parquet position-delete files share `parquet_delete_reader` for local and remote reads. Remote reads retain the filesystem's access and consistency rules. Reading a fixed object version requires a caller-supplied identity check and backend enforcement.
+
 Eligible deletion-vector inputs are prepared per file during execution; positional-delete files and scans without a bounded reservation keep eager loading. See [Preparation and publication](scan-contracts-design.md#preparation-and-publication) for admission and lifetime rules.
 
 #### Deferred Puffin ownership and bounds

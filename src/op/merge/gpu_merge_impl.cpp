@@ -25,6 +25,7 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/groupby.hpp>
@@ -32,13 +33,59 @@
 #include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
+#include <utility>
 
 namespace sirius {
 namespace op {
+
+namespace {
+
+/// Reorders @p views, partials with one key column, by their first key. The first keys are
+/// gathered into one small column, ordered on the device, and the order is read back with a
+/// single synchronization. Ties keep their input order. Returns false and leaves @p views
+/// untouched when a partial is empty or its key has nulls.
+bool order_partials_by_first_key(std::vector<cudf::table_view>& views,
+                                 ::cuda::stream_ref stream,
+                                 rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::column_view> first_rows;
+  first_rows.reserve(views.size());
+  for (auto const& view : views) {
+    if (view.num_rows() == 0 || view.column(0).has_nulls()) { return false; }
+    first_rows.push_back(cudf::slice(view.column(0), {0, 1}, stream)[0]);
+  }
+  auto const first_keys = cudf::concatenate(first_rows, stream, mr);
+  auto const order      = cudf::stable_sorted_order(cudf::table_view({first_keys->view()}),
+                                                    {cudf::order::ASCENDING},
+                                                    {cudf::null_order::AFTER},
+                                               stream,
+                                               mr);
+  std::vector<cudf::size_type> host_order(views.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(host_order.data(),
+                                order->view().data<cudf::size_type>(),
+                                host_order.size() * sizeof(cudf::size_type),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  stream.sync();
+  std::vector<cudf::table_view> ordered;
+  ordered.reserve(views.size());
+  for (auto const idx : host_order) {
+    ordered.push_back(views[idx]);
+  }
+  views = std::move(ordered);
+  return true;
+}
+
+}  // namespace
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
@@ -220,6 +267,15 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     throw std::runtime_error(
       "`num columns = num_group_cols + num aggregates` not true in `merge_grouped_aggregate()`");
   }
+  // Partials of sorted input batches are themselves sorted, and with a table pinned in key order
+  // they cover consecutive key ranges. When the hash partitions upstream kept their input order
+  // (they do for sorted input), ordering the partials by their first key then makes the
+  // concatenation sorted, so the merge can use cuDF's sorted-keys path. The order is verified
+  // after concatenation, so any other input keeps the hash path.
+  auto const first_key_type   = input_cudf_table_views[0].column(0).type();
+  bool const try_sorted_merge = num_group_cols == 1 && cudf::is_fixed_width(first_key_type) &&
+                                !cudf::is_floating_point(first_key_type);
+  if (try_sorted_merge) { order_partials_by_first_key(input_cudf_table_views, stream, mr); }
 
   // A wide integer SUM's partials are INT64, or DECIMAL128 where the batch could overflow INT64.
   // Concatenation needs one type per column, so once any batch carries DECIMAL128 the INT64
@@ -317,7 +373,20 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       group_cols.push_back(col);
     }
   }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
+  bool const keys_sorted =
+    try_sorted_merge && group_cols.size() == 1 && keys_ascending(group_cols[0], stream);
+  SIRIUS_LOG_DEBUG("merge_grouped_agg: sorted-key check tried={} rows={} batches={} sorted={}",
+                   try_sorted_merge,
+                   concatenated->num_rows(),
+                   input.size(),
+                   keys_sorted);
+  std::vector<cudf::order> const key_order(group_cols.size(), cudf::order::ASCENDING);
+  std::vector<cudf::null_order> const key_null_order(group_cols.size(), cudf::null_order::AFTER);
+  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols),
+                                   cudf::null_policy::INCLUDE,
+                                   keys_sorted ? cudf::sorted::YES : cudf::sorted::NO,
+                                   key_order,
+                                   key_null_order);
   std::vector<cudf::groupby::aggregation_request> requests;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + static_cast<int>(i);

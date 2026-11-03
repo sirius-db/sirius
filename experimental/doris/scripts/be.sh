@@ -36,12 +36,11 @@ case "${1:-}" in
         export SIRIUS_BE_DUMP_FRAGMENTS="${SIRIUS_BE_DUMP_FRAGMENTS:-${LOG_DIR}/dump}"
         if [ "${engine}" = true ]; then
             export SIRIUS_BE_TRANSLATE_ONLY="${SIRIUS_BE_TRANSLATE_ONLY:-0}"
-            # The binary links libsirius.so (sirius-sys symlinks it to the DuckDB extension in
-            # the build tree) whose CUDA/RAPIDS deps live in the pixi env; neither is on the
-            # default loader path.
+            # The binary links libsirius.so; its CUDA/RAPIDS dependencies live in the
+            # pixi environment. Add the library locations to the loader path.
             build_dir="${SIRIUS_BUILD_DIR:-$(cd ../.. && pwd)/build/release}"
             export SIRIUS_BUILD_DIR="${build_dir}"
-            export LD_LIBRARY_PATH="${build_dir}/extension/sirius${CONDA_PREFIX:+:${CONDA_PREFIX}/lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+            export LD_LIBRARY_PATH="${build_dir}:${build_dir}/extension/sirius${CONDA_PREFIX:+:${CONDA_PREFIX}/lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
             case " $* " in
                 *" --sirius-config "*|*" --sirius-config="*) ;;
                 *) set -- --sirius-config conf/sirius.yaml "$@" ;;

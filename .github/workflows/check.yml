@@ -219,7 +219,7 @@ jobs:
             [[ -z "$explicit" ]]
           fi
 
-      # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
+      # Rust bindings (sirius-ffi) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the
       # cxx glue against the Sirius FFI header and links the proof-of-life test
       # against the single Sirius library built above (build.rs discovers it under
@@ -233,9 +233,9 @@ jobs:
           && matrix.build.cudf-channel == 'stable'
         run: |
           set -euo pipefail
-          pixi run --locked cargo fmt --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --check
-          pixi run --locked cargo clippy --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --all-targets -- -D warnings
-          pixi run --locked cargo test --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys
+          pixi run --locked cargo fmt --manifest-path rust/Cargo.toml --package sirius-ffi --check
+          pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius-ffi --all-targets -- -D warnings
+          pixi run --locked cargo test --locked --no-run --manifest-path rust/Cargo.toml --package sirius-ffi
 
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'
@@ -258,7 +258,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_INSTALLED_DIR="$PWD/build/static-install" -DVCPKG_MANIFEST_INSTALL=OFF
           pixi run --locked -e vcpkg cmake --build build/static-consumer
-          for consumer in consumer c_consumer c_configuration_consumer; do
+          for consumer in consumer c_consumer c_configuration_consumer cpp_configuration_consumer; do
             readelf -d "build/static-consumer/$consumer" > "build/static-consumer/$consumer.dynamic.txt"
             while read -r library; do
               case "$library" in

@@ -260,6 +260,12 @@ jobs:
             --reporter xml \
             --out build/release/test/cpp/log/preparation-faults/results.xml
 
+      - name: Run Rust bindings tests
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build/release:$CONDA_PREFIX/lib:$CONDA_PREFIX/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          pixi run --locked -e ${{ matrix.cuda.pixi-environment }} cargo test --locked \
+            --manifest-path rust/Cargo.toml --package sirius-ffi
+
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
         # The C++ suite asserts routes and rows, but every case shares one in-process

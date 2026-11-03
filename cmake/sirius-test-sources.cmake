@@ -1,5 +1,6 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan/test_parquet_delete_reader.cpp
     test/cpp/scan/bench_parquet_footer_cache.cpp
     test/cpp/io/cache/bench_metadata_store.cpp
     test/cpp/io/test_parquet_metadata_retention.cpp
@@ -82,6 +83,7 @@ set(TEST_SOURCES
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
+    test/cpp/expression_evaluator/test_checked_division.cpp
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
@@ -115,6 +117,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_grouping_sets.cpp
+    test/cpp/integration/test_gpu_execution_division.cpp
     test/cpp/integration/test_gpu_execution_hugeint.cpp
     test/cpp/integration/test_gpu_execution_integer_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
@@ -234,6 +237,7 @@ set(TEST_SOURCES
     test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+    test/cpp/operator/aggregate/test_sorted_keys.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
     test/cpp/operator/aggregate/test_low_cardinality_groupby.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp

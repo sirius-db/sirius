@@ -8,7 +8,7 @@ and [Pixi](https://pixi.prefix.dev/) to manage build dependencies.
 ## Public API documentation
 
 Build the C reference for `include/sirius-c/`, the C++ reference for `include/sirius/`,
-and the Rust `sirius` crate reference:
+and the Rust `sirius-ffi` crate reference:
 
 ```bash
 pixi run -e docs docs
@@ -16,7 +16,7 @@ pixi run -e docs docs
 
 Open `build/docs/site/index.html` in your browser. The site has a landing page at
 `/`, the C reference at `/c/`, the C++ reference at `/cpp/`, and the Rust reference at `/rust/` (which opens
-`/rust/sirius/`). These paths are relative to the GitHub Pages project URL.
+`/rust/sirius_ffi/`). These paths are relative to the GitHub Pages project URL.
 
 Build individual references with `pixi run -e docs docs-c`,
 `pixi run -e docs docs-cpp`, or

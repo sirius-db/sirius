@@ -162,7 +162,7 @@ rust = "1.*"
 
 [feature.docs.tasks.docs-rust]
 description = "Build the Sirius Rust API reference without libsirius."
-cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps --target-dir build/docs/rust-target"
+cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius-ffi --lib --no-deps --target-dir build/docs/rust-target"
 env = { DOCS_RS = "1", RUSTDOCFLAGS = "-D warnings" }
 
 [feature.docs.tasks.docs-theme]

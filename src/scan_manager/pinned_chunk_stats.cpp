@@ -19,17 +19,15 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "helper/cudf_scalar_to_value.hpp"
 #include "log/logging.hpp"
 
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
-#include <cudf/wrappers/timestamps.hpp>
 
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/enums/filter_propagate_result.hpp>
-#include <duckdb/common/types/date.hpp>
-#include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/filter/table_filter_functions.hpp>
@@ -60,53 +58,6 @@ std::optional<cudf::type_id> expected_cudf_type(duckdb::LogicalType const& type)
   }
 }
 
-duckdb::Value scalar_to_value(cudf::scalar const& s, ::cuda::stream_ref stream)
-{
-  switch (s.type().id()) {
-    case cudf::type_id::INT8:
-      return duckdb::Value::TINYINT(
-        static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream));
-    case cudf::type_id::INT16:
-      return duckdb::Value::SMALLINT(
-        static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream));
-    case cudf::type_id::INT32:
-      return duckdb::Value::INTEGER(
-        static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream));
-    case cudf::type_id::INT64:
-      return duckdb::Value::BIGINT(
-        static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream));
-    case cudf::type_id::UINT8:
-      return duckdb::Value::UTINYINT(
-        static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream));
-    case cudf::type_id::UINT16:
-      return duckdb::Value::USMALLINT(
-        static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream));
-    case cudf::type_id::UINT32:
-      return duckdb::Value::UINTEGER(
-        static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream));
-    case cudf::type_id::UINT64:
-      return duckdb::Value::UBIGINT(
-        static_cast<cudf::numeric_scalar<std::uint64_t> const&>(s).value(stream));
-    case cudf::type_id::TIMESTAMP_DAYS: {
-      auto const days = static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(s)
-                          .value(stream)
-                          .time_since_epoch()
-                          .count();
-      return duckdb::Value::DATE(duckdb::date_t{days});
-    }
-    case cudf::type_id::TIMESTAMP_MICROSECONDS: {
-      auto const micros = static_cast<cudf::timestamp_scalar<cudf::timestamp_us> const&>(s)
-                            .value(stream)
-                            .time_since_epoch()
-                            .count();
-      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{micros});
-    }
-    default:
-      SIRIUS_LOG_DEBUG("[pinned_chunk_stats] scalar type {} outside allowlist; dropping stats cell",
-                       static_cast<std::int32_t>(s.type().id()));
-      return duckdb::Value();
-  }
-}
 }  // namespace
 
 std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> compute_pinned_chunk_stats(
@@ -143,8 +94,8 @@ std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> compute_pinned_chunk_sta
       continue;
     }
 
-    auto const min_value = scalar_to_value(*min_scalar, stream);
-    auto const max_value = scalar_to_value(*max_scalar, stream);
+    auto const min_value = cudf_scalar_to_value(*min_scalar, stream);
+    auto const max_value = cudf_scalar_to_value(*max_scalar, stream);
     if (min_value.IsNull() || max_value.IsNull()) { continue; }
 
     // CreateUnknown pre-sets both null flags ("may have nulls, may have valid rows"); tighten to
