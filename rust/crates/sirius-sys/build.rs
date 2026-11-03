@@ -2,15 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "generate-bindings")]
 #[path = "bindgen/mod.rs"]
 mod bindings;
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    println!("cargo:rerun-if-env-changed=SIRIUS_BINDGEN");
-    if let Ok(mode) = std::env::var("SIRIUS_BINDGEN") {
-        bindings::run(&manifest, &mode);
-    }
+    #[cfg(feature = "generate-bindings")]
+    bindings::run(&manifest);
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     // Rustdoc needs only declarations; Miri tests provide Rust ABI stand-ins.
     println!("cargo:rerun-if-env-changed=CARGO_CFG_MIRI");

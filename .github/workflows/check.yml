@@ -34,7 +34,14 @@ jobs:
           locked: true
           cache: false
       - name: Check generated Rust declarations
-        run: pixi run --locked -e bindings check-bindings
+        run: |
+          pixi run --locked -e bindings generate-bindings
+          git diff --exit-code -- rust/crates/sirius-sys/src/generated.rs
+      - name: Lint binding generation
+        env:
+          DOCS_RS: "1"
+          LIBCLANG_PATH: ${{ github.workspace }}/.pixi/envs/bindings/lib
+        run: pixi run --locked -e bindings cargo clippy --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings -- -D warnings
       - name: Install Miri
         run: rustup toolchain install nightly-2026-11-01 --profile minimal --component miri --component rust-src
       - name: Check public Rust ownership with Miri

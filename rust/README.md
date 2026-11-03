@@ -122,23 +122,23 @@ directory. Configuration uses the C declarations in
 
 ## Maintaining the C bindings
 
-Raw declarations are checked in under `sirius-sys/src/generated.rs`. The
-`sirius-sys` build script runs the pinned bindgen tool only when `SIRIUS_BINDGEN`
-is set to `write` (regenerate) or `check` (reject drift). Ordinary
-builds require neither bindgen nor libclang. After changing the public C headers,
-run `pixi run --locked -e bindings generate-bindings` and commit the result.
-`pixi run --locked -e bindings check-bindings` checks for drift in CI using pinned
-bindgen and Clang versions. These maintenance tasks set `DOCS_RS=1` to skip
-native linking; they do not require a built Sirius library. The build script also
-compares declarations for Linux x86-64,
-Linux AArch64, and macOS AArch64; this checks declaration portability, not native
-library support on those platforms.
+Raw declarations are checked in under `sirius-sys/src/generated.rs`. Enable the
+maintainer-only `generate-bindings` Cargo feature to regenerate them in `build.rs`
+using the pinned bindgen library. Normal builds do not compile bindgen or need
+libclang.
+
+After changing the public C headers, run
+`pixi run --locked -e bindings generate-bindings` and commit the result. The task
+uses the pinned Clang environment and sets `DOCS_RS=1` to skip native linking.
+Generation checks that Linux amd64 and arm64 produce identical declarations.
+CI regenerates the file and uses `git diff --exit-code` to detect drift.
 
 Opaque handle definitions remain handwritten to preserve their thread-safety and
 pinning restrictions. Generation rejects new opaque handles until those definitions
 and the generator blocklist are updated. The ABI version accessor retains its safe Rust wrapper.
 All other function declarations and status values come from the C headers.
-When adding functions, also add them to the explicit exports in `c_api.rs`.
+Include new public headers in `bindgen/wrapper.h`, and add new functions to the
+explicit exports in `c_api.rs`.
 
 ## Checking unsafe Rust with Miri
 
