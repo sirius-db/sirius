@@ -15,9 +15,7 @@
 
 namespace sirius::op::scan::detail {
 namespace {
-struct validation_status {
-  unsigned invalid, nulls;
-};
+using validation_status = arrow_device_validation_status;
 __device__ bool bit(void const* data, int64_t row)
 {
   return !data || ((static_cast<uint8_t const*>(data)[row / 8] >> (row % 8)) & 1);
@@ -109,6 +107,7 @@ int blocks(int64_t rows)
 std::unique_ptr<cudf::table> import_arrow_device_columns(ArrowArray const& root,
                                                          arrow_bound_schema const& schema,
                                                          arrow_source_profile const& profile,
+                                                         arrow_device_validation_status& observed,
                                                          ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
@@ -149,7 +148,6 @@ std::unique_ptr<cudf::table> import_arrow_device_columns(ArrowArray const& root,
       static_cast<uint64_t>(limit >> 64),
       device_status);
     CUDF_CUDA_TRY(cudaGetLastError());
-    validation_status observed{};
     CUDF_CUDA_TRY(cudaMemcpyAsync(
       &observed, device_status, sizeof(observed), cudaMemcpyDeviceToHost, stream.get()));
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
@@ -178,7 +176,6 @@ std::unique_ptr<cudf::table> import_arrow_device_columns(ArrowArray const& root,
                                                              0,
                                                              device_status);
     CUDF_CUDA_TRY(cudaGetLastError());
-    validation_status observed{};
     CUDF_CUDA_TRY(cudaMemcpyAsync(
       &observed, device_status, sizeof(observed), cudaMemcpyDeviceToHost, stream.get()));
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));

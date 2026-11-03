@@ -23,6 +23,20 @@
 #include <string_view>
 
 namespace sirius::op::scan {
+std::unique_ptr<cudf::table> detail::import_arrow_device_columns(
+  ArrowArray const& root,
+  arrow_bound_schema const& schema,
+  arrow_source_profile const& profile,
+  std::shared_ptr<arrow_device_validation_status> observed,
+  cucascade::exec::submission& submission,
+  rmm::device_async_resource_ref mr)
+{
+  if (!observed) throw std::invalid_argument("Arrow device validation requires a readback owner");
+  submission.on_retire([observed](cudaError_t) noexcept {});
+  return import_arrow_device_columns(
+    root, schema, profile, *observed, ::cuda::stream_ref{submission.stream()}, mr);
+}
+
 owned_arrow_batch::owned_arrow_batch(ArrowSchema& s,
                                      ArrowArray& a,
                                      std::shared_ptr<void> permit,
@@ -153,6 +167,7 @@ struct normalized_batch {
   // Release PMR buffers before the producer/capacity owner that keeps the resource alive.
   std::shared_ptr<owned_arrow_batch> owner;
   std::pmr::vector<normalized_column> columns;
+  detail::arrow_device_validation_status device_validation;
 };
 
 void normalize_columns(normalized_batch& batch,
@@ -493,9 +508,10 @@ arrow_input_estimate validate_arrow_source(ArrowSchema const& schema,
   auto rows = static_cast<uint64_t>(array.length);
   check_buffer(
     array.buffers[0], profile.root_validity, array.buffers[0] ? (array.offset + rows + 7) / 8 : 0);
-  estimate.control = checked_add(profile.control_bytes,
-                                 sizeof(owned_arrow_batch) + sizeof(arrow_source_profile) +
-                                   sizeof(ArrowArray) + sizeof(ArrowSchema) + 256);
+  estimate.control =
+    checked_add(profile.control_bytes,
+                sizeof(owned_arrow_batch) + sizeof(arrow_source_profile) + sizeof(ArrowArray) +
+                  sizeof(ArrowSchema) + sizeof(normalized_batch) + 256);
   estimate.control = checked_add(
     estimate.control, checked_mul(profile.allocations.capacity(), sizeof(arrow_allocation)));
   // Charge queue copies and spare descriptor capacity.
@@ -511,6 +527,7 @@ arrow_input_estimate validate_arrow_source(ArrowSchema const& schema,
     estimate.control,
     checked_add(checked_mul(lengths.bucket_count(), sizeof(void*)),
                 checked_mul(lengths.size(), sizeof(arrow_metadata_lengths::value_type) + 32)));
+  bool character_limit_exceeded = false;
   for (size_t i = 0; i < types.size(); ++i) {
     auto const& field    = *schema.children[i];
     auto const& child    = *array.children[i];
@@ -530,9 +547,14 @@ arrow_input_estimate validate_arrow_source(ArrowSchema const& schema,
       check_buffer(child.buffers[1], buffers[1], rows ? checked_mul(end + 1, width) : 0);
       if (rows && !profile.strings[i]) invalid();
       auto window = profile.strings[i].value_or(arrow_string_window{});
-      payload     = detail::arrow_string_window_size(window.first, window.last);
+      if (window.first < 0 || window.last < window.first) invalid();
+      payload = static_cast<uint64_t>(window.last - window.first);
       if (!rows && payload) invalid();
       check_buffer(child.buffers[2], buffers[2], rows && payload ? window.last : 0);
+      if (payload > std::numeric_limits<cudf::size_type>::max()) {
+        character_limit_exceeded = true;
+        payload = 0;  // Finish checking later columns without sizing a refused destination.
+      }
       payload = checked_add(payload, checked_mul(rows + 1, sizeof(int32_t)));
     } else {
       if (profile.strings[i]) invalid();
@@ -553,6 +575,10 @@ arrow_input_estimate validate_arrow_source(ArrowSchema const& schema,
   }
   for (auto const& [pointer, bytes] : lengths)
     estimate.control = checked_add(estimate.control, bytes);
+  if (character_limit_exceeded)
+    throw transparent::classified_execution_error(
+      transparent::late_failure_cause::resource,
+      "arrow_batch_too_large: Arrow characters exceed the destination string-offset limit");
   if (types.empty() && rows) estimate.destination = rows;
   if (profile.memory != arrow_source_memory::device) {
     estimate.staging = arrow_import_staging_bytes(array, types);
@@ -725,7 +751,13 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
   std::unique_ptr<cudf::table> table;
   if (source && source->memory == arrow_source_memory::device) {
     table =
-      detail::import_arrow_device_columns(input->array, *program.arrow_schema, *source, stream, mr);
+      detail::import_arrow_device_columns(input->array,
+                                          *program.arrow_schema,
+                                          *source,
+                                          std::shared_ptr<detail::arrow_device_validation_status>{
+                                            normalized, &normalized->device_validation},
+                                          submission,
+                                          mr);
   } else {
     // Legacy inputs were already payload-validated by validate_for(). Qualified
     // host inputs need that validation only now, after their readiness event.

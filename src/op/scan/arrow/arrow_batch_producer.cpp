@@ -618,8 +618,9 @@ arrow_production arrow_push_queue::next(admitted_arrow_input admitted,
     {
       std::lock_guard lock(impl_->mutex);
       if (impl_->error) std::rethrow_exception(impl_->error);
-      if (stop.stop_requested() || impl_->cancelled)
+      if (stop.stop_requested())
         throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      if (impl_->cancelled) throw duckdb::InterruptException();
       if (!impl_->queued) {
         if (impl_->finished || impl_->closed) return arrow_end_of_stream{};
         throw std::logic_error("Arrow queue claimed while pending");
@@ -645,12 +646,16 @@ arrow_production arrow_push_queue::next(admitted_arrow_input admitted,
       {
         std::lock_guard lock(impl_->mutex);
         if (impl_->error) std::rethrow_exception(impl_->error);
-        if (stop.stop_requested() || impl_->cancelled)
+        if (stop.stop_requested())
           throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+        if (impl_->cancelled) throw duckdb::InterruptException();
       }
       return produced_arrow_input{std::move(input), {}};
+    } catch (duckdb::InterruptException const&) {
+      cancel();
+      throw;
     } catch (std::system_error const& error) {
-      if (error.code() == std::errc::operation_canceled)
+      if (stop.stop_requested() && error.code() == std::errc::operation_canceled)
         cancel();
       else
         fail(std::current_exception());

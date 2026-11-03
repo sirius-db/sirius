@@ -350,6 +350,95 @@ TEST_CASE("Arrow string row limits are resource refusals after schema and extent
   CHECK(queue.observe().accepted == 0);
 }
 
+TEST_CASE("Arrow character limits preserve malformed extent and schema precedence",
+          "[arrow_qualified][arrow_profile][arrow_admission]")
+{
+  auto kind = GENERATE(0, 1, 2, 3, 4, 5);  // limit, excess, high origin, empty, negative, reversed
+  auto malformed =
+    GENERATE(0, 1, 2, 3, 4);  // valid, short chars, missing chars, later schema/extent
+  struct string_tree : import_tree {
+    ArrowSchema second{};
+    ArrowArray second_array{};
+    ArrowSchema* all_fields[2]{&field, &second};
+    ArrowArray* all_columns[2]{&column, &second_array};
+    int32_t value = 1;
+    void const* second_buffers[2]{nullptr, &value};
+    string_tree() : import_tree("U", 1)
+    {
+      array.offset = column.offset = 0;
+      column.length                = 1;
+      column.null_count            = 0;
+      schema.n_children = array.n_children = 2;
+      schema.children                      = all_fields;
+      array.children                       = all_columns;
+      second                               = field;
+      second.name                          = "second";
+      second.format                        = "i";
+      second_array                         = column;
+      second_array.n_buffers               = 2;
+      second_array.buffers                 = second_buffers;
+    }
+  };
+  auto tree     = std::make_shared<string_tree>();
+  int64_t first = kind == 2 ? int64_t{INT32_MAX} + 17 : 0;
+  int64_t last  = kind == 0 ? INT32_MAX : kind == 1 ? int64_t{INT32_MAX} + 1 : first + 7;
+  if (kind == 3) {
+    tree->array.length = tree->column.length = tree->second_array.length = 0;
+    first = last = 0;
+  }
+  if (kind == 4) first = -1;
+  if (kind == 5) first = last + 1;
+  std::array<int64_t, 2> offsets{first, last};
+  auto chars       = reinterpret_cast<void const*>(uintptr_t{0x1000000000});
+  auto bytes       = static_cast<uint64_t>(std::max<int64_t>(last, 1));
+  tree->buffers[1] = offsets.data();
+  tree->buffers[2] = chars;
+  arrow_source_profile profile;
+  profile.completed     = true;
+  profile.leases        = tree;
+  profile.control_bytes = sizeof(string_tree);
+  profile.allocations   = {{1, offsets.data(), sizeof(offsets)},
+                           {2, chars, bytes},
+                           {3, &tree->value, sizeof(tree->value)}};
+  profile.buffers = {{{}, arrow_buffer_use{1, 0, sizeof(offsets)}, arrow_buffer_use{2, 0, bytes}},
+                     {{}, arrow_buffer_use{3, 0, sizeof(tree->value)}}};
+  profile.strings = {arrow_string_window{first, last}, {}};
+  if (malformed == 1) {
+    profile.buffers[0][2]->bytes  = 0;
+    profile.buffers[0][2]->offset = 1;
+  }
+  if (malformed == 2)
+    tree->buffers[2] = nullptr;  // A use without a pointer is malformed even when empty.
+  if (malformed == 3) tree->second.name = "wrong";
+  if (malformed == 4) profile.buffers[1][1]->offset = 1;
+  materialization_program program{
+    701,
+    4,
+    {cudf::data_type{cudf::type_id::STRING}, cudf::data_type{cudf::type_id::INT32}},
+    0,
+    false};
+  program.input_types  = program.output_types;
+  program.arrow_schema = std::make_shared<arrow_bound_schema const>(
+    arrow_bound_schema{{{"value", "U", cudf::data_type{cudf::type_id::STRING}, true},
+                        {"second", "i", cudf::data_type{cudf::type_id::INT32}, true}}});
+  bool valid = !malformed && kind < 4;
+  if (valid && kind != 1)
+    CHECK_NOTHROW(validate_arrow_source(tree->schema, tree->array, profile, *program.arrow_schema));
+  // Small windows are refused by the byte budget, so virtual chars are never materialized.
+  arrow_push_queue queue(program, kind == 1 ? 64ULL << 30 : 1, [](auto) {});
+  auto slot = queue.acquire_offered_slot();
+  slot.set_input(tree->schema, tree->array, tree, std::move(profile));
+  try {
+    queue.offer(slot);
+    FAIL("character admission must refuse before payload access");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == (valid ? sirius::transparent::late_failure_cause::resource
+                                : sirius::transparent::late_failure_cause::physical_input));
+    if (valid) CHECK(std::string(error.what()).find("arrow_batch_too_large") != std::string::npos);
+  }
+  CHECK(queue.observe().accepted == 0);
+}
+
 TEST_CASE("Qualified Arrow rejects actual placement drift before importing payload",
           "[arrow_qualified][arrow_profile]")
 {
