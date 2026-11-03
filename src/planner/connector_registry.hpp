@@ -25,6 +25,7 @@
 
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace duckdb {
 class DatabaseInstance;
@@ -116,6 +117,30 @@ connector const* lookup_connector(duckdb::BoundTableFunction const&,
 bool iceberg_flat_mapping_supported(duckdb::FunctionData const* bind_data);
 bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data);
 std::span<connector const> registered_connectors();
+
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+namespace testing {
+// Test builds only. Replaces the policy and hook fields of existing trusted registry entries for
+// one database instance while lookup keeps verifying the original entry's trusted references,
+// bind data, catalog registration and verify_binding. A matching override is authoritative: its
+// decline never falls through to the original entry. Install the scope before any binding,
+// policy or capture lookup and keep it alive until every prepared statement, callback and
+// execution that may observe it has drained. The database must outlive the scope.
+// One scope per database instance at a time.
+class scoped_connector_overrides {
+ public:
+  scoped_connector_overrides(duckdb::DatabaseInstance const& db, std::vector<connector> overrides);
+  ~scoped_connector_overrides();
+  scoped_connector_overrides(scoped_connector_overrides const&)            = delete;
+  scoped_connector_overrides& operator=(scoped_connector_overrides const&) = delete;
+
+ private:
+  duckdb::DatabaseInstance const* db_;
+};
+// A test that calls this probe fails to link if the guarded registry variant is missing.
+bool connector_overrides_linked();
+}  // namespace testing
+#endif
 
 // Register at Sirius load; bootstrap Iceberg trust during extension loading, never in lookup.
 void register_scan_source_callbacks(duckdb::DatabaseInstance&);
