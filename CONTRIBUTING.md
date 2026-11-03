@@ -75,7 +75,7 @@ advisory; configuration, generation, and compiler errors fail the task. Normal
 builds, commits, and lint CI do not run clang-tidy.
 
 Additional arguments go directly to LLVM's `run-clang-tidy`. Use source regexes
-to narrow analysis and `-j` to override the default of four workers:
+to narrow analysis and `-j` to override automatic CPU-count parallelism:
 
 ```bash
 pixi run --locked clang-tidy 'src/io/uri_parser[.]cpp$'

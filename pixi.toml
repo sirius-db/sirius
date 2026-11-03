@@ -93,7 +93,7 @@ cmake --build build/clang-tidy --target cargo-build_telemetry_bridge simpatico_e
 description = "Prepare generated headers and run advisory clang-tidy (optional source regexes and -j)."
 depends-on = ["_clang-tidy-prepare"]
 cmd = '''
-run-clang-tidy -p build/clang-tidy -j 4 -warnings-as-errors='-*' \
+run-clang-tidy -p build/clang-tidy -warnings-as-errors='-*' \
   -source-filter "$PIXI_PROJECT_ROOT/(src|test)/.*[.](c|cc|cpp|cxx)$" \
   -header-filter "$PIXI_PROJECT_ROOT/(src|include|test)/"
 '''
