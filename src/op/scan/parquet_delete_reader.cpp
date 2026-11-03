@@ -27,6 +27,7 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
+#include <vector>
 #include <unordered_set>
 
 namespace sirius::op::scan {
@@ -102,6 +103,7 @@ void scan_delete_row_groups(duckdb::ClientContext& context,
   auto workers = std::max<idx_t>(1, std::min(reader.NumRowGroups(), scheduler.NumberOfThreads()));
   std::mutex claim_mutex;
   delete_read_failure failure;
+  std::vector<parquet_delete_consumer> consumers;
   duckdb::unique_ptr<ScanReadAhead> read_ahead;
   if (reader.NumRowGroups() > 1) {
     bool disable_prefetch = false;
@@ -203,14 +205,15 @@ void scan_delete_row_groups(duckdb::ClientContext& context,
   };
   std::exception_ptr executor_error;
   if (workers == 1) {
-    run(make_consumer());
+    consumers.push_back(make_consumer());
+    run(consumers.back());
   } else {
     TaskExecutor executor(context);
     try {
       duckdb::vector<duckdb::unique_ptr<BaseExecutorTask>> tasks;
       for (idx_t i = 0; i < workers; ++i) {
-        tasks.push_back(
-          make_uniq<delete_scan_task>(executor, [&, consume = make_consumer()] { run(consume); }));
+        consumers.push_back(make_consumer());
+        tasks.push_back(make_uniq<delete_scan_task>(executor, [&, i] { run(consumers[i]); }));
       }
       executor.ScheduleTasks(std::move(tasks));
       executor.WorkOnTasks();
