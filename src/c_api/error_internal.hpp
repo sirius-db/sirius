@@ -30,8 +30,8 @@ sirius_status invoke(sirius_error** error,
   if (error) { *error = nullptr; }
   try {
     return operation();
-  } catch (const std::bad_alloc&) {
-    return SIRIUS_ALLOCATION_FAILURE;
+  } catch (const std::bad_alloc& e) {
+    return fail(SIRIUS_ALLOCATION_FAILURE, e.what(), error);
   } catch (const std::exception& e) {
     return fail(exception_status, e.what(), error);
   } catch (...) {

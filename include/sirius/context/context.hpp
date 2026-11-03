@@ -46,8 +46,10 @@ class Context {
    * @brief Create an initialized engine from a validated configuration.
    * @param config Requested engine settings; hardware limits are checked here.
    * @return An owned context, or an Error with code ErrorCode::context_initialization
-   *         or ErrorCode::allocation_failure. Allocation failures have an empty message.
-   * An unrecoverable failure during rollback can terminate the process, as in destruction.
+   *         or ErrorCode::allocation_failure.
+   *
+   * Allocation diagnostics are best-effort and may be empty. An unrecoverable failure
+   * during rollback can terminate the process, as in destruction.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
