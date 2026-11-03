@@ -50,7 +50,7 @@ uuid = "1"
 # tests buildable without a Sirius build tree or a GPU.
 default = ["sirius-engine"]
 # Bring up an embedded Sirius engine context for the backend.
-sirius-engine = ["dep:sirius"]
+sirius-engine = ["dep:sirius-ffi"]
 
 [dependencies]
 anyhow.workspace = true
@@ -69,7 +69,7 @@ ryu.workspace = true
 prost.workspace = true
 # Optional: links the local Sirius engine build tree (gated by the
 # `sirius-engine` feature). Path dependency on the sibling `rust/` workspace.
-sirius = { path = "../../rust/crates/sirius", optional = true }
+sirius-ffi = { path = "../../rust/crates/sirius-ffi", optional = true }
 thiserror.workspace = true
 thrift.workspace = true
 tokio.workspace = true
