@@ -44,10 +44,8 @@ jobs:
         run: pixi run --locked -e bindings cargo clippy --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings -- -D warnings
       - name: Install Miri
         uses: dtolnay/rust-toolchain@0c5191052c6bf2ba7dee1704a526ce23acd9a454 # miri
-        with:
-          toolchain: nightly-2026-11-01
       - name: Check public Rust ownership with Miri
-        run: cargo +nightly-2026-11-01 miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
+        run: cargo miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
 
   lint:
     runs-on: ubuntu-24.04

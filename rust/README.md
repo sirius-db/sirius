@@ -142,11 +142,11 @@ explicit exports in `c_api.rs`.
 
 ## Checking unsafe Rust with Miri
 
-Install the pinned interpreter once:
+Install or update the nightly interpreter:
 
 ```bash
-rustup toolchain install nightly-2026-11-01 --profile minimal --component miri --component rust-src
-cargo +nightly-2026-11-01 miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
+rustup toolchain install nightly --profile minimal --component miri --component rust-src
+cargo +nightly miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
 ```
 
 CI runs these tests for `sirius` and `sirius-sys` without a GPU or native library.
