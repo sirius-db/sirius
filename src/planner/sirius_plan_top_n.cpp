@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_top_n.hpp"
@@ -31,6 +32,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
     reject_nested_column_operation(*order.expression, "ORDER BY");
   }
 
+  if (op.dynamic_filter) op.dynamic_filter->Reset();
   auto plan = create_plan(*op.children[0]);
 
   auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(

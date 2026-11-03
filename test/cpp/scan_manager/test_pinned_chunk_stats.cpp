@@ -748,6 +748,13 @@ TEST_CASE("compute_pinned_chunk_stats - unsupported or degenerate columns yield 
   auto ms_col = make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_MILLISECONDS, {1'000, 5'000});
   REQUIRE_FALSE(capture_one(ms_col->view(), LogicalType::TIMESTAMP));
 
+  // Top-N supports these units, but shared conversion must not broaden this allowlist.
+  REQUIRE_FALSE(capture_one(ms_col->view(), LogicalType::TIMESTAMP_MS));
+  auto sec_col = make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_SECONDS, {1, 5});
+  REQUIRE_FALSE(capture_one(sec_col->view(), LogicalType::TIMESTAMP_S));
+  auto ns_col = make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_NANOSECONDS, {1'000, 5'000});
+  REQUIRE_FALSE(capture_one(ns_col->view(), LogicalType::TIMESTAMP_NS));
+
   // All-null and empty columns have no bounds to capture.
   auto all_null = make_gpu_col<int32_t>(cudf::type_id::INT32, {1, 2}, {false, false});
   REQUIRE_FALSE(capture_one(all_null->view(), LogicalType::INTEGER));
