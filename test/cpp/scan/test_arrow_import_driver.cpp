@@ -390,6 +390,76 @@ TEST_CASE("Arrow offered permit is shared across threads and all terminal transi
   if (mode > 1) CHECK(next.status() == arrow_push_queue::capacity_result::failed);
 }
 
+TEST_CASE("Qualified Arrow preserves independent cancellation before and during next",
+          "[arrow_driver][arrow_stop]")
+{
+  auto during           = GENERATE(false, true);
+  auto token_stopped    = GENERATE(false, true);
+  auto original_failure = GENERATE(false, true);
+  auto program          = qualified_integer_program();
+  int failures = 0, released = 0;
+  auto q = std::make_shared<arrow_push_queue>(program, 8192, [&](auto) { ++failures; });
+  queue_guard guard{q};
+  harness h(q, program);
+  auto slot = q->acquire_offered_slot();
+  fill_slot(slot, 3, [&] { ++released; });
+  REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  std::stop_source stop;
+  auto cancel = [&] {
+    if (original_failure) q->fail(std::make_exception_ptr(std::runtime_error("original failure")));
+    q->cancel();
+    if (token_stopped) stop.request_stop();
+  };
+  std::exception_ptr error;
+  if (during) {
+    sirius::test::preparation::hold allocating;
+    h.backing.seen->before_allocate = [&] { allocating.wait(); };
+    auto consuming                  = std::async(std::launch::async, [&] {
+      try {
+        (void)h.next(sm::preparation_stop_token{stop.get_token()});
+      } catch (...) {
+        return std::current_exception();
+      }
+      return std::exception_ptr{};
+    });
+    bool entered                    = allocating.await();
+    cancel();
+    allocating.release();
+    error = consuming.get();
+    REQUIRE(entered);
+  } else {
+    cancel();
+    sm::unit_key key{99, 0};
+    auto permit = h.ledger->try_acquire_unit(key, 0);
+    REQUIRE(permit);
+    try {
+      (void)q->next({key, h.ledger->allocator(permit), {}},
+                    sm::preparation_stop_token{stop.get_token()});
+    } catch (...) {
+      error = std::current_exception();
+    }
+    permit.release();
+    h.ledger->retire_unit(key);
+  }
+  REQUIRE(error);
+  if (original_failure) {
+    CHECK_THROWS_WITH(std::rethrow_exception(error), "original failure");
+  } else if (token_stopped) {
+    try {
+      std::rethrow_exception(error);
+    } catch (std::system_error const& e) {
+      CHECK(e.code() == std::errc::operation_canceled);
+    }
+  } else {
+    CHECK_THROWS_AS(std::rethrow_exception(error), duckdb::InterruptException);
+  }
+  CHECK(failures == (original_failure ? 1 : 0));
+  CHECK(released == 1);
+  CHECK(q->observe().accepted == 0);
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
 TEST_CASE("Arrow accepted roots release outside the queue lock on failure and cancellation",
           "[arrow_driver][arrow_admission][arrow_ownership]")
 {
@@ -2229,7 +2299,8 @@ TEST_CASE("Arrow retained budgets are reusable through end of stream",
 
 TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driver][arrow_stop]")
 {
-  auto push   = GENERATE(false, true);
+  auto kind   = GENERATE(0, 1, 2);  // pull, legacy push, qualified push
+  auto push   = kind != 0;
   auto reason = GENERATE(
     sm::stop_reason::normal_eos, sm::stop_reason::user_cancel, sm::stop_reason::failure_induced);
   auto read_fails = GENERATE(false, true);
@@ -2238,11 +2309,12 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   auto pull    = std::make_shared<pull_producer>();
   pull->rows   = {3, 3};
   pull->domain = sm::preparation_execution_domain::native_reader;
-  auto q       = queue(integer_program(), [&](auto) { ++failures; });
+  auto program = kind == 2 ? qualified_integer_program() : integer_program();
+  auto q       = queue(program, [&](auto) { ++failures; });
   std::shared_ptr<arrow_batch_producer> producer =
     push ? std::static_pointer_cast<arrow_batch_producer>(q)
          : std::static_pointer_cast<arrow_batch_producer>(pull);
-  harness h(producer);
+  harness h(producer, program);
   int allocations = 0;
   auto pause      = [&] {
     reading.wait();
@@ -2279,8 +2351,16 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   coordinator.add_source(std::move(source));
   if (push)
     submitting = std::async(std::launch::async, [&] {
-      auto owner = std::make_shared<integer_tree>();
-      if (q->offer(owner->offer(owner))) (void)q->offer(owner->offer(owner));
+      if (kind == 2) {
+        for (int i = 0; i < 2; ++i) {
+          auto slot = q->acquire_offered_slot();
+          fill_slot(slot);
+          REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+        }
+      } else {
+        auto owner = std::make_shared<integer_tree>();
+        if (q->offer(owner->offer(owner))) (void)q->offer(owner->offer(owner));
+      }
     });
   coordinator.arm();
   coordinator.start();

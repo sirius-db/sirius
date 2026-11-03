@@ -1,12 +1,17 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "catch.hpp"
 #include "op/scan/arrow/arrow_batch_producer.hpp"
+#include "op/scan/arrow/arrow_device_import.hpp"
 #include "utils/cuda_status_fault.hpp"
 
+#include <cudf/utilities/memory_resource.hpp>
+
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <atomic>
 #include <future>
+#include <optional>
 
 using namespace sirius::op::scan;
 namespace {
@@ -84,7 +89,94 @@ void produce(arrow_push_queue::offered_slot& slot,
   profile.strings.resize(1);
   slot.set_input(root->schema, root->array, root, std::move(profile));
 }
+
+struct validation_completion_fault {
+  static inline thread_local validation_completion_fault* active = nullptr;
+  bool refuse_sync                                               = true;
+  validation_completion_fault() { active = this; }
+  ~validation_completion_fault() { active = nullptr; }
+  static cudaError_t add(cudaStream_t, cudaStreamCallback_t, void*, unsigned)
+  {
+    return cudaErrorInvalidValue;
+  }
+  static cudaError_t synchronize(cudaStream_t stream)
+  {
+    return active->refuse_sync ? cudaErrorUnknown : cudaStreamSynchronize(stream);
+  }
+};
 }  // namespace
+
+TEST_CASE("Arrow device validation retains its readback destination through failed completion",
+          "[arrow_qualified][arrow_ownership][cuda_status_fault]")
+{
+  using fault       = sirius::test::scoped_cuda_status_fault;
+  auto zero_columns = GENERATE(false, true);
+  auto mode         = GENERATE(0, 1, 2, 3);  // success, failed wait, failed copy, malformed payload
+  rmm::cuda_stream stream;
+  auto mr       = cudf::get_current_device_resource_ref();
+  int32_t value = mode == 3 && zero_columns ? 0 : 1;
+  rmm::device_buffer data(&value, sizeof(value), stream, mr);
+  stream.synchronize();
+  auto counts = std::make_shared<root_counts>();
+  event_root tree(counts, stream.value());
+  auto program              = integer_program();
+  arrow_bound_schema schema = *program.arrow_schema;
+  arrow_source_profile profile;
+  profile.strings.resize(1);
+  tree.buffers[1] = data.data();
+  if (zero_columns) {
+    tree.array.n_children = 0;
+    tree.array.null_count = -1;
+    tree.root_buffers[0]  = data.data();
+    schema.columns.clear();
+  } else if (mode == 3) {
+    tree.column.null_count = 1;
+  }
+  unsigned released = 0;
+  auto observed     = std::shared_ptr<detail::arrow_device_validation_status>(
+    new detail::arrow_device_validation_status{99, 99}, [&](auto* state) {
+      ++released;
+      delete state;
+    });
+  std::weak_ptr<detail::arrow_device_validation_status> retained = observed;
+  validation_completion_fault completion;
+  sirius::exec::detail::completion_cuda_api api;
+  api.add_callback = validation_completion_fault::add;
+  api.synchronize  = validation_completion_fault::synchronize;
+  sirius::exec::retire_lane lane(stream.value(), api);
+  std::exception_ptr error;
+  {
+    auto submission = lane.begin();
+    std::optional<fault> injected;
+    if (mode == 1 || mode == 2)
+      injected.emplace(mode == 1 ? fault::synchronize_stream : fault::copy_device_to_host,
+                       cudaErrorUnknown,
+                       0,
+                       stream.value());
+    try {
+      auto output =
+        detail::import_arrow_device_columns(tree.array, schema, profile, observed, submission, mr);
+      CHECK(output->num_columns() == (zero_columns ? 0 : 1));
+    } catch (...) {
+      error = std::current_exception();
+    }
+    if (injected) CHECK(injected->consumed());
+  }
+  CHECK(bool(error) == (mode != 0));
+  if (mode != 2) {
+    CHECK(observed->invalid == (zero_columns && mode == 3 ? 1 : 0));
+    CHECK(observed->nulls == 0);
+  }
+  observed.reset();
+  CHECK_FALSE(retained.expired());
+  CHECK(released == 0);
+  CHECK(lane.quiesce() == cudaErrorUnknown);
+  CHECK_FALSE(retained.expired());
+  completion.refuse_sync = false;
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  CHECK(retained.expired());
+  CHECK(released == 1);
+}
 
 TEST_CASE("Arrow offered roots retain capacity after readiness synchronization fails",
           "[arrow_qualified][arrow_admission][cuda_status_fault]")
