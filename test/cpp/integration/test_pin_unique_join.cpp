@@ -551,3 +551,50 @@ TEST_CASE("a Hive partition column is not proven unique by a same-named file col
 
   con.Query("CALL unpin_table('pin_unique_join_hive_dim');");
 }
+
+TEST_CASE("a scan that does not return the files' own columns is not proven from the pin",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_raw_columns"};
+  auto const& tmp       = scratch.path();
+  auto const unique_dim = tmp / "unique_dim.parquet";
+  auto const dup_dim    = tmp / "dup_dim.parquet";
+  auto const fact       = tmp / "fact.parquet";
+  generate_parquet(unique_dim, dup_dim, fact);
+
+  auto const yaml_path = tmp / "pin_unique_join_raw_columns.yaml";
+  write_config(yaml_path);
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
+  pin(con, unique_dim, "pin_unique_join_raw_columns_dim");
+
+  auto const query = [&](std::string const& options) {
+    return "SELECT count(*), sum(f.v + d.payload) FROM read_parquet(" +
+           sirius::test::sql_literal(fact.string()) + ") f JOIN read_parquet(" +
+           sirius::test::sql_literal(unique_dim.string()) + options + ") d ON f.f_k = d.k";
+  };
+
+  SECTION("a plain scan returns the file's columns and is proven")
+  {
+    CHECK(join_proven_unique(con, query("")));
+  }
+
+  SECTION("union_by_name merges the files' schemas, so the pin's facts do not carry over")
+  {
+    CHECK_FALSE(join_proven_unique(con, query(", union_by_name = true")));
+  }
+
+  con.Query("CALL unpin_table('pin_unique_join_raw_columns_dim');");
+}

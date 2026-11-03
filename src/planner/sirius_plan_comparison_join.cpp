@@ -65,6 +65,22 @@
 
 namespace sirius::planner {
 
+/// Whether @p get is a plain parquet scan whose output columns are the files' own columns, read by
+/// name. A pin proves something about those columns, so a scan that maps, renames, merges or
+/// synthesizes columns (iceberg_scan resolves them by field id and fills in added columns and
+/// partition values; union_by_name and an explicit schema merge and remap the files') may return
+/// different values under the same name. An allowlist, so a scan this does not know is not proven.
+static bool returns_raw_parquet_columns(duckdb::LogicalGet const& get)
+{
+  auto const function_name = get.function.GetName().GetIdentifierName();
+  if (function_name != "read_parquet" && function_name != "parquet_scan") { return false; }
+  auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (multi_file == nullptr) { return false; }
+  auto const& options = multi_file->file_options;
+  return !options.union_by_name && options.schema.empty() && options.bound_schema.empty() &&
+         options.mapping == duckdb::MultiFileColumnMappingMode::BY_NAME;
+}
+
 /// Output position of a parquet scan's column that the pinned copy of the same files proved
 /// distinct at pin time (see late_mat::unique_probe: no nulls and no repeated value across the
 /// whole table), or an empty set. Only the scan's own files count, so a filter or projection above
@@ -72,7 +88,7 @@ namespace sirius::planner {
 static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
   duckdb::SiriusContext* sirius_context, duckdb::LogicalGet& get)
 {
-  if (sirius_context == nullptr) { return {}; }
+  if (sirius_context == nullptr || !returns_raw_parquet_columns(get)) { return {}; }
   auto const files = resolve_parquet_scan_file_paths(
     get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
   if (files.empty()) { return {}; }
