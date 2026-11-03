@@ -43,6 +43,7 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 namespace sirius {
@@ -96,9 +97,10 @@ sirius::exec::invocable<void()> gpu_pipeline_executor::get_per_thread_init()
     // thread to land on GPU 0 regardless of device_id.
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
-      SIRIUS_LOG_ERROR("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
-                       device_id,
-                       cudaGetErrorString(err));
+      throw std::runtime_error(
+        std::format("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+                    device_id,
+                    cudaGetErrorString(err)));
     }
     sirius::util::enable_log_on_default_stream();
   };

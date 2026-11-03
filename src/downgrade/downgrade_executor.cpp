@@ -29,8 +29,10 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <format>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -98,9 +100,10 @@ void downgrade_executor::start()
       // across contexts.
       cudaError_t err = cudaSetDevice(device_id);
       if (err != cudaSuccess) {
-        SIRIUS_LOG_ERROR("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
-                         device_id,
-                         cudaGetErrorString(err));
+        throw std::runtime_error(
+          std::format("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+                      device_id,
+                      cudaGetErrorString(err)));
       }
     };
   }
