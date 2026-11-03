@@ -23,6 +23,23 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
 
 jobs:
+  rust-api:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+        with:
+          pixi-version: v0.81.0
+          environments: bindings
+          locked: true
+          cache: false
+      - name: Check generated Rust declarations
+        run: pixi run --locked -e bindings check-bindings
+      - name: Install Miri
+        run: rustup toolchain install nightly-2026-11-01 --profile minimal --component miri --component rust-src
+      - name: Check public Rust ownership with Miri
+        run: pixi run --locked -e bindings miri
+
   lint:
     runs-on: ubuntu-24.04
     env:
@@ -219,13 +236,9 @@ jobs:
             [[ -z "$explicit" ]]
           fi
 
-      # Rust bindings (sirius-ffi) — fmt/clippy + build/link the test.
-      # Run on a single representative entry. `cargo test --no-run` compiles the
-      # cxx glue against the Sirius FFI header and links the proof-of-life test
-      # against the single Sirius library built above (build.rs discovers it under
-      # build/release). It is NOT run here: constructing a context does GPU
-      # bring-up, and these are CPU runners — the actual run belongs on a GPU
-      # runner (test workflow).
+      # Compile all Rust bindings against the library on one representative entry.
+      # The public configuration tests do not initialize GPUs, but sirius-ffi
+      # tests do. The full suite runs in the GPU test workflow.
       - name: Rust bindings checks
         if: >-
           matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
@@ -233,9 +246,10 @@ jobs:
           && matrix.build.cudf-channel == 'stable'
         run: |
           set -euo pipefail
-          pixi run --locked cargo fmt --manifest-path rust/Cargo.toml --package sirius-ffi --check
-          pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius-ffi --all-targets -- -D warnings
-          pixi run --locked cargo test --locked --no-run --manifest-path rust/Cargo.toml --package sirius-ffi
+          pixi run --locked cargo fmt --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi --check
+          pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi --all-targets -- -D warnings
+          RUSTFLAGS="--cfg miri" pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --test miri -- -D warnings
+          pixi run --locked cargo test --locked --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi
 
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'
@@ -301,12 +315,12 @@ jobs:
 
   check:
     runs-on: ubuntu-slim
-    needs: [lint, build]
+    needs: [lint, build, rust-api]
     if: always()
     steps:
       - name: All checks ok
-        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' }}
+        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust-api.result == 'success' }}
         run: exit 0
       - name: Some checks failed
-        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success') }}
+        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust-api.result == 'success') }}
         run: exit 1

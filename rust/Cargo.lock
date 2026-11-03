@@ -3003,6 +3003,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "sirius"
+version = "0.1.0"
+dependencies = [
+ "sirius-sys",
+ "tempfile",
+]
+
+[[package]]
 name = "sirius-ffi"
 version = "0.1.0"
 dependencies = [
@@ -3012,9 +3020,14 @@ dependencies = [
  "cxx-build",
  "parquet",
  "prost",
+ "sirius-sys",
  "substrait",
  "tempfile",
 ]
+
+[[package]]
+name = "sirius-sys"
+version = "0.1.0"
 
 [[package]]
 name = "sirius-telemetry-analyzer"

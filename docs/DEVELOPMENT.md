@@ -8,15 +8,14 @@ and [Pixi](https://pixi.prefix.dev/) to manage build dependencies.
 ## Public API documentation
 
 Build the C reference for `include/sirius-c/`, the C++ reference for `include/sirius/`,
-and the Rust `sirius-ffi` crate reference:
+and the Rust `sirius` and `sirius-sys` crate references:
 
 ```bash
 pixi run -e docs docs
 ```
 
 Open `build/docs/site/index.html` in your browser. The site has a landing page at
-`/`, the C reference at `/c/`, the C++ reference at `/cpp/`, and the Rust reference at `/rust/` (which opens
-`/rust/sirius_ffi/`). These paths are relative to the GitHub Pages project URL.
+`/`, the C reference at `/c/`, the C++ reference at `/cpp/`, and the Rust references at `/rust/`. These paths are relative to the GitHub Pages project URL.
 
 Build individual references with `pixi run -e docs docs-c`,
 `pixi run -e docs docs-cpp`, or
@@ -24,7 +23,7 @@ Build individual references with `pixi run -e docs docs-c`,
 
 The isolated `docs` environment supports Linux x86_64 and aarch64, plus macOS on
 Apple Silicon (`osx-arm64`). It needs no GPU, engine build, or initialized
-submodules. It includes Rust and a C++ compiler for Rust dependencies. The Rust
+submodules. The public Rust references require no C++ compilation. The Rust
 task sets `DOCS_RS=1` to skip Sirius's native build and link steps, and treats
 Rustdoc warnings as errors. All builds run directly through Pixi tasks, with no
 Python or helper script.
