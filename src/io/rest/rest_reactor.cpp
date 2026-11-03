@@ -21,12 +21,15 @@
 #include "io/details/slot_pool.hpp"
 #include "io/io_errors.hpp"
 #include "io/rest/curl_handle.hpp"
+#include "io/rest/redirect_policy.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
@@ -68,6 +71,16 @@ size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
   auto* sink         = static_cast<buf_sink*>(userdata);
   size_t const bytes = size * nmemb;
   sink->total_received += bytes;
+  // A redirect's error body is not object data: count it, but keep it out of
+  // the destination buffers.  libcurl's own response code for this transfer
+  // decides — by the time body bytes arrive it is the final response's.
+  if (sink->easy != nullptr) {
+    long code = 0;
+    if (curl_easy_getinfo(sink->easy, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK &&
+        code / 100 == 3) {
+      return bytes;
+    }
+  }
   size_t remaining = bytes;
   auto const* src  = reinterpret_cast<uint8_t const*>(ptr);
   // Scatter across the destination buffers in file order; a fused contiguous
@@ -149,29 +162,90 @@ bool is_http_status_line(std::string_view line) noexcept
          ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/';
 }
 
-/// Header callback: capture Content-Range, Retry-After and ETag of the response
-/// block currently being received; a new status line starts a new block.
+/// The status code of an HTTP status line, decoded the way libcurl decodes it
+/// (lib/http.c, 8.22): "HTTP/" + version, exactly one blank (SP or HTAB), then
+/// exactly three digits — nothing is required after them; the version is not
+/// interpreted (HTTP/2 and HTTP/3 responses arrive as synthesized "HTTP/2 307"
+/// lines).  Returns 0 for any other spelling.  Grammar alone does not say
+/// whether a line IS a status line — see @c next_header_line for that.
+long status_line_code(std::string_view line) noexcept
+{
+  if (!is_http_status_line(line)) { return 0; }
+  size_t i = 5;
+  while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
+    ++i;
+  }
+  if (i == 5 || i + 4 > line.size()) { return 0; }
+  ++i;  // the single blank
+  for (size_t k = i; k < i + 3; ++k) {
+    if (line[k] < '0' || line[k] > '9') { return 0; }
+  }
+  return (line[i] - '0') * 100L + (line[i + 1] - '0') * 10L + (line[i + 2] - '0');
+}
+
+/// Header-callback framing, following libcurl's delivery (lib/http.c, 8.22):
+/// lines arrive one per callback; a status line is only ever the first line of
+/// a response block; a line whose FIRST byte is CR or LF ends the block (curl
+/// accepts and forwards non-canonical terminators such as "\r\r\n" too).  What
+/// follows the terminator depends on the block just ended: after an interim
+/// 1xx another response block starts; after the final response only trailers
+/// can follow, and a trailer never starts a response however its text looks
+/// (curl accepts field names such as "HTTP/1.1 206").  Proxy CONNECT blocks
+/// never reach these callbacks (CURLOPT_SUPPRESS_CONNECT_HEADERS).  So a field
+/// whose name begins with "HTTP/" is never taken for a status line.
+enum class header_line { status, field, terminator, trailer };
+
+header_line next_header_line(std::string_view line, header_phase& phase, long block_status) noexcept
+{
+  if (phase == header_phase::response_start) {
+    phase = header_phase::response_fields;
+    if (is_http_status_line(line)) { return header_line::status; }
+  }
+  if (phase == header_phase::trailers) { return header_line::trailer; }
+  if (!line.empty() && (line.front() == '\r' || line.front() == '\n')) {
+    phase = block_status / 100 == 1 ? header_phase::response_start : header_phase::trailers;
+    return header_line::terminator;
+  }
+  return header_line::field;
+}
+
+/// Header callback: capture the status code, Content-Range, Retry-After, ETag
+/// and Location of the response block currently being received; a new block
+/// starts a fresh capture; trailers are ignored.
 size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
 {
   auto* hc           = static_cast<header_capture*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view line(buffer, bytes);
-  if (is_http_status_line(line)) { hc->reset(); }
+  switch (next_header_line(line, hc->phase, hc->status)) {
+    case header_line::status:
+      hc->reset();
+      hc->phase  = header_phase::response_fields;
+      hc->status = status_line_code(line);
+      return bytes;
+    case header_line::terminator:
+    case header_line::trailer: return bytes;
+    case header_line::field: break;
+  }
   if (auto v = match_header(line, "content-range"); !v.empty()) {
     hc->content_range = std::move(v);
   }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
   if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
+  if (auto v = match_header(line, "location"); !v.empty()) { hc->location = std::move(v); }
   return bytes;
 }
 
-/// Per-attempt capture for the blocking HEAD: Retry-After for backoff plus the
-/// object's ETag.  Kept apart from @c header_capture, whose Content-Range the
-/// HEAD never receives.  The ETag resets on every status line, so interim
-/// responses (proxy CONNECT) within one transfer leave no residue.
+/// Per-attempt capture for the blocking HEAD: Retry-After for backoff, the
+/// object's ETag, and the Location of a redirect.  Kept apart from
+/// @c header_capture, whose Content-Range the HEAD never receives; framed the
+/// same way.
 struct head_capture {
+  header_phase phase{header_phase::response_start};
+  long status{0};
   std::string retry_after;
   std::string etag;
+  std::string location;
 };
 
 size_t head_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
@@ -179,73 +253,258 @@ size_t head_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   auto* hc           = static_cast<head_capture*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view const line(buffer, bytes);
-  if (is_http_status_line(line)) {
-    hc->etag.clear();
-    hc->retry_after.clear();
+  switch (next_header_line(line, hc->phase, hc->status)) {
+    case header_line::status:
+      hc->status = status_line_code(line);
+      hc->etag.clear();
+      hc->retry_after.clear();
+      hc->location.clear();
+      return bytes;
+    case header_line::terminator:
+    case header_line::trailer: return bytes;
+    case header_line::field: break;
   }
   if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
+  if (auto v = match_header(line, "location"); !v.empty()) { hc->location = std::move(v); }
   return bytes;
 }
 
 /// Shared sink for a suffix-range footer probe: the header callback records the
-/// HTTP status (from the status line) plus Content-Range / Retry-After / ETag;
-/// the body callback consults @c status to abort a non-206 response before it
-/// streams a whole object into us.  @c HEADERDATA and @c WRITEDATA point at the
-/// same one.
+/// block's status (framing) plus Content-Range / Retry-After / ETag / Location;
+/// the body callback consults libcurl's response code (via @c easy) to abort a
+/// non-206 response before it streams a whole object into us.  @c HEADERDATA
+/// and @c WRITEDATA point at the same one.
 struct suffix_sink {
   std::vector<std::uint8_t> data;
   std::size_t cap{0};
   std::size_t total_received{0};  // wire bytes, incl. those dropped by cap/abort
+  CURL* easy{nullptr};
+  header_phase phase{header_phase::response_start};
   long status{0};
   std::string content_range;
   std::string retry_after;
   std::string etag;
+  std::string location;
 };
 
-/// Header callback for a suffix probe: parse the status code out of the status
-/// line so the body callback can abort a non-206 early, and capture the headers
-/// the caller needs (Content-Range to verify the 206, Retry-After for backoff,
-/// ETag for the probe result).
+/// Header callback for a suffix probe: capture the headers the caller needs
+/// (Content-Range to verify the 206, Retry-After for backoff, ETag for the
+/// probe result, Location for a redirect); a new response block starts a fresh
+/// capture, trailers are ignored.
 size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
 {
   auto* s            = static_cast<suffix_sink*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view const line(buffer, bytes);
-  if (is_http_status_line(line)) {
-    s->etag.clear();
-    s->content_range.clear();
-    s->retry_after.clear();
-    if (auto const sp = line.find(' '); sp != std::string_view::npos) {
-      long code = 0;
-      for (size_t i = sp + 1; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
-        code = code * 10 + (line[i] - '0');
-      }
-      if (code != 0) { s->status = code; }
-    }
+  switch (next_header_line(line, s->phase, s->status)) {
+    case header_line::status:
+      s->status = status_line_code(line);
+      s->etag.clear();
+      s->content_range.clear();
+      s->retry_after.clear();
+      s->location.clear();
+      return bytes;
+    case header_line::terminator:
+    case header_line::trailer: return bytes;
+    case header_line::field: break;
   }
   if (auto v = match_header(line, "content-range"); !v.empty()) { s->content_range = std::move(v); }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { s->retry_after = std::move(v); }
   if (auto v = match_header(line, "etag"); !v.empty()) { s->etag = std::move(v); }
+  if (auto v = match_header(line, "location"); !v.empty()) { s->location = std::move(v); }
   return bytes;
 }
 
 /// Body callback for a suffix probe: abort a non-206 response (a deliberate
 /// short write, surfacing as CURLE_WRITE_ERROR) so a server that ignores the
 /// Range or answers 416/4xx never streams a whole object into us; otherwise
-/// append up to @c cap bytes and report the full incoming size to curl.
+/// append up to @c cap bytes and report the full incoming size to curl.  The
+/// status is libcurl's own for the transfer.
 size_t suffix_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
   auto* s            = static_cast<suffix_sink*>(userdata);
   size_t const bytes = size * nmemb;
   s->total_received += bytes;
-  if (s->status != 206) { return 0; }
+  long code = 0;
+  if (s->easy == nullptr || curl_easy_getinfo(s->easy, CURLINFO_RESPONSE_CODE, &code) != CURLE_OK ||
+      code != 206) {
+    return 0;
+  }
   if (s->data.size() < s->cap) {
     size_t const take = std::min(s->cap - s->data.size(), bytes);
     auto const* src   = reinterpret_cast<std::uint8_t const*>(ptr);
     s->data.insert(s->data.end(), src, src + take);
   }
   return bytes;
+}
+
+// ---- cluster-redirect policy -----------------------------------------------
+
+using redirect_admission::detail::split_authority;
+
+bool is_alnum_ascii(unsigned char c) noexcept
+{
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+bool is_valid_port(std::string_view port) noexcept
+{
+  if (port.empty() || port.size() > 5) { return false; }
+  unsigned value = 0;
+  for (unsigned char const c : port) {
+    if (c < '0' || c > '9') { return false; }
+    value = value * 10 + (c - '0');
+  }
+  return value >= 1 && value <= 65535;
+}
+
+/// A DNS-style host: dot-separated non-empty labels of alnum / '-' / '_'.
+bool is_valid_hostname(std::string_view host) noexcept
+{
+  if (host.empty() || host.front() == '.' || host.back() == '.') { return false; }
+  std::size_t label = 0;
+  for (unsigned char const c : host) {
+    if (c == '.') {
+      if (label == 0) { return false; }
+      label = 0;
+      continue;
+    }
+    if (!is_alnum_ascii(c) && c != '-' && c != '_') { return false; }
+    ++label;
+  }
+  return label > 0;
+}
+
+/// The inside of a bracketed IP literal must parse as an IPv6 address
+/// (inet_pton: group widths and count, one `::`, valid embedded IPv4 octets);
+/// zone identifiers are not supported.
+bool is_valid_ipv6_literal(std::string_view addr) noexcept
+{
+  // An embedded NUL would let inet_pton validate a prefix while the caller
+  // keeps the whole view; a zone id's acceptance is libc-dependent.
+  if (addr.empty() || addr.size() >= INET6_ADDRSTRLEN ||
+      addr.find('\0') != std::string_view::npos || addr.find('%') != std::string_view::npos) {
+    return false;
+  }
+  char buffer[INET6_ADDRSTRLEN];
+  std::memcpy(buffer, addr.data(), addr.size());
+  buffer[addr.size()] = '\0';
+  in6_addr parsed{};
+  return ::inet_pton(AF_INET6, buffer, &parsed) == 1;
+}
+
+/// Logging-only validated host/port; invalid input yields "-", with userinfo omitted.
+std::string_view log_authority(std::string_view url) noexcept
+{
+  auto const parsed = split_authority(url);
+  if (!parsed) { return "-"; }
+  std::string_view authority = parsed->authority;
+  if (auto const at = authority.rfind('@'); at != std::string_view::npos) {
+    authority.remove_prefix(at + 1);
+  }
+  std::string_view port;
+  bool has_port = false;
+  if (!authority.empty() && authority.front() == '[') {
+    auto const close = authority.find(']');
+    if (close == std::string_view::npos || !is_valid_ipv6_literal(authority.substr(1, close - 1))) {
+      return "-";
+    }
+    std::string_view const rest = authority.substr(close + 1);
+    if (!rest.empty()) {
+      if (rest.front() != ':') { return "-"; }
+      has_port = true;
+      port     = rest.substr(1);
+    }
+  } else {
+    auto const colon = authority.find(':');
+    if (!is_valid_hostname(authority.substr(0, colon))) { return "-"; }
+    if (colon != std::string_view::npos) {
+      has_port = true;
+      port     = authority.substr(colon + 1);
+    }
+  }
+  if (has_port && !is_valid_port(port)) { return "-"; }
+  return authority;
+}
+
+using redirect_retention_policy::connection_retention;
+using redirect_retention_policy::retention_name;
+
+using redirect_routes::k_max_route_bytes;
+using redirect_routes::route_reuse_enabled;
+
+char const* route_kind(rest_io_op_request const& request) noexcept
+{
+  if (request.route_cached) { return "cached"; }
+  return request.delegated_url.empty() ? "origin" : "fresh";
+}
+
+/// Successful new connections reported for the current completed transfer.
+/// A response-bearing failure can have a known count; no-response errors and
+/// unavailable counters are unknown rather than evidence of reuse.
+std::string transfer_connects(CURL* handle, CURLcode rc, long status)
+{
+  if (handle == nullptr || (rc != CURLE_OK && status == 0)) { return "-"; }
+  long connects = 0;
+  if (curl_easy_getinfo(handle, CURLINFO_NUM_CONNECTS, &connects) != CURLE_OK || connects < 0) {
+    return "-";
+  }
+  return std::to_string(connects);
+}
+
+/// Terminal transfer observation; structural Range is request-generated, not a response header.
+void log_transfer(std::string_view method,
+                  std::string_view url,
+                  std::string_view range,
+                  std::string_view outcome,
+                  long status,
+                  std::size_t bytes,
+                  std::size_t attempt,
+                  bool delegated,
+                  std::chrono::steady_clock::time_point started,
+                  std::string_view route,
+                  std::string_view connects)
+{
+  auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
+  redirect_records::transfer_record const record{method,
+                                                 log_authority(url),
+                                                 range.empty() ? std::string_view{"-"} : range,
+                                                 status,
+                                                 outcome,
+                                                 bytes,
+                                                 attempt,
+                                                 delegated,
+                                                 elapsed_ms,
+                                                 route,
+                                                 connects};
+  SIRIUS_LOG_INFO(redirect_records::transfer_record::format,
+                  record.method,
+                  record.authority,
+                  record.range,
+                  record.status,
+                  record.outcome,
+                  record.bytes,
+                  record.attempt,
+                  record.delegated,
+                  record.elapsed_ms,
+                  record.route,
+                  record.connects);
+}
+
+char const* curl_outcome(CURLcode rc) noexcept
+{
+  return rc == CURLE_OK ? "ok" : curl_easy_strerror(rc);
+}
+
+/// The value part of a "Range: bytes=…" header line built by range_header /
+/// suffix_range_header, for the transfer record.
+std::string_view range_value(std::string_view header_line) noexcept
+{
+  auto const sep = header_line.find(": ");
+  return sep == std::string_view::npos ? header_line : header_line.substr(sep + 2);
 }
 
 // ---- retry classification --------------------------------------------------
@@ -588,6 +847,12 @@ rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_vie
     throw std::invalid_argument("rest_reactor: max_connections must be > 0");
   }
   if (_config.max_retry_attempts == 0) { _config.max_retry_attempts = 1; }
+  if (_config.request_log && _config.cluster_redirect.enabled) {
+    SIRIUS_LOG_INFO("rest_reactor: redirect retention mode={} maxconnects={} host_connections={}",
+                    retention_name(_config),
+                    connection_retention(_config),
+                    _config.max_connections);
+  }
 
   // Touch the process-wide curl context so global init + the shared cache are
   // ready before any handle is created — including the blocking HEAD that
@@ -717,31 +982,116 @@ void rest_reactor::warmup(std::string bucket)
   interrupt();
 }
 
+bool rest_reactor::delegate_redirect(object_ref const& obj,
+                                     std::string_view request_url,
+                                     bool already_delegated,
+                                     long status,
+                                     std::string_view location,
+                                     std::string& reason_out)
+{
+  auto decision = redirect_admission::evaluate_cluster_redirect(
+    _config, request_url, already_delegated, status, location);
+  if (decision.follow) {
+    _redirects_followed.fetch_add(1, std::memory_order_relaxed);
+    // The Location may carry the gateway's own authorization in its path or
+    // query; only the (allow-listed) authority is fit for a log line.
+    auto const target    = split_authority(location);
+    auto const authority = target ? target->authority : std::string_view{};
+    SIRIUS_LOG_DEBUG(
+      "rest_reactor: delegating {}/{} to storage node {}", obj.bucket, obj.key, authority);
+    if (_config.request_log) {
+      SIRIUS_LOG_INFO("rest_reactor: redirect decision=follow reason=- authority={}",
+                      log_authority(location));
+    }
+    return true;
+  }
+  _redirects_refused.fetch_add(1, std::memory_order_relaxed);
+  SIRIUS_LOG_WARN(
+    "rest_reactor: refusing HTTP {} for {}/{}: {}", status, obj.bucket, obj.key, decision.reason);
+  if (_config.request_log) {
+    SIRIUS_LOG_INFO("rest_reactor: redirect decision=refuse reason=\"{}\" authority=-",
+                    decision.reason);
+  }
+  reason_out = std::move(decision.reason);
+  return false;
+}
+
+bool rest_reactor::cached_route_refused(CURLcode rc, long status) noexcept
+{
+  if (rc == CURLE_OUT_OF_MEMORY || rc == CURLE_ABORTED_BY_CALLBACK) { return false; }
+  if (rc == CURLE_OK || status != 0) {
+    return status == 307 || status == 401 || status == 403 || status == 404 || status == 503;
+  }
+  return rc == CURLE_COULDNT_CONNECT || rc == CURLE_COULDNT_RESOLVE_HOST;
+}
+
+bool rest_reactor::seed_route(io_object const& obj, std::string_view route) noexcept
+{
+  if (!route_reuse_enabled(_config) || route.empty() || route.size() > k_max_route_bytes ||
+      conditional_tag(&obj).empty()) {
+    return false;
+  }
+  auto const* rest_obj = dynamic_cast<rest_io_object const*>(&obj);
+  if (rest_obj == nullptr) { return false; }
+  if (!rest_obj->try_seed_route(route, std::weak_ptr<const void>(_ctx))) { return false; }
+  _route_seeds.fetch_add(1, std::memory_order_relaxed);
+  log::log_noexcept(
+    [&] { SIRIUS_LOG_DEBUG("rest_reactor: stored storage-node route for {}", obj.object_path()); });
+  return true;
+}
+
 head_object_result rest_reactor::head_object(std::string_view bucket, std::string_view key)
 {
   object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
-  for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
+  // Origin attempts authorize; delegated attempts retain their admitted URL
+  // (config::cluster_redirect).
+  std::string delegated_url;
+  std::size_t attempt = 0;
+  while (attempt < _config.max_retry_attempts) {
     head_capture hc;
-    auto const authd =
-      _ctx->authorizer()->authorize(obj, request_method::HEAD, presign_ttl(_config));
+    std::string url;
+    std::vector<std::pair<std::string, std::string>> auth_headers;
+    if (delegated_url.empty()) {
+      auto authd   = _ctx->authorizer()->authorize(obj, request_method::HEAD, presign_ttl(_config));
+      url          = std::move(authd.url);
+      auth_headers = std::move(authd.headers);
+    } else {
+      url = delegated_url;
+    }
 
     curl_easy_ptr h{curl_easy_init()};
     if (!h) { throw std::runtime_error("rest_reactor::head_object: curl_easy_init failed"); }
     configure_easy_handle(h.get(), global_curl_context::instance().share_handle());
     apply_request_opts(h.get(), _config);
 
-    curl_slist_ptr hdrs = build_header_list(authd.headers, nullptr);
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
+    curl_slist_ptr hdrs = build_header_list(auth_headers, nullptr);
+    SIRIUS_CURL_CHECK(
+      curl_easy_setopt(h.get(), CURLOPT_PATH_AS_IS, delegated_url.empty() ? 0L : 1L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, url.c_str()));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_NOBODY, 1L));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_discard));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &head_header_cb));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
 
-    CURLcode const rc = curl_easy_perform(h.get());
-    long status       = 0;
+    auto const started = std::chrono::steady_clock::now();
+    CURLcode const rc  = curl_easy_perform(h.get());
+    long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+    if (_config.request_log) {
+      log_transfer("HEAD",
+                   url,
+                   {},
+                   curl_outcome(rc),
+                   status,
+                   0,
+                   attempt,
+                   !delegated_url.empty(),
+                   started,
+                   delegated_url.empty() ? "origin" : "fresh",
+                   transfer_connects(h.get(), rc, status));
+    }
 
     if (rc == CURLE_OK && status == 200) {
       curl_off_t cl = -1;
@@ -751,6 +1101,23 @@ head_object_result rest_reactor::head_object(std::string_view bucket, std::strin
                                  obj.bucket + "/" + obj.key);
       }
       return head_object_result{static_cast<size_t>(cl), std::move(hc.etag)};
+    }
+
+    // Final redirect/refusal outcomes precede transport retry; informational
+    // responses (1xx, left in the status when the transfer failed before the
+    // final response) do not.
+    if (status == 307) {
+      std::string reason;
+      if (delegate_redirect(obj, url, !delegated_url.empty(), status, hc.location, reason)) {
+        delegated_url = std::move(hc.location);
+        continue;
+      }
+      throw std::runtime_error("rest_reactor::head_object: HTTP 307 (" + reason + ") for " +
+                               obj.bucket + "/" + obj.key);
+    }
+    if (status >= 200 && status != 200 && !is_retriable_status(status)) {
+      throw std::runtime_error("rest_reactor::head_object: HTTP " + std::to_string(status) +
+                               " for " + obj.bucket + "/" + obj.key);
     }
 
     last_error =
@@ -770,6 +1137,7 @@ head_object_result rest_reactor::head_object(std::string_view bucket, std::strin
                       _config.max_retry_attempts);
       std::this_thread::sleep_for(compute_backoff(attempt, hc.retry_after, _config));
     }
+    ++attempt;
   }
   throw std::runtime_error("rest_reactor::head_object: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
@@ -807,9 +1175,23 @@ std::string rest_reactor::list_page(std::string_view bucket,
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &capture_header));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
 
-    CURLcode const rc = curl_easy_perform(h.get());
-    long status       = 0;
+    auto const started = std::chrono::steady_clock::now();
+    CURLcode const rc  = curl_easy_perform(h.get());
+    long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+    if (_config.request_log) {
+      log_transfer("LIST",
+                   authd.url,
+                   {},
+                   curl_outcome(rc),
+                   status,
+                   body.size(),
+                   attempt,
+                   false,
+                   started,
+                   "origin",
+                   transfer_connects(h.get(), rc, status));
+    }
 
     if (rc == CURLE_OK && status == 200) { return body; }
 
@@ -846,35 +1228,76 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
 
   object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
-  for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
+  std::string delegated_url;  // see head_object
+  std::size_t attempt = 0;
+  while (attempt < _config.max_retry_attempts) {
     suffix_sink sink;
     sink.cap = n;
-    auto const authd =
-      _ctx->authorizer()->authorize(obj, request_method::GET, presign_ttl(_config));
+    std::string url;
+    std::vector<std::pair<std::string, std::string>> auth_headers;
+    if (delegated_url.empty()) {
+      auto authd   = _ctx->authorizer()->authorize(obj, request_method::GET, presign_ttl(_config));
+      url          = std::move(authd.url);
+      auth_headers = std::move(authd.headers);
+    } else {
+      url = delegated_url;
+    }
 
     curl_easy_ptr h{curl_easy_init()};
     if (!h) {
       throw std::runtime_error("rest_reactor::fetch_footer_suffix: curl_easy_init failed");
     }
+    sink.easy = h.get();
     configure_easy_handle(h.get(), global_curl_context::instance().share_handle());
     apply_request_opts(h.get(), _config);
 
     std::string const range = suffix_range_header(n);
-    curl_slist_ptr hdrs     = build_header_list(authd.headers, &range);
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
+    curl_slist_ptr hdrs     = build_header_list(auth_headers, &range);
+    SIRIUS_CURL_CHECK(
+      curl_easy_setopt(h.get(), CURLOPT_PATH_AS_IS, delegated_url.empty() ? 0L : 1L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, url.c_str()));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &suffix_write_cb));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEDATA, &sink));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &suffix_header_cb));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &sink));
 
-    CURLcode const rc = curl_easy_perform(h.get());
-    long status       = 0;
+    auto const started = std::chrono::steady_clock::now();
+    CURLcode const rc  = curl_easy_perform(h.get());
+    long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+    if (_config.request_log) {
+      log_transfer("GET",
+                   url,
+                   range_value(range),
+                   curl_outcome(rc),
+                   status,
+                   sink.total_received,
+                   attempt,
+                   !delegated_url.empty(),
+                   started,
+                   delegated_url.empty() ? "origin" : "fresh",
+                   transfer_connects(h.get(), rc, status));
+    }
 
-    // suffix_write_cb aborts any non-206 body, so a CURLE_WRITE_ERROR here is our
-    // own doing and the HTTP status is still valid; only a different curl error
-    // (no HTTP status) is a genuine transport failure.
+    // Final outcomes first, as in head_object.  suffix_write_cb aborts any
+    // non-206 body, so a CURLE_WRITE_ERROR is our own doing; any other curl
+    // error without a final response is a genuine transport failure.
+    if (status == 307) {
+      std::string reason;
+      if (delegate_redirect(obj, url, !delegated_url.empty(), status, sink.location, reason)) {
+        delegated_url = std::move(sink.location);
+        continue;
+      }
+      throw std::runtime_error("rest_reactor::fetch_footer_suffix: HTTP 307 (" + reason + ") for " +
+                               obj.bucket + "/" + obj.key);
+    }
+    if (status >= 200 && status != 206 && status != 200 && status != 416 &&
+        !is_retriable_status(status)) {
+      // 404 / 403 / 401 / ... — an error a HEAD would not recover from either.
+      throw std::runtime_error("rest_reactor::fetch_footer_suffix: HTTP " + std::to_string(status) +
+                               " for " + obj.bucket + "/" + obj.key);
+    }
     if (rc != CURLE_OK && rc != CURLE_WRITE_ERROR) {
       last_error = std::string(curl_easy_strerror(rc));
       if (!is_retriable_curl(rc)) {
@@ -892,6 +1315,10 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
         probe.window_lo   = *start;
         probe.bytes       = make_shared_byte_span(std::move(sink.data));
         probe.etag        = std::move(sink.etag);
+        if (route_reuse_enabled(_config) && delegated_url.size() <= k_max_route_bytes &&
+            rest_io_object::is_strong_tag(probe.etag)) {
+          probe.delegated_route = std::move(delegated_url);
+        }
       }
       return probe;
     } else if (status == 200 || status == 416) {
@@ -901,9 +1328,11 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     } else if (is_retriable_status(status)) {
       last_error = "HTTP " + std::to_string(status);
     } else {
-      // 404 / 403 / 401 / ... — an error a HEAD would not recover from either.
-      throw std::runtime_error("rest_reactor::fetch_footer_suffix: HTTP " + std::to_string(status) +
-                               " for " + obj.bucket + "/" + obj.key);
+      // A completed transfer without a final response (status 0 or 1xx): not a
+      // server verdict to retry on, and nothing the body abort could explain.
+      throw std::runtime_error("rest_reactor::fetch_footer_suffix: no final response (HTTP " +
+                               std::to_string(status) + ", " + curl_easy_strerror(rc) + ") for " +
+                               obj.bucket + "/" + obj.key);
     }
     if (attempt + 1 < _config.max_retry_attempts) {
       SIRIUS_LOG_WARN("rest_reactor::fetch_footer_suffix: retrying {}/{} after {} (attempt {}/{})",
@@ -914,6 +1343,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
                       _config.max_retry_attempts);
       std::this_thread::sleep_for(compute_backoff(attempt, sink.retry_after, _config));
     }
+    ++attempt;
   }
   throw std::runtime_error("rest_reactor::fetch_footer_suffix: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
@@ -997,6 +1427,9 @@ struct io_slot {
   curl_slist_ptr headers;
   buf_sink sink;
   header_capture hc;
+  std::chrono::steady_clock::time_point started{};
+  // Owner lifetime spans preparation and completion; only an in-flight attempt is drain-eligible.
+  bool attempt_active{false};
 
   void reset() noexcept
   {
@@ -1005,7 +1438,9 @@ struct io_slot {
     headers.reset();
     sink = buf_sink{};
     hc.reset();
-    token = {};
+    token          = {};
+    started        = {};
+    attempt_active = false;
   }
 };
 
@@ -1082,7 +1517,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     SIRIUS_CURLM_CHECK(curl_multi_setopt(
       multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(_config.max_connections)));
     SIRIUS_CURLM_CHECK(curl_multi_setopt(
-      multi.get(), CURLMOPT_MAXCONNECTS, static_cast<long>(_config.max_connections)));
+      multi.get(), CURLMOPT_MAXCONNECTS, static_cast<long>(connection_retention(_config))));
 
     auto epoll_add = [&](int fd, std::uint32_t events) {
       epoll_event event{};
@@ -1250,7 +1685,11 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       try {
         auto& attempt    = is_auth ? req->auth_attempt : req->attempt;
         auto const limit = is_auth ? _config.max_auth_retry_attempts : _config.max_retry_attempts;
-        if (attempt + 1 >= limit) {
+        // Cache-started requests share a total budget in addition to the auth ceiling.
+        bool const shared_exhausted =
+          req->route_started_cached &&
+          req->attempt + req->auth_attempt + 1 >= _config.max_retry_attempts;
+        if (attempt + 1 >= limit || shared_exhausted) {
           req->op->finish_error(std::make_exception_ptr(std::runtime_error(
             "rest_reactor: exhausted retries for " + req->object.bucket + "/" + req->object.key)));
           return;
@@ -1440,25 +1879,57 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     };
 
     auto setup_easy = [&](io_slot& slot) {
-      auto auth =
-        _ctx->authorizer()->authorize(slot.req->object, request_method::GET, presign_ttl(_config));
-      slot.url           = std::move(auth.url);
+      // Origin attempts authorize; delegated attempts retain their admitted URL
+      // and reconfigure the pooled handle.
+      bool const delegated = !slot.req->delegated_url.empty();
+      std::vector<std::pair<std::string, std::string>> auth_headers;
+      if (delegated) {
+        slot.url = slot.req->delegated_url;
+      } else {
+        auto auth = _ctx->authorizer()->authorize(
+          slot.req->object, request_method::GET, presign_ttl(_config));
+        slot.url     = std::move(auth.url);
+        auth_headers = std::move(auth.headers);
+      }
       slot.sink.buffers  = slot.req->op->iovecs;
       slot.sink.capacity = slot.req->op->io_rng.size;
+      slot.sink.easy     = slot.easy.get();
       slot.sink.reset();
       slot.hc.reset();
       auto const range = range_header(slot.req->op->io_rng.offset, slot.req->op->io_rng.size);
       auto const tag   = conditional_tag(slot.req->op->obj.get());
       std::string const if_match = tag.empty() ? std::string{} : "If-Match: " + std::string(tag);
-      slot.headers = build_header_list(auth.headers, &range, tag.empty() ? nullptr : &if_match);
+      slot.headers = build_header_list(auth_headers, &range, tag.empty() ? nullptr : &if_match);
       auto* handle = slot.easy.get();
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L));
+      SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_PATH_AS_IS, delegated ? 1L : 0L));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_URL, slot.url.c_str()));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTPHEADER, slot.headers.get()));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &write_to_sink));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_WRITEDATA, &slot.sink));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &capture_header));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERDATA, &slot.hc));
+      slot.started = std::chrono::steady_clock::now();
+    };
+
+    // Keep allocating route selection inside the slot's completion/error boundary.
+    auto select_route = [&](rest_io_op_request& request) {
+      if (!redirect_routes::first_submission_eligible(_config,
+                                                      request.delegated_url,
+                                                      request.route_refreshed,
+                                                      request.attempt,
+                                                      request.auth_attempt)) {
+        return;
+      }
+      auto const* file = dynamic_cast<rest_io_object const*>(request.op->obj.get());
+      if (file == nullptr || conditional_tag(file).empty()) return;
+      if (auto route = file->route(_ctx)) {
+        request.delegated_url        = *route;
+        request.route_snapshot       = std::move(route);
+        request.route_cached         = true;
+        request.route_started_cached = true;
+        _route_hits.fetch_add(1, std::memory_order_relaxed);
+      }
     };
 
     int running  = 0;
@@ -1490,12 +1961,14 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         slot.req         = std::move(request);
         try {
           allocate_staging(*slot.req);
+          select_route(*slot.req);
           setup_easy(slot);
           auto const status = curl_multi_add_handle(multi.get(), slot.easy.get());
           if (status != CURLM_OK) {
             throw std::runtime_error(std::string("rest_reactor: curl_multi_add_handle failed: ") +
                                      curl_multi_strerror(status));
           }
+          slot.attempt_active = true;
           ++inflight;
         } catch (rmm::out_of_memory const& e) {
           // Pinned staging is shared with the prefetching cache.  When it is
@@ -1521,9 +1994,88 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       auto& request     = *slot.req;
       auto& op          = *request.op;
       auto const io_rng = op.io_rng;
+      if (_config.request_log) {
+        // attempt = this operation's earlier attempts, transport and
+        // authorization retries combined; a delegated hop keeps the index and
+        // is told apart by `delegated`.
+        log_transfer("GET",
+                     slot.url,
+                     range_value(range_header(io_rng.offset, io_rng.size)),
+                     curl_outcome(curl_status),
+                     http_status,
+                     slot.sink.total_received,
+                     request.attempt + request.auth_attempt,
+                     !request.delegated_url.empty(),
+                     slot.started,
+                     route_kind(request),
+                     transfer_connects(slot.easy.get(), curl_status, http_status));
+      }
       bool const full_object =
         io_rng.offset == 0 && op.obj != nullptr && io_rng.size == op.obj->size();
       bool const range_status = http_status == 206 || (http_status == 200 && full_object);
+
+      // Invalidate the used hint before spending one unit on origin re-resolution.
+      if (request.route_cached && cached_route_refused(curl_status, http_status)) {
+        request.route_cached = false;
+        if (op.obj != nullptr && request.route_snapshot != nullptr) {
+          if (auto const* rest_obj = dynamic_cast<rest_io_object const*>(op.obj.get())) {
+            rest_obj->drop_route(request.route_snapshot);
+          }
+        }
+        request.route_snapshot.reset();
+        if (request.route_refreshed || request.attempt + 1 >= _config.max_retry_attempts) {
+          op.finish_error(std::make_exception_ptr(
+            std::runtime_error("rest_reactor: exhausted retries for " + request.object.bucket +
+                               "/" + request.object.key)));
+          return false;
+        }
+        ++request.attempt;
+        request.route_refreshed = true;
+        request.delegated_url.clear();
+        _route_refreshes.fetch_add(1, std::memory_order_relaxed);
+        ready.push_front(std::move(slot.req));
+        return false;
+      }
+
+      // Final redirect/refusal outcomes precede transport retry; informational
+      // responses do not.  (A truncated error body — CURLE_PARTIAL_FILE — must
+      // not turn a redirect or a storage node's refusal into a retry.)
+      if (http_status / 100 == 3) {
+        // Only an eligible first 307 delegates (one hop per physical GET: the
+        // same operation is re-queued against the storage node; write_to_sink
+        // kept the 3xx body out of the sink).  Every other 3xx is terminal and
+        // outside the 307 policy counters.
+        if (http_status == 307) {
+          std::string reason;
+          if (delegate_redirect(request.object,
+                                slot.url,
+                                !request.delegated_url.empty(),
+                                http_status,
+                                slot.hc.location,
+                                reason)) {
+            request.delegated_url = std::move(slot.hc.location);
+            ready.push_front(std::move(slot.req));
+            return false;
+          }
+          op.finish_error(std::make_exception_ptr(
+            std::runtime_error("rest_reactor: HTTP 307 (" + reason + ") for " +
+                               request.object.bucket + "/" + request.object.key)));
+          return false;
+        }
+        op.finish_error(std::make_exception_ptr(
+          std::runtime_error("rest_reactor: HTTP " + std::to_string(http_status) + " for " +
+                             request.object.bucket + "/" + request.object.key)));
+        return false;
+      }
+      if ((http_status == 401 || http_status == 403) && !request.delegated_url.empty()) {
+        // The delegated URL carries the storage node's own authorization and is
+        // not re-signed on retry, so its refusal cannot be recovered the way an
+        // expired presigned origin URL can.
+        op.finish_error(std::make_exception_ptr(std::runtime_error(
+          "rest_reactor: HTTP " + std::to_string(http_status) + " from the storage node for " +
+          request.object.bucket + "/" + request.object.key)));
+        return false;
+      }
 
       if (curl_status == CURLE_OK && http_status == 206) {
         auto const start = content_range_start(slot.hc.content_range);
@@ -1556,6 +2108,9 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         }
       }
       if (curl_status == CURLE_OK && range_status && complete_body) {
+        if (!request.delegated_url.empty() && !request.route_cached && op.obj != nullptr) {
+          seed_route(*op.obj, request.delegated_url);
+        }
         if (!request.is_device()) {
           op.finish_success();
           return false;
@@ -1629,6 +2184,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         auto const index = static_cast<std::size_t>(reinterpret_cast<std::intptr_t>(private_data));
         curl_multi_remove_handle(multi.get(), handle);
         --inflight;
+        slots[index].attempt_active = false;  // observed: finish() owns the record from here
         if (!finish(index, message->data.result, http_status)) slots[index].reset();
       }
     };
@@ -1664,6 +2220,28 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
       for (auto& slot : slots) {
         if (slot.req == nullptr) continue;
+        // In-flight attempts only; the status is curl's snapshot (0 when no
+        // HTTP code was reported), not a claim that a response completed.
+        if (_config.request_log && slot.attempt_active) {
+          slot.attempt_active = false;
+          try {
+            long status = 0;
+            curl_easy_getinfo(slot.easy.get(), CURLINFO_RESPONSE_CODE, &status);
+            auto const& rng = slot.req->op->io_rng;
+            log_transfer("GET",
+                         slot.url,
+                         range_value(range_header(rng.offset, rng.size)),
+                         "aborted-local",
+                         status,
+                         slot.sink.total_received,
+                         slot.req->attempt + slot.req->auth_attempt,
+                         !slot.req->delegated_url.empty(),
+                         slot.started,
+                         route_kind(*slot.req),
+                         "-");
+          } catch (...) {  // the record is best effort inside the noexcept drain
+          }
+        }
         curl_multi_remove_handle(multi.get(), slot.easy.get());
         slot.req->op->finish_error(terminal_error);
         slot.reset();

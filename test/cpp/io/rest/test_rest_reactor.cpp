@@ -17,6 +17,7 @@
 #include <cudf/io/text/byte_range_info.hpp>
 
 #include <catch.hpp>
+#include <io/rest/cluster_redirect_test_support.hpp>
 #include <io/rest/mock_authorizer.hpp>
 #include <io/rest/rest_reactor.hpp>
 
@@ -51,6 +52,7 @@ std::unique_ptr<rest_reactor> make_reactor(std::size_t max_retry_attempts = 10)
   auto authorizer = std::make_shared<mock_authorizer>(
     sirius::io::rest::authorized_request{"http://127.0.0.1/unused", {}});
   sirius::io::rest::config config;
+  sirius::test::rest_redirect::request_log_from_test_env(config);
   config.max_connections    = 1;
   config.max_retry_attempts = max_retry_attempts;
   auto context =

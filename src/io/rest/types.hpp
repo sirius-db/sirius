@@ -21,11 +21,18 @@
 #include "io/types.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
 
 namespace sirius::io::rest {
+
+/// Where a transfer's header callback is within libcurl's delivery: the next
+/// line starts a response block (first line = status line), lines are fields
+/// of the current response, or everything that follows the final response's
+/// headers (trailers) — which never starts a new response.
+enum class header_phase : std::uint8_t { response_start, response_fields, trailers };
 
 /// Write-callback target for one in-flight transfer.  libcurl hands the
 /// response body to the reactor in arbitrarily-sized pieces; @c buf_sink
@@ -35,7 +42,10 @@ namespace sirius::io::rest {
 /// reports the full incoming size back to curl (never a short count, which
 /// would abort the transfer with CURLE_WRITE_ERROR).  Bytes beyond @c capacity
 /// are counted in @c total_received but not stored, so the reactor can detect a
-/// server that ignored the Range header (e.g. returned the whole object).
+/// server that ignored the Range header (e.g. returned the whole object).  A
+/// 3xx body (the XML a redirect carries) is likewise counted but not stored;
+/// that decision uses libcurl's own response code for the transfer (@c easy),
+/// never a locally parsed status.
 struct buf_sink {
   std::span<iovec> buffers;  // destination buffers, in file order
   std::size_t capacity{0};   // Σ buffers[i].iov_len
@@ -43,6 +53,7 @@ struct buf_sink {
   std::size_t cursor{0};     // bytes written into buffers[active]
   std::size_t written{0};    // total bytes written across all buffers
   std::size_t total_received{0};
+  void* easy{nullptr};  // the transfer's CURL* (CURLINFO_RESPONSE_CODE), or null
 
   void reset() noexcept
   {
@@ -53,20 +64,26 @@ struct buf_sink {
   }
 };
 
-/// Response headers the reactor inspects on completion.  @c content_range
-/// validates that a 206 honored the requested byte range; @c retry_after drives
-/// the retry delay when the server asks the client to back off; @c etag is the
-/// response's validator.
+/// Response metadata for the current HTTP response block.  @c status is the
+/// block's own status line (used for framing); completion handling consumes
+/// @c location, the validators and the retry metadata.  A new response block
+/// clears the preceding block's fields; trailers never do.
 struct header_capture {
+  header_phase phase{header_phase::response_start};
+  long status{0};
   std::string content_range;
   std::string retry_after;
   std::string etag;
+  std::string location;
 
   void reset() noexcept
   {
+    phase  = header_phase::response_start;
+    status = 0;
     content_range.clear();
     retry_after.clear();
     etag.clear();
+    location.clear();
   }
 };
 
@@ -81,6 +98,16 @@ struct rest_io_op_request {
   std::size_t auth_attempt{0};
   bool needs_staging{false};
   std::size_t logical_bytes{0};
+  /// Set once this operation's 307 was delegated (config::cluster_redirect):
+  /// the Location to request instead of a freshly authorized origin URL.  It
+  /// lives on the request, not the connection slot, so a retry after the hop
+  /// goes back to the target and a second 307 is refused.
+  std::string delegated_url;
+  /// Cached-attempt provenance and operation-wide refresh/budget state.
+  bool route_cached{false};
+  bool route_started_cached{false};
+  bool route_refreshed{false};
+  std::shared_ptr<const std::string> route_snapshot;
 
   [[nodiscard]] bool is_device() const noexcept
   {

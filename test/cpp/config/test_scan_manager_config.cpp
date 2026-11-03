@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "io/rest/cluster_redirect_test_support.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -25,6 +26,8 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 using sirius::io::cache::cache_mode;
 using sirius::io::cache::eviction_policy;
@@ -774,4 +777,68 @@ TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
                    scan_manager_yaml(std::string("      preparation:\n        ") + fields + "\n"));
   CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
                   sirius::configuration_input_error);
+}
+
+TEST_CASE("sirius_config loads scoped cluster redirect settings",
+          "[scan_manager][config][scan_manager_config][rest_cluster_redirect]")
+{
+  auto cfg =
+    load_scan_manager("cluster-redirect-config.yaml",
+                      single_gpu_scan_manager_yaml(
+                        "      rest:\n"
+                        "        cluster_redirect:\n"
+                        "          enabled: true\n"
+                        "          origin: gateway:51080\n"
+                        "          allowed_targets: [storage-a:51081, storage-b:51081]\n"));
+  sirius::test::rest_redirect::require_policy(sirius::io::rest::config{}, false, "", {});
+  sirius::test::rest_redirect::require_policy(
+    cfg.rest, true, "gateway:51080", {"storage-a:51081", "storage-b:51081"});
+}
+
+TEST_CASE("sirius_config validates cluster redirect scope and rejects unknown keys",
+          "[scan_manager][config][scan_manager_config][rest_cluster_redirect]")
+{
+  for (auto const& [body, key] : std::vector<std::pair<std::string, std::string>>{
+         {"          enabled: true\n          allowed_targets: [target:51081]\n", "origin"},
+         {"          enabled: true\n          origin: gateway:51080\n"
+          "          allowed_targets: []\n",
+          "allowed_targets"},
+         {"          enabled: false\n          unexpected_option: 1\n", "unexpected_option"}}) {
+    DYNAMIC_SECTION(key)
+    {
+      auto yaml = single_gpu_scan_manager_yaml("      rest:\n        cluster_redirect:\n" + body);
+      CHECK_THROWS_WITH(load_scan_manager("cluster-redirect-invalid.yaml", yaml),
+                        Catch::Matchers::ContainsSubstring(key));
+    }
+  }
+}
+
+TEST_CASE("REST request logging defaults off in configuration",
+          "[scan_manager][config][rest_request_log]")
+{
+  using sirius::test::rest_redirect::request_log_enabled;
+  CHECK_FALSE(request_log_enabled(sirius::io::rest::config{}));
+  auto const absent =
+    load_scan_manager("request-log-absent.yaml", single_gpu_scan_manager_yaml(""));
+  CHECK_FALSE(request_log_enabled(absent.rest));
+}
+
+TEST_CASE("REST request logging YAML enables the collector and retains strict keys",
+          "[scan_manager][config][rest_request_log]")
+{
+  using sirius::test::rest_redirect::request_log_enabled;
+  auto const enabled =
+    load_scan_manager("request-log-enabled.yaml",
+                      single_gpu_scan_manager_yaml("      rest:\n        request_log: true\n"));
+  REQUIRE(request_log_enabled(enabled.rest));
+  auto const disabled =
+    load_scan_manager("request-log-disabled.yaml",
+                      single_gpu_scan_manager_yaml("      rest:\n        request_log: false\n"));
+  CHECK_FALSE(request_log_enabled(disabled.rest));
+  CHECK_THROWS_WITH(
+    load_scan_manager(
+      "request-log-unknown.yaml",
+      single_gpu_scan_manager_yaml(
+        "      rest:\n        request_log: true\n        request_log_unknown: 1\n")),
+    Catch::Matchers::ContainsSubstring("request_log_unknown"));
 }

@@ -121,13 +121,20 @@ void configure_easy_handle(CURL* handle,
 
   // HTTP behavior.
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0));
-  // Never follow redirects.  A presigned SigV4 URL is signed for one exact
-  // host/path/query; transparently following an S3 region-mismatch 301/307 to a
-  // different endpoint would re-issue the GET with an invalid signature (and
-  // curl drops the custom Range header across the redirect), so a 3xx must
-  // surface as an explicit error rather than silently producing a 403 or wrong
-  // bytes.  Region selection belongs at the authorizer/endpoint level.
+  // Keep libcurl's automatic redirect following disabled.  A presigned SigV4
+  // URL is signed for one exact host/path/query; transparently following an S3
+  // region-mismatch 301/307 to a different endpoint would re-issue the GET with
+  // an invalid signature (and curl drops the custom Range header across the
+  // redirect), so a 3xx must surface as an explicit error rather than silently
+  // producing a 403 or wrong bytes.  Region selection belongs at the
+  // authorizer/endpoint level.  The reactor may explicitly delegate a
+  // configured cluster 307 (config::cluster_redirect); service/region
+  // redirects remain outside that policy.
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L));
+  // Proxy CONNECT response headers never reach our header callbacks: the
+  // reactor frames responses itself (status line, fields, terminator, trailers)
+  // and a CONNECT block would look like a complete 200 response.
+  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L));
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, kRecvBufferSize));
 
   // Default timeouts; the reactor may override the whole-transfer timeout per
