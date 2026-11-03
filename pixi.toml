@@ -78,6 +78,26 @@ fastavro = "1.*"
 fuzz = { cmd = "PYTHONPATH=$PIXI_PROJECT_ROOT/test/fuzz python -m siriusfuzz", description = "Sirius fuzzer: run|doctor|replay|recheck|show-config|selftest (paths resolve from the current directory)" }
 fuzz-test = { cmd = "python -m unittest discover -s tests -t .", cwd = "test/fuzz", description = "Unit tests for the fuzzer harness (no GPU needed)" }
 
+[tasks._clang-tidy-configure]
+cmd = "cmake --preset clang-debug -B build/clang-tidy -DSIRIUS_TPCH_HAVOC=OFF"
+
+[tasks._clang-tidy-prepare]
+depends-on = ["_clang-tidy-configure"]
+cmd = """
+cmake --build build/clang-tidy --target cargo-build_telemetry_bridge simpatico_embedded_headers \
+  simpatico_codegen/tests/cache/fixtures/project/codegen/jit/embedded_headers.h \
+  simpatico_codegen/tests/cache/fixtures/cccl/codegen/jit/embedded_headers.h
+"""
+
+[tasks.clang-tidy]
+description = "Prepare generated headers and run advisory clang-tidy (optional source regexes and -j)."
+depends-on = ["_clang-tidy-prepare"]
+cmd = '''
+run-clang-tidy -p build/clang-tidy -j 4 -warnings-as-errors='-*' \
+  -source-filter "$PIXI_PROJECT_ROOT/(src|test)/.*[.](c|cc|cpp|cxx)$" \
+  -header-filter "$PIXI_PROJECT_ROOT/(src|include|test)/"
+'''
+
 [tasks.duckdb]
 description = "Start the local DuckDB shell with Sirius loaded."
 cmd = '''sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"'''

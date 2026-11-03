@@ -57,56 +57,38 @@ pre-commit run -a
 Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`, and
 `rumdl` (Markdown links and anchors).
 
-Clang-tidy runs separately from compilation through manual pre-commit hooks.
-Prepare the Clang debug build first so its compilation database and generated
-headers exist (CUDA dependencies and initialized build submodules are required):
+Run clang-tidy independently from compilation with Pixi:
 
 ```bash
-pixi run --locked cmake --preset clang-debug -DCMAKE_CUDA_ARCHITECTURES=100
-pixi run --locked make clang-debug
+pixi run --locked clang-tidy
 ```
 
-Choose a CUDA architecture appropriate for your GPU. Analysis uses the full
-repository `.clang-tidy` check set. Findings are advisory; missing prerequisites,
-invalid selections, and compiler errors fail the command. The hooks do not build,
-configure, or apply fixes, and do not run during normal commits or ordinary lint CI.
+Task dependencies configure a separate `build/clang-tidy` directory and generate
+telemetry and Simpatico headers before analysis. They do not compile the engine
+or run tests. The Pixi toolchain and initialized build submodules are required;
+configuration disables the optional TPC-Havoc dataset download in this build.
 
-Check selected C/C++ sources:
+The task uses the full `.clang-tidy` check set on configured C/C++ sources under
+`src/` and `test/`, including standalone Simpatico tests. CUDA translation units,
+third-party sources, and build-generated sources are excluded. Findings are
+advisory; configuration, generation, and compiler errors fail the task. Normal
+builds, commits, and lint CI do not run clang-tidy.
+
+Additional arguments go directly to LLVM's `run-clang-tidy`. Use source regexes
+to narrow analysis and `-j` to override the default of four workers:
 
 ```bash
-pixi run pre-commit run --hook-stage manual clang-tidy --files src/io/uri_parser.cpp
+pixi run --locked clang-tidy 'src/io/uri_parser[.]cpp$'
+pixi run --locked clang-tidy -j 8 'test/cpp/config/test_context_config[.]cpp$'
 ```
 
-For header, CMake, or clang-tidy configuration changes, check all configured
-sources in the main library and unit-test targets:
-
-```bash
-pixi run pre-commit run --hook-stage manual clang-tidy-all
-```
-
-Always name the hook: invoking all manual hooks also runs the selected-source
-hook, which rejects headers/configuration files and asks for `clang-tidy-all`.
-
-The full run can be expensive. Optional standalone benchmarks/cache-test targets,
-CUDA translation units, generated sources, and third-party sources are excluded.
-The runner reports diagnostics in owned `src/`, `include/`, and `test/` headers,
-excluding third-party headers. Headers are analyzed through source compilation
-contexts; the selected-source hook asks for the full run on header/configuration
-changes. Newly added sources
-must be tracked and included in the configured targets before analysis.
-
-For another prepared build, set `SIRIUS_CLANG_TIDY_BUILD_DIR`. Set
-`SIRIUS_CLANG_TIDY_JOBS` to control hook parallelism (default: four). The runner also
-accepts a build directory and worker limit directly:
-
-```bash
-pixi run python scripts/run_clang_tidy.py -p build/clang-debug -j 4 --all
-```
-
-The database preserves per-target language standards and compile definitions.
-Use the matching Pixi toolchain and rebuild after switching branches or changing
-build configuration. If generated telemetry headers disappear while Cargo reports
-its bridge build as cached, prepare a fresh build directory.
+Regexes select source files from the compilation database, rather than literal
+filenames or changed lines. Headers are analyzed through their including sources;
+run without a regex for header/configuration changes. The task reports diagnostics
+in owned headers and applies no fixes. An unmatched regex checks no sources, so
+check the tool's reported file count. If staged telemetry headers have been
+deleted while Cargo still reports its bridge build as cached, remove
+`build/clang-tidy` and rerun the task to regenerate them.
 
 Public re-exports can be declared using Clang's `IWYU pragma: export` and
 `IWYU pragma: begin_exports` / `end_exports` annotations.

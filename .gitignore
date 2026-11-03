@@ -61,7 +61,6 @@ nsys_profiles/
 
 *.local.md
 tools/log_analyzer/__pycache__/
-scripts/__pycache__/
 tools/log_analyzer/metrics/__pycache__/
 test/tpch_performance/__pycache__/
 test/tpch_performance/output/
