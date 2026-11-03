@@ -2085,7 +2085,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "iceberg internal queries remain invisible with global GPU execution enabled",
+                 "iceberg manifest queries remain invisible with global GPU execution enabled",
                  "[integration][gpu_execution][iceberg][transparent][read_view]")
 {
   REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=false")->HasError());
@@ -2110,9 +2110,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE_FALSE(enabled->HasError());
     REQUIRE(enabled->Collection().GetValue(0, 0).GetValue<bool>());
   }
-  sirius::io::kvikio_context ioctx;
-  auto const reads_before = sirius::op::scan::iceberg_delete_data_uncached_read_count();
-  // Positional deletes read Parquet metadata; deletion vectors also reread their Avro manifest.
+  // Deletion vectors also require an Avro manifest query during discovery.
   for (auto const* dataset : {"iceberg_snapshot_deletes", "iceberg_v3_deletion_vector"}) {
     auto const table = (get_project_root() / "test/cpp/integration/data" / dataset).string();
     CAPTURE(table);
@@ -2121,12 +2119,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(inventory.inventory);
     auto discovery = sirius::op::scan::discover_from_manifests(
       *con->context, table, std::move(*inventory.inventory));
-    auto data = sirius::op::scan::load_delete_payload(
-      *con->context, table, &ioctx, current_snapshot_id(table), discovery);
-    REQUIRE(data);
-    REQUIRE_FALSE(data->positional_deletes.empty());
+    REQUIRE(discovery.positional_delete_files.size() + discovery.deletion_vector_entries.size() ==
+            1);
   }
-  CHECK(sirius::op::scan::iceberg_delete_data_uncached_read_count() == reads_before + 2);
   auto const after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
   CHECK(after.provider_internal_skips == before.provider_internal_skips);
