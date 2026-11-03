@@ -184,24 +184,28 @@ void require_non_s3_cpu_replay(plan_source_policy const& policy, std::string con
   if (!veto && policy.discovery_error) {
     // DuckDB's query boundary handles std::exception, not arbitrary C++ exceptions.
     // Keep both failures visible: discovery explains why CPU replay was refused.
-    std::string discovery_message;
+    duckdb::ErrorData discovery;
     try {
       std::rethrow_exception(policy.discovery_error);
     } catch (duckdb::InterruptException const&) {
       throw;
     } catch (std::exception const& error) {
-      duckdb::ErrorData discovery(error);
-      if (discovery.Type() != duckdb::ExceptionType::INVALID || !discovery.ExtraInfo().empty()) {
-        // The type controls DuckDB transaction invalidation, not just diagnostics.
-        discovery.Throw("CPU fallback is not supported. Underlying GPU error: " + gpu_error +
-                        ". Source discovery failed: ");
-      }
-      discovery_message = discovery.RawMessage();
+      discovery = duckdb::ErrorData(error);
     } catch (...) {
-      discovery_message = "non-standard exception";
+      discovery = duckdb::ErrorData(duckdb::ExceptionType::INVALID, "non-standard exception");
     }
-    throw std::runtime_error("CPU fallback is not supported: source discovery failed: " +
-                             discovery_message + ". Underlying GPU error: " + gpu_error);
+    auto message =
+      "CPU fallback is not supported: source discovery failed: " + discovery.RawMessage() +
+      ". Underlying GPU error: " + gpu_error;
+    auto type = discovery.Type();
+    // A failed replay check must not invalidate the database instance.
+    if (type == duckdb::ExceptionType::INTERNAL || type == duckdb::ExceptionType::FATAL) {
+      throw duckdb::ExecutorException(message);
+    }
+    if (type != duckdb::ExceptionType::INVALID || !discovery.ExtraInfo().empty()) {
+      throw duckdb::Exception(discovery.ExtraInfo(), type, message);
+    }
+    throw std::runtime_error(message);
   }
   if (!policy.cpu_replay_permitted()) {
     throw std::runtime_error("CPU fallback is not supported: " + policy.reason() +

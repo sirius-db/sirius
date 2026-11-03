@@ -66,13 +66,17 @@ duckdb::unique_ptr<duckdb::LogicalGet> file_scan(std::string name, std::string p
 struct non_standard_discovery_error {};
 
 struct throwing_list final : duckdb::SimpleMultiFileList {
-  explicit throwing_list(bool non_standard = false, bool catalog = false)
-    : SimpleMultiFileList({}), non_standard(non_standard), catalog(catalog)
+  explicit throwing_list(bool non_standard = false)
+    : SimpleMultiFileList({}), non_standard(non_standard)
+  {
+  }
+  explicit throwing_list(std::exception_ptr error)
+    : SimpleMultiFileList({}), error(std::move(error))
   {
   }
   [[noreturn]] void fail() const
   {
-    if (catalog) throw duckdb::CatalogException("inventory catalog entry missing");
+    if (error) std::rethrow_exception(error);
     if (non_standard) throw non_standard_discovery_error{};
     throw std::runtime_error("inventory extraction failed");
   }
@@ -81,8 +85,8 @@ struct throwing_list final : duckdb::SimpleMultiFileList {
   duckdb::idx_t GetTotalFileCount() const override { fail(); }
   duckdb::OpenFileInfo GetFile(duckdb::idx_t) const override { fail(); }
 
-  bool non_standard;
-  bool catalog;
+  bool non_standard = false;
+  std::exception_ptr error;
 };
 
 struct external_child_operator final : duckdb::PhysicalOperator {
@@ -210,7 +214,9 @@ TEST_CASE("Source policy preserves DuckDB error types and metadata", "[transpare
                     duckdb::ExceptionType::BINDER,
                     duckdb::ExceptionType::INVALID_INPUT,
                     duckdb::ExceptionType::INVALID,
-                    duckdb::ExceptionType::OUT_OF_MEMORY}) {
+                    duckdb::ExceptionType::OUT_OF_MEMORY,
+                    duckdb::ExceptionType::INTERNAL,
+                    duckdb::ExceptionType::FATAL}) {
     CAPTURE(type);
     plan_source_policy policy;
     policy.discovery_complete = false;
@@ -223,10 +229,15 @@ TEST_CASE("Source policy preserves DuckDB error types and metadata", "[transpare
       error = duckdb::ErrorData(ex);
     }
     REQUIRE(error.HasError());
-    CHECK(error.Type() == type);
-    CHECK(error.ExtraInfo().at("position") == "7");
-    CHECK(error.RawMessage().find("typed discovery failure") != std::string::npos);
-    CHECK(error.RawMessage().find("GPU scan unsupported") != std::string::npos);
+    if (type == duckdb::ExceptionType::INTERNAL || type == duckdb::ExceptionType::FATAL) {
+      CHECK(error.Type() == duckdb::ExceptionType::EXECUTOR);
+    } else {
+      CHECK(error.Type() == type);
+      CHECK(error.ExtraInfo().at("position") == "7");
+    }
+    CHECK(error.RawMessage() ==
+          "CPU fallback is not supported: source discovery failed: "
+          "typed discovery failure. Underlying GPU error: GPU scan unsupported");
   }
 }
 
@@ -749,32 +760,42 @@ TEST_CASE("Transparent finalize preserves GPU errors before incomplete-source ve
   }
 }
 
-TEST_CASE("Discovery catalog errors preserve the open transaction at the query boundary",
+TEST_CASE("Discovery errors respect transaction and database validity at the query boundary",
           "[integration][policy][discovery_transaction]")
 {
   sirius::test::GpuExecutionFixture fixture;
   auto& con             = *fixture.con;
-  auto const name       = "catalog_discovery_" + fixture.attach_alias;
+  auto const name       = "typed_discovery_" + fixture.attach_alias;
   precedence_bind_count = 0;
-  duckdb::ExtensionLoader loader(*con.context->db, "catalog_discovery_test");
+  duckdb::ExtensionLoader loader(*con.context->db, "typed_discovery_test");
   loader.RegisterFunction(duckdb::TableFunction(
     duckdb::Identifier(name),
-    {},
+    {duckdb::LogicalType::VARCHAR},
     [](duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) {
       FAIL("CPU source must not execute");
     },
     [](duckdb::ClientContext&,
-       duckdb::TableFunctionBindInput&,
+       duckdb::TableFunctionBindInput& input,
        duckdb::vector<duckdb::LogicalType>& types,
        duckdb::vector<duckdb::Identifier>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
       if (++precedence_bind_count > 1)
-        throw duckdb::NotImplementedException("catalog source GPU replan refused");
-      types           = {duckdb::LogicalType::INTEGER};
-      names           = {"id"};
-      auto bind       = duckdb::make_uniq<duckdb::MultiFileBindData>();
-      bind->types     = types;
-      bind->names     = names;
-      bind->file_list = duckdb::make_shared_ptr<throwing_list>(false, true);
+        throw duckdb::NotImplementedException("source GPU replan refused");
+      types       = {duckdb::LogicalType::INTEGER};
+      names       = {"id"};
+      auto bind   = duckdb::make_uniq<duckdb::MultiFileBindData>();
+      bind->types = types;
+      bind->names = names;
+      auto kind   = input.inputs[0].GetValue<std::string>();
+      std::exception_ptr error;
+      if (kind == "internal") {
+        error = std::make_exception_ptr(duckdb::InternalException("internal discovery failure"));
+      } else if (kind == "fatal") {
+        error = std::make_exception_ptr(duckdb::FatalException("fatal discovery failure"));
+      } else {
+        error =
+          std::make_exception_ptr(duckdb::CatalogException("inventory catalog entry missing"));
+      }
+      bind->file_list = duckdb::make_shared_ptr<throwing_list>(error);
       return std::move(bind);
     }));
   fixture.run_ok("SET gpu_execution = false");
@@ -789,14 +810,14 @@ TEST_CASE("Discovery catalog errors preserve the open transaction at the query b
     fixture.run_ok("SET gpu_execution = true");
     precedence_bind_count = 0;
     duckdb::unique_ptr<duckdb::QueryResult> result;
-    REQUIRE_NOTHROW(result = con.Query("SELECT * FROM " + name + "()"));
+    REQUIRE_NOTHROW(result = con.Query("SELECT * FROM " + name + "('catalog')"));
     REQUIRE(result);
     REQUIRE(result->HasError());
     INFO(result->GetError());
     CHECK(precedence_bind_count >= 2);
     CHECK(result->GetErrorType() == duckdb::ExceptionType::CATALOG);
     CHECK(result->GetError().find("inventory catalog entry missing") != std::string::npos);
-    CHECK(result->GetError().find("catalog source GPU replan refused") != std::string::npos);
+    CHECK(result->GetError().find("source GPU replan refused") != std::string::npos);
     auto next = con.Query("SELECT count(*) FROM discovery_transaction_rows");
     REQUIRE(next);
     if (std::string_view(policy) == "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE") {
@@ -812,6 +833,18 @@ TEST_CASE("Discovery catalog errors preserve the open transaction at the query b
     auto persisted = con.Query("SELECT count(*) FROM discovery_transaction_rows");
     REQUIRE_FALSE(persisted->HasError());
     CHECK(persisted->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
+  }
+  fixture.run_ok("SET gpu_execution = true");
+  for (std::string kind : {"internal", "fatal"}) {
+    CAPTURE(kind);
+    precedence_bind_count = 0;
+    auto result           = con.Query("SELECT * FROM " + name + "('" + kind + "')");
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
+    CHECK(result->GetError().find(kind + " discovery failure") != std::string::npos);
+    CHECK(result->GetError().find("source GPU replan refused") != std::string::npos);
+    fixture.run_ok("SELECT 1");
   }
 }
 
