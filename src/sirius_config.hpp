@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "preload/config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -407,6 +408,11 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
+  /// The @c sirius.executor.preload block, as configured. Disabled by default; the preload
+  /// executor clamps its ceilings per memory space.
+  [[nodiscard]] const preload::preload_executor_config& get_preload_executor_config()
+    const noexcept;
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -464,6 +470,7 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
+  preload::preload_executor_config _preload_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;

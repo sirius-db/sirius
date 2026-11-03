@@ -167,4 +167,19 @@ void query_event_publisher::publish_compressed_materialization(
   publish<compressed_materialization_event>(activity, count);
 }
 
+void query_event_publisher::publish_task_downgraded(query_id_t query_id,
+                                                    downgraded_task task) noexcept
+{
+  publish<task_downgraded_event>(query_id, std::move(task));
+}
+
+void query_event_publisher::publish_task_popped(query_id_t query_id,
+                                                std::uint64_t task_id,
+                                                std::size_t pipeline_id,
+                                                int gpu,
+                                                std::size_t tasks_left) noexcept
+{
+  publish<task_popped_event>(query_id, task_id, pipeline_id, gpu, tasks_left);
+}
+
 }  // namespace sirius::event

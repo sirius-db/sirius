@@ -108,6 +108,7 @@ sirius:
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
+    # preload:    { device_budget: 0.1 }   # off by default; see sirius.executor.preload
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
     max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
@@ -305,7 +306,8 @@ sirius:
 **Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`
 
 The `sirius.executor` block configures the thread pools and task scheduling. It has four
-per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`. The
+per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`, plus the
+`preload` block, which is not a thread pool and is off by default (below). The
 `scan_manager` sub-block is large and is documented in
 [Scan Manager & IO Configuration](#scan-manager--io-configuration) below.
 
@@ -337,6 +339,43 @@ Thread pool (default `num_threads: 1`) plus:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+
+### `sirius.executor.preload`
+
+**File:** `src/preload/config.hpp`
+
+The preload executor moves queued tasks' inputs that are off the GPU (spilled while queued, or
+queued already spilled) back to a GPU (HOST→GPU, DISK→GPU), or from DISK to HOST when the GPU has
+no room, before the task runs
+(see [Memory Management](memory-management.md#preload-executor)). It is advisory: a refused or
+failed promotion costs performance only. It is not a thread pool: it runs one worker thread per
+GPU plus an event-subscriber thread, and has no `num_threads` or `cpu_affinity` key.
+
+It runs only when `device_budget > 0` or `host_budget > 0`. With both at 0 (the default) no
+executor, thread, event subscription or stream pool exists.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `device_budget` | float (0.0–1.0) | 0.0 | Bytes per GPU that preload may hold for promoted inputs whose task has not been popped yet, as a fraction of the GPU's capacity. `0` = no promotion to a GPU. |
+| `device_ceiling` | float (0.0–1.0) | 0.5 | Promote to a GPU only while its consumed memory plus the promotion stays at or below this fraction of its capacity. |
+| `host_budget` | float (0.0–1.0) | 0.0 | The same budget per HOST space, for DISK→HOST staging. `0` = no staging. |
+| `host_ceiling` | float (0.0–1.0) | 0.7 | Stage into a HOST space only while its consumed memory plus the staging stays at or below this fraction of its capacity. |
+
+When the executor is created, a ceiling above a space's `downgrade_stop_fraction` is clamped to it
+with one WARN per space (for a side whose budget is > 0), so preload on its own never starts a
+downgrade. If any GPU space sets `per_stream_reservation: true`, `device_budget` is treated as 0
+with one WARN, because that tracking would not charge a promotion's copy to the reservation preload
+attaches; DISK→HOST staging still runs when `host_budget > 0`. Unknown keys are rejected, as
+everywhere else in the config.
+
+```yaml
+sirius:
+  executor:
+    preload:
+      device_budget: 0.1    # up to 10% of each GPU for promoted, not-yet-popped inputs
+      device_ceiling: 0.5
+      host_budget: 0.05     # DISK→HOST staging when the GPU has no room
+```
 
 ## Scan Manager & IO Configuration
 
@@ -729,8 +768,9 @@ Then open `http://localhost:8080` and select the captured Sirius engine/query.
 
 ## Thread Pool Configuration
 
-Summary of the four executor thread pools. See [Executor Configuration](#executor-configuration)
-and [Scan Manager & IO Configuration](#scan-manager--io-configuration) for the full YAML keys and
+Summary of the four executor thread pools and the preload executor's workers. See
+[Executor Configuration](#executor-configuration) and
+[Scan Manager & IO Configuration](#scan-manager--io-configuration) for the full YAML keys and
 per-pool extras.
 
 | Pool | YAML block | Default Threads | Thread Name Prefix | Purpose |
@@ -739,6 +779,7 @@ per-pool extras.
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
 | `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
+| `preload_executor` | `executor.preload` | off by default; one worker per GPU when enabled (no `num_threads`) | `preload` | Promoting spilled inputs of queued tasks before they run |
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
@@ -1024,6 +1065,7 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
 | `src/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
+| `src/preload/config.hpp` | Preload executor config (`executor.preload`) |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 

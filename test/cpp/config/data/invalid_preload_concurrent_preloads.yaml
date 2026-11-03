@@ -1,0 +1,7 @@
+# A key of the first preload executor, removed with it.
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      concurrent_preloads: 2

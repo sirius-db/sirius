@@ -236,6 +236,25 @@ class selective_subscriber : public query_event_subscriber {
     record(event_type::compressed_materialization, "compressed_materialization");
   }
 
+  void on_task_downgraded(event_id_t,
+                          timestamp_t,
+                          query_id_t,
+                          downgraded_task const&) noexcept override
+  {
+    record(event_type::task_downgraded, "task_downgraded");
+  }
+
+  void on_task_popped(event_id_t,
+                      timestamp_t,
+                      query_id_t,
+                      std::uint64_t,
+                      std::size_t,
+                      int,
+                      std::size_t) noexcept override
+  {
+    record(event_type::task_popped, "task_popped");
+  }
+
   [[nodiscard]] std::vector<std::string> seen() const
   {
     std::lock_guard g{_mtx};
@@ -285,6 +304,8 @@ void publish_one_of_each(query_event_publisher& publisher)
   publisher.publish_wait_for_memory_for_task(make_query_id(1), 2, 0, 4096);
   publisher.publish_compressed_materialization(
     compressed_materialization_activity::pin_columns_narrowed, 3);
+  publisher.publish_task_downgraded(make_query_id(1), downgraded_task{});
+  publisher.publish_task_popped(make_query_id(1), 2, 3, 0, 4);
 }
 
 constexpr auto some_op_type                     = op::SiriusPhysicalOperatorType::GPU_SCAN;
@@ -804,7 +825,9 @@ TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publi
                                 event_type::executor_awaiting_task,
                                 event_type::memory_downgrade_for_task,
                                 event_type::wait_for_memory_for_task,
-                                event_type::compressed_materialization}};
+                                event_type::compressed_materialization,
+                                event_type::task_downgraded,
+                                event_type::task_popped}};
   subscriber.start();
   witness.start();
 
@@ -850,7 +873,9 @@ TEST_CASE("each event reaches exactly its own subscriber", "[event][query_event_
                                        "executor_awaiting_task",
                                        "memory_downgrade_for_task",
                                        "wait_for_memory_for_task",
-                                       "compressed_materialization"};
+                                       "compressed_materialization",
+                                       "task_downgraded",
+                                       "task_popped"};
   for (std::size_t i = 0; i < n_query_events; ++i) {
     subscribers.push_back(std::make_unique<selective_subscriber>(
       *publisher, std::initializer_list<event_type>{static_cast<event_type>(i)}));

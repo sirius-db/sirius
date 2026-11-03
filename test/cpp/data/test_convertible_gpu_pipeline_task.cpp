@@ -27,6 +27,8 @@
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
+#include <pipeline/pipeline_build_context.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
 #include <utils/telemetry_utils.hpp>
 
@@ -60,6 +62,9 @@ struct test_env {
 
 test_env& env()
 {
+  // Other test cases may shut the process-global converter registry down between uses of the
+  // cached environment.
+  sirius::test::operator_utils::ensure_converter_registry();
   static test_env e;
   return e;
 }
@@ -100,6 +105,43 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
     std::move(local),
     std::move(global));
 }
+
+/// Global state carrying an operator-less pipeline of a given query, a scheduling priority and a
+/// preferred device. The pipeline is detached again on destruction: a task whose pipeline has no
+/// operators cannot report its completion, so tasks sharing this state must be destroyed after it.
+struct attributed_global_state {
+  std::shared_ptr<sirius::pipeline::gpu_pipeline_task_global_state> state;
+
+  attributed_global_state(sirius::query_id_t query,
+                          sirius::exec::queue_priority priority,
+                          int preferred_device,
+                          std::size_t pipeline_id = 0)
+  {
+    const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+    auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
+    pipeline->set_query_id(query);
+    pipeline->set_pipeline_id(pipeline_id);
+    state = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
+      std::move(pipeline), sirius::test::make_test_telemetry_context());
+    state->set_priority(priority);
+    state->set_preferred_device_id(preferred_device);
+  }
+
+  ~attributed_global_state() { state->set_pipeline(nullptr); }
+
+  attributed_global_state(const attributed_global_state&)            = delete;
+  attributed_global_state& operator=(const attributed_global_state&) = delete;
+
+  std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_task(
+    uint64_t task_id, std::vector<std::shared_ptr<cucascade::data_batch>> batches) const
+  {
+    auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
+    auto local =
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
+    return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      task_id, std::vector<cucascade::shared_data_repository*>{}, std::move(local), state);
+  }
+};
 
 /// Helper: get the tier of a data_batch using a temporary read-only lock.
 inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
@@ -380,4 +422,171 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
 
   // Queue is interrupted and empty — task was destroyed, not pushed
   REQUIRE(queue.empty());
+}
+
+TEST_CASE("convert records nothing unless recording is on", "[convertible_gpu_pipeline_task]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  REQUIRE(queue.push(make_test_gpu_task(1, {batch})));
+
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd != nullptr);
+
+  REQUIRE(cd->convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  REQUIRE(cd->converted_batches().empty());
+}
+
+TEST_CASE("convert records each moved batch", "[convertible_gpu_pipeline_task]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const query = sirius::make_query_id(7);
+  lifecycle.open_query(query);
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto moved1 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto moved2 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5, 6, 7, 8}, cudf::type_id::INT32);
+  auto moved1_size = get_batch_size(*moved1);
+  auto moved2_size = get_batch_size(*moved2);
+
+  // Already at the target, so it is skipped and not recorded.
+  auto resident = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{9}, cudf::type_id::INT32);
+  {
+    sirius::convertible_data_batch to_host(resident);
+    REQUIRE(to_host.convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+  }
+
+  auto const priority = static_cast<sirius::exec::queue_priority>((std::uint64_t{7} << 32) | 3);
+  // Declared after the queue so the pipeline is detached before the queue destroys the task.
+  attributed_global_state global(query, priority, /*preferred_device=*/0);
+  REQUIRE(queue.push(global.make_task(1, {moved1, resident, moved2})));
+
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd != nullptr);
+
+  cd->record_conversions(true);
+  auto result = cd->convert({e.host_space}, e.stream(), *e.mgr, true);
+  REQUIRE(result.has_value());
+  REQUIRE((*result)[0] == moved1_size + moved2_size);
+
+  auto const records = cd->converted_batches();
+  REQUIRE(records.size() == 2);
+  REQUIRE(records[0].batch_id == moved1->get_batch_id());
+  REQUIRE(records[0].bytes == moved1_size);
+  REQUIRE(records[1].batch_id == moved2->get_batch_id());
+  REQUIRE(records[1].bytes == moved2_size);
+  REQUIRE(records[0].batch.lock() == moved1);
+  REQUIRE(records[1].batch.lock() == moved2);
+  for (auto const& rec : records) {
+    REQUIRE(rec.from == e.gpu_space->get_id());
+    REQUIRE(rec.to == e.host_space->get_id());
+  }
+}
+
+TEST_CASE("downgraded_task_record reports the task and the inputs it moved off the GPU",
+          "[convertible_gpu_pipeline_task][preload]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const query = sirius::make_query_id(7);
+  lifecycle.open_query(query);
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto moved1 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto moved2 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5, 6, 7, 8}, cudf::type_id::INT32);
+  auto const moved1_size = get_batch_size(*moved1);
+  auto const moved2_size = get_batch_size(*moved2);
+  // Already at the target, so it is not moved and not reported.
+  auto resident = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{9}, cudf::type_id::INT32);
+  {
+    sirius::convertible_data_batch to_host(resident);
+    REQUIRE(to_host.convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+  }
+
+  auto const priority = static_cast<sirius::exec::queue_priority>((std::uint64_t{7} << 32) | 3);
+  // Declared after the queue so the pipeline is detached before the queue destroys the task.
+  attributed_global_state global(query, priority, /*preferred_device=*/0, /*pipeline_id=*/12);
+  REQUIRE(queue.push(global.make_task(5, {moved1, resident, moved2})));
+
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd != nullptr);
+  auto& task_cd = dynamic_cast<sirius::convertible_gpu_pipeline_task&>(*cd);
+  // Nothing moved yet.
+  CHECK_FALSE(task_cd.downgraded_task_record().has_value());
+
+  cd->record_conversions(true);
+  REQUIRE(cd->convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+  auto const record = task_cd.downgraded_task_record();
+  REQUIRE(record.has_value());
+  auto const& [record_query, task] = *record;
+  CHECK(record_query == query);
+  CHECK(task.task_id == 5);
+  CHECK(task.pipeline_id == 12);
+  CHECK(task.priority == priority);
+  CHECK(task.preferred_device == 0);
+  REQUIRE(task.inputs.size() == 2);
+  CHECK(task.inputs[0].batch_id == moved1->get_batch_id());
+  CHECK(task.inputs[0].batch.lock() == moved1);
+  CHECK(task.inputs[0].gpu_bytes == moved1_size);
+  CHECK(task.inputs[1].batch_id == moved2->get_batch_id());
+  CHECK(task.inputs[1].batch.lock() == moved2);
+  CHECK(task.inputs[1].gpu_bytes == moved2_size);
+  for (auto const& input : task.inputs) {
+    CHECK(input.to == e.host_space->get_id());
+  }
+}
+
+TEST_CASE("downgraded_task_record is empty without recording or without a pipeline",
+          "[convertible_gpu_pipeline_task][preload]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  auto& e = env();
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+
+  SECTION("recording off")
+  {
+    auto batch = sirius::test::operator_utils::make_numeric_batch(
+      *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+    attributed_global_state global(sirius::make_query_id(0), {}, 0);
+    REQUIRE(queue.push(global.make_task(1, {batch})));
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+    auto cd = provider.get_next_convertible(e.gpu_space, false);
+    REQUIRE(cd != nullptr);
+    REQUIRE(cd->convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+    CHECK_FALSE(dynamic_cast<sirius::convertible_gpu_pipeline_task&>(*cd)
+                  .downgraded_task_record()
+                  .has_value());
+  }
+  SECTION("a task without a pipeline")
+  {
+    auto batch = sirius::test::operator_utils::make_numeric_batch(
+      *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+    REQUIRE(queue.push(make_test_gpu_task(1, {batch})));
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+    auto cd = provider.get_next_convertible(e.gpu_space, false);
+    REQUIRE(cd != nullptr);
+    cd->record_conversions(true);
+    REQUIRE(cd->convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+    REQUIRE(cd->converted_batches().size() == 1);
+    CHECK_FALSE(dynamic_cast<sirius::convertible_gpu_pipeline_task&>(*cd)
+                  .downgraded_task_record()
+                  .has_value());
+  }
 }

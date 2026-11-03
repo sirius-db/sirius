@@ -1,0 +1,9 @@
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      device_budget: 0.25
+      device_ceiling: 0.6
+      host_budget: 0.15
+      host_ceiling: 0.55

@@ -26,6 +26,9 @@ graph TD
 
     DE["downgrade_executor(s)"] -->|"monitor pressure"| MRM
     DE -->|"move GPU→Host"| DRM
+    DE -.->|"task_downgraded"| PL["preload_executor (optional)"]
+    PE -.->|"task_popped, task_downgraded"| PL
+    PL -->|"move Host/Disk→GPU, Disk→Host"| DRM
 
     subgraph SiriusContext
         MRM
@@ -34,6 +37,7 @@ graph TD
         TC
         SM
         DE
+        PL
     end
 ```
 
@@ -52,6 +56,7 @@ SiriusContext
 ├── task_scheduler                      # Top-level executor (owns the GPU pipeline executors)
 ├── sirius_scan_manager                 # Scan-side preparation + I/O (io_context, prefetch cache, split providers)
 ├── downgrade_executor[]                # Per-memory-space monitors for GPU→Host spilling
+├── preload_executor                    # Optional (executor.preload): promotes spilled inputs of queued tasks
 ├── task_creator                        # Creates GPU pipeline tasks based on data availability
 └── per-query scan/creator state         # Registered and retired by query ID
 ```
@@ -119,7 +124,16 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 │  - Manager thread: dispatches downgrade tasks                   │
 │  - Worker threads: move data GPU→Host                           │
 └─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Preload Executor (only when a preload budget is > 0)           │
+│  - Event subscriber thread: task_downgraded, task_popped        │
+│  - One worker thread per GPU (preload-<gpu>): at most one       │
+│    promotion per task_popped on that GPU                        │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+The task scheduler and the downgrade executor only publish events to the preload executor. Its workers copy outside the executor's lock and never wait for a batch lock (`try_to_mutable`). See [Memory Management](memory-management.md#preload-executor).
 
 ## Execution Lifecycle
 
@@ -138,7 +152,7 @@ A query through Super Sirius follows these steps:
 6. **Scan Phase** — The scan manager drives split providers that pull bytes through the `io_context` (io_uring locally, or REST/kvikio backends) and the prefetching cache; the unified GPU scan source consumes splits and materializes GPU-ready batches into data repositories
 7. **Pipeline Execution** — GPU executor threads pull tasks from the queue, acquire memory reservations, and call `execute()` on every operator in the pipeline (source through sink) on CUDA streams, then call the sink's `sink()` to push results downstream
 8. **Task Creation** — After each task completes, the task creator is notified to schedule downstream consumers based on data availability in ports
-9. **Memory Management** — Downgrade executors monitor GPU memory pressure and spill data to host memory when thresholds are exceeded
+9. **Memory Management** — Downgrade executors monitor GPU memory pressure and spill data to host memory when thresholds are exceeded; when enabled, the preload executor moves spilled inputs of queued tasks back toward the GPU before the tasks run
 10. **Completion** — A query-terminal pipeline signals the completion future when it transitions to finished; the GPU task epilogue may also signal it safely
 11. **Result Extraction** — The main thread extracts the `MaterializedQueryResult` from the result collector and returns it to DuckDB
 
@@ -159,4 +173,5 @@ A query through Super Sirius follows these steps:
 | `src/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
 | `src/io/io_context.hpp` | I/O backends (uring / rest / kvikio) + prefetch cache |
 | `src/downgrade/downgrade_executor.hpp` | Memory spilling |
+| `src/preload/preload_executor.hpp` | Optional promotion of queued tasks' spilled inputs |
 | `src/memory/sirius_memory_reservation_manager.hpp` | Memory management |

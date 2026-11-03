@@ -229,6 +229,17 @@ On OOM the engine triggers a **downgrade**:
 
 After a downgrade frees enough space, the rescheduled task retries. The reservation tracking ensures the same task doesn't try to allocate more bytes than its reservation; if the reservation itself can't grow, the task fails out of the pipeline.
 
+### Preload targets across GPUs
+
+The optional preload executor ([Memory Management](memory-management.md#preload-executor)) promotes spilled inputs of queued tasks to a GPU before they run. It has one worker thread per GPU, and each GPU has its own pop credits, budget and ceiling. A pop on GPU `g` promotes only to `g`, and only inputs of tasks that prefer `g` or have no preference:
+
+| Candidate task | Promoted on a pop of |
+|---|---|
+| Prefers GPU `d` (preference is binding) | GPU `d` only |
+| No preference | Any GPU; the input goes to the popping GPU |
+
+A no-preference task may later run on another GPU, which then clones the promoted input like any other cross-GPU input (`clone_to`, above). Preload itself never moves a batch between GPUs: an input already on any GPU is left alone. When `g` has no room, a DISK input is staged on `g`'s NUMA-local HOST space (from the topology's NUMA node of `g`), else on the first HOST space; a HOST space's staging budget is shared by every GPU that stages into it.
+
 ## Concurrency Invariants (Quick Reference)
 
 | Invariant | Where enforced | Why |

@@ -41,6 +41,8 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "preload/preload_executor.hpp"
+#include "preload/preload_streams.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
@@ -605,6 +607,9 @@ void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirem
   if (mode == query_retirement_mode::cancelled && task_scheduler_) {
     task_scheduler_->discard_query_tasks(query_id);
   }
+  // Preload holds no lease between promotions, and the gate above refuses new ones, so it can
+  // drop the query now; a promotion still running is covered by the barrier below.
+  if (preload_executor_) { preload_executor_->retire_query(query_id); }
   // The sole query-wide work barrier: includes manager-held tasks, callbacks and spill victims.
   query_lifecycle_.wait_for_work(query_id);
 }
@@ -1170,15 +1175,75 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
-  // has been constructed.
+  // has been constructed, and let them report each queued task they downgrade.
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
+    executor->set_query_event_publisher(*query_event_publisher_);
+  }
+
+  // Preload (docs/super-sirius/configuration.md). A GPU that tracks reservations per stream would
+  // not charge a promotion's copy to the reservation preload attaches, so device promotion is
+  // off there; DISK->HOST staging still runs.
+  auto preload_config      = config_.get_preload_executor_config();
+  bool per_stream_disabled = false;
+  if (preload_config.device_budget > 0.0) {
+    for (auto const& space : config_.get_memory_space_configs()) {
+      if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+          g != nullptr && g->per_stream_reservation) {
+        SIRIUS_LOG_WARN(
+          "[preload] device_budget is set but a GPU space tracks reservations per stream "
+          "(per_stream_reservation: true); device promotion is disabled");
+        preload_config.device_budget = 0.0;
+        per_stream_disabled          = true;
+        break;
+      }
+    }
+  }
+  if (!sirius::preload::preload_enabled(preload_config)) {
+    SIRIUS_LOG_INFO("[preload] not started: {} and host_budget is 0",
+                    per_stream_disabled
+                      ? "device preloading is disabled by per-stream reservation tracking"
+                      : "device_budget is 0");
+  } else {
+    if (preload_config.device_budget > 0.0) {
+      preload_streams_ = std::make_shared<sirius::preload::preload_streams>(active_gpu_ids);
+    }
+    preload_executor_ = std::make_unique<sirius::preload::preload_executor>(
+      *query_event_publisher_,
+      preload_config,
+      sirius::preload::preload_dependencies{
+        .lifecycle                = query_lifecycle_,
+        .memory                   = *memory_manager_,
+        .topology                 = topology_index_,
+        .streams                  = preload_streams_,
+        .pipeline_threads_per_gpu = config_.get_gpu_pipeline_executor_config().num_threads,
+        // The pinned cuCascade exposes no get_capacity()/get_downgrade_stop_threshold(); derive
+        // both from Sirius's own memory configuration so preload computes the same byte ceilings.
+        .space_capacity =
+          [configs = config_.get_memory_space_configs()](
+            cucascade::memory::memory_space_id id) -> sirius::preload::space_capacity_info {
+          for (auto const& space : configs) {
+            if (id.tier == cucascade::memory::Tier::GPU) {
+              if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+                  g != nullptr && g->device_id == id.device_id) {
+                return {g->memory_capacity, g->downgrade_stop_fraction};
+              }
+            } else if (id.tier == cucascade::memory::Tier::HOST) {
+              if (auto const* h = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+                  h != nullptr && h->numa_id == id.device_id) {
+                return {h->memory_capacity, h->downgrade_stop_fraction};
+              }
+            }
+          }
+          return {};
+        }});
   }
 
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {
     executor->start();
   }
+  if (preload_executor_) { preload_executor_->start(); }
   task_creator_->start_thread_pool();
   scan_manager_->start();
   task_scheduler_->start();
@@ -1210,6 +1275,9 @@ void SiriusContext::terminate()
   task_scheduler_->stop();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
+  // Null when preload is off. Joins a promotion still running: before clear(), which requires
+  // the work lease that promotion holds to be released.
+  if (preload_executor_) { preload_executor_->stop(); }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
@@ -1219,6 +1287,7 @@ void SiriusContext::terminate()
   task_creator_->reset_all();
   query_lifecycle_.clear();
   task_creator_.reset();
+  preload_executor_.reset();
   downgrade_executors_.clear();
   task_scheduler_.reset();
   telemetry_context_.reset();
@@ -1243,6 +1312,8 @@ void SiriusContext::terminate()
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
   // no borrower can outlive this.
   data_repository_registry_.clear();
+  // Only now: buffers in the repositories just dropped may have been freed on preload streams.
+  preload_streams_.reset();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
@@ -1325,6 +1396,18 @@ SiriusContext::get_downgrade_executors() const
 {
   throw_if_not_initialized();
   return downgrade_executors_;
+}
+
+sirius::preload::preload_executor* SiriusContext::get_preload_executor() const
+{
+  throw_if_not_initialized();
+  return preload_executor_.get();
+}
+
+std::weak_ptr<sirius::preload::preload_streams const> SiriusContext::preload_streams_for_testing()
+  const noexcept
+{
+  return preload_streams_;
 }
 
 sirius::creator::task_creator& SiriusContext::get_task_creator()

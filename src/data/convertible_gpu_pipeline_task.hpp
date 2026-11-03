@@ -19,12 +19,14 @@
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "event/downgraded_task.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_submission.hpp"
 
 #include <cuda/stream>
@@ -41,6 +43,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -117,6 +120,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * which acquires a mutable_data_batch (blocking or non-blocking), attempts the conversion,
    * and releases automatically via RAII.
    *
+   * While recording is on, each batch moved yields one record.
+   *
    * @param target_spaces  Candidate destination memory spaces (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
@@ -158,11 +163,17 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
       // Delegate to convertible_data_batch which handles to_mutable() internally
       sirius::convertible_data_batch batch_converter(batch);
+      batch_converter.record_conversions(recording());
       auto result = batch_converter.convert(target_spaces, stream, res_mgr, blocking);
       if (result) {
         any_converted = true;
         for (std::size_t i = 0; i < result->size(); ++i) {
           totals[i] += (*result)[i];
+        }
+        // Store each batch's record as soon as it moves, so batches moved before a later batch's
+        // convert() throws stay reported. Recording never fails a conversion.
+        for (auto const& rec : batch_converter.converted_batches()) {
+          note_converted(rec);
         }
       }
     }
@@ -220,6 +231,69 @@ class convertible_gpu_pipeline_task : public convertible_data {
     if (!gpt_ls) { return nullptr; }
 
     return dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
+  }
+
+  /**
+   * @brief A @c task_downgraded payload naming @p task, with no inputs yet.
+   *
+   * Shared by both producers of the event: @ref downgraded_task_record and the scheduler, which
+   * reports a task queued with inputs already off the GPU. The pipeline and query are read through
+   * a checked cast of the global state rather than gpu_pipeline_task::get_pipeline(), which assumes
+   * the global state is a gpu_pipeline_task_global_state and would dereference a foreign one.
+   *
+   * @param task The task to name.
+   * @return The query to report the payload under, and the payload with its task id, pipeline id,
+   *         preferred device and priority set; nullopt when @p task is not a gpu_pipeline_task or
+   *         has no pipeline.
+   */
+  [[nodiscard]] static std::optional<std::pair<query_id_t, event::downgraded_task>>
+  downgraded_task_identity(sirius::parallel::itask& task)
+  {
+    auto* gpt = task.as<sirius::pipeline::gpu_pipeline_task>();
+    if (!gpt) { return std::nullopt; }
+    auto const* gs =
+      dynamic_cast<const sirius::pipeline::gpu_pipeline_task_global_state*>(gpt->global_state());
+    auto const* pipe = gs ? gs->get_pipeline() : nullptr;
+    if (!pipe) { return std::nullopt; }
+    return std::pair{pipe->get_query_id(),
+                     event::downgraded_task{.task_id          = gpt->get_task_id(),
+                                            .pipeline_id      = pipe->get_pipeline_id(),
+                                            .preferred_device = gpt->get_preferred_device_id(),
+                                            .priority         = gpt->get_priority(),
+                                            .inputs           = {}}};
+  }
+
+  /**
+   * @brief The owned task's moves off the GPU, as one @c task_downgraded payload.
+   *
+   * One input per record in converted_batches() whose source is a GPU space, in the order the
+   * moves completed. Read once convert() has returned or thrown, while this wrapper still owns the
+   * task.
+   *
+   * Never throws: a lost record costs a promotion, never correctness.
+   *
+   * @return The query to report the payload under, and the payload; nullopt when no input moved
+   *         off the GPU, the task is not a gpu_pipeline_task, or it has no pipeline.
+   */
+  [[nodiscard]] std::optional<std::pair<query_id_t, event::downgraded_task>>
+  downgraded_task_record() const noexcept
+  {
+    try {
+      auto record = _task ? downgraded_task_identity(*_task) : std::nullopt;
+      if (!record) { return std::nullopt; }
+      auto const records = converted_batches();
+      auto& inputs       = record->second.inputs;
+      inputs.reserve(records.size());
+      for (auto const& rec : records) {
+        if (rec.from.tier != cucascade::memory::Tier::GPU) { continue; }
+        inputs.push_back(event::downgraded_input{
+          .batch = rec.batch, .batch_id = rec.batch_id, .to = rec.to, .gpu_bytes = rec.bytes});
+      }
+      if (inputs.empty()) { return std::nullopt; }
+      return record;
+    } catch (...) {
+      return std::nullopt;
+    }
   }
 
  private:

@@ -20,13 +20,19 @@
 
 #include <cuda/stream>
 
+#include <cucascade/memory/common.hpp>
+
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
+#include <utility>
 #include <vector>
 
 // Forward declarations -- avoid pulling in heavy headers
 namespace cucascade {
+class data_batch;
 namespace memory {
 class memory_space;
 }  // namespace memory
@@ -40,6 +46,19 @@ class sirius_memory_reservation_manager;
 
 namespace sirius {
 
+/// One batch moved by convert() while recording was on.
+struct conversion_record {
+  /// The batch that was moved. Never extends its lifetime.
+  std::weak_ptr<cucascade::data_batch> batch;
+  std::uint64_t batch_id{0};
+  /// Memory space the batch was in before the move.
+  cucascade::memory::memory_space_id from{cucascade::memory::Tier::SIZE, -1};
+  /// Memory space the batch is in after the move.
+  cucascade::memory::memory_space_id to{cucascade::memory::Tier::SIZE, -1};
+  /// Size of the batch in @c from.
+  std::size_t bytes{0};
+};
+
 /**
  * @brief Abstract interface for a single unit of data that can be converted between memory tiers.
  *
@@ -50,6 +69,9 @@ namespace sirius {
  * - Acquiring mutable_data_batch via to_mutable() (blocking) or try_to_mutable() (non-blocking)
  * - Performing the actual data conversion via convert_to on the mutable accessor
  * - RAII automatic state restoration on all exit paths (success, failure, exception)
+ * - Recording one @c conversion_record per successful batch conversion while
+ *   record_conversions(true) is in effect, so the caller can report what moved once
+ *   convert() has returned and every batch lock has been released.
  */
 class convertible_data {
   // Base member destruction follows derived destruction (which can return a batch to a repo).
@@ -62,6 +84,29 @@ class convertible_data {
   }
 
   virtual ~convertible_data() = default;
+
+  /**
+   * @brief Turn recording of successful batch conversions on or off.
+   *
+   * Off by default, in which case convert() records nothing and allocates nothing. Not
+   * synchronized: set it before the object is handed to the thread that calls convert().
+   */
+  void record_conversions(bool on) noexcept { _record = on; }
+
+  /**
+   * @brief Records of the batch conversions completed while recording was on.
+   *
+   * One entry per batch moved, in the order the moves completed. Records accumulate across
+   * convert() calls on this object and are never cleared, so a caller that converts an object more
+   * than once must not report the same records twice; the downgrade executor converts each object
+   * once. If convert() throws, the records of batches it moved before the throw are kept and remain
+   * readable. Read only after convert() has returned or thrown; the next convert() may invalidate
+   * the span.
+   */
+  [[nodiscard]] std::span<const conversion_record> converted_batches() const noexcept
+  {
+    return _converted;
+  }
 
   /**
    * @brief Convert this data unit to reside in one of the target memory spaces.
@@ -96,6 +141,28 @@ class convertible_data {
    * @return The size in bytes, or 0 if not in that space.
    */
   virtual std::size_t bytes_in_space(cucascade::memory::memory_space* space) const = 0;
+
+ protected:
+  /// Whether convert() should record its successful batch conversions.
+  [[nodiscard]] bool recording() const noexcept { return _record; }
+
+  /**
+   * @brief Append one conversion record.
+   *
+   * Never throws: if the record cannot be stored it is dropped. A lost record only means the
+   * move is not reported, which costs a missed promotion and never correctness.
+   */
+  void note_converted(conversion_record rec) noexcept
+  {
+    try {
+      _converted.push_back(std::move(rec));
+    } catch (...) {
+    }
+  }
+
+ private:
+  bool _record{false};
+  std::vector<conversion_record> _converted;
 };
 
 /**

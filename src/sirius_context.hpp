@@ -68,6 +68,11 @@ namespace sirius::vss {
 class cuvs_index_cache;
 }  // namespace sirius::vss
 
+namespace sirius::preload {
+class preload_executor;
+class preload_streams;
+}  // namespace sirius::preload
+
 namespace sirius::memory {
 class numa_small_pinned_mr;
 class topology_index;
@@ -538,6 +543,9 @@ class SiriusContext : public ClientContextState {
   std::function<void()> cpu_replay_hook_for_testing;
   std::function<void()> cpu_replay_query_hook_for_testing;
   void before_cpu_replay_for_testing(ClientContext& context);
+  /// The preload stream pools; empty unless preload promotes to GPUs.
+  [[nodiscard]] std::weak_ptr<sirius::preload::preload_streams const> preload_streams_for_testing()
+    const noexcept;
 
   /// \brief Whether the given connection is inside an internal-query bracket.
   [[nodiscard]] static bool is_internal_query_active(ClientContext& context) noexcept;
@@ -755,6 +763,9 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
   get_downgrade_executors() const;
 
+  /// \brief The preload executor, or nullptr when both preload budgets are 0.
+  [[nodiscard]] sirius::preload::preload_executor* get_preload_executor() const;
+
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
@@ -950,6 +961,11 @@ class SiriusContext : public ClientContextState {
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
+  // Preload's stream pools; null unless preload promotes to GPUs. They must outlive every
+  // repository, since GPU buffers a DISK->GPU preload allocated are freed on a preload stream
+  // until their consumer rebinds them: declared before data_repository_registry_ so they are
+  // destroyed after it even when terminate() throws.
+  std::shared_ptr<sirius::preload::preload_streams> preload_streams_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
   /// Observes where a query is in its execution.  Declared before the creator
@@ -965,6 +981,10 @@ class SiriusContext : public ClientContextState {
   // throws before terminate() can run; terminate() also stops their threads before reset.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
+  // Null unless preload is enabled. Borrows the lifecycle registry, the memory manager and the
+  // publisher, so it is declared after them: if initialize() throws once it has started, its
+  // destructor joins its threads before any of those is destroyed.
+  std::unique_ptr<sirius::preload::preload_executor> preload_executor_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 

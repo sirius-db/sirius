@@ -1,0 +1,6 @@
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      host_ceiling: -0.1

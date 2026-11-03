@@ -54,6 +54,7 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/downgrade/test_downgrade_task_events.cpp
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
@@ -124,6 +125,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_single_join.cpp
     test/cpp/integration/test_gpu_execution_unsigned_narrowing.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
+    test/cpp/integration/test_gpu_execution_preload.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
@@ -226,6 +228,8 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
+    test/cpp/preload/test_preload_executor.cpp
+    test/cpp/preload/test_preload_promotion.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_build_probe_reclaim.cpp
     test/cpp/operator/test_ungrouped_aggregate_empty_input.cpp

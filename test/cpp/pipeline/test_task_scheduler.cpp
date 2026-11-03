@@ -16,11 +16,19 @@
 
 #include "catch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
+#include "data/data_batch_utils.hpp"
+#include "event/downgraded_task.hpp"
+#include "event/event.hpp"
+#include "event/query_event_publisher.hpp"
+#include "event/query_event_subscriber.hpp"
 #include "exec/config.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/query_retirement_test_utils.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "query_id.hpp"
 #include "scan/test_utils.hpp"
@@ -30,14 +38,29 @@
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
+#include <cucascade/data/common.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 using namespace sirius::pipeline;
 using namespace sirius::parallel;
@@ -400,9 +423,10 @@ void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
 
 // Regression test for the #1467 deadlock: the downgrade executor extracts
 // queued tasks and returns them via convertible_gpu_pipeline_task's RAII
-// destructor — a direct queue push with no task_available event. With every
-// executor already parked, the pre-fix loop (blocked on the channel) never
-// dispatched them; this stages that interleaving and times out on it.
+// destructor — a direct queue push that bypasses schedule(). With every
+// executor already parked, a loop that heard about new work only from
+// schedule() (blocked on the channel) never dispatched them; this stages that
+// interleaving and times out on it.
 TEST_CASE("Tasks extracted and RAII-returned while executors are parked still run",
           "[task_scheduler][deadlock-1467]")
 {
@@ -448,6 +472,149 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
                "(downgrade return emitted no event and the matcher never re-ran)");
 
   sched.stop();
+}
+
+namespace {
+
+/// Counts executor_awaiting_task deliveries (one per matcher pass that finds a parked device with
+/// no placeable task) and task_queue_empty deliveries.
+class awaiting_task_counter : public sirius::event::query_event_subscriber {
+ public:
+  explicit awaiting_task_counter(sirius::event::query_event_publisher& publisher)
+    : query_event_subscriber(publisher,
+                             {sirius::event::event_type::executor_awaiting_task,
+                              sirius::event::event_type::task_queue_empty})
+  {
+  }
+
+  ~awaiting_task_counter() override { stop(); }
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "awaiting_task_counter"; }
+
+  void on_executor_awaiting_task(sirius::event::event_id_t,
+                                 sirius::event::timestamp_t,
+                                 int) noexcept override
+  {
+    _count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void on_task_queue_empty(sirius::event::event_id_t, sirius::event::timestamp_t) noexcept override
+  {
+    _queue_empty_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] std::size_t count() const { return _count.load(std::memory_order_relaxed); }
+
+  [[nodiscard]] std::size_t queue_empty_count() const
+  {
+    return _queue_empty_count.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<std::size_t> _count{0};
+  std::atomic<std::size_t> _queue_empty_count{0};
+};
+
+/// executor_awaiting_task deliveries over @p window while the scheduler is otherwise idle.
+std::size_t awaiting_events_over(awaiting_task_counter const& counter,
+                                 std::chrono::milliseconds window)
+{
+  const auto before = counter.count();
+  std::this_thread::sleep_for(window);
+  return counter.count() - before;
+}
+
+}  // namespace
+
+// A parked device facing a queue that holds only work it cannot take (every task prefers another
+// device) must sleep until the channel reports new work or readiness, not re-run the matcher.
+TEST_CASE("A parked device with only unplaceable queued work does not spin the scheduler",
+          "[task_scheduler]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  auto manager = initialize_memory_manager(1);
+  auto events  = std::make_shared<sirius::event::query_event_publisher>();
+  awaiting_task_counter counter(*events);
+  counter.start();
+  // One worker thread, so the single GPU parks exactly once between tasks.
+  task_scheduler sched(lifecycle, {1}, *manager, sirius::test::make_test_telemetry_context());
+  sched.set_query_event_publisher(*events);
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  auto make_task    = [&](int id, std::optional<int> preferred_device) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(id, 0);
+    if (preferred_device) { local_state->set_preferred_device_id(*preferred_device); }
+    return std::make_unique<mock_gpu_pipeline_task>(id, std::move(local_state), global_state);
+  };
+
+  // Prefers a device that has no executor here, so GPU 0 can never take it.
+  constexpr int kAbsentDevice = 7;
+  sched.schedule(make_task(0, kAbsentDevice));
+  // A placeable task, extracted the way the downgrade executor's TIER-2 pass does, so that its
+  // RAII return can be replayed while GPU 0 sleeps. Extracted before start() so the matcher
+  // cannot dispatch it first.
+  sched.schedule(make_task(1, std::nullopt));
+  auto* queue    = sched.get_pipeline_task_queue();
+  auto extracted = queue->mutable_pop_if(
+    [](sirius::parallel::itask& t) {
+      return !dynamic_cast<gpu_pipeline_task&>(t).get_preferred_device_id().has_value();
+    },
+    /*front_to_back=*/true);
+  REQUIRE(extracted.has_value());
+  auto returned = std::make_unique<sirius::convertible_gpu_pipeline_task>(
+    std::move(*extracted), *queue, lifecycle);
+  REQUIRE(queue->size() == 1);
+  sched.start();
+
+  // The first matcher pass with GPU 0 parked reports it awaiting a task it can take.
+  wait_or_fail([&] { return counter.count() >= 1; }, 10s, "GPU 0 never parked on the scheduler");
+  // Nothing posts to the channel during the window, so the expected count is 0; the slack only
+  // absorbs in-flight events. A spinning loop runs tens of thousands of passes per window.
+  constexpr std::size_t kMaxIdlePasses = 5;
+  CHECK(awaiting_events_over(counter, 200ms) <= kMaxIdlePasses);
+  REQUIRE(global_state->executed_count.load() == 0);
+  REQUIRE(counter.queue_empty_count() == 0);
+  bool unplaceable_task_drained = false;
+
+  SECTION("a task returned straight into the queue wakes the parked device")
+  {
+    // The RAII return pushes into the queue directly, bypassing schedule().
+    returned.reset();
+    wait_or_fail([&] { return global_state->executed_count.load() == 1; },
+                 5s,
+                 "LOST WAKE: a task returned to the queue never reached the parked device");
+  }
+  SECTION("a scheduled task wakes the parked device")
+  {
+    sched.schedule(make_task(2, std::nullopt));
+    wait_or_fail([&] { return global_state->executed_count.load() == 1; },
+                 5s,
+                 "LOST WAKE: a scheduled task never reached the parked device");
+  }
+  SECTION("draining the unplaceable work reports the queue empty")
+  {
+    // A drain pushes nothing, yet must still wake the loop so the empty queue is reported.
+    sched.discard_query_tasks(sirius::make_query_id(0));
+    REQUIRE(queue->empty());
+    wait_or_fail([&] { return counter.queue_empty_count() >= 1; },
+                 5s,
+                 "a drained queue was never reported empty");
+    unplaceable_task_drained = true;
+  }
+
+  if (!unplaceable_task_drained) {
+    // GPU 0 re-parks after running it and goes quiet again in front of the same unplaceable task.
+    std::this_thread::sleep_for(100ms);
+    CHECK(awaiting_events_over(counter, 200ms) <= kMaxIdlePasses);
+    CHECK(queue->size() == 1);
+  }
+
+  sched.stop();
+  // Still held outside the returned-task section: the stopped queue refuses it, so it never runs.
+  const int executed_before_return = global_state->executed_count.load();
+  returned.reset();
+  CHECK(global_state->executed_count.load() == executed_before_return);
 }
 
 TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler][multi_gpu]")
@@ -628,4 +795,344 @@ TEST_CASE("successful retirement reports queued execution work before the work b
   scheduler.discard_query_tasks(q);
   lifecycle.wait_for_work(q);
   lifecycle.close(q);
+}
+
+namespace {
+
+/// The events a scheduler_event_recorder subscribes to: task_popped, and task_downgraded if asked.
+std::span<sirius::event::event_type const> recorded_events(bool with_task_downgraded)
+{
+  static constexpr std::array events{sirius::event::event_type::task_popped,
+                                     sirius::event::event_type::task_downgraded};
+  return std::span{events}.first(with_task_downgraded ? 2 : 1);
+}
+
+/// Every task_popped delivery, in delivery order, and, when asked, every task_downgraded delivery,
+/// each with its event id. Drains its mailbox on stop, so collect_downgrades() sees every event
+/// published before it.
+class scheduler_event_recorder final : public sirius::event::query_event_subscriber {
+ public:
+  struct popped {
+    sirius::event::event_id_t event_id;
+    sirius::query_id_t query;
+    std::uint64_t task_id;
+    std::size_t pipeline_id;
+    int gpu;
+    std::size_t tasks_left;
+  };
+
+  struct downgraded {
+    sirius::event::event_id_t event_id;
+    sirius::query_id_t query;
+    sirius::event::downgraded_task task;
+  };
+
+  explicit scheduler_event_recorder(sirius::event::query_event_publisher& publisher,
+                                    bool with_task_downgraded = false)
+    : query_event_subscriber(
+        publisher, recorded_events(with_task_downgraded), /*drain_on_stop=*/true)
+  {
+    start();
+  }
+
+  ~scheduler_event_recorder() override { stop(); }
+
+  [[nodiscard]] std::string_view name() const noexcept override
+  {
+    return "scheduler_event_recorder";
+  }
+
+  /// The pops that arrived once at least @p n did, or by @p timeout.
+  std::vector<popped> wait_for(std::size_t n, std::chrono::seconds timeout)
+  {
+    std::unique_lock lock(_mutex);
+    _cv.wait_for(lock, timeout, [&] { return _pops.size() >= n; });
+    return _pops;
+  }
+
+  /// Stop, delivering every event already published, and return the task_downgraded events.
+  std::vector<downgraded> collect_downgrades()
+  {
+    stop();
+    std::lock_guard lock(_mutex);
+    return _downgrades;
+  }
+
+ private:
+  void on_task_popped(sirius::event::event_id_t event_id,
+                      sirius::event::timestamp_t,
+                      sirius::query_id_t query_id,
+                      std::uint64_t task_id,
+                      std::size_t pipeline_id,
+                      int gpu,
+                      std::size_t tasks_left) noexcept override
+  {
+    std::lock_guard lock(_mutex);
+    _pops.push_back({event_id, query_id, task_id, pipeline_id, gpu, tasks_left});
+    _cv.notify_all();
+  }
+
+  void on_task_downgraded(sirius::event::event_id_t event_id,
+                          sirius::event::timestamp_t,
+                          sirius::query_id_t query_id,
+                          sirius::event::downgraded_task const& task) noexcept override
+  {
+    std::lock_guard lock(_mutex);
+    _downgrades.push_back({event_id, query_id, task});
+  }
+
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  std::vector<popped> _pops;
+  std::vector<downgraded> _downgrades;
+};
+
+/// Holds every task in execute() until released; counts the tasks that entered.
+struct execution_gate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open{false};
+  int entered{0};
+
+  void enter()
+  {
+    std::unique_lock lock(mu);
+    ++entered;
+    cv.notify_all();
+    cv.wait(lock, [&] { return open; });
+  }
+
+  bool wait_entered(int n, std::chrono::seconds timeout)
+  {
+    std::unique_lock lock(mu);
+    return cv.wait_for(lock, timeout, [&] { return entered >= n; });
+  }
+
+  void release()
+  {
+    std::lock_guard lock(mu);
+    open = true;
+    cv.notify_all();
+  }
+};
+
+/// A task of a real pipeline, with @p inputs as its input batches, that waits at @p gate when it
+/// runs.
+class gated_pipeline_task : public gpu_pipeline_task {
+ public:
+  gated_pipeline_task(uint64_t task_id,
+                      std::shared_ptr<gpu_pipeline_task_global_state> global_state,
+                      std::optional<int> preferred_device,
+                      execution_gate& gate,
+                      std::vector<std::shared_ptr<cucascade::data_batch>> inputs = {})
+    : gpu_pipeline_task(task_id,
+                        std::vector<cucascade::shared_data_repository*>{},
+                        make_local_state(preferred_device, std::move(inputs)),
+                        std::move(global_state)),
+      _gate(gate)
+  {
+  }
+
+  void execute(::cuda::stream_ref) override { _gate.enter(); }
+
+ private:
+  static std::unique_ptr<gpu_pipeline_task_local_state> make_local_state(
+    std::optional<int> preferred_device, std::vector<std::shared_ptr<cucascade::data_batch>> inputs)
+  {
+    auto local = std::make_unique<gpu_pipeline_task_local_state>(
+      std::make_unique<pipelineable_operator_data>(std::move(inputs)));
+    if (preferred_device) { local->set_preferred_device_id(*preferred_device); }
+    return local;
+  }
+
+  execution_gate& _gate;
+};
+
+/// A pipeline of @p query whose single operator is its source and sink, so its tasks can complete,
+/// and the global state its tasks share, with the priority of the pipeline's @p rank-th task.
+struct completable_pipeline {
+  sirius_physical_operator source_and_sink{
+    SiriusPhysicalOperatorType::FILTER, duckdb::vector<sirius::logical_type>{}, 0};
+  std::shared_ptr<sirius_pipeline> pipeline{
+    std::make_shared<sirius_pipeline>(pipeline_build_context{nullptr, true})};
+  sirius::exec::queue_priority priority;
+  std::shared_ptr<gpu_pipeline_task_global_state> global;
+
+  completable_pipeline(sirius::query_id_t query, std::size_t pipeline_id, std::int64_t rank)
+    : priority(static_cast<sirius::exec::queue_priority>(sirius::query_priority_bits(query) | rank))
+  {
+    source_and_sink.operator_id = 0;
+    sirius_pipeline_build_state build_state;
+    build_state.set_pipeline_source(*pipeline, source_and_sink);
+    build_state.set_pipeline_sink(*pipeline, &source_and_sink, /*sink_pipeline_count=*/1);
+    pipeline->set_query_id(query);
+    pipeline->set_pipeline_id(pipeline_id);
+    global = std::make_shared<gpu_pipeline_task_global_state>(
+      pipeline, sirius::test::make_test_telemetry_context());
+    global->set_priority(priority);
+  }
+};
+
+/// A representation of @p bytes in a memory space, holding no data. Counts the reads of its decoded
+/// size, which sizing the batch's materialization on a GPU reads.
+class sized_representation final : public cucascade::idata_representation {
+ public:
+  sized_representation(cucascade::memory::memory_space& space,
+                       std::size_t bytes,
+                       std::atomic<int>& size_reads)
+    : idata_representation(space), _bytes(bytes), _size_reads(size_reads)
+  {
+  }
+
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return _bytes; }
+
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    _size_reads.fetch_add(1);
+    return _bytes;
+  }
+
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
+    ::cuda::stream_ref) const override
+  {
+    return std::make_unique<sized_representation>(get_memory_space(), _bytes, _size_reads);
+  }
+
+ private:
+  std::size_t _bytes;
+  std::atomic<int>& _size_reads;
+};
+
+/// A batch of @p bytes in @p space; see sized_representation.
+std::shared_ptr<cucascade::data_batch> sized_batch(cucascade::memory::memory_space& space,
+                                                   std::size_t bytes,
+                                                   std::atomic<int>& size_reads)
+{
+  return cucascade::data_batch::make(
+    sirius::get_next_batch_id(), std::make_unique<sized_representation>(space, bytes, size_reads));
+}
+
+}  // namespace
+
+TEST_CASE(
+  "the scheduler publishes task_popped with the task, its pipeline and what the GPU can "
+  "still pop",
+  "[task_scheduler][preload]")
+{
+  auto const q = sirius::make_query_id(3);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(q);
+  auto manager = initialize_memory_manager(1);
+  completable_pipeline const pipeline(q, /*pipeline_id=*/9, /*rank=*/1);
+  auto const& global = pipeline.global;
+
+  execution_gate gate;
+  auto events = std::make_shared<sirius::event::query_event_publisher>();
+  scheduler_event_recorder recorder(*events);
+  // One worker thread: GPU 0 pops its next task only once the previous one has run.
+  task_scheduler sched(lifecycle, {1}, *manager, sirius::test::make_test_telemetry_context());
+  sched.set_query_event_publisher(*events);
+  // On every exit, so a failed REQUIRE cannot leave ~task_scheduler joining a worker held at the
+  // gate: declared after the scheduler, it runs first.
+  absl::Cleanup const open_gate = [&gate] { gate.release(); };
+
+  // GPU 0 pops its own bucket first, then the no-preference bucket in FIFO order; the task that
+  // prefers another device is never counted.
+  sched.schedule(std::make_unique<gated_pipeline_task>(1, global, 0, gate));
+  sched.schedule(std::make_unique<gated_pipeline_task>(2, global, std::nullopt, gate));
+  sched.schedule(std::make_unique<gated_pipeline_task>(3, global, std::nullopt, gate));
+  constexpr int kAbsentDevice = 7;
+  sched.schedule(std::make_unique<gated_pipeline_task>(4, global, kAbsentDevice, gate));
+  sched.start();
+
+  REQUIRE(gate.wait_entered(1, 10s));
+  auto first = recorder.wait_for(1, 10s);
+  REQUIRE(first.size() == 1);
+  CHECK(first[0].query == q);
+  CHECK(first[0].task_id == 1);
+  CHECK(first[0].pipeline_id == 9);
+  CHECK(first[0].gpu == 0);
+  CHECK(first[0].tasks_left == 2);
+
+  gate.release();
+  REQUIRE(gate.wait_entered(3, 10s));
+  auto const all = recorder.wait_for(3, 10s);
+  REQUIRE(all.size() == 3);
+  CHECK(all[1].task_id == 2);
+  CHECK(all[1].tasks_left == 1);
+  CHECK(all[2].task_id == 3);
+  CHECK(all[2].tasks_left == 0);
+  for (auto const& e : all) {
+    CHECK(e.query == q);
+    CHECK(e.pipeline_id == 9);
+    CHECK(e.gpu == 0);
+  }
+  // Only the task GPU 0 cannot take is left.
+  CHECK(sched.get_pipeline_task_queue()->size() == 1);
+  sched.stop();
+}
+
+TEST_CASE("the scheduler publishes task_downgraded for a task queued with inputs off the GPU",
+          "[task_scheduler][preload]")
+{
+  auto const q = sirius::make_query_id(3);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(q);
+  auto manager = initialize_memory_manager(1);
+  auto* gpu    = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* host   = manager->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(gpu != nullptr);
+  REQUIRE(host != nullptr);
+  completable_pipeline const pipeline(q, /*pipeline_id=*/9, /*rank=*/1);
+  // Declared before the scheduler: the batches of the tasks it destroys count into it.
+  std::atomic<int> size_reads{0};
+
+  execution_gate gate;
+  // No task waits at the gate: the test reads the events once every task has run.
+  gate.release();
+  auto events = std::make_shared<sirius::event::query_event_publisher>();
+  task_scheduler sched(lifecycle, {1}, *manager, sirius::test::make_test_telemetry_context());
+  sched.set_query_event_publisher(*events);
+
+  // Nobody subscribes to task_downgraded: schedule() does not even read the inputs.
+  REQUIRE_FALSE(events->has_subscribers(sirius::event::event_type::task_downgraded));
+  sched.schedule(std::make_unique<gated_pipeline_task>(
+    1, pipeline.global, 0, gate, std::vector{sized_batch(*host, 4096, size_reads)}));
+  CHECK(size_reads.load() == 0);
+
+  scheduler_event_recorder recorder(*events, /*with_task_downgraded=*/true);
+  auto const on_gpu  = sized_batch(*gpu, 1024, size_reads);
+  auto const on_host = sized_batch(*host, 2048, size_reads);
+  sched.schedule(std::make_unique<gated_pipeline_task>(
+    2, pipeline.global, 0, gate, std::vector{on_gpu, on_host}));
+  // Every input is on the GPU: nothing to report.
+  sched.schedule(std::make_unique<gated_pipeline_task>(
+    3, pipeline.global, std::nullopt, gate, std::vector{sized_batch(*gpu, 512, size_reads)}));
+  sched.start();
+
+  REQUIRE(gate.wait_entered(3, 10s));
+  auto const popped = recorder.wait_for(3, 10s);
+  REQUIRE(popped.size() == 3);
+  auto const downgrades = recorder.collect_downgrades();
+  REQUIRE(downgrades.size() == 1);
+  auto const& [event_id, query, task] = downgrades.front();
+  CHECK(query == q);
+  CHECK(task.task_id == 2);
+  CHECK(task.pipeline_id == 9);
+  CHECK(task.priority == pipeline.priority);
+  CHECK(task.preferred_device == 0);
+  // Only the input off the GPU, where it is, with its size on a GPU.
+  REQUIRE(task.inputs.size() == 1);
+  CHECK(task.inputs[0].batch.lock() == on_host);
+  CHECK(task.inputs[0].batch_id == on_host->get_batch_id());
+  CHECK(task.inputs[0].to == host->get_id());
+  CHECK(task.inputs[0].gpu_bytes == 2048);
+
+  // Published before the task was pushed, so before it could be popped: preload can tell this
+  // event from one about the task delivered after its pop.
+  auto const pop =
+    std::find_if(popped.begin(), popped.end(), [](auto const& e) { return e.task_id == 2; });
+  REQUIRE(pop != popped.end());
+  CHECK(event_id < pop->event_id);
+  sched.stop();
 }

@@ -206,7 +206,7 @@ if (evt->kind == task_request_kind::device_ready) {
 }
 ```
 
-`schedule()` pushes directly into the task queue and also publishes `task_available`. The queue push wakes a matcher waiting for work while a device is already ready; the channel event wakes it when it is waiting for a device signal.
+Every successful push into the task queue publishes `task_available` through the queue's enqueue listener, whichever path pushed (`schedule()` or the downgrade executor returning an extracted task); so does a per-query drain. The push itself wakes a matcher waiting on an empty queue; the channel event wakes it while it waits for a device signal or behind work no ready device can take.
 
 **Per-device match.** The scheduler first selects the highest-priority exact-device task and
 considers the unbound bucket only if no exact-device task is available. Priority ordering applies
@@ -264,6 +264,7 @@ sub-executor or scan-priority queue owned here.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
+| `schedule(task)` | Admits the task through its query's lifecycle gate and pushes it into the queue. While anyone subscribes to `task_downgraded` (the preload executor), it first publishes one for a task whose input batches are not all on a GPU, listing those inputs; see [Memory Management](memory-management.md#events) |
 | `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator` |
 | `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
 | `validate_query_complete(query_id)` | Checks execution queues after the owner settles publication; does not wait |
@@ -272,18 +273,22 @@ sub-executor or scan-priority queue owned here.
 ### Management Event Loop
 
 `management_eventloop()` is a pull-signal matcher on a dedicated thread. GPU executors publish
-`device_ready` when a worker is available; `schedule()` publishes `task_available` after adding a
-task. Ready devices remain recorded until a compatible task arrives:
+`device_ready` when a worker is available; the task queue's enqueue listener publishes
+`task_available` after every successful push. Ready devices remain recorded until a compatible
+task arrives:
 
 ```
 while running:
-    1. Collect device_ready events; block on the request channel only when no device is ready
+    1. Collect device_ready events; block on the request channel when no device is ready, or
+       when the previous pass found no queued task that fits any ready device
     2. If the task queue is empty, ask the task creator to look ahead, then wait for a queue push
        (schedule_lookahead(first ready device) — speculatively warms up a
        not-yet-activated scan; no-op unless strategy is `lookahead`)
     3. For each ready device, select a compatible queued task:
        a. pop the highest-priority exact-preference task
        b. if none exists, pop the highest-priority unbound task
+       c. if anyone subscribes (the preload executor), publish task_popped with the device and
+          the tasks it can still pop (its own bucket plus the unbound one)
     4. Dispatch; consume readiness only if the executor accepts the task
 ```
 

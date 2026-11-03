@@ -489,6 +489,16 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, preload::preload_executor_config& opt)
+{
+  yaml::reader r(node, "preload");
+  r.optional("device_budget", opt.device_budget, yaml::fraction<double>{});
+  r.optional("device_ceiling", opt.device_ceiling, yaml::fraction<double>{});
+  r.optional("host_budget", opt.host_budget, yaml::fraction<double>{});
+  r.optional("host_ceiling", opt.host_ceiling, yaml::fraction<double>{});
+  r.reject_unknown();
+}
+
 namespace {
 
 struct topology {
@@ -886,6 +896,7 @@ try {
     if (auto n = er.optional_node("pipeline"))
       from_yaml(*n, settings._gpu_pipeline_executor_config);
     if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
+    if (auto n = er.optional_node("preload")) from_yaml(*n, settings._preload_executor_config);
     er.reject_unknown();
   }
 
@@ -1101,6 +1112,11 @@ const exec::thread_pool_config& sirius_config::get_gpu_pipeline_executor_config(
 const exec::downgrade_executor_config& sirius_config::get_downgrade_executor_config() const noexcept
 {
   return _downgrade_executor_config;
+}
+
+const preload::preload_executor_config& sirius_config::get_preload_executor_config() const noexcept
+{
+  return _preload_executor_config;
 }
 
 const creator::task_creator_config& sirius_config::get_task_creator_config() const noexcept

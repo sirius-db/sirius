@@ -352,8 +352,6 @@ TEST_CASE("adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
   INFO("MGPU-07 integration ratio check: batch_ratio="
        << batch_ratio << " expected=" << free_ratio_gpu1_over_gpu0 << " delta=" << delta);
   REQUIRE(delta <= 0.10);
-
-  sirius::converter_registry::shutdown();
 }
 
 //===----------------------------------------------------------------------===//

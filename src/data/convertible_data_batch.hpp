@@ -41,6 +41,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -81,6 +82,8 @@ class convertible_data_batch : public convertible_data {
    * reservation in each via the reservation manager. On the first successful reservation
    * the batch is converted via convert_to on the mutable accessor. The mutable_data_batch
    * RAII destructor automatically restores the batch to idle on all exit paths.
+   *
+   * While recording is on, a successful conversion appends one record.
    *
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
@@ -180,6 +183,21 @@ class convertible_data_batch : public convertible_data {
             converter_registry, *reservation, stream);
           break;
         default: continue;
+      }
+
+      if (recording()) {
+        // The batch has already moved and cannot be moved back, so a failure while building the
+        // record drops the record rather than failing the conversion.
+        try {
+          conversion_record rec;
+          rec.batch    = _batch;
+          rec.batch_id = mut.get_batch_id();
+          if (cur_space != nullptr) { rec.from = cur_space->get_id(); }
+          rec.to    = space->get_id();
+          rec.bytes = data_size;
+          note_converted(std::move(rec));
+        } catch (...) {
+        }
       }
 
       // RAII: mutable_data_batch destructor releases the mutable lock and transitions back to idle

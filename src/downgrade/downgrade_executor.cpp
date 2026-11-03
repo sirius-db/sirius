@@ -20,6 +20,8 @@
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
+#include "event/downgraded_task.hpp"
+#include "event/query_event_publisher.hpp"
 #include "log/logging.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -27,6 +29,7 @@
 #include <absl/cleanup/cleanup.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <exception>
 #include <optional>
@@ -390,6 +393,16 @@ void downgrade_executor::processing_loop()
 
       // === TIER 2: task_scheduler task queue ===
       if (!req->satisfied.load() && !target_completed() && _pipeline_task_queue) {
+        // Tier 2 records its moves and reports each converted task (task_downgraded) only while
+        // someone listens; the answer is fixed for the whole pass so a worker never copies the
+        // publisher handle when nobody does.
+        bool const report_task_downgrades =
+          _query_event_publisher != nullptr &&
+          _query_event_publisher->has_subscribers(event::event_type::task_downgraded);
+        auto const task_queue_publisher = report_task_downgrades
+                                            ? _query_event_publisher
+                                            : std::shared_ptr<event::query_event_publisher>{};
+
         size_t max_tasks_to_convert = _pipeline_task_queue->size();
         size_t tasks_converted      = 0;
         failed_pipeline_candidates.reserve(max_tasks_to_convert);
@@ -403,6 +416,7 @@ void downgrade_executor::processing_loop()
             pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
           if (!candidate) break;
           tasks_converted++;
+          candidate->record_conversions(report_task_downgrades);
 
           auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -431,7 +445,8 @@ void downgrade_executor::processing_loop()
              &pipeline_queue_stats,
              &host_target_stats,
              &disk_target_stats,
-             predicate_satisfied]() mutable {
+             predicate_satisfied,
+             publisher = task_queue_publisher]() mutable {
               absl::Cleanup rollback = [&]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
                 std::lock_guard lock(failed_pipeline_candidates_mutex);
@@ -463,6 +478,17 @@ void downgrade_executor::processing_loop()
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
               } catch (...) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue");
+              }
+              // One task_downgraded for the task. Runs before `rollback`, while the wrapper still
+              // owns the extracted task, so the task cannot be popped again before the event is
+              // published, and also after a throw: inputs moved before it stay recorded.
+              if (publisher) {
+                if (auto const* task_cand =
+                      dynamic_cast<convertible_gpu_pipeline_task const*>(cand.get())) {
+                  if (auto record = task_cand->downgraded_task_record()) {
+                    publisher->publish_task_downgraded(record->first, std::move(record->second));
+                  }
+                }
               }
             });
         }
@@ -708,6 +734,12 @@ void downgrade_executor::set_pipeline_task_queue(
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
 {
   _pipeline_task_queue = pipeline_task_queue;
+}
+
+void downgrade_executor::set_query_event_publisher(sirius::event::query_event_publisher& publisher)
+{
+  assert(!_running.load() && "set_query_event_publisher must not race the processing thread");
+  _query_event_publisher = publisher.shared_from_this();
 }
 
 // --- Public request API ---
