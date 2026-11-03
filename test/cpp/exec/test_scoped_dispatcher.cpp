@@ -319,3 +319,53 @@ TEST_CASE("dispatcher bounded stop retains cleanup ownership until the last capt
   CHECK(disposed_at_notification == 5);
   CHECK(executed == 0);
 }
+
+TEST_CASE("dispatcher routes continuations to permanent worker domains",
+          "[scoped_dispatcher][metadata_placement]")
+{
+  using namespace sirius::exec;
+  auto allowed = thread_util::get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  auto second = allowed.size() > 1 ? allowed[1] : allowed[0];
+  static_thread_pool pool(2, "domain_test", {}, nullptr, {{allowed[0]}, {second}});
+  scoped_dispatcher dispatcher(pool, 1);  // Force every subsequent job through pending/handoff.
+  std::atomic<unsigned> wrong{0}, completed{0};
+  for (int i = 0; i < 100; ++i) {
+    auto domain = i % 2;
+    dispatcher.enqueue(
+      [&, domain] {
+        auto actual = thread_util::get_current_thread_affinity();
+        if (actual != std::vector<int>{domain ? second : allowed[0]}) ++wrong;
+        ++completed;
+      },
+      domain,
+      i % 3 == 0);
+  }
+  dispatcher.wait_for_all();
+  CHECK(completed == 100);
+  CHECK(wrong == 0);
+}
+
+TEST_CASE("coalescing bypasses metadata backlog without starving metadata", "[scoped_dispatcher]")
+{
+  using namespace sirius::exec;
+  static_thread_pool pool(1);
+  scoped_dispatcher dispatcher(pool);
+  std::promise<void> entered, release;
+  auto released = release.get_future();
+  dispatcher.enqueue([&] {
+    entered.set_value();
+    released.wait();
+  });
+  entered.get_future().wait();
+  std::vector<char> order;
+  for (int i = 0; i < 20; ++i)
+    dispatcher.enqueue([&] { order.push_back('m'); });
+  for (int i = 0; i < 20; ++i)
+    dispatcher.enqueue([&] { order.push_back('c'); }, -1, true);
+  release.set_value();
+  dispatcher.wait_for_all();
+  REQUIRE(order.size() == 40);
+  for (size_t i = 0; i < order.size(); ++i)
+    CHECK(order[i] == (i % 2 ? 'm' : 'c'));
+}

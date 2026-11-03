@@ -32,6 +32,10 @@ struct clocked_parquet_coalescer : scan::batch_coalescer {
   std::unique_ptr<scan::batch_coalescer> inner;
   std::function<clock::time_point()> now;
   std::function<void()> after_advance;
+  bool asynchronous_preparation() const noexcept override
+  {
+    return inner->asynchronous_preparation();
+  }
   size_t target_batch_bytes() const noexcept override { return inner->target_batch_bytes(); }
   size_t retained_bytes() const noexcept override { return inner->retained_bytes(); }
   void update_time()
