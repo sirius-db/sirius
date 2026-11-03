@@ -88,6 +88,29 @@ repos:
           [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
   - repo: local
     hooks:
+      - id: check-clang-tidy-runner
+        name: check clang-tidy runner behavior
+        entry: python3 -m unittest discover -s scripts -p test_run_clang_tidy.py
+        language: system
+        files: ^scripts/(run_clang_tidy|test_run_clang_tidy)\.py$
+        pass_filenames: false
+      - id: clang-tidy
+        name: advisory clang-tidy on selected sources
+        entry: pixi run --locked python scripts/run_clang_tidy.py
+        language: system
+        stages: [manual]
+        files: '(^([.]clang-tidy|CMakeLists[.]txt|CMakePresets[.]json|pixi[.](toml|lock))$|^cmake/|^(src|include|test)/.*(CMakeLists[.]txt|[.]cmake|[.](c|cc|cpp|cxx|h|hh|hpp|hxx))$)'
+        require_serial: true
+        verbose: true
+      - id: clang-tidy-all
+        name: advisory clang-tidy on all configured sources
+        entry: pixi run --locked python scripts/run_clang_tidy.py --all
+        language: system
+        stages: [manual]
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+        verbose: true
       - id: rumdl
         name: rumdl check --fix
         entry: pixi run --locked rumdl check --fix

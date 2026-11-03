@@ -21,5 +21,5 @@ set(SIRIUS_SUBSTRAIT_SOURCES
 # The vendored/generated protobuf + substrait TUs are not warning-clean; never
 # fail the build on them.
 set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
-                            PROPERTIES COMPILE_OPTIONS "-w" SKIP_LINTING ON)
+                            PROPERTIES COMPILE_OPTIONS "-w")
 target_sources(sirius_objects PRIVATE ${SIRIUS_SUBSTRAIT_SOURCES})

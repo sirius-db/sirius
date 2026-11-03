@@ -53,8 +53,8 @@ Checks:
        performance-unnecessary-value-param'
 
 WarningsAsErrors: '*'
-HeaderFilterRegex: '.*cudf/cpp/(src|include).*'
-ExcludeHeaderFilterRegex: '.*(Message_generated.h|Schema_generated.h|brotli_dict.hpp|unbz2.hpp|cxxopts.hpp).*'
+# The standalone runner supplies an absolute filter for owned headers.
+ExcludeHeaderFilterRegex: '.*(Message_generated.h|Schema_generated.h|brotli_dict.hpp|unbz2.hpp|cxxopts.hpp|/third_party/).*'
 FormatStyle:     none
 CheckOptions:
  - key:             modernize-loop-convert.MaxCopySize

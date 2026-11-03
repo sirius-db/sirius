@@ -57,27 +57,59 @@ pre-commit run -a
 Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`, and
 `rumdl` (Markdown links and anchors).
 
-CI runs clang-tidy with the repository's `.clang-tidy` configuration on C/C++
-sources in Sirius-owned targets during the Linux Clang debug build, including
-tests and benchmarks. Findings are reported as
-warnings; compiler errors still fail the build. CUDA translation units, generated
-sources, and third-party sources are excluded. Enable the same checks locally:
+Clang-tidy runs separately from compilation through manual pre-commit hooks.
+Prepare the Clang debug build first so its compilation database and generated
+headers exist (CUDA dependencies and initialized build submodules are required):
 
 ```bash
-pixi run --locked cmake --preset clang-debug -DSIRIUS_ENABLE_CLANG_TIDY=ON
-pixi run --locked cmake --build --preset clang-debug
+pixi run --locked cmake --preset clang-debug -DCMAKE_CUDA_ARCHITECTURES=100
+pixi run --locked make clang-debug
 ```
 
-Incremental builds check only sources being rebuilt. To check all configured
-sources under `src/` after building:
+Choose a CUDA architecture appropriate for your GPU. Analysis uses the full
+repository `.clang-tidy` check set. Findings are advisory; missing prerequisites,
+invalid selections, and compiler errors fail the command. The hooks do not build,
+configure, or apply fixes, and do not run during normal commits or ordinary lint CI.
+
+Check selected C/C++ sources:
 
 ```bash
-pixi run --locked run-clang-tidy -p build/clang-debug -j 4 \
-  -warnings-as-errors='-*' "$PWD/src/.*[.](c|cc|cpp|cxx)$"
+pixi run pre-commit run --hook-stage manual clang-tidy --files src/io/uri_parser.cpp
 ```
 
-Public re-exports can be declared using Clang's
-`IWYU pragma: export` and `IWYU pragma: begin_exports` / `end_exports` annotations.
+For header, CMake, or clang-tidy configuration changes, check all configured
+sources in the main library and unit-test targets:
+
+```bash
+pixi run pre-commit run --hook-stage manual clang-tidy-all
+```
+
+Always name the hook: invoking all manual hooks also runs the selected-source
+hook, which rejects headers/configuration files and asks for `clang-tidy-all`.
+
+The full run can be expensive. Optional standalone benchmarks/cache-test targets,
+CUDA translation units, generated sources, and third-party sources are excluded.
+The runner reports diagnostics in owned `src/`, `include/`, and `test/` headers,
+excluding third-party headers. Headers are analyzed through source compilation
+contexts; the selected-source hook asks for the full run on header/configuration
+changes. Newly added sources
+must be tracked and included in the configured targets before analysis.
+
+For another prepared build, set `SIRIUS_CLANG_TIDY_BUILD_DIR`. Set
+`SIRIUS_CLANG_TIDY_JOBS` to control hook parallelism (default: four). The runner also
+accepts a build directory and worker limit directly:
+
+```bash
+pixi run python scripts/run_clang_tidy.py -p build/clang-debug -j 4 --all
+```
+
+The database preserves per-target language standards and compile definitions.
+Use the matching Pixi toolchain and rebuild after switching branches or changing
+build configuration. If generated telemetry headers disappear while Cargo reports
+its bridge build as cached, prepare a fresh build directory.
+
+Public re-exports can be declared using Clang's `IWYU pragma: export` and
+`IWYU pragma: begin_exports` / `end_exports` annotations.
 
 ## Submodules
 
