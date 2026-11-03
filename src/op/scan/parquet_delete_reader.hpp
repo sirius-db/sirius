@@ -39,6 +39,8 @@ struct parquet_delete_column {
 
 struct parquet_delete_read_options {
   std::optional<uint64_t> expected_size;
+  // Only a bound footer size triggers an explicit trailer read. The opened handle's
+  // identity is always rechecked after ParquetReader construction.
   std::optional<uint64_t> expected_footer_size;
   // Called on scan workers and before queued I/O. Throw to cancel the read.
   std::function<void()> check_stop;
@@ -49,6 +51,8 @@ struct parquet_delete_read_options {
   // open options/backend policy and this callback. Called on every handle before
   // and after decoding; must not reopen/rebind the object.
   std::function<void(duckdb::CachingFileHandle&)> verify_remote;
+  // Test rendezvous after decoding a nonempty batch, before reserving its rows.
+  std::function<void()> after_decode_for_testing;
 };
 
 // Called before decoding: validate format-specific schema, reserve output budget,
@@ -59,7 +63,8 @@ using parquet_delete_bind =
 using parquet_delete_consumer = std::function<void(duckdb::DataChunk&)>;
 
 // The factory runs on the caller's thread once per worker. Each consumer receives
-// batches from its worker only. There is no ordering guarantee across workers.
+// batches from its worker only. Consumers may overlap. A callback admitted
+// before a peer publishes failure may finish. Batches across workers are unordered.
 // Stop and identity callbacks must be safe to invoke concurrently. All workers
 // use the caller's ClientContext and finish before this call returns or throws.
 // The caller owns the active query/transaction needed for filesystem secret lookup.

@@ -41,7 +41,7 @@ struct delete_read_failure {
   void capture()
   {
     std::call_once(first, [&] { error = std::current_exception(); });
-    failed.store(true, std::memory_order_relaxed);
+    failed.store(true, std::memory_order_release);
   }
 };
 
@@ -78,7 +78,12 @@ class delete_scan_task : public duckdb::BaseExecutorTask {
     : BaseExecutorTask(executor), run(std::move(run))
   {
   }
-  void ExecuteTask() override { run(); }
+  void ExecuteTask() override
+  {
+    auto execute = std::move(run);
+    execute();
+  }
+  void Cancel() override { run = nullptr; }
 
  private:
   std::function<void()> run;
@@ -88,7 +93,8 @@ void scan_delete_row_groups(duckdb::ClientContext& context,
                             duckdb::vector<duckdb::LogicalType> const& types,
                             std::function<parquet_delete_consumer()> const& make_consumer,
                             std::function<void()> const& check_stop,
-                            std::function<void(duckdb::CachingFileHandle&)> const& verify)
+                            std::function<void(duckdb::CachingFileHandle&)> const& verify,
+                            std::function<void()> const& after_decode_for_testing)
 {
   using namespace duckdb;
   ParquetReadGlobalState global(nullptr);
@@ -136,13 +142,13 @@ void scan_delete_row_groups(duckdb::ClientContext& context,
       throw;
     }
   };
-  std::vector<uint64_t> rows(workers);
-  auto scan_groups = [&](idx_t worker, parquet_delete_consumer const& consume) {
+  std::atomic<uint64_t> admitted{0};
+  const auto expected = reader.NumRows();
+  auto scan_groups    = [&](parquet_delete_consumer const& consume) {
     ParquetReadLocalState serial_state;
     TableFunctionInput input(nullptr, nullptr, &global);
     DataChunk chunk;
     chunk.Initialize(context, types);
-    auto& count = rows[worker];
     while (!failure.failed.load(std::memory_order_relaxed)) {
       duckdb::unique_ptr<ScanReadAheadJob> job;
       auto* state = &serial_state;
@@ -173,42 +179,60 @@ void scan_delete_row_groups(duckdb::ClientContext& context,
         verify(*state->scan_state.file_handle);
         if (status != AsyncResultType::HAVE_MORE_OUTPUT && status != AsyncResultType::FINISHED)
           throw IOException("Parquet delete decoding did not complete");
-        if (chunk.size() > reader.NumRows() - count)
-          throw IOException("Parquet delete rows exceed footer count");
-        count += chunk.size();
-        if (chunk.size()) consume(chunk);
+        if (chunk.size()) {
+          if (after_decode_for_testing) after_decode_for_testing();
+          auto count = admitted.load(std::memory_order_relaxed);
+          do {
+            if (chunk.size() > expected - count)
+              throw IOException("Parquet delete rows exceed footer count");
+          } while (!admitted.compare_exchange_weak(
+            count, count + chunk.size(), std::memory_order_relaxed));
+          if (failure.failed.load(std::memory_order_acquire)) return;
+          consume(chunk);
+        }
         if (status == AsyncResultType::FINISHED) break;
       }
     }
   };
-  auto run = [&](idx_t i, parquet_delete_consumer const& consume) {
+  auto run = [&](parquet_delete_consumer const& consume) {
     try {
-      scan_groups(i, consume);
+      scan_groups(consume);
     } catch (...) {
       failure.capture();
     }
   };
+  std::exception_ptr executor_error;
   if (workers == 1) {
-    run(0, make_consumer());
+    run(make_consumer());
   } else {
     TaskExecutor executor(context);
-    duckdb::vector<duckdb::unique_ptr<BaseExecutorTask>> tasks;
-    for (idx_t i = 0; i < workers; ++i) {
-      tasks.push_back(make_uniq<delete_scan_task>(
-        executor, [&, i, consume = make_consumer()] { run(i, consume); }));
+    try {
+      duckdb::vector<duckdb::unique_ptr<BaseExecutorTask>> tasks;
+      for (idx_t i = 0; i < workers; ++i) {
+        tasks.push_back(
+          make_uniq<delete_scan_task>(executor, [&, consume = make_consumer()] { run(consume); }));
+      }
+      executor.ScheduleTasks(std::move(tasks));
+      executor.WorkOnTasks();
+    } catch (...) {
+      executor_error = std::current_exception();
+      failure.failed.store(true, std::memory_order_release);
+      executor.CancelAndDrain();
     }
-    executor.ScheduleTasks(std::move(tasks));
-    executor.WorkOnTasks();
   }
-  if (read_ahead) read_ahead->CancelAndDrain();
+  if (read_ahead) {
+    read_ahead->CancelAndDrain();
+    try {
+      read_ahead->ThrowIfError();
+    } catch (...) {
+      if (!executor_error) executor_error = std::current_exception();
+    }
+  }
   if (failure.error) std::rethrow_exception(failure.error);
-  uint64_t count = 0;
-  for (auto n : rows) {
-    if (n > reader.NumRows() - count) throw IOException("Parquet delete rows exceed footer count");
-    count += n;
-  }
+  if (executor_error) std::rethrow_exception(executor_error);
   verify(reader.GetHandle());
-  if (count != reader.NumRows()) throw IOException("Incomplete Parquet delete footer coverage");
+  if (admitted.load(std::memory_order_relaxed) != expected)
+    throw IOException("Incomplete Parquet delete footer coverage");
 }
 }  // namespace
 
@@ -237,9 +261,13 @@ void read_parquet_delete_batches(duckdb::ClientContext& context,
   if (identity.file_size < 0 || opened.GetFileSize() != static_cast<uint64_t>(identity.file_size) ||
       (options.expected_size && *options.expected_size != opened.GetFileSize()))
     throw IOException("Parquet delete size differs from binding");
+  std::mutex stats_mutex;
   auto verify = [&](CachingFileHandle& handle) {
     check_stop();
-    auto current = handle.GetFileHandle()->Stats();
+    auto current = [&] {
+      std::lock_guard lock(stats_mutex);
+      return handle.GetFileHandle()->Stats();
+    }();
     // Remote files do not have POSIX device/inode identifiers. Compare the
     // metadata supplied by their filesystem on every handle, including the
     // separate scan handle, without changing that filesystem's admission or
@@ -261,11 +289,12 @@ void read_parquet_delete_batches(duckdb::ClientContext& context,
   if (size < 12) throw IOException("Truncated Parquet delete file");
   if (options.expected_footer_size) {
     uint8_t tail[8];
-    opened.GetFileHandle()->Read(tail, 8, size - 8);
+    // Check the bound size against the open object even if its cached trailer is reusable.
+    opened.GetFileHandle()->Read(tail, sizeof(tail), size - sizeof(tail));
     verify(opened);
     uint64_t footer = uint64_t(tail[0]) | (uint64_t(tail[1]) << 8) | (uint64_t(tail[2]) << 16) |
                       (uint64_t(tail[3]) << 24);
-    if (tail[4] != 'P' || tail[5] != 'A' || tail[6] != 'R' || tail[7] != '1' ||
+    if (tail[4] != 'P' || tail[5] != 'A' || tail[6] != 'R' || tail[7] != '1' || footer == 0 ||
         footer > size - 12 || *options.expected_footer_size != footer)
       throw IOException("Parquet delete footer differs from binding");
   }
@@ -284,6 +313,7 @@ void read_parquet_delete_batches(duckdb::ClientContext& context,
     reader.column_ids.emplace_back(index);
     types.push_back(columns[index].type);
   }
-  scan_delete_row_groups(context, reader, types, make_consumer, check_stop, verify);
+  scan_delete_row_groups(
+    context, reader, types, make_consumer, check_stop, verify, options.after_decode_for_testing);
 }
 }  // namespace sirius::op::scan

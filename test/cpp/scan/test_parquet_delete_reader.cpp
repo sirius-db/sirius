@@ -20,21 +20,25 @@
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/main/client_context_state.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/parquet_delete_reader.hpp>
 #include <parquet_extension.hpp>
+#include <parquet_reader.hpp>
 #include <unistd.h>
 #include <utils/s3_backend.hpp>
 
 #include <algorithm>
 #include <barrier>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <set>
 #include <thread>
 
 namespace {
@@ -76,6 +80,23 @@ struct delete_fixture {
       *connection.context, duckdb::OpenFileInfo(path), options, bind, [&] { return consume; });
   }
 };
+struct worker_rendezvous {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::set<std::thread::id> threads;
+
+  bool wait_for_peer()
+  {
+    std::unique_lock lock(mutex);
+    bool first = threads.empty();
+    threads.insert(std::this_thread::get_id());
+    cv.notify_all();
+    if (!cv.wait_for(lock, std::chrono::seconds(10), [&] { return threads.size() == 2; }))
+      throw std::runtime_error("second worker did not reach rendezvous");
+    return first;
+  }
+};
+
 auto position_projection = [](auto const&, uint64_t) { return std::vector<uint64_t>{0}; };
 }  // namespace
 
@@ -115,22 +136,40 @@ TEST_CASE("Parquet delete workers claim each group once and propagate consumer f
   REQUIRE_FALSE(f.connection.Query("SET threads=2")->HasError());
   const bool fail = GENERATE(false, true);
   size_t workers  = 0;
-  std::promise<void> ready[2];
-  auto first = ready[0].get_future(), second = ready[1].get_future();
+  REQUIRE_FALSE(f.connection.Query("SET disable_parquet_prefetching=true")->HasError());
+  struct task_exit : duckdb::ClientContextState {
+    std::promise<void> first_exit;
+    std::once_flag once;
+    void OnTaskStop(duckdb::ClientContext&) override
+    {
+      std::call_once(once, [&] { first_exit.set_value(); });
+    }
+  };
+  auto& states = *f.connection.context->registered_state;
+  auto exit    = states.GetOrCreate<task_exit>("delete_task_exit");
+  auto stopped = exit->first_exit.get_future();
+  worker_rendezvous rendezvous;
+  std::atomic<unsigned> consumed{0};
+  parquet_delete_read_options options;
+  options.after_decode_for_testing = [&] {
+    // Hold one decoded batch until its peer has published the consumer error.
+    if (!rendezvous.wait_for_peer() && fail &&
+        stopped.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+      throw std::runtime_error("failing decoder did not exit");
+  };
+  worker_rendezvous consumers;
   std::vector<int64_t> positions[2];
   auto scan = [&] {
     read_parquet_delete_batches(
-      *f.connection.context, duckdb::OpenFileInfo(f.path), {}, position_projection, [&] {
+      *f.connection.context, duckdb::OpenFileInfo(f.path), options, position_projection, [&] {
         auto worker = workers++;
         REQUIRE(worker < 2);
         return [&, worker](duckdb::DataChunk& chunk) {
-          if (positions[worker].empty()) {
-            ready[worker].set_value();
-            auto& peer = worker ? first : second;
-            if (peer.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
-              throw std::runtime_error("second worker did not start");
-            if (fail && worker == 0) throw std::runtime_error("consumer failed");
+          if (fail) {
+            ++consumed;
+            throw std::runtime_error("consumer failed");
           }
+          if (positions[worker].empty()) consumers.wait_for_peer();
           for (duckdb::idx_t i = 0; i < chunk.size(); ++i)
             positions[worker].push_back(chunk.GetValue(0, i).GetValue<int64_t>());
         };
@@ -138,8 +177,10 @@ TEST_CASE("Parquet delete workers claim each group once and propagate consumer f
   };
   if (fail) {
     REQUIRE_THROWS_WITH(scan(), Catch::Matchers::ContainsSubstring("consumer failed"));
+    REQUIRE(consumed == 1);
   } else {
     scan();
+    REQUIRE(consumers.threads.size() == 2);
     positions[0].insert(positions[0].end(), positions[1].begin(), positions[1].end());
     std::sort(positions[0].begin(), positions[0].end());
     REQUIRE(positions[0].size() == 10000);
@@ -147,6 +188,73 @@ TEST_CASE("Parquet delete workers claim each group once and propagate consumer f
       REQUIRE(positions[0][i] == i);
   }
   REQUIRE(workers == 2);
+  REQUIRE(rendezvous.threads.size() == 2);
+  states.Remove("delete_task_exit");
+}
+
+TEST_CASE("Parquet deletes reserve footer rows across workers before consuming",
+          "[parquet_delete_reader]")
+{
+  delete_fixture f;
+  REQUIRE_FALSE(f.connection.Query("SET threads=2")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET parquet_metadata_cache=true")->HasError());
+  f.write(4096);
+  duckdb::OpenFileInfo file(f.path);
+  auto& context = *f.connection.context;
+  duckdb::ParquetReader reader(context, file, duckdb::ParquetOptions(context));
+  REQUIRE(reader.NumRowGroups() == 2);
+  auto cached = duckdb::ParquetReader::GetMetadataCacheEntry(context, file);
+  REQUIRE(cached);
+  auto metadata      = duckdb::make_uniq<duckdb_parquet::FileMetaData>(*cached->metadata);
+  metadata->num_rows = 2048;
+  cached->metadata   = std::move(metadata);
+  worker_rendezvous rendezvous;
+  parquet_delete_read_options options;
+  options.after_decode_for_testing = [&] { rendezvous.wait_for_peer(); };
+  std::atomic<uint64_t> consumed{0};
+  REQUIRE_THROWS_WITH(
+    f.read(options, position_projection, [&](auto& chunk) { consumed += chunk.size(); }),
+    Catch::Matchers::ContainsSubstring("exceed footer count"));
+  REQUIRE(consumed <= 2048);
+}
+
+TEST_CASE("Parquet deletes drain workers before choosing the original error",
+          "[parquet_delete_reader]")
+{
+  delete_fixture f;
+  f.write(4096);
+  REQUIRE_FALSE(f.connection.Query("SET threads=2")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET disable_parquet_prefetching=true")->HasError());
+  struct task_failure : duckdb::ClientContextState {
+    bool also_fail_consumer = false;
+    std::atomic<unsigned> starts{0};
+    std::promise<void> consuming;
+    void OnTaskStart(duckdb::ClientContext&) override
+    {
+      if (also_fail_consumer) {
+        if (starts++ == 0) return;
+        if (consuming.get_future().wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+          throw std::runtime_error("consumer did not start");
+      }
+      throw std::runtime_error("executor task failed");
+    }
+  };
+  auto& states              = *f.connection.context->registered_state;
+  auto state                = states.GetOrCreate<task_failure>("delete_test");
+  state->also_fail_consumer = GENERATE(false, true);
+  auto scan                 = [&] {
+    f.read({}, position_projection, [&](auto&) {
+      state->consuming.set_value();
+      throw std::logic_error("original consumer error");
+    });
+  };
+  if (state->also_fail_consumer) {
+    REQUIRE_THROWS_AS(scan(), std::logic_error);
+  } else {
+    REQUIRE_THROWS_WITH(scan(), Catch::Matchers::ContainsSubstring("executor task failed"));
+  }
+  states.Remove("delete_test");
+  REQUIRE_NOTHROW(f.read({}, position_projection, [](auto&) {}));
 }
 
 TEST_CASE("Parquet deletes validate empty files and binding claims", "[parquet_delete_reader]")
@@ -260,6 +368,7 @@ class delete_remote_fs : public duckdb::FileSystem {
   };
   std::function<void()> before_read;
   std::string bytes;
+  duckdb::timestamp_t last_modified{0};
   uint64_t generation                     = 1;
   int live_handles                        = 0;
   bool versioned                          = true;
@@ -288,10 +397,7 @@ class delete_remote_fs : public duckdb::FileSystem {
     std::memcpy(buffer, bytes.data() + offset, count);
   }
   int64_t GetFileSize(duckdb::FileHandle&) override { return bytes.size(); }
-  duckdb::timestamp_t GetLastModifiedTime(duckdb::FileHandle&) override
-  {
-    return duckdb::timestamp_t(0);
-  }
+  duckdb::timestamp_t GetLastModifiedTime(duckdb::FileHandle&) override { return last_modified; }
   std::string GetVersionTag(duckdb::FileHandle& h) override
   {
     return versioned ? std::to_string(static_cast<remote_handle&>(h).generation) : "";
@@ -419,6 +525,25 @@ TEST_CASE("Remote Parquet deletes reject replacement and release handles on fail
                           },
                           [](auto&) {}),
                         Catch::Matchers::ContainsSubstring("object changed"));
+  }
+  SECTION("bound trailer is read from the current object even when the file cache is warm")
+  {
+    // The custom scheme needs local-file caching to exercise DuckDB's external cache.
+    REQUIRE_FALSE(f.connection.Query("SET cache_local_files=true")->HasError());
+    REQUIRE_FALSE(f.connection.Query("SET enable_external_file_cache=true")->HasError());
+    remote.versioned     = false;
+    remote.last_modified = duckdb::timestamp_t(1000000);
+    auto offset          = remote.bytes.size() - 8;
+    parquet_delete_read_options options;
+    options.expected_footer_size =
+      duckdb::Load<uint32_t>(duckdb::const_data_ptr_cast(remote.bytes.data() + offset));
+    f.read(options, position_projection, [](auto&) {});
+
+    // Replace the trailer while retaining the size and modification time.
+    ++remote.generation;
+    remote.bytes[offset] ^= 1;
+    REQUIRE_THROWS_WITH(f.read(options, position_projection, [](auto&) {}),
+                        Catch::Matchers::ContainsSubstring("footer differs from binding"));
   }
   SECTION("replacement during batches")
   {
