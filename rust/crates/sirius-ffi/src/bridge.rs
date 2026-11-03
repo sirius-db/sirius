@@ -1,20 +1,4 @@
-//! Low-level `cxx` bindings to the Sirius C++ API.
-//!
-//! This crate is intentionally thin: it exposes the C++ types and free functions
-//! declared in the `#[cxx::bridge]` module below and nothing else. Safe, idiomatic
-//! wrappers live in the [`sirius`](https://docs.rs/sirius) crate.
-//!
-//! The bridge binds Sirius's **public C++ surface** (`include/sirius/ffi.hpp`):
-//! an RAII [`Context`] held via [`cxx::UniquePtr`]. Constructing it brings up an
-//! initialized engine; dropping the `UniquePtr` tears it down. The header is
-//! lightweight, so the bridge compiles without any of Sirius's internal headers
-//! (cudf/rmm/duckdb). It is the seed of the public API `libsirius` will expose;
-//! the bindings link whichever Sirius artifact provides these symbols (the DuckDB
-//! extension today, a dedicated `libsirius` later — see `build.rs`).
-//!
-//! The `make_context*` functions are bound as fallible (`Result`): bringing up
-//! the engine (or parsing a config file) can throw, and cxx turns a C++ exception
-//! into `Err(cxx::Exception)` instead of aborting, so consumers can fail fast.
+//! Low-level bindings to `include/sirius/ffi.hpp`.
 
 // The `# Safety` docs on the unsafe bridge fns live on the declarations below;
 // cxx's macro expansion hides them from clippy's `missing_safety_doc`, so allow
@@ -58,7 +42,7 @@ mod ffi {
 
     unsafe extern "C++" {
         include!("sirius/ffi.hpp");
-        include!("sirius-sys/src/shim.hpp");
+        include!("sirius-ffi/src/shim.hpp");
 
         // The enums are defined by the C++ header; these declarations make CXX check the shared
         // declarations above against them instead of emitting a second definition.
@@ -88,8 +72,7 @@ mod ffi {
         /// # Safety
         /// `out_stream_addr` must be the address of a valid, writable
         /// `ArrowArrayStream` that outlives this call; C++ writes the result
-        /// stream through it. The safe [`sirius`](https://docs.rs/sirius) wrapper
-        /// upholds this.
+        /// stream through it. The safe [`crate::SiriusContext`] wrapper upholds this.
         unsafe fn execute_substrait(
             self: Pin<&mut Context>,
             plan: &CxxString,

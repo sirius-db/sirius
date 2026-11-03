@@ -1,12 +1,16 @@
-//! Safe, idiomatic Rust bindings for [Sirius](https://github.com/sirius-db/sirius),
-//! the GPU-native SQL engine.
+//! Bindings to the existing Sirius C++ FFI for execution and object stores.
 //!
-//! This crate wraps the low-level [`sirius-sys`][sirius_sys] cxx bindings in safe Rust types
-//! — the entry point for driving Sirius from Rust.
-//!
-//! Today it binds just enough to prove the toolchain links against the real
-//! Sirius library: constructing a [`SiriusContext`] from defaults or a YAML
-//! config file. More of the API surface is added in later PRs.
+//! This API remains supported while the public C API gains execution support.
+//! It requires a C++20 compiler and a matching Sirius C++ toolchain.
+
+/// Low-level C++ bridge, including object-store configuration.
+pub mod bridge;
+pub use bridge::{
+    Context, ObjectStoreConfig, ObjectStoreConfigArgs, SigningMode, Transport,
+    drop_object_store_prefix, make_context, make_context_from_config,
+    make_context_from_config_with_object_store, make_object_store_config,
+    object_store_config_for_uri,
+};
 
 use std::path::Path;
 
@@ -26,10 +30,10 @@ use cxx::{Exception, UniquePtr, let_cxx_string};
 ///
 /// The engine keeps process-global GPU state, so it currently supports a single
 /// live context per process; constructing or holding more than one concurrently
-/// is not yet supported (enforcement is a follow-up).
+/// is unsupported and is not prevented by a runtime check.
 pub struct SiriusContext {
     // RAII handle owning the C++ engine context for its lifetime.
-    inner: UniquePtr<sirius_sys::Context>,
+    inner: UniquePtr<bridge::Context>,
 }
 
 /// Fully materialized output of one Substrait execution.
@@ -45,7 +49,7 @@ impl SiriusContext {
     /// built-in defaults.
     pub fn new() -> Result<Self, Exception> {
         Ok(Self {
-            inner: sirius_sys::make_context()?,
+            inner: bridge::make_context()?,
         })
     }
 
@@ -56,7 +60,7 @@ impl SiriusContext {
         // one from the (lossy) UTF-8 form of the platform path.
         let_cxx_string!(config_path = path.to_string_lossy().as_ref());
         Ok(Self {
-            inner: sirius_sys::make_context_from_config(&config_path)?,
+            inner: bridge::make_context_from_config(&config_path)?,
         })
     }
 

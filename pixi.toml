@@ -31,15 +31,15 @@ make = "*"
 ninja = "*"
 sccache = "=0.18.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
-clang = "21.*"
+clang = "22.*"
 wget = "*"
 pre-commit = "*"
 identify = "2.*"
-clang-tools = "21.*"
+clang-tools = "22.*"
 # Provides llvm-symbolizer (and friends) matching the clang version above, so
-# ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 21.*.
-llvm-tools = "21.*"
-lld = "21.*"
+# ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 22.*.
+llvm-tools = "22.*"
+lld = "22.*"
 pkg-config = "*"
 mold = "*"
 rust = "*"
@@ -182,7 +182,7 @@ rust = "1.*"
 
 [feature.docs.tasks.docs-rust]
 description = "Build the Sirius Rust API reference without libsirius."
-cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps --target-dir build/docs/rust-target"
+cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius-ffi --lib --no-deps --target-dir build/docs/rust-target"
 env = { DOCS_RS = "1", RUSTDOCFLAGS = "-D warnings" }
 
 [feature.docs.tasks.docs-theme]
