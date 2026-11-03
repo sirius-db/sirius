@@ -1,5 +1,6 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/planner/test_paimon_bound_read.cpp
     test/cpp/scan/bench_parquet_footer_cache.cpp
     test/cpp/io/cache/bench_metadata_store.cpp
     test/cpp/io/test_parquet_metadata_retention.cpp
