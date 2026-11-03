@@ -55,7 +55,7 @@ class scoped_dispatcher {
     // User contract: drain (via wait_for_all, optionally preceded by
     // request_stop) before destruction. Loud assert beats silent UAF.
     std::lock_guard lk(mu_);
-    assert(inflight_ == 0 && pending_.empty() &&
+    assert(inflight_ == 0 && pending_empty() &&
            "scoped_dispatcher destroyed with outstanding work; "
            "call request_stop()/wait_for_all() first");
   }
@@ -68,9 +68,9 @@ class scoped_dispatcher {
   // A pool submission failure cancels pending work, releases the reserved slot, and rethrows.
   // Once stopped, successfully wrapped calls silently drop their task. Wrapping happens
   // before the stop check and can still throw even when the dispatcher is already stopped.
-  void enqueue(scoped_dispatcher_task auto&& f)
+  void enqueue(scoped_dispatcher_task auto&& f, int domain = -1, bool coalescing = false)
   {
-    auto task = wrap(std::forward<decltype(f)>(f));
+    queued_task task{wrap(std::forward<decltype(f)>(f)), domain};
 
     std::unique_lock lk(mu_);
     if (stop_.stop_requested()) return;
@@ -80,16 +80,18 @@ class scoped_dispatcher {
       lk.unlock();
       submit(std::move(task));
     } else {
-      pending_.push_back(std::move(task));
+      pending_[coalescing].push_back(std::move(task));
     }
   }
+
+  size_t num_domains() const noexcept { return pool_.num_domains(); }
 
   // @brief Blocking. Waits for an inflight slot, then submits directly to the pool.
   // Bypasses the pending queue — this is the producer-side back-pressure path.
   // Returns false iff request_stop() was observed while waiting (or already set).
   bool schedule(scoped_dispatcher_task auto&& f)
   {
-    auto task = wrap(std::forward<decltype(f)>(f));
+    queued_task task{wrap(std::forward<decltype(f)>(f)), -1};
 
     std::unique_lock lk(mu_);
     bool ok = cv_slot_.wait(lk, stop_.get_token(), [this] { return inflight_ < max_inflight_; });
@@ -126,16 +128,15 @@ class scoped_dispatcher {
     // Stop callbacks may reenter the dispatcher, so request cancellation outside mu_.
     stop_.request_stop();
     for (std::size_t count = 0;; ++count) {
-      task_t discarded;
+      queued_task discarded;
       {
         std::unique_lock lk(mu_);
-        if (pending_.empty() || count == max_discard) {
-          bool const empty = pending_.empty();
+        if (pending_empty() || count == max_discard) {
+          bool const empty = pending_empty();
           release_slot(lk);
           return empty;
         }
-        discarded = std::move(pending_.front());
-        pending_.pop_front();
+        discarded = take_pending();
       }
       // Destroy outside mu_. Moving one callable at a time avoids allocating a temporary
       // container, so this cleanup is also usable after an allocation failure in submit().
@@ -145,11 +146,15 @@ class scoped_dispatcher {
   void wait_for_all()
   {
     std::unique_lock lk(mu_);
-    cv_done_.wait(lk, [this] { return inflight_ == 0 && pending_.empty(); });
+    cv_done_.wait(lk, [this] { return inflight_ == 0 && pending_empty(); });
   }
 
  private:
   using task_t = sirius::exec::invocable<void()>;
+  struct queued_task {
+    task_t work;      // Owns the callback and its captures until execution or cancellation.
+    int domain = -1;  // Pool domain index; -1 permits execution by any pool worker.
+  };
 
   static void log_exception_ptr(const std::exception_ptr& eptr,
                                 std::source_location loc = std::source_location::current())
@@ -189,46 +194,88 @@ class scoped_dispatcher {
     }
   }
 
-  // Retain the slot across handoffs so wait_for_all() includes queued continuations.
-  // A null task means this continuation must claim pending work on the worker.
-  void run(task_t task) noexcept
+  bool pending_empty() const { return pending_[0].empty() && pending_[1].empty(); }
+  queued_task take_pending()
+  {
+    // Alternate classes when both have work. Metadata cannot indefinitely delay
+    // a ready batch, and a sustained coalescing stream cannot starve footers.
+    auto selected = pending_[next_class_].empty() ? !next_class_ : next_class_;
+    auto result   = std::move(pending_[selected].front());
+    pending_[selected].pop_front();
+    next_class_ = !selected;
+    return result;
+  }
+
+  void run(queued_task task) noexcept
+  {
+    if (!pool_.num_domains()) {
+      run_unrouted(std::move(task));
+      return;
+    }
+    try {
+      task.work();
+    } catch (...) {
+      try {
+        log_exception_ptr(std::current_exception());
+      } catch (...) {
+      }
+    }
+    task.work = nullptr;  // Dispose captures outside mu_.
+    {
+      std::unique_lock lk(mu_);
+      if (stop_.stop_requested() || pending_empty()) {
+        release_slot(lk);
+        return;
+      }
+      task = take_pending();
+    }
+    // Each handoff is routed anew: never execute another domain's work locally.
+    // submit failure stops/disposes pending work and releases this reserved slot.
+    try {
+      submit(std::move(task));
+    } catch (...) {
+      try {
+        log_exception_ptr(std::current_exception());
+      } catch (...) {
+      }
+    }
+  }
+
+  // Preserve the allocation-failure fallback for existing pools without placement.
+  // Pending captures remain here until a continuation actually starts.
+  void run_unrouted(queued_task task) noexcept
   {
     bool can_yield = true;
     for (;;) {
-      if (!task) {
+      if (!task.work) {
         std::unique_lock lk(mu_);
-        if (stop_.stop_requested() || pending_.empty()) {
+        if (stop_.stop_requested() || pending_empty()) {
           release_slot(lk);
           return;
         }
-        task = std::move(pending_.front());
-        pending_.pop_front();
+        task = take_pending();
       }
       try {
-        task();
+        task.work();
       } catch (...) {
         try {
           log_exception_ptr(std::current_exception());
         } catch (...) {
         }
       }
-      task = nullptr;  // Captures may reenter the dispatcher; destroy outside mu_.
+      task.work = nullptr;
       {
         std::unique_lock lk(mu_);
-        if (stop_.stop_requested() || pending_.empty()) {
+        if (stop_.stop_requested() || pending_empty()) {
           release_slot(lk);
           return;
         }
       }
       if (can_yield) {
         try {
-          // Pending tasks stay in the dispatcher until the continuation runs, so
-          // a failed submission cannot destroy or lose the next task.
-          pool_.schedule([this] { run(nullptr); }, priority_);
+          pool_.schedule([this] { run_unrouted({}); }, priority_);
           return;
         } catch (...) {
-          // Already on a worker: drain locally if the pool cannot accept a handoff.
-          // Avoid repeated failing allocations and preserve the outstanding slot.
           can_yield = false;
         }
       }
@@ -242,7 +289,7 @@ class scoped_dispatcher {
     std::function<void()> notify;
     --inflight_;
     cv_slot_.notify_one();
-    if (inflight_ == 0 && pending_.empty()) {
+    if (inflight_ == 0 && pending_empty()) {
       cv_done_.notify_all();
       if (stop_.stop_requested()) notify = std::move(stop_drained_);
     }
@@ -250,10 +297,12 @@ class scoped_dispatcher {
     if (notify) notify();
   }
 
-  void submit(task_t task)
+  void submit(queued_task task)
   {
     try {
-      pool_.schedule([this, task = std::move(task)]() mutable { run(std::move(task)); }, priority_);
+      auto domain = task.domain;
+      pool_.schedule(
+        [this, task = std::move(task)]() mutable { run(std::move(task)); }, priority_, domain);
     } catch (...) {
       // No worker owns this slot. Cancel pending work without executing user tasks on the
       // producer thread, then release the failed slot and propagate the original exception.
@@ -271,7 +320,11 @@ class scoped_dispatcher {
   std::mutex mu_;
   std::condition_variable cv_done_;      // drained signal; not stop-aware
   std::condition_variable_any cv_slot_;  // slot-open signal; stop-aware via wait(token, pred)
-  std::deque<task_t> pending_;
+  // Overflow beyond max_inflight_: metadata at index 0, coalescing at index 1.
+  // Each task retains its domain; these are class queues, not per-domain queues.
+  std::deque<queued_task> pending_[2];
+  // Preferred class on the next handoff; alternate when both classes have work.
+  bool next_class_      = true;
   std::size_t inflight_ = 0;  // Worker slots plus active cancellation cleanup calls.
   std::stop_source stop_;
   std::function<void()> stop_drained_;

@@ -139,3 +139,55 @@ TEST_CASE("Size-based partial batching defaults to bounded residence with valida
   SECTION("maximum precedes minimum") { config.partial_batch->max_residence = 49ms; }
   CHECK_THROWS_AS(config.resolve(4), std::invalid_argument);
 }
+
+TEST_CASE("metadata placement respects configured GPUs and CPU restrictions",
+          "[metadata_placement]")
+{
+  using namespace sirius::scan_manager;
+  cucascade::memory::system_topology_info hardware{};
+  cucascade::memory::gpu_topology_info first{}, second{};
+  first.id         = 0;
+  first.numa_node  = 0;
+  first.cpu_cores  = {0, 1, 2};
+  second.id        = 1;
+  second.numa_node = 1;
+  second.cpu_cores = {3, 4, 5};
+  hardware.gpus    = {first, second};
+  sirius::memory::topology_index both(hardware, std::vector<int>{0, 1});
+  auto placement = make_metadata_placement(both, {1, 2, 3, 4}, {}, 4);
+  CHECK(placement.nodes == std::vector<int>{0, 1});
+  CHECK(placement.cpus == std::vector<std::vector<int>>{{1, 2}, {3, 4}});
+  auto restricted = make_metadata_placement(both, {1, 2, 3, 4}, {2, 4, 5}, 2);
+  CHECK(restricted.cpus == std::vector<std::vector<int>>{{2}, {4}});
+  sirius::memory::topology_index one(hardware, std::vector<int>{1});
+  CHECK(make_metadata_placement(one, {0, 1, 2, 3, 4, 5}, {}, 2).nodes == std::vector<int>{1});
+  CHECK_THROWS_AS(make_metadata_placement(both, {1, 3}, {}, 1), std::invalid_argument);
+  CHECK_THROWS_AS(make_metadata_placement(both, {1, 3}, {5}, 2), std::invalid_argument);
+  // Unknown topology preserves the allowed/configured intersection without claiming locality.
+  sirius::memory::topology_index unknown({}, std::vector<int>{0});
+  auto fallback = make_metadata_placement(unknown, {1, 2}, {2, 3}, 1);
+  CHECK(fallback.nodes == std::vector<int>{-1});
+  CHECK(fallback.cpus == std::vector<std::vector<int>>{{2}});
+}
+
+TEST_CASE("automatic metadata worker count covers domains while explicit counts stay fixed",
+          "[metadata_placement][metadata_worker_defaults]")
+{
+  using namespace sirius::scan_manager;
+  scan_manager_config config;
+  auto initial = default_scan_manager_num_threads();
+  CHECK(resolve_scan_manager_num_threads(config, 2) == std::max(initial, 2));
+  CHECK(resolve_scan_manager_num_threads(config, static_cast<size_t>(initial) + 1) == initial + 1);
+  config.num_threads_explicit = true;
+  CHECK_THROWS_AS(resolve_scan_manager_num_threads(config, static_cast<size_t>(initial) + 1),
+                  std::invalid_argument);
+  config.thread_pool.num_threads = 1;
+  CHECK(resolve_scan_manager_num_threads(config, 1) == 1);
+  CHECK_THROWS_AS(resolve_scan_manager_num_threads(config, 2), std::invalid_argument);
+  config.thread_pool.num_threads = 2;
+  CHECK(resolve_scan_manager_num_threads(config, 2) == 2);
+  // Existing direct C++ overrides must not silently grow either.
+  config.num_threads_explicit    = false;
+  config.thread_pool.num_threads = 1;
+  CHECK_THROWS_AS(resolve_scan_manager_num_threads(config, 2), std::invalid_argument);
+}

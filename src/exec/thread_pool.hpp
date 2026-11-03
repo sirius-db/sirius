@@ -42,35 +42,57 @@ class static_thread_pool {
   explicit static_thread_pool(int num_threads,
                               const std::string& name  = "thread_pool",
                               std::vector<int> cpu_ids = {},
-                              sirius::exec::invocable<void() noexcept> per_thread_init = nullptr)
+                              sirius::exec::invocable<void() noexcept> per_thread_init = nullptr,
+                              std::vector<std::vector<int>> domains                    = {})
   {
+    if (num_threads <= 0 || domains.size() > static_cast<size_t>(num_threads))
+      throw std::invalid_argument("thread pool needs at least one worker per domain");
+    domains_ = std::move(domains);
+    queues_.resize(domains_.size() + 1);
     threads_.reserve(num_threads);
 
     std::unique_ptr<std::latch> init_latch;
-    if (per_thread_init) { init_latch = std::make_unique<std::latch>(num_threads); }
+    init_latch = std::make_unique<std::latch>(num_threads);
+    std::atomic<bool> affinity_failed{false};
 
     auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
     auto* latch_ptr   = init_latch.get();
 
     try {
       for (int i = 0; i < num_threads; ++i) {
-        auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
-          if (init_fn_ptr) {
-            (*init_fn_ptr)();
+        auto domain = domains_.empty() ? 0 : i % domains_.size() + 1;
+        auto& t     = threads_.emplace_back(
+          [this, init_fn_ptr, latch_ptr, domain, &cpu_ids, &affinity_failed]() {
+            auto const& cpus = domain ? domains_[domain - 1] : cpu_ids;
+            if (!cpus.empty()) {
+              cpu_set_t expected{}, actual{};
+              CPU_ZERO(&expected);
+              for (int cpu : cpus) {
+                if (cpu < 0 || cpu >= CPU_SETSIZE) {
+                  if (domain) affinity_failed = true;
+                  continue;
+                }
+                CPU_SET(cpu, &expected);
+              }
+              if (!thread_util::set_current_thread_affinity(cpus) ||
+                  pthread_getaffinity_np(pthread_self(), sizeof(actual), &actual) != 0 ||
+                  !CPU_EQUAL(&expected, &actual)) {
+                if (domain) affinity_failed = true;
+              }
+            }
+            if (init_fn_ptr) { (*init_fn_ptr)(); }
             latch_ptr->count_down();
-          }
-          work_loop();
-        });
+            work_loop(domain);
+          });
         if (!name.empty()) {
           std::ignore =
             sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
         }
-        if (!cpu_ids.empty()) {
-          std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
-        }
       }
 
-      if (init_latch) { init_latch->wait(); }
+      init_latch->wait();
+      if (affinity_failed)
+        throw std::runtime_error("thread pool CPU affinity could not be applied");
     } catch (...) {
       stop();
       for (auto& thread : threads_) {
@@ -91,9 +113,10 @@ class static_thread_pool {
     }
   }
 
-  // Lower priorities run first; equal priorities retain submission order. Running
+  // Lower priorities run first within each domain; equal priorities retain FIFO
+  // within each queue. Unrouted and domain queues alternate on equal priority. Running
   // callbacks are not preempted. Callers without a priority retain FIFO ordering.
-  void schedule(std::invocable auto&& fn, queue_priority priority = 0)
+  void schedule(std::invocable auto&& fn, queue_priority priority = 0, int domain = -1)
   {
     sirius::exec::invocable<void() noexcept> callback =
       [callable = std::forward<decltype(fn)>(fn)]() mutable noexcept {
@@ -109,15 +132,18 @@ class static_thread_pool {
     // captures which reenter the pool or their dispatcher.
     std::lock_guard l(mu_);
     if (stop_requested_) { throw std::runtime_error("thread pool is stopped"); }
-    auto [bucket, inserted] = queue_.try_emplace(priority);
+    if (domain < -1 || domain >= static_cast<int>(domains_.size()))
+      throw std::invalid_argument("invalid thread pool domain");
+    auto& queue             = queues_[domain + 1];
+    auto [bucket, inserted] = queue.try_emplace(priority);
     try {
       bucket->second.emplace_back(std::move(callback));
     } catch (...) {
       // A failed allocation must not leave an empty bucket for a worker to pop.
-      if (inserted) queue_.erase(bucket);
+      if (inserted) queue.erase(bucket);
       throw;
     }
-    cv_.notify_one();
+    cv_.notify_all();
   }
 
   /// \brief Alias for schedule(). Lets static_thread_pool satisfy the same
@@ -127,6 +153,8 @@ class static_thread_pool {
 
   [[nodiscard]] std::size_t num_threads() const noexcept { return threads_.size(); }
 
+  size_t num_domains() const noexcept { return domains_.size(); }
+
   void stop() noexcept
   {
     std::unique_lock l(mu_);
@@ -135,30 +163,53 @@ class static_thread_pool {
   }
 
  private:
-  [[nodiscard]] bool has_work_or_stopped() const { return !queue_.empty() || stop_requested_; }
-
-  void work_loop()
+  [[nodiscard]] bool has_work_or_stopped(size_t domain) const
   {
+    return !queues_[0].empty() || !queues_[domain].empty() || stop_requested_;
+  }
+
+  void work_loop(size_t domain)
+  {
+    // Per-worker tie breaker between global and local queues, not task classes.
+    // Higher-priority work still wins; equal priorities alternate when both are ready.
+    bool global_turn = true;
     while (!stop_requested_) {
       sirius::exec::invocable<void() noexcept> func;
       {
         std::unique_lock<std::mutex> l(mu_);
-        cv_.wait(l, [this] { return has_work_or_stopped(); });
+        cv_.wait(l, [this, domain] { return has_work_or_stopped(domain); });
         if (stop_requested_) { break; }
-        auto bucket = queue_.begin();
+        auto* queue = &queues_[domain];
+        if (queue->empty() ||
+            (!queues_[0].empty() &&
+             (queues_[0].begin()->first < queue->begin()->first ||
+              (queues_[0].begin()->first == queue->begin()->first && global_turn))))
+          queue = &queues_[0];
+        global_turn = queue != &queues_[0];
+        auto bucket = queue->begin();
         func        = std::move(bucket->second.front());
         bucket->second.pop_front();
-        if (bucket->second.empty()) queue_.erase(bucket);
+        if (bucket->second.empty()) queue->erase(bucket);
       }
       if (func == nullptr) { break; }
       func();
     }
   }
 
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::map<queue_priority, std::deque<sirius::exec::invocable<void() noexcept>>> queue_;
+  std::mutex mu_;               // Protects all queue contents and submission/stop ordering.
+  std::condition_variable cv_;  // Wakes workers when work arrives or shutdown is requested.
+  using queue_type = std::map<queue_priority, std::deque<sirius::exec::invocable<void() noexcept>>>;
+  // Immutable CPU masks indexed by pool domain, not OS NUMA node ID. Workers are
+  // assigned round-robin and retain that mask for their lifetime. Empty means unrouted.
+  std::vector<std::vector<int>> domains_;
+  // One global queue at index 0 plus one queue per domain at index domain + 1.
+  // Workers consume global work and their own domain only. Metadata and coalescing
+  // share these queues; each queue orders by priority, then FIFO within that priority.
+  std::vector<queue_type> queues_;
+  // Stops acceptance and worker dequeueing; already-running callbacks finish.
+  // Pending callbacks are not drained by stop(). Atomic for the outer worker loop.
   std::atomic<bool> stop_requested_{false};
+  // Owned workers, joined at destruction (or if construction fails).
   std::vector<std::thread> threads_;
 };
 
