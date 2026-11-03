@@ -44,10 +44,8 @@ Running tests directly (non-obvious invocations):
 pixi run build/release/test/cpp/sirius_unittest "[path_utils]"  # by Catch2 tag/test name
 ```
 
-`scripts/run_unit_tests.py` runs the unit tests in shards (2 per GPU), then isolated-context,
-`[multi_gpu]` and late-materialization tests. One test job, including its child processes, runs per GPU by default;
-different GPUs run in parallel. Use `--jobs-per-gpu 2` only when the independent fixtures and their
-child processes have enough combined memory headroom. Arguments after `--` go to every Catch2 process.
+`scripts/run_unit_tests.py` runs the unit tests in parallel shards (2 per GPU), then the
+`[multi_gpu]` and late-materialization tests. Arguments after `--` go to every Catch2 process.
 Logs go to `build/release/test/cpp/log/<process>/`.
 
 **Python API**: the default Pixi environment includes DuckDB's Python package. Load the built

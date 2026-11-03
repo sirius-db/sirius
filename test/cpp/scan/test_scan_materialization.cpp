@@ -979,7 +979,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Adapter mapping hook runs without an Iceberg physical schema",
                  "[materialization][scan][mapping][adapter][integration][fw_s4]")
 {
-  auto defect = std::string{GENERATE(
+  auto defect               = std::string{GENERATE(
     "valid", "foreign_contract", "foreign_metadata", "missing_datasource", "foreign_identity")};
   bool const multiple_files = GENERATE(false, true);
   CAPTURE(defect, multiple_files);

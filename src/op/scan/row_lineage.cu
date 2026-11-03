@@ -24,6 +24,20 @@
 #include <unordered_map>
 
 namespace sirius::op::scan {
+unsigned int detail::lineage_grid_size(int64_t rows)
+{
+  if (rows < 0) throw std::invalid_argument("negative lineage launch size");
+  if (!rows) return 0;
+  // Division before addition also covers INT64_MAX without overflow.
+  auto const blocks = rows / 256 + (rows % 256 != 0);
+  int device, max_grid_x;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&max_grid_x, cudaDevAttrMaxGridDimX, device));
+  if (blocks > max_grid_x || blocks > std::numeric_limits<unsigned int>::max())
+    throw std::invalid_argument("lineage launch exceeds device grid limit");
+  return static_cast<unsigned int>(blocks);
+}
+
 namespace {
 struct selection_run {
   int64_t output_first, input_first, count;
@@ -53,7 +67,7 @@ __global__ void select_runs(int64_t* output,
     else
       hi = mid;
   }
-  output[i] = runs[lo].input_first + index - runs[lo].output_first + shift;
+  output[i] = runs[lo].input_first + (index - runs[lo].output_first) + shift;
 }
 __global__ void copy_shift(int64_t* output, int64_t const* input, int64_t rows, int64_t shift)
 {
@@ -88,7 +102,7 @@ __global__ void physical_positions(int64_t const* ordinals,
   auto i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
   auto run = resolve_run(runs, run_count, ordinals[i]);
-  if (rows) rows[i] = run.first + ordinals[i] - run.ordinal;
+  if (rows) rows[i] = run.first + (ordinals[i] - run.ordinal);
   if (files) files[i] = run.file;
 }
 __global__ void file_rows_to_ordinals(uint64_t* values,
@@ -120,12 +134,10 @@ __global__ void file_rows_to_ordinals(uint64_t* values,
     atomicExch(invalid, 1);
     return;
   }
-  values[i] = runs[lo].ordinal + row - runs[lo].first;
+  values[i] = runs[lo].ordinal + (row - runs[lo].first);
 }
 __global__ void check_composition(int64_t count,
                                   int64_t const* selected,
-                                  selection_run const* selections,
-                                  int64_t selection_count,
                                   physical_run const* before,
                                   int64_t before_count,
                                   physical_run const* next,
@@ -134,23 +146,10 @@ __global__ void check_composition(int64_t count,
 {
   auto i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  int64_t ordinal = i;
-  if (selected)
-    ordinal = selected[i];
-  else if (selection_count) {
-    int64_t lo = 0, hi = selection_count;
-    while (lo < hi) {
-      auto mid = lo + (hi - lo) / 2;
-      if (selections[mid].output_first + selections[mid].count <= i)
-        lo = mid + 1;
-      else
-        hi = mid;
-    }
-    ordinal = selections[lo].input_first + i - selections[lo].output_first;
-  }
-  auto a = resolve_run(before, before_count, ordinal);
-  auto b = resolve_run(next, next_count, i);
-  if (a.file != b.file || a.first + ordinal - a.ordinal != b.first + i - b.ordinal)
+  auto const ordinal = selected[i];
+  auto a             = resolve_run(before, before_count, ordinal);
+  auto b             = resolve_run(next, next_count, i);
+  if (a.file != b.file || a.first + (ordinal - a.ordinal) != b.first + (i - b.ordinal))
     atomicExch(invalid, 1);
 }
 __global__ void visibility_mask(uint8_t* mask,
@@ -172,7 +171,7 @@ __global__ void visibility_mask(uint8_t* mask,
       hi = mid;
   }
   auto const run = runs[lo];
-  auto row       = run.first + ordinal - run.ordinal;
+  auto row       = run.first + (ordinal - run.ordinal);
   lo             = run.delete_first;
   hi             = lo + run.delete_count;
   while (lo < hi) {
@@ -200,7 +199,7 @@ __global__ void fill_ordinals(int64_t* output,
     else
       hi = mid;
   }
-  output[i] = runs[lo].input_first + i - runs[lo].output_first;
+  output[i] = runs[lo].input_first + (i - runs[lo].output_first);
 }
 }  // namespace
 
@@ -239,7 +238,7 @@ void row_lineage::validate_on_impl(int64_t rows,
     thrust::sort(rmm::exec_policy(stream, mr), sorted.begin(), sorted.end());
     retained->invalid = std::make_unique<rmm::device_scalar<int>>(stream, mr);
     retained->invalid->set_value_to_zero_async(stream);
-    check_ordinals<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+    check_ordinals<<<detail::lineage_grid_size(rows), 256, 0, stream.get()>>>(
       sorted.data(), rows, input_domain_length(), retained->invalid->data());
     CUDF_CUDA_TRY(cudaGetLastError());
     if (retained->invalid->value(stream))
@@ -364,7 +363,7 @@ row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> position
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
     if (rows) {
-      file_rows_to_ordinals<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+      file_rows_to_ordinals<<<detail::lineage_grid_size(rows), 256, 0, stream.get()>>>(
         state->input->rows->mutable_view().data<uint64_t>(),
         state->input->source_indices ? state->input->source_indices->view().data<int32_t>()
                                      : nullptr,
@@ -403,20 +402,35 @@ row_lineage select_host_lineage(row_lineage const& before,
 {
   if (selected.size() > std::numeric_limits<cudf::size_type>::max())
     throw std::invalid_argument("delivered selection exceeds column limit");
-  auto indices = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                           selected.size(),
-                                           cudf::mask_state::UNALLOCATED,
-                                           stream,
-                                           mr);
-  if (!selected.empty()) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(indices->mutable_view().data<int64_t>(),
-                                  selected.data(),
-                                  selected.size_bytes(),
-                                  cudaMemcpyHostToDevice,
-                                  stream.get()));
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  struct selection_state {
+    std::vector<int64_t> host;
+    std::unique_ptr<cudf::column> indices;
+  };
+  auto retained = std::make_unique<selection_state>();
+  retained->host.assign(selected.begin(), selected.end());
+  auto const unjoined = detail::prepare_unjoined_failure();
+  try {
+    retained->indices = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                                  selected.size(),
+                                                  cudf::mask_state::UNALLOCATED,
+                                                  stream,
+                                                  mr);
+    if (!selected.empty()) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(retained->indices->mutable_view().data<int64_t>(),
+                                    retained->host.data(),
+                                    selected.size_bytes(),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      detail::check_read_checkpoint(detail::read_checkpoint::COPY);
+    }
+    detail::retire_reads(retained, stream, unjoined);
+  } catch (...) {
+    if (retained) detail::retire_reads(retained, stream, unjoined);
+    throw;
   }
-  return before.select(indices->view(), stream, mr);
+  std::shared_ptr<cudf::column const> indices = std::move(retained->indices);
+  auto const view                             = indices->view();
+  return before.select_impl(view, stream, mr, std::move(indices));
 }
 
 void validate_lineage_composition(row_lineage const& before,
@@ -446,25 +460,49 @@ void validate_lineage_composition(row_lineage const& before,
     offset += run.count;
   }
   if (!before.output_length()) return;
-  std::vector<selection_run> selection;
-  offset = 0;
-  for (auto const& [first, count] : before.runs()) {
-    selection.push_back({offset, first, count});
-    offset += count;
+  if (before.state() != row_position_state::per_row) {
+    // Compare the complete delivered sequence by interval, regardless of how either
+    // domain partitions it. Compact domains can be far larger than a cuDF column.
+    std::size_t next = 0;
+    int64_t consumed = 0;
+    auto compare     = [&](int64_t first, int64_t count) {
+      auto input = std::lower_bound(a.begin(), a.end(), first, [](auto const& run, auto ordinal) {
+        return run.ordinal + run.count <= ordinal;
+      });
+      while (count) {
+        auto const& output = b[next];
+        auto const take =
+          std::min({count, input->ordinal + input->count - first, output.count - consumed});
+        if (input->file != output.file ||
+            input->first + (first - input->ordinal) != output.first + consumed)
+          throw std::invalid_argument("selection composition input sequence mismatch");
+        count -= take;
+        first += take;
+        consumed += take;
+        if (first == input->ordinal + input->count) ++input;
+        if (consumed == output.count) {
+          ++next;
+          consumed = 0;
+        }
+      }
+    };
+    if (before.state() == row_position_state::identity)
+      compare(0, before.output_length());
+    else
+      for (auto const& [first, count] : before.runs())
+        compare(first, count);
+    return;
   }
   struct composition_state {
     row_lineage input;
     std::vector<physical_run> a, b;
-    std::vector<selection_run> selection;
     std::unique_ptr<rmm::device_uvector<physical_run>> da, db;
-    std::unique_ptr<rmm::device_uvector<selection_run>> ds;
     std::unique_ptr<rmm::device_scalar<int>> invalid;
   };
   auto retained       = std::make_unique<composition_state>();
   retained->input     = before;
   retained->a         = std::move(a);
   retained->b         = std::move(b);
-  retained->selection = std::move(selection);
   auto const unjoined = detail::prepare_unjoined_failure();
   try {
     auto upload = [&](auto const& host, auto& output) {
@@ -479,15 +517,12 @@ void validate_lineage_composition(row_lineage const& before,
     };
     upload(retained->a, retained->da);
     upload(retained->b, retained->db);
-    upload(retained->selection, retained->ds);
     retained->invalid = std::make_unique<rmm::device_scalar<int>>(stream, mr);
     retained->invalid->set_value_to_zero_async(stream);
     auto rows = before.output_length();
-    check_composition<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+    check_composition<<<detail::lineage_grid_size(rows), 256, 0, stream.get()>>>(
       rows,
-      before.per_row() ? before.per_row()->view().data<int64_t>() : nullptr,
-      retained->ds->data(),
-      retained->ds->size(),
+      before.per_row()->view().data<int64_t>(),
       retained->da->data(),
       retained->da->size(),
       retained->db->data(),
@@ -542,7 +577,7 @@ std::unique_ptr<cudf::column> concatenate_lineage_ordinals(std::span<row_lineage
       auto const& part = parts[i];
       auto count       = part.output_length();
       if (count && part.state() == row_position_state::per_row) {
-        copy_shift<<<(count + 255) / 256, 256, 0, stream.get()>>>(
+        copy_shift<<<detail::lineage_grid_size(count), 256, 0, stream.get()>>>(
           retained->output->mutable_view().data<int64_t>() + output_offset,
           part.per_row()->view().data<int64_t>(),
           count,
@@ -556,7 +591,7 @@ std::unique_ptr<cudf::column> concatenate_lineage_ordinals(std::span<row_lineage
                                       host.size() * sizeof(selection_run),
                                       cudaMemcpyHostToDevice,
                                       stream.get()));
-        select_runs<int64_t><<<(count + 255) / 256, 256, 0, stream.get()>>>(
+        select_runs<int64_t><<<detail::lineage_grid_size(count), 256, 0, stream.get()>>>(
           retained->output->mutable_view().data<int64_t>() + output_offset,
           nullptr,
           count,
@@ -616,7 +651,7 @@ std::unique_ptr<cudf::column> row_lineage::ordinal_column(::cuda::stream_ref str
                                       retained->runs.size() * sizeof(selection_run),
                                       cudaMemcpyHostToDevice,
                                       stream.get()));
-        fill_ordinals<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+        fill_ordinals<<<detail::lineage_grid_size(rows), 256, 0, stream.get()>>>(
           retained->output->mutable_view().data<int64_t>(),
           rows,
           retained->device->data(),
@@ -636,6 +671,14 @@ row_lineage row_lineage::select(cudf::column_view selected,
                                 ::cuda::stream_ref stream,
                                 rmm::device_async_resource_ref mr) const
 {
+  return select_impl(selected, stream, mr, {});
+}
+
+row_lineage row_lineage::select_impl(cudf::column_view selected,
+                                     ::cuda::stream_ref stream,
+                                     rmm::device_async_resource_ref mr,
+                                     std::shared_ptr<cudf::column const> selected_owner) const
+{
   auto const& [state, domain, runs, per_row, validated, binding] = data();
   if (state == row_position_state::lost || state == row_position_state::none) return *this;
   if ((selected.type().id() != cudf::type_id::INT32 &&
@@ -645,17 +688,19 @@ row_lineage row_lineage::select(cudf::column_view selected,
   validate_on(output_length(), stream, mr);
   struct selection_state {
     row_lineage source, indices, output;
+    std::shared_ptr<cudf::column const> selected_owner;
     std::vector<selection_run> runs;
     std::unique_ptr<rmm::device_uvector<selection_run>> device;
     std::unique_ptr<cudf::column> column;
     std::shared_ptr<cudf::column const> output_column;
   };
-  auto retained           = std::make_unique<selection_state>();
-  retained->source        = *this;
-  auto index_domain       = std::make_shared<lineage_domain>();
-  index_domain->files     = {{"delivered selection", output_length()}};
-  index_domain->file_runs = {{0, 0, output_length()}};
-  auto const unjoined     = detail::prepare_unjoined_failure();
+  auto retained            = std::make_unique<selection_state>();
+  retained->source         = *this;
+  retained->selected_owner = std::move(selected_owner);
+  auto index_domain        = std::make_shared<lineage_domain>();
+  index_domain->files      = {{"delivered selection", output_length()}};
+  index_domain->file_runs  = {{0, 0, output_length()}};
+  auto const unjoined      = detail::prepare_unjoined_failure();
   try {
     // A selection supplied through the public API remains untrusted. Only the
     // already sealed source avoids another full copy and sort.
@@ -697,7 +742,7 @@ row_lineage row_lineage::select(cudf::column_view selected,
                                       retained->runs.size() * sizeof(selection_run),
                                       cudaMemcpyHostToDevice,
                                       stream.get()));
-        select_runs<int64_t><<<(selected.size() + 255) / 256, 256, 0, stream.get()>>>(
+        select_runs<int64_t><<<detail::lineage_grid_size(selected.size()), 256, 0, stream.get()>>>(
           retained->column->mutable_view().data<int64_t>(),
           retained->indices.per_row()->view().data<int64_t>(),
           selected.size(),
@@ -789,7 +834,7 @@ void append_lineage_virtual_columns(owning_table_view& table,
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
     if (count && resolve_positions) {
-      physical_positions<<<(count + 255) / 256, 256, 0, stream.get()>>>(
+      physical_positions<<<detail::lineage_grid_size(count), 256, 0, stream.get()>>>(
         ordinal_view.data<int64_t>(),
         count,
         state->device->data(),
@@ -962,7 +1007,7 @@ void apply_lineage_visibility(
     auto rows   = state->input.num_rows();
     state->mask = cudf::make_numeric_column(
       cudf::data_type{cudf::type_id::BOOL8}, rows, cudf::mask_state::UNALLOCATED, stream, mr);
-    visibility_mask<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+    visibility_mask<<<detail::lineage_grid_size(rows), 256, 0, stream.get()>>>(
       state->mask->mutable_view().data<uint8_t>(),
       ordinals.data<int64_t>(),
       rows,

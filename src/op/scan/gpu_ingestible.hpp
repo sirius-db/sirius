@@ -238,6 +238,10 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     expression_query_policy policy                                    = {},
     scan_execution_context execution                                  = {}) = 0;
 
+  // Record resident/decompression results before the shared consumer sees them.
+  // Implementations may attach authoritative execution facts when qualified.
+  virtual void record_resident_execution(filtered_table&) const {}
+
   /**
    * @brief Whether `view_layout` can describe any resident batch of this scan
    *
@@ -246,10 +250,6 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *
    * @return True if this ingestible can serve a cached view, false if it cannot.
    */
-  // Observe the resident/decompression outcome before the shared consumer sees it.
-  // Implementations may attach shadow facts; this hook cannot qualify a producer.
-  virtual void record_resident_execution(filtered_table&) const {}
-
   [[nodiscard]] virtual bool can_serve_cached_view() const noexcept { return false; }
 
   /**
