@@ -17,6 +17,7 @@
 #include "scan_manager/insert_delta_job.hpp"
 
 #include "log/logging.hpp"
+#include "memory/host_reservation.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
@@ -67,7 +68,8 @@ insert_delta_workset prepare_insert_delta_tasks(
   exec::scoped_dispatcher& dispatcher,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   sirius::memory::topology_index const& topology,
-  std::span<int const> gpu_ids)
+  std::span<int const> gpu_ids,
+  std::function<void()> const& check_running)
 {
   insert_delta_workset workset;
   if (requests.empty()) { return workset; }
@@ -238,7 +240,8 @@ insert_delta_workset prepare_insert_delta_tasks(
       if (total_size <= block_size) {
         ccm::any_memory_space_in_tier_with_preference host_req(
           ccm::Tier::HOST, numa_node_for_device(bundle.preferred_device, topology));
-        auto reservation = reservation_manager.request_reservation(host_req, block_size);
+        auto reservation = sirius::memory::reserve_host_memory(
+          reservation_manager, host_req, block_size, check_running);
         if (!reservation) {
           throw std::runtime_error(
             "[prepare_insert_delta_tasks] failed to reserve " + std::to_string(block_size) +
@@ -329,10 +332,11 @@ void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
                            exec::scoped_dispatcher& dispatcher,
                            cucascade::memory::memory_reservation_manager& reservation_manager,
                            sirius::memory::topology_index const& topology,
-                           std::span<int const> gpu_ids)
+                           std::span<int const> gpu_ids,
+                           std::function<void()> const& check_running)
 {
-  auto workset =
-    prepare_insert_delta_tasks(requests, dispatcher, reservation_manager, topology, gpu_ids);
+  auto workset = prepare_insert_delta_tasks(
+    requests, dispatcher, reservation_manager, topology, gpu_ids, check_running);
   if (workset.fill_tasks.empty()) { return; }
   SIRIUS_LOG_DEBUG("[run_insert_delta_jobs] {} bundle(s) across {} request(s)",
                    workset.works.size(),

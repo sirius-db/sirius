@@ -23,6 +23,7 @@
 #include "sirius_config.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -143,7 +144,8 @@ struct insert_delta_workset {
   exec::scoped_dispatcher& dispatcher,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   sirius::memory::topology_index const& topology,
-  std::span<int const> gpu_ids);
+  std::span<int const> gpu_ids,
+  std::function<void()> const& check_running = {});
 
 /**
  * Drop all-invisible bundles and clear all-visible bundles' masks so they
@@ -164,7 +166,8 @@ void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
                            exec::scoped_dispatcher& dispatcher,
                            cucascade::memory::memory_reservation_manager& reservation_manager,
                            sirius::memory::topology_index const& topology,
-                           std::span<int const> gpu_ids);
+                           std::span<int const> gpu_ids,
+                           std::function<void()> const& check_running = {});
 
 /// One per-operator split cut from a bundle: the scan info plus the mask and
 /// placement to attach to the outgoing scan_operator_input.
