@@ -371,6 +371,15 @@ bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
   return conn_state && conn_state->is_internal_query_active();
 }
 
+std::optional<sirius::query_id_t> SiriusContext::active_query_for(ClientContext const& outer) const
+{
+  std::lock_guard lock(window_completions_mutex_);
+  for (auto const& [id, window] : active_windows_) {
+    if (window.outer == &outer) return window.query_id;
+  }
+  return std::nullopt;
+}
+
 void SiriusContext::InternalQueryGuard::before_transaction_start(ClientContext& outer,
                                                                  AttachedDatabase const& database,
                                                                  bool read_only)
@@ -378,16 +387,7 @@ void SiriusContext::InternalQueryGuard::before_transaction_start(ClientContext& 
   if (read_only) { return; }
   auto ctx = outer.registered_state->Get<SiriusContext>("sirius_state");
   if (!ctx) { return; }
-  std::optional<sirius::query_id_t> query_id;
-  {
-    std::lock_guard lock(ctx->window_completions_mutex_);
-    for (auto const& [id, window] : ctx->active_windows_) {
-      if (window.outer == &outer) {
-        query_id = window.query_id;
-        break;
-      }
-    }
-  }
+  auto query_id = ctx->active_query_for(outer);
   // Snapshot first: never nest the window mutex with the scan-manager key mutex.
   // This gate enforces transaction ordering, not ClientContext thread safety.
   if (query_id && ctx->get_scan_manager().holds_checkpoint_key(*query_id, database)) {
@@ -1425,7 +1425,10 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
       : query->get_pipelines().front()->get_operator_params().enable_pinned_zone_map_pruning,
     task_creator_->get_active_gpu_ids(query_id),
     handler,
-    std::move(interrupted));
+    [this, interrupted = std::move(interrupted)] {
+      if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
+      return interrupted && interrupted();
+    });
   return query;
 }
 

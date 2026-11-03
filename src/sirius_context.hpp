@@ -530,6 +530,9 @@ class SiriusContext : public ClientContextState {
     friend class SiriusContext;
   };
 
+  [[nodiscard]] std::optional<sirius::query_id_t> active_query_for(
+    ClientContext const& outer) const;
+
   [[nodiscard]] static internal_connection open_internal_connection(ClientContext& outer);
 
   // Installed and cleared with no replay in flight; only invoked by the internal test option.
