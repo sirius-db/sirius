@@ -20,7 +20,7 @@ pub enum ConfigError {
     InvalidConfiguration(String),
     /// An unexpected native status was returned; diagnostics may be empty.
     Unexpected { status: u32, message: String },
-    /// The platform path cannot be represented by the native bridge.
+    /// The path contains a NUL byte or cannot be represented on the platform.
     InvalidPath,
 }
 
@@ -40,6 +40,9 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "Sirius status {status}")
             }
             Self::Unexpected { status, message } => write!(f, "Sirius status {status}: {message}"),
+            Self::InvalidPath if cfg!(unix) => {
+                f.write_str("configuration path contains a NUL byte")
+            }
             Self::InvalidPath => f.write_str("configuration path cannot be represented"),
         }
     }
@@ -66,10 +69,16 @@ fn configuration_error(status: u32, diagnostic: Diagnostic) -> ConfigError {
 ///
 /// Owns its native snapshot independently of its builder or source file. Hardware
 /// availability and capacity are checked when the engine is constructed.
-/// No thread-safety guarantees are exposed yet: this type is neither `Send` nor `Sync`.
+/// This type is `Send` and `Sync`: it may be moved or shared between threads.
 pub struct ContextConfig {
     inner: NonNull<c_api::SiriusContextConfig>,
 }
+
+// SAFETY: the C contract permits transferring owning references, including final release.
+unsafe impl Send for ContextConfig {}
+// SAFETY: settings are immutable; concurrent retain is allowed by the C contract.
+// Atomic reference counts and Rust borrows keep the handle live during use.
+unsafe impl Sync for ContextConfig {}
 
 impl Clone for ContextConfig {
     /// Share the immutable settings through a new owned handle.
@@ -93,10 +102,17 @@ impl Clone for ContextConfig {
 ///
 /// Parsing and validation are performed through the public C ABI. Loading and
 /// building do not initialize CUDA, discover hardware, or allocate engine resources.
-/// This type is neither `Send` nor `Sync`.
+/// This type is `Send` and `Sync`: it may be moved or shared between threads.
+/// Building and cloning through shared references may run concurrently.
 pub struct ContextConfigBuilder {
     inner: NonNull<c_api::SiriusContextConfigBuilder>,
 }
+
+// SAFETY: the C contract permits transferring owning references, including final release.
+unsafe impl Send for ContextConfigBuilder {}
+// SAFETY: settings are immutable; shared operations retain/build concurrently under the
+// C contract. Atomic reference counts and Rust borrows keep each handle live during use.
+unsafe impl Sync for ContextConfigBuilder {}
 
 impl ContextConfigBuilder {
     /// Start with built-in defaults. Native allocation failures are returned as
@@ -246,6 +262,40 @@ impl Drop for ContextConfigBuilder {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_handles_can_move_and_be_shared_between_threads() {
+        let builder = ContextConfigBuilder::new().unwrap();
+        let config = builder.build().unwrap();
+        let owned_builder = builder.clone();
+        let owned_config = config.clone();
+        std::thread::scope(|scope| {
+            let moved = scope.spawn(move || {
+                drop(owned_config.clone());
+                drop(owned_config);
+                owned_builder.build().unwrap()
+            });
+            let borrowed = scope.spawn(|| {
+                drop(config.clone());
+                builder.clone().build().unwrap()
+            });
+            drop(moved.join().unwrap());
+            drop(borrowed.join().unwrap());
+        });
+        builder.build().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let owners = [(builder.clone(), config.clone()), (builder, config)];
+        std::thread::scope(|scope| {
+            for (builder, config) in owners {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    drop(builder);
+                    drop(config);
+                });
+            }
+        });
+    }
 
     #[test]
     fn defaults_and_copies_own_their_handles() {

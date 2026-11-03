@@ -88,3 +88,37 @@ fn path_bytes_are_borrowed_for_the_call() {
     assert_eq!(backend::last_path(), bytes);
     builder.build().unwrap();
 }
+
+#[test]
+fn configuration_handles_can_move_and_be_shared_between_threads() {
+    let builder = ContextConfigBuilder::new().unwrap();
+    let config = builder.build().unwrap();
+    let owned_builder = builder.clone();
+    let owned_config = config.clone();
+    std::thread::scope(|scope| {
+        let moved = scope.spawn(move || {
+            drop(owned_config.clone());
+            drop(owned_config);
+            owned_builder.build().unwrap()
+        });
+        let borrowed = scope.spawn(|| {
+            drop(config.clone());
+            builder.clone().build().unwrap()
+        });
+        drop(moved.join().unwrap());
+        drop(borrowed.join().unwrap());
+    });
+    builder.build().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let owners = [(builder.clone(), config.clone()), (builder, config)];
+    std::thread::scope(|scope| {
+        for (builder, config) in owners {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                drop(builder);
+                drop(config);
+            });
+        }
+    });
+}
