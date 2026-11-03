@@ -459,8 +459,8 @@ void read_positional_delete_file(duckdb::ClientContext& context,
       return [&positions](duckdb::DataChunk& chunk) {
         duckdb::UnifiedVectorFormat paths;
         duckdb::UnifiedVectorFormat offsets;
-        chunk.data[0].ToUnifiedFormat(chunk.size(), paths);
-        chunk.data[1].ToUnifiedFormat(chunk.size(), offsets);
+        chunk.data[0].ToUnifiedFormat(paths);
+        chunk.data[1].ToUnifiedFormat(offsets);
         auto const* path_data = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(paths);
         auto const* pos_data  = duckdb::UnifiedVectorFormat::GetData<int64_t>(offsets);
         std::vector<int64_t>* target = nullptr;
