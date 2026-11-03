@@ -34,7 +34,7 @@ For the legacy Sirius implementation used for the ClickBench results, see the
 ## Requirements
 - Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
 - NVIDIA Turing or newer, with compute capability 7.5+.
-- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver R570 or newer).
+- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 570.26 or newer).
 - `io_uring` enabled at runtime (`CONFIG_IO_URING`, `kernel.io_uring_disabled=0` recommended). Containers must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
 - Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`).
 

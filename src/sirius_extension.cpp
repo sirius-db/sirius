@@ -3636,16 +3636,21 @@ static void default_to_explicit_delim_joins(DBConfig& config)
   Settings::Set<DelimJoinAsCteSetting>(config, SetScope::GLOBAL, Value::BOOLEAN(false));
 }
 
-// CUDA 12.8+ builds call cudaMemcpyBatchAsync, which older drivers lack. The sirius loader checks
-// this too, but a backend loaded directly bypasses it.
+// CUDA 12.8+ builds call cudaMemcpyBatchAsync, which older drivers lack. Keep this guard in sync
+// with the `CUDART_VERSION >= 12080` batch-copy paths (device_transfer.cpp,
+// duckdb_native_decoder.cpp, spill_chunked_converters.cpp). The sirius loader checks this too,
+// but a backend loaded directly bypasses it.
 static void check_cuda_driver_version()
 {
 #if CUDART_VERSION >= 12080 && CUDART_VERSION < 13000
   int version = 0;
-  if (cudaDriverGetVersion(&version) != cudaSuccess || version < 12080) {
+  if (cudaDriverGetVersion(&version) != cudaSuccess || version == 0) {
     throw InvalidInputException(
-      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer (reported CUDA version: "
-      "%d.%d)",
+      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: no driver found");
+  }
+  if (version < 12080) {
+    throw InvalidInputException(
+      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: reported CUDA version %d.%d",
       version / 1000,
       (version % 1000) / 10);
   }
