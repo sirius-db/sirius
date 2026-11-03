@@ -16,7 +16,6 @@
 
 #include "compression/compressed_representation.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "expression/ast/utils.hpp"
 #include "late_mat/column_origin.hpp"
 #include "late_mat/defer_directive.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"

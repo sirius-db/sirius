@@ -18,7 +18,6 @@
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/scan_plan.hpp>
-#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
@@ -28,7 +27,6 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 
 // standard library

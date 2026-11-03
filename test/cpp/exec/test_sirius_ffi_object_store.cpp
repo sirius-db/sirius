@@ -22,9 +22,9 @@
 #include "utils/ffi_object_store_fixture.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 
-#include <arpa/inet.h>
+#include <arpa/inet.h>  // IWYU pragma: keep
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/common/arrow/arrow.hpp>
 #include <poll.h>
 #include <substrait/plan.pb.h>

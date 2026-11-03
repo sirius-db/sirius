@@ -8,8 +8,7 @@
 #include "catch.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 
-#include <duckdb.hpp>
-#include <duckdb/common/string_util.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/main/secret/secret.hpp>
 #include <duckdb/main/secret/secret_manager.hpp>
 

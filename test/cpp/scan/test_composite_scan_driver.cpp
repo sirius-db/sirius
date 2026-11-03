@@ -28,7 +28,6 @@
 
 #include <array>
 #include <future>
-#include <numeric>
 #include <system_error>
 
 using namespace sirius::op::scan;

@@ -23,23 +23,18 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
-#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "yyjson.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
-
 #include <catch.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/string_util.hpp>
 #include <duckdb/common/types/blob.hpp>
-#include <duckdb/parser/sql_statement.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
@@ -57,7 +52,6 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <transparent/read_view_registry.hpp>
-#include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/log_test_utils.hpp>

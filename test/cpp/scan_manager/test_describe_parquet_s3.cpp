@@ -16,8 +16,6 @@
 
 #include "catch.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "scan/test_utils.hpp"
@@ -25,10 +23,6 @@
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
-#include <cucascade/memory/topology_discovery.hpp>
-#include <duckdb.hpp>
-
-#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>

@@ -20,7 +20,6 @@
 #include "op/scan/table_scan/split_validation.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
-#include "transparent/replay_admission.hpp"
 
 #include <duckdb/planner/operator/logical_get.hpp>
 

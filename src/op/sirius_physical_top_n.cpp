@@ -31,7 +31,6 @@
 
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/cudf_utils.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
 

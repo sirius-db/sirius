@@ -16,22 +16,18 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
 
-#include <fcntl.h>
 #include <log/logging.hpp>
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 

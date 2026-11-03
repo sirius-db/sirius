@@ -19,7 +19,6 @@
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "op/scan/detail/read_retirement.hpp"
 #include "op/scan/scan_plan.hpp"
-#include "op/scan/scan_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
 

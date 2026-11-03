@@ -6,7 +6,6 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/schema_catalog_entry.hpp>
@@ -15,34 +14,25 @@
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
-#include <fcntl.h>
 #include <op/scan/duckdb_native_metadata_cache.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/metadata_walk_parallel.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
-#include <signal.h>
 #include <sirius_context.hpp>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <transparent/read_view_registry.hpp>
-#include <unistd.h>
-#include <utils/child_process_environment.hpp>
+#include <transparent/read_view_registry.hpp>  // IWYU pragma: keep
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/isolated_checkpoint_test.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
-#include <fstream>
 #include <future>
 #include <mutex>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <thread>
 

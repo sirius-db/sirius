@@ -15,7 +15,6 @@
  */
 
 #include "catch.hpp"
-#include "duckdb.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"

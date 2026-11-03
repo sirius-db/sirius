@@ -17,7 +17,7 @@
 #include "planner/join_key_nullability.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>

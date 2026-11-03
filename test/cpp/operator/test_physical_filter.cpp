@@ -20,7 +20,6 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>

@@ -17,7 +17,6 @@
 // sirius
 #include <cudf/cudf_utils.hpp>
 
-#include <expression/ast/node.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>

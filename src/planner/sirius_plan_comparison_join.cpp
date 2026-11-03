@@ -19,7 +19,6 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -34,7 +33,6 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/join_condition.hpp"
-#include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
@@ -51,7 +49,6 @@
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>

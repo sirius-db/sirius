@@ -55,7 +55,6 @@
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/function/aggregate_function.hpp>
 #include <duckdb/function/scalar_function.hpp>
-#include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>

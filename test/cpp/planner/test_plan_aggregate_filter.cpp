@@ -37,7 +37,6 @@
 #include <cudf/aggregation.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/settings.hpp>
@@ -48,7 +47,6 @@
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
-#include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 

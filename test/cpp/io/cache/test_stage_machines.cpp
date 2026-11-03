@@ -22,8 +22,6 @@
 #include <future>
 #include <memory>
 #include <string>
-#include <thread>
-#include <tuple>
 #include <vector>
 
 using sirius::io::cache::consumer_stage;

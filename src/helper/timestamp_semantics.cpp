@@ -21,7 +21,6 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/transform.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <helper/timestamp_semantics.hpp>

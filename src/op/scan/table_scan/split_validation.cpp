@@ -17,7 +17,7 @@
 #include "op/scan/table_scan/split_validation.hpp"
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
-#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "transparent/replay_admission.hpp"
 
 #include <duckdb/storage/single_file_block_manager.hpp>

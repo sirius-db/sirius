@@ -17,7 +17,7 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/filter/table_filter_functions.hpp>
@@ -26,7 +26,6 @@
 #include <duckdb/planner/operator/logical_top_n.hpp>
 
 #include <algorithm>
-#include <string>
 #include <vector>
 
 namespace {

@@ -21,11 +21,8 @@
 #include <sirius/exception.hpp>
 
 // cudf
-#include "cudf/ast_compat.hpp"
-
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
 
 // standard library

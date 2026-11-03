@@ -19,9 +19,6 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 
-#include <rmm/error.hpp>
-
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 

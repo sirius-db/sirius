@@ -28,7 +28,6 @@
 #include <cstdint>
 #include <limits>
 #include <string>
-#include <utility>
 #include <vector>
 
 using sirius::planner::extract_scan_byte_ranges;

@@ -4,11 +4,10 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/utilities/error.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
 
-#include <cuda/stream_ref>
+#include <cuda/stream_ref>  // IWYU pragma: keep
 
 #include <bit>
 #include <charconv>
