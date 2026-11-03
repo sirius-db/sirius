@@ -82,8 +82,9 @@ class sirius_physical_unordered_streaming_limit : public sirius_physical_operato
   std::mutex _claim_mutex;
   std::size_t _remaining_offset;
   std::size_t _remaining_limit;
-  std::size_t _pending_claims = 0;
-  bool _has_approved_claim    = false;
+  // Zero-row requests cannot refund quota and must not delay exhaustion on an open stream.
+  std::size_t _pending_quota_claims = 0;
+  bool _has_approved_claim          = false;
   void update_exhaustion();  // Requires _claim_mutex.
   std::atomic<bool> _limit_exhausted{false};
 };
@@ -154,6 +155,7 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
   std::size_t _remaining_limit;
   std::optional<std::vector<std::size_t>> _positions;
   std::size_t _next_position = 0;
+  bool _has_output_task      = false;
 };
 
 }  // namespace op

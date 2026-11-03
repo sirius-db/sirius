@@ -22,12 +22,30 @@
 
 #include <cudf/copying.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
 namespace sirius {
 namespace op {
 
 namespace {
+// A discarded input never reaches GPU task preparation. Release GPU-resident inputs on their
+// owning device, matching other task-creation paths that discard repository batches.
+void release_unused_batch(std::shared_ptr<cucascade::data_batch>& batch)
+{
+  if (!batch) { return; }
+  std::optional<rmm::cuda_set_device_raii> device_guard;
+  {
+    auto ro     = batch->to_read_only();
+    auto* space = ro.get_memory_space();
+    if (space && space->get_tier() == cucascade::memory::Tier::GPU) {
+      device_guard.emplace(rmm::cuda_device_id{space->get_device_id()});
+    }
+  }
+  batch.reset();
+}
+
 std::unique_ptr<operator_data> execute_slice(const pipelineable_operator_data& input,
                                              std::size_t slice_begin,
                                              std::size_t slice_count,
@@ -85,7 +103,7 @@ sirius_physical_unordered_streaming_limit::claim_request::claim_request(
   _take = std::min(_owner._remaining_limit, rows - _skip);
   _owner._remaining_offset -= _skip;
   _owner._remaining_limit -= _take;
-  ++_owner._pending_claims;
+  if (_skip != 0 || _take != 0) { ++_owner._pending_quota_claims; }
 }
 
 sirius_physical_unordered_streaming_limit::claim_request::~claim_request() noexcept
@@ -95,7 +113,7 @@ sirius_physical_unordered_streaming_limit::claim_request::~claim_request() noexc
   // Other tasks may have committed in the meantime: never restore a counter snapshot.
   _owner._remaining_offset += _skip;
   _owner._remaining_limit += _take;
-  --_owner._pending_claims;
+  if (_skip != 0 || _take != 0) { --_owner._pending_quota_claims; }
   _owner.update_exhaustion();
 }
 
@@ -105,15 +123,16 @@ void sirius_physical_unordered_streaming_limit::claim_request::approve() noexcep
   std::lock_guard<std::mutex> guard(_owner._claim_mutex);
   _approved                  = true;
   _owner._has_approved_claim = true;
-  --_owner._pending_claims;
+  if (_skip != 0 || _take != 0) { --_owner._pending_quota_claims; }
   _owner.update_exhaustion();
 }
 
 void sirius_physical_unordered_streaming_limit::update_exhaustion()
 {
-  // Provisional reservations must not stop task creation. LIMIT 0 also needs a successful
-  // empty output before stopping, so downstream aggregates receive an input batch.
-  if (_has_approved_claim && _remaining_limit == 0 && _pending_claims == 0) {
+  // Only reservations that could refund offset/limit rows delay exhaustion. Zero-row requests
+  // may overlap indefinitely on an open stream, but already-created tasks still drain normally.
+  // LIMIT 0 needs a successful empty output before stopping for downstream aggregates.
+  if (_has_approved_claim && _remaining_limit == 0 && _pending_quota_claims == 0) {
     _limit_exhausted.store(true, std::memory_order_release);
   }
 }
@@ -180,28 +199,53 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::get_next_task_in
   if (!_positions && repo->get_ordering() == cucascade::data_repository_ordering::ORDERED) {
     _positions = repo->get_positions();
   }
-  std::shared_ptr<cucascade::data_batch> batch;
-  std::optional<std::size_t> position;
-  if (_positions) {
-    if (_next_position == _positions->size()) { return nullptr; }
-    position = (*_positions)[_next_position];
-    batch    = repo->pop_data_batch_by_position(*position);
-    if (!batch) { throw internal_exception("STREAMING_LIMIT input position disappeared"); }
-  } else {
-    batch = repo->pop_next_data_batch();
-    if (!batch) { return nullptr; }
+  // Retain at most one candidate for the required empty output if no task selects any rows.
+  std::shared_ptr<cucascade::data_batch> empty_batch;
+  std::optional<std::size_t> empty_position;
+  std::size_t empty_begin = 0;
+  while (true) {
+    std::shared_ptr<cucascade::data_batch> batch;
+    std::optional<std::size_t> position;
+    if (_positions) {
+      if (_next_position == _positions->size()) { break; }
+      position = (*_positions)[_next_position];
+      batch    = repo->pop_data_batch_by_position(*position);
+      if (!batch) { throw internal_exception("STREAMING_LIMIT input position disappeared"); }
+      ++_next_position;
+    } else {
+      batch = repo->pop_next_data_batch();
+      if (!batch) { break; }
+    }
+    if (_remaining_limit == 0 && (_has_output_task || empty_batch)) {
+      // No GPU task or row metadata is needed for trailing input that cannot contribute rows.
+      release_unused_batch(batch);
+      continue;
+    }
+    auto rows = sirius::get_batch_rows_and_bytes(*batch).rows;
+    if (!rows) { throw internal_exception("Cannot determine batch row count for STREAMING_LIMIT"); }
+    auto skip = std::min(_remaining_offset, *rows);
+    auto take = std::min(_remaining_limit, *rows - skip);
+    _remaining_offset -= skip;
+    _remaining_limit -= take;
+    if (take == 0) {
+      if (!_has_output_task && !empty_batch) {
+        empty_batch    = std::move(batch);
+        empty_position = position;
+        empty_begin    = skip;
+      } else {
+        release_unused_batch(batch);
+      }
+      continue;
+    }
+    release_unused_batch(empty_batch);
+    _has_output_task = true;
+    return std::make_unique<limiting_operator_data>(
+      std::vector{std::move(batch)}, skip, take, position);
   }
-  auto rows = sirius::get_batch_rows_and_bytes(*batch).rows;
-  if (!rows) { throw internal_exception("Cannot determine batch row count for STREAMING_LIMIT"); }
-  auto skip = std::min(_remaining_offset, *rows);
-  auto take = std::min(_remaining_limit, *rows - skip);
-  _remaining_offset -= skip;
-  _remaining_limit -= take;
-  if (_positions) { ++_next_position; }
-  // Retain zero-row outputs, including LIMIT 0, so downstream ungrouped aggregates see input.
-  // Every input is consumed; no early-exhaustion flag can close the pipeline before task creation.
+  if (!empty_batch) { return nullptr; }
+  _has_output_task = true;
   return std::make_unique<limiting_operator_data>(
-    std::vector{std::move(batch)}, skip, take, position);
+    std::vector{std::move(empty_batch)}, empty_begin, 0, empty_position);
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(

@@ -265,9 +265,10 @@ before approval refund only that request's reserved offset and limit; retries ma
 No batch IDs or per-input claim history are needed. A retry may select different rows, which is
 valid for this unordered input.
 
-`is_limit_exhausted()` stops further task creation only when the limit is consumed, no claims
-remain pending, and at least one output has been approved. Both approval and rollback update
-this condition. The pipeline waits for all already-created tasks (including retries) before
+`is_limit_exhausted()` stops further task creation only when the limit is consumed, no pending
+claim can refund offset or limit rows, and at least one output has been approved. Zero-row claims
+do not delay exhaustion, even if they keep overlapping on an open stream. Both approval and
+rollback update this condition. The pipeline waits for all already-created tasks (including retries) before
 completing. The executor's post-return diagnostics do not perform retryable GPU allocations;
 changes to its retry boundary must preserve approval after all retryable work. LIMIT 0 permits an
 initial task to emit an empty batch for downstream aggregates. This does not cancel independent
@@ -280,8 +281,8 @@ Implements LIMIT/OFFSET with a FULL input barrier and serialized slice claims du
 
 - **Key members:** `_remaining_offset` and `_remaining_limit` (`size_t` counters), guarded by `_claim_mutex`.
 - **Mechanism:** After the producer finishes, `get_next_task_input_data()` consumes ordered input by ascending existing position, or unordered input in FIFO order. It snapshots existing positions for ordered input, reads the batch row count with `get_batch_rows_and_bytes()`, and claims an immutable slice under `_claim_mutex`. Unknown row counts are errors. The resulting `limiting_operator_data` carries the slice and optional position; execution and retries apply that slice without claiming again.
-- **Completion:** Every input batch is consumed, including batches whose slice is empty after the limit is satisfied. Both ordered and unordered input wait for the complete producer output before LIMIT starts consuming it.
-- **Empty output:** Zero-row outputs retain their input position. A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
+- **Completion:** Every input batch is consumed, but offset-only and trailing unused batches are drained during task creation rather than sent to GPU tasks. Spilled trailing batches are released without restoring them to GPU memory. Already-created tasks and retries still finish normally. Both ordered and unordered input wait for the complete producer output before LIMIT starts consuming it.
+- **Empty output:** If no input slice selects rows (including LIMIT 0 or an offset past all input), one task emits a 0-row batch at the retained input's position, so a downstream ungrouped aggregate still returns its row. Other empty slices need no task. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
 
 ### `sirius_physical_replicate` — `REPLICATE`
 **File:** `src/op/sirius_physical_replicate.hpp`
