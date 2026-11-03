@@ -17,6 +17,7 @@
 #include <utils/test_validation_utility.hpp>
 
 #include <array>
+#include <limits>
 
 using namespace sirius::op::scan;
 
@@ -235,6 +236,154 @@ TEST_CASE("Lineage concatenation advances by input domain rather than survivors"
   REQUIRE(again.ordinals_on(static_cast<::cuda::stream_ref>(stream)) ==
           std::vector<int64_t>{301, 1001});
   REQUIRE(again.resolve(1001) == std::pair<std::size_t, int64_t>{1, 3});
+}
+
+TEST_CASE("Host lineage transfers retain storage until completion is established",
+          "[scan][lineage][retirement]")
+{
+  auto const operation = GENERATE(0, 1, 2);     // compact upload, selection upload, download
+  auto const failure   = GENERATE(0, 1, 2, 3);  // success, post-copy, failed cleanup, failed join
+  CAPTURE(operation, failure);
+  rmm::cuda_stream stream;
+  sirius::test::tracked_scan_resource resource(cudf::get_current_device_resource_ref(), stream);
+  rmm::device_async_resource_ref mr{resource};
+  auto source = identity("A", 8).validated_copy(8, stream, mr);
+  if (operation != 0) source = source.select(std::array<int64_t, 3>{7, 1, 5}, stream, mr);
+  std::weak_ptr<cudf::column const> source_life = source.per_row();
+  bool const unjoined                           = failure >= 2;
+  row_lineage result;
+  std::vector<int64_t> values;
+  {
+    detail::read_retirement_test_hooks hooks(
+      failure == 1 || failure == 2 ? std::optional{detail::read_checkpoint::COPY} : std::nullopt,
+      unjoined);
+    auto transfer = [&] {
+      if (operation == 0)
+        result = source.select(std::array<int64_t, 3>{7, 1, 5}, stream, mr);
+      else if (operation == 1)
+        result = source.select(std::array<int64_t, 2>{2, 0}, stream, mr);
+      else
+        values = source.ordinals_on(stream);
+    };
+    if (unjoined)
+      CHECK_THROWS_AS(transfer(), sirius::unjoined_gpu_work);
+    else if (failure)
+      CHECK_THROWS_AS(transfer(), rmm::out_of_memory);
+    else
+      REQUIRE_NOTHROW(transfer());
+    CHECK(hooks.checkpoint_reached == (failure == 1 || failure == 2));
+    CHECK(hooks.retained.has_value() == unjoined);
+    CHECK(cudaStreamQuery(stream.value()) == cudaSuccess);
+    source = {};
+    if (operation == 2) CHECK(source_life.expired() == !unjoined);
+    if (failure) CHECK((resource.state->live != 0) == unjoined);
+  }
+  CHECK(source_life.expired());
+  if (!failure) {
+    if (operation == 1)
+      CHECK(result.ordinals_on(stream) == std::vector<int64_t>{5, 7});
+    else if (operation == 0)
+      CHECK(result.ordinals_on(stream) == std::vector<int64_t>{7, 1, 5});
+    else
+      CHECK(values == std::vector<int64_t>{7, 1, 5});
+  }
+  result = {};
+  CHECK(resource.state->live == 0);
+  CHECK_FALSE(resource.state->wrong_stream);
+}
+
+TEST_CASE("Lineage launch sizing rejects grids that cannot cover every row", "[scan][lineage]")
+{
+  for (auto rows :
+       {int64_t{0}, int64_t{1}, int64_t{255}, int64_t{256}, int64_t{257}, int64_t{INT32_MAX}}) {
+    CAPTURE(rows);
+    auto blocks = detail::lineage_grid_size(rows);
+    CHECK(int64_t{blocks} * 256 >= rows);
+    CHECK((blocks == 0 || int64_t{blocks - 1} * 256 < rows));
+  }
+  int device, max_grid;
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  REQUIRE(cudaDeviceGetAttribute(&max_grid, cudaDevAttrMaxGridDimX, device) == cudaSuccess);
+  auto const limit = int64_t{max_grid} * 256;
+  CHECK(detail::lineage_grid_size(limit) == static_cast<unsigned int>(max_grid));
+  CHECK_THROWS_AS(detail::lineage_grid_size(limit + 1), std::invalid_argument);
+  CHECK_THROWS_AS(detail::lineage_grid_size((int64_t{1} << 40) + 256), std::invalid_argument);
+  CHECK_THROWS_AS(detail::lineage_grid_size(INT64_MAX), std::invalid_argument);
+  CHECK_THROWS_AS(detail::lineage_grid_size(-1), std::invalid_argument);
+}
+
+TEST_CASE("Compact composition validates the entire sequence without device allocation",
+          "[scan][lineage]")
+{
+  auto const rows = GENERATE(int64_t{0},
+                             int64_t{1},
+                             int64_t{255},
+                             int64_t{256},
+                             int64_t{257},
+                             (int64_t{1} << 40) + 256,
+                             int64_t{INT64_MAX - 2});
+  CAPTURE(rows);
+  rmm::cuda_stream stream;
+  sirius::test::tracked_scan_resource resource(cudf::get_current_device_resource_ref(), stream);
+  resource.state->fail_at = 0;
+  rmm::device_async_resource_ref mr{resource};
+  auto before          = identity("A", rows + 2, 0, rows);
+  auto delivered       = std::make_shared<lineage_domain>(*before.domain());
+  auto const split     = std::min(int64_t{256}, rows);
+  delivered->file_runs = {{0, 0, split}, {0, split, rows - split}, {0, rows, 0}};
+  row_lineage step{row_position_state::identity, delivered};
+  auto result = row_lineage::compose(before, step, stream, mr);
+  CHECK(result.output_length() == rows);
+  CHECK(result.state() == row_position_state::identity);
+  CHECK_FALSE(result.per_row());
+  if (rows > 256) {
+    // The old narrowed grid checked only the first 256 rows for 2^40 + 256.
+    ++delivered->file_runs[1].first;
+    CHECK_THROWS_AS(row_lineage::compose(before, step, stream, mr), std::invalid_argument);
+  }
+  CHECK(resource.state->attempts == 0);
+}
+
+TEST_CASE("Compact composition preserves reordered selections across files and intervals",
+          "[scan][lineage]")
+{
+  rmm::cuda_stream stream;
+  sirius::test::tracked_scan_resource resource(cudf::get_current_device_resource_ref(), stream);
+  resource.state->fail_at = 0;
+  rmm::device_async_resource_ref mr{resource};
+  auto const large  = (int64_t{1} << 40);
+  auto domain       = std::make_shared<lineage_domain>();
+  domain->files     = {{"A", INT64_MAX}, {"B", 1000}};
+  domain->file_runs = {{0, INT64_MAX - large, large}, {1, 10, 100}};
+  row_lineage before{row_position_state::runs, domain, {{large, 100}, {0, large}}};
+  auto delivered       = std::make_shared<lineage_domain>();
+  delivered->files     = {{"B", 1000}, {"A", INT64_MAX}};
+  delivered->file_runs = {
+    {0, 10, 20}, {0, 30, 80}, {1, INT64_MAX - large, large - 1}, {1, INT64_MAX - 1, 1}};
+  row_lineage step{row_position_state::runs, delivered, {{90, large + 10}, {0, 10}}};
+  auto result = row_lineage::compose(before, step, stream, mr);
+  CHECK(result.domain() == domain);
+  std::array<int64_t, 6> output_indices{0, 9, 10, large + 9, large + 10, large + 19};
+  std::array<int64_t, 6> expected_ordinals{large + 90, large + 99, 0, large - 1, large, large + 9};
+  for (std::size_t i = 0; i < output_indices.size(); ++i) {
+    auto index = output_indices[i];
+    bool found = false;
+    for (auto const& [first, count] : result.runs()) {
+      if (index < count) {
+        CHECK(first + index == expected_ordinals[i]);
+        found = true;
+        break;
+      }
+      index -= count;
+    }
+    CHECK(found);
+  }
+  CHECK(result.output_length() == large + 20);
+  CHECK_FALSE(result.per_row());
+  // A mismatch in the last interval must not hide behind the enormous preceding interval.
+  --delivered->file_runs.back().first;
+  CHECK_THROWS_AS(row_lineage::compose(before, step, stream, mr), std::invalid_argument);
+  CHECK(resource.state->attempts == 0);
 }
 
 TEST_CASE("Lineage resolves pruned gaps and composes only matching delivered domains",

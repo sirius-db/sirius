@@ -13,6 +13,10 @@
 #include <utility>
 
 namespace sirius::op::scan {
+namespace detail {
+// Checked grid width for lineage kernels with 256 threads per block; zero rows need no launch.
+unsigned int lineage_grid_size(int64_t rows);
+}  // namespace detail
 struct scan_plan;
 // File ordinals belong to this immutable namespace. Intervals describe the
 // input before selection, including the original offsets of pruned row groups.
@@ -115,6 +119,14 @@ class row_lineage {
                         bool strict) const;
   [[nodiscard]] std::shared_ptr<lineage_domain const> source_binding() const;
   void seal_validation(std::shared_ptr<lineage_domain const> binding = {});
+  row_lineage select_impl(cudf::column_view,
+                          ::cuda::stream_ref,
+                          rmm::device_async_resource_ref,
+                          std::shared_ptr<cudf::column const> selected_owner) const;
+  friend row_lineage select_host_lineage(row_lineage const&,
+                                         std::span<int64_t const>,
+                                         ::cuda::stream_ref,
+                                         rmm::device_async_resource_ref);
   friend row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions>,
                                               ::cuda::stream_ref,
                                               rmm::device_async_resource_ref,

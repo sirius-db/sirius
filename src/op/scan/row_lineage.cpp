@@ -1,6 +1,8 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "op/scan/row_lineage.hpp"
 
+#include "op/scan/detail/read_retirement.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -61,7 +63,7 @@ bool recoverable(row_position_state state)
          state == row_position_state::per_row;
 }
 row_lineage compact(std::shared_ptr<lineage_domain const> domain,
-                    std::span<int64_t const> ordinals,
+                    std::vector<int64_t> ordinals,
                     ::cuda::stream_ref stream,
                     rmm::device_async_resource_ref mr)
 {
@@ -84,19 +86,31 @@ row_lineage compact(std::shared_ptr<lineage_domain const> domain,
   } else if (runs.size() * 2 > ordinals.size() && !ordinals.empty()) {
     if (ordinals.size() > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()))
       throw std::invalid_argument("lineage selection exceeds column limit");
-    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                            ordinals.size(),
-                                            cudf::mask_state::UNALLOCATED,
-                                            stream,
-                                            mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<int64_t>(),
-                                  ordinals.data(),
-                                  ordinals.size_bytes(),
-                                  cudaMemcpyHostToDevice,
-                                  stream.get()));
-    // Host selection storage may be released by the caller immediately.
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-    per_row = std::move(column);
+    struct transfer_state {
+      std::vector<int64_t> host;
+      std::unique_ptr<cudf::column> device;
+    };
+    auto transfer       = std::make_unique<transfer_state>();
+    transfer->host      = std::move(ordinals);
+    auto const unjoined = detail::prepare_unjoined_failure();
+    try {
+      transfer->device = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                                   transfer->host.size(),
+                                                   cudf::mask_state::UNALLOCATED,
+                                                   stream,
+                                                   mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(transfer->device->mutable_view().data<int64_t>(),
+                                    transfer->host.data(),
+                                    transfer->host.size() * sizeof(int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      detail::check_read_checkpoint(detail::read_checkpoint::COPY);
+      detail::retire_reads(transfer, stream, unjoined);
+      per_row = std::move(transfer->device);
+    } catch (...) {
+      if (transfer) detail::retire_reads(transfer, stream, unjoined);
+      throw;
+    }
     runs.clear();
     state = row_position_state::per_row;
   }
@@ -194,12 +208,27 @@ std::vector<int64_t> row_lineage::ordinals_on(::cuda::stream_ref stream) const
       for (int64_t i = 0; i < length; ++i)
         *out++ = first + i;
   } else if (!values.empty()) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(values.data(),
-                                  per_row->view().data<int64_t>(),
-                                  values.size() * sizeof(int64_t),
-                                  cudaMemcpyDeviceToHost,
-                                  stream.get()));
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    struct transfer_state {
+      std::vector<int64_t> host;
+      std::shared_ptr<cudf::column const> device;
+    };
+    auto transfer       = std::make_unique<transfer_state>();
+    transfer->host      = std::move(values);
+    transfer->device    = per_row;
+    auto const unjoined = detail::prepare_unjoined_failure();
+    try {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(transfer->host.data(),
+                                    transfer->device->view().data<int64_t>(),
+                                    transfer->host.size() * sizeof(int64_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      detail::check_read_checkpoint(detail::read_checkpoint::COPY);
+      detail::retire_reads(transfer, stream, unjoined);
+      return std::move(transfer->host);
+    } catch (...) {
+      if (transfer) detail::retire_reads(transfer, stream, unjoined);
+      throw;
+    }
   }
   return values;
 }
@@ -242,7 +271,7 @@ row_lineage row_lineage::select(std::span<int64_t const> selected,
       }
     }
   }
-  auto result = compact(domain, ordinals, stream, mr);
+  auto result = compact(domain, std::move(ordinals), stream, mr);
   if (is_validated()) result.seal_validation(source_binding());
   return result;
 }
@@ -280,8 +309,44 @@ row_lineage row_lineage::compose(row_lineage const& before,
   }
   validate_lineage_composition(before, step, stream, mr);
   if (step.state() == row_position_state::identity) return before;
-  auto selected = step.ordinal_column(stream, mr);
-  return before.select(selected->view(), stream, mr);
+  if (before.state() == row_position_state::identity) {
+    row_lineage result{step.state(), before.domain(), step.runs(), step.per_row()};
+    if (before.is_validated() && step.is_validated())
+      result.seal_validation(before.source_binding());
+    return result;
+  }
+  if (before.state() == row_position_state::runs && step.state() == row_position_state::runs) {
+    // Compose interval selections without expanding their potentially 64-bit cardinality.
+    std::vector<int64_t> ends;
+    int64_t offset = 0;
+    for (auto const& [first, count] : before.runs())
+      ends.push_back(offset += count);
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    for (auto const& [first, count] : step.runs()) {
+      auto index     = std::upper_bound(ends.begin(), ends.end(), first) - ends.begin();
+      auto skip      = first - (index ? ends[index - 1] : 0);
+      auto remaining = count;
+      while (remaining) {
+        auto const& input = before.runs()[index];
+        auto const take   = std::min(remaining, input.second - skip);
+        auto const start  = input.first + skip;
+        if (!runs.empty() && runs.back().first + runs.back().second == start)
+          runs.back().second += take;
+        else
+          runs.emplace_back(start, take);
+        remaining -= take;
+        skip = 0;
+        ++index;
+      }
+    }
+    row_lineage result{row_position_state::runs, before.domain(), std::move(runs)};
+    if (before.is_validated() && step.is_validated())
+      result.seal_validation(before.source_binding());
+    return result;
+  }
+  std::shared_ptr<cudf::column const> selected = step.ordinal_column(stream, mr);
+  auto const view                              = selected->view();
+  return before.select_impl(view, stream, mr, std::move(selected));
 }
 
 row_lineage row_lineage::concatenate(std::span<row_lineage const> parts,
