@@ -19,7 +19,10 @@
 #include "sirius_context.hpp"
 #include "utils/sirius_test_env.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <array>
 
 namespace {
 struct output_observation {
@@ -146,4 +149,68 @@ TEST_CASE("successful shutdown releases registered query resources",
   CHECK(retirement_observed);
   CHECK(weak.expired());
   context.reset();
+}
+
+TEST_CASE("shutdown and retirement check both GPUs before releasing runtime backing",
+          "[unsafe_completion][isolated_context][multi_gpu]")
+{
+  using point        = sirius::gpu_completion_point;
+  auto const failure = GENERATE(
+    std::optional<point>{}, std::optional{point::shutdown}, std::optional{point::retirement});
+  auto context = duckdb::SiriusContext::create();
+  auto config  = sirius::test::integration_config_path().parent_path() / "integration-2gpu.yaml";
+  context->initialize(sirius::parsed_sirius_config::from_file(config));
+  auto& manager   = context->get_memory_manager();
+  auto& lifecycle = context->get_query_lifecycle_registry();
+  std::array<std::shared_ptr<output_observation>, 2> outputs;
+  std::array<cudaStream_t, 2> streams{};
+  for (int device = 0; device < 2; ++device) {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    auto* space = manager.get_memory_space(cucascade::memory::Tier::GPU, device);
+    REQUIRE(space);
+    auto id = sirius::make_query_id(device + 1);
+    lifecycle.open_query(id);
+    outputs[device] = std::make_shared<output_observation>();
+    auto output     = std::make_shared<owned_gpu_output>(*space, outputs[device]);
+    streams[device] = output->buffer.stream().get();
+    lifecycle.retain_resources(id, std::move(output));
+  }
+
+  // The hook runs on the selected device, after a real successful CUDA wait.
+  std::array<std::array<bool, 2>, 2> seen{};
+  sirius::gpu_completion_test_hooks hooks;
+  hooks.fail = [&](point phase) {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 2) return true;
+    seen[phase == point::retirement][device] = true;
+    for (auto const& output : outputs)
+      CHECK(output->destroyed == (phase == point::retirement));
+    return device == 1 && failure == phase;
+  };
+  std::vector<std::unique_ptr<void, void (*)(void*)>> retained;
+  hooks.retain = [&](void* owner, void (*destroy)(void*)) {
+    retained.emplace_back(owner, destroy);
+  };
+  if (failure) {
+    REQUIRE_THROWS_AS(context->terminate(), sirius::unjoined_gpu_work);
+    REQUIRE(&context->get_memory_manager() == &manager);
+    for (int device = 0; device < 2; ++device) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+      CHECK(cudaStreamQuery(streams[device]) == cudaSuccess);
+      auto* space = manager.get_memory_space(cucascade::memory::Tier::GPU, device);
+      REQUIRE(space);
+      CHECK(space->get_available_memory() <= space->get_max_memory());
+    }
+  } else {
+    REQUIRE_NOTHROW(context->terminate());
+  }
+  CHECK(seen[0] == std::array<bool, 2>{true, true});
+  bool const released = failure != point::shutdown;
+  CHECK(seen[1] == std::array<bool, 2>{released, released});
+  for (auto const& output : outputs)
+    CHECK(output->destroyed == released);
+  context.reset();
+  CHECK(retained.size() == (failure ? 1 : 0));
+  // Only the hook's simulated failure is reclaimable.
+  retained.clear();
 }
