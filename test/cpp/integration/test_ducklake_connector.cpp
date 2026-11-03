@@ -21,6 +21,8 @@
 #include "ducklake/scan_ingestible.hpp"
 #include "exec/streaming_fragment.hpp"
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
+#include "planner/connector_registry.hpp"
+#include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "utils/dynamic_filter_test_utils.hpp"
@@ -126,6 +128,17 @@ void observe_provider_query(duckdb::OptimizerExtensionInput& input,
   auto& observer = static_cast<provider_query_observer&>(*input.info);
   if (observer.observe) observer.observe(input.context);
   if (observer.inspect_plan) observer.inspect_plan(input.context, *plan);
+}
+
+duckdb::LogicalGet* ducklake_get(duckdb::LogicalOperator& plan)
+{
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& get = plan.Cast<duckdb::LogicalGet>();
+    if (get.function.GetName() == "ducklake_scan") return &get;
+  }
+  for (auto& child : plan.children)
+    if (auto* get = ducklake_get(*child)) return get;
+  return nullptr;
 }
 
 auto lake_config() { return sirius::test::integration_config_path(); }
@@ -2422,4 +2435,113 @@ TEST_CASE_METHOD(ducklake_fixture,
   }
   CHECK(observed->seen->live == 0);
   CHECK(observed->seen->grants == 0);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake lookup rejects foreign transaction and reader bindings",
+                 "[ducklake][ducklake_binding_lookup][isolated_context]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CREATE TABLE lake.q(i INTEGER)");
+  auto sibling = env.make_connection();
+  query(sibling, "SET gpu_execution=false");
+  run("BEGIN");
+  query(sibling, "BEGIN");
+  auto first = con.ExtractPlan("SELECT i FROM lake.q");
+  auto same  = con.ExtractPlan("SELECT i FROM lake.q");
+  auto other = sibling.ExtractPlan("SELECT i FROM lake.q");
+  auto* a    = ducklake_get(*first);
+  auto* b    = ducklake_get(*same);
+  auto* c    = ducklake_get(*other);
+  REQUIRE(a);
+  REQUIRE(b);
+  REQUIRE(c);
+  using sirius::planner::lookup_connector;
+  REQUIRE(lookup_connector(*a, *con.context));
+  REQUIRE(lookup_connector(*b, *con.context));
+  REQUIRE(lookup_connector(*c, *sibling.context));
+  using sirius::planner::lookup_connector_classified;
+  using sirius::planner::lookup_decline;
+  CHECK(lookup_connector_classified(*a, *sibling.context).decline ==
+        lookup_decline::bind_data_mismatch);
+
+  REQUIRE(a->function.function_info.get() != b->function.function_info.get());
+  // Keep the reader and its original transaction; change only the function-info owner.
+  std::swap(a->function.function_info, b->function.function_info);
+  auto mismatched = lookup_connector_classified(*a, *con.context);
+  std::swap(a->function.function_info, b->function.function_info);
+  CHECK(mismatched.decline == lookup_decline::bind_data_mismatch);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Normal EOS retires an in-flight DuckLake Parquet metadata job",
+                 "[ducklake][ducklake_parquet_eos][isolated_context]")
+{
+  namespace dl   = sirius::ducklake;
+  namespace sm   = sirius::scan_manager;
+  namespace prep = sirius::test::preparation;
+  if (!dl::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  run("CREATE TABLE lake.q AS SELECT 42 AS i");
+  auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+  bool exercised         = false;
+  observer->inspect_plan = [&](duckdb::ClientContext& ctx, duckdb::LogicalOperator& plan) {
+    if (&ctx != con.context.get()) return;
+    auto* get = ducklake_get(plan);
+    if (!get) return;
+    auto binding = dl::binding_handle::capture(get->function, get->bind_data.get(), ctx);
+    binding->bind_execution_owner();
+    binding->configure_scan({0}, nullptr);
+    sm::test::test_reservation_provider backing;
+    auto budget = std::make_unique<sm::preparation_ledger>(backing);
+    auto env    = dl::parquet_unit_ingestible::envelope(binding->unit_at(0).value());
+    std::vector<sm::scan_envelope> scans{{{env}, {}, true, 1}};
+    backing.grant_bytes = std::max<uint64_t>(1, env.retained + env.temporary_charge(1));
+    auto decision  = budget->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0});
+    auto admission = std::make_shared<sm::preparation_admission>(std::move(budget), decision);
+    auto ledger    = std::shared_ptr<sm::preparation_ledger>(admission->consume());
+    auto parquet   = binding->make_parquet_unit(0, 1, 1, admission, {0});
+    parquet->attach_preparation_ledger(ledger);
+    auto claim =
+      parquet->try_claim_split([](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
+        throw std::logic_error("stopped job reached Parquet I/O");
+      });
+    auto job = std::get<sm::preparation_job>(std::move(claim));
+    prep::fixture f;
+    auto hold  = f.make_hold();
+    auto out   = std::make_shared<prep::sink>();
+    auto guard = f.shutdown_guard();
+    f.source(std::make_shared<prep::accumulator>(),
+             out,
+             [claimed = false,
+              work    = std::move(job),
+              hold]() mutable -> sm::preparation_coordinator::claim_result {
+               if (std::exchange(claimed, true)) return {};
+               return sm::preparation_job{
+                 [job = std::move(work), hold](sm::preparation_stop_token stop) mutable {
+                   hold->wait();
+                   return job.run(stop);
+                 }};
+             });
+    f.start();
+    REQUIRE(hold->await());
+    f.coordinator.request_stop(sm::stop_reason::normal_eos);
+    hold->release();
+    f.finish();
+    CHECK_FALSE(f.completion.has_error());
+    CHECK_FALSE(f.owner_error);
+    CHECK(ledger->permits_in_flight() == 0);
+    exercised = true;
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), std::move(hook));
+  auto detach = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+  run("SELECT i FROM lake.q");
+  CHECK(exercised);
 }

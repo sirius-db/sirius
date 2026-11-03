@@ -309,7 +309,6 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
   if (!work) throw std::logic_error("DuckLake unit cursor exhausted during claim");
   return metadata_job{[this, owned, copied, work = std::move(work), resolve = std::move(resolve)](
                         scan_manager::preparation_stop_token stop) {
-    if (stop.stop_requested()) throw duckdb::InterruptException();
     auto result = work(stop);
     auto& file  = dynamic_cast<op::scan::parquet_file_scan_info&>(*result);
     if (file.file_path != unit_.input.path || file.certificates().size() != 1)

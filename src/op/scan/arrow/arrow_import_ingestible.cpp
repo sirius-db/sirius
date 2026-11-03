@@ -129,6 +129,8 @@ class import_coalescer final : public batch_coalescer {
 }  // namespace
 struct arrow_import_ingestible::impl {
   arrow_import_binding binding;
+  const std::shared_ptr<arrow_input_gate> gate =
+    binding.gate ? binding.gate : std::make_shared<arrow_input_gate>();
   std::shared_ptr<arrow_batch_producer> producer;
   arrow_producer_limits limits;
   arrow_table_info info;
@@ -167,7 +169,6 @@ struct arrow_import_ingestible::impl {
     if (!bytes || temporary_limit > binding.admission->decision.w ||
         limits.envelope.retained > binding.admission->decision.sigma_retained)
       throw std::invalid_argument("Arrow producer exceeds sealed admission");
-    if (!binding.gate) binding.gate = std::make_shared<arrow_input_gate>();
     info.contract_id = binding.program.contract;
     info.profiles    = binding.profiles;
     info.names       = binding.column_names;
@@ -261,12 +262,12 @@ arrow_import_ingestible::metadata_claim arrow_import_ingestible::try_claim_split
   impl_->check_stop();
   if (!impl_->ledger) throw std::logic_error("Arrow ledger is not attached");
   if (impl_->state->eos) return sm::preparation_exhausted{};
-  if (impl_->binding.gate->active || impl_->producer->readiness() == arrow_readiness::pending)
+  if (impl_->gate->active || impl_->producer->readiness() == arrow_readiness::pending)
     return sm::preparation_pending{};
   if (impl_->sequence == UINT64_MAX) throw std::overflow_error("Arrow sequence exhausted");
   auto claim    = std::make_shared<input_claim>();
   claim->ledger = impl_->ledger;
-  claim->gate   = impl_->binding.gate;
+  claim->gate   = impl_->gate;
   if (!impl_->pending_identity)
     impl_->pending_identity =
       impl_->binding.next_unit_id ? impl_->binding.next_unit_id() : impl_->sequence;
@@ -311,7 +312,7 @@ void arrow_import_ingestible::attach_preparation_ledger(
 }
 void arrow_import_ingestible::bind_preparation_wakeup(sm::preparation_wakeup wake)
 {
-  impl_->binding.gate->wake = wake;
+  if (!impl_->binding.gate) impl_->gate->wake = wake;
   impl_->producer->bind_wakeup(wake);
   if (impl_->ledger) impl_->ledger->bind_wakeup(wake);
 }

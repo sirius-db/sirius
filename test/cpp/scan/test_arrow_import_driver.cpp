@@ -213,14 +213,16 @@ struct harness {
   std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
   std::shared_ptr<void const> identity             = std::make_shared<int>(4);
   std::unique_ptr<arrow_import_ingestible> driver;
-  std::shared_ptr<arrow_input_gate> gate = std::make_shared<arrow_input_gate>();
+  std::shared_ptr<arrow_input_gate> gate;
   harness(std::shared_ptr<arrow_batch_producer> producer,
-          materialization_program program                   = integer_program(),
-          bool empty_source                                 = true,
-          sm::reservation_provider* external                = nullptr,
-          std::shared_ptr<arrow_batch_producer> other       = {},
-          uint64_t quantum                                  = 1,
+          materialization_program program              = integer_program(),
+          bool empty_source                            = true,
+          sm::reservation_provider* external           = nullptr,
+          std::shared_ptr<arrow_batch_producer> other  = {},
+          uint64_t quantum                             = 1,
+          std::shared_ptr<arrow_input_gate> input_gate = std::make_shared<arrow_input_gate>(),
           std::shared_ptr<physical_check_counters> counters = {})
+    : gate(std::move(input_gate))
   {
     auto unique     = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
     auto envelope   = producer->limits().envelope;
@@ -256,7 +258,7 @@ struct harness {
   harness(std::shared_ptr<physical_check_counters> counters,
           std::shared_ptr<arrow_batch_producer> producer,
           materialization_program program = integer_program())
-    : harness(std::move(producer), std::move(program), true, nullptr, {}, 1, std::move(counters))
+    : harness(std::move(producer), std::move(program), true, nullptr, {}, 1, std::make_shared<arrow_input_gate>(), std::move(counters))
   {
   }
   std::unique_ptr<scan_info> next(sm::preparation_stop_token stop = {})
@@ -1015,6 +1017,40 @@ TEST_CASE("Arrow rootless empty source supports a zero-column binding", "[arrow_
   CHECK(h.profiles->counters->arrow_batches_imported == 0);
   CHECK(h.backing.seen->allocations == 0);
   stream.synchronize();
+}
+
+TEST_CASE("Arrow child registration preserves the final input owner's wakeup",
+          "[arrow_driver][arrow_gate_wake]")
+{
+  auto parent  = std::make_shared<sm::preparation_gate>();
+  auto child   = std::make_shared<sm::preparation_gate>();
+  auto shared  = std::make_shared<arrow_input_gate>();
+  shared->wake = sm::preparation_wakeup(parent);
+  harness first(std::make_shared<pull_producer>(), integer_program(), true, nullptr, {}, 1, shared);
+  auto held = first.next();
+  REQUIRE(held);
+  harness next(std::make_shared<pull_producer>(), integer_program(), true, nullptr, {}, 1, shared);
+  next.driver->bind_preparation_wakeup(sm::preparation_wakeup(child));
+  CHECK(std::holds_alternative<sm::preparation_pending>(next.driver->try_claim_split({})));
+  std::thread([input = std::move(held)]() mutable { input.reset(); }).join();
+  CHECK(parent->wake_generation == 1);
+  CHECK(child->wake_generation == 0);
+  CHECK(next.next());
+}
+
+TEST_CASE("Standalone Arrow input retirement wakes its registration",
+          "[arrow_driver][arrow_gate_wake]")
+{
+  harness source(
+    std::make_shared<pull_producer>(), integer_program(), true, nullptr, {}, 1, nullptr);
+  auto gate = std::make_shared<sm::preparation_gate>();
+  source.driver->bind_preparation_wakeup(sm::preparation_wakeup(gate));
+  source.ledger->bind_wakeup({});  // Isolate the input gate's notification.
+  auto held = source.next();
+  REQUIRE(held);
+  auto before = gate->wake_generation;
+  held.reset();
+  CHECK(gate->wake_generation == before + 1);
 }
 
 TEST_CASE("Arrow imported input retires only after its final descriptor owner",
