@@ -27,8 +27,8 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
-#include <vector>
 #include <unordered_set>
+#include <vector>
 
 namespace sirius::op::scan {
 namespace {
