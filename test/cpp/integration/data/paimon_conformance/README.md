@@ -12,9 +12,9 @@ The optional native suite builds `paimon.duckdb_extension` from source before
 reading the corpus. It needs no hosted Paimon binary or community installation.
 `source-build.json` pins the extension, native reader and DuckDB source archives
 by commit, size and SHA256, together with the build options. Native dependencies
-use the upstream bundled versions and checksums. The recipe supports DuckDB
-v2 development commit `88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e`
-(`v2.0.0-dev87602`) on Linux x86_64; other revisions/platforms require a reviewed
+use the upstream bundled versions and checksums. The recipe pins DuckDB
+v2.0.0 commit `d54cbbe3df17e8e5ce68312f483b4155836112aa`
+on Linux x86_64; other revisions/platforms require a reviewed
 recipe update. The extension source is maintainer mrdrivingduck's v2 adaptation,
 pinned at `307fc34c04623fe18f0ac39125b6319ea0013c0f`; it is not a floating branch.
 See [dependency download evidence](DEPENDENCIES.md) for the enabled direct and
