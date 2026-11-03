@@ -15,18 +15,28 @@
  */
 
 #include "duckdb.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "sirius/duckdb.hpp"
 
 #include <cstdlib>
+#include <string>
 
 namespace sirius {
 
 void register_duckdb_extension(duckdb::ExtensionLoader& loader)
 {
-  if (std::getenv("SIRIUS_TEST_BACKEND_FAILURE")) {
-    throw duckdb::InvalidInputException("Backend initialization failed for test");
-  }
+  auto const* failure = std::getenv("SIRIUS_TEST_BACKEND_FAILURE");
+  auto fail = [] { throw duckdb::InvalidInputException("Backend initialization failed for test"); };
+  if (failure && std::string(failure) != "late") { fail(); }
+  // Mirror the real backend's transparent-execution switch.
+  duckdb::DBConfig::GetConfig(loader.GetDatabaseInstance())
+    .AddExtensionOption("gpu_execution",
+                        "Whether to transparently intercept SQL queries and execute them on GPU",
+                        duckdb::LogicalType::BOOLEAN,
+                        duckdb::Value::BOOLEAN(true));
+  // Fail after registering a setting, like a backend that fails partway through.
+  if (failure) { fail(); }
   loader.RegisterFunction(duckdb::ScalarFunction(
     "sirius_test_backend",
     {},
