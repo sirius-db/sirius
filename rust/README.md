@@ -146,7 +146,7 @@ Install the pinned interpreter once:
 
 ```bash
 rustup toolchain install nightly-2026-11-01 --profile minimal --component miri --component rust-src
-pixi run --locked -e bindings miri
+cargo +nightly-2026-11-01 miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
 ```
 
 CI runs these tests for `sirius` and `sirius-sys` without a GPU or native library.

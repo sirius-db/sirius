@@ -204,7 +204,3 @@ rust = "1.95.*"
 description = "Regenerate checked-in Rust C ABI declarations."
 cmd = 'LIBCLANG_PATH="$CONDA_PREFIX/lib" cargo check --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings'
 env = { DOCS_RS = "1" }
-
-[feature.bindings.tasks.miri]
-description = "Check public Rust ownership using a Rust C ABI test backend."
-cmd = "rustup run nightly-2026-11-01 cargo miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri"

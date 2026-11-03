@@ -5,6 +5,7 @@
 #     - Explicitly allowed third-party actions:
 #       prefix-dev/setup-pixi@*
 #       mozilla-actions/sccache-action@*
+#       dtolnay/rust-toolchain@*
 #     - Require actions to be pinned to a full-length commit SHA: NO
 #
 # Adding a new action? You must:
@@ -23,7 +24,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
 
 jobs:
-  rust-api:
+  rust:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,9 +44,12 @@ jobs:
           LIBCLANG_PATH: ${{ github.workspace }}/.pixi/envs/bindings/lib
         run: pixi run --locked -e bindings cargo clippy --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings -- -D warnings
       - name: Install Miri
-        run: rustup toolchain install nightly-2026-11-01 --profile minimal --component miri --component rust-src
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly-2026-11-01
+          components: miri, rust-src
       - name: Check public Rust ownership with Miri
-        run: pixi run --locked -e bindings miri
+        run: cargo +nightly-2026-11-01 miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
 
   lint:
     runs-on: ubuntu-24.04
@@ -322,12 +326,12 @@ jobs:
 
   check:
     runs-on: ubuntu-slim
-    needs: [lint, build, rust-api]
+    needs: [lint, build, rust]
     if: always()
     steps:
       - name: All checks ok
-        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust-api.result == 'success' }}
+        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust.result == 'success' }}
         run: exit 0
       - name: Some checks failed
-        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust-api.result == 'success') }}
+        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success' && needs.rust.result == 'success') }}
         run: exit 1
