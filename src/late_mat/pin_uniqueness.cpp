@@ -204,7 +204,7 @@ void unique_probe::drop(std::size_t column_pos, std::string_view why)
 
 void unique_probe::observe(cudf::table_view const& chunk,
                            ::cuda::stream_ref stream,
-                           std::function<bool(std::size_t bytes)> const& may_sort)
+                           std::function<bool(std::size_t bytes)> const& try_reserve_sort_memory)
 {
   if (_live_candidates == 0) { return; }
 
@@ -267,8 +267,9 @@ void unique_probe::observe(cudf::table_view const& chunk,
         }
         // The sort is optional. A pin that cannot spare the memory for it loses this proof,
         // never the pin itself.
-        if (may_sort && !may_sort(static_cast<std::size_t>(col.size()) * cudf::size_of(col.type()) *
-                                  sort_scratch_factor)) {
+        if (try_reserve_sort_memory &&
+            !try_reserve_sort_memory(static_cast<std::size_t>(col.size()) *
+                                     cudf::size_of(col.type()) * sort_scratch_factor)) {
           drop(i, "no GPU memory reserved for sorting a chunk");
           continue;
         }

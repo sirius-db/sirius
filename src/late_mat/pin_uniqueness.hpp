@@ -180,12 +180,13 @@ class unique_probe {
   /// than risking a positional misread. Runs on @p stream and synchronizes it
   /// via the scalar reads it performs.
   /// An automatic column whose chunk is unsorted is sorted on the spot, which needs about
-  /// sort_scratch_factor times the column's bytes of GPU memory. @p may_sort is asked for that
-  /// many bytes first and is expected to reserve them until its next call; when it declines, or
-  /// the sort fails for want of memory, the column is dropped without a proof and the pin goes on.
+  /// sort_scratch_factor times the column's bytes of GPU memory. @p try_reserve_sort_memory is
+  /// asked for that many bytes first and is expected to reserve them until its next call; when it
+  /// declines, or the sort fails for want of memory, the column is dropped without a proof and the
+  /// pin goes on.
   void observe(cudf::table_view const& chunk,
                ::cuda::stream_ref stream,
-               std::function<bool(std::size_t bytes)> const& may_sort = {});
+               std::function<bool(std::size_t bytes)> const& try_reserve_sort_memory = {});
 
   /// Per-column verdicts, positional with the selection.
   [[nodiscard]] std::vector<unique_verdict> verdicts() const;

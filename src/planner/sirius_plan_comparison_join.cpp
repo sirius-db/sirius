@@ -119,12 +119,12 @@ static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
   auto const& proj_ids    = get.projection_ids;
   auto const output_count = proj_ids.empty() ? column_ids.size() : proj_ids.size();
   for (duckdb::idx_t output_idx = 0; output_idx < output_count; ++output_idx) {
-    auto const column_idx  = proj_ids.empty() ? output_idx : proj_ids[output_idx];
-    auto const table_index = column_ids[column_idx].GetPrimaryIndex();
+    auto const column_idx           = proj_ids.empty() ? output_idx : proj_ids[output_idx];
+    auto const primary_column_index = column_ids[column_idx].GetPrimaryIndex();
     // Virtual columns (row ids and the like) have no pinned counterpart.
-    if (table_index >= get.names.size()) { continue; }
-    if (hive_partition_columns.contains(table_index)) { continue; }
-    auto const& column_name = get.names[table_index].GetIdentifierName();
+    if (primary_column_index >= get.names.size()) { continue; }
+    if (hive_partition_columns.contains(primary_column_index)) { continue; }
+    auto const& column_name = get.names[primary_column_index].GetIdentifierName();
     if (proven_unique(column_name)) {
       SIRIUS_LOG_DEBUG("[join] build key '{}' proven distinct by the pinned table", column_name);
       return {output_idx};
