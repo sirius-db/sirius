@@ -63,10 +63,10 @@ constexpr std::uint64_t bloom_cap       = 64 * acc::mib;
 
 class observed_repository final : public cucascade::shared_data_repository {
  public:
-  void add_data_batch(acc::batch_ptr batch, std::size_t partition = 0) override
+  void add_data_batch_unlocked(const acc::batch_ptr& batch, std::size_t partition = 0) override
   {
     if (before_deposit) { before_deposit(); }
-    cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
+    cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
     deposits.fetch_add(1);
   }
 
