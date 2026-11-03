@@ -126,7 +126,7 @@ into a silent CPU fallback.
 | `cuda_driver_version` | CUDA version the driver reports, e.g. `13.0`; `NULL` if unknown |
 | `backend` | Selected backend; `NULL` without a usable driver |
 | `backend_loaded` | The backend is loaded |
-| `gpu_execution` | Transparent GPU execution is active for this session |
+| `gpu_execution` | Transparent GPU execution is active for this session; `false` under `SIRIUS_DISABLE` |
 | `fallback_reason` | Why GPU execution is unavailable; `NULL` once the backend loaded |
 
 This layout is for DuckDB core distribution: the loader follows DuckDB's

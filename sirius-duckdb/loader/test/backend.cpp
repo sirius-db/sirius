@@ -17,11 +17,22 @@
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "sirius/duckdb.hpp"
 
 #include <cstdlib>
+#include <string_view>
 
 namespace sirius {
+
+namespace {
+
+struct runtime_ready : duckdb::ObjectCacheEntry {
+  std::string GetObjectType() override { return "sirius_runtime_ready"; }
+  duckdb::optional_idx GetEstimatedCacheMemory() const override { return {}; }
+};
+
+}  // namespace
 
 void register_duckdb_extension(duckdb::ExtensionLoader& loader)
 {
@@ -41,6 +52,12 @@ void register_duckdb_extension(duckdb::ExtensionLoader& loader)
     [](duckdb::DataChunk& input, duckdb::ExpressionState&, duckdb::Vector& output) {
       output.Reference(duckdb::Value(SIRIUS_TEST_CUDA_VERSION), duckdb::count_t(input.size()));
     }));
+  // Mirror the real backend, which skips runtime initialization under SIRIUS_DISABLE.
+  auto const* disable = std::getenv("SIRIUS_DISABLE");
+  if (disable == nullptr || std::string_view{disable} == "0") {
+    loader.GetDatabaseInstance().GetObjectCache().Put("sirius_runtime_ready",
+                                                      duckdb::make_shared_ptr<runtime_ready>());
+  }
 }
 
 }  // namespace sirius

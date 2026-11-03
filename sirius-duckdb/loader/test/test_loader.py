@@ -46,6 +46,7 @@ class LoaderTests(unittest.TestCase):
         environment["SIRIUS_TEST_DRIVER_VERSION"] = str(version)
         environment.pop("SIRIUS_TEST_DRIVER_ERROR", None)
         environment.pop("SIRIUS_TEST_BACKEND_FAILURE", None)
+        environment.pop("SIRIUS_DISABLE", None)
         environment.update(env or {})
         prelude = (
             f"SET extension_directories=[{quote(self.root / 'installed')}];"
@@ -140,6 +141,15 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertTrue(status["backend_loaded"])
         self.assertFalse(status["gpu_execution"])
+
+    def test_status_reports_disabled_runtime(self):
+        status = self.status(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
+            env={"SIRIUS_DISABLE": "1"},
+        )
+        self.assertTrue(status["backend_loaded"])
+        self.assertFalse(status["gpu_execution"])
+        self.assertIsNone(status["fallback_reason"])
 
     def test_prepared_status_reads_current_setting(self):
         result = self.query(

@@ -44,6 +44,7 @@ namespace {
 constexpr char const* gpu_execution_setting = "gpu_execution";
 // Set by the backend entry point (sirius-duckdb/src/sirius/sirius_extension.cpp).
 constexpr char const* backend_init_started_key = "sirius_backend_init_started";
+constexpr char const* runtime_ready_key        = "sirius_runtime_ready";
 
 /// Outcome of looking for a CUDA 12+ driver. Probed once per process.
 struct cuda_driver {
@@ -100,6 +101,7 @@ struct loader_status {
   cuda_driver driver;
   std::string backend;  ///< Selected CUDA backend, empty without a usable driver
   bool backend_loaded = false;
+  bool runtime_ready  = false;  ///< The backend initialized its runtime (not under SIRIUS_DISABLE)
   std::string fallback_reason;  ///< Why GPU execution is unavailable, empty if the backend loaded
 
   /// Rejects an explicit request for GPU execution while the backend is unavailable.
@@ -196,9 +198,9 @@ struct status_function {
     auto optional      = [](bool present, std::string const& value) {
       return present ? duckdb::Value(value) : duckdb::Value(duckdb::LogicalType::VARCHAR);
     };
-    // Transparent execution runs only when the backend loaded and this session enables it.
+    // Transparent execution runs only when the runtime initialized and this session enables it.
     duckdb::Value enabled;
-    auto const active = status.backend_loaded &&
+    auto const active = status.runtime_ready &&
                         context.TryGetCurrentSetting(gpu_execution_setting, enabled) &&
                         !enabled.IsNull() && enabled.GetValue<bool>();
     auto result = duckdb::make_uniq<state>();
@@ -303,6 +305,7 @@ class sirius_loader {
       }
     }
     status.backend_loaded = true;
+    status.runtime_ready  = db.GetObjectCache().GetObject(runtime_ready_key) != nullptr;
   }
 
   void install_and_load(std::string const& backend)
