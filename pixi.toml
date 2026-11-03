@@ -79,7 +79,7 @@ fuzz = { cmd = "PYTHONPATH=$PIXI_PROJECT_ROOT/test/fuzz python -m siriusfuzz", d
 fuzz-test = { cmd = "python -m unittest discover -s tests -t .", cwd = "test/fuzz", description = "Unit tests for the fuzzer harness (no GPU needed)" }
 
 [tasks._clang-tidy-configure]
-cmd = "cmake --preset clang-debug -B build/clang-tidy -DSIRIUS_TPCH_HAVOC=OFF"
+cmd = "cmake --preset clang-debug -B build/clang-tidy -U GIT_EXECUTABLE -DSIRIUS_TPCH_HAVOC=OFF"
 
 [tasks._clang-tidy-prepare]
 depends-on = ["_clang-tidy-configure"]
