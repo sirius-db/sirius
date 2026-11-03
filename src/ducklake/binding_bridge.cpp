@@ -516,12 +516,13 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   std::optional<parquet_delete_accumulator> accumulator;
   bool embedded = false;
   op::scan::parquet_delete_read_options options;
-  std::span<int64_t> positions, snapshots;
-  scan_manager::charged_block snapshot_backing;
-  options.expected_size        = unit->delete_file_size;
-  options.expected_footer_size = unit->delete_footer_size;
-  options.check_stop           = check_stop;
-  options.verify_remote        = [&](CachingFileHandle& handle) {
+  bool ordered = false;
+  std::span<int64_t> positions;
+  options.expected_size          = unit->delete_file_size;
+  options.expected_footer_size   = unit->delete_footer_size;
+  options.verify_unbound_trailer = !remote;
+  options.check_stop             = check_stop;
+  options.verify_remote          = [&](CachingFileHandle& handle) {
     if (!remote)
       throw cucascade::io::descriptor_mismatch_error("DuckLake local Parquet delete requires a regular file");
     auto current = io::s3::validated_identity(*handle.GetFileHandle());
@@ -542,7 +543,8 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
           columns[1].type != duckdb::LogicalType::BIGINT)
         throw std::runtime_error(
           "DuckLake Parquet delete schema requires file name and BIGINT position");
-      embedded = columns.size() == 3 && columns[2].name == "_ducklake_internal_snapshot_id";
+      embedded = columns.size() == 3 &&
+                 StringUtil::CIEquals(columns[2].name, "_ducklake_internal_snapshot_id");
       if (embedded && columns[2].type != duckdb::LogicalType::BIGINT)
         throw std::runtime_error("DuckLake Parquet delete snapshot requires BIGINT");
       if (rows > dv_max_positions)
@@ -555,40 +557,33 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
       return embedded ? std::vector<uint64_t>{1, 2} : std::vector<uint64_t>{1};
     },
     [&](bool in_file_order) {
-      if (embedded && !in_file_order && !snapshot_backing.data()) {
-        snapshot_backing = allocator.allocate_retained(positions.size() * sizeof(int64_t));
-        snapshots        = {reinterpret_cast<int64_t*>(snapshot_backing.data()), positions.size()};
-      }
+      ordered = in_file_order;
       return [&, in_file_order](uint64_t offset, DataChunk& chunk) {
-        UnifiedVectorFormat pos, versions;
+        UnifiedVectorFormat pos;
         chunk.data[0].ToUnifiedFormat(pos);
-        if (embedded) chunk.data[1].ToUnifiedFormat(versions);
+        UnifiedVectorFormat snapshots_column;
+        if (embedded) chunk.data[1].ToUnifiedFormat(snapshots_column);
+        auto read = [](UnifiedVectorFormat const& column, idx_t row) -> std::optional<int64_t> {
+          auto index = column.sel->get_index(row);
+          if (!column.validity.RowIsValid(index)) return std::nullopt;
+          return column.GetData<int64_t>()[index];
+        };
         for (idx_t row = 0; row < chunk.size(); ++row) {
-          auto index = pos.sel->get_index(row);
-          if (!pos.validity.RowIsValid(index))
-            throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
-          auto position = pos.GetData<int64_t>()[index];
-          std::optional<int64_t> snapshot;
-          if (embedded) {
-            auto vi = versions.sel->get_index(row);
-            if (versions.validity.RowIsValid(vi)) snapshot = versions.GetData<int64_t>()[vi];
-          }
-          if (in_file_order) {
+          auto position = read(pos, row);
+          auto snapshot = embedded ? read(snapshots_column, row) : std::nullopt;
+          if (in_file_order)
             accumulator->append(position, snapshot);
-          } else {
-            positions[offset + row] = position;
-            if (embedded) snapshots[offset + row] = snapshot.value_or(-1);
-          }
+          else
+            accumulator->stage(offset + row, position, snapshot);
         }
       };
     });
   validate_statement();
-  // Workers have drained. Validate physical order, including invisible rows, and
-  // compact visible positions in place; the write cursor never overtakes the read cursor.
-  for (size_t row = accumulator->validated_count(); row < positions.size(); ++row) {
-    if (row % STANDARD_VECTOR_SIZE == 0) check_stop();
-    accumulator->append(positions[row],
-                        embedded ? std::optional<int64_t>{snapshots[row]} : std::nullopt);
+  if (!ordered) {
+    for (size_t row = 0; row < positions.size(); ++row) {
+      if (row % STANDARD_VECTOR_SIZE == 0) check_stop();
+      accumulator->consume_staged(row);
+    }
   }
   check_stop();
   // The shared reader verifies local physical identity across every handle.

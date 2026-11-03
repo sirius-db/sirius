@@ -305,7 +305,7 @@ void read_parquet_delete_batches(duckdb::ClientContext& context,
   verify(opened);
   auto size = opened.GetFileSize();
   if (size < 12) throw IOException("Truncated Parquet delete file");
-  if (options.expected_footer_size) {
+  if (options.expected_footer_size || options.verify_unbound_trailer) {
     uint8_t tail[8];
     // Check the bound size against the open object even if its cached trailer is reusable.
     opened.GetFileHandle()->Read(tail, sizeof(tail), size - sizeof(tail));
@@ -313,7 +313,8 @@ void read_parquet_delete_batches(duckdb::ClientContext& context,
     uint64_t footer = uint64_t(tail[0]) | (uint64_t(tail[1]) << 8) | (uint64_t(tail[2]) << 16) |
                       (uint64_t(tail[3]) << 24);
     if (tail[4] != 'P' || tail[5] != 'A' || tail[6] != 'R' || tail[7] != '1' || footer == 0 ||
-        footer > size - 12 || *options.expected_footer_size != footer)
+        footer > size - 12 ||
+        (options.expected_footer_size && *options.expected_footer_size != footer))
       throw IOException("Parquet delete footer differs from binding");
   }
 

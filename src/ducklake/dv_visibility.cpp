@@ -243,15 +243,31 @@ void validate_delete_position(int64_t position, int64_t& previous)
 void parquet_delete_accumulator::append(std::optional<int64_t> position,
                                         std::optional<int64_t> snapshot)
 {
+  stage(validated_, position, snapshot);
+  consume_staged(validated_);
+}
+void parquet_delete_accumulator::stage(size_t offset,
+                                       std::optional<int64_t> position,
+                                       std::optional<int64_t> snapshot) const
+{
   if (!position) throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
-  validate_delete_position(*position, previous_);
-  if (validated_ >= output_.size())
+  if (*position < 0)
+    throw std::runtime_error(
+      "DuckLake Parquet delete positions must be nonnegative and strictly increasing");
+  if (offset >= output_.size())
     throw std::runtime_error("DuckLake Parquet deletes exceed footer coverage");
   if (embedded_ && (!snapshot || *snapshot < 0))
     throw std::runtime_error("DuckLake Parquet delete snapshot must be nonnegative and non-NULL");
+  // Use the sign bit to mark future deletes within the existing position budget.
+  bool visible    = !embedded_ || local_ || static_cast<uint64_t>(*snapshot) <= snapshot_;
+  output_[offset] = visible ? *position : ~*position;
+}
+void parquet_delete_accumulator::consume_staged(size_t offset)
+{
+  auto value = output_[offset];
+  validate_delete_position(value < 0 ? ~value : value, previous_);
   ++validated_;
-  if (!embedded_ || local_ || static_cast<uint64_t>(*snapshot) <= snapshot_)
-    output_[effective_++] = *position;
+  if (value >= 0) output_[effective_++] = value;
 }
 std::shared_ptr<dv_visibility const> bind_parquet_visibility(
   std::shared_ptr<dv_visibility const> source, std::string data_identity, int64_t file_rows)

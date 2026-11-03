@@ -58,6 +58,9 @@ class parquet_delete_accumulator {
   {
   }
   void append(std::optional<int64_t> position, std::optional<int64_t> snapshot);
+  // Parallel consumers stage rows at disjoint file offsets. Finish them in file order.
+  void stage(size_t offset, std::optional<int64_t> position, std::optional<int64_t> snapshot) const;
+  void consume_staged(size_t offset);
   size_t validated_count() const { return validated_; }
   std::span<int64_t const> positions() const { return output_.first(effective_); }
   int64_t last_position() const { return previous_; }
