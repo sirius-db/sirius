@@ -160,7 +160,10 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+# mold localizes GNU_UNIQUE symbols under --exclude-libs (rmm#826).
+if(CMAKE_LINKER_TYPE STREQUAL "MOLD")
+  set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+endif()
 
 # Keep the embedded DuckDB private when the host exposes another DuckDB
 # globally.
