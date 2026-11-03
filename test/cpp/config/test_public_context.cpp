@@ -7,6 +7,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream_ref>
 #include <cuda_runtime_api.h>
 
 #include <sirius/context/config_builder.hpp>
@@ -61,10 +62,10 @@ void check_default_allocators()
   REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
   for (int device = 0; device < device_count; ++device) {
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-    rmm::device_buffer buffer(
-      256, rmm::cuda_stream_default, cudf::get_current_device_resource_ref());
+    ::cuda::stream_ref stream{cudaStream_t{nullptr}};
+    rmm::device_buffer buffer(256, stream, cudf::get_current_device_resource_ref());
     REQUIRE(buffer.data() != nullptr);
-    rmm::cuda_stream_default.synchronize();
+    stream.sync();
   }
 }
 
