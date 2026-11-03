@@ -6272,7 +6272,7 @@ TEST_CASE("DuckLake validates invisible Parquet deletes across parallel row grou
     std::string pos = corrupt ? "CASE WHEN pos=4096 THEN 4094 ELSE pos END" : "pos";
     run("COPY (SELECT file_path," + pos +
         " AS pos, CASE WHEN pos=4096 THEN 999999 ELSE 0 END"
-        "::BIGINT AS _ducklake_internal_snapshot_id FROM read_parquet(" +
+        "::BIGINT AS _DuckLake_Internal_Snapshot_Id FROM read_parquet(" +
         source + ") t ORDER BY t.pos) TO " + dest + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
     REQUIRE(run("SELECT count(DISTINCT row_group_id) FROM parquet_metadata(" + dest + ")")
               ->Collection()
