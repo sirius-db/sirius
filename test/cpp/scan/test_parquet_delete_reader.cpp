@@ -208,10 +208,11 @@ TEST_CASE("Parquet delete workers claim each group once and propagate consumer f
   states.Remove("delete_task_exit");
 }
 
-TEST_CASE("Parquet deletes reject inconsistent footer row counts before creating consumers",
+TEST_CASE("Parquet deletes reserve footer rows across workers before consuming",
           "[parquet_delete_reader]")
 {
   delete_fixture f;
+  REQUIRE_FALSE(f.connection.Query("SET threads=2")->HasError());
   REQUIRE_FALSE(f.connection.Query("SET parquet_metadata_cache=true")->HasError());
   f.write(4096);
   duckdb::OpenFileInfo file(f.path);
@@ -223,17 +224,14 @@ TEST_CASE("Parquet deletes reject inconsistent footer row counts before creating
   auto metadata      = duckdb::make_uniq<duckdb_parquet::FileMetaData>(*cached->metadata);
   metadata->num_rows = 2048;
   cached->metadata   = std::move(metadata);
-  size_t factories   = 0;
-  REQUIRE_THROWS_WITH(read_parquet_delete_batches(context,
-                                                  file,
-                                                  {},
-                                                  position_projection,
-                                                  [&](bool) {
-                                                    ++factories;
-                                                    return [](uint64_t, duckdb::DataChunk&) {};
-                                                  }),
-                      Catch::Matchers::ContainsSubstring("exceed footer count"));
-  CHECK(factories == 0);
+  worker_rendezvous rendezvous;
+  parquet_delete_read_options options;
+  options.after_decode_for_testing = [&] { rendezvous.wait_for_peer(); };
+  std::atomic<uint64_t> consumed{0};
+  REQUIRE_THROWS_WITH(
+    f.read(options, position_projection, [&](auto& chunk) { consumed += chunk.size(); }),
+    Catch::Matchers::ContainsSubstring("exceed footer count"));
+  REQUIRE(consumed <= 2048);
 }
 
 TEST_CASE("Parquet deletes drain workers before choosing the original error",
@@ -553,18 +551,13 @@ TEST_CASE("Remote Parquet deletes reject replacement and release handles on fail
     remote.last_modified = duckdb::timestamp_t(1000000);
     auto offset          = remote.bytes.size() - 8;
     parquet_delete_read_options options;
-    bool bound = GENERATE(true, false);
-    if (bound) {
-      options.expected_footer_size =
-        duckdb::Load<uint32_t>(duckdb::const_data_ptr_cast(remote.bytes.data() + offset));
-    } else {
-      options.verify_unbound_trailer = true;
-    }
+    options.expected_footer_size =
+      duckdb::Load<uint32_t>(duckdb::const_data_ptr_cast(remote.bytes.data() + offset));
     f.read(options, position_projection, [](auto&) {});
 
     // Replace the trailer while retaining the size and modification time.
     ++remote.generation;
-    remote.bytes.back() ^= 1;
+    remote.bytes[offset] ^= 1;
     REQUIRE_THROWS_WITH(f.read(options, position_projection, [](auto&) {}),
                         Catch::Matchers::ContainsSubstring("footer differs from binding"));
   }

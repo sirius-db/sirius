@@ -68,7 +68,7 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
       (count_only && (!fields.empty() || !required_columns.empty())))
     throw std::invalid_argument(
       "DuckLake Parquet unit has an invalid bound schema or scan identity");
-  auto envelope                = parquet_unit_envelope(unit);
+  auto envelope                = parquet_unit_envelope(unit, dependency_scope::s3_deletes);
   auto info                    = std::make_unique<plain_info>();
   info->approximate_batch_size = options.scan_task_batch_size;
   info->contract_id            = contract;
@@ -230,7 +230,7 @@ std::shared_ptr<claimed_unit> claim_unit(plain_info const& info,
     owned->permit = owned->slot->try_acquire();
   } else {
     owned->permit = ledger->try_acquire_unit(
-      owned->key, parquet_unit_envelope(unit).retained_charge(granularity));
+      owned->key, parquet_unit_envelope(unit, dependency_scope::s3_deletes).retained_charge(granularity));
   }
   return owned->permit ? std::move(owned) : nullptr;
 }
@@ -260,7 +260,9 @@ parquet_unit_ingestible::parquet_unit_ingestible(
   uint64_t generation,
   std::shared_ptr<scan_manager::preparation_admission> admission,
   bool count_only,
-  unit_scan_options options)
+  unit_scan_options options,
+  std::shared_ptr<cucascade::io::ioctx> data_context,
+  std::shared_ptr<cucascade::io::ioctx> delete_context)
   : parquet_gpu_ingestible(make_info(unit,
                                      std::move(fields),
                                      required_columns,
@@ -270,6 +272,8 @@ parquet_unit_ingestible::parquet_unit_ingestible(
                                      std::move(options))),
     binding_(std::move(binding)),
     unit_(std::move(unit)),
+    data_context_(std::move(data_context)),
+    delete_context_(std::move(delete_context)),
     generation_(generation),
     inline_deletes_(std::make_shared<inline_delete_preparation>()),
     validator_(
@@ -283,7 +287,7 @@ parquet_unit_ingestible::parquet_unit_ingestible(
 }
 scan_manager::unit_envelope parquet_unit_ingestible::envelope(unit_descriptor const& unit)
 {
-  return parquet_unit_envelope(unit);
+  return parquet_unit_envelope(unit, dependency_scope::s3_deletes);
 }
 void parquet_unit_ingestible::preflight_for_query() { binding_->validate_statement(); }
 op::scan::gpu_ingestible::metadata_scan_task_t parquet_unit_ingestible::next_split_provider(
@@ -312,6 +316,17 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
                        ledger_);
     if (!owned) return scan_manager::preparation_pending{};
   }
+  // The shared manager's URI map can change on another connection. Keep the
+  // contexts captured on this unit's owner lane for both data and Puffin work.
+  resolve = [fallback    = std::move(resolve),
+             data        = data_context_,
+             deletes     = delete_context_,
+             data_path   = unit_.input.path,
+             delete_path = unit_.delete_path](std::string_view path) {
+    if (data && path == data_path) return data;
+    if (deletes && path == delete_path) return deletes;
+    return fallback(path);
+  };
   auto work = parquet_gpu_ingestible::next_split_provider(resolve);
   if (!work) throw std::logic_error("DuckLake unit cursor exhausted during claim");
   return metadata_job{[this, owned, copied, work = std::move(work), resolve = std::move(resolve)](
@@ -467,7 +482,7 @@ parquet_unit_ingestible::make_preparation_sources(io::ioctx_resolver resolve)
         if (unit_.deletes == delete_format::parquet) {
           try {
             result->ordinary = binding_->read_parquet_deletes(
-              unit_.original_file_index, allocator, stop, table_info().profiles->counters.get());
+              unit_.original_file_index, allocator, stop, table_info().profiles->counters.get(), delete_context_);
           } catch (duckdb::InterruptException const&) {
             throw;
           } catch (transparent::classified_execution_error const&) {

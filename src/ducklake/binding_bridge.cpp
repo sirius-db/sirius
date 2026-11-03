@@ -26,6 +26,10 @@
 #include "ducklake/inline_reader.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "ducklake/provider_api.hpp"
+#include "ducklake/remote_io.hpp"
+#include "ducklake/source_policy.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
+#include "io/s3/sirius_httpfs.hpp"
 #include "op/scan/parquet_delete_reader.hpp"
 #include "parquet_multi_file_info.hpp"
 #include "planner/connector_registry.hpp"
@@ -41,6 +45,9 @@
 
 #include <stdexcept>
 #include <thread>
+
+// Include io_uring after Parquet has declared its BLOCK_SIZE constant.
+#include "sirius_context.hpp"
 
 namespace sirius::ducklake {
 using namespace duckdb;
@@ -227,7 +234,30 @@ std::shared_ptr<binding_handle> binding_handle::capture(BoundTableFunction const
     new binding_handle(std::make_unique<impl>(function, data, context)));
 }
 op::scan::bound_read_view const& binding_handle::view() const noexcept { return impl_->captured; }
-void binding_handle::validate_statement() const { impl_->validate(); }
+void binding_handle::validate_statement() const
+{
+  impl_->validate();
+}
+transparent::scan_source_policy classify_bound_sources(BoundTableFunction const& function,
+                                                       FunctionData const* data,
+                                                       ClientContext& context)
+{
+  auto api = planner::registered_ducklake_provider(*context.db);
+  if (!verified_info(api, function, data, context))
+    throw std::invalid_argument("DuckLake source policy requires a verified original binding");
+  auto const& bind = *dynamic_cast<MultiFileBindData const*>(data);
+  auto const* list = api->file_list(bind.file_list.get());
+  dependency_source_policy policy;
+  // The bound provider list includes transaction-local changes and snapshot-selected
+  // delete descriptors. Inline table names are not filesystem paths. No Parquet or
+  // Puffin reader is opened by this inspection.
+  for (auto const& entry : (list->*api->get_files)()) {
+    if (entry.data_type == DuckLakeDataType::DATA_FILE) policy.observe(entry.file.path);
+    policy.observe(entry.delete_file.path);
+  }
+  return policy.finish();
+}
+
 void binding_handle::bind_execution_owner()
 {
   if (impl_->execution_bound || impl_->discovery_started) {
@@ -403,36 +433,54 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   uint64_t index,
   scan_manager::charging_allocator& allocator,
   scan_manager::preparation_stop_token stop,
-  op::scan::physical_check_counters* counters)
+  op::scan::physical_check_counters* counters,
+  std::shared_ptr<cucascade::io::ioctx> delete_context)
 {
   validate_statement();
   auto unit = unit_at(index);
   if (!unit || unit->deletes != delete_format::parquet)
-    throw std::invalid_argument("DuckLake ordinary delete reader requires a local original unit");
-  (void)parquet_unit_envelope(*unit);
+    throw std::invalid_argument(
+      "DuckLake ordinary delete reader requires an original Parquet delete unit");
+  (void)parquet_unit_envelope(*unit, dependency_scope::s3_deletes);
   auto context    = impl_->context.lock();
   auto check_stop = [&] {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   };
   check_stop();
-  op::scan::parquet_delete_read_options options;
-  options.expected_size          = unit->delete_file_size;
-  options.expected_footer_size   = unit->delete_footer_size;
-  options.verify_unbound_trailer = true;
-  options.check_stop             = check_stop;
-  options.verify_remote          = [](CachingFileHandle&) {
-    throw cucascade::io::descriptor_mismatch_error(
-      "DuckLake Parquet deletes require a local regular file");
-  };
+  bool remote = io::s3::is_s3_path(unit->delete_path);
+  std::optional<io::s3::scoped_native_read_context> access;
+  if (remote) access.emplace(*context, unit->delete_path, std::move(delete_context));
+  OpenFileInfo file(unit->delete_path);
+  if (remote) {
+    file.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+    file.extended_info->options["sirius_require_strong_identity"] = Value::BOOLEAN(true);
+    file.extended_info->options["sirius_expected_size"] = Value::UBIGINT(unit->delete_file_size);
+  }
   auto result = std::make_shared<dv_visibility>();
-  std::span<int64_t> positions;
+  std::optional<io::s3::validated_file_identity> remote_identity;
   std::optional<parquet_delete_accumulator> accumulator;
   bool embedded = false;
-  bool ordered  = false;
+  op::scan::parquet_delete_read_options options;
+  std::span<int64_t> positions, snapshots;
+  scan_manager::charged_block snapshot_backing;
+  options.expected_size        = unit->delete_file_size;
+  options.expected_footer_size = unit->delete_footer_size;
+  options.check_stop           = check_stop;
+  options.verify_remote        = [&](CachingFileHandle& handle) {
+    if (!remote)
+      throw cucascade::io::descriptor_mismatch_error("DuckLake local Parquet delete requires a regular file");
+    auto current = io::s3::validated_identity(*handle.GetFileHandle());
+    // The initial footer check runs on the owner before any workers are scheduled.
+    if (!remote_identity)
+      remote_identity = current;
+    else if (current != *remote_identity)
+      throw cucascade::io::object_changed_error(
+        unit->delete_path, remote_identity->object_key, current.object_key);
+  };
   op::scan::read_parquet_delete_batches(
     *context,
-    OpenFileInfo(unit->delete_path),
+    std::move(file),
     options,
     [&](auto const& columns, uint64_t rows) {
       if ((columns.size() != 2 && columns.size() != 3) ||
@@ -440,8 +488,7 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
           columns[1].type != duckdb::LogicalType::BIGINT)
         throw std::runtime_error(
           "DuckLake Parquet delete schema requires file name and BIGINT position");
-      embedded = columns.size() == 3 &&
-                 StringUtil::CIEquals(columns[2].name, "_ducklake_internal_snapshot_id");
+      embedded = columns.size() == 3 && columns[2].name == "_ducklake_internal_snapshot_id";
       if (embedded && columns[2].type != duckdb::LogicalType::BIGINT)
         throw std::runtime_error("DuckLake Parquet delete snapshot requires BIGINT");
       if (rows > dv_max_positions)
@@ -454,40 +501,51 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
       return embedded ? std::vector<uint64_t>{1, 2} : std::vector<uint64_t>{1};
     },
     [&](bool in_file_order) {
-      ordered = in_file_order;
+      if (embedded && !in_file_order && !snapshot_backing.data()) {
+        snapshot_backing = allocator.allocate_retained(positions.size() * sizeof(int64_t));
+        snapshots        = {reinterpret_cast<int64_t*>(snapshot_backing.data()), positions.size()};
+      }
       return [&, in_file_order](uint64_t offset, DataChunk& chunk) {
-        UnifiedVectorFormat pos;
+        UnifiedVectorFormat pos, versions;
         chunk.data[0].ToUnifiedFormat(pos);
-        UnifiedVectorFormat snapshots_column;
-        if (embedded) chunk.data[1].ToUnifiedFormat(snapshots_column);
-        auto read = [](UnifiedVectorFormat const& column, idx_t row) -> std::optional<int64_t> {
-          auto index = column.sel->get_index(row);
-          if (!column.validity.RowIsValid(index)) return std::nullopt;
-          return column.GetData<int64_t>()[index];
-        };
+        if (embedded) chunk.data[1].ToUnifiedFormat(versions);
         for (idx_t row = 0; row < chunk.size(); ++row) {
-          auto position = read(pos, row);
-          auto snapshot = embedded ? read(snapshots_column, row) : std::nullopt;
-          if (in_file_order)
+          auto index = pos.sel->get_index(row);
+          if (!pos.validity.RowIsValid(index))
+            throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
+          auto position = pos.GetData<int64_t>()[index];
+          std::optional<int64_t> snapshot;
+          if (embedded) {
+            auto vi = versions.sel->get_index(row);
+            if (versions.validity.RowIsValid(vi)) snapshot = versions.GetData<int64_t>()[vi];
+          }
+          if (in_file_order) {
             accumulator->append(position, snapshot);
-          else
-            accumulator->stage(offset + row, position, snapshot);
+          } else {
+            positions[offset + row] = position;
+            if (embedded) snapshots[offset + row] = snapshot.value_or(-1);
+          }
         }
       };
     });
   validate_statement();
-  if (!ordered) {
-    if (embedded && counters && counters->track_units)
-      counters->ducklake_parallel_snapshot_delete_rows.fetch_add(positions.size(),
-                                                                 std::memory_order_relaxed);
-    for (size_t row = 0; row < positions.size(); ++row) {
-      if (row % STANDARD_VECTOR_SIZE == 0) check_stop();
-      accumulator->consume_staged(row);
-    }
+  if (embedded && snapshot_backing.data() && counters && counters->track_units)
+    counters->ducklake_parallel_snapshot_delete_rows.fetch_add(positions.size(),
+                                                               std::memory_order_relaxed);
+  // Workers have drained. Validate physical order, including invisible rows, and
+  // compact visible positions in place; the write cursor never overtakes the read cursor.
+  for (size_t row = accumulator->validated_count(); row < positions.size(); ++row) {
+    if (row % STANDARD_VECTOR_SIZE == 0) check_stop();
+    accumulator->append(positions[row],
+                        embedded ? std::optional<int64_t>{snapshots[row]} : std::nullopt);
   }
   check_stop();
-  result->delete_identity =
-    "duckdb.local.parquet.read:" + std::to_string(cucascade::io::next_open_generation());
+  // The shared reader verifies local physical identity across every handle.
+  // This local token identifies this completed read only; no cross-read cache
+  // may treat it as a reusable file version. Remote reads retain backend identity.
+  result->delete_identity         = remote_identity
+                                      ? remote_identity->object_key
+                                      : "duckdb.parquet.read:" + std::to_string(cucascade::io::next_open_generation());
   result->positions               = accumulator->positions();
   result->last_validated_position = accumulator->last_position();
   result->parquet_validated       = true;
@@ -507,6 +565,18 @@ std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
       "DuckLake count-only cannot request user columns or a filter projection");
   auto unit = unit_at(index);
   if (!unit) throw std::out_of_range("DuckLake original file index");
+  auto context = impl_->context.lock();
+  auto runtime = context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!runtime) throw std::logic_error("DuckLake preparation requires SiriusContext");
+  auto& manager = runtime->get_scan_manager();
+  validate_unit_io(*unit, admission && admission->decision.deferred, [&](auto const& path) {
+    return manager.planning_io_backend(path);
+  });
+  auto const& defaults = runtime->get_config().get_scan_manager_config().object_store;
+  auto data_context =
+    io::s3::capture_duckdb_s3_context(*context, manager, unit->input.path, defaults);
+  auto delete_context =
+    io::s3::capture_duckdb_s3_context(*context, manager, unit->delete_path, defaults);
   auto const& info = *impl_->function_info;
   std::vector<op::scan::field_requirement> fields;
   auto const& schema = info.table.GetFieldData().GetFieldIds();
@@ -533,7 +603,9 @@ std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
                                 generation,
                                 std::move(admission),
                                 count_only,
-                                std::move(options)));
+                                std::move(options),
+                                std::move(data_context),
+                                std::move(delete_context)));
 }
 struct inline_reader::impl {
   std::shared_ptr<binding_handle> handle;
@@ -629,7 +701,10 @@ struct inline_reader::impl {
 };
 inline_reader::inline_reader(std::unique_ptr<impl> value) : impl_(std::move(value)) {}
 inline_reader::~inline_reader() = default;
-duckdb::DataChunk const* inline_reader::next() { return impl_->next(); }
+duckdb::DataChunk const* inline_reader::next()
+{
+  return impl_->next();
+}
 std::unique_ptr<inline_reader> binding_handle::open_inline_unit(uint64_t index,
                                                                 std::vector<size_t> const& selected)
 {

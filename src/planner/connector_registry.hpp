@@ -98,6 +98,12 @@ struct connector {
   std::optional<scan_manager::preparation_request> (*prepare)(op::sirius_physical_table_scan&,
                                                               operator_params const&,
                                                               duckdb::ClientContext&) = nullptr;
+  // Inspect the original bound dependency inventory for CPU replay policy.
+  // Unlike capture, this may discover metadata, but must not open external
+  // data/delete files or rebind SQL. Exceptions make policy discovery incomplete.
+  transparent::scan_source_policy (*source_policy)(duckdb::BoundTableFunction const&,
+                                                   duckdb::FunctionData const*,
+                                                   duckdb::ClientContext&) = nullptr;
 };
 
 enum class lookup_decline : uint8_t {

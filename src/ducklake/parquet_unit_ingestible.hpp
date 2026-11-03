@@ -57,9 +57,12 @@ class parquet_unit_ingestible final : public op::scan::parquet_gpu_ingestible {
                           uint64_t,
                           std::shared_ptr<scan_manager::preparation_admission>,
                           bool count_only,
-                          unit_scan_options);
+                          unit_scan_options,
+                          std::shared_ptr<cucascade::io::ioctx> data_context,
+                          std::shared_ptr<cucascade::io::ioctx> delete_context);
   std::shared_ptr<binding_handle> binding_;
   unit_descriptor unit_;
+  std::shared_ptr<cucascade::io::ioctx> data_context_, delete_context_;
   uint64_t generation_;
   uint64_t preparation_id_;
   std::shared_ptr<inline_delete_preparation> inline_deletes_;

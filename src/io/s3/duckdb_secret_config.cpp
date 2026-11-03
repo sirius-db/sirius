@@ -7,6 +7,8 @@
 
 #include "io/s3/duckdb_secret_config.hpp"
 
+#include "scan_manager/sirius_scan_manager.hpp"
+
 #include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -229,6 +231,24 @@ object_store_config resolve_duckdb_s3_secret(duckdb::ClientContext& context,
       std::string(use_ssl ? "https://" : "http://") + "s3." + defaults.region + "." + suffix;
   }
   return defaults;
+}
+
+void install_duckdb_s3_config(duckdb::ClientContext& context,
+                              scan_manager::sirius_scan_manager& manager,
+                              std::string_view path,
+                              object_store_config const& defaults)
+{
+  if (is_s3_path(path))
+    manager.install_s3_config(path, resolve_duckdb_s3_secret(context, path, defaults));
+}
+
+std::shared_ptr<cucascade::io::ioctx> capture_duckdb_s3_context(duckdb::ClientContext& context,
+                                                 scan_manager::sirius_scan_manager& manager,
+                                                 std::string_view path,
+                                                 object_store_config const& defaults)
+{
+  if (!is_s3_path(path)) return {};
+  return manager.capture_s3_context(path, resolve_duckdb_s3_secret(context, path, defaults));
 }
 
 }  // namespace sirius::io::s3

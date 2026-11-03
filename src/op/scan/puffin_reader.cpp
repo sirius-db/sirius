@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
+#include "io/path_utils.hpp"
 #include "op/scan/puffin_reader.hpp"
 
 #include "op/scan/iceberg_delete_set.hpp"
+#include "op/scan/puffin_io.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_errors.hpp>
@@ -1096,6 +1098,25 @@ std::shared_ptr<decoded_delete_positions const> decode_deletion_vector_payload(
 std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
 {
   return read_deletion_vector_impl(ref, nullptr).legacy;
+}
+
+opened_puffin_source open_puffin_source(std::string const& path,
+                                        io::ioctx_resolver const& resolve,
+                                        scan_manager::preparation_stop_token stop)
+{
+  auto check_stop = [&] {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+  };
+  check_stop();
+  auto context = resolve(path);
+  check_stop();
+  if (!context) throw std::runtime_error("[puffin] No I/O context: " + path);
+  auto datasource = sirius::io::open_datasource(context, path, cucascade::io::open_hint::generic);
+  check_stop();
+  if (!datasource) throw std::runtime_error("[puffin] No datasource: " + path);
+  auto identity = datasource->get_io_object().identity_cache_key();
+  return {make_puffin_byte_source(std::move(datasource)), std::move(identity)};
 }
 
 std::unique_ptr<puffin_byte_source> make_puffin_byte_source(

@@ -26,10 +26,14 @@ inline constexpr uint64_t dv_max_file_bytes = 64ULL * 1024 * 1024;
 inline constexpr size_t dv_max_positions    = 1024 * 1024;
 inline constexpr size_t dv_max_footer_bytes = 1024 * 1024;
 inline constexpr size_t dv_max_blobs        = 64;
-bool parquet_unit_dependencies_supported(unit_descriptor const&);
-void validate_parquet_unit_dependencies(unit_descriptor const&);
+enum class dependency_scope { local, s3_deletes };
+bool parquet_unit_dependencies_supported(unit_descriptor const&,
+                                         dependency_scope = dependency_scope::local);
+void validate_parquet_unit_dependencies(unit_descriptor const&,
+                                        dependency_scope = dependency_scope::local);
 scan_manager::unit_envelope puffin_visibility_envelope(uint64_t file_bytes);
-scan_manager::unit_envelope parquet_unit_envelope(unit_descriptor const&);
+scan_manager::unit_envelope parquet_unit_envelope(unit_descriptor const&,
+                                                  dependency_scope = dependency_scope::local);
 struct dv_visibility final : op::scan::prepared_visibility {
   std::string data_identity, delete_identity;
   size_t validated_blobs          = 0;
@@ -55,9 +59,6 @@ class parquet_delete_accumulator {
   {
   }
   void append(std::optional<int64_t> position, std::optional<int64_t> snapshot);
-  // Parallel consumers stage rows at disjoint file offsets. Finish them in file order.
-  void stage(size_t offset, std::optional<int64_t> position, std::optional<int64_t> snapshot) const;
-  void consume_staged(size_t offset);
   size_t validated_count() const { return validated_; }
   std::span<int64_t const> positions() const { return output_.first(effective_); }
   int64_t last_position() const { return previous_; }
@@ -79,13 +80,15 @@ std::shared_ptr<dv_visibility const> combine_inline_visibility(std::shared_ptr<d
                                                                int64_t file_rows,
                                                                scan_manager::charging_allocator&);
 // Structural/source seam for adapter tests; it cannot publish a scan certificate.
-std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const&,
-                                                           int64_t file_rows,
-                                                           std::string data_identity,
-                                                           op::scan::puffin_byte_source&,
-                                                           scan_manager::charging_allocator&,
-                                                           scan_manager::preparation_stop_token,
-                                                           std::string delete_identity = {});
+std::shared_ptr<dv_visibility const> prepare_dv_visibility(
+  unit_descriptor const&,
+  int64_t file_rows,
+  std::string data_identity,
+  op::scan::puffin_byte_source&,
+  scan_manager::charging_allocator&,
+  scan_manager::preparation_stop_token,
+  std::string delete_identity = {},
+  dependency_scope            = dependency_scope::local);
 std::shared_ptr<dv_visibility const> read_dv_visibility(unit_descriptor const&,
                                                         int64_t file_rows,
                                                         std::string data_identity,

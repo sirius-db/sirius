@@ -25,6 +25,7 @@
 // No GPU: file IO and parsing only.
 
 #include "op/scan/iceberg_delete_set.hpp"  // IWYU pragma: keep
+#include "op/scan/puffin_io.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "utils/puffin_test_utils.hpp"
@@ -1251,4 +1252,96 @@ TEST_CASE("Neutral Puffin metadata has independent limits and preserves source f
   auto metadata = read_puffin_metadata(empty, allocator, {1000, 0});
   CHECK(metadata->blob_count() == 0);
   CHECK_FALSE(metadata->file_property("absent"));
+}
+
+TEST_CASE("Shared Puffin planning inspects capabilities without opening local inputs",
+          "[puffin][puffin_io]")
+{
+  using cucascade::io::io_context_type;
+  size_t lookups = 0;
+  std::optional<io_context_type> backend;
+  auto lookup = [&](std::string const&) {
+    ++lookups;
+    return backend;
+  };
+  for (auto const* path :
+       {"data/deletes.puffin", "/tmp/deletes.puffin", "file:///tmp/deletes.puffin"}) {
+    auto capability = inspect_puffin_io(path, lookup);
+    CHECK_FALSE(capability.remote);
+    CHECK(capability.permits_route(false));
+    CHECK(capability.permits_route(true));
+  }
+  CHECK(lookups == 0);
+  for (auto candidate :
+       {io_context_type::uring, io_context_type::restful, io_context_type::kvikio}) {
+    backend         = candidate;
+    auto capability = inspect_puffin_io("s3://bucket/deletes.puffin", lookup);
+    CHECK(capability.remote);
+    CHECK_FALSE(capability.permits_route(false));
+    CHECK(capability.permits_route(true) == (candidate != io_context_type::uring));
+  }
+  backend.reset();
+  CHECK_FALSE(inspect_puffin_io("s3://bucket/deletes.puffin", lookup).backend_available);
+  backend = io_context_type::restful;
+  for (auto const* path : {"https://host/deletes.puffin",
+                           "gs://bucket/deletes.puffin",
+                           "unknown://bucket/deletes.puffin"}) {
+    auto capability = inspect_puffin_io(path, lookup);
+    CHECK(capability.remote);
+    CHECK_FALSE(capability.permits_route(true));
+  }
+}
+
+TEST_CASE("Shared Puffin open honors cancellation before resolving access scope",
+          "[puffin][puffin_io]")
+{
+  std::stop_source cancel;
+  cancel.request_stop();
+  bool resolved                      = false;
+  sirius::io::ioctx_resolver resolve = [&](std::string_view) {
+    resolved = true;
+    return std::shared_ptr<cucascade::io::ioctx>{};
+  };
+  try {
+    open_puffin_source("s3://bucket/deletes.puffin",
+                       resolve,
+                       sirius::scan_manager::preparation_stop_token(cancel.get_token()));
+    FAIL("cancelled open succeeded");
+  } catch (std::system_error const& error) {
+    CHECK(error.code() == std::errc::operation_canceled);
+  }
+  CHECK_FALSE(resolved);
+}
+
+TEST_CASE("Shared Puffin open preserves resolver failures and rejects missing contexts",
+          "[puffin][puffin_io]")
+{
+  std::string const path             = "s3://bucket/deletes.puffin";
+  sirius::io::ioctx_resolver resolve = [&](std::string_view received) {
+    CHECK(received == path);
+    return std::shared_ptr<cucascade::io::ioctx>{};
+  };
+  CHECK_THROWS_WITH(open_puffin_source(path, resolve, {}), "[puffin] No I/O context: " + path);
+  resolve = [&](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+    throw cucascade::io::object_changed_error(path, "expected", "observed");
+  };
+  CHECK_THROWS_AS(open_puffin_source(path, resolve, {}), cucascade::io::object_changed_error);
+  resolve = [&](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+    throw cucascade::io::descriptor_mismatch_error("descriptor changed");
+  };
+  CHECK_THROWS_AS(open_puffin_source(path, resolve, {}), cucascade::io::descriptor_mismatch_error);
+  resolve = [&](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { throw std::bad_alloc{}; };
+  CHECK_THROWS_AS(open_puffin_source(path, resolve, {}), std::bad_alloc);
+  std::stop_source cancel;
+  resolve = [&](std::string_view) {
+    cancel.request_stop();
+    return std::shared_ptr<cucascade::io::ioctx>{};
+  };
+  try {
+    open_puffin_source(
+      path, resolve, sirius::scan_manager::preparation_stop_token(cancel.get_token()));
+    FAIL("open ignored cancellation during resolution");
+  } catch (std::system_error const& error) {
+    CHECK(error.code() == std::errc::operation_canceled);
+  }
 }

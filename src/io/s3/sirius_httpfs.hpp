@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -29,7 +30,33 @@ namespace sirius::scan_manager {
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
+namespace cucascade::io {
+class ioctx;
+}
+
 namespace sirius::io::s3 {
+
+// Identity of a conditional-read-capable Sirius REST handle. Holding the context
+// preserves the credential snapshot and allows comparisons across native opens.
+struct validated_file_identity {
+  std::string object_key;
+  std::shared_ptr<cucascade::io::ioctx> access_scope;
+  bool operator==(validated_file_identity const&) const = default;
+};
+validated_file_identity validated_identity(duckdb::FileHandle&);
+
+// Pins the access scope for synchronous native auxiliary reads on one connection.
+// Native footer and row-group opens use this context; destruction restores ordinary opens.
+class scoped_native_read_context {
+ public:
+  scoped_native_read_context(duckdb::ClientContext&, std::string path, std::shared_ptr<cucascade::io::ioctx>);
+  ~scoped_native_read_context();
+  scoped_native_read_context(scoped_native_read_context const&)            = delete;
+  scoped_native_read_context& operator=(scoped_native_read_context const&) = delete;
+
+ private:
+  duckdb::ClientContext& context_;
+};
 
 /// @brief DuckDB FileSystem subsystem that lets DuckDB's native @c read_parquet
 /// BIND an @c s3:// object through Sirius's per-connection REST io backend.
@@ -54,8 +81,9 @@ namespace sirius::io::s3 {
 ///
 /// **GPU-only / no CPU fallback:** @ref OpenFile refuses to open an @c s3:// path
 /// unless @c gpu_execution is enabled on the connection. The GPU path reads via
-/// the routed ioctx, so this FileSystem only ever serves the bind-time footer
-/// read; it is never the CPU data path. Read-only: write opens are rejected.
+/// the routed ioctx. The filesystem also serves admitted native auxiliary
+/// readers (such as Parquet deletes) inside GPU execution; it does not permit
+/// CPU fallback. Read-only: write opens are rejected.
 class sirius_httpfs : public duckdb::FileSystem {
  public:
   sirius_httpfs() = default;
@@ -72,7 +100,9 @@ class sirius_httpfs : public duckdb::FileSystem {
   /// A valid LIST-provided @c "file_size" option (the non-negative BIGINT
   /// @ref Glob attaches) selects the parquet footer probe, which resolves size
   /// and stashes the suffix in one GET. Invalid metadata falls back to the
-  /// regular HEAD-based open.
+  /// regular HEAD-based open. The internal `sirius_require_strong_identity`
+  /// option requires conditional REST reads and bypasses native byte/footer
+  /// caches; callers also force `validate_external_file_cache=true` per file.
   duckdb::unique_ptr<duckdb::FileHandle> OpenFileExtended(
     const duckdb::OpenFileInfo& file,
     duckdb::FileOpenFlags flags,
@@ -89,8 +119,11 @@ class sirius_httpfs : public duckdb::FileSystem {
   /// The object's ETag captured by this handle's open (HEAD or footer-probe
   /// GET), or empty when the backend sent none.  DuckDB's external file cache
   /// reads it once per caching handle as the validation token; an empty tag
-  /// keeps the safe (uncached) bypass.
+  /// keeps the safe (uncached) bypass. Strict auxiliary opens return an empty
+  /// native cache token and non-finite modification time; validated_identity()
+  /// still exposes their real object identity and access scope.
   std::string GetVersionTag(duckdb::FileHandle& handle) override;
+  duckdb::optional<duckdb::timestamp_t> GetCacheValidUntil(duckdb::FileHandle& handle) override;
 
   /// Exact key: returns @c {path} when @ref CanHandleFile. A glob pattern
   /// expands via one paginated S3 LIST (see @ref expand_glob) under four
