@@ -770,7 +770,8 @@ TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL k
         keyed_total += keys.size() - keys.null_count();
       }
     }
-    CHECK(nulls == nulls_per_batch * static_cast<cudf::size_type>(c.world()));
+    // Row 0 has a NULL key, and each sender sends its first row to every rank as well.
+    CHECK(nulls == (nulls_per_batch + 1) * static_cast<cudf::size_type>(c.world()));
   }
   CHECK(keyed_total ==
         (rows_per_batch - nulls_per_batch) * static_cast<cudf::size_type>(c.world()));
@@ -898,7 +899,8 @@ TEST_CASE("a NULL in any of several keys sends the row to every rank", "[exchang
         keyed_total += keyed;
       }
     }
-    CHECK(null_keyed == any_null * static_cast<cudf::size_type>(c.world()) + all_null_rows);
+    // Row 0's first key is NULL, and each sender sends its first row to every rank as well.
+    CHECK(null_keyed == (any_null + 1) * static_cast<cudf::size_type>(c.world()) + all_null_rows);
   }
   CHECK(keyed_total == (rows_per_batch - any_null) * static_cast<cudf::size_type>(c.world()));
 }
@@ -1022,4 +1024,49 @@ TEST_CASE("an exchange source shapes its owed empty batch like its sink's input"
   auto const view = sirius::get_cudf_table_view(batches[0]->to_read_only());
   CHECK(view.num_rows() == 0);
   CHECK(view.column(0).type().id() == cudf::type_id::INT32);
+}
+
+TEST_CASE("a MARK build exchange leaves no rank empty when any rank has rows",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  exchange_spec spec;
+  spec.key_columns             = {0};
+  spec.null_keys_to_every_rank = true;
+  constexpr stream_id stream   = 15;
+  std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    sources.push_back(std::make_unique<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[r].service, stream, std::set<rank_t>{0, 1, 2}, false));
+    sources.back()->set_memory_space(*env().gpu);
+  }
+
+  SECTION("one rank has build rows")
+  {
+    for (rank_t r = c.world(); r-- > 0;) {
+      sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+      if (r == 0) { sink_batch(sink, key_value_batch(0, 0)); }
+      sink.finalize_operator();
+    }
+    std::size_t total = 0;
+    for (rank_t r = 0; r < c.world(); ++r) {
+      auto const got = flat(drain(*sources[r]));
+      CHECK_FALSE(got.empty());
+      total += got.size();
+    }
+    CHECK(total == rows_per_batch + c.world());
+  }
+
+  SECTION("no rank has build rows")
+  {
+    for (rank_t r = c.world(); r-- > 0;) {
+      sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+      sink.finalize_operator();
+    }
+    for (rank_t r = 0; r < c.world(); ++r) {
+      auto const tasks = drain(*sources[r]);
+      REQUIRE(tasks.size() == 1);
+      CHECK(tasks[0].empty());
+    }
+  }
 }
