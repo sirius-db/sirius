@@ -324,17 +324,27 @@ std::size_t sirius_physical_exchange_sink::no_history_peak_memory_estimate(
 
 void sirius_physical_exchange_sink::on_finalize_operator()
 {
-  // A failed exchange throws here; its receivers already learn of it through on_error.
-  try {
-    if (_spec.routing == exchange_spec::mode::gather) {
-      _service->close(_stream, _spec.target);
-      return;
-    }
-    for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+  // Every rank is told, even after a close to another fails. A failed close aborts the query on
+  // every rank, so no receiver waits for an end that will not come; rethrowing instead would leave
+  // this pipeline half finalized.
+  auto const end_to = [this](exchange::rank_t r) {
+    try {
       _service->close(_stream, r);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("exchange sink: stream {} not closed to rank {}: {}", _stream, r, e.what());
+      try {
+        _service->abort(exchange::query_of(_stream), e.what());
+      } catch (std::exception const& abort_error) {
+        SIRIUS_LOG_WARN("exchange sink: stream {} not aborted: {}", _stream, abort_error.what());
+      }
     }
-  } catch (std::exception const& e) {
-    SIRIUS_LOG_WARN("exchange sink: stream {} not closed: {}", _stream, e.what());
+  };
+  if (_spec.routing == exchange_spec::mode::gather) {
+    end_to(_spec.target);
+    return;
+  }
+  for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+    end_to(r);
   }
 }
 
