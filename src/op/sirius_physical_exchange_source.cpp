@@ -95,12 +95,6 @@ struct sirius_physical_exchange_source::state {
     auto head     = p->get_source();
     if (creator && head) { creator->schedule(head.get()); }
   }
-
-  /// Re-checks whether the pipeline finished, now nothing more will arrive.
-  void recheck()
-  {
-    if (auto p = pipeline.lock()) { p->update_pipeline_status(false); }
-  }
 };
 
 struct sirius_physical_exchange_source::receiver : exchange::inbound {
@@ -140,10 +134,10 @@ struct sirius_physical_exchange_source::receiver : exchange::inbound {
       s->ended.insert(from);
       done = s->all_ended();
     }
-    if (done) {
-      s->schedule();
-      s->recheck();
-    }
+    // Only schedules: finishing the pipeline here would finalize its operators on the transport's
+    // engine thread, stalling every query's streams. The task creator re-checks the pipeline on
+    // its own thread when it finds nothing left to run.
+    if (done) { s->schedule(); }
   }
 
   void on_error(std::exception_ptr error) override

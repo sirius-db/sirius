@@ -1070,3 +1070,28 @@ TEST_CASE("a MARK build exchange leaves no rank empty when any rank has rows",
     }
   }
 }
+
+TEST_CASE("a source's last end leaves finishing its pipeline to the task creator",
+          "[exchange][operators]")
+{
+  ranks c(1);
+  constexpr stream_id stream = 16;
+  sirius_physical_exchange_source source(
+    key_value_types(), 0, c.all[0].service, stream, {0}, false);
+  stub_operator next{sirius::op::SiriusPhysicalOperatorType::PROJECTION, key_value_types(), 0};
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{nullptr, true});
+  sirius::pipeline::sirius_pipeline_build_state build;
+  build.set_pipeline_source(*pipeline, source);
+  build.add_pipeline_operator(*pipeline, next);
+  source.set_pipeline(pipeline);
+
+  // This rank's own end runs on_end() inline, so it is over once close() returns. A peer's runs
+  // on the transport's engine thread, where finishing a pipeline would stall every stream.
+  c.all[0].service->close(stream, 0);
+  REQUIRE(source.all_ports_empty());
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  // What the task creator does on its own thread once the source has nothing left to run.
+  pipeline->update_pipeline_status(false);
+  CHECK(pipeline->is_pipeline_finished());
+}
