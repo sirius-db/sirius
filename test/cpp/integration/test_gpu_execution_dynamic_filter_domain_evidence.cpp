@@ -18,7 +18,6 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -36,6 +35,18 @@ namespace {
 
 using sirius::test::scoped_sirius_setting;
 using sirius::test::sql_literal;
+
+enum class build_keys : bool { distinct, duplicated };
+enum class declaration : bool { none, unique_k };
+
+/// Expected result rows and pin serving for every run; domain and gate counts apply only with
+/// dynamic filters enabled.
+struct expected_join {
+  std::size_t rows;
+  bool known_domain    = true;
+  bool gated           = false;
+  bool served_from_pin = true;
+};
 
 class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
  public:
@@ -58,9 +69,12 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
     run_ok("COPY (" + select + ") TO " + directory.file_literal(file) + " (FORMAT PARQUET);");
   }
 
-  void build(std::string const& file, bool duplicates = false, int begin = 0, int end = 100)
+  void build(std::string const& file,
+             build_keys keys = build_keys::distinct,
+             int begin       = 0,
+             int end         = 100)
   {
-    auto const key = duplicates ? "(i % 10)" : "i";
+    auto const key = keys == build_keys::duplicated ? "(i % 10)" : "i";
     write(file,
           "SELECT " + std::string{key} + "::BIGINT AS payload, (" + key +
             " * 1000003 + 7)::BIGINT AS k, ((i % 5) * 1000003 + 7)::BIGINT AS other, "
@@ -68,14 +82,18 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
             std::to_string(begin) + ", " + std::to_string(end) + ") t(i)");
   }
 
-  void pin(std::string const& source, std::string const& tier, bool declared = true)
+  void pin(std::string const& source,
+           std::string const& tier,
+           declaration declared = declaration::unique_k)
   {
     run_ok("CALL pin_table(" + directory.file_literal(source) + ", tier=" + sql_literal(tier) +
            ", name=" + sql_literal(pin_name()) + ", cols=['marker', 'other', 'payload', 'k']" +
-           (declared ? ", unique_cols=['k']" : "") + ");");
+           (declared == declaration::unique_k ? ", unique_cols=['k']" : "") + ");");
   }
 
-  std::string query(std::string const& source, int selected, std::string const& key = "k") const
+  [[nodiscard]] std::string query(std::string const& source,
+                                  int selected,
+                                  std::string const& key = "k") const
   {
     // Keep the filtered build on the right; source, pin and projected key ordinals differ.
     return "SELECT p.p, b.payload, b.k FROM read_parquet(" +
@@ -85,11 +103,8 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
   }
 
   void check(std::string const& sql,
-             std::size_t expected_rows,
-             bool known_domain,
-             bool gated,
-             std::vector<std::string> const& build_files,
-             bool cached = true)
+             expected_join const& expect,
+             std::vector<std::string> const& build_files)
   {
     INFO(sql);
     duckdb::unique_ptr<duckdb::QueryResult> cpu;
@@ -99,11 +114,11 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
     }
     REQUIRE(cpu);
     REQUIRE_FALSE(cpu->HasError());
-    REQUIRE(cpu->RowCount() == expected_rows);
+    REQUIRE(cpu->RowCount() == expect.rows);
     auto const expected = sirius::test::collect_rows(*cpu);
 
     for (bool const enabled : {false, true}) {
-      CAPTURE(enabled, known_domain, gated, cached);
+      CAPTURE(enabled, expect.known_domain, expect.gated, expect.served_from_pin);
       scoped_sirius_setting filters(*con, "enable_dynamic_filter", enabled);
       auto const before     = sirius::test::get_dynamic_filter_stats_snapshot(*con);
       auto before_execution = sirius::test::get_transparent_execution_stats(*con);
@@ -120,10 +135,10 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
       REQUIRE(after.publications_failed == before.publications_failed);
       REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
       REQUIRE(after.keys_with_known_domain ==
-              before.keys_with_known_domain + (enabled && known_domain ? 1 : 0));
+              before.keys_with_known_domain + (enabled && expect.known_domain ? 1 : 0));
       REQUIRE(after.keys_skipped_domain_gate ==
-              before.keys_skipped_domain_gate + (enabled && gated ? 1 : 0));
-      if (enabled && !gated) {
+              before.keys_skipped_domain_gate + (enabled && expect.gated ? 1 : 0));
+      if (enabled && !expect.gated) {
         REQUIRE(after.filters_pushed > before.filters_pushed);
       } else {
         REQUIRE(after.filters_pushed == before.filters_pushed);
@@ -134,7 +149,7 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
               before_execution.parquet_reader_calls[probe]);
       for (auto const& file : build_files) {
         auto const path = directory.file(file);
-        if (cached) {
+        if (expect.served_from_pin) {
           REQUIRE(after_execution.parquet_reader_calls[path] ==
                   before_execution.parquet_reader_calls[path]);
         } else {
@@ -145,9 +160,9 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
     }
   }
 
-  std::string pin_name() const { return attach_alias + "_domain"; }
+  [[nodiscard]] std::string pin_name() const { return attach_alias + "_domain"; }
 
-  sirius::planner::build_key_domain_evidence evidence(std::string const& sql)
+  sirius::op::dynamic_filter_domain_evidence evidence(std::string const& sql)
   {
     scoped_sirius_setting cpu(*con, "gpu_execution", false);
     run_ok("BEGIN TRANSACTION;");
@@ -192,9 +207,8 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   build("build.parquet");
   pin("build.parquet", tier);
   check(query(directory.file_literal("build.parquet"), selected),
-        2 * selected,
-        true,
-        selected == 95 || threshold == "0.45",
+        {.rows  = static_cast<std::size_t>(2 * selected),
+         .gated = selected == 95 || threshold == "0.45"},
         {"build.parquet"});
 }
 
@@ -214,15 +228,15 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
           "CASE WHEN i = 0 THEN NULL::BIGINT ELSE ((i % 10) * 1000003 + 7)::BIGINT END AS k, "
           "((i % 5) * 1000003 + 7)::BIGINT AS other, i::INTEGER AS marker FROM range(100) t(i)");
   } else {
-    build("duplicates.parquet", true);
+    build("duplicates.parquet", build_keys::duplicated);
   }
   pin("duplicates.parquet", tier);
   auto const join = query(directory.file_literal("duplicates.parquet"), 95);
-  check(join, null_key ? 188 : 190, true, true, {"duplicates.parquet"});
+  check(join,
+        {.rows = null_key ? std::size_t{188} : std::size_t{190}, .gated = true},
+        {"duplicates.parquet"});
   check("SELECT DISTINCT p, payload, k FROM (" + join + ") joined",
-        20,
-        true,
-        true,
+        {.rows = 20, .gated = true},
         {"duplicates.parquet"});
 }
 
@@ -238,16 +252,14 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   build("build.parquet");
   SECTION("a pin without a declaration cannot gate")
   {
-    pin("build.parquet", tier, false);
-    check(query(directory.file_literal("build.parquet"), 95), 190, true, false, {"build.parquet"});
+    pin("build.parquet", tier, declaration::none);
+    check(query(directory.file_literal("build.parquet"), 95), {.rows = 190}, {"build.parquet"});
   }
   SECTION("a declaration for k cannot gate the other source column")
   {
     pin("build.parquet", tier);
     check(query(directory.file_literal("build.parquet"), 95, "other"),
-          190,
-          true,
-          false,
+          {.rows = 190},
           {"build.parquet"});
   }
 }
@@ -281,7 +293,7 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
     CHECK_FALSE(changed_reader.declared_unique);
   }
 
-  pin("replacement.parquet", tier, false);
+  pin("replacement.parquet", tier, declaration::none);
   auto const stale = evidence(sql);
   CHECK(stale.cardinality == 0);
   CHECK(stale.source == source::unknown);
@@ -316,7 +328,7 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   REQUIRE(domain.cardinality == 0);
   REQUIRE(domain.source == sirius::op::dynamic_filter_domain_source::unknown);
   REQUIRE_FALSE(domain.declared_unique);
-  check(sql, 380, false, false, {"build.parquet"});
+  check(sql, {.rows = 380, .known_domain = false}, {"build.parquet"});
 }
 
 TEST_CASE_METHOD(DomainEvidenceFixture,
@@ -344,22 +356,21 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   CAPTURE(tier, threshold);
   scoped_sirius_setting coverage(
     *con, "dynamic_filter_domain_coverage_threshold", std::string_view{threshold});
-  build("part-a.parquet", false, 0, 50);
-  build("part-b.parquet", false, 50, 100);
+  build("part-a.parquet", build_keys::distinct, 0, 50);
+  build("part-b.parquet", build_keys::distinct, 50, 100);
   pin("part-*.parquet", tier);
   auto const files = "[" + directory.file_literal("part-b.parquet") + ", " +
                      directory.file_literal("part-a.parquet") + "]";
-  check(query(files, 95), 190, true, true, {"part-a.parquet", "part-b.parquet"});
+  check(query(files, 95), {.rows = 190, .gated = true}, {"part-a.parquet", "part-b.parquet"});
   check(query(directory.file_literal("part-b.parquet"), 95),
-        90,
-        false,
-        false,
-        {"part-b.parquet"},
-        false);
+        {.rows = 90, .known_domain = false, .served_from_pin = false},
+        {"part-b.parquet"});
   auto const repeated = "[" + directory.file_literal("part-a.parquet") + ", " +
                         directory.file_literal("part-a.parquet") + ", " +
                         directory.file_literal("part-b.parquet") + "]";
-  check(query(repeated, 95), 290, false, false, {"part-a.parquet", "part-b.parquet"}, false);
+  check(query(repeated, 95),
+        {.rows = 290, .known_domain = false, .served_from_pin = false},
+        {"part-a.parquet", "part-b.parquet"});
 }
 
 TEST_CASE_METHOD(DomainEvidenceFixture,
@@ -376,19 +387,21 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   pin("first.parquet", tier);
   auto const first       = query(directory.file_literal("first.parquet"), 95);
   auto const replacement = query(directory.file_literal("replacement.parquet"), 95);
-  check(first, 190, true, true, {"first.parquet"});
+  check(first, {.rows = 190, .gated = true}, {"first.parquet"});
 
-  pin("replacement.parquet", tier, false);
-  check(replacement, 190, true, false, {"replacement.parquet"});
-  check(first, 190, false, false, {"first.parquet"}, false);
+  pin("replacement.parquet", tier, declaration::none);
+  check(replacement, {.rows = 190}, {"replacement.parquet"});
+  check(first, {.rows = 190, .known_domain = false, .served_from_pin = false}, {"first.parquet"});
 
   run_ok("CALL unpin_table(" + sql_literal(pin_name()) + ");");
   pin("replacement.parquet", tier);
-  check(replacement, 190, true, true, {"replacement.parquet"});
+  check(replacement, {.rows = 190, .gated = true}, {"replacement.parquet"});
   run_ok("CALL unpin_table(" + sql_literal(pin_name()) + ");");
-  check(replacement, 190, false, false, {"replacement.parquet"}, false);
-  pin("replacement.parquet", tier, false);
-  check(replacement, 190, true, false, {"replacement.parquet"});
+  check(replacement,
+        {.rows = 190, .known_domain = false, .served_from_pin = false},
+        {"replacement.parquet"});
+  pin("replacement.parquet", tier, declaration::none);
+  check(replacement, {.rows = 190}, {"replacement.parquet"});
 }
 
 TEST_CASE_METHOD(DomainEvidenceFixture,
@@ -401,7 +414,6 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
          "CALL pin_table(" + args + ", tier='gpu', unique_cols=['k', NULL]);",
          "CALL pin_table(" + args + ", tier='gpu', unique_cols='k');",
          "CALL pin_table(" + args + ", tier='parquet', unique_cols=['k']);",
-         "CALL pin_table(" + args + ", tier='gpu', cols=['payload'], unique_cols=['k']);",
          "CALL pin_table(format='duckdb', name='domain_native', tier='gpu', unique_cols=['k']);"}) {
     INFO(sql);
     auto prepared = con->Prepare(sql);
@@ -412,10 +424,16 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   auto& manager     = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
   auto const epoch  = manager.pin_registry_epoch();
   auto const before = sirius::test::get_transparent_execution_stats(*con);
-  auto invalid = con->Query("CALL pin_table(" + args + ", tier='gpu', unique_cols=['missing']);");
-  REQUIRE(invalid);
-  REQUIRE(invalid->HasError());
-  REQUIRE(invalid->GetError().find("unique_cols") != std::string::npos);
+  // Only the source schema and the pinned columns can show these declarations are invalid.
+  for (auto const& sql : std::vector<std::string>{
+         "CALL pin_table(" + args + ", tier='gpu', unique_cols=['missing']);",
+         "CALL pin_table(" + args + ", tier='gpu', cols=['payload'], unique_cols=['k']);"}) {
+    INFO(sql);
+    auto invalid = con->Query(sql);
+    REQUIRE(invalid);
+    REQUIRE(invalid->HasError());
+    REQUIRE(invalid->GetError().find("unique_cols") != std::string::npos);
+  }
   REQUIRE(manager.pin_registry_epoch() == epoch);
   REQUIRE(sirius::test::get_transparent_execution_stats(*con).parquet_reader_calls ==
           before.parquet_reader_calls);
@@ -449,7 +467,8 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   REQUIRE(found);
   for (auto const* key : {"k", "other"}) {
     CAPTURE(key);
-    check(
-      query(directory.file_literal("build.parquet"), 95, key), 190, true, true, {"build.parquet"});
+    check(query(directory.file_literal("build.parquet"), 95, key),
+          {.rows = 190, .gated = true},
+          {"build.parquet"});
   }
 }

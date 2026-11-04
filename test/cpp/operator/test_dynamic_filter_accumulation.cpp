@@ -242,10 +242,11 @@ TEST_CASE("declared domain coverage gates accumulation before partial allocation
     auto const base = fixture.make_plan(256 * mib);
     auto keys       = base.admitted_keys();
     for (std::size_t index = 0; index < keys.size(); ++index) {
-      keys[index].build_key_domain_cardinality = all_gated || index == gated_key ? 2000 : 10000;
-      keys[index].build_key_proven_unique      = false;
-      keys[index].build_key_declared_unique    = true;
-      keys[index].build_key_domain_source = op::dynamic_filter_domain_source::pinned_parquet_exact;
+      keys[index].build_key_proven_unique = false;
+      keys[index].build_key_domain        = {
+                       .cardinality     = all_gated || index == gated_key ? std::size_t{2000} : std::size_t{10000},
+                       .source          = op::dynamic_filter_domain_source::pinned_parquet_exact,
+                       .declared_unique = true};
     }
     return op::dynamic_filter_publish_plan{std::move(keys),
                                            base.probe_targets(),
@@ -1351,11 +1352,12 @@ TEST_CASE("inapplicable accumulation keys cannot report a declared coverage skip
                                 {cudf::data_type{key_type}},
                                 {},
                                 {cudf::data_type{incompatible_probe ? cudf::type_id::FLOAT64 : key_type}});
-    auto keys                                 = base.admitted_keys();
-    keys.front().build_key_domain_cardinality = 100;
-    keys.front().build_key_proven_unique      = false;
-    keys.front().build_key_declared_unique    = true;
-    keys.front().build_key_domain_source = op::dynamic_filter_domain_source::pinned_parquet_exact;
+    auto keys                            = base.admitted_keys();
+    keys.front().build_key_proven_unique = false;
+    keys.front().build_key_domain        = {
+                     .cardinality     = 100,
+                     .source          = op::dynamic_filter_domain_source::pinned_parquet_exact,
+                     .declared_unique = true};
     return op::dynamic_filter_publish_plan{
       std::move(keys),
       base.probe_targets(),

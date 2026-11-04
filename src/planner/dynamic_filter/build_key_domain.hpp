@@ -40,22 +40,13 @@ class sirius_scan_manager;
 
 namespace sirius::planner {
 
-/// Copied per-column usefulness evidence; no registry entry is retained by the plan.
-struct build_key_domain_evidence {
-  std::size_t cardinality                 = 0;
-  op::dynamic_filter_domain_source source = op::dynamic_filter_domain_source::unknown;
-  bool declared_unique                    = false;
-
-  [[nodiscard]] bool operator==(build_key_domain_evidence const&) const = default;
-};
-
 /**
  * @brief Copies domain evidence for each original join condition through row-subset lineage
  *
  * Unknown or mismatched sources return empty evidence. Call before `create_plan` moves the logical
  * children, while the planning window keeps the pin registry stable.
  */
-[[nodiscard]] std::vector<build_key_domain_evidence> build_key_domain_evidence_for(
+[[nodiscard]] std::vector<op::dynamic_filter_domain_evidence> build_key_domain_evidence_for(
   duckdb::LogicalComparisonJoin const& join,
   duckdb::ClientContext& context,
   scan_manager::sirius_scan_manager const& registry);
@@ -71,7 +62,7 @@ template <class Source>
 concept base_table_domain_evidence_source =
   std::invocable<Source const&, duckdb::LogicalGet const&, std::size_t> &&
   std::same_as<std::invoke_result_t<Source const&, duckdb::LogicalGet const&, std::size_t>,
-               build_key_domain_evidence>;
+               op::dynamic_filter_domain_evidence>;
 
 namespace detail {
 
@@ -93,12 +84,12 @@ namespace detail {
  * @pre @p join still owns both logical children; call before `create_plan`
  */
 template <base_table_domain_evidence_source Source>
-[[nodiscard]] std::vector<build_key_domain_evidence> build_key_domain_evidence_for(
+[[nodiscard]] std::vector<op::dynamic_filter_domain_evidence> build_key_domain_evidence_for(
   duckdb::LogicalComparisonJoin const& join, Source const& evidence_for)
 {
   auto const columns = detail::resolve_build_key_scan_columns(join);
-  std::vector<build_key_domain_evidence> domains(columns.size());
-  std::vector<std::pair<scan_column_origin, build_key_domain_evidence>> memo;
+  std::vector<op::dynamic_filter_domain_evidence> domains(columns.size());
+  std::vector<std::pair<scan_column_origin, op::dynamic_filter_domain_evidence>> memo;
   for (std::size_t condition_index = 0; condition_index < columns.size(); ++condition_index) {
     if (!columns[condition_index]) { continue; }
     auto const column = *columns[condition_index];

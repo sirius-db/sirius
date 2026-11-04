@@ -1006,15 +1006,7 @@ unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context
       if (value.IsNull()) {
         throw BinderException("pin_table 'unique_cols' list cannot contain NULL entries");
       }
-      auto column = value.ToString();
-      if (result->args.cols && !result->args.cols->empty() &&
-          std::none_of(result->args.cols->begin(), result->args.cols->end(), [&](auto const& name) {
-            return StringUtil::CIEquals(name, column);
-          })) {
-        throw BinderException("pin_table 'unique_cols' entry '" + column +
-                              "' is not in the pinned 'cols' list");
-      }
-      result->args.declared_unique_columns.push_back(std::move(column));
+      result->args.declared_unique_columns.push_back(value.ToString());
     }
   }
 
@@ -1250,6 +1242,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // ingestible_table_info and drives later cache-hit matching + the gather.
     auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
+    // Normalize declarations to the cached spelling; the registry sorts and deduplicates them.
     for (auto& column : data.args.declared_unique_columns) {
       auto const& names = cache_info.column_names();
       auto const found  = std::find_if(names.begin(), names.end(), [&](auto const& name) {
@@ -1262,10 +1255,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       }
       column = *found;
     }
-    auto& declared_columns = data.args.declared_unique_columns;
-    std::sort(declared_columns.begin(), declared_columns.end());
-    declared_columns.erase(std::unique(declared_columns.begin(), declared_columns.end()),
-                           declared_columns.end());
 
     // Compression config (tier-agnostic): load the per-table plan DSL from the plan
     // directory (if configured), then resolve it into a compression_pin_config. Both

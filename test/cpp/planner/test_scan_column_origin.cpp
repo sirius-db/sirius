@@ -52,8 +52,8 @@
 #include <utility>
 #include <vector>
 
+using sirius::op::dynamic_filter_domain_evidence;
 using sirius::op::dynamic_filter_domain_source;
-using sirius::planner::build_key_domain_evidence;
 using sirius::planner::build_key_domain_evidence_for;
 using sirius::planner::origin_policy;
 using sirius::planner::resolve_scan_column_origin;
@@ -89,7 +89,8 @@ constexpr std::size_t stub_cardinality_of(duckdb::idx_t table_index)
 }
 
 struct stub_cardinality_source {
-  build_key_domain_evidence operator()(duckdb::LogicalGet const& get, std::size_t ordinal) const
+  dynamic_filter_domain_evidence operator()(duckdb::LogicalGet const& get,
+                                            std::size_t ordinal) const
   {
     return {stub_cardinality_of(get.table_index.index),
             dynamic_filter_domain_source::pinned_parquet_exact,
@@ -98,13 +99,17 @@ struct stub_cardinality_source {
 };
 
 struct refusing_source {
-  build_key_domain_evidence operator()(duckdb::LogicalGet const&, std::size_t) const { return {}; }
+  dynamic_filter_domain_evidence operator()(duckdb::LogicalGet const&, std::size_t) const
+  {
+    return {};
+  }
 };
 
 // Count evidence lookups to verify per-column memoization.
 struct counting_source {
   std::size_t* calls = nullptr;
-  build_key_domain_evidence operator()(duckdb::LogicalGet const& get, std::size_t ordinal) const
+  dynamic_filter_domain_evidence operator()(duckdb::LogicalGet const& get,
+                                            std::size_t ordinal) const
   {
     ++*calls;
     return stub_cardinality_source{}(get, ordinal);

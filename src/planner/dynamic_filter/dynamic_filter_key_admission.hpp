@@ -19,7 +19,6 @@
 #include "duckdb/common/enums/join_type.hpp"
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
-#include "planner/dynamic_filter/build_key_domain.hpp"
 
 #include <cudf/types.hpp>
 
@@ -60,7 +59,7 @@ namespace sirius::planner {
 [[nodiscard]] std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
-  std::vector<build_key_domain_evidence> const& condition_domain_evidence,
+  std::vector<op::dynamic_filter_domain_evidence> const& condition_domain_evidence,
   std::optional<std::size_t> build_side_unique_column = std::nullopt);
 
 /**

@@ -57,7 +57,7 @@ std::vector<std::optional<scan_column_origin>> resolve_build_key_scan_columns(
 
 namespace {
 
-bool default_parquet_reader(duckdb::FunctionData const& bind_data)
+bool has_default_parquet_reader_options(duckdb::FunctionData const& bind_data)
 {
   auto const& options = duckdb::ParquetScanFunction::GetFileOptions(bind_data);
   duckdb::ParquetOptions const defaults;
@@ -73,7 +73,7 @@ bool default_parquet_reader(duckdb::FunctionData const& bind_data)
 
 // Pins decode the physical schema with default reader options; transformed readers have no matching
 // evidence.
-bool default_parquet_scan(duckdb::LogicalGet const& get)
+bool is_untransformed_parquet_scan(duckdb::LogicalGet const& get)
 {
   if (!get.named_parameters.empty() || get.has_pushed_projection) { return false; }
   if (get.function.GetName() == "sirius_read_parquet") {
@@ -95,13 +95,14 @@ bool default_parquet_scan(duckdb::LogicalGet const& get)
   if (wrapped == nullptr || !wrapped->options.named_parameters.empty()) { return false; }
   bool checked = false;
   if (wrapped->options.schema_bind_data) {
-    if (!default_parquet_reader(*wrapped->options.schema_bind_data)) { return false; }
+    if (!has_default_parquet_reader_options(*wrapped->options.schema_bind_data)) { return false; }
     checked = true;
   }
   if (bind->initial_reader) {
     auto const* reader =
       dynamic_cast<duckdb::TableFunctionFileReader const*>(bind->initial_reader.get());
-    if (reader == nullptr || !reader->bind_data || !default_parquet_reader(*reader->bind_data)) {
+    if (reader == nullptr || !reader->bind_data ||
+        !has_default_parquet_reader_options(*reader->bind_data)) {
       return false;
     }
     checked = true;
@@ -126,7 +127,7 @@ std::optional<std::size_t> catalog_cardinality(duckdb::LogicalGet const& get,
   }
 }
 
-build_key_domain_evidence evidence_for_column(
+op::dynamic_filter_domain_evidence evidence_for_column(
   duckdb::LogicalGet const& get,
   std::size_t scan_ordinal,
   duckdb::ClientContext& context,
@@ -136,8 +137,8 @@ build_key_domain_evidence evidence_for_column(
     if (get.function.GetName() == "seq_scan") {
       auto const cardinality = catalog_cardinality(get, context).value_or(0);
       return cardinality == 0
-               ? build_key_domain_evidence{}
-               : build_key_domain_evidence{
+               ? op::dynamic_filter_domain_evidence{}
+               : op::dynamic_filter_domain_evidence{
                    cardinality, op::dynamic_filter_domain_source::catalog_bound, false};
     }
     auto const& function_name = get.function.GetName();
@@ -145,7 +146,9 @@ build_key_domain_evidence evidence_for_column(
         function_name != "sirius_read_parquet") {
       return {};
     }
-    if (lookup_connector(get, context) == nullptr || !default_parquet_scan(get)) { return {}; }
+    if (lookup_connector(get, context) == nullptr || !is_untransformed_parquet_scan(get)) {
+      return {};
+    }
 
     std::size_t position = scan_ordinal;
     if (!get.projection_ids.empty()) {
@@ -199,7 +202,7 @@ build_key_domain_evidence evidence_for_column(
 
 }  // namespace
 
-std::vector<build_key_domain_evidence> build_key_domain_evidence_for(
+std::vector<op::dynamic_filter_domain_evidence> build_key_domain_evidence_for(
   duckdb::LogicalComparisonJoin const& join,
   duckdb::ClientContext& context,
   scan_manager::sirius_scan_manager const& registry)

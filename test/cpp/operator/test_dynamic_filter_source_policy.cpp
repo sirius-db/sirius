@@ -254,6 +254,8 @@ TEST_CASE("domain-coverage gate does not skip filters for an empty build",
 {
   REQUIRE_FALSE(domain_coverage_gate_fires(0, 100, true, 0.9));
   REQUIRE_FALSE(domain_coverage_gate_fires(0, 100, true, 0.45));
+  // Plans transport thresholds unvalidated; an empty build stays filtered even at zero.
+  REQUIRE_FALSE(domain_coverage_gate_fires(0, 100, true, 0.0));
 }
 
 TEST_CASE("domain-coverage gate preserves configured threshold boundaries",

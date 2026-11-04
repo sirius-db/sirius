@@ -199,7 +199,7 @@ Native scans retain their catalog row bounds and genuine uniqueness proofs. Parq
 
 The domain is a row count, not a `[min,max]` range: holes in key values do not enlarge it. Unknown or zero domains, builds larger than their domain, and keys without eligibility disable this optional gate. A false declaration can skip a useful filter, but cannot change join results: declarations never feed late-materialization proofs, distinct joins, or deduplication. The default threshold remains `0.9`; `0.45` is an explicit measurement profile, not a new default. The Bloom allocation cap and publication transport are unchanged.
 
-At DEBUG level, each considered bound key emits `[dynamic_filter_domain] path=ordinary|accumulated condition=N rows=N domain=N provenance=unknown|catalog_bound|pinned_parquet_exact eligible=0|1 threshold=X decision=skip|keep`. `condition` is the original join-condition index. Accumulated type mismatches report `eligible=0 decision=keep`; `skip` means the domain gate actually applies. Use separate INFO runs for timings.
+At DEBUG level, each considered bound key emits `[dynamic_filter_domain] path=ordinary|accumulated condition=N rows=N domain=N provenance=unknown|catalog_bound|pinned_parquet_exact eligible=0|1 threshold=X decision=skip|keep`. `condition` is the original join-condition index. `eligible` reports only the uniqueness proof or backed declaration; `domain` and `decision` show the coverage check. Accumulated type mismatches report `eligible=0 decision=keep`; `skip` means the domain gate actually applies. Use separate INFO runs for timings.
 
 ### Key types
 

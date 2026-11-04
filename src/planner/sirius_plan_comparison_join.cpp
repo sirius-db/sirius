@@ -409,7 +409,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
     build_evidence ? build_key_domain_evidence_for(op, context, sirius_context->get_scan_manager())
-                   : std::vector<build_key_domain_evidence>{};
+                   : std::vector<sirius::op::dynamic_filter_domain_evidence>{};
 
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
   auto left                    = create_plan(*op.children[0]);

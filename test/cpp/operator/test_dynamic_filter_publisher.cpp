@@ -164,12 +164,12 @@ dynamic_filter_publish_plan::admitted_key make_int64_key(std::size_t condition_i
                                                          std::size_t domain_cardinality = 0)
 {
   return dynamic_filter_publish_plan::admitted_key{
-    .planner_condition_index      = condition_index,
-    .build_key_ordinal            = build_key_ordinal,
-    .storage_type                 = kInt64,
-    .key_shape                    = {},
-    .build_key_domain_cardinality = domain_cardinality,
-    .build_key_proven_unique      = domain_cardinality > 0};
+    .planner_condition_index = condition_index,
+    .build_key_ordinal       = build_key_ordinal,
+    .storage_type            = kInt64,
+    .key_shape               = {},
+    .build_key_domain        = {.cardinality = domain_cardinality},
+    .build_key_proven_unique = domain_cardinality > 0};
 }
 
 // GPU resources and key columns used by publisher tests.
@@ -509,8 +509,11 @@ cucascade::memory::memory_space& host_memory_space(publisher_fixture& fixture)
   return *space;
 }
 
+enum class key_uniqueness : bool { proven, pinned_declaration };
+
 // Verify that coverage gating uses the selected key's domain, build ordinal, and push ordinal.
-void require_domain_gate_skips_only(std::size_t gated_key_index, bool declared_unique = false)
+void require_domain_gate_skips_only(std::size_t gated_key_index,
+                                    key_uniqueness uniqueness = key_uniqueness::proven)
 {
   constexpr std::size_t kBuildRows = 3;
   // Coverage 3/3 = 1.0 trips the plan's default threshold; 3/1000 = 0.003 stays far below it.
@@ -541,11 +544,13 @@ void require_domain_gate_skips_only(std::size_t gated_key_index, bool declared_u
                                                    .probe_storage_type   = kInt64}}});
   std::vector<dynamic_filter_publish_plan::admitted_key> keys{make_int64_key(0, 1, domain_of(0)),
                                                               make_int64_key(1, 0, domain_of(1))};
-  if (declared_unique) {
+  if (uniqueness == key_uniqueness::pinned_declaration) {
     for (auto& key : keys) {
-      key.build_key_proven_unique   = false;
-      key.build_key_declared_unique = true;
-      key.build_key_domain_source = sirius::op::dynamic_filter_domain_source::pinned_parquet_exact;
+      key.build_key_proven_unique = false;
+      key.build_key_domain        = {
+               .cardinality     = key.build_key_domain.cardinality,
+               .source          = sirius::op::dynamic_filter_domain_source::pinned_parquet_exact,
+               .declared_unique = true};
     }
   }
   dynamic_filter_publish_plan plan{
@@ -554,7 +559,7 @@ void require_domain_gate_skips_only(std::size_t gated_key_index, bool declared_u
   sirius::test::scoped_recording_log_sink logs{"debug"};
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
-  if (declared_unique) {
+  if (uniqueness == key_uniqueness::pinned_declaration) {
     std::size_t decisions = 0;
     std::size_t skips     = 0;
     for (auto const& record : logs.records()) {
@@ -1432,7 +1437,7 @@ TEST_CASE("declared domain coverage skips only its bound ordinary key and report
           "[dynamic_filter][publisher][domain_evidence]")
 {
   auto const gated_key = GENERATE(std::size_t{0}, std::size_t{1});
-  require_domain_gate_skips_only(gated_key, true);
+  require_domain_gate_skips_only(gated_key, key_uniqueness::pinned_declaration);
 }
 
 TEST_CASE("an unknown domain source cannot authorize a declared uniqueness gate",
@@ -1440,12 +1445,12 @@ TEST_CASE("an unknown domain source cannot authorize a declared uniqueness gate"
 {
   publisher_fixture fixture;
   fixture.add_key_column(95);
-  auto const base                           = make_single_replica_plan(fixture);
-  auto keys                                 = base.admitted_keys();
-  keys.front().build_key_domain_cardinality = 100;
-  keys.front().build_key_proven_unique      = false;
-  keys.front().build_key_declared_unique    = true;
-  keys.front().build_key_domain_source      = sirius::op::dynamic_filter_domain_source::unknown;
+  auto const base                      = make_single_replica_plan(fixture);
+  auto keys                            = base.admitted_keys();
+  keys.front().build_key_proven_unique = false;
+  keys.front().build_key_domain        = {.cardinality = 100,
+                                          .source      = sirius::op::dynamic_filter_domain_source::unknown,
+                                          .declared_unique = true};
   dynamic_filter_publish_plan plan{std::move(keys), base.probe_targets(), base.replica_spaces()};
   sirius::test::scoped_recording_log_sink logs{"debug"};
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
