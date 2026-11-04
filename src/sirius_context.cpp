@@ -1531,6 +1531,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
   snapshot.split_flushed_for_schema =
     physical_counters_->split_flushed_for_schema.load(std::memory_order_relaxed);
+  snapshot.arrow_schema_drift_refusals =
+    physical_counters_->arrow_schema_drift_refusals.load(std::memory_order_relaxed);
   snapshot.parquet_type_mismatch_observed =
     physical_counters_->type_mismatches.load(std::memory_order_relaxed);
   snapshot.parquet_type_refusals =

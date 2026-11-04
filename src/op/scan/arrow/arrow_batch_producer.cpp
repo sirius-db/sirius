@@ -17,6 +17,7 @@
 #include "op/scan/arrow/arrow_batch_producer.hpp"
 
 #include "op/scan/arrow/arrow_staging_resource.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 
 #include <cudf/utilities/traits.hpp>
 
@@ -189,14 +190,18 @@ struct arrow_push_queue::impl {
   materialization_program program;
   arrow_push_limits bounds;
   std::function<void(std::exception_ptr)> report;
+  std::shared_ptr<physical_check_counters> counters;
   mutable std::mutex mutex;
   std::condition_variable cv;
   sm::preparation_wakeup wake;
   std::optional<offered_arrow_input> input;
   bool offering = false, consumed = false, finished = false, closed = false, cancelled = false;
   std::exception_ptr error;
-  impl(materialization_program p, arrow_push_limits b, std::function<void(std::exception_ptr)> f)
-    : program(std::move(p)), bounds(b), report(std::move(f))
+  impl(materialization_program p,
+       arrow_push_limits b,
+       std::function<void(std::exception_ptr)> f,
+       std::shared_ptr<physical_check_counters> c)
+    : program(std::move(p)), bounds(b), report(std::move(f)), counters(std::move(c))
   {
     if (!program.contract || !program.generation || !program.input_types || !report ||
         b.max_rows < 0 || b.max_rows > std::numeric_limits<cudf::size_type>::max() ||
@@ -208,11 +213,13 @@ struct arrow_push_queue::impl {
   void validate(offered_arrow_input const& value) const
   {
     if (!value.schema || !value.array || !value.owner || !value.retained_bytes ||
-        value.retained_bytes > bounds.max_offered_bytes || value.array->length > bounds.max_rows ||
-        value.array->n_children != static_cast<int64_t>(program.input_types->size()))
+        value.retained_bytes > bounds.max_offered_bytes || value.array->length > bounds.max_rows)
       throw std::invalid_argument("Arrow offered input exceeds its declared bounds");
     auto types = validate_arrow_host_flat(*value.schema, *value.array, value.metadata_lengths);
-    if (types != *program.input_types) throw std::invalid_argument("Arrow offered schema drift");
+    if (types.size() != program.input_types->size())
+      throw transparent::arrow_schema_drift_error("Arrow offered input exceeds its declared bounds");
+    if (types != *program.input_types)
+      throw transparent::arrow_schema_drift_error("Arrow offered schema drift");
     if (copy_size(value, types) > aligned(bounds.max_copy_bytes) ||
         arrow_import_staging_bytes(*value.array, types) > bounds.staging_bytes)
       throw std::invalid_argument("Arrow offered input exceeds copy or normalization bounds");
@@ -223,14 +230,15 @@ struct arrow_push_queue::impl {
       (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
       if (program.decimal_precisions.size() != types.size() ||
           program.decimal_precisions[i] != precision)
-        throw std::invalid_argument("Arrow offered decimal precision drift");
+        throw transparent::arrow_schema_drift_error("Arrow offered decimal precision drift");
     }
   }
 };
 arrow_push_queue::arrow_push_queue(materialization_program p,
                                    arrow_push_limits b,
-                                   std::function<void(std::exception_ptr)> f)
-  : impl_(std::make_unique<impl>(std::move(p), b, std::move(f)))
+                                   std::function<void(std::exception_ptr)> f,
+                                   std::shared_ptr<physical_check_counters> counters)
+  : impl_(std::make_unique<impl>(std::move(p), b, std::move(f), std::move(counters)))
 {
 }
 arrow_push_queue::~arrow_push_queue() = default;
@@ -240,6 +248,13 @@ bool arrow_push_queue::offer(offered_arrow_input const& input)
   // remains owned by the caller, but the attempt must still observe physical drift.
   try {
     impl_->validate(input);
+  } catch (transparent::arrow_schema_drift_error const& e) {
+    if (auto counters = impl_->counters)
+      counters->arrow_schema_drift_refusals.fetch_add(1, std::memory_order_relaxed);
+    auto error = std::make_exception_ptr(transparent::classified_execution_error(
+      transparent::late_failure_cause::physical_input, e.what(), transparent::kArrowSchemaDrift));
+    fail(error);
+    std::rethrow_exception(error);
   } catch (std::exception const& e) {
     auto error = std::make_exception_ptr(transparent::classified_execution_error(
       transparent::late_failure_cause::physical_input, e.what()));

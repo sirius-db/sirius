@@ -39,12 +39,30 @@
 #include <duckdb/common/types/blob.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace {
+// Diagnostic label for the static filter bytes: zero-padded 64-bit FNV-1a, first eight hex digits;
+// "-" when the contract carries no static filter. Never a cache, equality or enforcement input.
+std::string static_filter_label(std::string const& bytes)
+{
+  if (bytes.empty()) return "-";
+  uint64_t hash = 14695981039346656037ull;
+  for (unsigned char c : bytes) {
+    hash ^= c;
+    hash *= 1099511628211ull;
+  }
+  char text[17];
+  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+  return std::string(text, 8);
+}
+}  // namespace
 
 namespace sirius::pipeline {
 
@@ -526,6 +544,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
           << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
           << (contract.predicates.pushdown_mode.empty() ? "none"
                                                         : contract.predicates.pushdown_mode)
+
+          << " fingerprint=" << static_filter_label(contract.predicates.static_filter_fingerprint)
           << " scan_cpu_replay="
           << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
                                                                                : "forbidden")
@@ -592,6 +612,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " depth=" << dump_evidence_depth(entry.eligibility.depth)
         << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
         << (contract.predicates.pushdown_mode.empty() ? "none" : contract.predicates.pushdown_mode)
+
+        << " fingerprint=" << static_filter_label(contract.predicates.static_filter_fingerprint)
         << " scan_cpu_replay="
         << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
                                                                              : "forbidden")

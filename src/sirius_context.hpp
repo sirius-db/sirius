@@ -415,6 +415,7 @@ class SiriusContext : public ClientContextState {
     uint64_t iceberg_inventory_bytes_peak      = 0;
     uint64_t split_physical_checks             = 0;
     uint64_t split_flushed_for_schema          = 0;
+    uint64_t arrow_schema_drift_refusals       = 0;
     std::array<uint64_t, semantic_reason_count> split_physical_rejections{};
     uint64_t parquet_type_mismatch_observed = 0;
     uint64_t parquet_type_refusals          = 0;

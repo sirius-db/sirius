@@ -208,6 +208,12 @@ struct arrow_import_ingestible::impl {
       if (!input.batch || input.batch->row_count() > limits.max_rows)
         throw std::invalid_argument("Arrow producer exceeded its declared row bound");
       input.batch->validate_for(binding.program);
+    } catch (transparent::arrow_schema_drift_error const& error) {
+      if (auto counters = info.profiles->counters)
+        counters->arrow_schema_drift_refusals.fetch_add(1, std::memory_order_relaxed);
+      throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
+                                                    error.what(),
+                                                    transparent::kArrowSchemaDrift);
     } catch (std::invalid_argument const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
                                                     error.what());

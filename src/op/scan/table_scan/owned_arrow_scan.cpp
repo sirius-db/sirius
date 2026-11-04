@@ -16,6 +16,8 @@
 
 #include "op/scan/table_scan/owned_arrow_scan.hpp"
 
+#include "transparent/replay_admission.hpp"
+
 namespace sirius::op::scan {
 namespace {
 std::string identity(uint64_t sequence)
@@ -56,6 +58,11 @@ class arrow_validator final : public split_validator {
         arrow->batch()->validate_for(program);
       else if (arrow->input_types() != *program.input_types)
         fail("Arrow empty source schema mismatch");
+    } catch (transparent::arrow_schema_drift_error const& error) {
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::physical_input,
+        error.what(),
+        transparent::kArrowSchemaDrift);
     } catch (std::invalid_argument const& error) {
       throw certificate_incomplete(context.contract, {}, error.what());
     }
