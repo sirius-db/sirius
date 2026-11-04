@@ -65,7 +65,9 @@ void validate(cudf::table_view input,
 }
 
 // The order keys as one column: the key itself, or a struct view over the keys when there are
-// several. The view does not own or copy the key columns.
+// several. The view does not own or copy the key columns. The rows are already sorted by every
+// key, each with its own direction and NULL placement, so the scan only uses the struct to compare
+// each row with the previous one for equality.
 cudf::column_view order_values(cudf::table_view sorted, std::size_t partitions, std::size_t keys)
 {
   if (keys == 1) { return sorted.column(static_cast<cudf::size_type>(partitions)); }
