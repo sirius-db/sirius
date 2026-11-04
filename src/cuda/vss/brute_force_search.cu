@@ -32,8 +32,11 @@
 #include <raft/core/device_resources.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
+#include <rmm/device_uvector.hpp>
+
 #include <cuvs/neighbors/brute_force.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <string_view>
 
@@ -244,6 +247,64 @@ knn_result brute_force_knn(raft::device_resources const& res,
 #endif
   auto const index = brute_force_build(res, dataset, metric);
   return brute_force_knn(res, index, queries, k, mr);
+}
+
+knn_result brute_force_int8_topk(raft::device_resources const& res,
+                                 std::int8_t const* x,
+                                 int64_t n,
+                                 std::int8_t const* q,
+                                 int64_t m,
+                                 int64_t d,
+                                 int64_t k,
+                                 bool take_sqrt,
+                                 rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(k >= 1 && k <= n, "VSS k must satisfy 1 <= k <= n_rows");
+  CUDF_EXPECTS(m >= 0, "INT8 brute-force query count must be nonnegative");
+  CUDF_EXPECTS(d > 0 && d % 4 == 0 && d <= 131068,
+               "INT8 brute-force dimension must be a positive multiple of 4, at most 131068");
+  auto const stream   = raft::resource::get_cuda_stream(res);
+  auto const out_size = column_size(m * k, "vector join top-k");
+  auto neighbors      = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto distances = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT32}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
+  if (m == 0) { return knn_result{std::move(neighbors), std::move(distances), m, k}; }
+
+  namespace scalar = cuvs::preprocessing::quantize::scalar;
+  scalar::quantizer<float> const quantizer{-128.f, 127.f};
+  // Borrow the corpus codes for this call. The fixed range makes decoding and re-encoding
+  // identity operations, including -128 and 127; cuVS computes norms and handles tail rows.
+  cuvs::device_sq_dataset<float, int64_t, float>::const_view_type const dataset{
+    raft::make_device_matrix_view<const std::int8_t, int64_t>(x, n, d), quantizer.view()};
+  bf::index_params params;
+  params.metric    = take_sqrt ? cuvs::distance::DistanceType::L2SqrtExpanded
+                               : cuvs::distance::DistanceType::L2Expanded;
+  auto const index = bf::build(res, params, dataset);
+
+  // The SQ search accepts floating-point queries. Widen only a bounded batch, retaining the
+  // existing tile budget; cuVS independently tiles its scores and performs top-k selection.
+  auto const tile_rows = std::min<int64_t>(
+    m, std::max<int64_t>(1, gemm_search_tile_bytes() / (sizeof(float) * std::max(n, d))));
+  rmm::device_uvector<float> queries(static_cast<std::size_t>(tile_rows * d), stream, mr);
+  for (int64_t q0 = 0; q0 < m; q0 += tile_rows) {
+    auto const rows       = std::min(tile_rows, m - q0);
+    auto const query_view = raft::make_device_matrix_view<float, int64_t>(queries.data(), rows, d);
+    scalar::inverse_transform(
+      res,
+      quantizer.view(),
+      raft::make_device_matrix_view<const std::int8_t, int64_t>(q + q0 * d, rows, d),
+      query_view);
+    bf::search(res,
+               bf::search_params{},
+               index,
+               raft::make_const_mdspan(query_view),
+               raft::make_device_matrix_view<int64_t, int64_t>(
+                 neighbors->mutable_view().data<int64_t>() + q0 * k, rows, k),
+               raft::make_device_matrix_view<float, int64_t>(
+                 distances->mutable_view().data<float>() + q0 * k, rows, k));
+  }
+  return knn_result{std::move(neighbors), std::move(distances), m, k};
 }
 
 }  // namespace sirius::vss
