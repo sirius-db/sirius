@@ -484,11 +484,13 @@ class parquet_batch_coalescer : public batch_coalescer {
     // Reject invalid ownership or coverage before recording a fallback or flushing pending work.
     if (file->contract_id() != _contract_id) {
       throw transparent::classified_execution_error(
-        transparent::late_failure_cause::certificate, "parquet file contract does not match coalescer contract");
+        transparent::late_failure_cause::certificate,
+        "parquet file contract does not match coalescer contract");
     }
     if (file->certificates().size() != 1 || file->dependencies().size() != 1) {
       throw transparent::classified_execution_error(
-        transparent::late_failure_cause::certificate, "parquet file requires one certificate and dependency");
+        transparent::late_failure_cause::certificate,
+        "parquet file requires one certificate and dependency");
     }
 
     // Remember the first stats-pruned file. If every file has no surviving row
@@ -2466,13 +2468,14 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   if (split.field_mapping) {
     auto const& mapping = *split.field_mapping;
     if (mapping.program().contract != _info->contract_id)
-      throw transparent::classified_execution_error(
-        transparent::late_failure_cause::certificate, "mapped split belongs to another scan");
+      throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
+                                                    "mapped split belongs to another scan");
     for (auto const& slice : split.rg_slices)
       if (slice.file_metadata != mapping.metadata()->file_metadata() || !slice.datasource ||
           slice.datasource->get_io_object().identity_cache_key() != mapping.identity())
         throw transparent::classified_execution_error(
-        transparent::late_failure_cause::certificate, "mapped split does not match its approved file");
+          transparent::late_failure_cause::certificate,
+          "mapped split does not match its approved file");
   }
   // All-pruned fallback split (parquet_batch_coalescer::flush): every slice
   // carries zero row groups.

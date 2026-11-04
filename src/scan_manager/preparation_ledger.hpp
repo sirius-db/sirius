@@ -239,7 +239,7 @@ struct preparation_request {
 admission_decision prepare_statement_resources(reservation_provider&,
                                                std::span<preparation_request>,
                                                memory_space_id,
-                                               uint32_t max_permits = 1,
+                                               uint32_t max_permits     = 1,
                                                bool* rollback_completed = nullptr);
 struct scan_dv_count {
   op::scan::scan_contract_id contract;

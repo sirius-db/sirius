@@ -59,10 +59,9 @@ class arrow_validator final : public split_validator {
       else if (arrow->input_types() != *program.input_types)
         fail("Arrow empty source schema mismatch");
     } catch (transparent::arrow_schema_drift_error const& error) {
-      throw transparent::classified_execution_error(
-        transparent::late_failure_cause::physical_input,
-        error.what(),
-        transparent::kArrowSchemaDrift);
+      throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
+                                                    error.what(),
+                                                    transparent::kArrowSchemaDrift);
     } catch (std::invalid_argument const& error) {
       throw certificate_incomplete(context.contract, {}, error.what());
     }

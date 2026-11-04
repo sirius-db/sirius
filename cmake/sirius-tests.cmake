@@ -46,9 +46,10 @@ endif()
 target_sources(sirius_unittest
                PRIVATE $<TARGET_OBJECTS:sirius_context_config_test>)
 
-# Test variant of the connector registry: the same translation unit compiled with the
-# test-connector override seam. Linking the object ahead of sirius_core keeps the archive's
-# production object out of the test executable; production libraries never see the seam.
+# Test variant of the connector registry: the same translation unit compiled
+# with the test-connector override seam. Linking the object ahead of sirius_core
+# keeps the archive's production object out of the test executable; production
+# libraries never see the seam.
 add_library(sirius_connector_registry_test OBJECT
             src/planner/connector_registry.cpp)
 target_compile_definitions(

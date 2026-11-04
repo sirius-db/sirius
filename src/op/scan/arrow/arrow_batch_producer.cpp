@@ -217,7 +217,8 @@ struct arrow_push_queue::impl {
       throw std::invalid_argument("Arrow offered input exceeds its declared bounds");
     auto types = validate_arrow_host_flat(*value.schema, *value.array, value.metadata_lengths);
     if (types.size() != program.input_types->size())
-      throw transparent::arrow_schema_drift_error("Arrow offered input exceeds its declared bounds");
+      throw transparent::arrow_schema_drift_error(
+        "Arrow offered input exceeds its declared bounds");
     if (types != *program.input_types)
       throw transparent::arrow_schema_drift_error("Arrow offered schema drift");
     if (copy_size(value, types) > aligned(bounds.max_copy_bytes) ||
