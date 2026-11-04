@@ -484,18 +484,17 @@ void sirius_dynamic_bloom_filter::merge_from(void const* words,
   if (bytes != storage_bytes() || bytes % sizeof(std::uint32_t) != 0) {
     throw std::invalid_argument("[sirius_dynamic_bloom_filter] merging a filter of another size");
   }
-  auto* into         = static_cast<std::uint32_t*>(const_cast<void*>(storage()));
-  auto const count   = bytes / sizeof(std::uint32_t);
-  auto constexpr per = 256;
-  auto const blocks  = static_cast<unsigned>((count + per - 1) / per);
-  or_words<<<blocks, per, 0, stream.get()>>>(into, static_cast<std::uint32_t const*>(words), count);
-  CUDF_CUDA_TRY(cudaGetLastError());
-  // An accumulated filter is already replicated: every other GPU's copy takes the merged bits.
-  for (auto const& replica : _impl->accumulated_replicas) {
-    if (replica->device_id == _impl->source_device) { continue; }
-    CUDF_CUDA_TRY(cudaMemcpyPeerAsync(
-      replica->bits->data(), replica->device_id, into, _impl->source_device, bytes, stream.get()));
+  // Distributed ranks run on one GPU each, so a merged filter has no other replica to update.
+  if (replica_count() > 1) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter] merge_from on a filter on several GPUs");
   }
+  auto* into                 = static_cast<std::uint32_t*>(const_cast<void*>(storage()));
+  auto const count           = bytes / sizeof(std::uint32_t);
+  constexpr unsigned threads = 256;
+  auto const blocks          = static_cast<unsigned>(::cuda::ceil_div(count, std::size_t{threads}));
+  or_words<<<blocks, threads, 0, stream.get()>>>(
+    into, static_cast<std::uint32_t const*>(words), count);
+  CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(
