@@ -75,7 +75,7 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  protected:
-  /// Under a distributed hash join's build port, closes the join's dynamic-filter publication.
+  /// Under a hash join's build port, tells the join its build input has finished.
   void on_finalize_operator() override;
 
  private:
