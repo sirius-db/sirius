@@ -68,6 +68,42 @@ bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
   return false;
 }
 
+/// A device INT32 column holding @p indices.
+std::unique_ptr<cudf::column> index_column(std::vector<int32_t> const& indices,
+                                           ::cuda::stream_ref stream,
+                                           rmm::device_async_resource_ref mr)
+{
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          static_cast<cudf::size_type>(indices.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<int32_t>(),
+                                indices.data(),
+                                indices.size() * sizeof(int32_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
+  return column;
+}
+
+/// Rows i * rows / parts of @p sorted for i in [1, parts), offset by @p first: parts - 1
+/// evenly spaced boundaries.
+std::unique_ptr<cudf::table> evenly_spaced(cudf::table_view sorted,
+                                           cudf::size_type first,
+                                           cudf::size_type rows,
+                                           std::size_t parts,
+                                           ::cuda::stream_ref stream,
+                                           rmm::device_async_resource_ref mr)
+{
+  std::vector<int32_t> indices;
+  for (std::size_t i = 1; i < parts; ++i) {
+    auto const at = static_cast<std::size_t>(rows) * i / parts;
+    indices.push_back(first + static_cast<int32_t>(std::min<std::size_t>(at, rows - 1)));
+  }
+  auto const column = index_column(indices, stream, mr);
+  return cudf::gather(sorted, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+}
+
 }  // namespace
 
 sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
@@ -311,53 +347,25 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     }
 
     // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)
+    std::vector<cudf::column_view> sort_key_cols;
+    for (int idx : order_key_idx) {
+      sort_key_cols.push_back(merged_sample_view.column(idx));
+    }
+    cudf::table_view const sort_keys_view(sort_key_cols);
     if (_distributed) {
-      std::vector<cudf::column_view> key_cols;
-      for (int idx : order_key_idx) {
-        key_cols.push_back(merged_sample_view.column(idx));
-      }
       compute_distributed_boundaries(
-        cudf::table_view{key_cols}, num_parts, column_order, null_precedence, stream);
+        sort_keys_view, num_parts, column_order, null_precedence, stream);
     } else if (num_parts <= 1 || total_rows == 0) {
       // Single partition — no boundaries needed
       _num_partitions = 1;
       _partition_boundaries.reset();
     } else {
-      // Compute boundary row indices: [total_rows/P, 2*total_rows/P, ..., (P-1)*total_rows/P]
-      size_t num_boundaries = num_parts - 1;
-      std::vector<int32_t> boundary_indices_host;
-      boundary_indices_host.reserve(num_boundaries);
-      for (size_t i = 1; i <= num_boundaries; i++) {
-        auto idx = static_cast<int32_t>((i * total_rows) / num_parts);
-        if (idx >= static_cast<int32_t>(total_rows)) { idx = static_cast<int32_t>(total_rows) - 1; }
-        boundary_indices_host.push_back(idx);
-      }
-
-      // Create a device column with the boundary indices
-      auto indices_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                                   static_cast<cudf::size_type>(num_boundaries),
-                                                   cudf::mask_state::UNALLOCATED,
-                                                   stream,
-                                                   space->get_default_allocator());
-      CUDF_CUDA_TRY(cudaMemcpyAsync(indices_col->mutable_view().data<int32_t>(),
-                                    boundary_indices_host.data(),
-                                    num_boundaries * sizeof(int32_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-
-      // Extract only the sort key columns from merged sample for the boundaries
-      std::vector<cudf::column_view> sort_key_cols;
-      for (int idx : order_key_idx) {
-        sort_key_cols.push_back(merged_sample_view.column(idx));
-      }
-      cudf::table_view sort_keys_view(sort_key_cols);
-
-      // Gather boundary rows
-      _partition_boundaries = cudf::gather(sort_keys_view,
-                                           indices_col->view(),
-                                           cudf::out_of_bounds_policy::DONT_CHECK,
-                                           stream,
-                                           space->get_default_allocator());
+      _partition_boundaries = evenly_spaced(sort_keys_view,
+                                            0,
+                                            static_cast<cudf::size_type>(total_rows),
+                                            num_parts,
+                                            stream,
+                                            space->get_default_allocator());
       _num_partitions       = num_parts;
     }
 
@@ -380,46 +388,6 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
   return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
 }
-
-namespace {
-
-/// A device INT32 column holding @p indices.
-std::unique_ptr<cudf::column> index_column(std::vector<int32_t> const& indices,
-                                           ::cuda::stream_ref stream,
-                                           rmm::device_async_resource_ref mr)
-{
-  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                          static_cast<cudf::size_type>(indices.size()),
-                                          cudf::mask_state::UNALLOCATED,
-                                          stream,
-                                          mr);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<int32_t>(),
-                                indices.data(),
-                                indices.size() * sizeof(int32_t),
-                                cudaMemcpyHostToDevice,
-                                stream.get()));
-  return column;
-}
-
-/// Rows i * rows / parts of @p sorted for i in [1, parts), offset by @p first: parts - 1
-/// evenly spaced boundaries.
-std::unique_ptr<cudf::table> evenly_spaced(cudf::table_view sorted,
-                                           cudf::size_type first,
-                                           cudf::size_type rows,
-                                           std::size_t parts,
-                                           ::cuda::stream_ref stream,
-                                           rmm::device_async_resource_ref mr)
-{
-  std::vector<int32_t> indices;
-  for (std::size_t i = 1; i < parts; ++i) {
-    auto const at = static_cast<std::size_t>(rows) * i / parts;
-    indices.push_back(first + static_cast<int32_t>(std::min<std::size_t>(at, rows - 1)));
-  }
-  auto const column = index_column(indices, stream, mr);
-  return cudf::gather(sorted, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
-}
-
-}  // namespace
 
 void sirius_physical_sort_sample::compute_distributed_boundaries(
   cudf::table_view sample_keys,
