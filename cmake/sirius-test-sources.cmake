@@ -279,6 +279,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_connector_admission.cpp
+    test/cpp/planner/test_connector_capture.cpp
     test/cpp/planner/test_connector_overrides.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
