@@ -818,6 +818,21 @@ Evaluators retain their own policy values rather than reading mutable global def
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+| `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of a multi-file Parquet scan. |
+
+DuckDB reads column statistics for a scan of several Parquet files only with `union_by_name`.
+Without them its optimizer estimates every scan filter at a fixed 20%, even an `IS NOT NULL` on a
+column without NULLs, which can pick the wrong join order and build side. With
+`parquet_footer_statistics` on, the pre-optimizer hook merges the footers' null counts and numeric,
+date and decimal bounds and hands them to DuckDB through the scan's `column_statistics` option.
+DuckDB then also uses them to prove filters always true or always false, as it does for one file.
+Each file's statistics are read once per process and reused while its size, inode and
+modification time are unchanged; a modification time less than 10 seconds old is not trusted,
+the same rule DuckDB's own file caches use. Scans with `union_by_name`, explicit
+`column_statistics`, a `schema` or remote files are left alone. At TPC-H SF1000 this makes the
+`delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
+to 0.50 s); the first query over a table pays for reading its footers (about 0.15 s for 61
+`lineitem` files).
 
 The scan-task batch target is derived from effective GPU capacity. Advanced
 benchmark and test envelopes may still override `scan_task_batch_size` in YAML

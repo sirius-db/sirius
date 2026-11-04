@@ -3350,6 +3350,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::BOOLEAN(true),
     SetEnableLikeSwarFastpath);
 
+  config.AddExtensionOption(
+    "parquet_footer_statistics",
+    "Whether a scan of several Parquet files gives DuckDB's optimizer the merged statistics of "
+    "all their footers, which DuckDB itself reads only with union_by_name",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(true));
+
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
                             "Maximum bytes per sort partition (0 = auto based on "
