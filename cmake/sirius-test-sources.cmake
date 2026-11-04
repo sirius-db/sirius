@@ -21,6 +21,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
     test/cpp/transparent/test_read_view_scaling.cpp
+    test/cpp/integration/test_pin_unique_join.cpp
     test/cpp/integration/test_transparent_read_view.cpp
     test/cpp/scan/test_split_certificates.cpp
     test/cpp/transparent/test_late_failure.cpp

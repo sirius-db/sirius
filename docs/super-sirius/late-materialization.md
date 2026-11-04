@@ -32,6 +32,16 @@ like one that did nothing.
 The uniqueness probe costs pin-time work, so name the columns a ride actually needs rather than
 using `all`; without a proof there is no group-by-rowid ride and no riders.
 
+The same proof also serves joins. Parquet scans declare no PRIMARY KEY, so a join over one takes
+cuDF's two-pass hash join. When the build key of a join is a column of a pinned parquet table that
+the probe proved distinct, the planner treats it like a PRIMARY KEY and takes the single-pass
+distinct hash join. Name the build keys of the dimension tables you join on (`p_partkey`,
+`s_suppkey`, ...) in `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` to get this; the join gate itself is
+the same variable, there is no separate switch. Only plain `read_parquet` / `parquet_scan` scans of
+the pinned files count: `union_by_name`, an explicit `schema`, a Hive partition column or an
+Iceberg scan gets no proof, and a native table keeps using its declared constraints, because its
+pin is a snapshot that later writes can invalidate.
+
 | Variable | Default | Effect |
 |---|---|---|
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
