@@ -1040,12 +1040,13 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
                           static_cast<std::uint32_t>(bloom->domain().family),
                           static_cast<std::uint32_t>(bloom->domain().scale),
                           static_cast<std::uint32_t>(bytes)};
-      auto column      = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT32},
-                                              static_cast<cudf::size_type>(header + bytes / 4),
-                                              cudf::mask_state::UNALLOCATED,
-                                              stream,
-                                              mr);
-      auto* words      = column->mutable_view().data<std::uint32_t>();
+      auto column      = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::UINT32},
+        static_cast<cudf::size_type>(header + bytes / sizeof(std::uint32_t)),
+        cudf::mask_state::UNALLOCATED,
+        stream,
+        mr);
+      auto* words = column->mutable_view().data<std::uint32_t>();
       RMM_CUDA_TRY(
         cudaMemcpyAsync(words, head.data(), sizeof(head), cudaMemcpyHostToDevice, stream.get()));
       RMM_CUDA_TRY(cudaMemcpyAsync(
@@ -1067,19 +1068,19 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
     }
     if (!bloom) { continue; }
     std::vector<std::uint32_t const*> others;
-    bool mergeable = true;
-    for (exchange::rank_t r = 0; r < all.size() && mergeable; ++r) {
-      if (!all[r]) {
-        mergeable = false;
-        break;
+    bool mergeable =
+      std::all_of(all.begin(), all.end(), [](auto const& t) { return t != nullptr; });
+    if (mergeable) {
+      // Every rank's header in one copy-back, so the key costs one host sync, not one per rank.
+      std::vector<std::array<std::uint32_t, header>> heads(all.size());
+      for (exchange::rank_t r = 0; r < all.size(); ++r) {
+        auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
+        RMM_CUDA_TRY(cudaMemcpyAsync(
+          heads[r].data(), theirs, sizeof(heads[r]), cudaMemcpyDeviceToHost, stream.get()));
+        if (r != d.service->rank()) { others.push_back(theirs + header); }
       }
-      auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
-      std::array<std::uint32_t, header> their_head{};
-      RMM_CUDA_TRY(cudaMemcpyAsync(
-        their_head.data(), theirs, sizeof(their_head), cudaMemcpyDeviceToHost, stream.get()));
       stream.sync();
-      mergeable = their_head == head;
-      if (r != d.service->rank()) { others.push_back(theirs + header); }
+      mergeable = std::all_of(heads.begin(), heads.end(), [&](auto const& h) { return h == head; });
     }
     if (!mergeable) {
       SIRIUS_LOG_DEBUG(
