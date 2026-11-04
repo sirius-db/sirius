@@ -24,6 +24,7 @@
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -32,7 +33,10 @@
 #include "op/sirius_physical_sort_sample.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
@@ -40,6 +44,7 @@
 #include <chrono>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -117,6 +122,28 @@ std::shared_ptr<cucascade::data_batch> keys_batch(std::int64_t first, std::int64
   return gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
 }
 
+/// Sets @p column's rows NULL where @p is_null(row) holds.
+template <typename Pred>
+void null_rows(cudf::column& column, Pred is_null)
+{
+  auto const rows = column.size();
+  std::vector<std::uint32_t> words(
+    cudf::bitmask_allocation_size_bytes(rows) / sizeof(std::uint32_t), 0);
+  cudf::size_type nulls = 0;
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    if (is_null(i)) {
+      ++nulls;
+    } else {
+      words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
+    }
+  }
+  rmm::device_buffer mask(words.data(),
+                          words.size() * sizeof(std::uint32_t),
+                          utils::default_stream(),
+                          utils::get_resource_ref(*env().gpu));
+  column.set_null_mask(std::move(mask), nulls);
+}
+
 std::vector<std::int64_t> keys_of(cucascade::data_batch& batch)
 {
   auto ro = batch.to_read_only();
@@ -136,12 +163,15 @@ duckdb::vector<sirius::logical_type> key_types()
   return sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
 }
 
-/// SORT_SAMPLE ascending on column 0, with partitions small enough that a rank keeps several.
-std::unique_ptr<sirius_physical_sort_sample> make_sample()
+/// SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small enough that a
+/// rank keeps several.
+std::unique_ptr<sirius_physical_sort_sample> make_sample(
+  duckdb::OrderType order       = duckdb::OrderType::ASCENDING,
+  duckdb::OrderByNullType nulls = duckdb::OrderByNullType::NULLS_FIRST)
 {
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.emplace_back(duckdb::OrderType::ASCENDING,
-                      duckdb::OrderByNullType::NULLS_FIRST,
+  orders.emplace_back(order,
+                      nulls,
                       duckdb::make_uniq<duckdb::BoundReferenceExpression>(
                         duckdb::LogicalType::BIGINT, duckdb::idx_t{0}));
   return std::make_unique<sirius_physical_sort_sample>(key_types(),
@@ -269,6 +299,20 @@ TEST_CASE("a rank whose accumulation ends without a filter does not hold up the 
   // whose Bloom would miss rank 1's keys.
   on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000), r == 1); });
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+  CHECK(joins[0]->bloom() == nullptr);
+  CHECK(joins[1]->bloom() == nullptr);
+}
+
+TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(std::make_unique<accumulating_join>(
+      c.all[r].service, std::size_t{4096} << r, std::uint64_t{64} << 20));
+  }
+  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000)); });
   CHECK(joins[0]->bloom() == nullptr);
   CHECK(joins[1]->bloom() == nullptr);
 }
@@ -433,6 +477,88 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
     }
   }
   CHECK(samples[0]->get_num_partitions() > 1);
+}
+
+TEST_CASE("a DESC NULLS LAST range exchange keeps rank order and puts NULLs on the last rank",
+          "[exchange][collectives]")
+{
+  rank_t const world = 3;
+  ranks c(world);
+  constexpr int rows  = 10'000;
+  constexpr int nulls = 100;
+  // Each rank's batch sorted DESC NULLS LAST: distinct descending keys, then its NULLs.
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> inputs(world);
+  for (rank_t r = 0; r < world; ++r) {
+    std::vector<std::int64_t> keys(rows);
+    for (int i = 0; i < rows; ++i) {
+      keys[i] = std::int64_t{3} * (rows - i) + r;
+    }
+    auto column = numeric_column(cudf::data_type{cudf::type_id::INT64}, keys);
+    null_rows(*column, [](cudf::size_type i) { return i >= rows - nulls; });
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(column));
+    inputs[r] = {gpu_batch(std::make_unique<cudf::table>(std::move(columns)))};
+  }
+  std::vector<std::unique_ptr<sirius::op::sirius_physical_exchange_source>> sources;
+  for (rank_t r = 0; r < world; ++r) {
+    sources.push_back(std::make_unique<sirius::op::sirius_physical_exchange_source>(
+      key_types(), 0, c.all[r].service, 33, std::set<rank_t>{0, 1, 2}, false));
+  }
+  exchange_spec spec;
+  spec.routing         = exchange_spec::mode::range;
+  spec.key_columns     = {0};
+  spec.column_order    = {cudf::order::DESCENDING};
+  spec.null_precedence = {sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
+                                                         duckdb::OrderByNullType::NULLS_LAST)};
+
+  on_every_rank(world, [&](rank_t r) {
+    sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 33, spec);
+    auto sample = make_sample(duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST);
+    sample->set_distributed(
+      {c.all[r].service, 34, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
+         sink.set_range_boundaries(std::move(b));
+       }});
+    pipelineable_operator_data data{inputs[r]};
+    auto out    = sample->execute(data, utils::default_stream());
+    auto routed = sink.execute(*out, utils::default_stream());
+    sink.sink(*routed, utils::default_stream());
+    sink.finalize_operator();
+  });
+
+  std::size_t total = 0;
+  std::optional<std::int64_t> previous_min;
+  for (rank_t r = 0; r < world; ++r) {
+    std::vector<std::int64_t> mine;
+    cudf::size_type null_count = 0;
+    while (!sources[r]->all_ports_empty()) {
+      auto data = sources[r]->get_next_task_input_data();
+      if (!data) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        continue;
+      }
+      for (auto const& b : dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches()) {
+        auto const view = sirius::get_cudf_table_view(b->to_read_only());
+        total += static_cast<std::size_t>(view.num_rows());
+        null_count += view.column(0).null_count();
+        // Each slice stays sorted DESC NULLS LAST: its valid keys come first.
+        auto k = keys_of(*b);
+        k.resize(k.size() - static_cast<std::size_t>(view.column(0).null_count()));
+        CHECK(std::is_sorted(k.rbegin(), k.rend()));
+        mine.insert(mine.end(), k.begin(), k.end());
+      }
+    }
+    if (r + 1 < world) {
+      CHECK(null_count == 0);
+    } else {
+      CHECK(null_count == static_cast<cudf::size_type>(world * nulls));
+    }
+    if (mine.empty()) { continue; }
+    // Ranges follow rank order, descending: every key of rank r is at most rank r - 1's least.
+    auto const [lo, hi] = std::minmax_element(mine.begin(), mine.end());
+    if (previous_min) { CHECK(*hi <= *previous_min); }
+    previous_min = *lo;
+  }
+  CHECK(total == static_cast<std::size_t>(world * rows));
 }
 
 TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted range",
