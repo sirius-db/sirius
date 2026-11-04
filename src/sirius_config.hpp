@@ -221,8 +221,10 @@ struct operator_params {
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip an eligible key when its complete build meets this known-domain coverage. Values above 1
-  /// disable the gate.
+  /// Skip an eligible key when its complete build meets this known row-domain coverage. A key is
+  /// eligible when proven unique, or declared through `pin_table(..., unique_cols => [...])` on a
+  /// matching materialized Parquet pin. Unknown or zero domains disable the gate, as do values
+  /// above 1.
   double dynamic_filter_domain_coverage_threshold =
     sirius::op::default_dynamic_filter_domain_coverage_threshold;
 
