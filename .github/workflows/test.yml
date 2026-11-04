@@ -262,7 +262,7 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="$PWD/build/release:$CONDA_PREFIX/lib:$CONDA_PREFIX/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           pixi run --locked -e ${{ matrix.cuda.pixi-environment }} cargo test --locked \
-            --manifest-path rust/Cargo.toml --package sirius-ffi
+            --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
