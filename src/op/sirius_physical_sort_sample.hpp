@@ -70,9 +70,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
    *
    * Every rank shares an evenly spaced summary of its sample, and merges all of them in rank
    * order, so every rank holds the same global sample. From it each derives the same world size
-   * - 1 boundaries for the range exchange after this operator, and its own partition boundaries
-   * from the part of the sample inside its range. Every rank's boundary task joins the exchange,
-   * one with no input included.
+   * minus one boundaries for the range exchange after this operator, and its own partition
+   * boundaries from the part of the sample inside its range. Every rank's boundary task joins the
+   * exchange, one with no input included.
    */
   struct distributed_sampling {
     std::shared_ptr<exchange::exchange_service> service;
@@ -105,7 +105,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Distributed: the boundary task is still owed, input or not, until it has been claimed.
   [[nodiscard]] bool all_ports_empty() override;
-  //! get_next_task_input_data() has already claimed the task (SCHEDULED) when this is asked.
+  //! Distributed: the boundary task runs with no input, since every rank's all-gather waits for
+  //! it. get_next_task_input_data() has already claimed it (SCHEDULED) when this is asked.
   [[nodiscard]] bool runs_without_input() const override
   {
     return _distributed.has_value() &&
