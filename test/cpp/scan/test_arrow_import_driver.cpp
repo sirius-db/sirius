@@ -261,6 +261,18 @@ struct harness {
     : harness(std::move(producer), std::move(program), true, nullptr, {}, 1, std::make_shared<arrow_input_gate>(), std::move(counters))
   {
   }
+  auto make_preparation_source()
+  {
+    auto lane = driver->make_preparation_source({});
+    // The fixture owns any gate it supplies to the driver.
+    if (gate) {
+      lane.bind_wakeup = [gate = gate, bind = std::move(lane.bind_wakeup)](auto wake) {
+        gate->wake = wake;
+        bind(std::move(wake));
+      };
+    }
+    return lane;
+  }
   std::unique_ptr<scan_info> next(sm::preparation_stop_token stop = {})
   {
     auto claim = driver->try_claim_split({});
@@ -854,7 +866,7 @@ TEST_CASE("Arrow lanes run and close on their declared owner without publishing 
   sirius::pipeline::completion_handler completion;
   sm::native_reader_executor readers(1, 1);
   sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
-  auto lane      = h.driver->make_preparation_source({});
+  auto lane      = h.make_preparation_source();
   auto connector = std::make_shared<sm::split_connector>();
   sm::preparation_coordinator::source source;
   source.execution   = lane.execution;
@@ -1038,13 +1050,18 @@ TEST_CASE("Arrow child registration preserves the final input owner's wakeup",
   CHECK(next.next());
 }
 
-TEST_CASE("Standalone Arrow input retirement wakes its registration",
-          "[arrow_driver][arrow_gate_wake]")
+TEST_CASE("Arrow input retirement wakes its owning registration", "[arrow_driver][arrow_gate_wake]")
 {
-  harness source(
-    std::make_shared<pull_producer>(), integer_program(), true, nullptr, {}, 1, nullptr);
+  auto external = GENERATE(false, true);
+  harness source(std::make_shared<pull_producer>(),
+                 integer_program(),
+                 true,
+                 nullptr,
+                 {},
+                 1,
+                 external ? std::make_shared<arrow_input_gate>() : nullptr);
   auto gate = std::make_shared<sm::preparation_gate>();
-  source.driver->bind_preparation_wakeup(sm::preparation_wakeup(gate));
+  source.make_preparation_source().bind_wakeup(sm::preparation_wakeup(gate));
   source.ledger->bind_wakeup({});  // Isolate the input gate's notification.
   auto held = source.next();
   REQUIRE(held);
@@ -1562,7 +1579,7 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   sirius::pipeline::completion_handler completion;
   sm::native_reader_executor readers(1, 1);
   sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
-  auto lane      = h.driver->make_preparation_source({});
+  auto lane      = h.make_preparation_source();
   auto connector = std::make_shared<sm::split_connector>();
   sm::preparation_coordinator::source source;
   source.execution   = lane.execution;
@@ -1644,7 +1661,7 @@ TEST_CASE("Arrow legacy pull interrupts after an observed stop follow coordinato
   sirius::pipeline::completion_handler completion;
   sm::native_reader_executor readers(1, 1);
   sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
-  auto lane      = h.driver->make_preparation_source({});
+  auto lane      = h.make_preparation_source();
   auto connector = std::make_shared<sm::split_connector>();
   sm::preparation_coordinator::source source;
   source.execution   = lane.execution;
@@ -1677,7 +1694,8 @@ TEST_CASE("Arrow legacy pull interrupts after an observed stop follow coordinato
   // producer, not by the driver's bracketing checks.
   if (which == mode::failure_induced)
     completion.report_error(std::make_exception_ptr(std::runtime_error("original failure")));
-  if (which == mode::normal_eos) coordinator.request_stop(sm::stop_reason::normal_eos);
+  if (which == mode::normal_eos || (!entered && which == mode::no_token_interrupt))
+    coordinator.request_stop(sm::stop_reason::normal_eos);
   if (which == mode::user_cancel) coordinator.request_stop(sm::stop_reason::user_cancel);
   if (which == mode::failure_induced) coordinator.request_stop(sm::stop_reason::failure_induced);
   reading.release();
