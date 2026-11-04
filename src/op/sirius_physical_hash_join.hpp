@@ -343,6 +343,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     return _dynamic_filter_session;
   }
 
+  /**
+   * @brief The build CONCAT has finalized. Distributed, this rank's filter publication closes now
+   * rather than at this join's own finalize, after its probe side: a peer's merge waits on this
+   * rank's share, and that peer's probe rows may wait on its publication.
+   */
+  void on_build_input_finished() noexcept
+  {
+    if (_dynamic_filter_session.plan().distributed() != nullptr) {
+      _dynamic_filter_session.finish_input();
+    }
+  }
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
