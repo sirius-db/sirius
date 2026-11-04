@@ -669,10 +669,8 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
         freq_str);
     }
     auto input = evaluate_as_column(*args[1]);
-    // DuckDB binds date_trunc(part, DATE) to TIMESTAMP. Every supported unit is a day or finer, so
-    // truncation leaves a DATE unchanged; convert it like CAST(date AS TIMESTAMP), which keeps
-    // infinities. cuDF's floor would keep TIMESTAMP_DAYS, which parents such as CASE and COALESCE
-    // reject beside the TIMESTAMP inputs DuckDB bound them with.
+    // DATE has no sub-day component; return DuckDB's declared TIMESTAMP type so parent
+    // expressions can combine it with timestamp branches.
     if (input.get_column_view().type().id() == cudf::type_id::TIMESTAMP_DAYS) {
       return evaluate_result(cast_date_to_timestamp(
         input.get_column_view(), output_type, /*try_cast=*/false, _stream, _mr));

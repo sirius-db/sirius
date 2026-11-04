@@ -107,8 +107,6 @@ TEST_CASE_METHOD(ExpressionFallbackFixture,
                  "date_trunc on DATE gives parent expressions its declared TIMESTAMP type",
                  "[integration][gpu_execution][expression_plan_fallback]")
 {
-  // DuckDB binds date_trunc(part, DATE) to TIMESTAMP. CASE and COALESCE combine their inputs
-  // with cuDF calls that require identical types, so a TIMESTAMP_DAYS result fails on the GPU.
   run_ok("CREATE TABLE trunc_t(k INTEGER, d DATE, ts TIMESTAMP, ts_ms TIMESTAMP_MS);");
   run_ok(
     "INSERT INTO trunc_t VALUES"

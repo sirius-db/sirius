@@ -216,12 +216,14 @@ constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d
 GPU as `month(DATE '2020-02-01')`.
 Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
 
-`date_trunc` returns DuckDB's declared `TIMESTAMP` (microseconds). For TIMESTAMP input,
-`cudf::datetime::floor_datetimes` keeps the input resolution. DATE input skips the floor: every
-GPU-supported unit is a day or finer, so the value is unchanged and only converted with the
-DATE-to-TIMESTAMP cast (`cast_date_to_timestamp`, which keeps infinities). Returning cuDF's
-`TIMESTAMP_DAYS` would break parents such as CASE (`cudf::copy_if_else`) that need every input
-to have the same type.
+`date_trunc` must return the type DuckDB declares: a microsecond `TIMESTAMP`. A DATE input
+normally uses cuDF's day-resolution `TIMESTAMP_DAYS` type. If that type reaches a parent
+`CASE` or `COALESCE`, it cannot be combined with a TIMESTAMP branch.
+
+For a DATE input, every GPU-supported unit is a day or finer, so truncation does not change
+the date. The evaluator converts it to a `TIMESTAMP` with `cast_date_to_timestamp`, which
+preserves infinities. For a TIMESTAMP input, it uses `cudf::datetime::floor_datetimes` to
+round to the requested unit.
 
 `in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that.
 
