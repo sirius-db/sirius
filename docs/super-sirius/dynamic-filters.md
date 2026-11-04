@@ -201,8 +201,6 @@ The domain is a row count, not a `[min,max]` range: holes in key values do not e
 
 At DEBUG level, each considered bound key emits `[dynamic_filter_domain] path=ordinary|accumulated condition=N rows=N domain=N provenance=unknown|catalog_bound|pinned_parquet_exact eligible=0|1 threshold=X decision=skip|keep`. `condition` is the original join-condition index. Accumulated type mismatches report `eligible=0 decision=keep`; `skip` means the domain gate actually applies. Use separate INFO runs for timings.
 
-The completed [S5 validation](../../experiments/s5/README.md) records source review, correctness checks and the explicit coverage-profile measurements on two and four GPUs. The measured two-GPU Q21 benefit does not establish a four-GPU latency gain or change the production default.
-
 ### Key types
 
 Membership filters accept the integer, temporal, fixed-point, and string key types below; every other build type (floating-point, duration, nested) is declined by all three and the key publishes nothing. The type gate is one predicate, `membership_key_supported` (`src/op/dynamic_filter/dynamic_filter_key_domain.hpp`), shared by the three filters' `supports()`, the publisher, the publish-plan validator, and the planner's join-edge gate.
