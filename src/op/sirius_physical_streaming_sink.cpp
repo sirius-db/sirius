@@ -176,7 +176,7 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                                      stream,
                                                      *space,
                                                      batch_telemetry(),
-                                                     _spec.hash_seed,
+                                                     cudf::DEFAULT_HASH_SEED,
                                                      _spec.preserve_input_order);
 
     for (std::size_t i = 0; i < slices.size(); ++i) {
