@@ -82,7 +82,7 @@ static bool returns_raw_parquet_columns(duckdb::LogicalGet const& get)
 
 /// Output position of a parquet scan's column that the pinned copy of the same files proved
 /// distinct at pin time (see late_mat::unique_probe, which pin_table runs on the columns named by
-/// SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS: no nulls and no repeated value across the
+/// SIRIUS_EXP_PIN_UNIQUE_COLS: no nulls and no repeated value across the
 /// whole table), or an empty set. Only the scan's own files count, so a filter or projection above
 /// the scan keeps the fact valid: a subset of distinct values is distinct.
 static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(

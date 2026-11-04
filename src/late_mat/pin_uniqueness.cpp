@@ -86,7 +86,7 @@ std::vector<bool> pin_unique_probe_selection(std::span<std::string const> column
 {
   std::vector<bool> selected(column_names.size(), false);
 
-  char const* raw = std::getenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
+  char const* raw = std::getenv("SIRIUS_EXP_PIN_UNIQUE_COLS");
   if (raw == nullptr || raw[0] == '\0') { return selected; }
   std::string const spec = lowered(raw);
   if (spec == "0" || spec == "none" || spec == "off") { return selected; }

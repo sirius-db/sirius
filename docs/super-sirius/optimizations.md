@@ -437,7 +437,7 @@ distinctness proof.
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
 
 **Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
-`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
+`SIRIUS_EXP_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
 which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
 floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather

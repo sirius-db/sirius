@@ -18,7 +18,7 @@
 // GPU required.
 //
 // Parquet scans declare no PRIMARY KEY, so a join over them takes cuDF's two-pass hash join. The
-// pin proves the columns named by SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS distinct, and the planner
+// pin proves the columns named by SIRIUS_EXP_PIN_UNIQUE_COLS distinct, and the planner
 // takes the single-pass distinct hash join for a build key it proved. Each case checks the plan
 // (did the proof fire, or correctly not fire) and the answer against DuckDB on the CPU: a wrong
 // proof drops matches.
@@ -282,13 +282,13 @@ TEST_CASE("a pinned distinct parquet column proves a join's build keys unique",
   }
 
   sirius::test::scratch_dir scratch{"pin_unique_join"};
-  auto const& tmp        = scratch.path();
-  auto const unique_dim  = tmp / "unique_dim.parquet";
-  auto const dup_dim     = tmp / "dup_dim.parquet";
-  auto const unprobed    = tmp / "unprobed_dim.parquet";
-  auto const fact        = tmp / "fact.parquet";
-  auto const hive_dir    = tmp / "hive_dim";
-  auto const hive_glob   = hive_dir / "*" / "*.parquet";
+  auto const& tmp       = scratch.path();
+  auto const unique_dim = tmp / "unique_dim.parquet";
+  auto const dup_dim    = tmp / "dup_dim.parquet";
+  auto const unprobed   = tmp / "unprobed_dim.parquet";
+  auto const fact       = tmp / "fact.parquet";
+  auto const hive_dir   = tmp / "hive_dim";
+  auto const hive_glob  = hive_dir / "*" / "*.parquet";
   generate_parquet(unique_dim, dup_dim, fact);
   fs::copy_file(unique_dim, unprobed);
   generate_hive_dim(hive_dir);
@@ -301,13 +301,13 @@ TEST_CASE("a pinned distinct parquet column proves a join's build keys unique",
 
   {
     // The columns the pin observes are the ones named here; `unprobed` is pinned without any.
-    scoped_env const probed{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "k,year"};
+    scoped_env const probed{"SIRIUS_EXP_PIN_UNIQUE_COLS", "k,year"};
     pin(con, unique_dim, "pin_unique_join_unique_dim");
     pin(con, dup_dim, "pin_unique_join_dup_dim");
     pin(con, hive_glob, "pin_unique_join_hive_dim");
   }
   {
-    scoped_env const none{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
+    scoped_env const none{"SIRIUS_EXP_PIN_UNIQUE_COLS", nullptr};
     pin(con, unprobed, "pin_unique_join_unprobed_dim");
   }
 

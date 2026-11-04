@@ -112,7 +112,7 @@ TEST_CASE_METHOD(NativeFilterFixture,
   // an unrelated reason — the join's fan-out is still uncollapsed at the port — and
   // the control below could not tell a working plan from a rejected one. Read at pin
   // time, so it must be set before the pin.
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
+  ::setenv("SIRIUS_EXP_PIN_UNIQUE_COLS", "c_custkey", 1);
   run_ok("CALL pin_table(format='duckdb', name='c', tier='gpu');");
 
   // Control. Without it a decline proves nothing: a query that never had a
@@ -135,6 +135,6 @@ TEST_CASE_METHOD(NativeFilterFixture,
   REQUIRE(rows_of(*gpu_filtered) == expected_filtered);
   REQUIRE(sirius::late_mat::deferrals_installed() == before_filtered);
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
+  ::unsetenv("SIRIUS_EXP_PIN_UNIQUE_COLS");
   run_ok("CALL unpin_table('c');");
 }

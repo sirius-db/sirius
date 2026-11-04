@@ -13,8 +13,8 @@ addressable when the far end asks for them, and that is what the pin guarantees.
 ## Turning it on (experimental)
 
 ```bash
-SIRIUS_EXP_LATE_MAT=1                               # the gate; off = nothing below exists
-SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=c_custkey,...   # or `all`
+SIRIUS_EXP_LATE_MAT=1                      # the gate; off = nothing below exists
+SIRIUS_EXP_PIN_UNIQUE_COLS=c_custkey,...   # or `all`
 ```
 
 For the TPC-H SF1000 q10 ride specifically, the column list needs to cover BOTH the group-by-rowid
@@ -22,7 +22,7 @@ key and every rider's key: `c_custkey` (customer, the ride itself) plus `n_name,
 (nation, riding alongside on the join to customer):
 
 ```bash
-SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=c_custkey,n_name,n_nationkey   # needed for q10's full ride
+SIRIUS_EXP_PIN_UNIQUE_COLS=c_custkey,n_name,n_nationkey   # needed for q10's full ride
 ```
 
 Off by default and inert when off. The census goes to the log under the `[late-mat]` tag, and
@@ -36,16 +36,15 @@ The same proof also serves joins. Parquet scans declare no PRIMARY KEY, so a joi
 cuDF's two-pass hash join. When the build key of a join is a column of a pinned parquet table that
 the probe proved distinct, the planner treats it like a PRIMARY KEY and takes the single-pass
 distinct hash join. Name the build keys of the dimension tables you join on (`p_partkey`,
-`s_suppkey`, ...) in `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` to get this; the join gate itself is
-the same variable, there is no separate switch. Only plain `read_parquet` / `parquet_scan` scans of
-the pinned files count: `union_by_name`, an explicit `schema`, a Hive partition column or an
-Iceberg scan gets no proof, and a native table keeps using its declared constraints, because its
-pin is a snapshot that later writes can invalidate.
+`s_suppkey`, ...) in `SIRIUS_EXP_PIN_UNIQUE_COLS` to get this; there is no separate switch. Only
+plain `read_parquet` / `parquet_scan` scans of the pinned files count: `union_by_name`, an explicit
+`schema`, a Hive partition column or an Iceberg scan gets no proof, and a native table keeps using
+its declared constraints, because its pin is a snapshot that later writes can invalidate.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
-| `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. |
+| `SIRIUS_EXP_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. |
 | `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` | 300000000 | Row cap on the exact uniqueness stage, so a fact table does not buy a sort per column at pin time. |
 | `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |

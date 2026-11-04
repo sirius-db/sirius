@@ -17,7 +17,7 @@
 #pragma once
 
 // Pin-time proof that a column's values are distinct across a whole pinned
-// table (env gate: SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS).
+// table (env gate: SIRIUS_EXP_PIN_UNIQUE_COLS).
 //
 // This fact is what lets a ride survive a GROUP BY: if the deferred columns are
 // functionally determined by a key that is unique over the pinned table, the
@@ -78,7 +78,7 @@
 
 namespace sirius::late_mat {
 
-/// Which pinned columns to observe, from `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS`,
+/// Which pinned columns to observe, from `SIRIUS_EXP_PIN_UNIQUE_COLS`,
 /// positional with @p column_names:
 ///
 ///   unset / "" / "0" / "none"  -> nothing observed (the probe is off)

@@ -2040,12 +2040,12 @@ TEST_CASE("pin_table compression - device tier driver returns uniqueness verdict
 
   // Only k is asked for: the probe selection is by name, so d is never observed
   // and must come back not-proven regardless of whether it happens to repeat.
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "k", 1);
+  ::setenv("SIRIUS_EXP_PIN_UNIQUE_COLS", "k", 1);
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_uniqcompressed');");
   require_ok(pin, "pin uniqcompressed");
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
+  ::unsetenv("SIRIUS_EXP_PIN_UNIQUE_COLS");
 
   // The driver actually took the compressed path — otherwise this would be
   // indistinguishable from the uncompressed GPU driver, which already had

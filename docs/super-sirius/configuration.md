@@ -954,7 +954,7 @@ still an experimental optimization, not a normal session choice.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. Carries a pin-order rowid instead of scanned values for a GPU-tier pinned table, restoring them at the far end. |
-| `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. Required for a group-by-rowid ride or a rider to be admissible at all. |
+| `SIRIUS_EXP_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. Required for a group-by-rowid ride or a rider to be admissible at all, and a join whose build key is proven distinct takes the single-pass distinct hash join. |
 
 Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full

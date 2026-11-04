@@ -16,9 +16,11 @@ NAME="${NAME:-sf1000_repro}"
 # default; both are worth real suite time here and are safe to leave on for a repro run.
 # PIN_UNIQUE_COLS must cover every rider's key, not just the ride's own — dropping n_name/
 # n_nationkey still gets a correct answer (nation just stops riding) but costs real time.
+# The dimension keys (o_orderkey, p_partkey, s_suppkey, r_regionkey) feed no ride; a join whose
+# build key the pin proved distinct takes the single-pass distinct hash join (~3.5% of the suite).
 # See docs/super-sirius/late-materialization.md.
 export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
-export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
+export SIRIUS_EXP_PIN_UNIQUE_COLS="${SIRIUS_EXP_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey,o_orderkey,p_partkey,s_suppkey,r_regionkey}"
 export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
 export SIRIUS_EXP_LOWCARD_GROUPBY="${SIRIUS_EXP_LOWCARD_GROUPBY:-1}"
 
@@ -54,7 +56,8 @@ echo "data      : $DATA"
 echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
 echo "plans     : $PLANS"
 echo "config    : $CFG"
-echo "late-mat  : SIRIUS_EXP_LATE_MAT=$SIRIUS_EXP_LATE_MAT SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=$SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS"
+echo "late-mat  : SIRIUS_EXP_LATE_MAT=$SIRIUS_EXP_LATE_MAT"
+echo "pin unique: SIRIUS_EXP_PIN_UNIQUE_COLS=$SIRIUS_EXP_PIN_UNIQUE_COLS"
 echo "fused scan: SIRIUS_EXP_FUSED_SCAN_FILTER=$SIRIUS_EXP_FUSED_SCAN_FILTER"
 echo "lowcard gb: SIRIUS_EXP_LOWCARD_GROUPBY=$SIRIUS_EXP_LOWCARD_GROUPBY"
 echo
