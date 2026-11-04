@@ -111,7 +111,7 @@ void on_every_rank(rank_t world, Work work)
 }
 
 /// A sorted INT64 column: @p rows keys from @p first, @p step apart.
-std::shared_ptr<cucascade::data_batch> keys_batch(std::int64_t first, std::int64_t step, int rows)
+std::unique_ptr<cudf::table> keys_table(std::int64_t first, std::int64_t step, int rows)
 {
   std::vector<std::int64_t> keys(rows);
   for (int i = 0; i < rows; ++i) {
@@ -119,7 +119,12 @@ std::shared_ptr<cucascade::data_batch> keys_batch(std::int64_t first, std::int64
   }
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, keys));
-  return gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+std::shared_ptr<cucascade::data_batch> keys_batch(std::int64_t first, std::int64_t step, int rows)
+{
+  return gpu_batch(keys_table(first, step, rows));
 }
 
 /// Sets @p column's rows NULL where @p is_null(row) holds.
@@ -181,6 +186,42 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample(
                                                        /*max_partition_bytes=*/64 * KiB);
 }
 
+using sirius::op::dynamic_filter_publish_plan;
+
+/// A join's filter plan on INT64 key column 0, publishing to @p channel.
+dynamic_filter_publish_plan filter_plan(
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel, std::uint64_t cap)
+{
+  cudf::data_type const int64{cudf::type_id::INT64};
+  return dynamic_filter_publish_plan{
+    {{.build_key_ordinal = 0, .storage_type = int64}},
+    {{std::move(channel), sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
+    {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
+    {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
+}
+
+/// The merge of every rank's filters, the same on every rank.
+dynamic_filter_publish_plan::distributed_merge merge_over(std::shared_ptr<exchange_service> service,
+                                                          std::size_t bloom_keys)
+{
+  return {.service      = std::move(service),
+          .first_stream = 41,
+          .gpu          = env().gpu,
+          .bloom_keys   = bloom_keys,
+          .timeout      = std::chrono::seconds{30}};
+}
+
+/// The Bloom published to @p channel, or null.
+sirius::op::sirius_dynamic_bloom_filter const* published_bloom(
+  sirius::op::sirius_dynamic_filter_set const& channel)
+{
+  auto const snapshot = channel.snapshot();
+  if (snapshot.entries().empty()) { return nullptr; }
+  // The channel keeps the filter alive after the snapshot goes.
+  return dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(
+    snapshot.entries().front().filter.get());
+}
+
 /// One rank's join publishing a Bloom on INT64 key column 0, merged with the other ranks' Blooms.
 struct accumulating_join {
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel =
@@ -191,18 +232,8 @@ struct accumulating_join {
                     std::size_t bloom_keys,
                     std::uint64_t cap)
   {
-    using plan_type = sirius::op::dynamic_filter_publish_plan;
-    cudf::data_type const int64{cudf::type_id::INT64};
-    plan_type plan{
-      {{.build_key_ordinal = 0, .storage_type = int64}},
-      {{channel, sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
-      {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
-      {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
-    plan.set_distributed({.service      = std::move(service),
-                          .first_stream = 41,
-                          .gpu          = env().gpu,
-                          .bloom_keys   = bloom_keys,
-                          .timeout      = std::chrono::seconds{30}});
+    auto plan = filter_plan(channel, cap);
+    plan.set_distributed(merge_over(std::move(service), bloom_keys));
     session =
       std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), nullptr);
   }
@@ -226,11 +257,34 @@ struct accumulating_join {
 
   [[nodiscard]] sirius::op::sirius_dynamic_bloom_filter const* bloom() const
   {
-    auto const snapshot = channel->snapshot();
-    if (snapshot.entries().empty()) { return nullptr; }
-    // The channel keeps the filter alive after the snapshot goes.
-    return dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(
-      snapshot.entries().front().filter.get());
+    return published_bloom(*channel);
+  }
+};
+
+/// One rank's whole-build publication on INT64 key column 0, merged with the other ranks'.
+struct whole_build_join {
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel =
+    std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  dynamic_filter_publish_plan plan;
+
+  explicit whole_build_join(std::shared_ptr<exchange_service> service)
+    : plan(filter_plan(channel, 64 * KiB))
+  {
+    plan.set_distributed(merge_over(std::move(service), 4096));
+  }
+
+  sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
+  {
+    std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
+    producers.push_back(channel->register_producer({0}));
+    channel->freeze_registration();
+    auto const stream  = utils::default_stream();
+    auto const outcome = sirius::op::publish_dynamic_filters(plan, build, stream, producers);
+    stream.sync();
+    producers.front().finish(outcome.filters_pushed != 0
+                               ? sirius::op::sirius_dynamic_filter_set::completion::PUBLISHED
+                               : sirius::op::sirius_dynamic_filter_set::completion::SKIPPED);
+    return outcome;
   }
 };
 
@@ -315,6 +369,33 @@ TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
   on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000)); });
   CHECK(joins[0]->bloom() == nullptr);
   CHECK(joins[1]->bloom() == nullptr);
+}
+
+TEST_CASE("whole-build ranks merge even when one build is empty and another's targets are drained",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  std::vector<std::unique_ptr<whole_build_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(std::make_unique<whole_build_join>(c.all[r].service));
+  }
+  joins[1]->channel->close_for_new_filters();
+  auto const odd_keys = sequence(1, 2, 2000);
+
+  std::vector<sirius::op::dynamic_filter_publication_outcome> outcomes(2);
+  auto const start = std::chrono::steady_clock::now();
+  on_every_rank(2, [&](rank_t r) {
+    auto const build = r == 0 ? keys_table(0, 1, 0) : keys_table(1, 2, 2000);
+    outcomes[r]      = joins[r]->publish(build->view());
+  });
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+
+  auto const* bloom = published_bloom(*joins[0]->channel);
+  REQUIRE(bloom != nullptr);
+  CHECK(members(*bloom, odd_keys) == odd_keys.size());
+  CHECK(outcomes[0].publications_skipped_targets_drained == 0);
+  CHECK(outcomes[1].publications_skipped_targets_drained == 1);
+  CHECK(published_bloom(*joins[1]->channel) == nullptr);
 }
 
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
