@@ -36,8 +36,13 @@ sirius-duckdb: release
 		SIRIUS_INSTALL_DIR="$(CURDIR)/build/release/install" \
 		EXT_FLAGS="$(EXT_FLAGS) -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
+# Development tooling from the Pixi environment; set SIRIUS_CMAKE_FLAGS= without it.
+SIRIUS_CMAKE_FLAGS ?= -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+	-DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
+	-DCMAKE_LINKER_TYPE=MOLD
+
 build/%/build.ninja: $(CMAKE_INPUTS)
-	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))"
+	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))" $(SIRIUS_CMAKE_FLAGS)
 
 release: build/release/build.ninja
 	$(CMAKE) --build --preset release --target $(BUILD_TARGETS)

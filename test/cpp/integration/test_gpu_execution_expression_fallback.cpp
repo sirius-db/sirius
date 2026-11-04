@@ -102,3 +102,33 @@ TEST_CASE_METHOD(ExpressionFallbackFixture,
     compare_gpu_vs_cpu(std::string("SELECT date_trunc('") + unit + "', d) FROM expr_t;");
   }
 }
+
+TEST_CASE_METHOD(ExpressionFallbackFixture,
+                 "date_trunc on DATE gives parent expressions its declared TIMESTAMP type",
+                 "[integration][gpu_execution][expression_plan_fallback]")
+{
+  run_ok("CREATE TABLE trunc_t(k INTEGER, d DATE, ts TIMESTAMP, ts_ms TIMESTAMP_MS);");
+  run_ok(
+    "INSERT INTO trunc_t VALUES"
+    " (1, DATE '2024-06-15', TIMESTAMP '2024-06-15 12:34:56.123456',"
+    "  TIMESTAMP_MS '2024-06-16 01:02:03.456'),"
+    " (2, DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59.999999',"
+    "  TIMESTAMP_MS '1970-01-01 00:00:00.001'),"
+    " (3, DATE 'infinity', TIMESTAMP '2000-01-01 00:00:00', NULL),"
+    " (4, DATE '-infinity', NULL, TIMESTAMP_MS '1991-09-07 09:07:46.337'),"
+    " (5, NULL, TIMESTAMP '2020-01-01 12:30:45', TIMESTAMP_MS '2020-01-01 12:30:45.5');");
+  run_ok("CHECKPOINT;");
+  for (auto const* unit : {"day", "hour", "minute", "second", "millisecond", "microsecond"}) {
+    CAPTURE(unit);
+    auto const trunc = std::string("date_trunc('") + unit + "', d)";
+    compare_gpu_vs_cpu("SELECT k, CASE WHEN k % 2 = 0 THEN " + trunc +
+                       " ELSE ts END FROM trunc_t;");
+    compare_gpu_vs_cpu("SELECT k, CASE WHEN k > 2 THEN " + trunc + " ELSE ts_ms END FROM trunc_t;");
+    compare_gpu_vs_cpu("SELECT k, coalesce(" + trunc + ", ts) FROM trunc_t;");
+    compare_gpu_vs_cpu("SELECT k FROM trunc_t WHERE " + trunc + " <= ts;");
+  }
+  // Fuzz finding 022-gpu_internal_error-e13f6ef8: a DATE THEN beside TIMESTAMP_MS branches.
+  compare_gpu_vs_cpu(
+    "SELECT k, CASE WHEN ts IS NULL THEN date_trunc('day', d) WHEN k = 1 THEN ts_ms"
+    " ELSE CAST(TIMESTAMP '1991-09-07 09:07:46.337000' AS TIMESTAMP_MS) END FROM trunc_t;");
+}

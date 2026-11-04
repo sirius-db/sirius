@@ -41,12 +41,8 @@
   "configurePresets": [
     {
       "cacheVariables": {
-        "CMAKE_CUDA_COMPILER_LAUNCHER": "sccache",
-        "CMAKE_CXX_COMPILER_LAUNCHER": "sccache",
         "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
-        "CMAKE_C_COMPILER_LAUNCHER": "sccache",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_LINKER_TYPE": "MOLD",
         "EXPORT_DYNAMIC_SYMBOLS": "ON",
         "SIRIUS_BUILD_TESTS": "ON"
       },
@@ -56,10 +52,10 @@
     },
     {
       "cacheVariables": {
-        "CMAKE_CUDA_HOST_COMPILER": "$env{CONDA_PREFIX}/bin/clang++",
-        "CMAKE_CXX_COMPILER": "$env{CONDA_PREFIX}/bin/clang++",
+        "CMAKE_CUDA_HOST_COMPILER": "clang++",
+        "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
-        "CMAKE_C_COMPILER": "$env{CONDA_PREFIX}/bin/clang",
+        "CMAKE_C_COMPILER": "clang",
         "EXPORT_DYNAMIC_SYMBOLS": "OFF"
       },
       "hidden": true,
