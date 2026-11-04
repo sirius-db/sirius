@@ -35,13 +35,10 @@
 
 #include <cuda_runtime.h>
 
-#include <arpa/inet.h>
-#include <config.hpp>
-#include <cucascade/memory/topology_discovery.hpp>
-#include <log/logging.hpp>
+#include <arpa/inet.h>  // IWYU pragma: keep
 #include <netinet/in.h>
+#include <signal.h>  // IWYU pragma: keep
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <utils/log_test_utils.hpp>
@@ -52,7 +49,6 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
-#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>

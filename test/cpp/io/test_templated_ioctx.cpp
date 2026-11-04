@@ -18,7 +18,6 @@
 #include "io/cache/types.hpp"
 #include "io/templated_ioctx.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

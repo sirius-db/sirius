@@ -19,6 +19,7 @@
 
 #include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
+#include "memory/pool_peer_access.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -62,6 +63,13 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   if (gpu_spaces.empty()) {
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
+  // Complete grants before installing resource references that constructor unwinding could
+  // invalidate.
+  for_each_pair_without_pool_access(gpu_spaces, [](int owner_device, int accessor_device) {
+    SIRIUS_LOG_INFO(
+      "Pool access unavailable: owner GPU {}, accessor GPU {}", owner_device, accessor_device);
+    return true;
+  });
   for (const auto* space : gpu_spaces) {
     runtime_stream_pools_.push_back(runtime_stream_pool::install(*space));
     auto const device_mr = space->get_default_allocator();

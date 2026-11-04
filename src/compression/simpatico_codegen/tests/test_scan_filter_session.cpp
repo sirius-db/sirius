@@ -11,7 +11,6 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <algorithm>
 #include <array>
@@ -909,14 +908,14 @@ int main()
     rmm::cuda_stream stream;
     simpatico::stream_pool pool;
     expect(pool.init(4), "stream pool initialization");
-    numeric_sources(pool, stream.view(), resource);
-    membership_cascade(pool, stream.view(), resource);
-    membership_measurement(pool, stream.view(), resource);
-    bool8_delivery(pool, stream.view(), resource);
-    nullable_bool8_declines(pool, stream.view(), resource);
-    dict_codes_gather(pool, stream.view(), resource);
-    nullable_full_route_declines(pool, stream.view(), resource);
-    aliased_borrowed_lanes(pool, stream.view(), resource);
+    numeric_sources(pool, stream, resource);
+    membership_cascade(pool, stream, resource);
+    membership_measurement(pool, stream, resource);
+    bool8_delivery(pool, stream, resource);
+    nullable_bool8_declines(pool, stream, resource);
+    dict_codes_gather(pool, stream, resource);
+    nullable_full_route_declines(pool, stream, resource);
+    aliased_borrowed_lanes(pool, stream, resource);
     cuda_check(pool.sync_all());
     stream.synchronize();
     cuda_check(cudaDeviceSynchronize());

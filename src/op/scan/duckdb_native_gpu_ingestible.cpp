@@ -27,11 +27,9 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
-#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
-#include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius_context.hpp>
 
 // duckdb
@@ -42,7 +40,6 @@
 // cudf
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -54,7 +51,6 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
-#include <stop_token>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -444,10 +440,12 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
   // throws if no backend supports the path.
   // Runs on a scan-manager dispatcher thread:
   return [this, rg_begin, rg_end, resolve = std::move(resolve)](
-           std::stop_token stop) -> std::unique_ptr<scan_info> {
+           scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(_info->db_path);
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     duckdb_native_row_group_range range;
     try {
       range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
@@ -469,6 +467,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                          std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                          ")): " + range.viability_failure_reason);
     }
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto split = std::make_unique<duckdb_native_scan_info>(
       std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
     std::vector<split_materializer_certificate> certificates;

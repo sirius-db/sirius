@@ -58,7 +58,8 @@ void restore_bundle(std::vector<std::size_t> const& output_positions,
                     cudf::table_view const& batch,
                     std::map<std::size_t, std::unique_ptr<cudf::column>>& restored_by_position,
                     ::cuda::stream_ref stream,
-                    rmm::device_async_resource_ref mr)
+                    rmm::device_async_resource_ref mr,
+                    transfer_context transfers)
 {
   auto const rowids = batch.column(static_cast<cudf::size_type>(rowid_at));
   // Nothing an outer join could null is ever deferred, so a null here means the
@@ -98,7 +99,7 @@ void restore_bundle(std::vector<std::size_t> const& output_positions,
       throw std::runtime_error("late_mat::materialize_at_port: origin column " + std::to_string(i) +
                                " no longer resolves");
     }
-    auto produced = materialize(*column, selection, stream, mr);
+    auto produced = materialize(*column, selection, stream, mr, transfers);
     // A narrow-stored pin may come back a strictly narrower carrier of the
     // restored type, and only that; anything else is not what was deferred.
     if (produced->type() != restored_types[i]) {
@@ -124,7 +125,8 @@ bool port_directive_matches(port_materialize_directive const& directive,
 std::unique_ptr<cudf::table> materialize_at_port(port_materialize_directive const& directive,
                                                  cudf::table_view const& batch,
                                                  ::cuda::stream_ref stream,
-                                                 rmm::device_async_resource_ref mr)
+                                                 rmm::device_async_resource_ref mr,
+                                                 transfer_context transfers)
 {
   nvtx_scoped_range nvtx_range{"sirius::late_mat::materialize_at_port"};
   if (!port_directive_matches(directive, batch)) {
@@ -142,7 +144,8 @@ std::unique_ptr<cudf::table> materialize_at_port(port_materialize_directive cons
                  batch,
                  restored_by_position,
                  stream,
-                 mr);
+                 mr,
+                 transfers);
   for (auto const& rider : directive.riders) {
     restore_bundle(rider.output_positions,
                    rider.rowid_at,
@@ -151,7 +154,8 @@ std::unique_ptr<cudf::table> materialize_at_port(port_materialize_directive cons
                    batch,
                    restored_by_position,
                    stream,
-                   mr);
+                   mr,
+                   transfers);
   }
 
   // Splice: every other position is copied through. The copy is of the batch as

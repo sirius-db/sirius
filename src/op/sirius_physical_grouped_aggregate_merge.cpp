@@ -16,9 +16,7 @@
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
 #include "cucascade/utils/overloaded.hpp"
-#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/stddev.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
@@ -262,20 +260,20 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   auto const num_group_cols = static_cast<int>(num_output_group_columns());
-  // A wide integer SUM that was accumulated over DECIMAL128 is narrowed back to its INT64 result
-  // in the post-merge projection; one that stayed INT64 passes through.
-  auto const has_widened_sum = [&](cudf::table_view const& view) {
-    return std::ranges::any_of(aggregate_slots, [&](AggregateSlot const& slot) {
+  // An aggregate whose result is HUGEINT but whose sum stayed INT64 is widened to HUGEINT's
+  // DECIMAL128 carrier in the post-merge projection; a DECIMAL128 one passes through.
+  auto const has_int64_hugeint = [&](cudf::table_view const& view) {
+    return std::ranges::any_of(aggregate_slots, [&](auto const& slot) {
       auto const* plain = std::get_if<plain_slot>(&slot);
-      return plain && plain->is_wide_integer_sum &&
-             view.column(num_group_cols + static_cast<int>(plain->partial_idx)).type() ==
-               wide_integer_sum_type();
+      return plain && plain->returns_hugeint &&
+             view.column(num_group_cols + static_cast<int>(plain->partial_idx)).type().id() ==
+               cudf::type_id::INT64;
     });
   };
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && partials_are_output() &&
-      !has_widened_sum(get_cudf_table_view(input_batches[0]))) {
+      !has_int64_hugeint(get_cudf_table_view(input_batches[0]))) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -288,6 +286,23 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
+    // cuDF's SUM wraps past 128 bits; a HUGEINT input's partials can get there.
+    for (auto const& slot : aggregate_slots) {
+      std::optional<std::size_t> sum_idx;
+      if (auto const* plain = std::get_if<plain_slot>(&slot); plain && plain->sums_hugeint_input) {
+        sum_idx = plain->partial_idx;
+      } else if (auto const* avg = std::get_if<avg_slot>(&slot); avg && avg->sums_hugeint_input) {
+        sum_idx = avg->sum_idx;
+      }
+      if (!sum_idx) { continue; }
+      std::vector<cudf::column_view> partials;
+      for (auto const& batch : input_batches) {
+        partials.push_back(
+          get_cudf_table_view(batch).column(num_group_cols + static_cast<int>(*sum_idx)));
+      }
+      require_decimal128_partial_sums_in_range(
+        partials, stream, input_batches[0].get_memory_space()->get_default_allocator());
+    }
     merged = gpu_merge_impl::merge_grouped_aggregate(
       input_batches,
       num_group_cols,
@@ -300,7 +315,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   // If no post-processing needed, return merged result directly
-  if (partials_are_output() && !has_widened_sum(get_cudf_table_view(merged->to_read_only()))) {
+  if (partials_are_output() && !has_int64_hugeint(get_cudf_table_view(merged->to_read_only()))) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
@@ -328,10 +343,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   auto const finalize       = cucascade::utils::overloaded{
     [&](plain_slot const& slot) {
       auto column = std::move(merged_cols[partials_begin + slot.partial_idx]);
-      // INT64 passes through; DECIMAL128 is narrowed, or the query falls back if it overflows.
-      if (slot.is_wide_integer_sum) {
-        return narrow_wide_integer_sum(std::move(column), stream, mr);
-      }
+      // INT64 is widened to HUGEINT's carrier; DECIMAL128 passes through.
+      if (slot.returns_hugeint) { return to_hugeint_carrier(std::move(column), stream, mr); }
       return column;
     },
     [&](avg_slot const& slot) {

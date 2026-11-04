@@ -620,7 +620,7 @@ bool load_ducklake(duckdb::Connection& con)
                        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = "
                        "'ducklake' AND loaded");
   REQUIRE(version->RowCount() == 1);
-  REQUIRE(version->Collection().GetValue(0, 0).ToString() == "d8a1881e");
+  REQUIRE(version->Collection().GetValue(0, 0).ToString() == "417a9117f5");
   return true;
 }
 

@@ -36,7 +36,6 @@
 #include "helper/logical_type.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -45,7 +44,6 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 
-#include <cudf/cudf_utils.hpp>
 #include <cudf/types.hpp>
 
 #include <catch.hpp>

@@ -17,14 +17,11 @@
 // Metadata walk under a real execution-window lease; no GPU decode is performed here.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
@@ -33,7 +30,6 @@
 #include <utils/table_filter_test_utils.hpp>
 
 #include <cstdio>
-#include <filesystem>
 #include <memory>
 #include <numeric>
 #include <string>

@@ -26,7 +26,6 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/unary.hpp>
 
 #include <catch.hpp>
 

@@ -6,7 +6,7 @@
 //! baidu_std framing is involved on the FE→BE path.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// `internal_service.proto` and its transitive imports (in `doris/gensrc/proto`).
 const PROTOS: &[&str] = &[
@@ -35,45 +35,22 @@ fn main() {
         proto_dir.display()
     );
 
-    println!("cargo:rerun-if-env-changed=PROTOC");
-    if env::var_os("PROTOC").is_none()
-        && let Some(protoc) = find_protoc(&workspace_dir)
-    {
-        // prost-build does not bundle protoc; point it at the pixi env's copy when the build
-        // is not running inside `pixi run`.
-        unsafe { env::set_var("PROTOC", protoc) };
-    }
-
     let protos: Vec<PathBuf> = PROTOS.iter().map(|name| proto_dir.join(name)).collect();
     for proto in &protos {
         println!("cargo:rerun-if-changed={}", proto.display());
     }
 
+    let descriptors = protox::compile(&protos, std::slice::from_ref(&proto_dir))
+        .expect("failed to compile Doris proto files");
+    for proto in &descriptors.file {
+        if let Some(name) = proto.name.as_deref() {
+            println!("cargo:rerun-if-changed={}", proto_dir.join(name).display());
+        }
+    }
+
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&protos, std::slice::from_ref(&proto_dir))
-        .expect("failed to compile Doris proto files");
-}
-
-/// Locates `protoc` in the pixi envs when `$PROTOC` is unset and it is not on `$PATH`.
-fn find_protoc(workspace_dir: &Path) -> Option<PathBuf> {
-    if find_in_path("protoc").is_some() {
-        return None;
-    }
-    [
-        workspace_dir.join(".pixi/envs/be/bin/protoc"),
-        workspace_dir.join(".pixi/envs/default/bin/protoc"),
-    ]
-    .into_iter()
-    .find(|candidate| candidate.exists())
-}
-
-/// Returns the first directory in `$PATH` containing `binary`.
-fn find_in_path(binary: &str) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|dir| dir.join(binary))
-            .find(|candidate| candidate.exists())
-    })
+        .compile_fds(descriptors)
+        .expect("failed to generate Rust code for Doris protos");
 }

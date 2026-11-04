@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <algorithm>
@@ -28,7 +29,7 @@ namespace sirius::op::scan {
 // For deferred results:
 // Positions use the charged allocation itself; no separately allocated vector or shadow charge.
 // Publish only shared_ptr<const iceberg_delete_set>. The backing outlives every consumer.
-struct iceberg_delete_set {
+struct iceberg_delete_set : prepared_visibility {
   iceberg_delete_set(iceberg_delete_set const&)            = delete;
   iceberg_delete_set& operator=(iceberg_delete_set const&) = delete;
   explicit iceberg_delete_set(std::string file) : file_owner_(std::move(file))

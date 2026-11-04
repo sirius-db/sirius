@@ -21,7 +21,6 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/transform.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <helper/timestamp_semantics.hpp>
@@ -190,7 +189,7 @@ std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::transform_input cons
   };
   auto date_ticks = day_counts(reversed ? right : left, date_type);
   auto days_ticks = day_counts(reversed ? left : right, difference ? date_type : int32_type);
-  // transform_extended skips rows with either input NULL and propagates their
+  // transform skips rows with either input NULL and propagates their
   // validity. Infinity must be handled before invoking checked arithmetic.
   static std::string const offset_prefix = R"(
 #include <cuda/numeric>
@@ -225,16 +224,19 @@ __device__ void date_difference(int64_t* out, int32_t left, int32_t right)
   std::array<cudf::transform_input, 2> inputs{date_ticks, days_ticks};
   std::unique_ptr<cudf::column> result;
   try {
-    result = cudf::transform_extended(inputs,
-                                      udf,
-                                      difference ? int64_type : int32_type,
-                                      cudf::udf_source_type::CUDA,
-                                      std::nullopt,
-                                      cudf::null_aware::NO,
-                                      row_count,
-                                      cudf::output_nullability::PRESERVE,
-                                      stream,
-                                      mr);
+    cudf::transform_output const output{difference ? int64_type : int32_type,
+                                        cudf::output_nullability::PRESERVE};
+    auto transformed = cudf::transform(udf,
+                                       cudf::udf_source_type::CUDA,
+                                       cudf::null_aware::NO,
+                                       std::nullopt,
+                                       inputs,
+                                       std::span(&output, 1),
+                                       {},
+                                       row_count,
+                                       stream,
+                                       mr);
+    result           = std::move(transformed->release().front());
   } catch (cudf::evaluation_error const& error) {
     if (error.error_code() != overflow_error) { throw; }
     throw invalid_input_exception("Date out of range");

@@ -31,6 +31,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/host_pin_placement.hpp"
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
@@ -481,6 +482,8 @@ struct parquet_bind_result {
  * queries prepare, run and tear down independently.
  */
 class sirius_scan_manager {
+  friend struct scan_manager_query_test;
+
  public:
   /**
    * @brief Construct a new scan manager.
@@ -546,7 +549,13 @@ class sirius_scan_manager {
                          std::shared_ptr<pipeline::completion_handler> completion = nullptr,
                          std::function<bool()> interrupted                        = {});
   // Called by execute after task_scheduler starts the GPU consumers.
-  void run_preparation_on_query_thread(sirius::query_id_t);
+  void start_preparation(sirius::query_id_t);
+  // Wait on the query owner, servicing provider requests between completion checks.
+  // The callback returns true on cancellation or throws on runtime failure.
+  // Does not retire the attempt; success and failure both use the existing quiesce path.
+  void await_query_completion(sirius::query_id_t,
+                              std::future<void>&,
+                              std::function<bool()> interrupted = {});
   void close_preparation(sirius::query_id_t, stop_reason) noexcept;
   void release_footer_hold_for_testing(uint64_t file_number)
   {
@@ -571,6 +580,7 @@ class sirius_scan_manager {
   /// mutex, so another connection's prepare_for_query is never parked behind it.
   // Stop producers while retaining providers/buffers until downstream retirement.
   void quiesce(sirius::query_id_t query_id);
+  void finish_preparation(sirius::query_id_t query_id) noexcept;
   void reset(sirius::query_id_t query_id);
 
   /// Drain and drop this query's scan work while retaining checkpoint protection.
@@ -583,6 +593,9 @@ class sirius_scan_manager {
 
   /// \brief Number of registered queries that have GPU scan work. Observability and tests.
   [[nodiscard]] std::size_t num_active_queries() const noexcept;
+
+  /// Host-pin placement persists across maintenance calls, query resets and unpins.
+  host_pin_placement& get_host_pin_placement() noexcept { return _host_pin_placement; }
 
   /// \brief Drop every ioctx's prefetching cache and build a fresh one.
   ///
@@ -921,10 +934,12 @@ class sirius_scan_manager {
 
     //! Stop and join every task this query put on the shared pool. Idempotent, and safe to
     //! call outside the state mutex — it can block for as long as an in-flight read.
-    //! Calls for this state are serialized by the query owner.
+    //! Q drives provider close; external callers wait without excluding Q from drain.
     void drain() noexcept;
 
-    bool drained{false};
+    std::mutex execution_mutex;  // Start and retirement serialize around owned execution state.
+    bool draining{false};        // Start admission is closed; provider close may still require Q.
+    bool drained{false};         // Coordinator, dispatcher and resource teardown have all settled.
     preparation_options const preparation;  // Immutable attempt snapshot.
     uint64_t query_token = 0;
     std::shared_ptr<preparation_ledger> ledger;
@@ -1000,6 +1015,8 @@ class sirius_scan_manager {
     std::unique_ptr<preparation_coordinator> coordinator;
   };
 
+  std::unique_ptr<preparation_coordinator> make_preparation_coordinator(query_scan_manager_state&);
+
   /// \brief Register scan sources and arm the completion gate without submitting disk work.
   void start_metadata_processing(query_scan_manager_state& state,
                                  std::function<bool()> interrupted);
@@ -1071,6 +1088,10 @@ class sirius_scan_manager {
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
     std::make_shared<shared_scan_budget>();
+  // Runtime-wide native capacity; declared before query states so it outlives their leases.
+  // Threads start only when an attempt first admits native readers.
+  native_reader_executor _native_readers;
+  coordinator_pool _coordinators;
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
@@ -1102,6 +1123,7 @@ class sirius_scan_manager {
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
   /// the data alive until the last serving provider releases it.
   std::unordered_map<std::string, std::shared_ptr<pinned_entry>> _pinned_entries;
+  host_pin_placement _host_pin_placement;
   /// Guards the STRUCTURE of _pinned_entries (lookup/insert/erase) only, never the serving
   /// of an entry — shared ownership covers that. Held only for map manipulation and the
   /// snapshot in try_match_cached_entry, never across match/validate/plan work, so

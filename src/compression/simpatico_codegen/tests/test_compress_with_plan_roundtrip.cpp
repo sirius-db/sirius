@@ -1,6 +1,4 @@
 #include "api/simpatico_codegen.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"
-#include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/util/stream_pool.hpp"
 #include "test_utils.hpp"
@@ -10,7 +8,6 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -19,10 +16,8 @@
 #include <nvcomp/version.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -527,8 +522,8 @@ int main()
     }
 
     {
-      // ZigZag leaf at the region root — stored as its own fixed-stride
-      // `zigzag` channel.  int32 and int64.
+      // ZigZag at the region root with nothing fused below — its codes are
+      // stored by a fixed-stride Raw passthrough.  int32 and int64.
       auto t32 = make_int32_table(2, 4096, 71);
       std::string dsl32 =
         "input -> zigzag -> zigzag\n"
@@ -599,9 +594,9 @@ int main()
     }
 
     {
-      // Delta -> ZigZag: delta is the region root (inline scan), ZigZag is the
-      // covered leaf that stores the ZigZagged differences.  This is the
-      // canonical signed-residual pipeline.
+      // Delta -> ZigZag: delta is the region root (inline scan), ZigZag is
+      // covered and a Raw passthrough stores the ZigZagged differences.  This
+      // is the canonical signed-residual pipeline.
       auto t = make_int32_table(2, 4096, 77);
       std::string dsl =
         "input -> delta -> differences\n"
@@ -614,8 +609,8 @@ int main()
     }
 
     {
-      // Delta -> ZigZag -> ANS: the headline use case.  ZigZag's stored
-      // channel is entropy-tail-routed to ANS (small signed deltas become
+      // Delta -> ZigZag -> ANS: the headline use case.  ZigZag's Raw
+      // passthrough is entropy-tail-routed to ANS (small signed deltas become
       // small unsigned codes that the entropy coder compresses well).
       auto t = make_int32_table(2, 4096, 83);
       std::string dsl =

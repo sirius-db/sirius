@@ -14,13 +14,11 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_concat.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 

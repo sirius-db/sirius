@@ -27,7 +27,6 @@
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 namespace sirius {

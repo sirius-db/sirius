@@ -24,7 +24,6 @@
 #include "sirius_engine.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>

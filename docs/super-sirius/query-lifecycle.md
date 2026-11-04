@@ -82,6 +82,15 @@ be silently discarded or cause a wait on work that cannot progress. A validation
 the owner's cancellation path. Repeated retirement calls from the engine/destructor/window
 backstops remain safe; they use the same ordering without a separate retired flag.
 
+Scan state remains reachable until preparation drains. The query owner services provider close; external retirement callers request stop and wait without holding the registry or execution mutex. Release scan resources only after that barrier, including on an error path.
+
+Manager shutdown must not race new preparation. Drain query states and return their native-reader leases, join native workers, then stop the metadata pool. Resetting one query leaves shared workers available to other queries.
+
+| Preparation outcome | Cleanup and replay |
+|---|---|
+| Read or execution failure, cleanup succeeds | Preserve the original error and apply the normal CPU replay policy. |
+| Source close fails | Finish retirement, do not retry close, disable CPU replay and mark the runtime unavailable. Preserve any earlier query error, including during stack unwinding. |
+
 An existing lease does not authorize new task publication after closure. Handoffs to the creator,
 scheduler and GPU staging queues, including retry and spill return, need a submission guard.
 Internal dispatch from a manager into its bounded worker pool transfers an already-held claim;

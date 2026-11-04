@@ -21,7 +21,7 @@ jobs:
           pixi-version: v0.81.0
           environments: docs
           locked: true
-      - name: Build C++ and Rust API references
+      - name: Build C, C++ and Rust API references
         run: pixi run --locked -e docs docs
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

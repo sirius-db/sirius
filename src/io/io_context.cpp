@@ -23,7 +23,6 @@
 #include "io/uri_parser.hpp"
 
 #include <cassert>
-#include <cmath>
 #include <cstddef>
 #include <exception>
 #include <memory>

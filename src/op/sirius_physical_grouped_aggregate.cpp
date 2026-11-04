@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
-#include "config.hpp"
-#include "data/data_batch_utils.hpp"
 #include "duckdb/common/assert.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
@@ -25,7 +23,6 @@
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
-#include <functional>
 #include <variant>
 
 namespace sirius {
@@ -144,16 +141,29 @@ sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
 {
   auto const aggregate_offset = num_output_group_columns();
   auto const num_carried      = carried_inputs(aggregate_slots).size();
-  if (std::ranges::none_of(cudf_aggregate_is_wide_integer_sum, std::identity{}) ||
-      types.size() != aggregate_offset + cudf_aggregates.size() + num_carried) {
-    return {};
-  }
-  std::vector<std::optional<cudf::data_type>> alternates(types.size());
-  for (size_t i = 0; i < cudf_aggregate_is_wide_integer_sum.size(); ++i) {
-    if (cudf_aggregate_is_wide_integer_sum[i]) {
-      alternates[aggregate_offset + i] = wide_integer_sum_type();
+  if (types.size() != aggregate_offset + cudf_aggregates.size() + num_carried) { return {}; }
+  auto const alternate_partial = [](AggregateSlot const& slot) -> std::optional<std::size_t> {
+    if (auto const* plain = std::get_if<plain_slot>(&slot);
+        plain && (plain->is_wide_integer_sum || plain->returns_hugeint)) {
+      return plain->partial_idx;
     }
+    if (auto const* avg = std::get_if<avg_slot>(&slot); avg && avg->is_wide_integer_sum) {
+      return avg->sum_idx;
+    }
+    return std::nullopt;
+  };
+  std::vector<std::optional<cudf::data_type>> alternates(types.size());
+  bool has_alternate = false;
+  for (auto const& slot : aggregate_slots) {
+    auto const partial = alternate_partial(slot);
+    if (!partial) { continue; }
+    auto const column  = aggregate_offset + *partial;
+    alternates[column] = sirius::require_cudf_type(types[column]) == wide_integer_sum_type()
+                           ? cudf::data_type{cudf::type_id::INT64}
+                           : wide_integer_sum_type();
+    has_alternate      = true;
   }
+  if (!has_alternate) { return {}; }
   return alternates;
 }
 
@@ -184,7 +194,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                           cudf_aggregate_is_wide_integer_sum));
       continue;
     }
-    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+    auto const last_groups     = _last_batch_groups.load(std::memory_order_relaxed);
+    bool const split_wide_sums = last_groups <= split_wide_sum_max_groups;
+    cudf::size_type num_groups = 0;
+    auto result                = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
@@ -194,7 +207,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               *space,
                                                               batch_telemetry(),
                                                               cudf_aggregate_input_max_abs,
-                                                              cudf_aggregate_is_wide_integer_sum);
+                                                              cudf_aggregate_is_wide_integer_sum,
+                                                              split_wide_sums,
+                                                              &num_groups);
+    _last_batch_groups.store(num_groups, std::memory_order_relaxed);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

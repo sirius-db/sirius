@@ -27,10 +27,10 @@
 #include "catch.hpp"
 #include "creator/config.hpp"
 #include "creator/task_creator.hpp"
-#include "operator/operator_test_utils.hpp"
+#include "operator/operator_test_utils.hpp"  // IWYU pragma: keep
 #include "query_id.hpp"
 
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 
 #include <memory>
 

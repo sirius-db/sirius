@@ -37,7 +37,6 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
@@ -306,6 +305,21 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST preserves carried columns beside low-cardinality SUM",
+                 "[integration][gpu_execution][distinct][aggregate][lowcard_groupby]")
+{
+  // Also run with SIRIUS_EXP_LOWCARD_GROUPBY=1: the specialized SUM kernel cannot emit FIRSTs.
+  run_ok("CREATE TABLE first_lowcard (k VARCHAR NOT NULL, v BIGINT NOT NULL);");
+  run_ok("INSERT INTO first_lowcard VALUES ('A', 10), ('A', 20), ('B', 30), ('B', 40);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, first(v) AS a, first(100 - v) AS b, sum(v) AS s "
+    "FROM first_lowcard GROUP BY k) WHERE a + b <> 100 OR "
+    "(k = 'A' AND s <> 30) OR (k = 'B' AND s <> 70)");
+  compare_gpu_vs_cpu("SELECT k, first(k), sum(v) FROM first_lowcard GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution FIRST beside another aggregate runs on the GPU",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
@@ -406,8 +420,8 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT ON carrying a grouped sum",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // The carried sum is planned as BIGINT under a HUGEINT declaration. Each `k` is one row, so the
-  // carried value is determined, and sums at both ends of BIGINT catch a read at the wrong width.
+  // Each `k` is one row, so the carried HUGEINT value is determined. Sums at both ends of BIGINT
+  // exercise the native 128-bit carrier.
   compare_gpu_vs_cpu(
     "SELECT DISTINCT ON (k) k, s FROM (SELECT k, sum(x) AS s FROM dist_sum GROUP BY k)");
 }
@@ -416,7 +430,7 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT ON over a GROUP BY carries the aggregate results",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // The GROUP BY's results reach the DISTINCT ON as carried columns, and sum() is planned BIGINT
+  // The GROUP BY's results reach the DISTINCT ON as carried columns, and sum() stays HUGEINT
   // under a HUGEINT declaration.
   SECTION("one group per key")
   {
@@ -771,16 +785,14 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution FIRST beside a FILTER or a DISTINCT sum falls back at plan time",
+                 "gpu_execution FIRST beside a filtered SUM or an unsupported DISTINCT sum",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // Pins `main`'s refusals of every aggregate FILTER and every DISTINCT aggregate but COUNT. On
-  // this table both change the answer: the filter excludes k = 1, and k = 1 and k = 2 each hold a
-  // duplicated v.
+  // The filtered SUM masks only its own input; FIRST must still see every row in the group.
+  // DISTINCT remains supported only for COUNT.
   SECTION("FILTER")
   {
-    expect_plan_fallback_matches_cpu(
-      "SELECT k, first(v), sum(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v), sum(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");
   }
 
   SECTION("DISTINCT sum")
@@ -794,8 +806,8 @@ TEST_CASE_METHOD(DistinctFixture,
                  "[integration][gpu_execution][distinct][aggregate]")
 {
   // The CPU answer is (1, NULL) (2, 20) (3, 30) (NULL, NULL). A route that ignored the filter would
-  // return (1, 10), so a result comparison alone would also catch the defect. Pins `main`'s refusal
-  // of every aggregate FILTER, kept for when it lifts.
+  // return (1, 10), so a result comparison alone would also catch the defect. FIRST does not skip
+  // NULLs, so the mask-to-null lowering used by supported filtered aggregates cannot answer it.
   expect_plan_fallback_matches_cpu(
     "SELECT k, first(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");
 }

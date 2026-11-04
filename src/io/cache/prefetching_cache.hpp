@@ -82,10 +82,11 @@ namespace sirius::io::cache {
 struct cache_generation {
   /// Materialise a chunk for every offset in @p incoming, fold the matching
   /// entry of @p desired into its populated extent, and count the calling
-  /// request as a subscriber of each.  Returns the chunks in @p incoming
-  /// order.  @p desired runs index-parallel to @p incoming.
-  std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
-                                                   std::span<const chunk_fill> desired);
+  /// request as a subscriber of each. Records each acquired subscription in result,
+  /// in incoming order. The caller owns rollback even if acquisition throws.
+  void subscribe_chunks(std::span<const size_t> incoming,
+                        std::span<const chunk_fill> desired,
+                        std::vector<cached_chunk*>& result);
 
   std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                           std::size_t size,
@@ -311,6 +312,7 @@ class prefetching_cache {
   // fadvise dispatch through it.
   friend class sirius::io::sirius_datasource;
   friend class cache_handle;
+  friend struct prefetching_cache_test_access;
 
  public:
   using byte_range = cudf::io::text::byte_range_info;

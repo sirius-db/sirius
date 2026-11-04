@@ -16,7 +16,6 @@
 
 #include "transparent/physical_sirius_execution.hpp"
 
-#include "cuda/device_health.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
@@ -451,6 +450,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       try {
         require_s3_cpu_replay(source_policy_, query_sql_, gpu_msg);
+      } catch (duckdb::Exception const&) {
+        // Preserve typed discovery failures, including their transaction semantics.
+        throw;
       } catch (std::runtime_error const& error) {
         throw duckdb::ExecutorException(error.what());
       }
@@ -468,6 +470,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       try {
         require_non_s3_cpu_replay(source_policy_, gpu_msg);
+      } catch (duckdb::Exception const&) {
+        // Preserve typed discovery failures, including their transaction semantics.
+        throw;
       } catch (std::runtime_error const& error) {
         throw duckdb::ExecutorException(error.what());
       }

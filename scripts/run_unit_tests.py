@@ -10,7 +10,9 @@ The run has four steps:
   shards     Two Catch2 shards per visible GPU, run in parallel. Each shard sees
              one GPU and uses integration-shard.yaml. [multi_gpu] and hidden
              tests are excluded.
-  cuda_fault Isolated CUDA status-injection tests (Linux only).
+  cuda_fault Isolated CUDA status-injection tests (Linux only). One GPU is
+             visible; the [multi_gpu] ones run in a second process with all
+             GPUs visible, skipped when fewer than two are.
   multi_gpu  The [multi_gpu] tests with all GPUs visible. Skipped when fewer
              than two GPUs are visible.
   late_mat   The late-materialization tests with SIRIUS_EXP_LATE_MAT=1. The
@@ -48,12 +50,13 @@ SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
 STEPS = ("shards", "cuda_fault", "multi_gpu", "late_mat")
 STEP_SPECS = {
     "shards": "~[.]~[multi_gpu]",
-    "cuda_fault": "[cuda_status_fault]",
+    "cuda_fault": "[cuda_status_fault]~[multi_gpu]",
     "multi_gpu": "[multi_gpu]~[.]",
     "late_mat": "[late_mat]~[late_mat_fused],[deferred_query]~[late_mat_fused],"
     "[native_filter]~[late_mat_fused]",
 }
 LATE_MAT_FUSED_SPEC = "[late_mat_fused]"
+CUDA_FAULT_MULTI_GPU_SPEC = "[cuda_status_fault][multi_gpu]~[.]"
 TIMEOUT_MIN = {"shards": 45, "cuda_fault": 10, "multi_gpu": 20, "late_mat": 20}
 SUMMARY_PREFIXES = ("All tests passed", "test cases:", "No tests ran")
 
@@ -248,8 +251,19 @@ def main() -> int:
                         cmd=cmd,
                         env={"CUDA_VISIBLE_DEVICES": gpus[0]},
                         log_dir=log_root / step,
+                        prefix="[cuda_fault] ",
                     )
                 ]
+                if len(gpus) >= 2:
+                    jobs.append(
+                        Job(
+                            label="fault_mgpu",
+                            cmd=cmd[:-1] + [CUDA_FAULT_MULTI_GPU_SPEC],
+                            env={},
+                            log_dir=log_root / "fault_mgpu",
+                            prefix="[fault_mgpu] ",
+                        )
+                    )
             case "multi_gpu":
                 jobs = [Job(label=step, cmd=cmd, env={}, log_dir=log_root / step)]
             case "late_mat":

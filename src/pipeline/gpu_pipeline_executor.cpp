@@ -23,9 +23,7 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/leased_callable.hpp"
 #include "log/logging.hpp"
-#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
@@ -36,7 +34,6 @@
 
 #include <util/stream_check_wrapper.hpp>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -315,14 +312,15 @@ void gpu_pipeline_executor::process_task(
                                             pipe ? pipe->get_query_id() : make_query_id(0))) {
           throw;
         }
-        // The downgrade executor cancelled this request (its queue was drained). This task cannot
-        // get its reservation, so fail its query
-        SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
-                        gpu_task->get_task_id(),
-                        e.what());
+        // The downgrade request failed or was cancelled. This task cannot get its reservation, so
+        // fail its query
+        SIRIUS_LOG_INFO(
+          "GPU Pipeline Executor: downgrade request failed or cancelled for task {}: {}",
+          gpu_task->get_task_id(),
+          e.what());
         if (iteration_completion) {
           iteration_completion->report_error(
-            "GPU Pipeline Executor: downgrade request cancelled for task " +
+            "GPU Pipeline Executor: downgrade request failed or cancelled for task " +
             std::to_string(gpu_task->get_task_id()) + ": " + e.what());
         }
         return;

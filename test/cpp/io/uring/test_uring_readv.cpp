@@ -33,7 +33,6 @@
 #include <future>
 #include <memory>
 #include <span>
-#include <stdexcept>
 #include <system_error>
 #include <thread>
 #include <type_traits>

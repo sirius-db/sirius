@@ -53,12 +53,22 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 2 * DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MiB
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+
+/// Fallback BUILD_PROBE budgets with the default hash partition size equal to batch size.
+/// Resolution derives the index budget from startup hash_partition_bytes; the resident budget
+/// remains batch-derived. At >= 4 bytes per row, an 8x index budget covers the former 2x payload
+/// threshold, subject to the cuDF row limit and the independent resident budget.
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES     = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024;  // 256 MiB
+
+/// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
+/// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
+constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -121,6 +131,14 @@ constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
 /// Budget when GPU tier capacity cannot be read at planning time.
 constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
+/// 0 = auto: a share of the pinning GPU memory space's capacity, below.
+constexpr uint64_t DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES = 0;
+
+/// Share of the GPU memory space capacity that the values retained across all columns may occupy
+/// in the pin-time exact uniqueness check when its cap is auto. The check's peak is about three
+/// times the retained bytes, so this keeps it near 30% of the space.
+constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -128,7 +146,7 @@ constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 10
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
-  /// Construct defaults with a shared batch size and twice that size for hash builds.
+  /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
@@ -154,20 +172,28 @@ struct operator_params {
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
-  /// Target size (bytes) for the concat operator output batch.
+  /// Target output batch size (bytes) for CONCAT and REPLICATE. REPLICATE may exceed the target by
+  /// one row.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.
-  uint64_t cross_join_task_bytes = config::derived_default_batch_size();
+  uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
-  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
-  /// batch default. May be larger than concat_batch_bytes; build-side batches will be
-  /// concatenated if needed.
+  /// Estimated per-GPU cuco hash-table byte budget for BUILD_PROBE, computed from measured rows.
+  /// Defaults to 8x startup-resolved hash_partition_bytes unless explicitly configured.
+  /// SET hash_partition_bytes does not re-derive it; 0 disables BUILD_PROBE including MARK.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Per-GPU decoded build payload budget for BUILD_PROBE. The folded batch stays read-locked
+  /// for the probe stream, and folding may temporarily hold both inputs and output. Admission
+  /// uses a per-partition average for hash partitioning, so skew and concurrent joins can exceed
+  /// available memory. Defaults to 8x batch size; 0 disables BUILD_PROBE including MARK.
+  // SET/RESET overrides are connection-local and captured in the query options snapshot.
+  uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
@@ -243,6 +269,22 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
+  /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
+  /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
+  /// When on, pin_table observes every column it is not already asked to observe; an observed
+  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
+  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
+  /// late materialization asks for.
+  bool prove_unique_keys{true};
+
+  /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
+  /// sorts a whole column when its chunks overlap in range. Earlier columns take priority when the
+  /// cap is short; the check's peak GPU use is about three times the cap. A column that no longer
+  /// fits stays unproven. 0 = a share (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the
+  /// pinning GPU memory space's capacity. Applies to every observed column, whether late
+  /// materialization or join-key proofs asked for it.
+  uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
+
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
@@ -282,9 +324,9 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression. The unprefixed fields apply to
+/// pin_table(tier=>'host'); the spill_ fields apply to batches the downgrade
+/// executor spills to the host or disk tier.
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
@@ -311,6 +353,25 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Store batches the downgrade executor spills to the host or disk tier
+  /// Simpatico-compressed, with per-type default plans, and decode them on their way
+  /// back to the GPU. A batch whose compressed form saves too little (see
+  /// spill_max_compressed_fraction) or fails to encode spills uncompressed.
+  bool enable_spill_compression{false};
+
+  /// Batches smaller than this spill uncompressed.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// Keep a spilled batch compressed only when its header + payload is at most this
+  /// fraction of the batch's device size. Finite and non-negative; values above 1
+  /// allow compressed forms that expand relative to the original batch.
+  double spill_max_compressed_fraction{0.75};
+
+  /// Encode a spilled batch only when this fraction of its size could be reserved in
+  /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
+  /// In [0, 1]; 0 skips the check.
+  double spill_encode_reserve_fraction{0.5};
 };
 
 class configuration_input_error : public std::runtime_error {
@@ -443,6 +504,9 @@ class parsed_sirius_config {
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
+  /// embedder check backend-dependent options before the engine is brought up.
+  [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
   [[nodiscard]] sirius_config resolve(
     const cucascade::memory::system_topology_info& topology) const;
 
