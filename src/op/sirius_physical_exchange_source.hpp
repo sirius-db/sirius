@@ -73,7 +73,7 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   /// Where to make the one empty batch handed on when the stream ends having brought nothing.
   void set_memory_space(cucascade::memory::memory_space& gpu);
 
-  /// Arrivals schedule this pipeline; the last sender's end re-checks whether it finished.
+  /// Arrivals and the last sender's end schedule this pipeline's source.
   void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
 
   bool is_source() const override { return true; }
