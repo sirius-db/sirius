@@ -36,7 +36,11 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <cucascade/data/data_repository.hpp>
 
@@ -213,6 +217,14 @@ std::vector<std::int64_t> all_keys(rank_t world, int batches)
   }
   return keys;
 }
+
+struct stub_operator : sirius::op::sirius_physical_operator {
+  using sirius_physical_operator::sirius_physical_operator;
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+};
 
 }  // namespace
 
@@ -797,4 +809,217 @@ TEST_CASE("a VALUES source keeps its rows on rank 0 alone", "[exchange][operator
   CHECK(errors == std::vector<std::string>(c.world()));
   CHECK(rows[0] == 1);
   CHECK(rows[1] == 0);
+}
+
+namespace {
+
+/// Sets @p column's rows NULL where @p is_null(row) holds.
+template <typename Pred>
+void null_rows(cudf::column& column, Pred is_null)
+{
+  auto const rows = column.size();
+  std::vector<std::uint32_t> words(
+    cudf::bitmask_allocation_size_bytes(rows) / sizeof(std::uint32_t), 0);
+  cudf::size_type nulls = 0;
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    if (is_null(i)) {
+      ++nulls;
+    } else {
+      words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
+    }
+  }
+  rmm::device_buffer mask(words.data(),
+                          words.size() * sizeof(std::uint32_t),
+                          utils::default_stream(),
+                          utils::get_resource_ref(*env().gpu));
+  column.set_null_mask(std::move(mask), nulls);
+}
+
+}  // namespace
+
+TEST_CASE("a NULL in any of several keys sends the row to every rank", "[exchange][operators]")
+{
+  ranks c(3);
+  exchange_spec spec;
+  spec.key_columns             = {0, 1};
+  spec.null_keys_to_every_rank = true;
+  constexpr stream_id stream   = 11;
+  constexpr int all_null_rows  = 50;
+  std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    sources.push_back(std::make_unique<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[r].service, stream, std::set<rank_t>{0, 1, 2}, false));
+  }
+  // NULLs fall in different key columns: column 0 every 7th row, column 1 every 5th from row 1.
+  auto const null_key0 = [](cudf::size_type i) { return i % 7 == 0; };
+  auto const null_key1 = [](cudf::size_type i) { return i % 5 == 1; };
+  int any_null         = 0;
+  for (int i = 0; i < rows_per_batch; ++i) {
+    any_null += null_key0(i) || null_key1(i) ? 1 : 0;
+  }
+  for (rank_t r = c.world(); r-- > 0;) {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+    auto table = std::make_unique<cudf::table>(
+      sirius::get_cudf_table_view(key_value_batch(r, 0)->to_read_only()), utils::default_stream());
+    auto columns = table->release();
+    null_rows(*columns[0], null_key0);
+    null_rows(*columns[1], null_key1);
+    sink_batch(sink, gpu_batch(std::make_unique<cudf::table>(std::move(columns))));
+    if (r == 0) {
+      // Every row's key NULL: nothing is left to route by hash.
+      auto none = std::make_unique<cudf::table>(
+        cudf::slice(sirius::get_cudf_table_view(key_value_batch(0, 1)->to_read_only()),
+                    {0, all_null_rows})
+          .front(),
+        utils::default_stream());
+      auto none_columns = none->release();
+      null_rows(*none_columns[0], [](cudf::size_type) { return true; });
+      sink_batch(sink, gpu_batch(std::make_unique<cudf::table>(std::move(none_columns))));
+    }
+    sink.finalize_operator();
+  }
+
+  cudf::size_type keyed_total = 0;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    cudf::size_type null_keyed = 0;
+    auto const deadline        = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+    while (!sources[r]->all_ports_empty()) {
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      auto data = sources[r]->get_next_task_input_data();
+      if (!data) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        continue;
+      }
+      for (auto const& batch :
+           dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches()) {
+        auto const view  = sirius::get_cudf_table_view(batch->to_read_only());
+        auto const keyed = cudf::drop_nulls(view, {0, 1}, utils::default_stream())->num_rows();
+        null_keyed += view.num_rows() - keyed;
+        keyed_total += keyed;
+      }
+    }
+    CHECK(null_keyed == any_null * static_cast<cudf::size_type>(c.world()) + all_null_rows);
+  }
+  CHECK(keyed_total == (rows_per_batch - any_null) * static_cast<cudf::size_type>(c.world()));
+}
+
+TEST_CASE("an exchange sink rejects a spec that does not fit", "[exchange][operators]")
+{
+  ranks c(2);
+  auto const reject = [&](exchange_spec spec) {
+    CHECK_THROWS_AS(
+      sirius_physical_exchange_sink(key_value_types(), 0, c.all[0].service, 12, std::move(spec)),
+      sirius::invalid_input_exception);
+  };
+  CHECK_THROWS_AS(sirius_physical_exchange_sink(
+                    key_value_types(), 0, nullptr, 12, exchange_spec{.routing = mode::broadcast}),
+                  sirius::invalid_input_exception);
+  reject({.routing = mode::hash});
+  reject({.routing = mode::range});
+  reject({.routing = mode::broadcast, .key_columns = {0}});
+  reject({.routing = mode::gather, .key_columns = {0}});
+  reject({.routing = mode::hash, .key_columns = {2}});
+  reject({.routing = mode::hash, .key_columns = {-1}});
+  reject({.routing        = mode::hash,
+          .key_columns    = {0},
+          .key_cast_types = {cudf::data_type{cudf::type_id::INT64},
+                             cudf::data_type{cudf::type_id::INT64}}});
+  reject({.routing = mode::range, .key_columns = {0}});
+  reject({.routing                 = mode::range,
+          .key_columns             = {0},
+          .null_keys_to_every_rank = true,
+          .column_order            = {cudf::order::ASCENDING},
+          .null_precedence         = {cudf::null_order::BEFORE}});
+  reject({.routing = mode::broadcast, .null_keys_to_every_rank = true});
+  reject({.routing = mode::gather, .target = 2});
+
+  exchange_spec range{.routing         = mode::range,
+                      .key_columns     = {0},
+                      .column_order    = {cudf::order::ASCENDING},
+                      .null_precedence = {cudf::null_order::BEFORE}};
+  sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[0].service, 12, range);
+  auto const boundaries = [](std::vector<std::int64_t> keys, int columns) {
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    for (int i = 0; i < columns; ++i) {
+      cols.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, keys));
+    }
+    return std::make_shared<cudf::table const>(std::move(cols));
+  };
+  CHECK_THROWS_AS(sink.set_range_boundaries(nullptr), sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sink.set_range_boundaries(boundaries({1, 2}, 1)),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sink.set_range_boundaries(boundaries({1}, 2)), sirius::invalid_input_exception);
+  CHECK_NOTHROW(sink.set_range_boundaries(boundaries({1}, 1)));
+}
+
+TEST_CASE("a waiting exchange source walks on to this rank's unfinished producer",
+          "[exchange][operators]")
+{
+  struct producer_pipeline : sirius::pipeline::sirius_pipeline {
+    using sirius_pipeline::sirius_pipeline;
+    bool finished = false;
+    bool is_pipeline_finished() const override { return finished; }
+  };
+  ranks c(1);
+  constexpr stream_id stream = 13;
+  sirius_physical_exchange_source source(
+    key_value_types(), 0, c.all[0].service, stream, {0}, false);
+  stub_operator scan{sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, key_value_types(), 0};
+  auto producer =
+    std::make_shared<producer_pipeline>(sirius::pipeline::pipeline_build_context{nullptr, true});
+  sirius::pipeline::sirius_pipeline_build_state{}.add_pipeline_operator(*producer, scan);
+  cucascade::shared_data_repository repo;
+  auto port          = std::make_unique<sirius::op::sirius_physical_operator::port>();
+  port->type         = sirius::op::MemoryBarrierType::PIPELINE;
+  port->repo         = &repo;
+  port->src_pipeline = producer;
+  source.add_port("default", std::move(port));
+
+  auto hint = source.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == sirius::op::TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  CHECK(hint->producer == &scan);
+
+  // Every sender has ended, but this rank's producer still runs: keep walking to it.
+  c.all[0].service->close(stream, 0);
+  hint = source.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->producer == &scan);
+
+  producer->finished = true;
+  CHECK_FALSE(source.get_next_task_hint().has_value());
+}
+
+TEST_CASE("an exchange source shapes its owed empty batch like its sink's input",
+          "[exchange][operators]")
+{
+  ranks c(1);
+  constexpr stream_id stream = 14;
+  auto source                = duckdb::make_uniq<sirius_physical_exchange_source>(
+    key_value_types(), 0, c.all[0].service, stream, std::set<rank_t>{0}, false);
+  source->set_memory_space(*env().gpu);
+  source->children.push_back(duckdb::make_uniq<sirius_physical_exchange_sink>(
+    key_value_types(), 0, c.all[0].service, stream, exchange_spec{.routing = mode::broadcast}));
+  auto& sink = source->children[0]->Cast<sirius_physical_exchange_sink>();
+
+  // Declared BIGINT, given INT32: a producer's batches can differ from its declared types.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    numeric_column(cudf::data_type{cudf::type_id::INT32}, std::vector<std::int32_t>{}));
+  columns.push_back(
+    numeric_column(cudf::data_type{cudf::type_id::INT32}, std::vector<std::int32_t>{}));
+  sink_batch(sink, gpu_batch(std::make_unique<cudf::table>(std::move(columns))));
+  sink.finalize_operator();
+
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  std::unique_ptr<sirius::op::operator_data> data;
+  while (!(data = source->get_next_task_input_data())) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  auto const& batches = dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto const view = sirius::get_cudf_table_view(batches[0]->to_read_only());
+  CHECK(view.num_rows() == 0);
+  CHECK(view.column(0).type().id() == cudf::type_id::INT32);
 }
