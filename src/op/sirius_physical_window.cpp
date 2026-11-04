@@ -76,6 +76,8 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
     return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
   };
   if (_ranking_functions.empty() || _partition_columns.empty() || _ranking_order.columns.empty() ||
+      _ranking_order.directions.size() != _ranking_order.columns.size() ||
+      _ranking_order.nulls.size() != _ranking_order.columns.size() ||
       !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
       !std::all_of(_ranking_order.columns.begin(), _ranking_order.columns.end(), valid_slot)) {
     throw std::invalid_argument("Window key or order key is outside its prepared schema");
@@ -113,10 +115,10 @@ std::size_t sirius_physical_window::workspace_bytes(std::size_t rows, std::size_
   // groupby and distinct-join hash tables, the row-to-group map, restored/widened arguments,
   // checked SUM structs, counts/AVG temporaries, and expanded output columns. Worst case: one
   // group per row. History refines this after execution, and native OOM follows ordinary retries.
-  // A ranking window sorts the key columns: the sort order, the gathered keys, one scan result
-  // and its INT64 copy per function, and the scattered result.
-  auto per_row = memory::saturating_add(
-    128, memory::saturating_mul(_aggregates.size() + _ranking_functions.size(), 128));
+  // A ranking window needs about 24 bytes per row for each function: the INT32 scan result, the
+  // scattered result and the INT64 cast. The sort order is shared by all functions.
+  auto per_row = memory::saturating_add(128, memory::saturating_mul(_aggregates.size(), 128));
+  per_row = memory::saturating_add(per_row, memory::saturating_mul(_ranking_functions.size(), 24));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_partition_columns.size(), 32));
   per_row =
     memory::saturating_add(per_row, memory::saturating_mul(_ranking_order.columns.size(), 32));
@@ -176,14 +178,15 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
         restored.push_back(std::move(column));
       }
     };
-    for (auto slot : _partition_columns) {
-      restore(slot);
-    }
-    for (auto const& aggregate : _aggregates) {
-      restore(aggregate.argument_column);
-    }
-    for (auto slot : _ranking_order.columns) {
-      restore(slot);
+    // Ranking only reads the equality and the order of its keys, which an exact narrower carrier
+    // keeps, so its keys are used as they are.
+    if (_ranking_functions.empty()) {
+      for (auto slot : _partition_columns) {
+        restore(slot);
+      }
+      for (auto const& aggregate : _aggregates) {
+        restore(aggregate.argument_column);
+      }
     }
     std::shared_ptr<cudf::table> results =
       _ranking_functions.empty()

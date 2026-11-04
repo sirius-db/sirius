@@ -51,7 +51,7 @@ namespace {
 }
 
 /// The numeric types the window evaluator accepts as an aggregate argument.
-bool numeric_argument(duckdb::LogicalType const& type)
+bool is_supported_numeric_argument(duckdb::LogicalType const& type)
 {
   using duckdb::LogicalTypeId;
   switch (type.id()) {
@@ -69,7 +69,7 @@ bool numeric_argument(duckdb::LogicalType const& type)
 }
 
 /// The types the window evaluator accepts as a partition key.
-bool partition_key(duckdb::LogicalType const& type)
+bool is_supported_partition_key(duckdb::LogicalType const& type)
 {
   using duckdb::LogicalTypeId;
   switch (type.id()) {
@@ -93,9 +93,9 @@ bool partition_key(duckdb::LogicalType const& type)
 }
 
 /// Whether COUNT, MIN and MAX accept an argument of @p type.
-bool count_min_max_argument(duckdb::LogicalType const& type)
+bool is_supported_count_min_max_argument(duckdb::LogicalType const& type)
 {
-  return numeric_argument(type) || partition_key(type);
+  return is_supported_numeric_argument(type) || is_supported_partition_key(type);
 }
 
 /// Decline the window modifiers that no window function here supports.
@@ -140,9 +140,9 @@ std::optional<op::ranking_function> validate_ranking(
 }
 
 /// The types a window ORDER BY key accepts: the numeric types and the partition key types.
-bool order_key(duckdb::LogicalType const& type)
+bool is_supported_order_key(duckdb::LogicalType const& type)
 {
-  return partition_key(type) || numeric_argument(type);
+  return is_supported_partition_key(type) || is_supported_numeric_argument(type);
 }
 
 /// Whether two windows have the same ORDER BY keys, directions and NULL placement.
@@ -160,24 +160,22 @@ bool same_order(duckdb::BoundWindowExpression const& a, duckdb::BoundWindowExpre
   return true;
 }
 
-/// Record the order key slots, direction and NULL placement of the first ranking window.
+/// Record the order key slots, directions and NULL placements of the first ranking window.
 template <typename Prepare>
-void plan_ranking_order(whole_partition_window_plan& plan,
+void plan_ranking_order(window_plan& plan,
                         duckdb::BoundWindowExpression const& expression,
                         Prepare&& prepare)
 {
-  auto const& first = expression.OrderBy().front();
-  if (first.null_order == duckdb::OrderByNullType::ORDER_DEFAULT) {
-    decline("unresolved NULL order");
-  }
-  plan.ranking_order.direction = op::to_cudf_order(first.type);
-  plan.ranking_order.nulls     = op::to_cudf_null_order(first.type, first.null_order);
   for (auto const& node : expression.OrderBy()) {
-    if (node.type != first.type || node.null_order != first.null_order) {
-      decline("ORDER BY keys with different directions");
+    if (node.null_order == duckdb::OrderByNullType::ORDER_DEFAULT) {
+      decline("unresolved NULL order");
     }
-    if (!order_key(node.expression->GetReturnType())) { decline("order key type or collation"); }
+    if (!is_supported_order_key(node.expression->GetReturnType())) {
+      decline("order key type or collation");
+    }
     plan.ranking_order.columns.push_back(static_cast<cudf::size_type>(prepare(*node.expression)));
+    plan.ranking_order.directions.push_back(op::to_cudf_order(node.type));
+    plan.ranking_order.nulls.push_back(op::to_cudf_null_order(node.type, node.null_order));
   }
 }
 
@@ -217,17 +215,17 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
   }
   if (expression.GetChildren().size() == 1) {
     auto const& argument = expression.GetChildren()[0]->GetReturnType();
-    if (count_min_max_argument(argument) && id == aggregate_id::count &&
+    if (is_supported_count_min_max_argument(argument) && id == aggregate_id::count &&
         expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
       return aggregate_id::count;
     }
-    if (count_min_max_argument(argument) && expression.GetReturnType() == argument) {
+    if (is_supported_count_min_max_argument(argument) && expression.GetReturnType() == argument) {
       if (id == aggregate_id::min) { return aggregate_id::min; }
       if (id == aggregate_id::max) { return aggregate_id::max; }
     }
   }
   if (expression.GetChildren().size() != 1 ||
-      !numeric_argument(expression.GetChildren()[0]->GetReturnType())) {
+      !is_supported_numeric_argument(expression.GetChildren()[0]->GetReturnType())) {
     decline("aggregate argument type or arity");
   }
   auto const& argument = expression.GetChildren()[0]->GetReturnType();
@@ -261,17 +259,17 @@ std::size_t count_window_stages(duckdb::LogicalOperator const& plan)
 
 }  // namespace
 
-void validate_whole_partition_window_stages(duckdb::LogicalOperator const& plan)
+void validate_window_stages(duckdb::LogicalOperator const& plan)
 {
   if (count_window_stages(plan) > 1) { decline("more than one window operator in a plan"); }
 }
 
-whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window)
+window_plan plan_window(duckdb::LogicalWindow const& window)
 {
   if (window.children.size() != 1 || window.expressions.empty()) {
     decline("expected one child and at least one expression");
   }
-  whole_partition_window_plan plan;
+  window_plan plan;
   plan.input_width    = window.children[0]->types.size();
   plan.prepared_types = window.children[0]->types;
   plan.output_types   = window.types;
@@ -327,7 +325,9 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
       decline("incompatible partition specifications");
     }
     for (auto const& key : expression.Partitions()) {
-      if (!partition_key(key->GetReturnType())) { decline("partition key type or collation"); }
+      if (!is_supported_partition_key(key->GetReturnType())) {
+        decline("partition key type or collation");
+      }
       if (key->IsVolatile()) { decline("volatile key or argument"); }
     }
     if (!organization) {
@@ -376,9 +376,9 @@ namespace {
  *
  * @throws duckdb::InternalException if the child's schema differs from the plan's input schema.
  */
-duckdb::unique_ptr<op::sirius_physical_operator> prepare_whole_partition_window_input(
+duckdb::unique_ptr<op::sirius_physical_operator> prepare_window_input(
   duckdb::unique_ptr<op::sirius_physical_operator> child,
-  whole_partition_window_plan const& plan,
+  window_plan const& plan,
   std::size_t estimated_cardinality)
 {
   if (!child || child->types.size() != plan.input_width ||
@@ -403,18 +403,18 @@ duckdb::unique_ptr<op::sirius_physical_operator> prepare_whole_partition_window_
 
 }  // namespace
 
-duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_input(
+duckdb::unique_ptr<op::sirius_physical_operator> build_window_input(
   duckdb::unique_ptr<op::sirius_physical_operator> child,
-  whole_partition_window_plan const& plan,
+  window_plan const& plan,
   std::size_t estimated_cardinality,
   uint64_t hash_partition_bytes)
 {
-  child = prepare_whole_partition_window_input(std::move(child), plan, estimated_cardinality);
-  return build_whole_partition_window_exchange(
+  child = prepare_window_input(std::move(child), plan, estimated_cardinality);
+  return build_window_exchange(
     std::move(child), plan.partition_slots, estimated_cardinality, hash_partition_bytes);
 }
 
-duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_exchange(
+duckdb::unique_ptr<op::sirius_physical_operator> build_window_exchange(
   duckdb::unique_ptr<op::sirius_physical_operator> child,
   std::vector<duckdb::idx_t> const& partition_slots,
   std::size_t estimated_cardinality,
@@ -466,8 +466,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_ex
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(
   duckdb::LogicalWindow& window)
 {
-  auto bound_plan = plan_whole_partition_window(window);
-  auto child      = prepare_whole_partition_window_input(
+  auto bound_plan = plan_window(window);
+  auto child      = prepare_window_input(
     create_plan(*window.children[0]), bound_plan, window.estimated_cardinality);
   auto prepared = sirius::from_duckdb_vec(bound_plan.prepared_types);
   std::vector<cudf::size_type> keys(bound_plan.partition_slots.begin(),

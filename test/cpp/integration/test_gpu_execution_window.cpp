@@ -267,6 +267,12 @@ TEST_CASE_METHOD(WindowFixture,
     "SELECT id,rank() OVER (PARTITION BY p ORDER BY v DESC NULLS FIRST),"
     "dense_rank() OVER (PARTITION BY p ORDER BY v DESC NULLS FIRST) FROM w");
   // Peers are numbered in a determined order only when id breaks the ties.
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v,q DESC),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v,q DESC) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST,q ASC NULLS FIRST),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST,q ASC NULLS FIRST) FROM w");
   compare_window("SELECT id,row_number() OVER (PARTITION BY p ORDER BY v,id) FROM w");
   compare_window("SELECT id,row_number() OVER (PARTITION BY p,q ORDER BY d DESC,id DESC) FROM w");
   compare_window(
@@ -306,8 +312,6 @@ TEST_CASE_METHOD(WindowFixture,
 {
   expect_plan_fallback_matches_cpu("SELECT id,sum(v) OVER (ORDER BY id) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,rank() OVER (ORDER BY v) FROM w");
-  expect_plan_fallback_matches_cpu(
-    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v,q DESC) FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT id,percent_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
   expect_plan_fallback_matches_cpu(

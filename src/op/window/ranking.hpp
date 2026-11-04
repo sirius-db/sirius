@@ -44,15 +44,18 @@ enum class ranking_function {
 
 /**
  * @brief The ORDER BY of a ranking window.
+ *
+ * `directions` and `nulls` have one entry for each of `columns`.
  */
 struct ranking_order {
   /// Indices of the order key columns in the input table. Must not be empty.
   std::vector<cudf::size_type> columns;
-  /// Direction shared by all order keys.
-  cudf::order direction = cudf::order::ASCENDING;
-  /// Where NULLs sort, in the cuDF sense: applied in the ascending frame and reversed for a
-  /// descending direction. `to_cudf_null_order` converts SQL `NULLS FIRST` and `NULLS LAST`.
-  cudf::null_order nulls = cudf::null_order::BEFORE;
+  /// Direction of each order key.
+  std::vector<cudf::order> directions;
+  /// Where NULLs sort for each order key, in the cuDF sense: applied in the ascending frame and
+  /// reversed for a descending direction. `to_cudf_null_order` converts SQL `NULLS FIRST` and
+  /// `NULLS LAST`.
+  std::vector<cudf::null_order> nulls;
 };
 
 /**
@@ -66,10 +69,10 @@ struct ranking_order {
  * @p input, so the input columns are neither copied nor reordered and the caller appends the
  * result columns to them.
  *
- * Partition columns and order keys refer to columns of @p input and must already have their
- * logical types, including decimal scales. Compressed physical carriers are not interpreted.
- * NaN orders above every other value and equals NaN, and `-0.0` equals `0.0`. Strings order by
- * their bytes.
+ * Partition columns and order keys refer to columns of @p input. A key may be in an exact
+ * narrower carrier of its logical type, which sorts and compares like the type itself. Decimal
+ * keys must have their logical scale. NaN orders above every other value and equals NaN, and
+ * `-0.0` equals `0.0`. Strings order by their bytes.
  *
  * @param input Table holding the partition columns and the order keys.
  * @param partition_columns Indices of the partition columns in @p input. Must not be empty.

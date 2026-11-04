@@ -1883,10 +1883,10 @@ void insert_gpu_pipeline_operators_recursive(
       auto const& window = slot->Cast<sirius::op::sirius_physical_window>();
       std::vector<duckdb::idx_t> keys(window.partition_columns().begin(),
                                       window.partition_columns().end());
-      slot->children[0] = build_whole_partition_window_exchange(std::move(slot->children[0]),
-                                                                keys,
-                                                                slot->estimated_cardinality,
-                                                                op_params.hash_partition_bytes);
+      slot->children[0] = build_window_exchange(std::move(slot->children[0]),
+                                                keys,
+                                                slot->estimated_cardinality,
+                                                op_params.hash_partition_bytes);
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
@@ -2356,7 +2356,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   };
   try {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
-    validate_whole_partition_window_stages(*op);
+    validate_window_stages(*op);
     plan = create_plan(*op);
   } catch (duckdb::NotImplementedException const&) {
     // A pre-capture refusal used to throw before parent planning. Preserve

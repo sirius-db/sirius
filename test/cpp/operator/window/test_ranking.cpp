@@ -99,6 +99,18 @@ struct direction {
   duckdb::OrderByNullType nulls;
 };
 
+// An ORDER BY over @p columns with the direction and NULL placement of each key.
+ranking_order make_order(std::vector<cudf::size_type> columns, std::vector<direction> const& keys)
+{
+  ranking_order order;
+  order.columns = std::move(columns);
+  for (auto const& key : keys) {
+    order.directions.push_back(sirius::op::to_cudf_order(key.type));
+    order.nulls.push_back(sirius::op::to_cudf_null_order(key.type, key.nulls));
+  }
+  return order;
+}
+
 // 12 rows. Partition key k has NULLs, order key v has NULLs and ties, w breaks some of them.
 constexpr char const* create_table =
   "CREATE TABLE w(id INTEGER, k INTEGER, q VARCHAR, v BIGINT, w INTEGER);"
@@ -180,12 +192,9 @@ TEST_CASE("ranking evaluator matches DuckDB for every direction and NULL order",
       "DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST});
   auto const sliced = GENERATE(false, true);
   INFO(order.sql << (sliced ? " sliced" : ""));
-  auto view = sliced ? cudf::slice(input->view(), {2, 11}, stream).front() : input->view();
-  ranking_order spec;
-  spec.columns   = {1};
-  spec.direction = sirius::op::to_cudf_order(order.type);
-  spec.nulls     = sirius::op::to_cudf_null_order(order.type, order.nulls);
-  auto result    = evaluate_ranking_window(
+  auto view   = sliced ? cudf::slice(input->view(), {2, 11}, stream).front() : input->view();
+  auto spec   = make_order({1}, {order});
+  auto result = evaluate_ranking_window(
     view, {0}, spec, {ranking_function::rank, ranking_function::dense_rank}, stream, mr);
 
   // The sliced table is the rows with id 2 to 10 in DuckDB.
@@ -211,12 +220,10 @@ TEST_CASE("ranking evaluator ranks over several order keys and numbers rows",
 
   SECTION("two order keys, one of them with NULLs")
   {
-    ranking_order spec;
-    spec.columns   = {1, 2};
-    spec.direction = cudf::order::DESCENDING;
-    spec.nulls     = sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
-                                                duckdb::OrderByNullType::NULLS_LAST);
-    auto result    = evaluate_ranking_window(
+    direction const desc_last{
+      "DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST};
+    auto spec   = make_order({1, 2}, {desc_last, desc_last});
+    auto result = evaluate_ranking_window(
       input->view(), {0}, spec, {ranking_function::rank, ranking_function::dense_rank}, stream, mr);
     check_against_duckdb(con,
                          "PARTITION BY k ORDER BY v DESC NULLS LAST, w DESC NULLS LAST",
@@ -224,21 +231,42 @@ TEST_CASE("ranking evaluator ranks over several order keys and numbers rows",
                          {"rank", "dense_rank"},
                          stream);
   }
+  SECTION("order keys with different directions and NULL placements")
+  {
+    direction const desc_last{
+      "DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST};
+    direction const asc_first{
+      "ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST};
+    for (auto const& keys : {std::vector<direction>{desc_last, asc_first},
+                             std::vector<direction>{asc_first, desc_last}}) {
+      auto spec   = make_order({1, 2}, keys);
+      auto result = evaluate_ranking_window(input->view(),
+                                            {0},
+                                            spec,
+                                            {ranking_function::rank, ranking_function::dense_rank},
+                                            stream,
+                                            mr);
+      check_against_duckdb(
+        con,
+        std::string("PARTITION BY k ORDER BY v ") + keys[0].sql + ", w " + keys[1].sql,
+        result->view(),
+        {"rank", "dense_rank"},
+        stream);
+    }
+  }
   SECTION("row_number follows the input order of peers")
   {
     // The id column breaks every tie, so DuckDB's numbering is determined.
-    ranking_order spec;
-    spec.columns   = {1, 3};
-    spec.direction = cudf::order::ASCENDING;
-    spec.nulls     = sirius::op::to_cudf_null_order(duckdb::OrderType::ASCENDING,
-                                                duckdb::OrderByNullType::NULLS_FIRST);
+    direction const asc_first{
+      "ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST};
+    auto spec = make_order({1, 3}, {asc_first, asc_first});
     auto result =
       evaluate_ranking_window(input->view(), {0}, spec, {ranking_function::row_number}, stream, mr);
     check_against_duckdb(
       con, "PARTITION BY k ORDER BY v NULLS FIRST, id", result->view(), {"row_number"}, stream);
 
     // Peers keep their input order.
-    spec.columns = {1};
+    spec = make_order({1}, {asc_first});
     result =
       evaluate_ranking_window(input->view(), {0}, spec, {ranking_function::row_number}, stream, mr);
     auto values = host(result->view().column(0), stream);
@@ -249,18 +277,16 @@ TEST_CASE("ranking evaluator ranks over several order keys and numbers rows",
   }
   SECTION("several functions share one sort")
   {
-    ranking_order spec;
-    spec.columns   = {1};
-    spec.direction = cudf::order::DESCENDING;
-    spec.nulls     = sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
-                                                duckdb::OrderByNullType::NULLS_FIRST);
-    auto result    = evaluate_ranking_window(input->view(),
-                                             {0},
+    direction const desc_first{
+      "DESC NULLS FIRST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_FIRST};
+    auto spec   = make_order({1}, {desc_first});
+    auto result = evaluate_ranking_window(input->view(),
+                                          {0},
                                           spec,
-                                             {ranking_function::dense_rank,
-                                              ranking_function::rank,
-                                              ranking_function::rank,
-                                              ranking_function::dense_rank},
+                                          {ranking_function::dense_rank,
+                                           ranking_function::rank,
+                                           ranking_function::rank,
+                                           ranking_function::dense_rank},
                                           stream,
                                           mr);
     check_against_duckdb(con,
@@ -304,12 +330,9 @@ TEST_CASE("ranking evaluator partitions by strings and several columns, and orde
                                    mr,
                                    {1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1}));
   cudf::table input(std::move(columns));
-  ranking_order spec;
-  spec.columns   = {3};
-  spec.direction = cudf::order::ASCENDING;
-  spec.nulls     = sirius::op::to_cudf_null_order(duckdb::OrderType::ASCENDING,
-                                              duckdb::OrderByNullType::NULLS_FIRST);
-  auto result    = evaluate_ranking_window(
+  auto spec = make_order(
+    {3}, {{"ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST}});
+  auto result = evaluate_ranking_window(
     input.view(), {1, 2}, spec, {ranking_function::rank, ranking_function::dense_rank}, stream, mr);
   check_against_duckdb(con,
                        "PARTITION BY q, k ORDER BY f NULLS FIRST",
@@ -328,8 +351,8 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
   columns.push_back(column<int32_t>({}, cudf::type_id::INT32, stream, mr));
   columns.push_back(column<int64_t>({}, cudf::type_id::INT64, stream, mr));
   cudf::table empty(std::move(columns));
-  ranking_order spec;
-  spec.columns = {1};
+  auto spec = make_order(
+    {1}, {{"ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST}});
 
   SECTION("empty input gives empty INT64 columns")
   {
@@ -338,6 +361,7 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
     REQUIRE(result->num_columns() == 2);
     CHECK(result->num_rows() == 0);
     CHECK(result->view().column(0).type() == cudf::data_type{cudf::type_id::INT64});
+    CHECK(result->view().column(1).type() == cudf::data_type{cudf::type_id::INT64});
   }
   SECTION("invalid requests throw")
   {
@@ -355,5 +379,43 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
     CHECK_THROWS_AS(call({0}, spec, {ranking_function::rank}), std::invalid_argument);
     spec.columns = {4};
     CHECK_THROWS_AS(call({0}, spec, {ranking_function::rank}), std::invalid_argument);
+    // Each order key needs a direction and a NULL placement.
+    spec.columns = {1};
+    spec.directions.clear();
+    CHECK_THROWS_AS(call({0}, spec, {ranking_function::rank}), std::invalid_argument);
   }
+}
+
+TEST_CASE("ranking evaluator ranks narrow integer carriers like their logical type",
+          "[window_evaluator][window_ranking][gpu]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  REQUIRE_FALSE(con.Query(create_table)->HasError());
+  rmm::cuda_stream owning_stream;
+  auto stream = owning_stream.view();
+  auto mr     = cudf::get_current_device_resource_ref();
+  // The partition key k and the order key v of `create_table`, as INT8 and INT16 carriers.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(column<int8_t>({1, 2, 1, 0, 2, 1, 0, 2, 1, 1, 0, 2},
+                                   cudf::type_id::INT8,
+                                   stream,
+                                   mr,
+                                   {1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1}));
+  columns.push_back(column<int16_t>({5, 3, 5, 7, 0, 2, 7, 3, 0, 9, 1, 3},
+                                    cudf::type_id::INT16,
+                                    stream,
+                                    mr,
+                                    {1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1}));
+  cudf::table input(std::move(columns));
+  auto spec = make_order(
+    {1}, {{"DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST}});
+  auto result = evaluate_ranking_window(
+    input.view(), {0}, spec, {ranking_function::rank, ranking_function::dense_rank}, stream, mr);
+  check_against_duckdb(con,
+                       "PARTITION BY k ORDER BY v DESC NULLS LAST",
+                       result->view(),
+                       {"rank", "dense_rank"},
+                       stream);
 }
