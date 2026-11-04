@@ -25,6 +25,7 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
+#include <numeric>
 #include <stdexcept>
 
 namespace sirius::op {
@@ -198,14 +199,11 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
                                   stream,
                                   mr);
 
-    // Forward payload in its original carrier and row order, followed by the window results.
-    std::vector<cudf::column_view> visible;
-    for (std::size_t i = 0; i < _input_width; ++i) {
-      visible.push_back(table.column(i));
-    }
-    for (auto column : results->view()) {
-      visible.push_back(column);
-    }
+    // Forward payload in its original carrier and row order, followed by the window results. The
+    // hidden columns after the payload are not published.
+    std::vector<cudf::size_type> payload(_input_width);
+    std::iota(payload.begin(), payload.end(), 0);
+    cudf::table_view const visible{{table.select(payload), results->view()}};
     struct window_owner {
       std::shared_ptr<cudf::table> results;
       cucascade::read_only_data_batch input;
@@ -213,7 +211,7 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
     auto bytes = memory::saturating_add(input_bytes, results->alloc_size());
     window_owner owner{std::move(results), std::move(batch)};
     output.push_back(make_data_batch_from_view(
-      cudf::table_view(visible), std::move(owner), bytes, space, stream, batch_telemetry()));
+      visible, std::move(owner), bytes, space, stream, batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(std::move(output));
 }
