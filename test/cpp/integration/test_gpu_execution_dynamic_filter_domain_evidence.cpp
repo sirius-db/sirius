@@ -308,6 +308,48 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
 }
 
 TEST_CASE_METHOD(DomainEvidenceFixture,
+                 "domain evidence reads every pin of the scanned files",
+                 "[integration][gpu_execution][dynamic_filter][domain_evidence]")
+{
+  auto const tier           = GENERATE(std::string{"gpu"}, std::string{"host"});
+  auto const other_cols     = GENERATE(std::string{"['marker', 'other', 'payload']"},
+                                   std::string{"['marker', 'other', 'payload', 'k']"});
+  auto const swap_names     = GENERATE(false, true);
+  auto const declared_first = GENERATE(false, true);
+  auto const sidecar        = pin_name() + "_sidecar";
+  // Registry order depends on names and insertion order; varying both puts each pin first.
+  auto const declared   = swap_names ? sidecar : pin_name();
+  auto const undeclared = swap_names ? pin_name() : sidecar;
+  absl::Cleanup unpin   = [&] { con->Query("CALL unpin_table(" + sql_literal(sidecar) + ");"); };
+  CAPTURE(tier, other_cols, swap_names, declared_first);
+  build("build.parquet");
+  auto const source         = directory.file_literal("build.parquet");
+  auto const pin_undeclared = [&] {
+    run_ok("CALL pin_table(" + source + ", tier=" + sql_literal(tier) +
+           ", name=" + sql_literal(undeclared) + ", cols=" + other_cols + ");");
+  };
+  auto const pin_declared = [&] {
+    run_ok("CALL pin_table(" + source + ", tier=" + sql_literal(tier) +
+           ", name=" + sql_literal(declared) +
+           ", cols=['marker', 'other', 'payload', 'k'], unique_cols=['k']);");
+  };
+  if (declared_first) {
+    pin_declared();
+    pin_undeclared();
+  } else {
+    pin_undeclared();
+    pin_declared();
+  }
+
+  auto const sql    = query(source, 95);
+  auto const domain = evidence(sql);
+  REQUIRE(domain.cardinality == 100);
+  REQUIRE(domain.source == sirius::op::dynamic_filter_domain_source::pinned_parquet_exact);
+  REQUIRE(domain.declared_unique);
+  check(sql, {.rows = 190, .gated = true}, {"build.parquet"});
+}
+
+TEST_CASE_METHOD(DomainEvidenceFixture,
                  "multiplying Parquet lineage declines coverage without changing join rows",
                  "[integration][gpu_execution][dynamic_filter][domain_evidence]")
 {

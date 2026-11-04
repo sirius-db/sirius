@@ -843,6 +843,12 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
 
+  /// Every pinned entry whose parquet identity matches @p resolved_file_paths, in registry
+  /// order. OWNING, like find_pinned_entry_for_parquet_files. One file set may be pinned under
+  /// several names with different column sets, and the serve-time matcher may use any of them.
+  [[nodiscard]] std::vector<std::shared_ptr<const pinned_entry>>
+  find_pinned_entries_for_parquet_files(std::span<std::string const> resolved_file_paths) const;
+
   parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Pin @p file_paths' column-chunk bytes into the prefetching cache.

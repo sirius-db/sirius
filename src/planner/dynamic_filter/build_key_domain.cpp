@@ -32,6 +32,10 @@
 
 #include <parquet_multi_file_info.hpp>
 
+#include <algorithm>
+#include <optional>
+#include <string>
+
 namespace sirius::planner {
 
 namespace detail {
@@ -127,6 +131,44 @@ std::optional<std::size_t> catalog_cardinality(duckdb::LogicalGet const& get,
   }
 }
 
+// Exact evidence from one pin of the scanned files, or nullopt when the pin cannot describe the
+// scanned column with its native type.
+std::optional<op::dynamic_filter_domain_evidence> pinned_column_evidence(
+  scan_manager::pinned_entry const& entry,
+  duckdb::ColumnIndex const& column,
+  std::string const& scan_name,
+  duckdb::LogicalType const& scan_type)
+{
+  if (entry.num_rows == 0 || !entry.identity_evidence.passed || !entry.layout_evidence.passed ||
+      !entry.cache_info.table_name.empty() ||
+      (entry.tier != cucascade::memory::Tier::GPU && entry.tier != cucascade::memory::Tier::HOST)) {
+    return std::nullopt;
+  }
+  auto const projection = entry.cache_info.column_projection_for({column});
+  if (projection.size() != 1 || projection[0] >= entry.cache_info.names.size()) {
+    return std::nullopt;
+  }
+  auto const pinned_position = projection[0];
+  auto const& name           = entry.cache_info.names[pinned_position];
+  if (name != scan_name) { return std::nullopt; }
+  auto const native = sirius::get_cudf_type(sirius::from_duckdb(scan_type));
+  if (!native || entry.column_storage.empty()) { return std::nullopt; }
+  if (entry.zone_maps.has_stats() && (pinned_position >= entry.zone_maps.column_count() ||
+                                      entry.zone_maps.column_type(pinned_position) != scan_type)) {
+    return std::nullopt;
+  }
+  for (auto const& chunk : entry.column_storage) {
+    if (pinned_position >= chunk.size() || chunk[pinned_position].native != *native) {
+      return std::nullopt;
+    }
+  }
+  return op::dynamic_filter_domain_evidence{
+    entry.num_rows,
+    op::dynamic_filter_domain_source::pinned_parquet_exact,
+    std::binary_search(
+      entry.declared_unique_columns.begin(), entry.declared_unique_columns.end(), name)};
+}
+
 op::dynamic_filter_domain_evidence evidence_for_column(
   duckdb::LogicalGet const& get,
   std::size_t scan_ordinal,
@@ -167,34 +209,17 @@ op::dynamic_filter_domain_evidence evidence_for_column(
 
     auto const files = resolve_parquet_scan_file_paths(
       function_name.GetIdentifierName(), get.bind_data.get(), get.parameters);
-    auto const entry = registry.find_pinned_entry_for_parquet_files(files);
-    if (!entry || entry->num_rows == 0 || !entry->identity_evidence.passed ||
-        !entry->layout_evidence.passed || !entry->cache_info.table_name.empty() ||
-        (entry->tier != cucascade::memory::Tier::GPU &&
-         entry->tier != cucascade::memory::Tier::HOST)) {
-      return {};
+    // Every pin of one file set describes the same rows, so a declaration on any pin that holds
+    // the column applies; pins that disagree on the row count supply no evidence.
+    std::optional<op::dynamic_filter_domain_evidence> chosen;
+    for (auto const& entry : registry.find_pinned_entries_for_parquet_files(files)) {
+      auto const evidence = pinned_column_evidence(
+        *entry, column, get.names[primary].GetIdentifierName(), get.returned_types[primary]);
+      if (!evidence) { continue; }
+      if (chosen && chosen->cardinality != evidence->cardinality) { return {}; }
+      if (!chosen || evidence->declared_unique) { chosen = evidence; }
     }
-    auto const projection = entry->cache_info.column_projection_for({column});
-    if (projection.size() != 1 || projection[0] >= entry->cache_info.names.size()) { return {}; }
-    auto const pinned_position = projection[0];
-    auto const& name           = entry->cache_info.names[pinned_position];
-    if (name != get.names[primary].GetIdentifierName()) { return {}; }
-    auto const native = sirius::get_cudf_type(sirius::from_duckdb(get.returned_types[primary]));
-    if (!native || entry->column_storage.empty()) { return {}; }
-    if (entry->zone_maps.has_stats() &&
-        (pinned_position >= entry->zone_maps.column_count() ||
-         entry->zone_maps.column_type(pinned_position) != get.returned_types[primary])) {
-      return {};
-    }
-    for (auto const& chunk : entry->column_storage) {
-      if (pinned_position >= chunk.size() || chunk[pinned_position].native != *native) {
-        return {};
-      }
-    }
-    return {entry->num_rows,
-            op::dynamic_filter_domain_source::pinned_parquet_exact,
-            std::binary_search(
-              entry->declared_unique_columns.begin(), entry->declared_unique_columns.end(), name)};
+    return chosen.value_or(op::dynamic_filter_domain_evidence{});
   } catch (...) {
     return {};
   }

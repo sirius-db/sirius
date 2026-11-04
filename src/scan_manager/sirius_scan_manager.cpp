@@ -3574,6 +3574,18 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_p
   return nullptr;
 }
 
+std::vector<std::shared_ptr<const pinned_entry>>
+sirius_scan_manager::find_pinned_entries_for_parquet_files(
+  std::span<std::string const> resolved_file_paths) const
+{
+  std::vector<std::shared_ptr<const pinned_entry>> matches;
+  std::lock_guard pin_lk{_pinned_entries_mutex};
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { matches.push_back(entry); }
+  }
+  return matches;
+}
+
 void validate_column_storage_shape(pinned_column_storage_matrix const& matrix,
                                    std::size_t expected_chunks,
                                    std::size_t expected_columns,
