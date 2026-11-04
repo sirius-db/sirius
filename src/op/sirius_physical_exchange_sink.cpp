@@ -283,11 +283,12 @@ void sirius_physical_exchange_sink::sink(const operator_data& input_data,
 std::size_t sirius_physical_exchange_sink::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
-  // Hash and range hold a partitioned copy beside their input; broadcast and gather send the
-  // input itself.
+  // Hash and range hold a partitioned copy beside their input, and a NULL-key split one more
+  // before it; broadcast and gather send the input itself.
   using mode        = exchange_spec::mode;
   bool const splits = _spec.routing == mode::hash || _spec.routing == mode::range;
-  return splits ? stats.bytes * 2 : 0;
+  if (!splits) { return 0; }
+  return stats.bytes * (_spec.null_keys_to_every_rank ? 3 : 2);
 }
 
 void sirius_physical_exchange_sink::on_finalize_operator()
