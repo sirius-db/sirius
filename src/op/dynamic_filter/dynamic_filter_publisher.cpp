@@ -211,16 +211,6 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
                         ::cuda::stream_ref stream);
 void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
 
-/**
- * @brief The most keys a Bloom of each of @p key_count keys can be sized for under @p cap.
- */
-std::size_t bloom_keys_within_cap(std::uint64_t cap, std::size_t key_count) noexcept
-{
-  auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  auto const blocks        = cap / key_count / alignment * alignment / bloom_bytes_per_block;
-  return blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
-}
-
 }  // namespace
 
 //===----------------------------------------------------------------------===//
