@@ -25,6 +25,8 @@
 #include "scan_manager/preparation_identity.hpp"
 #include "scan_manager/preparation_slot.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "sirius_context.hpp"
+#include "transparent/replay_admission.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/strings/strings_column_view.hpp>
@@ -36,6 +38,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <numeric>
 #include <system_error>
@@ -50,6 +53,35 @@ materialization_program integer_program()
   materialization_program result{701, 4, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
   result.input_types = result.output_types;
   return result;
+}
+std::shared_ptr<physical_check_counters> make_counters(bool track_units = true)
+{
+  auto counters         = std::make_shared<physical_check_counters>();
+  counters->track_units = track_units;
+  return counters;
+}
+template <class Action>
+std::exception_ptr capture_rejection(Action&& action)
+{
+  std::exception_ptr error;
+  try {
+    action();
+  } catch (...) {
+    error = std::current_exception();
+  }
+  REQUIRE(error);
+  return error;
+}
+void check_physical_failure(std::exception_ptr error, std::string const& message, bool drift)
+{
+  REQUIRE(error);
+  try {
+    std::rethrow_exception(error);
+  } catch (sirius::transparent::classified_execution_error const& e) {
+    CHECK(e.cause == sirius::transparent::late_failure_cause::physical_input);
+    CHECK(std::string(e.what()) == message);
+    CHECK(e.reason == (drift ? sirius::transparent::kArrowSchemaDrift : ""));
+  }
 }
 struct integer_tree {
   ArrowSchema schema{}, field{};
@@ -183,11 +215,12 @@ struct harness {
   std::unique_ptr<arrow_import_ingestible> driver;
   std::shared_ptr<arrow_input_gate> gate = std::make_shared<arrow_input_gate>();
   harness(std::shared_ptr<arrow_batch_producer> producer,
-          materialization_program program             = integer_program(),
-          bool empty_source                           = true,
-          sm::reservation_provider* external          = nullptr,
-          std::shared_ptr<arrow_batch_producer> other = {},
-          uint64_t quantum                            = 1)
+          materialization_program program                   = integer_program(),
+          bool empty_source                                 = true,
+          sm::reservation_provider* external                = nullptr,
+          std::shared_ptr<arrow_batch_producer> other       = {},
+          uint64_t quantum                                  = 1,
+          std::shared_ptr<physical_check_counters> counters = {})
   {
     auto unique     = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
     auto envelope   = producer->limits().envelope;
@@ -216,10 +249,15 @@ struct harness {
     binding.emit_empty_source = empty_source;
     binding.admission  = std::make_shared<sm::preparation_admission>(std::move(unique), decision);
     ledger             = std::shared_ptr<sm::preparation_ledger>(binding.admission->consume());
-    profiles->counters = std::make_shared<physical_check_counters>();
-    profiles->counters->track_units = true;
+    profiles->counters = counters ? std::move(counters) : make_counters();
     driver = std::make_unique<arrow_import_ingestible>(std::move(binding), std::move(producer));
     driver->attach_preparation_ledger(ledger);
+  }
+  harness(std::shared_ptr<physical_check_counters> counters,
+          std::shared_ptr<arrow_batch_producer> producer,
+          materialization_program program = integer_program())
+    : harness(std::move(producer), std::move(program), true, nullptr, {}, 1, std::move(counters))
+  {
   }
   std::unique_ptr<scan_info> next(sm::preparation_stop_token stop = {})
   {
@@ -246,11 +284,12 @@ void await_ready(arrow_push_queue const& queue)
   REQUIRE(queue.readiness() == arrow_readiness::ready);
 }
 std::shared_ptr<arrow_push_queue> queue(
+  std::shared_ptr<physical_check_counters> counters,
   materialization_program p                    = integer_program(),
   std::function<void(std::exception_ptr)> fail = [](auto) {})
 {
   return std::make_shared<arrow_push_queue>(
-    p, arrow_push_limits{32, 8192, 8192, 8192}, std::move(fail));
+    p, arrow_push_limits{32, 8192, 8192, 8192}, std::move(fail), std::move(counters));
 }
 }  // namespace
 
@@ -384,24 +423,77 @@ TEST_CASE("Arrow driver preserves empty source and zero-row data as distinct sta
   stream.synchronize();
 }
 
-TEST_CASE("Arrow driver rejects foreign read identity and schema drift", "[arrow_driver]")
+TEST_CASE("Arrow driver rejects foreign read identity and schema drift", "[arrow_driver][fw_s4]")
 {
   auto producer = std::make_shared<pull_producer>();
-  harness h(producer);
   SECTION("schema drift is a physical input failure")
   {
-    producer->wrong_schema = true;
-    try {
-      h.next();
-      FAIL("expected schema refusal");
-    } catch (sirius::transparent::classified_execution_error const& e) {
-      CHECK(e.cause == sirius::transparent::late_failure_cause::physical_input);
+    auto mode        = GENERATE(0, 1, 2);
+    auto track_units = GENERATE(false, true);
+    CAPTURE(mode, track_units);
+    auto counters        = make_counters(track_units);
+    auto program         = integer_program();
+    std::string expected = "Arrow schema does not match its bound program";
+    if (mode == 0) {
+      producer->wrong_schema = true;
+    } else if (mode == 1) {
+      producer->observe_tree = [](ArrowSchema& schema, ArrowArray& array) {
+        schema.n_children = array.n_children = 0;
+      };
+    } else {
+      producer->rows         = {0};
+      producer->observe_tree = [](ArrowSchema& schema, ArrowArray&) {
+        schema.children[0]->format = "d:10,2";
+      };
+      program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL128, -2}};
+      program.input_types        = program.output_types;
+      program.decimal_precisions = {9};
+      expected                   = "Arrow decimal precision does not match its bound program";
     }
+    harness h(counters, producer, program);
+    check_physical_failure(capture_rejection([&] { h.next(); }), expected, true);
+    CHECK(h.profiles->counters == counters);
+    CHECK(counters->arrow_schema_drift_refusals == 1);
+    CHECK(producer->calls == 1);
+    CHECK(h.ledger->permits_in_flight() == 0);
+    CHECK(h.backing.seen->allocated_bytes == 0);
+    h.driver->stop_preparation();
+    CHECK(h.driver->create_batch_coalescer()->flush().empty());
+    CHECK(counters->arrow_schema_drift_refusals == 1);
+  }
+  SECTION("row bounds retain precedence over schema comparison")
+  {
+    producer->rows         = {4};
+    producer->observe_tree = [](ArrowSchema& schema, ArrowArray& array) {
+      schema.n_children = array.n_children = 0;
+    };
+    harness h(producer);
+    check_physical_failure(capture_rejection([&] { h.next(); }),
+                           "Arrow producer exceeded its declared row bound",
+                           false);
+    CHECK(h.profiles->counters->arrow_schema_drift_refusals == 0);
     CHECK(h.ledger->permits_in_flight() == 0);
     CHECK(h.backing.seen->allocated_bytes == 0);
   }
+  SECTION("owned validator retains the schema drift family and reason")
+  {
+    harness h(producer);
+    auto input           = h.next();
+    auto program         = integer_program();
+    program.output_types = {cudf::data_type{cudf::type_id::FLOAT32}};
+    program.input_types  = program.output_types;
+    auto validator       = owned_arrow_split_validator(program);
+    check_physical_failure(
+      capture_rejection([&] {
+        validate_split_for_gpu(
+          701, check_bit(later_check::host_staged), {}, *input, *validator, 4, h.profiles);
+      }),
+      "Arrow schema does not match its bound program",
+      true);
+  }
   SECTION("same schema does not authorize another bound read")
   {
+    harness h(producer);
     auto input        = h.next();
     auto const& arrow = dynamic_cast<owned_arrow_scan_info const&>(*input);
     owned_arrow_scan_info foreign(
@@ -417,12 +509,14 @@ TEST_CASE("Arrow driver rejects foreign read identity and schema drift", "[arrow
   }
   SECTION("errors do not become empty source")
   {
+    harness h(producer);
     producer->fail_read = true;
     CHECK_THROWS_WITH(h.next(), "pull failed");
     CHECK(h.driver->create_batch_coalescer()->flush().empty());
   }
   SECTION("cancel does not become empty source")
   {
+    harness h(producer);
     std::stop_source stop;
     stop.request_stop();
     try {
@@ -439,8 +533,9 @@ TEST_CASE("Arrow driver rejects foreign read identity and schema drift", "[arrow
 TEST_CASE("Arrow push queue wakes an empty source and copies through admitted backing",
           "[arrow_driver]")
 {
-  auto q = queue();
-  harness h(q);
+  auto counters = make_counters();
+  auto q        = queue(counters);
+  harness h(counters, q);
   auto gate = std::make_shared<sm::preparation_gate>();
   h.driver->bind_preparation_wakeup(sm::preparation_wakeup(gate));
   CHECK(std::holds_alternative<sm::preparation_pending>(h.driver->try_claim_split({})));
@@ -487,8 +582,9 @@ TEST_CASE("Arrow push terminal transitions release blocked external offers", "[a
 {
   auto mode = GENERATE(0, 1, 2, 3);
   std::atomic<int> failures{0};
-  auto q = queue(integer_program(), [&](auto) { ++failures; });
-  harness h(q);
+  auto counters = make_counters();
+  auto q        = queue(counters, integer_program(), [&](auto) { ++failures; });
+  harness h(counters, q);
   auto owner      = std::make_shared<integer_tree>();
   auto offered    = owner->offer(owner);
   auto submitting = std::async(std::launch::async, [&] { return q->offer(offered); });
@@ -508,8 +604,9 @@ TEST_CASE("Arrow push terminal transitions release blocked external offers", "[a
 
 TEST_CASE("Arrow push finish drains queued data before EOS", "[arrow_driver]")
 {
-  auto q = queue();
-  harness h(q);
+  auto counters = make_counters();
+  auto q        = queue(counters);
+  harness h(counters, q);
   auto owner      = std::make_shared<integer_tree>();
   auto offered    = owner->offer(owner);
   auto submitting = std::async(std::launch::async, [&] { return q->offer(offered); });
@@ -525,32 +622,67 @@ TEST_CASE("Arrow push finish drains queued data before EOS", "[arrow_driver]")
   CHECK(h.driver->create_batch_coalescer()->flush().empty());
 }
 
-TEST_CASE("Arrow push rejects schema and bound drift before waiting", "[arrow_driver]")
+TEST_CASE("Arrow push rejects schema and bound drift before waiting", "[arrow_driver][fw_s4]")
 {
-  auto mode    = GENERATE(0, 1, 2, 3);
-  int failures = 0;
-  auto q       = queue(integer_program(), [&](auto e) {
+  auto mode           = GENERATE(0, 1, 2, 3, 4, 5, 6);
+  auto track_units    = GENERATE(false, true);
+  auto observe_stored = GENERATE(false, true);
+  CAPTURE(mode, track_units, observe_stored);
+  duckdb::SiriusContext statistics;
+  auto counters         = statistics.physical_counters();
+  counters->track_units = track_units;
+  auto before           = statistics.get_transparent_execution_stats().arrow_schema_drift_refusals;
+  REQUIRE(before == 0);
+  int failures             = 0;
+  uint64_t count_at_report = UINT64_MAX;
+  std::exception_ptr reported;
+  auto q = queue(counters, integer_program(), [&](auto e) {
     ++failures;
-    try {
-      std::rethrow_exception(e);
-    } catch (sirius::transparent::classified_execution_error const& error) {
-      CHECK(error.cause == sirius::transparent::late_failure_cause::physical_input);
-    }
+    reported        = e;
+    count_at_report = counters->arrow_schema_drift_refusals.load();
   });
-  harness h(q);
+  harness h(counters, q);
   auto owner   = std::make_shared<integer_tree>();
   auto offered = owner->offer(owner);
   if (mode == 0) owner->field.format = "f";
   if (mode == 1) offered.retained_bytes = 8193;
   if (mode == 2) owner->array.length = 33;
   if (mode == 3) owner->field.flags = ARROW_FLAG_NULLABLE, owner->column.null_count = 1;
-  CHECK_THROWS(q->offer(offered));
+  if (mode == 4) owner->schema.n_children = owner->array.n_children = 0;
+  if (mode == 5) owner->array.n_children = 0;
+  if (mode == 6) owner->field.format = "f", offered.retained_bytes = 8193;
+  auto error = capture_rejection([&] { q->offer(offered); });
+  auto drift = mode == 0 || mode == 4;
+  std::string expected =
+    mode == 0 ? "Arrow offered schema drift"
+              : (mode == 3 || mode == 5 ? "unsupported or invalid arrow_host_flat_v1 input"
+                                        : "Arrow offered input exceeds its declared bounds");
+  check_physical_failure(error, expected, drift);
+  CHECK(reported == error);
+  check_physical_failure(reported, expected, drift);
   CHECK(failures == 1);
+  CHECK(h.profiles->counters == counters);
+  CHECK(count_at_report == (drift ? 1 : 0));
+  CHECK(counters->arrow_schema_drift_refusals == count_at_report);
+  CHECK(statistics.get_transparent_execution_stats().arrow_schema_drift_refusals ==
+        before + (drift ? 1 : 0));
   CHECK(owner->schema.release);
   CHECK(owner->array.release);
   CHECK(owner.use_count() == 2);
   CHECK(h.backing.seen->allocations == 0);
-  CHECK_THROWS(h.next());
+  CHECK(h.ledger->tracked_units() == 0);
+  if (observe_stored) {
+    auto stored = capture_rejection([&] { h.next(); });
+    CHECK(stored == error);
+    check_physical_failure(stored, expected, drift);
+  } else {
+    h.driver->stop_preparation();
+  }
+  CHECK(failures == 1);
+  CHECK(counters->arrow_schema_drift_refusals == count_at_report);
+  CHECK(statistics.get_transparent_execution_stats().arrow_schema_drift_refusals ==
+        before + (drift ? 1 : 0));
+  CHECK(h.ledger->permits_in_flight() == 0);
 }
 
 TEST_CASE("Arrow push imports selected strings and preserves zero-column cardinality",
@@ -577,8 +709,9 @@ TEST_CASE("Arrow push imports selected strings and preserves zero-column cardina
     owner->array.length                                = mode == 2 ? 3 : 0;
   }
   program.input_types = program.output_types;
-  auto q              = queue(program);
-  harness h(q, program);
+  auto counters       = make_counters();
+  auto q              = queue(counters, program);
+  harness h(counters, q, program);
   auto offered    = owner->offer(owner);
   auto submitting = std::async(std::launch::async, [&] { return q->offer(offered); });
   queue_guard guard{q};
@@ -633,18 +766,29 @@ TEST_CASE("Arrow rootless descriptors require normal EOS from the bound source",
 }
 
 TEST_CASE("Arrow copy and normalization bounds are checked before accepting an offer",
-          "[arrow_driver]")
+          "[arrow_driver][fw_s4]")
 {
-  auto mode    = GENERATE(0, 1);
-  int failures = 0;
-  auto q       = std::make_shared<arrow_push_queue>(
+  auto mode     = GENERATE(0, 1);
+  auto counters = make_counters(false);
+  int failures  = 0;
+  std::exception_ptr reported;
+  auto q = std::make_shared<arrow_push_queue>(
     integer_program(),
     arrow_push_limits{3, 8192, mode == 0 ? 16U : 8192U, mode == 1 ? 1U : 8192U},
-    [&](auto) { ++failures; });
+    [&](auto error) {
+      ++failures;
+      reported = error;
+    },
+    counters);
+  harness h(counters, q);
   auto owner   = std::make_shared<integer_tree>();
   auto offered = owner->offer(owner);
-  CHECK_THROWS(q->offer(offered));
+  auto error   = capture_rejection([&] { q->offer(offered); });
+  CHECK(reported == error);
+  check_physical_failure(error, "Arrow offered input exceeds copy or normalization bounds", false);
   CHECK(failures == 1);
+  CHECK(h.profiles->counters == counters);
+  CHECK(counters->arrow_schema_drift_refusals == 0);
   CHECK(owner.use_count() == 2);
 }
 
@@ -774,8 +918,9 @@ TEST_CASE("Arrow push copies nullable Boolean slices and bound decimal precision
   }
   owner->column.buffers = buffers.data();
   program.input_types   = program.output_types;
-  auto q                = queue(program);
-  harness h(q, program);
+  auto counters         = make_counters();
+  auto q                = queue(counters, program);
+  harness h(counters, q, program);
   auto offered    = owner->offer(owner);
   auto submitting = std::async(std::launch::async, [&] { return q->offer(offered); });
   queue_guard guard{q};
@@ -822,8 +967,10 @@ TEST_CASE("Arrow push copies nullable Boolean slices and bound decimal precision
 }
 
 TEST_CASE("Arrow push refuses decimal precision drift even when the scale matches",
-          "[arrow_driver]")
+          "[arrow_driver][fw_s4]")
 {
+  auto track_units           = GENERATE(false, true);
+  auto counters              = make_counters(track_units);
   auto program               = integer_program();
   program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL128, -2}};
   program.input_types        = program.output_types;
@@ -831,9 +978,19 @@ TEST_CASE("Arrow push refuses decimal precision drift even when the scale matche
   auto owner                 = std::make_shared<integer_tree>(0);
   owner->field.format        = "d:10,2";
   int failures               = 0;
-  auto q                     = queue(program, [&](auto) { ++failures; });
-  CHECK_THROWS(q->offer(owner->offer(owner)));
+  std::exception_ptr reported;
+  auto q = queue(counters, program, [&](auto error) {
+    ++failures;
+    reported = error;
+  });
+  harness h(counters, q, program);
+  auto error = capture_rejection([&] { q->offer(owner->offer(owner)); });
+  CHECK(reported == error);
+  check_physical_failure(error, "Arrow offered decimal precision drift", true);
   CHECK(failures == 1);
+  CHECK(h.profiles->counters == counters);
+  CHECK(counters->arrow_schema_drift_refusals == 1);
+  CHECK(h.ledger->tracked_units() == 0);
   CHECK(owner->schema.release);
   CHECK(owner->array.release);
 }
@@ -926,8 +1083,9 @@ TEST_CASE("Arrow push copy retains foreign backing after a cancelled offer retur
           "[arrow_driver][arrow_ownership]")
 {
   auto cancelled = GENERATE(false, true);
-  auto q         = queue();
-  harness h(q);
+  auto counters  = make_counters();
+  auto q         = queue(counters);
+  harness h(counters, q);
   sirius::test::preparation::hold copying;
   h.backing.seen->before_allocate = [&] { copying.wait(); };
   std::promise<std::thread::id> foreign_release;
@@ -1336,14 +1494,15 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   auto read_fails = GENERATE(false, true);
   sirius::test::preparation::hold reading;
   std::atomic<int> failures{0};
-  auto pull    = std::make_shared<pull_producer>();
-  pull->rows   = {3, 3};
-  pull->domain = sm::preparation_execution_domain::native_reader;
-  auto q       = queue(integer_program(), [&](auto) { ++failures; });
+  auto pull     = std::make_shared<pull_producer>();
+  pull->rows    = {3, 3};
+  pull->domain  = sm::preparation_execution_domain::native_reader;
+  auto counters = make_counters();
+  auto q        = queue(counters, integer_program(), [&](auto) { ++failures; });
   std::shared_ptr<arrow_batch_producer> producer =
     push ? std::static_pointer_cast<arrow_batch_producer>(q)
          : std::static_pointer_cast<arrow_batch_producer>(pull);
-  harness h(producer);
+  harness h(counters, producer);
   int allocations = 0;
   auto pause      = [&] {
     reading.wait();
