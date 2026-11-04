@@ -44,9 +44,6 @@ class memory_space;
 
 namespace sirius::exchange {
 
-/// The exchange's id for one logical flow of batches, the same on every rank.
-using stream_id = std::uint64_t;
-
 /// A distributed query's number, the same on every rank, from 1; not a sirius::query_id_t window.
 using distributed_query_id = std::uint64_t;
 

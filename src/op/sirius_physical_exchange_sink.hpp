@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "exchange/transport.hpp"
+#include "exchange/fabric.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cudf/table/table.hpp>
