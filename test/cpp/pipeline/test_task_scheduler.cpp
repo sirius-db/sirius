@@ -24,6 +24,7 @@
 #include "pipeline/task_scheduler.hpp"
 #include "query_id.hpp"
 #include "scan/test_utils.hpp"
+#include "transparent/replay_admission.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -178,6 +179,7 @@ TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_schedul
   const int num_tasks = 10;
   for (int i = 0; i < num_tasks; ++i) {
     auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    if (i == 0) local_state->set_preferred_device_id(sirius::exec::no_preferred_device);
     auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
     executor.schedule(std::move(task));
   }
@@ -195,6 +197,23 @@ TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_schedul
   REQUIRE(global_state->executed_count.load() == num_tasks);
 
   executor.stop();
+}
+
+TEST_CASE("Task scheduler refuses a device without a configured executor before queueing",
+          "[task_scheduler][config]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  auto manager = initialize_memory_manager(1);
+  task_scheduler executor(lifecycle, {2}, *manager, sirius::test::make_test_telemetry_context());
+  auto global = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  auto local  = std::make_unique<mock_gpu_pipeline_task_local_state>(0, 1);
+  local->set_preferred_device_id(1);
+  auto task = std::make_unique<mock_gpu_pipeline_task>(0, std::move(local), global);
+  CHECK_THROWS_AS(executor.schedule(std::move(task)),
+                  sirius::transparent::classified_execution_error);
+  CHECK(global->executed_count == 0);
+  CHECK(lifecycle.activity(sirius::make_query_id(0)).work == 0);
 }
 
 TEST_CASE("terminate_query fails only its own query and leaves the scheduler running",

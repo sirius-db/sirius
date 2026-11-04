@@ -31,6 +31,7 @@
 #include "planner/query.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -123,6 +124,13 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
       submission = begin_submission(
         _query_lifecycle, *task, "task_scheduler: query lifecycle registration is missing");
       if (!submission) { return; }
+    }
+    if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
+      auto device = gpu_task->get_preferred_device_id();
+      if (device && *device != exec::no_preferred_device && !_gpu_executors.contains(*device))
+        throw transparent::classified_execution_error(
+          transparent::late_failure_cause::physical_input,
+          "GPU task requires a device without a configured executor");
     }
     if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_fsm().queued(

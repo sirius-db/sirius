@@ -142,6 +142,7 @@ bool scoped_pool_access_fault::consumed() const
 
 extern "C" cudaError_t __real_cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned int);
 extern "C" cudaError_t __real_cudaDeviceSynchronize();
+extern "C" cudaError_t __real_cudaEventSynchronize(cudaEvent_t);
 extern "C" cudaError_t __real_cudaMemPoolGetAccess(cudaMemAccessFlags*,
                                                    cudaMemPool_t,
                                                    cudaMemLocation*);
@@ -162,6 +163,13 @@ extern "C" cudaError_t __wrap_cudaDeviceSynchronize()
       status != cudaSuccess)
     return status;
   return __real_cudaDeviceSynchronize();
+}
+
+extern "C" cudaError_t __wrap_cudaEventSynchronize(cudaEvent_t event)
+{
+  auto const status = __real_cudaEventSynchronize(event);
+  if (status != cudaSuccess) return status;
+  return take_status(sirius::test::scoped_cuda_status_fault::synchronize_event);
 }
 
 extern "C" cudaError_t __wrap_cudaMemPoolGetAccess(cudaMemAccessFlags* flags,

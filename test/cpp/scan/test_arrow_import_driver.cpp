@@ -15,16 +15,23 @@
  */
 
 #include "catch.hpp"
+#include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
+#include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
 #include "op/scan/detail/read_retirement.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/query_retirement_test_utils.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/preparation_identity.hpp"
 #include "scan_manager/preparation_slot.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "transparent/plan_source_policy.hpp"
+#include "transparent/read_view_registry.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/strings/strings_column_view.hpp>
@@ -123,6 +130,7 @@ class pull_producer final : public arrow_batch_producer {
   std::function<void()> before_stop_check;
   std::function<void(ArrowSchema&, ArrowArray&)> observe_tree;
   sm::unit_envelope envelope{{8192}, 0};
+  int64_t max_rows                = 3;
   uint64_t temporary_probe_before = 0, temporary_probe_after = 0;
   size_t cursor  = 0;
   int preflights = 0, calls = 0, closes = 0;
@@ -132,7 +140,7 @@ class pull_producer final : public arrow_batch_producer {
   sm::preparation_execution_domain domain = sm::preparation_execution_domain::query_owner;
   std::thread::id owner                   = std::this_thread::get_id();
   sm::preparation_execution_domain execution_domain() const noexcept override { return domain; }
-  arrow_producer_limits limits() const override { return {3, envelope}; }
+  arrow_producer_limits limits() const override { return {max_rows, envelope}; }
   void preflight() override { ++preflights; }
   arrow_readiness readiness() const noexcept override
   {
@@ -180,14 +188,15 @@ struct harness {
   std::shared_ptr<sm::preparation_ledger> ledger;
   std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
   std::shared_ptr<void const> identity             = std::make_shared<int>(4);
-  std::unique_ptr<arrow_import_ingestible> driver;
+  std::shared_ptr<arrow_import_ingestible> driver;
   std::shared_ptr<arrow_input_gate> gate = std::make_shared<arrow_input_gate>();
   harness(std::shared_ptr<arrow_batch_producer> producer,
-          materialization_program program             = integer_program(),
-          bool empty_source                           = true,
-          sm::reservation_provider* external          = nullptr,
-          std::shared_ptr<arrow_batch_producer> other = {},
-          uint64_t quantum                            = 1)
+          materialization_program program                      = integer_program(),
+          bool empty_source                                    = true,
+          sm::reservation_provider* external                   = nullptr,
+          std::shared_ptr<arrow_batch_producer> other          = {},
+          uint64_t quantum                                     = 1,
+          std::function<void(arrow_import_binding&)> configure = {})
   {
     auto unique     = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
     auto envelope   = producer->limits().envelope;
@@ -200,9 +209,12 @@ struct harness {
       w = std::max(w, other->limits().envelope.temporary_charge(quantum));
       retained += other->limits().envelope.retained;
     }
-    backing.grant_bytes = w * scans.size() + retained;
+    uint32_t permits = 0;
+    for (auto const& scan : scans)
+      permits += scan.minimum_permits;
+    backing.grant_bytes = w * permits + retained;
     auto decision =
-      unique->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}, scans.size());
+      unique->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}, permits);
     REQUIRE(decision.deferred);
     arrow_import_binding binding;
     binding.gate          = gate;
@@ -218,7 +230,8 @@ struct harness {
     ledger             = std::shared_ptr<sm::preparation_ledger>(binding.admission->consume());
     profiles->counters = std::make_shared<physical_check_counters>();
     profiles->counters->track_units = true;
-    driver = std::make_unique<arrow_import_ingestible>(std::move(binding), std::move(producer));
+    if (configure) configure(binding);
+    driver = std::make_shared<arrow_import_ingestible>(std::move(binding), std::move(producer));
     driver->attach_preparation_ledger(ledger);
   }
   std::unique_ptr<scan_info> next(sm::preparation_stop_token stop = {})
@@ -253,6 +266,337 @@ std::shared_ptr<arrow_push_queue> queue(
     p, arrow_push_limits{32, 8192, 8192, 8192}, std::move(fail));
 }
 }  // namespace
+
+namespace {
+materialization_program qualified_integer_program()
+{
+  auto program         = integer_program();
+  program.arrow_schema = std::make_shared<arrow_bound_schema const>(
+    arrow_bound_schema{{{"value", "i", cudf::data_type{cudf::type_id::INT32}, false}}});
+  return program;
+}
+struct qualified_integer : integer_tree {
+  std::function<void()> released;
+  explicit qualified_integer(int rows = 3) : integer_tree(rows)
+  {
+    field.name         = "value";
+    array.private_data = this;
+    array.release      = [](ArrowArray* array) {
+      auto& root     = *static_cast<qualified_integer*>(array->private_data);
+      array->release = nullptr;
+      if (root.released) root.released();
+    };
+  }
+  arrow_source_profile profile(std::shared_ptr<qualified_integer> const& self)
+  {
+    arrow_source_profile result;
+    result.completed     = true;
+    result.leases        = self;
+    result.control_bytes = sizeof(*this);
+    auto id              = reinterpret_cast<uintptr_t>(self.get());
+    result.allocations   = {{id, self.get(), sizeof(*this)}};
+    result.buffers       = {
+      {{},
+             arrow_buffer_use{
+         id, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(values) - id), sizeof(values)}}};
+    result.strings.resize(1);
+    return result;
+  }
+};
+void fill_slot(arrow_push_queue::offered_slot& slot,
+               int rows                       = 3,
+               std::function<void()> released = {})
+{
+  auto tree      = std::make_shared<qualified_integer>(rows);
+  tree->released = std::move(released);
+  slot.set_input(tree->schema, tree->array, tree, tree->profile(tree));
+  CHECK_FALSE(tree->schema.release);
+  CHECK_FALSE(tree->array.release);
+}
+}  // namespace
+
+TEST_CASE("Arrow qualified admission retains Q2 credits across dequeue and shared input owners",
+          "[arrow_driver][arrow_admission]")
+{
+  auto rows    = GENERATE(0, 3);
+  auto program = qualified_integer_program();
+  auto q       = std::make_shared<arrow_push_queue>(program, 8192, [](auto) {});
+  queue_guard guard{q};
+  harness h(q, program);
+  auto released = std::make_shared<std::atomic<int>>(0);
+  for (int i = 0; i < 2; ++i) {
+    auto slot = q->acquire_offered_slot();
+    REQUIRE(slot.held());
+    fill_slot(slot, rows, [q, released] {
+      CHECK(q->observe().accepted > 0);
+      ++*released;
+    });
+    REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+    CHECK_FALSE(slot.held());
+  }
+  auto first  = h.next();
+  auto second = h.next();
+  REQUIRE(first);
+  REQUIRE(second);
+  auto retained = dynamic_cast<owned_arrow_scan_info&>(*first).coalesced_copy();
+  CHECK(h.ledger->permits_in_flight() == 2);
+  auto slot = q->acquire_offered_slot();
+  fill_slot(slot, rows);
+  CHECK(q->offer(slot) == arrow_push_queue::offer_outcome::capacity_wait);
+  CHECK(q->observe().accepted == 2);
+  CHECK(q->observe().offered == 1);
+  CHECK(q->observe().reserved_bytes == 3 * 8192);
+  auto waiting =
+    std::async(std::launch::async, [&] { return q->wait_for_capacity_or_terminal(slot); });
+  queue_guard wait_guard{q};
+  first.reset();
+  CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+  CHECK(*released == 0);
+  retained.reset();
+  REQUIRE(waiting.wait_for(5s) == std::future_status::ready);
+  CHECK(waiting.get() == arrow_push_queue::capacity_result::available);
+  CHECK(*released == 1);
+  CHECK(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  auto third = h.next();
+  q->finish();
+  second.reset();
+  third.reset();
+  CHECK(*released == 2);
+  CHECK(q->observe().accepted == 0);
+  CHECK(q->observe().unique_retained_bytes == 0);
+  CHECK_FALSE(h.next());
+}
+
+TEST_CASE("Arrow offered permit is shared across threads and all terminal transitions wake it",
+          "[arrow_driver][arrow_admission]")
+{
+  auto mode = GENERATE(0, 1, 2, 3);
+  auto q    = std::make_shared<arrow_push_queue>(qualified_integer_program(), 8192, [](auto) {});
+  queue_guard guard{q};
+  auto slot = q->acquire_offered_slot();
+  fill_slot(slot);
+  auto waiting = std::async(std::launch::async, [&] { return q->acquire_offered_slot(); });
+  queue_guard wait_guard{q};
+  CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+  CHECK(q->observe().offered == 1);
+  if (mode == 0) slot = {};
+  if (mode == 1) q->finish();
+  if (mode == 2) q->fail(std::make_exception_ptr(std::runtime_error("failed producer")));
+  if (mode == 3) q->cancel();
+  REQUIRE(waiting.wait_for(5s) == std::future_status::ready);
+  auto next = waiting.get();
+  CHECK(next.held() == (mode == 0));
+  if (mode == 1) CHECK(next.status() == arrow_push_queue::capacity_result::closed);
+  if (mode > 1) CHECK(next.status() == arrow_push_queue::capacity_result::failed);
+}
+
+TEST_CASE("Qualified Arrow preserves independent cancellation before and during next",
+          "[arrow_driver][arrow_stop]")
+{
+  auto during           = GENERATE(false, true);
+  auto token_stopped    = GENERATE(false, true);
+  auto original_failure = GENERATE(false, true);
+  auto program          = qualified_integer_program();
+  int failures = 0, released = 0;
+  auto q = std::make_shared<arrow_push_queue>(program, 8192, [&](auto) { ++failures; });
+  queue_guard guard{q};
+  harness h(q, program);
+  auto slot = q->acquire_offered_slot();
+  fill_slot(slot, 3, [&] { ++released; });
+  REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  std::stop_source stop;
+  auto cancel = [&] {
+    if (original_failure) q->fail(std::make_exception_ptr(std::runtime_error("original failure")));
+    q->cancel();
+    if (token_stopped) stop.request_stop();
+  };
+  std::exception_ptr error;
+  if (during) {
+    sirius::test::preparation::hold allocating;
+    h.backing.seen->before_allocate = [&] { allocating.wait(); };
+    auto consuming                  = std::async(std::launch::async, [&] {
+      try {
+        (void)h.next(sm::preparation_stop_token{stop.get_token()});
+      } catch (...) {
+        return std::current_exception();
+      }
+      return std::exception_ptr{};
+    });
+    bool entered                    = allocating.await();
+    cancel();
+    allocating.release();
+    error = consuming.get();
+    REQUIRE(entered);
+  } else {
+    cancel();
+    sm::unit_key key{99, 0};
+    auto permit = h.ledger->try_acquire_unit(key, 0);
+    REQUIRE(permit);
+    try {
+      (void)q->next({key, h.ledger->allocator(permit), {}},
+                    sm::preparation_stop_token{stop.get_token()});
+    } catch (...) {
+      error = std::current_exception();
+    }
+    permit.release();
+    h.ledger->retire_unit(key);
+  }
+  REQUIRE(error);
+  if (original_failure) {
+    CHECK_THROWS_WITH(std::rethrow_exception(error), "original failure");
+  } else if (token_stopped) {
+    try {
+      std::rethrow_exception(error);
+    } catch (std::system_error const& e) {
+      CHECK(e.code() == std::errc::operation_canceled);
+    }
+  } else {
+    CHECK_THROWS_AS(std::rethrow_exception(error), duckdb::InterruptException);
+  }
+  CHECK(failures == (original_failure ? 1 : 0));
+  CHECK(released == 1);
+  CHECK(q->observe().accepted == 0);
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Arrow accepted roots release outside the queue lock on failure and cancellation",
+          "[arrow_driver][arrow_admission][arrow_ownership]")
+{
+  auto failed = GENERATE(false, true);
+  auto q      = std::make_shared<arrow_push_queue>(qualified_integer_program(), 8192, [](auto) {});
+  queue_guard guard{q};
+  auto released = std::make_shared<std::atomic<int>>(0);
+  for (int i = 0; i < 2; ++i) {
+    auto slot = q->acquire_offered_slot();
+    fill_slot(slot, 3, [q, released] {
+      (void)q->observe();
+      ++*released;
+    });
+    REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  }
+  auto slot = q->acquire_offered_slot();
+  fill_slot(slot, 3, [q, released] {
+    (void)q->observe();
+    ++*released;
+  });
+  CHECK(q->offer(slot) == arrow_push_queue::offer_outcome::capacity_wait);
+  auto waiting =
+    std::async(std::launch::async, [&] { return q->wait_for_capacity_or_terminal(slot); });
+  queue_guard wait_guard{q};
+  CHECK(waiting.wait_for(20ms) == std::future_status::timeout);
+  if (failed)
+    q->fail(std::make_exception_ptr(std::runtime_error("producer failure")));
+  else
+    q->cancel();
+  REQUIRE(waiting.wait_for(5s) == std::future_status::ready);
+  CHECK(waiting.get() == arrow_push_queue::capacity_result::failed);
+  CHECK(*released == 2);
+  CHECK(q->offer(slot) == arrow_push_queue::offer_outcome::terminal);
+  slot = {};
+  CHECK(*released == 3);
+  CHECK(q->observe().accepted == 0);
+}
+
+TEST_CASE("Arrow qualified admission rejects valid oversize and first schema drift without waiting",
+          "[arrow_driver][arrow_admission]")
+{
+  auto drift   = GENERATE(false, true);
+  int failures = 0;
+  auto q       = std::make_shared<arrow_push_queue>(
+    qualified_integer_program(), drift ? 8192 : 64, [&](std::exception_ptr failure) {
+      ++failures;
+      try {
+        std::rethrow_exception(failure);
+      } catch (sirius::transparent::classified_execution_error const& error) {
+        CHECK(error.cause == (drift ? sirius::transparent::late_failure_cause::physical_input
+                                          : sirius::transparent::late_failure_cause::resource));
+      }
+    });
+  auto slot = q->acquire_offered_slot();
+  auto tree = std::make_shared<qualified_integer>();
+  if (drift) tree->field.name = "wrong";
+  slot.set_input(tree->schema, tree->array, tree, tree->profile(tree));
+  CHECK_THROWS_AS(q->offer(slot), sirius::transparent::classified_execution_error);
+  CHECK(failures == 1);
+  CHECK(q->observe().accepted == 0);
+  CHECK(slot.held());
+}
+
+TEST_CASE("Arrow admission includes rounded staging before accepting a root",
+          "[arrow_driver][arrow_admission]")
+{
+  auto q = std::make_shared<arrow_push_queue>(qualified_integer_program(), 8192, [](auto) {});
+  q->bind_allocation_granularity(8192);
+  auto slot = q->acquire_offered_slot();
+  fill_slot(slot);
+  try {
+    q->offer(slot);
+    FAIL("rounded staging plus retained source exceeded Bmax");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::resource);
+  }
+  CHECK(q->observe().accepted == 0);
+}
+
+TEST_CASE("Arrow row admission classifies a valid wide root without allocating its payload",
+          "[arrow_driver][arrow_admission]")
+{
+  auto malformed = GENERATE(false, true);
+  auto q =
+    std::make_shared<arrow_push_queue>(qualified_integer_program(), 64ULL << 30, [](auto) {});
+  auto slot          = q->acquire_offered_slot();
+  auto tree          = std::make_shared<qualified_integer>();
+  auto profile       = tree->profile(tree);
+  tree->array.length = tree->column.length = int64_t{INT32_MAX} + 1;
+  auto base                                = reinterpret_cast<void const*>(uintptr_t{0x100000});
+  auto bytes       = static_cast<uint64_t>(tree->array.length) * sizeof(int32_t);
+  tree->buffers[1] = base;
+  if (malformed) tree->field.name = "wrong";
+  profile.memory      = arrow_source_memory::device;
+  profile.device      = 0;
+  profile.allocations = {{1, base, bytes}};
+  profile.buffers     = {{{}, arrow_buffer_use{1, 0, bytes}}};
+  slot.set_input(tree->schema, tree->array, tree, std::move(profile));
+  try {
+    q->offer(slot);
+    FAIL("row limit must refuse before conversion");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == (malformed ? sirius::transparent::late_failure_cause::physical_input
+                                    : sirius::transparent::late_failure_cause::resource));
+  }
+  CHECK(q->observe().accepted == 0);
+}
+
+TEST_CASE("Arrow queue counts a shared parent once while reserving separate root credits",
+          "[arrow_driver][arrow_admission]")
+{
+  auto conflict = GENERATE(false, true);
+  auto q = std::make_shared<arrow_push_queue>(qualified_integer_program(), 8192, [](auto) {});
+  queue_guard guard{q};
+  auto parent = std::make_shared<std::array<int32_t, 3>>(std::array<int32_t, 3>{11, 22, 33});
+  for (unsigned i = 0; i < 2; ++i) {
+    auto slot           = q->acquire_offered_slot();
+    auto tree           = std::make_shared<qualified_integer>();
+    tree->buffers[1]    = parent->data();
+    auto profile        = tree->profile(tree);
+    profile.leases      = parent;
+    auto id             = conflict && i ? 19U : 17U;
+    profile.allocations = {{id, parent->data(), sizeof(*parent)}};
+    profile.buffers     = {{{}, arrow_buffer_use{id, 0, sizeof(*parent)}}};
+    slot.set_input(tree->schema, tree->array, tree, std::move(profile));
+    if (conflict && i) {
+      CHECK_THROWS_AS(q->offer(slot), sirius::transparent::classified_execution_error);
+      return;
+    }
+    REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  }
+  CHECK(q->observe().unique_retained_bytes == sizeof(*parent));
+  CHECK(q->observe().accepted == 2);
+  CHECK(q->observe().reserved_bytes == 2 * 8192);
+  q->cancel();
+  CHECK(q->observe().unique_retained_bytes == 0);
+}
 
 TEST_CASE("Arrow pull claims retain admission until their last input owner releases",
           "[arrow_driver]")
@@ -534,7 +878,9 @@ TEST_CASE("Arrow push rejects schema and bound drift before waiting", "[arrow_dr
     try {
       std::rethrow_exception(e);
     } catch (sirius::transparent::classified_execution_error const& error) {
-      CHECK(error.cause == sirius::transparent::late_failure_cause::physical_input);
+      auto expected = mode == 1 ? sirius::transparent::late_failure_cause::resource
+                                      : sirius::transparent::late_failure_cause::physical_input;
+      CHECK(error.cause == expected);
     }
   });
   harness h(q);
@@ -557,17 +903,21 @@ TEST_CASE("Arrow push imports selected strings and preserves zero-column cardina
           "[arrow_driver]")
 {
   auto mode    = GENERATE(0, 1, 2, 3);
+  auto large   = GENERATE(false, true);
   auto program = integer_program();
   auto owner   = std::make_shared<integer_tree>();
-  std::array<int32_t, 6> offsets{-1, 0, 2, 4, 6, -1};
+  std::array<int32_t, 7> offsets{-1, -1, 0, 2, 4, 6, -1};
+  std::array<int64_t, 7> large_offsets{-1, -1, 0, 2, 4, 6, -1};
   std::array<char, 6> chars{'a', 'b', 'c', 'd', 'e', 'f'};
   std::array<void const*, 3> buffers{nullptr, offsets.data(), chars.data()};
+  if (large) buffers[1] = large_offsets.data();
   if (mode < 2) {
     program.output_types    = {cudf::data_type{cudf::type_id::STRING}};
-    owner->field.format     = "u";
+    owner->field.format     = large ? "U" : "u";
     owner->column.n_buffers = 3;
     owner->column.buffers   = buffers.data();
-    owner->column.length    = 5;
+    owner->column.offset    = 1;
+    owner->column.length    = 4;
     owner->array.offset     = 1;
     owner->array.length     = mode == 0 ? 3 : 0;
     if (mode == 1) buffers[1] = buffers[2] = nullptr;
@@ -646,6 +996,138 @@ TEST_CASE("Arrow copy and normalization bounds are checked before accepting an o
   CHECK_THROWS(q->offer(offered));
   CHECK(failures == 1);
   CHECK(owner.use_count() == 2);
+}
+
+TEST_CASE("Arrow push distinguishes valid admission refusals from malformed roots",
+          "[arrow_driver][arrow_profile]")
+{
+  auto mode    = GENERATE(0, 1, 2, 3, 4);
+  int failures = 0;
+  auto q       = std::make_shared<arrow_push_queue>(
+    integer_program(),
+    arrow_push_limits{mode == 0 ? 2 : 3,
+                      mode == 1 || mode == 4 ? 1U : 8192U,
+                      mode == 2 ? 16U : 8192U,
+                      mode == 3 ? 1U : 8192U},
+    [&](std::exception_ptr failure) {
+      ++failures;
+      try {
+        std::rethrow_exception(failure);
+      } catch (sirius::transparent::classified_execution_error const& error) {
+        auto expected = mode == 4 ? sirius::transparent::late_failure_cause::physical_input
+                                        : sirius::transparent::late_failure_cause::resource;
+        CHECK(error.cause == expected);
+        CHECK(std::string(error.what())
+                .find(mode == 4 ? "arrow_schema_drift" : "arrow_batch_too_large") !=
+              std::string::npos);
+      }
+    });
+  auto owner = std::make_shared<integer_tree>();
+  if (mode == 4) owner->field.format = "f";
+  CHECK_THROWS_AS(q->offer(owner->offer(owner)), sirius::transparent::classified_execution_error);
+  CHECK(failures == 1);
+  CHECK(owner.use_count() == 1);
+  CHECK(owner->schema.release);
+  CHECK(owner->array.release);
+}
+
+TEST_CASE("Arrow push rejects unavailable envelopes at construction",
+          "[arrow_driver][arrow_profile]")
+{
+  auto mode = GENERATE(0, 1, 2, 3, 4, 5);
+  arrow_push_limits limits{3, 8192, 8192, 8192};
+  if (mode == 0) limits.max_offered_bytes = 0;
+  if (mode == 1) limits.max_copy_bytes = 0;
+  if (mode == 2) limits.staging_bytes = 0;
+  if (mode == 3) limits.max_copy_bytes = UINT64_MAX;
+  if (mode == 4) limits.staging_bytes = UINT64_MAX;
+  if (mode == 5) limits.max_rows = -1;
+  try {
+    arrow_push_queue q(integer_program(), limits, [](auto) {});
+    FAIL("invalid envelope was accepted");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::resource);
+    CHECK(std::string(error.what()).find("arrow_envelope_unavailable") != std::string::npos);
+  }
+}
+
+TEST_CASE("Arrow pull classifies valid row-limit refusals after validating the schema",
+          "[arrow_driver][arrow_profile]")
+{
+  auto malformed         = GENERATE(false, true);
+  auto producer          = std::make_shared<pull_producer>();
+  producer->max_rows     = 2;
+  producer->wrong_schema = malformed;
+  harness h(producer);
+  try {
+    (void)h.next();
+    FAIL("invalid input was accepted");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == (malformed ? sirius::transparent::late_failure_cause::physical_input
+                                    : sirius::transparent::late_failure_cause::resource));
+    if (!malformed)
+      CHECK(std::string(error.what()).find("arrow_batch_too_large") != std::string::npos);
+  }
+  CHECK(producer->calls == 1);
+  CHECK_FALSE(h.gate->active);
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Arrow push preserves timestamp units and signed values through sliced imports",
+          "[arrow_driver][arrow_profile]")
+{
+  using T             = cudf::type_id;
+  auto [format, type] = GENERATE(table<char const*, T>({{"tss:", T::TIMESTAMP_SECONDS},
+                                                        {"tsm:", T::TIMESTAMP_MILLISECONDS},
+                                                        {"tsu:", T::TIMESTAMP_MICROSECONDS},
+                                                        {"tsn:", T::TIMESTAMP_NANOSECONDS}}));
+  CAPTURE(format);
+  auto program         = integer_program();
+  program.output_types = {cudf::data_type{type}};
+  program.input_types  = program.output_types;
+  auto owner           = std::make_shared<integer_tree>();
+  std::array<int64_t, 5> values{111, 222, -1234567890123LL, 0, 9876543210123LL};
+  uint8_t validity    = 0b00010111;
+  owner->field.format = format;
+  owner->field.flags  = ARROW_FLAG_NULLABLE;
+  owner->buffers[0]   = &validity;
+  owner->buffers[1]   = values.data();
+  owner->array.offset = owner->column.offset = 1;
+  owner->column.length                       = 4;
+  owner->column.null_count                   = -1;
+  auto q                                     = queue(program);
+  harness h(q, program);
+  auto submitting = std::async(std::launch::async, [&] { return q->offer(owner->offer(owner)); });
+  queue_guard guard{q};
+  await_ready(*q);
+  auto input = h.next();
+  REQUIRE(input);
+  REQUIRE(submitting.wait_for(5s) == std::future_status::ready);
+  CHECK(submitting.get());
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+  auto result = h.driver->materialize_metadata_to_table(*input, *space, stream);
+  auto column = result.table.view().column(0);
+  CHECK(column.type() == program.output_types[0]);
+  CHECK(column.size() == 3);
+  CHECK(column.null_count() == 1);
+  std::array<int64_t, 3> actual{};
+  uint32_t mask = 0;
+  REQUIRE(cudaMemcpyAsync(
+            actual.data(), column.head(), sizeof(actual), cudaMemcpyDeviceToHost, stream.value()) ==
+          cudaSuccess);
+  REQUIRE(cudaMemcpyAsync(
+            &mask, column.null_mask(), sizeof(mask), cudaMemcpyDeviceToHost, stream.value()) ==
+          cudaSuccess);
+  stream.synchronize();
+  CHECK(actual.front() == values[2]);
+  CHECK(actual.back() == values[4]);
+  CHECK((mask & 7) == 5);
+  q->finish();
+  input.reset();
+  CHECK_FALSE(h.next());
 }
 
 TEST_CASE("Arrow cancellation during import waits for completion and vetoes its output",
@@ -751,7 +1233,8 @@ TEST_CASE("Arrow lanes run and close on their declared owner without publishing 
 
 TEST_CASE("Arrow push copies nullable Boolean slices and bound decimal precision", "[arrow_driver]")
 {
-  auto boolean = GENERATE(false, true);
+  auto mode    = GENERATE(0, 1, 2, 3);
+  auto boolean = mode == 0;
   auto program = integer_program();
   auto owner   = std::make_shared<integer_tree>();
   std::array<__int128_t, 3> decimals{123, -456, 0};
@@ -767,9 +1250,10 @@ TEST_CASE("Arrow push copies nullable Boolean slices and bound decimal precision
     owner->column.null_count = 1;
     buffers                  = {&validity, &values};
   } else {
-    program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL128, -2}};
+    int32_t scale              = mode == 1 ? 2 : mode == 2 ? -3 : 10;
+    program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL128, -scale}};
     program.decimal_precisions = {9};
-    owner->field.format        = "d:9,2";
+    owner->field.format        = mode == 1 ? "d:9,2" : mode == 2 ? "d:9,-3" : "d:9,10,128";
     buffers                    = {nullptr, decimals.data()};
   }
   owner->column.buffers = buffers.data();
@@ -1049,6 +1533,270 @@ TEST_CASE("Arrow returned tree callbacks run once on the final retaining thread"
 }
 
 namespace {
+struct retry_observation {
+  std::atomic<unsigned> retries{0};
+  owned_arrow_batch const* root = nullptr;
+  std::atomic<bool> same_root{true};
+  std::function<void()> on_retry;
+};
+class observed_arrow_task final : public sirius::pipeline::gpu_pipeline_task {
+ public:
+  observed_arrow_task(uint64_t id,
+                      std::unique_ptr<sirius::pipeline::sirius_pipeline_task_local_state> local,
+                      std::shared_ptr<sirius::pipeline::sirius_pipeline_task_global_state> global,
+                      std::shared_ptr<retry_observation> observation)
+    : gpu_pipeline_task(id, {}, std::move(local), std::move(global)),
+      observed(std::move(observation))
+  {
+  }
+  std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_rescheduled_task(
+    uint64_t id, std::unique_ptr<sirius::pipeline::sirius_pipeline_task_local_state> local) override
+  {
+    auto const& state   = local->cast<sirius::pipeline::gpu_pipeline_task_local_state>();
+    auto const& input   = dynamic_cast<scan_operator_input const&>(*state._input_data);
+    auto const& split   = dynamic_cast<owned_arrow_scan_info const&>(input.get_scan_info());
+    observed->same_root = observed->same_root && split.batch().get() == observed->root;
+    ++observed->retries;
+    if (observed->on_retry) observed->on_retry();
+    return std::make_unique<observed_arrow_task>(
+      id, std::move(local), get_shared_global_state(), observed);
+  }
+
+ private:
+  std::shared_ptr<retry_observation> observed;
+};
+class arrow_engine_sink final : public sirius::op::sirius_physical_operator {
+ public:
+  arrow_engine_sink()
+    : sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::FILTER, {}, 0)
+  {
+  }
+  void sink(sirius::op::operator_data const& input, ::cuda::stream_ref stream) override
+  {
+    auto const& batches = dynamic_cast<sirius::op::pipelineable_operator_data const&>(input);
+    for (auto const& batch : batches.get_data_batches()) {
+      auto view = sirius::get_cudf_table_view(*batch);
+      columns   = view.num_columns();
+      values.resize(view.num_rows());
+      if (!values.empty() && cudaMemcpyAsync(values.data(),
+                                             view.column(0).head(),
+                                             values.size() * sizeof(int32_t),
+                                             cudaMemcpyDeviceToHost,
+                                             stream.get()) != cudaSuccess)
+        throw std::runtime_error("sink copy failed");
+      retained = batch;
+      ++publications;
+    }
+  }
+  std::vector<int32_t> values;
+  int columns = 0, publications = 0;
+  std::shared_ptr<cucascade::data_batch> retained;
+};
+// A trusted test connector binds a non-replayable stream to the production scan,
+// coordinator, scheduler and GPU executor; only root creation and the result sink are fixtures.
+struct arrow_engine_fixture {
+  decltype(sirius::test::operator_utils::initialize_memory_manager()) manager =
+    sirius::test::operator_utils::initialize_memory_manager();
+  sm::host_reservation_provider backing{*manager};
+  std::shared_ptr<sirius::transparent::read_view_registry> registry =
+    std::make_shared<sirius::transparent::read_view_registry>();
+  bound_read_view view;
+  materialization_program program;
+  std::shared_ptr<sirius::pipeline::completion_handler> completion =
+    std::make_shared<sirius::pipeline::completion_handler>();
+  std::shared_ptr<arrow_push_queue> queue;
+  std::unique_ptr<harness> input;
+  std::unique_ptr<sirius_gpu_scan_operator> scan;
+  arrow_engine_sink sink;
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::shared_ptr<sirius::pipeline::sirius_pipeline_task_global_state> global;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  std::unique_ptr<sirius::pipeline::task_scheduler> scheduler;
+  std::unique_ptr<sirius::creator::task_creator> creator;
+  std::shared_ptr<retry_observation> retries      = std::make_shared<retry_observation>();
+  std::shared_ptr<std::atomic<unsigned>> released = std::make_shared<std::atomic<unsigned>>(0);
+  std::vector<scan_execution_record> records;
+
+  arrow_engine_fixture()
+  {
+    bound_read_identity identity;
+    identity.source = {"test_arrow_stream", source_kind::stream_source, "test.arrow.qualified.v1"};
+    identity.data_view   = stream_identity{17};
+    identity.bound_types = {duckdb::LogicalType::INTEGER};
+    identity.bound_names = {"value"};
+    view.identity        = make_bound_read_identity(std::move(identity), {});
+    view.replay_policy   = {"test_arrow_stream",
+                            sirius::transparent::byte_source_class::stream,
+                            false,
+                            "Arrow stream has no replay authority"};
+    program              = qualified_integer_program();
+    program.contract =
+      allocate_scan_contract(*registry,
+                             {},
+                             program.generation,
+                             1,
+                             std::make_shared<bound_read_view const>(view),
+                             {},
+                             {},
+                             {materializer_kind::stream, "arrow_host_flat_v1"},
+                             {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER});
+    // Duplicate projection makes skipped post-processing observable; filter removes 11.
+    program.output_types.push_back(program.output_types[0]);
+    program.predicates = 1;
+    queue              = std::make_shared<arrow_push_queue>(
+      // Leave room for the real scan's 8x cold estimate and the executor's 2x retry floor.
+      program,
+      8ULL << 20,
+      [done = completion](auto error) { done->report_error(error); });
+    input = std::make_unique<harness>(
+      queue, program, true, &backing, nullptr, 1, [&](arrow_import_binding& binding) {
+        binding.read_identity  = view.identity;
+        binding.output_columns = {0, 0};
+        auto integer           = sirius::logical_type::make(sirius::type_id::INTEGER);
+        binding.predicate      = std::make_shared<sirius::ast::node>(sirius::ast::comparison{
+          sirius::comparison_type::gt,
+          std::make_unique<sirius::ast::node>(sirius::ast::reference{0, integer}),
+          std::make_unique<sirius::ast::node>(sirius::ast::constant{int32_t{11}, integer})});
+      });
+    registry->profiles = input->profiles;
+    registry->bind_split_validator(program.contract, input->driver->materializer().validator);
+    certification_result certified;
+    certified.verdict      = eligibility_verdict::supported;
+    certified.later_checks = check_bit(later_check::host_staged);
+    registry->record_verdict(program.contract, certified);
+    registry->publish_correspondence(
+      certificate_evidence_scope::binding_correspondence, "test stream", std::array{view});
+    input->profiles->counters->scan_execution_for_testing =
+      [this](bool, scan_execution_record const& record) { records.push_back(record); };
+    scan = std::make_unique<sirius_gpu_scan_operator>(
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                  duckdb::LogicalType::INTEGER}),
+      3,
+      input->driver,
+      program.contract,
+      nullptr,
+      registry);
+    scan->operator_id = 1;
+    sink.operator_id  = 2;
+    namespace pl      = sirius::pipeline;
+    pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
+    pipeline->set_pipeline_id(73);
+    pl::sirius_pipeline_build_state build;
+    build.set_pipeline_source(*pipeline, *scan);
+    build.add_pipeline_operator(*pipeline, *scan);
+    build.set_pipeline_sink(*pipeline, sink, 1);
+    global = std::make_shared<pl::sirius_pipeline_task_global_state>(
+      pipeline, sirius::test::make_test_telemetry_context());
+    global->set_completion_handler(completion);
+  }
+  ~arrow_engine_fixture()
+  {
+    queue->cancel();
+    if (scheduler) scheduler->stop();
+    sink.retained.reset();  // Free output before executor streams and allocator.
+    input->profiles->counters->scan_execution_for_testing = {};
+  }
+  std::unique_ptr<sirius::op::operator_data> prepare(
+    int rows, arrow_source_memory memory = arrow_source_memory::pageable_host)
+  {
+    if (rows >= 0) {
+      auto slot = queue->acquire_offered_slot();
+      if (memory == arrow_source_memory::pageable_host) {
+        fill_slot(slot, rows, [count = released] { ++*count; });
+      } else {
+        auto tree      = std::make_shared<qualified_integer>(rows);
+        tree->released = [count = released] { ++*count; };
+        void* values   = nullptr;
+        auto status    = memory == arrow_source_memory::device
+                           ? cudaMalloc(&values, sizeof(tree->values))
+                           : cudaMallocHost(&values, sizeof(tree->values));
+        REQUIRE(status == cudaSuccess);
+        std::shared_ptr<void> owner(values, [memory](void* p) {
+          if (memory == arrow_source_memory::device)
+            cudaFree(p);
+          else
+            cudaFreeHost(p);
+        });
+        if (memory == arrow_source_memory::device)
+          REQUIRE(cudaMemcpy(values, tree->values, sizeof(tree->values), cudaMemcpyHostToDevice) ==
+                  cudaSuccess);
+        else
+          std::memcpy(values, tree->values, sizeof(tree->values));
+        auto profile     = tree->profile(tree);
+        tree->buffers[1] = values;
+        profile.memory   = memory;
+        if (memory == arrow_source_memory::device)
+          REQUIRE(cudaGetDevice(&profile.device) == cudaSuccess);
+        profile.leases      = std::move(owner);
+        profile.allocations = {{1, values, sizeof(tree->values)}};
+        profile.buffers     = {{{}, arrow_buffer_use{1, 0, sizeof(tree->values)}}};
+        slot.set_input(tree->schema, tree->array, tree, std::move(profile));
+      }
+      REQUIRE(queue->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+    }
+    queue->finish();
+    sirius::exec::static_thread_pool pool(2);
+    sirius::exec::scoped_dispatcher dispatcher(pool);
+    sm::preparation_coordinator coordinator(*completion, dispatcher, {2, 2, 2, 1});
+    auto lane = input->driver->make_preparation_source({});
+    sm::preparation_coordinator::source source;
+    source.execution   = lane.execution;
+    source.try_claim   = std::move(lane.try_claim);
+    source.bind_wakeup = std::move(lane.bind_wakeup);
+    source.close       = std::move(lane.close);
+    source.coalescer   = std::move(lane.coalescer);
+    source.destination = scan->get_shared_split_connector();
+    source.construct   = [](auto metadata) {
+      auto bytes = metadata->preparation_bytes();
+      return sirius::test::preparation::make_publication(std::move(metadata), bytes);
+    };
+    coordinator.add_source(std::move(source));
+    input->driver->preflight_for_query();
+    coordinator.arm();
+    coordinator.start();
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!scan->get_split_connector().has_more_splits() && !completion->has_error() &&
+           std::chrono::steady_clock::now() < deadline)
+      coordinator.advance(1ms);
+    REQUIRE_FALSE(completion->has_error());
+    REQUIRE(scan->get_split_connector().has_more_splits());
+    auto result = scan->get_next_task_input_data();
+    REQUIRE(result);
+    auto const& split = dynamic_cast<owned_arrow_scan_info const&>(
+      dynamic_cast<scan_operator_input const&>(*result).get_scan_info());
+    retries->root = split.batch().get();
+    coordinator.drain();
+    return result;
+  }
+  void run(std::unique_ptr<sirius::op::operator_data> data)
+  {
+    namespace pl = sirius::pipeline;
+    lifecycle.open_query(pipeline->get_query_id());
+    sirius::exec::thread_pool_config config;
+    config.num_threads        = 1;
+    config.thread_name_prefix = "arrow-engine";
+    scheduler                 = std::make_unique<pl::task_scheduler>(
+      lifecycle, config, *manager, sirius::test::make_test_telemetry_context());
+    creator = std::make_unique<sirius::creator::task_creator>(
+      lifecycle, sirius::creator::task_creator_config{}, *manager);
+    creator->set_task_scheduler(*scheduler);
+    scheduler->set_task_creator(*creator);
+    scheduler->start();
+    auto local = std::make_unique<pl::gpu_pipeline_task_local_state>(std::move(data));
+    local->set_preferred_device_id(0);
+    scheduler->schedule(
+      std::make_unique<observed_arrow_task>(1, std::move(local), global, retries));
+    auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!pipeline->get_tasks_completed() && !completion->has_error() &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(1ms);
+    bool finished = pipeline->get_tasks_completed() || completion->has_error();
+    sirius::test::retire_scheduler_query(
+      lifecycle, *scheduler, pipeline->get_query_id(), false, creator.get());
+    REQUIRE(finished);
+  }
+};
+
 // Keep the production task's reservation, execution, sink and exception cleanup paths.
 // Only the operator boundary is supplied by the fixture.
 class arrow_task_operator final : public sirius::op::sirius_physical_operator {
@@ -1118,6 +1866,227 @@ class arrow_task_operator final : public sirius::op::sirius_physical_operator {
   }
 };
 }  // namespace
+
+TEST_CASE("Qualified Arrow executes through production scan and executor with the same retry root",
+          "[arrow_driver][arrow_engine][arrow_qualified]")
+{
+  auto rows   = GENERATE(0, 3);
+  auto oom    = GENERATE(false, true);
+  auto memory = GENERATE(arrow_source_memory::device,
+                         arrow_source_memory::pinned_host,
+                         arrow_source_memory::pageable_host);
+  arrow_engine_fixture f;
+  auto data = f.prepare(rows, memory);
+  CHECK(f.input->profiles->counters->arrow_batches_imported == 0);
+  CHECK(f.released->load() == 0);
+  auto injections                       = std::make_shared<test_injections>();
+  injections->gpu_task_oom              = oom ? 1 : 0;
+  injections->gpu_task_launch_error     = oom ? 0 : 1;
+  injections->gpu_task_retry_limit      = 2;
+  injections->gpu_task_retry_backoff_ms = 0;
+  f.completion->injections              = injections;
+  f.run(std::move(data));
+  REQUIRE_FALSE(f.completion->has_error());
+  CHECK(f.retries->retries == 1);
+  CHECK(f.retries->same_root);
+  CHECK(f.released->load() == 1);
+  CHECK(f.queue->observe().accepted == 0);
+  CHECK(f.input->ledger->permits_in_flight() == 0);
+  CHECK(f.sink.publications == 1);
+  CHECK(f.sink.columns == 2);
+  CHECK(f.sink.values == (rows ? std::vector<int32_t>{22, 33} : std::vector<int32_t>{}));
+  CHECK(f.input->profiles->counters->arrow_batches_imported == 1);
+  REQUIRE(f.records.size() == 2);
+  CHECK(f.records[0].producer == execution_record_producer::arrow_import);
+  CHECK(f.records[0].authoritative);
+  CHECK(f.records[0].predicates.empty());
+  CHECK_FALSE(f.records[0].whole_static_complete);
+  CHECK_FALSE(f.records[0].projection_complete);
+  CHECK(f.records[0].layout_width == 1);
+  CHECK(f.records[1].whole_static_complete);
+  CHECK(f.records[1].projection_complete);
+  CHECK(f.records[1].layout_width == 2);
+  for (auto const& record : f.records) {
+    CHECK(record.visibility_complete);
+    CHECK(record.visibility_applied.empty());
+    CHECK(record.positions == row_position_state::none);
+  }
+  REQUIRE(f.sink.retained);
+  CHECK(sirius::get_cudf_table_view(*f.sink.retained).num_rows() == (rows ? 2 : 0));
+}
+
+TEST_CASE("Qualified Arrow preserves executor exhaustion and cancellation without CPU replay",
+          "[arrow_driver][arrow_engine][arrow_qualified]")
+{
+  auto mode = GENERATE(0, 1, 2);
+  arrow_engine_fixture f;
+  auto data                             = f.prepare(3);
+  auto injections                       = std::make_shared<test_injections>();
+  injections->gpu_task_oom              = mode == 1 ? 0 : 100;
+  injections->gpu_task_launch_error     = mode == 1 ? 100 : 0;
+  injections->gpu_task_retry_limit      = 1;
+  injections->gpu_task_retry_backoff_ms = 0;
+  f.completion->injections              = injections;
+  if (mode == 2)
+    f.retries->on_retry = [&] {
+      f.input->driver->stop_preparation();
+      f.completion->report_error(std::make_exception_ptr(duckdb::InterruptException()));
+    };
+  f.run(std::move(data));
+  REQUIRE(f.completion->has_error());
+  using cause = sirius::transparent::late_failure_cause;
+  if (mode == 2)
+    CHECK_THROWS_AS(std::rethrow_exception(f.completion->terminal_error()),
+                    duckdb::InterruptException);
+  else
+    CHECK(f.completion->failure().cause ==
+          (mode == 0 ? cause::oom_exhausted : cause::retry_exhausted));
+  CHECK(f.retries->same_root);
+  CHECK(f.sink.publications == 0);
+  CHECK(f.released->load() == 1);
+  CHECK(f.queue->observe().accepted == 0);
+  CHECK(f.input->ledger->permits_in_flight() == 0);
+  sirius::transparent::plan_source_policy policy;
+  policy.scans = {f.view.replay_policy};
+  CHECK_FALSE(policy.cpu_replay_permitted());
+  CHECK_THROWS(sirius::transparent::require_cpu_replay(
+    policy, "test Arrow input", f.completion->failure().detail));
+}
+
+TEST_CASE("Qualified empty Arrow source emits one typed carrier through the real scan",
+          "[arrow_driver][arrow_engine]")
+{
+  arrow_engine_fixture f;
+  auto data            = f.prepare(-1);
+  auto const& metadata = dynamic_cast<scan_operator_input const&>(*data).get_scan_info();
+  CHECK(dynamic_cast<owned_arrow_scan_info const&>(metadata).rootless());
+  f.run(std::move(data));
+  REQUIRE_FALSE(f.completion->has_error());
+  CHECK(f.sink.publications == 1);
+  CHECK(f.sink.columns == 2);
+  CHECK(f.sink.values.empty());
+  CHECK(f.released->load() == 0);
+  CHECK(f.input->profiles->counters->arrow_batches_imported == 0);
+  CHECK(f.input->ledger->permits_in_flight() == 0);
+}
+
+TEST_CASE("Arrow real consumer rejects stale or inconsistent raw execution records",
+          "[arrow_driver][arrow_engine]")
+{
+  auto mode = GENERATE(0, 1, 2, 3, 4, 5);
+  arrow_engine_fixture f;
+  auto data   = f.prepare(3);
+  auto* space = f.manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+  auto const& metadata = dynamic_cast<scan_operator_input const&>(*data).get_scan_info();
+  auto raw             = f.input->driver->materialize_metadata_to_table(metadata, *space, stream);
+  REQUIRE(raw.execution);
+  if (mode == 0) ++raw.execution->generation;
+  if (mode == 1) raw.execution->layout = std::make_shared<int>(0);
+  if (mode == 2) raw.execution->layout_width = 99;
+  if (mode == 3) raw.execution->authoritative = false;
+  if (mode == 4) raw.required_visibility = std::make_shared<visibility_bindings const>();
+  if (mode == 5) raw.execution->projection_complete = true;
+  CHECK_THROWS_AS(f.input->driver->post_filter_and_project(std::move(raw), *space, stream),
+                  std::invalid_argument);
+  CHECK(f.records.empty());
+  stream.synchronize();
+}
+
+TEST_CASE("Pending Arrow allows another source to progress and wakes the parked coordinator",
+          "[arrow_driver][arrow_admission][arrow_wakeup]")
+{
+  auto transition    = GENERATE(0, 1, 2);  // accept, finish, fail
+  auto program       = qualified_integer_program();
+  auto waiting_queue = std::make_shared<arrow_push_queue>(program, 8192, [](auto) {});
+  auto ready_queue   = std::make_shared<arrow_push_queue>(program, 8192, [](auto) {});
+  queue_guard waiting_guard{waiting_queue}, ready_guard{ready_queue};
+  harness waiting(waiting_queue, program), ready(ready_queue, program);
+  auto slot = ready_queue->acquire_offered_slot();
+  fill_slot(slot);
+  REQUIRE(ready_queue->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  ready_queue->finish();
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  sirius::pipeline::completion_handler completion;
+  sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1});
+  auto waiting_output = std::make_shared<sm::split_connector>();
+  auto ready_output   = std::make_shared<sm::split_connector>();
+  auto add            = [&](harness& h, std::shared_ptr<sm::split_connector> output) {
+    auto lane = h.driver->make_preparation_source({});
+    sm::preparation_coordinator::source source;
+    source.execution   = lane.execution;
+    source.try_claim   = std::move(lane.try_claim);
+    source.bind_wakeup = std::move(lane.bind_wakeup);
+    source.close       = std::move(lane.close);
+    source.coalescer   = std::move(lane.coalescer);
+    source.destination = std::move(output);
+    source.construct   = [](auto metadata) {
+      auto bytes = metadata->preparation_bytes();
+      return sirius::test::preparation::make_publication(std::move(metadata), bytes);
+    };
+    coordinator.add_source(std::move(source));
+  };
+  add(waiting, waiting_output);
+  add(ready, ready_output);
+  std::promise<void> parked;
+  auto idle = parked.get_future();
+  std::atomic<bool> signaled{false};
+  coordinator.before_control_wait_for_testing([&] {
+    if (ready_output->is_discovery_complete() && !signaled.exchange(true)) parked.set_value();
+  });
+  auto query_owner = std::async(std::launch::async, [&] {
+    coordinator.arm();
+    coordinator.start();
+    while (coordinator.snapshot().phase != sm::preparation_coordinator::lifecycle::quiescent)
+      coordinator.advance(std::chrono::hours{1});
+    coordinator.drain();
+  });
+  struct stop_control {
+    sm::preparation_coordinator& control;
+    std::future<void>& owner;
+    ~stop_control()
+    {
+      control.request_stop(sm::stop_reason::normal_eos);
+      if (owner.valid()) owner.wait();
+    }
+  } cleanup{coordinator, query_owner};
+  REQUIRE(idle.wait_for(5s) == std::future_status::ready);
+  CHECK(ready_output->has_more_splits());
+  CHECK_FALSE(waiting_output->is_discovery_complete());
+  CHECK_FALSE(waiting_output->has_more_splits());
+  CHECK(waiting.ledger->tracked_units() == 0);
+  // No test wake or periodic advance: only the producer transition wakes control.
+  if (transition == 0) {
+    auto offered = waiting_queue->acquire_offered_slot();
+    fill_slot(offered);
+    CHECK(waiting_queue->offer(offered) == arrow_push_queue::offer_outcome::accepted);
+    waiting_queue->finish();
+  } else if (transition == 1)
+    waiting_queue->finish();
+  else
+    waiting_queue->fail(std::make_exception_ptr(std::runtime_error("external Arrow failure")));
+  auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (!waiting_output->is_discovery_complete() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(1ms);
+  REQUIRE(waiting_output->is_discovery_complete());
+  ready_output->get_next_split().reset();
+  if (transition == 2)
+    CHECK(completion.has_error());
+  else {
+    REQUIRE(waiting_output->has_more_splits());
+    auto output = waiting_output->get_next_split();
+    REQUIRE(output);
+    auto const& input = dynamic_cast<scan_operator_input const&>(**output);
+    CHECK(dynamic_cast<owned_arrow_scan_info const&>(input.get_scan_info()).rootless() ==
+          (transition == 1));
+    output.reset();
+    CHECK_FALSE(completion.has_error());
+  }
+  coordinator.request_stop(sm::stop_reason::normal_eos);
+  REQUIRE(query_owner.wait_for(5s) == std::future_status::ready);
+  REQUIRE_NOTHROW(query_owner.get());
+}
 
 TEST_CASE("Arrow outputs survive input retirement through task success and sink failure",
           "[arrow_driver][arrow_ownership][arrow_task_lifetime]")
@@ -1330,7 +2299,8 @@ TEST_CASE("Arrow retained budgets are reusable through end of stream",
 
 TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driver][arrow_stop]")
 {
-  auto push   = GENERATE(false, true);
+  auto kind   = GENERATE(0, 1, 2);  // pull, legacy push, qualified push
+  auto push   = kind != 0;
   auto reason = GENERATE(
     sm::stop_reason::normal_eos, sm::stop_reason::user_cancel, sm::stop_reason::failure_induced);
   auto read_fails = GENERATE(false, true);
@@ -1339,11 +2309,12 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   auto pull    = std::make_shared<pull_producer>();
   pull->rows   = {3, 3};
   pull->domain = sm::preparation_execution_domain::native_reader;
-  auto q       = queue(integer_program(), [&](auto) { ++failures; });
+  auto program = kind == 2 ? qualified_integer_program() : integer_program();
+  auto q       = queue(program, [&](auto) { ++failures; });
   std::shared_ptr<arrow_batch_producer> producer =
     push ? std::static_pointer_cast<arrow_batch_producer>(q)
          : std::static_pointer_cast<arrow_batch_producer>(pull);
-  harness h(producer);
+  harness h(producer, program);
   int allocations = 0;
   auto pause      = [&] {
     reading.wait();
@@ -1380,8 +2351,16 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   coordinator.add_source(std::move(source));
   if (push)
     submitting = std::async(std::launch::async, [&] {
-      auto owner = std::make_shared<integer_tree>();
-      if (q->offer(owner->offer(owner))) (void)q->offer(owner->offer(owner));
+      if (kind == 2) {
+        for (int i = 0; i < 2; ++i) {
+          auto slot = q->acquire_offered_slot();
+          fill_slot(slot);
+          REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+        }
+      } else {
+        auto owner = std::make_shared<integer_tree>();
+        if (q->offer(owner->offer(owner))) (void)q->offer(owner->offer(owner));
+      }
     });
   coordinator.arm();
   coordinator.start();

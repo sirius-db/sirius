@@ -41,7 +41,8 @@ class scoped_cuda_status_fault {
     copy_device_to_host = 4,
     copy_host_to_device = 5,
     synchronize_stream  = 6,
-    copy_batch          = 7
+    copy_batch          = 7,
+    synchronize_event   = 8
   };
   scoped_cuda_status_fault(operation op,
                            cudaError_t status,
