@@ -83,8 +83,9 @@ std::unique_ptr<cudf::groupby_scan_aggregation> make_scan(ranking_function funct
   switch (function) {
     case ranking_function::rank:
     case ranking_function::dense_rank:
-      // The rows are already sorted. The scan only compares each row with the one before it, so
-      // it does not read the direction and NULL order. INCLUDE ranks NULL as a value, so rows
+      // The rows are already sorted and the groupby is told so. For presorted keys cuDF does not
+      // sort the values again and only compares each row with the one before it, so the
+      // direction and NULL order arguments are never read. INCLUDE ranks NULL as a value, so rows
       // with a NULL key are peers of each other and get a rank like any other row.
       return cudf::make_rank_aggregation<cudf::groupby_scan_aggregation>(
         function == ranking_function::rank ? cudf::rank_method::MIN : cudf::rank_method::DENSE,

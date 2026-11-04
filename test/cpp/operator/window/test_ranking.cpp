@@ -341,6 +341,53 @@ TEST_CASE("ranking evaluator partitions by strings and several columns, and orde
                        stream);
 }
 
+TEST_CASE("ranking evaluator orders a string key and an integer key in different directions",
+          "[window_evaluator][window_ranking][gpu]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  REQUIRE_FALSE(
+    con
+      .Query("CREATE TABLE w(id INTEGER, k INTEGER, s VARCHAR, w INTEGER);"
+             "INSERT INTO w VALUES (0,1,'b',1),(1,1,'a',2),(2,1,'b',2),(3,1,NULL,1),(4,2,'a',1),"
+             "(5,2,'a',1),(6,2,NULL,2),(7,2,'c',3),(8,1,'a',2),(9,NULL,'b',1),(10,NULL,'b',2),"
+             "(11,2,'c',3)")
+      ->HasError());
+  rmm::cuda_stream owning_stream;
+  auto stream = owning_stream.view();
+  auto mr     = cudf::get_current_device_resource_ref();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(column<int32_t>({1, 1, 1, 1, 2, 2, 2, 2, 1, 0, 0, 2},
+                                    cudf::type_id::INT32,
+                                    stream,
+                                    mr,
+                                    {1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1}));
+  auto strings = sirius::test::operator_utils::make_string_column(
+    {"b", "a", "b", "", "a", "a", "", "c", "a", "b", "b", "c"}, stream, mr);
+  set_validity(*strings, {1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1}, stream, mr);
+  columns.push_back(std::move(strings));
+  columns.push_back(
+    column<int32_t>({1, 2, 2, 1, 1, 1, 2, 3, 2, 1, 2, 3}, cudf::type_id::INT32, stream, mr));
+  cudf::table input(std::move(columns));
+  direction const desc_last{
+    "DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST};
+  direction const asc_first{
+    "ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST};
+  for (auto const& keys : {std::vector<direction>{desc_last, asc_first},
+                           std::vector<direction>{asc_first, desc_last}}) {
+    auto spec   = make_order({1, 2}, keys);
+    auto result = evaluate_ranking_window(
+      input.view(), {0}, spec, {ranking_function::rank, ranking_function::dense_rank}, stream, mr);
+    check_against_duckdb(
+      con,
+      std::string("PARTITION BY k ORDER BY s ") + keys[0].sql + ", w " + keys[1].sql,
+      result->view(),
+      {"rank", "dense_rank"},
+      stream);
+  }
+}
+
 TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
           "[window_evaluator][window_ranking][gpu]")
 {
