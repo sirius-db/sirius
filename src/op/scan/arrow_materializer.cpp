@@ -23,6 +23,20 @@
 #include <string_view>
 
 namespace sirius::op::scan {
+std::unique_ptr<cudf::table> detail::import_arrow_device_columns(
+  ArrowArray const& root,
+  arrow_bound_schema const& schema,
+  arrow_source_profile const& profile,
+  std::shared_ptr<arrow_device_validation_status> observed,
+  exec::submission& submission,
+  rmm::device_async_resource_ref mr)
+{
+  if (!observed) throw std::invalid_argument("Arrow device validation requires a readback owner");
+  submission.on_retire([observed](cudaError_t) noexcept {});
+  return import_arrow_device_columns(
+    root, schema, profile, *observed, ::cuda::stream_ref{submission.stream()}, mr);
+}
+
 owned_arrow_batch::owned_arrow_batch(ArrowSchema& s,
                                      ArrowArray& a,
                                      std::shared_ptr<void> permit,

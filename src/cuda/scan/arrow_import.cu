@@ -1,5 +1,4 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
-#include "exec/cuda_event_completion_poll.hpp"
 #include "op/scan/arrow/arrow_device_import.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -105,17 +104,13 @@ int blocks(int64_t rows)
 }
 }  // namespace
 
-std::unique_ptr<cudf::table> import_arrow_device_columns(
-  ArrowArray const& root,
-  arrow_bound_schema const& schema,
-  arrow_source_profile const& profile,
-  std::shared_ptr<arrow_device_validation_status> observed,
-  exec::submission& submission,
-  rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::table> import_arrow_device_columns(ArrowArray const& root,
+                                                         arrow_bound_schema const& schema,
+                                                         arrow_source_profile const& profile,
+                                                         arrow_device_validation_status& observed,
+                                                         ::cuda::stream_ref stream,
+                                                         rmm::device_async_resource_ref mr)
 {
-  if (!observed) throw std::invalid_argument("Arrow device validation requires a readback owner");
-  submission.on_retire([observed](cudaError_t) noexcept {});
-  ::cuda::stream_ref stream{submission.stream()};
   auto rows = static_cast<cudf::size_type>(root.length);
   rmm::device_buffer status_buffer(sizeof(validation_status), stream, mr);
   auto* device_status = static_cast<validation_status*>(status_buffer.data());
@@ -154,14 +149,14 @@ std::unique_ptr<cudf::table> import_arrow_device_columns(
       device_status);
     CUDF_CUDA_TRY(cudaGetLastError());
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      observed.get(), device_status, sizeof(*observed), cudaMemcpyDeviceToHost, stream.get()));
+      &observed, device_status, sizeof(observed), cudaMemcpyDeviceToHost, stream.get()));
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-    if (observed->invalid ||
-        (child.null_count >= 0 && (observed->nulls > child.null_count ||
-                                   child.null_count > observed->nulls + child.length - rows)))
+    if (observed.invalid ||
+        (child.null_count >= 0 && (observed.nulls > child.null_count ||
+                                   child.null_count > observed.nulls + child.length - rows)))
       throw std::invalid_argument(
         "arrow_layout_unsupported: invalid device payload or declared string window");
-    null_counts[i] = observed->nulls;
+    null_counts[i] = observed.nulls;
   }
   if (schema.columns.empty() && root.null_count && root.buffers[0] && rows) {
     CUDF_CUDA_TRY(cudaMemsetAsync(device_status, 0, sizeof(validation_status), stream.get()));
@@ -182,9 +177,9 @@ std::unique_ptr<cudf::table> import_arrow_device_columns(
                                                              device_status);
     CUDF_CUDA_TRY(cudaGetLastError());
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      observed.get(), device_status, sizeof(*observed), cudaMemcpyDeviceToHost, stream.get()));
+      &observed, device_status, sizeof(observed), cudaMemcpyDeviceToHost, stream.get()));
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-    if (observed->invalid)
+    if (observed.invalid)
       throw std::invalid_argument("arrow_layout_unsupported: nullable record batch");
   }
   std::vector<std::unique_ptr<cudf::column>> columns;
