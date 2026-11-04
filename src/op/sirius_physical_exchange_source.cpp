@@ -30,7 +30,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 
-#include <algorithm>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -53,6 +52,7 @@ struct sirius_physical_exchange_source::state {
   /// Unordered: batches that arrived before the port was wired, in arrival order.
   std::deque<std::shared_ptr<cucascade::data_batch>> queue;
   /// Ordered: batches by (sender, batch number), released together.
+  /// TODO(#2376): `queue` and `held` live outside any repository, so they cannot spill.
   std::map<std::pair<exchange::rank_t, std::uint64_t>, std::shared_ptr<cucascade::data_batch>> held;
   std::set<exchange::rank_t> ended;
   std::exception_ptr error;
@@ -62,7 +62,10 @@ struct sirius_physical_exchange_source::state {
   /// Whether a task has taken any batch from this source.
   bool delivered = false;
 
-  state(std::set<exchange::rank_t> s, bool o) : senders(std::move(s)), ordered(o) {}
+  state(std::set<exchange::rank_t> sender_ranks, bool is_ordered)
+    : senders(std::move(sender_ranks)), ordered(is_ordered)
+  {
+  }
 
   /// Under mutex.
   [[nodiscard]] bool all_ended() const { return ended.size() == senders.size(); }
