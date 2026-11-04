@@ -527,18 +527,15 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.sync();
-      _impl->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _impl->source_device,
-        device_id,
-        e.what());
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    } catch (...) {
+      failures.record_fatal("[sirius_dynamic_bloom_filter]", _impl->source_device, device_id);
     }
   }
   failures.rethrow_if_fatal();
+  for (auto& [replica, stream_lease] : pending) {
+    _impl->replicas.push_back(std::move(replica));
+  }
 }
 
 bool sirius_dynamic_bloom_filter::is_available_on_device(int device_id) const noexcept
@@ -582,15 +579,23 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_impl(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  return detail::compute_membership_mask(
-    _impl.get(), _domain, probe, prior_mask_words, prior_keep, device_id, stream, mr);
+  return detail::compute_membership_mask(_impl.get(),
+                                         _domain,
+                                         probe,
+                                         prior_mask_words,
+                                         prior_keep,
+                                         device_id,
+                                         stream,
+                                         mr,
+                                         preserves_nulls());
 }
 
 bool sirius_dynamic_bloom_filter::prepare_fused_probe(cudf::column_view const& probe,
                                                       int device_id,
                                                       detail::fused_probe& out) const
 {
-  return detail::prepare_fused_membership_probe(_impl.get(), _domain, probe, device_id, out);
+  return detail::prepare_fused_membership_probe(
+    _impl.get(), _domain, probe, device_id, out, preserves_nulls());
 }
 
 namespace detail {
@@ -905,17 +910,21 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
   std::span<dynamic_filter_replica_space const> targets)
 {
   auto constexpr maximum = std::numeric_limits<std::size_t>::max();
-  if (keys.empty() || geometry.raw_bytes == 0 ||
+  // clang-format off
+  if (keys.empty() ||
+      geometry.raw_bytes == 0 ||
       geometry.blocks != geometry.raw_bytes / bloom_bytes_per_block ||
       geometry.raw_bytes % bloom_bytes_per_block != 0 ||
       geometry.raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1) ||
-      geometry.chunk_bytes == 0 || geometry.chunk_bytes % rmm::CUDA_ALLOCATION_ALIGNMENT != 0 ||
+      geometry.chunk_bytes == 0 ||
+      geometry.chunk_bytes % rmm::CUDA_ALLOCATION_ALIGNMENT != 0 ||
       geometry.chunk_bytes > tracked_replica_allocation_bytes(geometry.raw_bytes) ||
       geometry.chunk_bytes > accumulated_bloom_geometry::k_max_transfer_chunk_bytes ||
       keys.size() > maximum / tracked_replica_allocation_bytes(geometry.raw_bytes) ||
       geometry.arrays_bytes != keys.size() * tracked_replica_allocation_bytes(geometry.raw_bytes)) {
     throw accumulation_invariant_error{"invalid accumulated Bloom geometry"};
   }
+  // clang-format on
   for (auto const& active : keys) {
     if (!supports(active.type)) {
       throw accumulation_invariant_error(
@@ -956,7 +965,7 @@ namespace {
 
 /**
  * @brief Throws `accumulation_invariant_error` with @p mismatch unless @p stream belongs to
- * `device`.
+ *        `device`.
  */
 void require_stream_on(::cuda::stream_ref stream, rmm::cuda_device_id device, char const* mismatch)
 {
@@ -1065,7 +1074,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   std::unique_ptr<impl::chunk_pipeline> pipeline;
   sirius::cuda::device_copy_batch copies;
   bool prepared  = false;
-  auto transport = publication_transport::host_staged;
+  auto transport = publication_transport::HOST_STAGED;
   try {
     auto const execute = [&] {
       bool direct = !force_host && !sirius::memory::find_pair_without_pool_access(spaces);
@@ -1105,11 +1114,12 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
           auto const block_size = host->get_block_size();
           auto const blocks =
             geometry.chunk_bytes / block_size + (geometry.chunk_bytes % block_size != 0);
-          auto const charge = multiply(blocks, block_size);
-          staging           = host->allocate_multiple_blocks(geometry.chunk_bytes);
+          staging = host->allocate_multiple_blocks(geometry.chunk_bytes);
           if (observation) { observation->host_staging_bytes = staging->size_bytes(); }
-          if (staging->size_bytes() != charge) {
-            throw accumulation_invariant_error{"accumulated publication HOST charge mismatch"};
+          // The HOST copy loop walks `chunk_bytes` of this window.
+          if (staging->size_bytes() < geometry.chunk_bytes) {
+            throw accumulation_invariant_error{
+              "accumulated publication HOST window is smaller than a chunk"};
           }
           copies.reserve(blocks);
         }
@@ -1124,7 +1134,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
       }
       prepared = true;
       if (direct) {
-        transport = publication_transport::peer_copy;
+        transport = publication_transport::PEER_COPY;
         pipeline->order_after_inserts();
         for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
           for (std::size_t offset = 0; offset < geometry.raw_bytes;
@@ -1136,7 +1146,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
       } else {
         // The root's task stream owns scratch allocation; all other root work follows this join.
         check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(staged allocation)");
-        auto const stage =
+        auto const submit =
           [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
             rmm::cuda_set_device_raii guard{rmm::cuda_device_id{owner.device_id}};
             copies.clear();
@@ -1153,8 +1163,15 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
             }
             auto const status = copies.enqueue(owner.stream_ref());
             check_cuda(status, "device_copy_batch::enqueue(accumulated staging)");
-            check_cuda(cudaStreamSynchronize(owner.stream->value()),
-                       "cudaStreamSynchronize(accumulated staging)");
+          };
+        auto const wait = [](impl::partial const& owner) {
+          check_cuda(cudaStreamSynchronize(owner.stream->value()),
+                     "cudaStreamSynchronize(accumulated staging)");
+        };
+        auto const stage =
+          [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
+            submit(owner, device_bytes, bytes, to_host);
+            wait(owner);
           };
         for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
           for (std::size_t offset = 0; offset < geometry.raw_bytes;
@@ -1167,22 +1184,27 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
                     bytes,
                     true);
               stage(*root, static_cast<std::byte*>(scratch->data()), bytes, false);
+              // No wait follows the merge: the next write to scratch and the copy out of
+              // `root_chunk` run after it on the root stream.
               enqueue_or_chunk(root_chunk,
                                static_cast<std::byte const*>(scratch->data()),
                                geometry.chunk_bytes,
                                1,
                                bytes,
                                root->stream->value());
-              check_cuda(cudaStreamSynchronize(root->stream->value()),
-                         "cudaStreamSynchronize(staged merge)");
             }
             if (!targets.empty()) {
               stage(*root, root_chunk, bytes, true);
+              // Every upload only reads the merged chunk in the window, so all of them run
+              // together; the window is refilled only after the last one retires.
               for (auto* target : targets) {
-                stage(*target,
-                      static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
-                      bytes,
-                      false);
+                submit(*target,
+                       static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
+                       bytes,
+                       false);
+              }
+              for (auto const* target : targets) {
+                wait(*target);
               }
             }
           }
@@ -1217,7 +1239,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
     root->device_id,
     _impl->keys.size(),
     geometry.raw_bytes,
-    transport == publication_transport::peer_copy ? "peer copies" : "HOST staging",
+    transport == publication_transport::PEER_COPY ? "peer copies" : "HOST staging",
     sources.size(),
     targets.size());
   make_filters(root->device_id);

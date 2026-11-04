@@ -14,12 +14,7 @@
  * limitations under the License.
  */
 
-// clang-format off
-#include <variant>
 #include "expression_evaluator/regex/regex_playground.hpp"
-// clang-format on
-
-#include <cudf/cudf_utils.hpp>
 
 namespace sirius {
 namespace regex {
@@ -85,7 +80,6 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
 )***";
 
   cudf::transform_input ti = input;
-#if CUDF_VERSION_NUM >= 2610
   cudf::transform_output const output{cudf::data_type{cudf::type_id::STRING},
                                       cudf::output_nullability::PRESERVE};
   auto result  = cudf::transform(udf,
@@ -100,18 +94,6 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
                                 mr);
   auto columns = result->release();
   return std::move(columns.front());
-#else
-  return cudf::transform_extended(std::span(&ti, 1),
-                                  udf,
-                                  cudf::data_type{cudf::type_id::STRING},
-                                  cudf::udf_source_type::CUDA,
-                                  std::nullopt,
-                                  cudf::null_aware::YES,
-                                  std::nullopt,
-                                  cudf::output_nullability::PRESERVE,
-                                  stream,
-                                  mr);
-#endif
 }
 
 }  // namespace regex

@@ -6,8 +6,7 @@ members = [
     "crates/telemetry/store",
     "crates/telemetry/analyzer",
     "crates/telemetry/server",
-    "crates/sirius-sys",
-    "crates/sirius"
+    "crates/sirius-ffi"
 ]
 
 [workspace.package]
@@ -19,4 +18,3 @@ edition = "2024"
 # version-coupled). The shared "1" caret + the lockfile keep them in lockstep.
 cxx = "1"
 cxx-build = "1"
-sirius-sys = { path = "crates/sirius-sys" }

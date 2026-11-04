@@ -24,6 +24,15 @@ Sirius searches for a config file in this order:
 
 If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
 
+### Concurrent query admission
+
+`sirius.max_concurrent_queries` is a positive startup integer, default **1**, shared by
+connections to one DatabaseInstance. It bounds initialization through retirement. Additional
+queries wait in a cancellable FIFO queue. The former
+`sirius.executor.scan_manager.max_concurrent_queries` key is a deprecated alias; conflicting
+values fail configuration loading. See [Concurrent queries](concurrent-queries.md) for the
+maintenance, error and multi-GPU contracts.
+
 ### `SIRIUS_DISABLE`
 
 Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
@@ -80,6 +89,7 @@ config.load_from_file("/path/to/config.yaml");  // Optional
 
 ```yaml
 sirius:
+  max_concurrent_queries: 1
   topology: { num_gpus: 1 }
   memory:
     gpu:
@@ -193,6 +203,21 @@ table is pinned uncompressed.
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
 `max_compressed_fraction` values instead of silently changing retention behavior.
+
+### Spill compression (`sirius.compression`)
+
+With spill compression on, a GPU batch the downgrade executor moves to the host or disk tier is
+stored Simpatico-compressed and decoded on its way back to the GPU. Plans are chosen per column
+from its type (see [Memory Management](memory-management.md#spill-compression)); no plan files are
+involved. A batch that does not qualify, saves too little, or fails to encode spills
+uncompressed.
+
+| Key | DuckDB setting | Type | Default | Description |
+|-----|----------------|------|---------|-------------|
+| `enable_spill_compression` | `spill_compression` | bool | false | Compress spilled batches. The setting applies to the whole process. |
+| `spill_min_batch_bytes` | — | bytes | 64Mi | Spill batches smaller than this uncompressed. |
+| `spill_max_compressed_fraction` | — | finite double >= 0 | 0.75 | A spilled batch stays compressed only at or below this fraction of its device size. Independent of the input-table `max_compressed_fraction`. |
+| `spill_encode_reserve_fraction` | — | double in [0, 1] | 0.5 | Encode only when this fraction of the batch's size could be reserved in its GPU memory space; otherwise the batch spills uncompressed. `0` skips the check. |
 
 ### How Downgrade Thresholds Work
 
@@ -321,7 +346,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
@@ -487,13 +512,16 @@ Those two knobs derive the settings below, which are therefore **not** individua
 
 ### `sirius.executor.scan_manager.preparation`
 
-These settings are loaded at initialization. Metadata jobs default to a limit of 4096; DV jobs have no configured count cap by default. `0` disables either job limit. Other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+These settings are loaded at initialization. Metadata jobs default to a limit of 4096; DV jobs have no configured count cap by default. `0` disables either job limit. `coordinator_workers: 0` selects dedicated coordinator threads; other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
 
 | Key | Default | Description |
 |---|---|---|
 | `max_inflight_metadata_jobs` | 4096 | Maximum submitted metadata preparation jobs across the query, including queued work. `0` means unlimited. Completion returns the job slot. |
 | `max_inflight_dv_jobs` | unlimited | Maximum DV preparation jobs holding temporary-memory permits, including queued work. Omitted or `0` imposes no configured count cap. Admission may grant fewer permits when HOST memory is insufficient. |
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
+| `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
+| `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
+| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Metadata-only attempts still run coordination on the query owner. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -513,6 +541,9 @@ sirius:
       preparation:
         max_inflight_metadata_jobs: 4096
         max_inflight_dv_jobs: 0
+        coordinator_workers: 1
+        native_reader_workers: 2
+        max_native_readers: 64
         lookahead_batches: 2
         max_control_work: 4
         drain_quantum: 4
@@ -557,9 +588,11 @@ explicit GPU capacity in YAML, it is computed at startup as
 GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
 default is narrowed to
 `min(physical-memory default, max(1 byte, smallest resolved GPU capacity / 40))`.
-`max_build_hash_table_bytes` defaults to **2× that batch default**. Explicit
-`operator_params` values are applied afterward and still override each value
-individually.
+`max_build_hash_table_bytes` defaults to **8× the startup-resolved
+`hash_partition_bytes`**, including an explicit YAML partition size.
+`max_build_probe_resident_bytes` defaults independently to **8× the batch default**.
+An explicit value for either budget overrides its default. `SET hash_partition_bytes`
+does not re-derive either budget; `RESET` restores each registered startup default.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -567,10 +600,11 @@ individually.
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
-| `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT and REPLICATE (`EXCEPT ALL` / `INTERSECT ALL`). REPLICATE may exceed the byte target by one row. A small value splits REPLICATE output into many small batches and slows those queries. 0 disables ordinary CONCAT coalescing and REPLICATE's byte target; CONCAT's `concat_all` mode still combines the whole partition |
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
-| `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
+| `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission). 0 disables BUILD_PROBE. |
+| `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build-side payload a BUILD_PROBE join may keep GPU-resident (un-spillable) for the whole probe stream. 0 disables BUILD_PROBE. |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
@@ -590,7 +624,14 @@ individually.
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
-**Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
+`max_build_probe_resident_bytes` is connection-local: `SET` and `RESET` affect only the
+issuing connection, and `SET GLOBAL` is rejected. Planning captures its value from the
+immutable query options; existing plans retain their admission budget. `RESET` restores
+the registered default (including a YAML override).
+
+**Note:** `max_build_probe_resident_bytes` can be larger than `concat_batch_bytes`. When the partition operator selects BUILD_PROBE, or folds a single-partition build whole for dynamic-filter publication (both admissions bounded by `max_build_probe_resident_bytes`), it configures CONCAT to concatenate all build batches into one. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
+
+BUILD_PROBE admission requires measured build rows and a full-build count within `cudf::size_type`'s row limit, so even a completely skewed partition can be concatenated. MARK joins follow the same admission rules as SEMI joins and can use partitioned STANDARD execution. Hash-table costs exclude cuco capacity rounding and auxiliary allocations; hash-partitioned admissions use rounded-up averages that do not bound skew. Resident accounting uses decoded bytes even for compressed inputs. Folding can temporarily hold both input and output, and concurrent joins can exhaust available memory despite individual admission budgets.
 
 Runtime distinct-build probing is an internal join policy, not a user configuration choice. It is
 temporarily disabled while the cuCollections defect tracked in #1600 remains unresolved. The
@@ -701,8 +742,7 @@ per-pool extras.
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
-GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`, which requires
-`> 2`.
+GPU's CPU topology. `num_threads` must be `> 0` for every pool.
 
 ## DuckDB Settings Changed by Sirius
 
@@ -805,7 +845,8 @@ SET enable_compressed_materialization = false;
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
-| `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
+| `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B) |
+| `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build payload kept GPU-resident by a BUILD_PROBE join |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
@@ -894,10 +935,16 @@ retention gates.
 | `pin_table_compression` | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
-| `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |
+| `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
 
 Both size gates are evaluated on the narrowed table when compressed materialization is active.
 See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authoring, and results.
+
+### Spill Compression (Simpatico)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `spill_compression` | false | Store batches the downgrade executor spills to the host or disk tier Simpatico-compressed. Applies to the whole process, not just the session. See [Spill compression](#spill-compression-siriuscompression) for the YAML-only gates. |
 
 ### Late Materialization (experimental)
 
@@ -912,6 +959,16 @@ still an experimental optimization, not a normal session choice.
 Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
+
+### Grouped Aggregation (experimental)
+
+Off by default, and gated by an environment variable rather than `sirius_config`/`SET`, like late materialization. The path applies only to batches it can handle and falls back to cuDF's group-by for anything else, so the variable never changes query results.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIRIUS_EXP_LOWCARD_GROUPBY` | off | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. Set to `1` to enable; any other value leaves it off. |
+
+See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
 
 ### Runtime Data Size Estimation
 

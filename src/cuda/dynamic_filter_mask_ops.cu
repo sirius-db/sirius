@@ -14,14 +14,13 @@
  * limitations under the License.
  */
 
-#include "helper/utils.hpp"
-
 #include <rmm/error.hpp>
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda/dynamic_filter_fused_probe.cuh>
 #include <cuda_runtime.h>
 
+#include <helper/utils.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <telemetry/nvtx.hpp>
@@ -34,7 +33,7 @@
 namespace sirius::op {
 namespace {
 constexpr int block_size                   = 256;
-constexpr std::size_t fused_round_capacity = 4;
+constexpr std::size_t fused_round_capacity = fused_membership_round_capacity;
 constexpr std::size_t fused_block_limit    = 4096;
 
 /// @brief A round of fused membership probes. Each round can contain up to `fused_round_capacity`
@@ -60,11 +59,13 @@ struct fused_round {
 };
 
 static_assert(std::is_trivially_copyable_v<fused_round>);
+// Kernel arguments are limited to 4 KiB.
+static_assert(sizeof(fused_round) <= 4096);
 
 using block_reduction = cub::BlockReduce<cudf::size_type, block_size>;
 
-/// @brief Adds the block's sum of @p value to @p counter. Every thread of the block must call it;
-/// it synchronizes before returning so the caller can reuse @p scratch.
+/// @brief Whether @p row survives an optional BOOL8 mask: true without a mask, otherwise only when
+/// the row is valid and set. A null row is rejected.
 __device__ __forceinline__ bool mask_keeps(bool const* mask,
                                            detail::probe_validity valid,
                                            cudf::size_type row) noexcept
@@ -82,7 +83,6 @@ __device__ __forceinline__ void add_block_count(block_reduction::TempStorage& sc
   if (threadIdx.x == 0 && total != 0) { atomicAdd(counter, total); }
   __syncthreads();
 }
-static_assert(sizeof(fused_round) <= 4096);
 
 /// @brief Fused membership probe kernel.
 /// @note `__grid_constant__` lets the probe lookups take references into the launch argument
@@ -157,7 +157,7 @@ void try_fused_membership_mask(std::span<fused_membership_input const> steps,
   if (running.type().id() != cudf::type_id::BOOL8 || running.nullable() ||
       (residual && (residual->type().id() != cudf::type_id::BOOL8 || residual->size() != rows)) ||
       (!counts.empty() &&
-       counts.size() != steps.size() + static_cast<std::size_t>(bool(residual)))) {
+       counts.size() != steps.size() + static_cast<std::size_t>(residual.has_value()))) {
     throw std::invalid_argument("invalid fused membership buffers");
   }
   for (auto const& step : steps) {
@@ -185,9 +185,10 @@ void try_fused_membership_mask(std::span<fused_membership_input const> steps,
       .rows           = rows,
       .active_steps   = static_cast<int>(size),
       .residual_count = !counts.empty() && first == 0 && residual ? counts.data() : nullptr,
-      .step_counts =
-        counts.empty() ? nullptr : counts.data() + first + static_cast<std::size_t>(bool(residual)),
-      .initialize = first == 0};
+      .step_counts    = counts.empty()
+                          ? nullptr
+                          : counts.data() + first + static_cast<std::size_t>(residual.has_value()),
+      .initialize     = first == 0};
     std::copy_n(probes.begin() + static_cast<std::ptrdiff_t>(first), size, args.probes.data());
     fused_membership_mask_kernel<<<blocks, block_size, 0, stream.get()>>>(args);
     RMM_CUDA_TRY(cudaPeekAtLastError());

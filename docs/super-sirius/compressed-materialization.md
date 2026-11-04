@@ -205,6 +205,11 @@ materialized wide. An operator the classifier does not model is by construction 
 restores at, so the default under uncertainty is native. Retractions are counted by the
 plan-time `scan_narrow_targets_retracted` counter.
 
+A compacted (filter-pushdown) Simpatico decode of a GPU-tier compressed chunk writes such a
+column directly in its restore type when the scan's output assembly is a leading identity, so the
+widening cast, and its `scan_columns_restored` count, is skipped for those chunks. Other decodes
+still restore in scan normalization. See [Decode to Restore Type](optimizations.md#decode-to-restore-type).
+
 The policy commutes with the dynamic-filter guard in the propagation pass — both only ever flip
 narrow → native, so a guard target the policy already retracted is a no-op for the guard, and
 payload columns that no dynamic filter targets keep their transport verdicts. Zero-benefit pruning
@@ -521,7 +526,7 @@ basis unchanged.
   dispatches per chunk and the recorded metadata is identical either way.
 - Both on, the GPU-tier narrowing policy retracts a target: the plan target is native, decode
   still yields the narrow carrier, and scan normalization restores it (counted by
-  `scan_columns_restored`). Pin-on/query-off behaves the same way. An entry's tier, not its
+  `scan_columns_restored`), unless a compacted decode already wrote it in the native type. Pin-on/query-off behaves the same way. An entry's tier, not its
   compression, decides `sidecar_from_gpu_tier_pin`.
 - INSERT deltas: the residency gate installs no narrow sidecar when deltas will serve (see the
   residency states above); entry chunks and their metadata are untouched by deltas.

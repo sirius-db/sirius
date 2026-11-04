@@ -87,6 +87,8 @@ class dynamic_filter_publish_plan final {
     bool build_key_proven_unique                         = false;
     bool build_key_declared_unique                       = false;
     dynamic_filter_domain_source build_key_domain_source = dynamic_filter_domain_source::unknown;
+    // NULL-safe equality: retain probe NULLs as conservative false positives.
+    bool preserve_nulls = false;
 
     [[nodiscard]] bool operator==(admitted_key const&) const = default;
   };

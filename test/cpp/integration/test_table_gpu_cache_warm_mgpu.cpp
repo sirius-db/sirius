@@ -37,11 +37,9 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>

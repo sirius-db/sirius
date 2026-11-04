@@ -10,19 +10,15 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "util/host_observation.hpp"
+#include "util/nvcomp_payload_format.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
-
-#include <rmm/device_buffer.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -120,6 +116,7 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_le(v, META_ANS);
       push_le(v, a.uncompressed_size);
       push_le(v, a.original_type_id);
+      push_le(v, a.payload_format);
     }
     void operator()(leaf_meta::bitcomp const& b)
     {
@@ -136,6 +133,7 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_le(v, c.num_deltas);
       push_le(v, c.num_RLEs);
       push_le(v, c.use_bp);
+      push_le(v, c.payload_format);
     }
     void operator()(leaf_meta::snappy const& s)
     {
@@ -173,7 +171,9 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
     }
     case META_ANS: {
       leaf_meta::ans a;
-      if (!r.read_le(a.uncompressed_size) || !r.read_le(a.original_type_id)) return false;
+      if (!r.read_le(a.uncompressed_size) || !r.read_le(a.original_type_id) ||
+          !r.read_le(a.payload_format))
+        return false;
       out = a;
       return true;
     }
@@ -188,10 +188,11 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
     case META_CASCADED: {
       std::uint64_t us;
       std::int32_t ti, num_deltas, nr, bp;
+      std::uint8_t payload_format;
       if (!r.read_le(us) || !r.read_le(ti) || !r.read_le(num_deltas) || !r.read_le(nr) ||
-          !r.read_le(bp))
+          !r.read_le(bp) || !r.read_le(payload_format))
         return false;
-      out = leaf_meta::nvcomp_cascaded{us, ti, num_deltas, nr, bp};
+      out = leaf_meta::nvcomp_cascaded{us, ti, num_deltas, nr, bp, payload_format};
       return true;
     }
     case META_SNAPPY: {
@@ -335,7 +336,14 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 13: a Bitpack "packed" buffer carries five decode guard words rather than three,
 //     because the 128-bit gather spans five uint32 words. The count is part of the
 //     buffer's num_rows, so a v12 payload read with a v13 decoder would over-read.
-static constexpr std::uint8_t kVersion = 13;
+//
+// 14: ANS and Cascaded leaf metadata explicitly records the nvCOMP payload format.
+//     File layout and codec compatibility can now evolve independently.
+//
+// 15: a ZigZag output no fused op consumes is stored like Delta's and FOR's, as a Raw
+//     passthrough {data, offsets} parked on the ZigZag node, instead of as a "zigzag"
+//     buffer on the ZigZag node's own rep.
+static constexpr std::uint8_t kVersion = 15;
 
 // Per-column validity record, written right after num_rows:
 //
@@ -556,6 +564,15 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
       if (!r.read_le(ld.type_tag)) return bad("truncated leaf type_tag");
       if (!r.read_le(ld.num_rows)) return bad("truncated leaf num_rows");
       if (!read_meta(r, ld.meta)) return bad("truncated/unknown leaf meta");
+      if (auto const* meta = std::get_if<leaf_meta::ans>(&ld.meta)) {
+        auto const error = detail::nvcomp_payload_compatibility_error("ans", meta->payload_format);
+        if (!error.empty()) return bad(error);
+      }
+      if (auto const* meta = std::get_if<leaf_meta::nvcomp_cascaded>(&ld.meta)) {
+        auto const error =
+          detail::nvcomp_payload_compatibility_error("nvcomp_cascaded", meta->payload_format);
+        if (!error.empty()) return bad(error);
+      }
 
       std::uint8_t nb;
       if (!r.read_le(nb)) return bad("truncated num_bufs");

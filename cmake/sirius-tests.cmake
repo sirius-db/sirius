@@ -115,6 +115,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     sirius_cuda_fault_test
     test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
     test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
+    test/cpp/memory/test_device_transfer_fault.cpp
+    test/cpp/scan_manager/test_memory_prefetcher_health.cpp
     test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
     test/cpp/utils/cuda_status_fault.cpp
     src/sirius_extension_entry.cpp
@@ -130,8 +132,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     PRIVATE sirius_core duckdb_static ZLIB::ZLIB Catch2::Catch2WithMain
             ${SIRIUS_CURL_TARGET} ${CMAKE_DL_LIBS})
   sirius_link_duckdb_extensions(sirius_cuda_fault_test PRIVATE)
-  # Wrap the Sirius batch boundary: cuDF dispatches the CUDA batch call from its
-  # shared library.
+  # Wrap device_copy_batch::enqueue at the Sirius boundary: cuDF dispatches its
+  # CUDA batch call from its shared library.
   target_link_options(
     sirius_cuda_fault_test
     PRIVATE
@@ -139,10 +141,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "LINKER:--wrap=cudaStreamWaitEvent"
     "LINKER:--wrap=cudaDeviceSynchronize"
     "LINKER:--wrap=cudaMemPoolGetAccess"
+    "LINKER:--wrap=cudaMemcpyAsync"
+    "LINKER:--wrap=cudaMemcpyBatchAsync"
+    "LINKER:--wrap=cudaStreamSynchronize"
+    "LINKER:--wrap=_ZN9cucascade6memory21exclusive_stream_pool14acquire_streamENS1_21stream_acquire_policyE"
     "LINKER:--wrap=cudaMemcpyPeerAsync"
     "LINKER:--wrap=_ZNK6sirius4cuda17device_copy_batch7enqueueEN4cuda3__410stream_refE"
     "LINKER:--wrap=cudaEventRecord"
-    "LINKER:--wrap=cudaStreamSynchronize"
     "LINKER:--wrap=cudaEventCreateWithFlags")
   set_target_properties(
     sirius_cuda_fault_test

@@ -25,7 +25,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdint>
 #include <stdexcept>
 
 namespace sirius::io::cache {

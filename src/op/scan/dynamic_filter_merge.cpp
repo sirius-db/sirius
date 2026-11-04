@@ -22,22 +22,22 @@
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/version_config.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/error.hpp>
 
+#include <cuda/buffer>
 #include <cuda_runtime_api.h>
 
 #include <data/data_batch_utils.hpp>
-#include <expression/ast/utils.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
-#include <sirius/exception.hpp>
 #include <telemetry/nvtx.hpp>
 
 #include <algorithm>
@@ -45,15 +45,12 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <concepts>
 #include <cstddef>
-#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -136,7 +133,7 @@ struct application_program_decisions {
 struct application_program_state : application_program_decisions {
   sirius::op::dynamic_filter_snapshot snapshot;  ///< Compared by generation.
   bool fused_membership = false;                 ///< The ablation paired programs differ in.
-  std::unique_ptr<sirius::ast::node> residual;  ///< Each program owns a copy; compared by presence.
+  std::unique_ptr<sirius::ast::node> residual;   ///< Taken from its layout; compared by presence.
 };
 
 /// @brief A key column compacted alongside the survivor row IDs.
@@ -336,6 +333,35 @@ detail::compaction_strategy detail::choose_compaction_strategy(
   return evaluate_compaction_policy(input).strategy;
 }
 
+namespace {
+template <typename Visit>
+void visit_reader_dynamic_filters(sirius::op::dynamic_filter_snapshot const& filters,
+                                  scan_plan const& plan,
+                                  std::optional<int> device_id,
+                                  Visit&& visit)
+{
+  for (auto const& [col_idx, filter] : filters.entries()) {
+    if (col_idx >= plan.output_layout.size()) continue;
+    auto const& entry = plan.output_layout[col_idx];
+    if (entry.source != scan_plan::output_entry::DATA || entry.idx >= plan.data_columns.size())
+      continue;
+    if (device_id && !filter->is_available_on_device(*device_id)) continue;
+    auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(filter.get());
+    if (lowerable) visit(*lowerable, plan.data_columns[entry.idx].name);
+  }
+}
+}  // namespace
+
+bool has_reader_dynamic_filter(sirius::op::dynamic_filter_snapshot const& filters,
+                               scan_plan const& plan,
+                               std::optional<int> device_id) noexcept
+{
+  bool found = false;
+  visit_reader_dynamic_filters(
+    filters, plan, device_id, [&](auto const&, auto const&) { found = true; });
+  return found;
+}
+
 cudf::ast::expression const* merge_dynamic_filters_into_ast(
   cudf::ast::tree& tree,
   cudf::ast::expression const* existing_root,
@@ -345,18 +371,11 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
 {
   device_id        = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
   auto const* root = existing_root;
-  for (auto const& [col_idx, filter] : filters.entries()) {
-    if (col_idx >= plan.output_layout.size()) { continue; }
-    auto const& entry = plan.output_layout[col_idx];
-    if (entry.source != scan_plan::output_entry::DATA) { continue; }  // hive — skip
-    auto const& parquet_col_name = plan.data_columns[entry.idx].name;
-
-    if (!filter->is_available_on_device(device_id)) { continue; }
-    auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(filter.get());
-    if (!lowerable) { continue; }
-    auto const& col_ref = tree.emplace<cudf::ast::column_name_reference>(parquet_col_name);
-    root                = and_into(tree, root, lowerable->to_ast(tree, col_ref, device_id));
-  }
+  visit_reader_dynamic_filters(
+    filters, plan, device_id, [&](auto const& lowerable, auto const& name) {
+      auto const& col_ref = tree.emplace<cudf::ast::column_name_reference>(name);
+      root                = and_into(tree, root, lowerable.to_ast(tree, col_ref, device_id));
+    });
   return root;
 }
 
@@ -583,9 +602,7 @@ std::unique_ptr<application_program_state> prepare_state(
         })) {
       throw std::invalid_argument("cached dynamic-filter projection is invalid");
     }
-    if (input.cached_layout->residual) {
-      program->residual = sirius::ast::clone(*input.cached_layout->residual);
-    }
+    program->residual = std::move(input.cached_layout->residual);
   }
   std::vector<std::optional<double>> estimates;
   for (auto const& step : program->membership) {
@@ -804,6 +821,75 @@ void apply_deferred_keys(application_result_state& result,
 }
 
 //===----------GATHER_ONCE compaction strategy----------===//
+/// @brief Allocates optional prefix counters, including the initial mask's count when present.
+void allocate_prefix_counters(application_result_state& result,
+                              bool has_initial_mask,
+                              ::cuda::stream_ref stream,
+                              rmm::device_async_resource_ref mr)
+{
+  if (!result.program->want_counts) { return; }
+  // Without an initial mask, the host already knows how many rows enter the first probe.
+  auto const size = result.program->membership.size() + static_cast<std::size_t>(has_initial_mask);
+  result.counters.emplace(size, stream, mr);
+  RMM_CUDA_TRY(
+    cudaMemsetAsync(result.counters->data(), 0, size * sizeof(cudf::size_type), stream.get()));
+}
+
+/// @brief Submits optional prefix count readback once the conjunction is complete.
+///
+/// Without an initial mask, the host fills in the first count, every input row.
+void submit_prefix_counts(application_result_state& result,
+                          cudf::table_view input,
+                          bool has_initial_mask,
+                          ::cuda::stream_ref stream)
+{
+  detail::check_read_checkpoint(detail::read_checkpoint::MASK_FOLD);
+  if (result.program->want_counts) {
+    auto const device_counts = result.counters->size();
+    result.readback          = std::make_unique<detail::pinned_counts>(device_counts, stream);
+    result.counts.resize(result.program->membership.size() + 1);
+    if (!has_initial_mask) { result.counts[0] = input.num_rows(); }
+    RMM_CUDA_TRY(cudaMemcpyAsync(result.readback->data(),
+                                 result.counters->data(),
+                                 device_counts * sizeof(cudf::size_type),
+                                 cudaMemcpyDeviceToHost,
+                                 stream.get()));
+  }
+  detail::check_read_checkpoint(detail::read_checkpoint::COUNTS_COPY);
+}
+
+/// @brief Folds membership masks into the conjunction and submits optional prefix count readback.
+///
+/// With an initial mask, the caller has already folded it and counted its survivors in counter 0.
+/// Otherwise the first membership fold initializes the conjunction with no prior-mask hint.
+void fold_membership_masks(application_result_state& result,
+                           cudf::table_view input,
+                           bool has_initial_mask,
+                           ::cuda::stream_ref stream,
+                           rmm::device_async_resource_ref mr)
+{
+  auto const& program           = *result.program;
+  auto* const counts            = result.counters ? result.counters->data() : nullptr;
+  auto* const membership_counts = counts && has_initial_mask ? counts + 1 : counts;
+  for (std::size_t i = 0; i < program.membership.size(); ++i) {
+    auto const& step      = program.membership[i];
+    auto const probe      = input.column(step.column_index);
+    result.mask           = i != 0 || has_initial_mask
+                              ? step.mask_source->compute_mask_if(
+                        probe, result.conjunction->view(), program.device_id, stream, mr)
+                              : step.mask_source->compute_mask(probe, program.device_id, stream, mr);
+    result.contributed[i] = result.mask != nullptr;
+    sirius::op::fold_dynamic_filter_mask(
+      result.conjunction->mutable_view(),
+      result.mask ? std::optional{result.mask->view()} : std::nullopt,
+      membership_counts ? membership_counts + i : nullptr,
+      i == 0 && !has_initial_mask,
+      stream);
+    result.mask.reset();
+  }
+  submit_prefix_counts(result, input, has_initial_mask, stream);
+}
+
 /// @brief Apply the GATHER_ONCE compaction strategy.
 void apply_gather_once(application_result_state& result,
                        cudf::table_view input,
@@ -817,55 +903,19 @@ void apply_gather_once(application_result_state& result,
     apply_cascade(result, input, stream, mr);
     return;
   }
-  auto const size = program.membership.size() + 1;
-  // Without an AST mask, every input row enters the first membership step: the host already knows
-  // that count, and the first membership fold initializes the conjunction.
-  auto const device_counts = result.ast_mask ? size : size - 1;
-  if (program.want_counts) {
-    result.counters.emplace(device_counts, stream, mr);
-    RMM_CUDA_TRY(cudaMemsetAsync(
-      result.counters->data(), 0, device_counts * sizeof(cudf::size_type), stream.get()));
-  }
-  auto* const counts = result.counters ? result.counters->data() : nullptr;
+  bool const has_initial_mask = result.ast_mask != nullptr;
+  allocate_prefix_counters(result, has_initial_mask, stream, mr);
   result.conjunction = cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
                                                  input.num_rows(),
                                                  cudf::mask_state::UNALLOCATED,
                                                  stream,
                                                  mr);
   if (result.ast_mask) {
+    auto* const counts = result.counters ? result.counters->data() : nullptr;
     sirius::op::fold_dynamic_filter_mask(
       result.conjunction->mutable_view(), result.ast_mask->view(), counts, true, stream);
   }
-  auto* const membership_counts = counts && result.ast_mask ? counts + 1 : counts;
-  for (std::size_t i = 0; i < program.membership.size(); ++i) {
-    auto const& step      = program.membership[i];
-    result.mask           = i != 0 || result.ast_mask
-                              ? step.mask_source->compute_mask_if(input.column(step.column_index),
-                                                        result.conjunction->view(),
-                                                        program.device_id,
-                                                        stream,
-                                                        mr)
-                              : step.mask_source->compute_mask(
-                        input.column(step.column_index), program.device_id, stream, mr);
-    result.contributed[i] = result.mask != nullptr;
-    sirius::op::fold_dynamic_filter_mask(
-      result.conjunction->mutable_view(),
-      result.mask ? std::optional{result.mask->view()} : std::nullopt,
-      membership_counts ? membership_counts + i : nullptr,
-      i == 0 && !result.ast_mask,
-      stream);
-  }
-  if (program.want_counts) {
-    result.readback = std::make_unique<detail::pinned_counts>(device_counts, stream);
-    result.counts.resize(size);
-    if (!result.ast_mask) { result.counts[0] = input.num_rows(); }
-    RMM_CUDA_TRY(cudaMemcpyAsync(result.readback->data(),
-                                 result.counters->data(),
-                                 device_counts * sizeof(cudf::size_type),
-                                 cudaMemcpyDeviceToHost,
-                                 stream.get()));
-  }
-  detail::check_read_checkpoint(detail::read_checkpoint::COUNTS_COPY);
+  fold_membership_masks(result, input, has_initial_mask, stream, mr);
   if (any_contributed(result)) {
     result.output = sirius::apply_retention_mask(input, result.conjunction->view(), stream, mr);
   }
@@ -877,9 +927,9 @@ void apply_gather_once(application_result_state& result,
 ///
 /// The residual's own column becomes the conjunction. When the program allows fusion and every
 /// selected filter can describe its probe, `try_fused_membership_mask` writes the conjunction in
-/// rounds of up to `fused_round_capacity` filters with no intermediate masks. Otherwise the
-/// ordinary chain folds the residual and then each filter's mask, freeing each mask right after its
-/// fold; the probe API returns a new row-sized mask, so that one mask (1 byte per row) is the
+/// rounds of up to `fused_membership_round_capacity` filters with no intermediate masks. Otherwise
+/// the ordinary chain folds the residual and then each filter's mask, freeing each mask right after
+/// its fold; the probe API returns a new row-sized mask, so that one mask (1 byte per row) is the
 /// chain's only buffer beyond what the ordinary residual selection holds. Either way the residual's
 /// validity is freed once its nulls are resolved into the values. A lone filter without a residual
 /// skips the conjunction and gathers through its own mask.
@@ -913,15 +963,7 @@ void apply_cached(application_result_state& result,
     result.contributed.front() = result.mask != nullptr;
     if (!result.mask) { return; }
   } else {
-    auto const size = program.membership.size() + 1;
-    // Without a residual, every input row enters the first membership step: the host already knows
-    // that count, and the first membership fold initializes the conjunction.
-    auto const device_counts = residual ? size : size - 1;
-    if (program.want_counts) {
-      result.counters.emplace(device_counts, stream, mr);
-      RMM_CUDA_TRY(cudaMemsetAsync(
-        result.counters->data(), 0, device_counts * sizeof(cudf::size_type), stream.get()));
-    }
+    allocate_prefix_counters(result, residual, stream, mr);
     auto* const counts = result.counters ? result.counters->data() : nullptr;
     if (residual) {
       result.conjunction = std::move(result.residual_result->release().front());
@@ -953,7 +995,7 @@ void apply_cached(application_result_state& result,
         program.device_id,
         running,
         incoming,
-        counts ? cudf::device_span<cudf::size_type>{counts, device_counts}
+        counts ? cudf::device_span<cudf::size_type>{counts, result.counters->size()}
                : cudf::device_span<cudf::size_type>{},
         result.fused_rounds,
         stream);
@@ -965,41 +1007,19 @@ void apply_cached(application_result_state& result,
     // Both paths have resolved the residual's nulls into its values. The validity is freed in
     // stream order, after the work already submitted that reads it.
     if (result.conjunction->nullable()) {
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+      result.conjunction->set_null_mask(::cuda::device_buffer<cudf::bitmask_type>{stream, mr}, 0);
+#else
       result.conjunction->set_null_mask(rmm::device_buffer{}, 0);
+#endif
     }
     if (result.fused_rounds != 0) {
+      // std::ranges::fill does not accept std::vector<bool>.
       std::fill(result.contributed.begin(), result.contributed.end(), true);
+      submit_prefix_counts(result, input, residual, stream);
     } else {
-      auto* const membership_counts = counts && residual ? counts + 1 : counts;
-      for (std::size_t i = 0; i < program.membership.size(); ++i) {
-        auto const& step      = program.membership[i];
-        auto const probe      = input.column(step.column_index);
-        result.mask           = i != 0 || residual
-                                  ? step.mask_source->compute_mask_if(
-                            probe, result.conjunction->view(), program.device_id, stream, mr)
-                                  : step.mask_source->compute_mask(probe, program.device_id, stream, mr);
-        result.contributed[i] = result.mask != nullptr;
-        sirius::op::fold_dynamic_filter_mask(
-          running,
-          result.mask ? std::optional{result.mask->view()} : std::nullopt,
-          membership_counts ? membership_counts + i : nullptr,
-          i == 0 && !residual,
-          stream);
-        result.mask.reset();
-      }
+      fold_membership_masks(result, input, residual, stream, mr);
     }
-    detail::check_read_checkpoint(detail::read_checkpoint::MASK_FOLD);
-    if (program.want_counts) {
-      result.readback = std::make_unique<detail::pinned_counts>(device_counts, stream);
-      result.counts.resize(size);
-      if (!residual) { result.counts[0] = input.num_rows(); }
-      RMM_CUDA_TRY(cudaMemcpyAsync(result.readback->data(),
-                                   result.counters->data(),
-                                   device_counts * sizeof(cudf::size_type),
-                                   cudaMemcpyDeviceToHost,
-                                   stream.get()));
-    }
-    detail::check_read_checkpoint(detail::read_checkpoint::COUNTS_COPY);
     if (!residual && !any_contributed(result)) { return; }
   }
   auto const keep = single_mask ? result.mask->view() : result.conjunction->view();
@@ -1244,7 +1264,12 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
   gate_selection selection{};
   auto candidates = capture_candidates(snapshot, _gate, bindings, selection);
   decode_selection result{_channel, snapshot.generation(), {}};
-  if (!selection.applicable || selection.needs_combined_sample) { return result; }
+  // An undecided gate lets the decode apply the filters and measure them; waiting for a clean
+  // endpoint sample instead would leave every batch decoded before that sample unfiltered.
+  if (!selection.applicable || (selection.needs_combined_sample && !selection.decode_trains)) {
+    return result;
+  }
+  auto const bound_entries = candidates.size();
   for (auto& current : candidates) {
     current.prior = static_selectivity_of(*current.identity.filter);
   }
@@ -1254,6 +1279,15 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
              current.identity.filter.get()) ||
            (current.expected_keep && skip_measured_filter(*current.expected_keep, std::nullopt));
   });
+  if (candidates.empty()) { return result; }
+  // Filters a decode applies get no marginal sample at the endpoint, so the decode measures them
+  // until each has a current estimate, as well as while the gate is undecided.
+  result.measure =
+    selection.decode_trains || std::ranges::any_of(candidates, [](candidate const& current) {
+      return !current.expected_keep.has_value();
+    });
+  result.complete = selection.decode_trains && bound_entries == snapshot.entries().size() &&
+                    candidates.size() == bound_entries;
   // Sorting first makes each group's first member its preferred representative.
   for (auto const& aliases : group_aliases(candidates)) {
     decode_step step{aliases.front()->identity, aliases.front()->column_index, {}};
@@ -1264,6 +1298,25 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
     result.steps.push_back(std::move(step));
   }
   return result;
+}
+
+void dynamic_filter_consumer::record_decode_keep_ratio(std::size_t rows_before,
+                                                       std::size_t rows_after,
+                                                       std::size_t generation,
+                                                       bool complete) noexcept
+{
+  _gate.record_decode_keep_ratio(rows_before, rows_after, generation, complete);
+}
+
+void dynamic_filter_consumer::record_decode_filter_keep_ratio(applied_entry const& filter,
+                                                              std::size_t rows_before,
+                                                              std::size_t rows_after,
+                                                              std::size_t generation) noexcept
+{
+  if (rows_before == 0 || rows_after > rows_before) { return; }
+  _gate.record_filter_keep_ratio({filter.filter.get(), filter.output_ordinal},
+                                 static_cast<double>(rows_after) / static_cast<double>(rows_before),
+                                 generation);
 }
 
 std::optional<application_program> dynamic_filter_consumer::prepare(
@@ -1365,10 +1418,10 @@ batch_receipt dynamic_filter_consumer::finish(application_result&& result,
   state->program->receipt.original_batch_id = original_batch_id;
   return std::move(state->program->receipt);
 }
-
 //===--------------------------------------------------------------------===//
 // TEST SEAMS
 //===--------------------------------------------------------------------===//
+
 dynamic_filter_gate& detail::consumer_test_access::gate(dynamic_filter_consumer& consumer) noexcept
 {
   return consumer._gate;
@@ -1380,7 +1433,8 @@ bool detail::consumer_test_access::same_selection(application_program const& lef
   auto const& a = *left._state;
   auto const& b = *right._state;
   return static_cast<application_program_decisions const&>(a) == b &&
-         a.snapshot.generation() == b.snapshot.generation() && bool(a.residual) == bool(b.residual);
+         a.snapshot.generation() == b.snapshot.generation() &&
+         (a.residual != nullptr) == (b.residual != nullptr);
 }
 
 namespace {
@@ -1631,7 +1685,33 @@ gate_selection dynamic_filter_gate::capture(sirius::op::dynamic_filter_snapshot 
   for (std::size_t i = 0; i < keys.size(); ++i) {
     estimates[i] = current_keep_ratio(keys[i], filters.generation());
   }
-  return {applicable, applicable && current != state::ACTIVE};
+  return {
+    applicable,
+    applicable && current != state::ACTIVE,
+    applicable && current == state::UNKNOWN && !_decode_undecided.load(std::memory_order_relaxed)};
+}
+
+void dynamic_filter_gate::record_decode_keep_ratio(std::size_t rows_before,
+                                                   std::size_t rows_after,
+                                                   std::size_t observed_filter_count,
+                                                   bool complete) noexcept
+{
+  if (rows_before == 0 || rows_after > rows_before) { return; }
+  try {
+    std::scoped_lock decision_lock(_decision_mu);
+    if (_state.load(std::memory_order_relaxed) != state::UNKNOWN) { return; }
+    auto const kept = static_cast<double>(rows_after) / static_cast<double>(rows_before);
+    if (kept <= _keep_threshold || complete) {
+      _decided_filter_count.store(observed_filter_count, std::memory_order_relaxed);
+      _state.store(kept > _keep_threshold ? state::DISABLED : state::ACTIVE,
+                   std::memory_order_relaxed);
+    } else {
+      // The filters the decode skipped might still be selective.
+      _decode_undecided.store(true, std::memory_order_relaxed);
+    }
+  } catch (...) {
+    // Failure to acquire optional decision state leaves its previous verdict intact.
+  }
 }
 
 void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
@@ -1666,6 +1746,12 @@ bool detail::gate_test_access::needs_combined_sample(
   dynamic_filter_gate const& gate, sirius::op::dynamic_filter_snapshot const& filters)
 {
   return gate.capture(filters, {}, {}).needs_combined_sample;
+}
+
+bool detail::gate_test_access::decode_trains(dynamic_filter_gate const& gate,
+                                             sirius::op::dynamic_filter_snapshot const& filters)
+{
+  return gate.capture(filters, {}, {}).decode_trains;
 }
 
 std::optional<double> detail::gate_test_access::filter_keep_ratio(dynamic_filter_gate const& gate,

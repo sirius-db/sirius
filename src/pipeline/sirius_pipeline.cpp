@@ -16,14 +16,9 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
-#include "config.hpp"
 #include "creator/task_creator.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/settings.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -353,9 +348,26 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   }
 }
 
-std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
+sirius_pipeline::task_creation_guard::task_creation_guard(sirius_pipeline& pipeline)
+  : pipeline_(&pipeline), lock_(pipeline._task_creation_mutex)
 {
-  return std::unique_lock<std::mutex>(_status_mutex);
+  std::lock_guard status(pipeline._status_mutex);
+  pipeline._task_creation_active = true;
+}
+sirius_pipeline::task_creation_guard::~task_creation_guard() { unlock(); }
+void sirius_pipeline::task_creation_guard::unlock()
+{
+  if (!pipeline_) return;
+  {
+    std::lock_guard status(pipeline_->_status_mutex);
+    pipeline_->_task_creation_active = false;
+  }
+  pipeline_ = nullptr;
+  lock_.unlock();
+}
+sirius_pipeline::task_creation_guard sirius_pipeline::get_task_creation_lock()
+{
+  return task_creation_guard(*this);
 }
 
 void sirius_pipeline::update_pipeline_status(bool original_pipeline)
@@ -368,6 +380,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
   bool just_closed = false;
   {
     std::lock_guard<std::mutex> lock(_status_mutex);
+    if (_task_creation_active) return;
 
     auto end_nvtx_range_if_finished = [this]() {
       if (pipeline_finished.load() && _nvtx_range_started.load()) {

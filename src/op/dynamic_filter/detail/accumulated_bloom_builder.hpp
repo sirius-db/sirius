@@ -229,8 +229,8 @@ class accumulated_bloom_builder final {
    * @brief How `finish` moved partials and the union between GPUs.
    */
   enum class publication_transport : std::uint8_t {
-    peer_copy,   ///< `cudaMemcpyPeerAsync`; every replica pool grants every other replica GPU
-    host_staged  ///< Bounded pinned HOST staging, when a grant is unavailable or direct scratch
+    PEER_COPY,   ///< `cudaMemcpyPeerAsync`; every replica pool grants every other replica GPU
+    HOST_STAGED  ///< Bounded pinned HOST staging, when a grant is unavailable or direct scratch
                  ///< is refused
   };
 
@@ -254,14 +254,14 @@ class accumulated_bloom_builder final {
    * after every submitted transfer has retired.
    *
    * @pre Every `enqueue_add` returned; this is the only `finish` call; the caller is the only user
-   * of the builder
+   *      of the builder
    * @throw accumulation_invariant_error if @p root is not the current device or @p stream belongs
    * to another GPU, before anything is enqueued
    * @param root The reducing GPU, current on the calling thread
    * @param stream The publication stream of @p root
    * @param scratch_mr Resource borrowing the task's reservation
    * @return The published filters, or no value when @p root holds no partial or publication
-   * workspace allocation is refused
+   *         workspace allocation is refused
    */
   [[nodiscard]] std::optional<publication> finish(rmm::cuda_device_id root,
                                                   ::cuda::stream_ref stream,
@@ -277,28 +277,44 @@ class accumulated_bloom_builder final {
   [[nodiscard]] bool releasable_here() const noexcept;
 
   /**
-   * @brief The state of one published replica, copied for verification.
+   * @brief One GPU's Bloom bit array for one key, copied to the host by `inspect_partial` or
+   *        `inspect_replica`.
+   *
+   * Both inspection functions below query the array's stream, enqueue a device-to-host copy on that
+   * same stream so the copy runs after the work already queued there, and then wait on the host for
+   * the copy. Both are meant for tests and diagnostics; publication never calls them. Tests compare
+   * every replica of a key with the bitwise OR of that key's partials.
    */
   struct replica_contents {
-    std::vector<std::byte> bytes;  ///< The replica's filter array
-    bool stream_idle;              ///< Whether the replica's stream had no pending work at the call
+    std::vector<std::byte> bytes;  ///< The copied bit array
+    bool stream_idle;  ///< Whether the array's stream had no pending work before the copy
   };
 
   /**
-   * @brief Copies a private partial to owned host bytes after waiting for its insertions.
+   * @brief Copies the private partial (before publication) of @p device for key @p key_index to the
+   *        host.
+   *
+   * A partial holds only the keys that `enqueue_add` inserted from the batches @p device
+   * contributed. `finish` ORs every GPU's partial into the root and copies that union into each
+   * replica, after which the partials no longer exist. The copy runs after the pending insertions
+   * on the partial's stream.
    *
    * @pre All `enqueue_add` calls returned and publication has not begun; the caller is the
-   * builder's only user
+   *      builder's only user
+   * @param key_index The key whose partial is copied
+   * @param device The GPU whose partial is copied
    * @return The partial contents, or no value for an absent key or GPU
    */
   [[nodiscard]] std::optional<replica_contents> inspect_partial(std::size_t key_index,
                                                                 rmm::cuda_device_id device) const;
 
   /**
-   * @brief Copies @p filter's accumulated replica on @p device to the host.
+   * @brief Copies the replica (after publication) of @p filter on @p device to the host.
    *
-   * Queries the replica's stream before enqueueing the copy on it, then waits for the copy on the
-   * host. Meant for tests and diagnostics; publication never calls it.
+   * A replica is one GPU's copy of the union of all partials for the key of @p filter, read through
+   * the `sirius_dynamic_bloom_filter` that `finish` returned. The function is static because it
+   * reads only @p filter, which may outlive the builder. The copy runs after the publication copies
+   * on the replica's stream.
    *
    * @pre @p filter was published: the `finish` call that returned it has returned
    * @param filter An accumulated filter returned by `finish`

@@ -113,9 +113,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-array"
-version = "60.0.0"
+version = "60.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51dff6e4b9f158864a0aeb6a131ad53858ecbae7a2fc8989307b9b3c6b2f122e"
+checksum = "0f3d22a41d3df78b71df0b685af219ae3a94188ab98d6fb29c958eb55c3247f4"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -132,9 +132,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-buffer"
-version = "60.0.0"
+version = "60.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7235b863533e9db3ab86905b4521251de11226275b436ff3cb2d0010558d1c5"
+checksum = "7bd46a530bc1a8e763102fc36c1dc0f51f3ffa150c78e7f5658ccb54b1458ade"
 dependencies = [
  "bytes",
  "half",
@@ -155,9 +155,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-data"
-version = "60.0.0"
+version = "60.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aa06d5e22786c4966ffc4d2f171d0cb65d95f6bdea108a14e8c335e9faa437f"
+checksum = "415b7fbc4cf56b080bb5677a4ae74211b5c79e571ed37a1d547633ec07f3b43b"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -182,9 +182,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-schema"
-version = "60.0.0"
+version = "60.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f85a9a58cd03560526b0066487574aacb9008e413504fa0ee23d61141e96c338"
+checksum = "de2c8e714b466404cdc1189e89f892426efea614d938e16c15518c340cd43ba3"
 dependencies = [
  "bitflags",
 ]
@@ -620,7 +620,7 @@ name = "doris-proto"
 version = "0.1.0"
 dependencies = [
  "prost",
- "prost-build",
+ "protox",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2169,16 +2169,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
-name = "sirius"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "cxx",
- "sirius-sys",
-]
-
-[[package]]
 name = "sirius-doris-be"
 version = "0.1.0"
 dependencies = [
@@ -2196,7 +2186,7 @@ dependencies = [
  "parquet",
  "prost",
  "ryu",
- "sirius",
+ "sirius-ffi",
  "substrait",
  "tempfile",
  "thiserror",
@@ -2211,9 +2201,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "sirius-sys"
+name = "sirius-ffi"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "cxx",
  "cxx-build",
 ]

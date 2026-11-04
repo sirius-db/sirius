@@ -94,13 +94,45 @@ The core-extension layout has three artifacts:
 - `sirius_cuda13`: the backend built with CUDA 13.
 
 `INSTALL sirius; LOAD sirius;` opens `libcuda.so.1` and queries `cuDriverGetVersion`.
-Driver support below CUDA 12, a missing driver, or an unsuccessful version query
-produces an error. Versions 12000–12999 select `sirius_cuda12`; 13000 and newer
-select `sirius_cuda13`. This layout is for DuckDB core distribution:
-the loader follows DuckDB's autoload policy, trusting core signatures and using
-DuckDB's configured auto-install repository, not the repository it came from. Community
-signatures are not supported. Backend errors include the selected backend and
-driver version; the loader does not retry with the other CUDA version.
+Versions 12000–12999 select `sirius_cuda12`; 13000 and newer select `sirius_cuda13`.
+When `autoinstall_known_extensions` is enabled and the selected backend is not
+installed yet, `LOAD sirius` downloads it from DuckDB's community repository (or
+the configured auto-install repository); without a usable driver it does no
+network I/O. The loader does not retry with the other CUDA version.
+
+If the driver is missing, supports a CUDA version below 12, or cannot report its
+version, or the selected backend is not installed, cannot be installed, or its
+file cannot be loaded, `LOAD sirius` still succeeds and the loader leaves
+DuckDB's CPU execution untouched: it registers no optimizer hook and
+`gpu_execution` defaults to `false`. Explicit requests for the GPU, `SET gpu_execution = true` or the
+`gpu_execution(...)` table function, then fail with the recorded reason, such as
+`Sirius requires an NVIDIA driver supporting CUDA 12 or newer: cannot open
+libcuda.so.1 (...)`. The fallback is logged once at `INFO` level to
+`duckdb_logs`, and the loader prints nothing. The result is cached per database:
+loading the backend after a fallback needs a new database instance.
+
+`LOAD sirius` still fails if the database already has the other backend loaded,
+if the loader is loaded under a backend name, or if the backend fails once its
+own initialization has started (for example a GPU or configuration error). The
+backend entry point records that start in the database's object cache under
+`sirius_backend_init_started`, so such failures are reported rather than turned
+into a silent CPU fallback.
+
+`sirius_status()` returns one row describing that outcome:
+
+| Column | Meaning |
+| --- | --- |
+| `driver_found` | `libcuda.so.1` could be opened |
+| `cuda_driver_version` | CUDA version the driver reports, e.g. `13.0`; `NULL` if unknown |
+| `backend` | Selected backend; `NULL` without a usable driver |
+| `backend_loaded` | The backend is loaded |
+| `gpu_execution` | Transparent GPU execution is active for this session; `false` under `SIRIUS_DISABLE` |
+| `fallback_reason` | Why GPU execution is unavailable; `NULL` once the backend loaded |
+
+This layout is for DuckDB core distribution: the loader follows DuckDB's
+autoload policy, trusting core signatures and using DuckDB's configured
+auto-install repository, not the repository it came from. Community signatures
+are not supported.
 
 These are Linux glibc amd64/arm64 SBSA builds; Jetson/Tegra is not supported.
 The loader does not detect or reject unsupported GPU architectures.
@@ -166,23 +198,44 @@ cannot bypass these checks. The loader also reserves those backend names.
 Applications should load `sirius`, rather than select
 backends manually.
 
-The loader tests build fake drivers and backend extensions, so they need no GPU:
+The loader tests build fake drivers and backend extensions, so they need no GPU.
+The unittest links the prebuilt archive's capabilities only when they sit next
+to it:
 
 ```sh
+prebuilt="$PWD/build/loader-prebuilt"
+mkdir -p "$prebuilt"
+cp sirius-duckdb/build/release/src/libduckdb_static.a \
+  sirius-duckdb/build/release/src/main/extension/libduckdb_loadable_extensions.a \
+  sirius-duckdb/build/release/src/main/http/libduckdb_httplib.a "$prebuilt/"
 pixi run cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF \
+  -DDUCKDB_EXPLICIT_VERSION=v2.0.0 \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=ON -DBUILD_SHELL=OFF \
   -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
-  -DPREBUILT_BINARY="$PWD/sirius-duckdb/build/release/src/libduckdb_static.a" \
+  -DPREBUILT_BINARY="$prebuilt/libduckdb_static.a" \
   -DDUCKDB_EXTENSION_CONFIGS="$PWD/sirius-duckdb/config/loader.cmake" \
   -DSIRIUS_LOADER_TESTS=ON
 pixi run cmake --build build/loader \
-  --target sirius_loadable_extension sirius_loader_test_fixtures
+  --target unittest sirius_loadable_extension sirius_loader_test_fixtures
 pixi run python sirius-duckdb/loader/test/test_loader.py \
   --duckdb sirius-duckdb/build/release/duckdb --build-dir build/loader
 ```
 
+`loader/test/sql` holds the sqllogictests DuckDB's CI runs on CPU-only machines.
+They expect no driver; on a GPU machine, hide it with the test fixture:
+
+```sh
+repository="$PWD/build/loader/repository/v2.0.0/$(cat build/loader/duckdb_platform_out)"
+mkdir -p "$repository"
+cp build/loader/extension/sirius/sirius.duckdb_extension "$repository/"
+LOCAL_EXTENSION_REPO="$PWD/build/loader/repository" \
+LD_PRELOAD="$PWD/build/loader/extension/sirius/test/libsirius_test_hide_driver.so" \
+  build/loader/test/unittest --autoloading available --require sirius \
+  "$PWD/sirius-duckdb/loader/test/sql/*"
+```
+
 The test host and prebuilt archive must use the same DuckDB revision and build
 settings; `pixi run make` produces both. Reusing the archive tests the loader's production
-linkage without rebuilding DuckDB. Tests cover version boundaries, driver and
-backend failures, repeated loading, and automatic installation from a local
-repository.
+linkage without rebuilding DuckDB. Tests cover version boundaries, the CPU
+fallback for each driver and backend failure, the status function, repeated
+loading, and automatic installation from a local repository.

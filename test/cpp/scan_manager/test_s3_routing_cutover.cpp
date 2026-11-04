@@ -24,7 +24,6 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
-#include "op/scan/table_scan/parquet_physical_profile.hpp"
 #include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -33,18 +32,9 @@
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
-#include <cudf/io/datasource.hpp>
-#include <cudf/io/experimental/hybrid_scan.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
-
-#include <rmm/cuda_stream.hpp>
-#include <rmm/device_buffer.hpp>
-
-#include <arpa/inet.h>
-#include <cucascade/memory/topology_discovery.hpp>
+#include <arpa/inet.h>  // IWYU pragma: keep
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -825,10 +815,13 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
                                                 make_datasource_resolver(manager));
 
   routing_observations routed;
-  while (provider.has_more_splits()) {
-    auto task = provider.next_split_provider();
-    if (!task) { continue; }
-    auto scan = task({});
+  auto sources = provider.make_preparation_sources();
+  REQUIRE(sources.size() == 1);
+  for (;;) {
+    auto claim = sources.front().try_claim();
+    if (std::holds_alternative<sirius::scan_manager::preparation_exhausted>(claim)) break;
+    REQUIRE(std::holds_alternative<sirius::op::scan::gpu_ingestible::metadata_job>(claim));
+    auto scan = std::get<sirius::op::scan::gpu_ingestible::metadata_job>(std::move(claim)).run({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);

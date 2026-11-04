@@ -21,12 +21,16 @@
 
 #include <cuda/stream>
 
+#include <cstddef>
 #include <optional>
 #include <span>
 
 namespace sirius::op {
 
 class sirius_mask_applicable;
+
+/// @brief Most membership filters one fused round evaluates; more filters take further rounds.
+inline constexpr std::size_t fused_membership_round_capacity = 4;
 
 /**
  * @brief A single membership test input, connecting a filter to its probe column
@@ -37,7 +41,12 @@ struct fused_membership_input {
 };
 
 /**
- * @brief Prepares all membership steps and submits their ordered conjunction in rounds of four
+ * @brief Submits the ordered conjunction of all membership steps in rounds of up to
+ * `fused_membership_round_capacity` filters, or submits nothing if any step lacks a descriptor
+ *
+ * Every descriptor is prepared before the first round. If any filter cannot describe its probe,
+ * the call returns with `submitted_rounds` zero, no GPU work submitted and every buffer untouched,
+ * so the caller can run the ordinary per-filter chain instead.
  *
  * The first round starts with the residual's valid true rows, or all rows without a residual. Later
  * rounds use the running conjunction. `running` may alias the residual's values; its validity

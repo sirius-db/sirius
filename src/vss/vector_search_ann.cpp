@@ -28,13 +28,11 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
-#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 
 #include <cucascade/cudf/host_data_representation.hpp>
-#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <cstdint>

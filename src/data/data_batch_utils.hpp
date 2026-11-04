@@ -120,9 +120,9 @@ inline std::size_t peak_materialization_bytes(const cucascade::idata_representat
 /**
  * @brief Row count of @p data read from its metadata, without touching column data.
  *
- * Known for GPU tables and for unpacked host and disk tables; nullopt for other representations
- * (packed host tables, Simpatico-compressed chunks) and for nullptr. A table with no columns has
- * zero rows.
+ * Known for GPU tables, for unpacked host and disk tables and for Simpatico-compressed
+ * representations; nullopt for other representations (packed host tables) and for nullptr. A table
+ * with no columns has zero rows.
  */
 inline std::optional<std::size_t> representation_num_rows(
   const cucascade::idata_representation* data)
@@ -130,6 +130,9 @@ inline std::optional<std::size_t> representation_num_rows(
   if (data == nullptr) { return std::nullopt; }
   if (auto const* gpu = dynamic_cast<const cucascade::gpu_table_representation*>(data)) {
     return static_cast<std::size_t>(gpu->get_table_view().num_rows());
+  }
+  if (auto const* compressed = dynamic_cast<const simpatico_compressed_representation*>(data)) {
+    return static_cast<std::size_t>(compressed->num_rows());
   }
   auto const rows_of = [](std::vector<cucascade::memory::column_metadata> const& columns) {
     return columns.empty() ? std::size_t{0} : static_cast<std::size_t>(columns.front().num_rows);

@@ -23,17 +23,84 @@
 #include <chrono>
 #include <cstddef>
 
+namespace cucascade::memory {
+class fixed_size_host_memory_resource;
+}
+
 namespace sirius::test {
-// One-shot CUDA readiness failure on the calling thread, armed only after test
-// setup. These wrappers are linked into the test executable, never production.
+// One-shot CUDA failure, armed only after test setup. Readiness faults target
+// the calling thread; acquisition faults target the next worker acquisition.
+// These wrappers are linked into the isolated test executable, never production.
+// Until it is destroyed, a calling-thread fault also records each stream that receives a peer copy,
+// a `sirius::cuda::device_copy_batch::enqueue`, an event record, or a synchronize_stream_unjoined
+// failure on that thread, and whether a later synchronization of that stream succeeded.
 class scoped_cuda_status_fault {
  public:
-  enum operation { wait_event = 1, synchronize_device = 2 };
-  scoped_cuda_status_fault(operation op, cudaError_t status);
+  // acquire_stream targets the next pool acquisition on any thread, allowing
+  // a prefetch worker to observe a typed failure without poisoning the device.
+  // synchronize_stream reports its failure after the stream's work retires, while
+  // synchronize_stream_unjoined fails without waiting and leaves that work pending. copy_batch
+  // targets `cudaMemcpyBatchAsync` calls made by Sirius and submits a real one-entry prefix before
+  // failing; enqueue_copy_batch fails `sirius::cuda::device_copy_batch::enqueue`, whose batch call
+  // libcudf makes, before submitting anything.
+  enum operation {
+    wait_event                  = 1,
+    synchronize_device          = 2,
+    acquire_stream              = 3,
+    copy_device_to_host         = 4,
+    copy_host_to_device         = 5,
+    synchronize_stream          = 6,
+    copy_batch                  = 7,
+    copy_peer                   = 8,
+    enqueue_copy_batch          = 9,
+    record_event                = 10,
+    create_event                = 11,
+    synchronize_stream_unjoined = 12
+  };
+  // When the faulting call has a non-null stream, @p delay queues a host callback that sleeps for
+  // that duration, holding up later work on the stream. Most wrappers queue the callback before
+  // calling CUDA; synchronize_stream queues it after the real wait. create_event and
+  // synchronize_device ignore @p delay, and acquire_stream requires it to be zero. Passing
+  // cudaSuccess as @p status injects no error and requires a nonzero @p delay.
+  scoped_cuda_status_fault(operation op,
+                           cudaError_t status,
+                           std::size_t skip                = 0,
+                           cudaStream_t matching_stream    = nullptr,
+                           std::chrono::milliseconds delay = {});
   ~scoped_cuda_status_fault();
   scoped_cuda_status_fault(scoped_cuda_status_fault const&)            = delete;
   scoped_cuda_status_fault& operator=(scoped_cuda_status_fault const&) = delete;
-  bool consumed();
+  bool consumed() const noexcept;
+  // Distinct recorded streams, including those of injected failures
+  std::size_t observed_stream_count() const noexcept;
+  bool all_submitted_streams_joined() const noexcept;
+  // Recorded submissions this thread made to other streams while @p delay still held the faulting
+  // call's stream
+  std::size_t submissions_during_delay() const noexcept;
+  // Whether a recorded synchronization reported cudaErrorInvalidResourceHandle
+  bool invalid_join() const noexcept;
+
+ private:
+  operation operation_;
+};
+
+struct cuda_transfer_observation {
+  std::size_t synchronizations              = 0;
+  std::size_t batch_submissions             = 0;
+  std::size_t partial_batch_submissions     = 0;
+  std::size_t synchronizations_with_staging = 0;
+};
+
+// Observe only this thread's calls between setup and readback/teardown. HOST bytes above the
+// resource's initial allocation count show that staging is still retained when each join begins.
+class scoped_cuda_transfer_observer {
+ public:
+  explicit scoped_cuda_transfer_observer(
+    cucascade::memory::fixed_size_host_memory_resource const& staging_resource);
+  ~scoped_cuda_transfer_observer();
+  scoped_cuda_transfer_observer(scoped_cuda_transfer_observer const&)            = delete;
+  scoped_cuda_transfer_observer& operator=(scoped_cuda_transfer_observer const&) = delete;
+  [[nodiscard]] cuda_transfer_observation snapshot() const noexcept;
 };
 
 // One-shot cudaMemPoolGetAccess failure for one pool and accessor, from any thread. The first
@@ -45,31 +112,5 @@ class scoped_pool_access_fault {
   scoped_pool_access_fault(scoped_pool_access_fault const&)            = delete;
   scoped_pool_access_fault& operator=(scoped_pool_access_fault const&) = delete;
   bool consumed() const;
-};
-
-/**
- * @brief Injects one publication API result and observes submitted streams until cleanup.
- *
- * Only the calling thread is armed. An optional delay precedes one matching call; owners and
- * observation storage remain test-owned. This helper is linked only into the isolated CUDA fault
- * executable.
- */
-class scoped_publication_fault {
- public:
-  enum operation { peer_copy, batch_copy, record_event, synchronize_stream, create_event };
-  scoped_publication_fault(operation op,
-                           std::size_t skip,
-                           cudaError_t status,
-                           std::chrono::milliseconds delay = {});
-  ~scoped_publication_fault();
-  scoped_publication_fault(scoped_publication_fault const&)            = delete;
-  scoped_publication_fault& operator=(scoped_publication_fault const&) = delete;
-  bool consumed() const noexcept;
-  /**
-   * @brief Distinct streams observed by the submission wrappers, including injected failures
-   */
-  std::size_t observed_stream_count() const noexcept;
-  bool all_submitted_streams_joined() const noexcept;
-  bool invalid_join() const noexcept;
 };
 }  // namespace sirius::test

@@ -17,7 +17,6 @@
 #include "telemetry/memory_context.hpp"
 
 #include "telemetry-bridge/gen/quent.hpp"
-#include "telemetry/telemetry_context.hpp"
 
 #include <format>
 #include <optional>

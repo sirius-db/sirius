@@ -30,6 +30,7 @@
 
 #include <catch.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <cstddef>

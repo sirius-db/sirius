@@ -22,7 +22,6 @@
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -69,7 +68,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
                                                std::size_t n_slots)
 {
   membership_snapshot snap;
-  snap.generation = selection.generation;
+  snap.generation  = selection.generation;
+  snap.measurement = {.measure = selection.measure, .complete = selection.complete};
   snap.probes.resize(n_slots);
   for (std::size_t order = 0; order < selection.steps.size(); ++order) {
     auto const& step       = selection.steps[order];
@@ -83,7 +83,9 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
     // The actual execution device is selected after attachment. The closure retains its filter
     // and resolves the local replica when the decoder invokes it on that device.
     int const use_current_device = -1;
-    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order.
+    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order. The
+    // tag is the position of the step's representative in `attached`, which becomes the batch's
+    // decode history.
     snap.probes[step.column_index].push_back(
       {[f = filter, applicable](cudf::column_view const& keys,
                                 std::uint32_t const* prior_mask_words,
@@ -92,7 +94,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
          return applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
        },
        0,
-       order + 1});
+       order + 1,
+       snap.attached.size()});
     snap.attached.insert(snap.attached.end(), step.represented.begin(), step.represented.end());
   }
   return snap;
@@ -126,8 +129,9 @@ std::optional<detail::membership_refresh> detail::refresh_membership_probes(
     current
       ? current
       : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
-  return membership_refresh{base->with_membership_probes(std::move(snap.probes), snap.generation),
-                            std::move(snap.attached)};
+  return membership_refresh{
+    base->with_membership_probes(std::move(snap.probes), snap.generation, snap.measurement),
+    std::move(snap.attached)};
 }
 
 scan_operator_input::scan_operator_input(
@@ -148,10 +152,20 @@ scan_operator_input::scan_operator_input(
 
 void scan_operator_input::initialize_prefetch()
 {
-  if (std::exchange(_prefetch_started, true)) {
+  prepare_prefetch();
+  publish_prefetch();
+}
+
+void scan_operator_input::prepare_prefetch()
+{
+  if (_prefetch_phase != prefetch_phase::idle) {
     throw std::logic_error("scan input prefetch initialization already attempted");
   }
-  if (!has_scan_metadata()) return;
+  _prefetch_phase = prefetch_phase::preparing;
+  if (!has_scan_metadata()) {
+    _prefetch_phase = prefetch_phase::prepared;
+    return;
+  }
   auto const& stored    = std::get<std::shared_ptr<scan_info>>(materialization_info);
   auto preferred_device = get_preferred_device_id();
 
@@ -173,6 +187,16 @@ void scan_operator_input::initialize_prefetch()
   // Never wait for synchronous eviction while initializing a scan input.
   static_cast<void>(stored->prepare_for_prefetching(false));
 
+  _prefetch_phase = prefetch_phase::prepared;
+}
+
+void scan_operator_input::publish_prefetch()
+{
+  if (_prefetch_phase != prefetch_phase::prepared)
+    throw std::logic_error("scan input must be prepared exactly once before publication");
+  _prefetch_phase = prefetch_phase::published;
+  if (!has_scan_metadata()) return;
+  auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
   // The publication barrier.  register_scan_task takes the readahead's mutex,
   // which the worker also takes to collect, so the hints above are ordered
   // before any read of them on the worker's side.  Keep this last.
@@ -302,6 +326,23 @@ void scan_operator_input::prepare_for_processing(
             drop_row_selection(host_rep);
           }
         }
+        // Hand the scan's restore types to the decode, so a compacted decode can write a
+        // narrow-stored column directly in the type the scan would otherwise cast it to.
+        if (!decode_restore_types.empty()) {
+          auto attach_output_types = [&](auto* rep) {
+            if (!rep->pushdown_scan()) { return; }
+            std::vector<std::optional<cudf::data_type>> types(decode_restore_types.begin(),
+                                                              decode_restore_types.end());
+            rep->set_pushdown_scan(rep->pushdown_scan()->with_output_types(std::move(types)));
+          };
+          if (auto* device_rep =
+                dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+            attach_output_types(device_rep);
+          } else if (auto* host_rep =
+                       dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+            attach_output_types(host_rep);
+          }
+        }
         // Only original compressed input can become a clean sampling opportunity. A reused
         // conversion keeps its history, including when a previous prepare failed after conversion.
         if (!_decoded_input_reused) {
@@ -382,6 +423,10 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
   auto const* decoded =
     dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(data);
   if (decoded == nullptr) { return; }
+  report_membership_keep(decoded->outcome().membership_keep);
+  // Join filters the decode skipped left these rows unfiltered, so the endpoint may sample them
+  // as clean input instead of a decode the filters might have touched.
+  if (decoded->outcome().membership_skipped) { decode_attached.clear(); }
   // The converter reports what the decode did as a value on the representation. row_filtered
   // means the whole table-filter conjunction was applied and every column is compacted to the
   // surviving rows — materialize_table maps it to filter_state::ROW_FILTERED so the filter is
@@ -416,6 +461,23 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
       "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
       "visibility mask on masked chunks");
   }
+}
+
+void scan_operator_input::report_membership_keep(
+  std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept
+{
+  // Only a decode that carried this consumer's probes has anything to report. The consumer ignores
+  // reports once it has decided, so a decode selected after the decision reports harmlessly.
+  if (!consumer || decode_attached.empty() || !observation) { return; }
+  auto const generation = static_cast<std::size_t>(observation->generation);
+  for (auto const& probe : observation->probes) {
+    // The tag indexes the representative binding of the probe's decode step.
+    if (probe.tag >= decode_attached.size()) { continue; }
+    consumer->record_decode_filter_keep_ratio(
+      decode_attached[probe.tag], probe.rows_before, probe.rows_after, generation);
+  }
+  consumer->record_decode_keep_ratio(
+    observation->rows_before, observation->rows_after, generation, observation->complete);
 }
 
 std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(
@@ -520,9 +582,16 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 
 std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
 {
+  return get_estimated_working_set_size_in_bytes(std::nullopt);
+}
+
+std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
+  std::optional<int> device) const
+{
   if (std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info)) {
-    auto const decode_bytes =
-      std::get<std::shared_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
+    auto const& metadata    = std::get<std::shared_ptr<scan_info>>(materialization_info);
+    auto const decode_bytes = device ? metadata->estimated_working_set_bytes_for_device(*device)
+                                     : metadata->estimated_working_set_bytes();
     if (mvcc_keep_mask.has_mask()) {
       // A partially visible insert-delta split is mask-filtered right after
       // decode: the decoded input and the compacted output (up to input-sized)

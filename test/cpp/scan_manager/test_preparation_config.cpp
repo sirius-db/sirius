@@ -85,6 +85,13 @@ TEST_CASE("Invalid preparation options fail before constructing a scan manager",
     config.preparation.interrupt_check_interval = std::chrono::milliseconds(-1);
   }
   SECTION("no workers") { config.thread_pool.num_threads = 0; }
+  SECTION("zero native workers") { config.preparation.native_reader_workers = 0; }
+  SECTION("zero native slots") { config.preparation.max_native_readers = 0; }
+  SECTION("too few native slots")
+  {
+    config.preparation.native_reader_workers = 3;
+    config.preparation.max_native_readers    = 2;
+  }
   CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(config),
                   std::invalid_argument);
 }

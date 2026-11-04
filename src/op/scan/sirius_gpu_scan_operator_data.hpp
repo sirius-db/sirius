@@ -66,6 +66,9 @@ struct membership_snapshot {
     probes;                      ///< Parallel to selected slots; closures retain filters.
   std::uint64_t generation = 0;  ///< Channel generation captured with these probes.
   std::vector<applied_entry> attached;
+  /// Whether the decode reports the probes' keep ratio (`decode_selection::measure` and
+  /// `decode_selection::complete`).
+  sirius::membership_measurement_request measurement;
 };
 
 /**
@@ -175,6 +178,10 @@ class scan_operator_input : public op::operator_data {
   /// Initialize hints, buffers and readahead before exposing this input to consumers.
   /// Single-owner, at most once; an exception requires discarding the input, not retrying it.
   void initialize_prefetch();
+  // Single-owner stages: prepare may call datasources and must run outside the publication gate.
+  // Publish only registers the prepared input with readahead; it never calls datasource hooks.
+  void prepare_prefetch();
+  void publish_prefetch();
 
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,
@@ -294,6 +301,8 @@ class scan_operator_input : public op::operator_data {
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
   [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override;
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes(
+    std::optional<int> device) const;
 
   [[nodiscard]] const scan_info& get_scan_info() const
   {
@@ -370,6 +379,10 @@ class scan_operator_input : public op::operator_data {
   bool cached_view_possible{false};
   /// Possible membership applications attached to this split's current decoded rows.
   std::vector<applied_entry> decode_attached;
+  /// The scan's per-output-column normalization targets, set when the scan's output assembly is a
+  /// leading identity, so a compacted decode may write restored columns directly in their target
+  /// type. Empty otherwise.
+  std::vector<cudf::data_type> decode_restore_types;
   /// Operator-shared latch for "compacting this scan's batches during decode
   /// does not pay off", stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands
@@ -422,6 +435,11 @@ class scan_operator_input : public op::operator_data {
   /// @throws std::runtime_error if the decode compacted rows but left an mvcc keep-mask unconsumed.
   void record_decode_outcome(::cucascade::idata_representation const* data);
 
+  /// Reports the keep ratios a decode measured for the membership probes attached from `consumer`,
+  /// together and per filter, so the consumer can decide without a clean batch.
+  void report_membership_keep(
+    std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept;
+
   /// Whether the input has already been decoded for a retry (preserve dynamic filter history)
   bool _decoded_input_reused{false};
   /// Per-query readahead bookkeeping this split reports into; null when the
@@ -429,7 +447,8 @@ class scan_operator_input : public op::operator_data {
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
   /// Operator id this split was emitted under, the key @ref _readahead uses.
   std::size_t _operator_id{0};
-  bool _prefetch_started{false};
+  enum class prefetch_phase { idle, preparing, prepared, published };
+  prefetch_phase _prefetch_phase{prefetch_phase::idle};
 };
 
 }  // namespace sirius::op::scan

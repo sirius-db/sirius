@@ -10,6 +10,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
@@ -36,11 +37,12 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
   rmm::device_buffer chars_buf(chars->view().head<void>(), chars_bytes, stream, mr);
 
   auto offsets_copy = std::make_unique<cudf::column>(*offsets, stream, mr);
-  return cudf::make_strings_column(num_rows,
-                                   std::move(offsets_copy),
-                                   std::move(chars_buf),
-                                   /*null_count=*/0,
-                                   rmm::device_buffer(0, stream, mr));
+  return cudf::make_strings_column(
+    num_rows,
+    std::move(offsets_copy),
+    std::move(chars_buf),
+    /*null_count=*/0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 std::unique_ptr<compressed_representation> str_split_compressor::compress(

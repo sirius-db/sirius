@@ -23,10 +23,13 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
+#include <optional>
+#include <vector>
 
 namespace {
 namespace acc = sirius::test::accumulation;
-using fault   = sirius::test::scoped_publication_fault;
+using fault   = sirius::test::scoped_cuda_status_fault;
 
 bool has_two_gpus()
 {
@@ -47,19 +50,19 @@ struct failure_point {
 }  // namespace
 
 TEST_CASE("accumulated publication faults drain all registered streams and retain the CUDA cause",
-          "[dynamic_filter][accumulation_fault][multi_gpu]")
+          "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
-  auto const point = GENERATE(failure_point{fault::peer_copy, 1, false},
-                              failure_point{fault::peer_copy, 4, false},
-                              failure_point{fault::peer_copy, 6, false},
-                              failure_point{fault::peer_copy, 11, false},
+  auto const point = GENERATE(failure_point{fault::copy_peer, 1, false},
+                              failure_point{fault::copy_peer, 4, false},
+                              failure_point{fault::copy_peer, 6, false},
+                              failure_point{fault::copy_peer, 11, false},
                               failure_point{fault::record_event, 4, false},
-                              failure_point{fault::synchronize_stream, 0, false},
-                              failure_point{fault::batch_copy, 1, true},
-                              failure_point{fault::batch_copy, 3, true},
-                              failure_point{fault::batch_copy, 12, true},
-                              failure_point{fault::synchronize_stream, 5, true});
+                              failure_point{fault::synchronize_stream_unjoined, 0, false},
+                              failure_point{fault::enqueue_copy_batch, 1, true},
+                              failure_point{fault::enqueue_copy_batch, 3, true},
+                              failure_point{fault::enqueue_copy_batch, 12, true},
+                              failure_point{fault::synchronize_stream_unjoined, 4, true});
   CAPTURE(point.operation, point.skip, point.staged);
   acc::fixture fixture({.devices = 2});
   if (!point.staged && !acc::has_pool_access(fixture.spaces)) { return; }
@@ -77,7 +80,7 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
   auto const start       = std::chrono::steady_clock::now();
   {
     fault injection{
-      point.operation, point.skip, cudaErrorInvalidValue, std::chrono::milliseconds{80}};
+      point.operation, cudaErrorInvalidValue, point.skip, nullptr, std::chrono::milliseconds{80}};
     try {
       (void)acc::builder_access::finish(builder,
                                         rmm::cuda_device_id{0},
@@ -105,7 +108,7 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
 }
 
 TEST_CASE("accumulation preparation event failure preserves partials and retires scratch",
-          "[dynamic_filter][accumulation_fault][multi_gpu]")
+          "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   auto const skip = GENERATE(std::size_t{0}, std::size_t{6});
@@ -118,7 +121,7 @@ TEST_CASE("accumulation preparation event failure preserves partials and retires
   auto const expected = acc::partial_union(builder, 2, 2);
   {
     // Six prior events place the late failure at the last target-completion event.
-    fault injection{fault::create_event, skip, cudaErrorInvalidValue};
+    fault injection{fault::create_event, cudaErrorInvalidValue, skip};
     REQUIRE_THROWS_AS(builder.finish(rmm::cuda_device_id{0},
                                      fixture.publication_stream(0),
                                      fixture.gpu(0).get_default_allocator()),
@@ -134,16 +137,16 @@ TEST_CASE("accumulation preparation event failure preserves partials and retires
 
 TEST_CASE(
   "delayed accumulation ingress merge and egress preserve every bitmap byte across halves and keys",
-  "[dynamic_filter][accumulation_fault][multi_gpu]")
+  "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
-  auto const point = GENERATE(failure_point{fault::peer_copy, 0, false},
-                              failure_point{fault::peer_copy, 1, false},
-                              failure_point{fault::peer_copy, 4, false},
-                              failure_point{fault::peer_copy, 6, false},
+  auto const point = GENERATE(failure_point{fault::copy_peer, 0, false},
+                              failure_point{fault::copy_peer, 1, false},
+                              failure_point{fault::copy_peer, 4, false},
+                              failure_point{fault::copy_peer, 6, false},
                               failure_point{fault::record_event, 2, false},
-                              failure_point{fault::batch_copy, 1, true},
-                              failure_point{fault::batch_copy, 3, true});
+                              failure_point{fault::enqueue_copy_batch, 1, true},
+                              failure_point{fault::enqueue_copy_batch, 3, true});
   CAPTURE(point.operation, point.skip, point.staged);
   acc::fixture fixture({.devices = 2});
   if (!point.staged && !acc::has_pool_access(fixture.spaces)) { return; }
@@ -155,7 +158,8 @@ TEST_CASE(
   auto const expected = acc::partial_union(builder, 2, 2);
   std::optional<sirius::op::detail::accumulated_bloom_builder::publication> published;
   {
-    fault injection{point.operation, point.skip, cudaSuccess, std::chrono::milliseconds{80}};
+    fault injection{
+      point.operation, cudaSuccess, point.skip, nullptr, std::chrono::milliseconds{80}};
     published = acc::builder_access::finish(builder,
                                             rmm::cuda_device_id{0},
                                             fixture.publication_stream(0),
@@ -166,12 +170,67 @@ TEST_CASE(
   }
   REQUIRE(published);
   using transport = sirius::op::detail::accumulated_bloom_builder::publication_transport;
-  REQUIRE(published->transport == (point.staged ? transport::host_staged : transport::peer_copy));
+  REQUIRE(published->transport == (point.staged ? transport::HOST_STAGED : transport::PEER_COPY));
   acc::require_exact_union(published->filters, expected, 2);
 }
 
+TEST_CASE("HOST publication submits every target upload before waiting for any",
+          "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
+{
+  if (auto const visible = acc::visible_gpus(); visible < 3) {
+    WARN("HOST upload overlap test needs 3 GPUs, " << visible << " visible; skipping");
+    return;
+  }
+  acc::fixture fixture({.devices = 3});
+  // Three chunks per key, so later chunks refill the HOST window after the held upload retires.
+  auto const geometry = acc::bloom_geometry(2'097'153);
+  REQUIRE(geometry.chunks_per_key() == 3);
+  auto builder = acc::make_builder(fixture, geometry);
+  std::vector<acc::batch_ptr> batches;
+  for (int device = 0; device < 3; ++device) {
+    batches.push_back(fixture.make_batch(device, std::int64_t{1000} * device, 100));
+    acc::add_to_builder(builder, fixture, batches.back());
+  }
+  auto const expected = acc::partial_union(builder, 2, 3);
+  auto* host          = fixture.spaces[0]
+                 .get_host_staging_space()
+                 .get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host);
+  auto const host_before = host->get_total_allocated_bytes();
+  auto const baseline    = fixture.allocated_bytes();
+  acc::builder_access::workspace_observation workspace;
+  std::optional<sirius::op::detail::accumulated_bloom_builder::publication> published;
+  {
+    // The first chunk passes each of its two sources through HOST to GPU 0 (four batches) and
+    // copies the merged chunk to HOST (one batch) before its two uploads, so the delay holds the
+    // sixth batch: the first upload.
+    fault injection{
+      fault::enqueue_copy_batch, cudaSuccess, 5, nullptr, std::chrono::milliseconds{200}};
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+    published = acc::builder_access::finish(builder,
+                                            rmm::cuda_device_id{0},
+                                            fixture.publication_stream(0),
+                                            fixture.gpu(0).get_default_allocator(),
+                                            true,
+                                            &workspace);
+    REQUIRE(injection.consumed());
+    REQUIRE_FALSE(injection.invalid_join());
+    REQUIRE(injection.all_submitted_streams_joined());
+    // The second upload was submitted while the first was held.
+    REQUIRE(injection.submissions_during_delay() == 1);
+  }
+  REQUIRE(published);
+  using transport = sirius::op::detail::accumulated_bloom_builder::publication_transport;
+  REQUIRE(published->transport == transport::HOST_STAGED);
+  acc::require_exact_union(published->filters, expected, 3);
+  auto const block = host->get_block_size();
+  REQUIRE(workspace.host_staging_bytes == ((geometry.chunk_bytes + block - 1) / block) * block);
+  REQUIRE(host->get_total_allocated_bytes() == host_before);
+  REQUIRE(fixture.allocated_bytes() == baseline);
+}
+
 TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
-          "[dynamic_filter][multi_partition][accumulation_fault][multi_gpu]")
+          "[dynamic_filter][multi_partition][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   acc::fixture fixture({.devices = 2});
@@ -195,7 +254,7 @@ TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
   auto const host_before = host->get_total_allocated_bytes();
   acc::builder_access::workspace_observation workspace;
   {
-    fault injection{fault::batch_copy, 0, cudaErrorInvalidValue};
+    fault injection{fault::enqueue_copy_batch, cudaErrorInvalidValue};
     auto result = acc::builder_access::finish(builder,
                                               rmm::cuda_device_id{0},
                                               fixture.publication_stream(0),

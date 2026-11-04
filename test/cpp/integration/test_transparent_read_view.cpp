@@ -6,7 +6,6 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/gpu_execution_fixture.hpp>

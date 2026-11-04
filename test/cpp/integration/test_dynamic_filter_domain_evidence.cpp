@@ -159,9 +159,10 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
       REQUIRE(node->children.size() == 1);
       node = node->children.front().get();
     }
-    auto context         = sirius::test::get_registered_sirius_context(*con);
-    auto stable_registry = context->lock_pinned_table_updates();
-    auto const result    = sirius::planner::build_key_domain_evidence_for(
+    auto context = sirius::test::get_registered_sirius_context(*con);
+    duckdb::SiriusContext::SlotGuard stable_registry(
+      *context, *con->context, sirius::exec::query_admission::access::planning);
+    auto const result = sirius::planner::build_key_domain_evidence_for(
       node->Cast<duckdb::LogicalComparisonJoin>(), *con->context, context->get_scan_manager());
     REQUIRE(result.size() == 1);
     return result.front();

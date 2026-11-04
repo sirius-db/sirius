@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_partition.hpp"
 
-#include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
@@ -25,7 +24,6 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -229,7 +227,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                            count,
                                                            stream,
                                                            *space,
-                                                           batch_telemetry());
+                                                           batch_telemetry(),
+                                                           _spec.preserve_input_order);
   std::vector<std::size_t> destinations(partitioned_results.size());
   std::iota(destinations.begin(), destinations.end(), std::size_t{0});
   auto result =
@@ -290,14 +289,23 @@ partition_input_stats sirius_physical_partition::compute_input_totals()
     if (batch) {
       auto ro = batch->to_read_only();
       if (ro.get_data()) {
-        auto const bytes = ro.get_data()->get_size_in_bytes();
-        totals.bytes += bytes;
+        auto const bytes         = ro.get_data()->get_uncompressed_data_size_in_bytes();
+        totals.bytes             = memory::saturating_add(totals.bytes, bytes);
+        totals.resident_bytes    = memory::saturating_add(*totals.resident_bytes, bytes);
+        auto const measured_rows = representation_num_rows(*ro.get_data());
+        if (totals.measured_rows) {
+          totals.measured_rows = measured_rows ? std::optional<uint64_t>{memory::saturating_add(
+                                                   *totals.measured_rows, *measured_rows)}
+                                               : std::nullopt;
+        }
         if (auto const rows = representation_num_rows(ro.get_data())) {
           totals.rows += *rows;
           counted_bytes += bytes;
         } else {
           uncounted_bytes += bytes;
         }
+      } else {
+        totals.measured_rows = std::nullopt;
       }
     }
   }
@@ -400,7 +408,9 @@ partition_input_stats sirius_physical_partition::input_statistics(bool use_estim
                    : _size_estimate->exact ? sizing_basis::upstream_complete
                                            : sizing_basis::projected;
   return {_sizing_bytes,
-          estimated ? scale_rows(received.rows, *estimated, received.bytes) : received.rows};
+          estimated ? scale_rows(received.rows, *estimated, received.bytes) : received.rows,
+          estimated ? std::nullopt : received.measured_rows,
+          estimated ? std::nullopt : received.resident_bytes};
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()

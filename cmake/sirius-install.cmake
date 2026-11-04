@@ -8,7 +8,7 @@ write_basic_package_version_file(
   COMPATIBILITY SameMinorVersion)
 
 install(
-  DIRECTORY include/sirius
+  DIRECTORY include/sirius include/sirius-c
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
   COMPONENT sirius_library)
 install(

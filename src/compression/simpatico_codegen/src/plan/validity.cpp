@@ -5,6 +5,8 @@
 
 #include "codegen/plan/validity.hpp"
 
+#include "codegen/plan/representation.hpp"
+
 #include <cudf/null_mask.hpp>
 
 #include <vector>
@@ -13,7 +15,7 @@ namespace simpatico {
 
 cudf::column_view strip_validity(cudf::column_view input,
                                  validity_sidecar& out,
-                                 rmm::cuda_stream_view stream,
+                                 ::cuda::stream_ref stream,
                                  rmm::device_async_resource_ref mr)
 {
   auto const n     = input.size();
@@ -40,7 +42,7 @@ cudf::column_view strip_validity(cudf::column_view input,
     // of input.offset().
     out.kind       = validity_kind::mask;
     out.null_count = nulls;
-    out.mask       = cudf::copy_bitmask(input, stream, mr);
+    out.mask       = copy_bitmask_as_data(input, stream, mr);
   }
 
   // The same column with its validity buffer dropped. Offset and children are
@@ -62,7 +64,7 @@ cudf::column_view strip_validity(cudf::column_view input,
 
 void attach_validity(cudf::column& col,
                      validity_sidecar const& v,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   switch (v.kind) {
@@ -77,12 +79,14 @@ void attach_validity(cudf::column& col,
       // Copied, not moved: decompress_column takes the tree by const reference
       // and the same tree may be decoded repeatedly (e.g. a pinned chunk served
       // to several queries).
-      col.set_null_mask(rmm::device_buffer(v.mask.data(), v.mask.size(), stream, mr),
-                        static_cast<cudf::size_type>(v.null_count));
+      col.set_null_mask(
+        cudf::copy_bitmask(
+          static_cast<cudf::bitmask_type const*>(v.mask.data()), 0, col.size(), stream, mr),
+        static_cast<cudf::size_type>(v.null_count));
       // The copy above is stream-ordered but v.mask belongs to the caller's tree, which it
       // may free as soon as decompress returns. Wait for the copy to land, as every other
       // decode route does before handing back.
-      stream.synchronize();
+      stream.sync();
       return;
   }
 }

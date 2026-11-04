@@ -33,7 +33,6 @@
 
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
-#include <duckdb/common/types.hpp>
 #include <utils/duckdb_table_identity.hpp>
 
 #include <cstddef>

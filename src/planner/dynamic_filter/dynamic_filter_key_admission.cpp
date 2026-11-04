@@ -22,8 +22,8 @@
 #include "duckdb/planner/joinside.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
-#include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
+#include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -63,8 +63,11 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   build_key_domain_evidence const& domain,
   std::optional<std::size_t> build_side_unique_column)
 {
-  // Null-equal keys could turn a pruned LEFT join match into an accepted NULL-padded row.
-  if (condition.comparison != sirius::comparison_type::equal) { return std::nullopt; }
+  // Comparison semantics determine NULL handling independently of the producer join type.
+  bool const preserve_nulls = condition.comparison == sirius::comparison_type::not_distinct_from;
+  if (condition.comparison != sirius::comparison_type::equal && !preserve_nulls) {
+    return std::nullopt;
+  }
   if (side_blocks_scan_route(shape.probe) || side_blocks_scan_route(shape.build)) {
     return std::nullopt;
   }
@@ -95,7 +98,8 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
     .build_key_proven_unique =
       build_side_unique_column == std::optional{static_cast<std::size_t>(build_key_ordinal)},
     .build_key_declared_unique = domain.declared_unique,
-    .build_key_domain_source   = domain.source};
+    .build_key_domain_source   = domain.source,
+    .preserve_nulls            = preserve_nulls};
 }
 
 }  // namespace
@@ -167,14 +171,15 @@ bool direct_route_admissible(duckdb::JoinType join_type,
                              cudf::data_type probe_storage_type,
                              cudf::data_type build_storage_type) noexcept
 {
-  bool const join_type_supported =
-    join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::SEMI;
-  bool const shapes_supported = shape.probe == op::dynamic_filter_key_shape::direct &&
+  bool const join_type_supported = probe_filter_join_type_admissible(join_type);
+  bool const shapes_supported    = shape.probe == op::dynamic_filter_key_shape::direct &&
                                 shape.build == op::dynamic_filter_key_shape::direct;
   bool const storage_type_supported =
     probe_storage_type == build_storage_type && op::membership_key_supported(build_storage_type);
-  return join_type_supported && comparison == sirius::comparison_type::equal && shapes_supported &&
-         storage_type_supported;
+  return join_type_supported &&
+         (comparison == sirius::comparison_type::equal ||
+          comparison == sirius::comparison_type::not_distinct_from) &&
+         shapes_supported && storage_type_supported;
 }
 
 }  // namespace sirius::planner

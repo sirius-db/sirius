@@ -54,7 +54,6 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <glob.h>
-#include <log/logging.hpp>
 #include <log/spdlog_owning_sink.hpp>
 
 #include <algorithm>

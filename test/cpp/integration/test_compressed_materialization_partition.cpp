@@ -30,18 +30,13 @@
 
 #include "compressed_materialization_test_common.hpp"
 #include "cudf/cudf_utils.hpp"
-#include "op/scan/sirius_physical_dynamic_filter.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_partition.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/types.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/settings.hpp>

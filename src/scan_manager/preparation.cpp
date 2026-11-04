@@ -17,14 +17,13 @@
 #include "scan_manager/preparation.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "op/scan/iceberg_delete_set.hpp"
 
 namespace sirius::scan_manager {
 void preparation_gate::check_interrupted()
 {
   if (interrupted && interrupted()) {
     closed = true;
-    cv.notify_all();
+    notify_under_lock();
     throw duckdb::InterruptException();
   }
 }
@@ -63,7 +62,7 @@ void preparation_unit::finish_input(required_input input)
     record_.state = unit_state::ready;
   }
   record_.completed = completed;
-  if (gate_) gate_->cv.notify_all();
+  if (gate_) gate_->notify_under_lock();
 }
 bool preparation_unit::complete_input(footer_input input)
 {
@@ -95,7 +94,7 @@ bool preparation_unit::complete_input(segments_input input)
   finish_input(required_input::segments);
   return true;
 }
-bool preparation_unit::complete_input(delete_set_input input)
+bool preparation_unit::complete_input(visibility_input input)
 {
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
@@ -103,10 +102,10 @@ bool preparation_unit::complete_input(delete_set_input input)
     if (gate_->closed) return false;
   }
   std::lock_guard lock(mutex_);
-  if (!accept(required_input::delete_set)) return false;
-  if (!input.value) throw std::invalid_argument("pending delete set is not an empty result");
-  deps_.delete_set = std::move(input.value);
-  finish_input(required_input::delete_set);
+  if (!accept(required_input::visibility)) return false;
+  if (!input.value) throw std::invalid_argument("pending visibility is not an empty result");
+  deps_.visibility = std::move(input.value);
+  finish_input(required_input::visibility);
   return true;
 }
 bool preparation_unit::complete_input(checkpoint_input input)
@@ -124,6 +123,19 @@ bool preparation_unit::complete_input(checkpoint_input input)
 }
 bool preparation_unit::fail(preparation_failure failure)
 {
+  struct callback_use {
+    std::shared_ptr<preparation_gate> gate;
+    bool active = false;
+    ~callback_use()
+    {
+      if (!active) return;
+      std::lock_guard lock(gate->mutex);
+      --gate->callbacks;
+      gate->notify_under_lock();
+    }
+  } use{gate_};
+  // Declared after the credit: input retirement precedes callback settlement on every exit.
+  op::scan::split_dependencies discarded;
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
     gate_lock = std::unique_lock(gate_->mutex);
@@ -135,26 +147,18 @@ bool preparation_unit::fail(preparation_failure failure)
     failure.validate();
     record_.failure = failure;
     record_.state   = unit_state::failed;
-    deps_           = {};
+    discarded       = std::move(deps_);
   }
   if (gate_) {
     // arm binds once; this callback stays stable until accepted users have drained.
     auto* report = gate_->report_failure ? &gate_->report_failure : nullptr;
-    if (report) ++gate_->callbacks;
-    gate_->cv.notify_all();
-    gate_lock.unlock();
     if (report) {
-      struct callback_use {
-        std::shared_ptr<preparation_gate> gate;
-        ~callback_use()
-        {
-          std::lock_guard lock(gate->mutex);
-          --gate->callbacks;
-          gate->cv.notify_all();
-        }
-      } use{gate_};
-      (*report)(failure);
+      ++gate_->callbacks;
+      use.active = true;
     }
+    gate_->notify_under_lock();
+    gate_lock.unlock();
+    if (report) (*report)(failure);
   }
 
   return true;
@@ -170,8 +174,8 @@ bool preparation_unit::cancel_under_gate()
   std::lock_guard lock(mutex_);
   if (record_.state != unit_state::pending) return false;
   record_.state = unit_state::cancelled;
-  deps_         = {};
-  if (gate_) gate_->cv.notify_all();
+  // Keep incomplete owned inputs until the unit is retired outside the publication gate.
+  if (gate_) gate_->notify_under_lock();
   return true;
 }
 unit_record preparation_unit::record() const
@@ -179,7 +183,7 @@ unit_record preparation_unit::record() const
   std::lock_guard lock(mutex_);
   return record_;
 }
-required_input_set required_inputs(op::scan::later_check_set const& checks, bool needs_delete_set)
+required_input_set required_inputs(op::scan::later_check_set const& checks, bool needs_visibility)
 {
   using op::scan::later_check;
   auto has = [&](later_check check) { return checks[static_cast<size_t>(check)]; };
@@ -189,7 +193,7 @@ required_input_set required_inputs(op::scan::later_check_set const& checks, bool
                has(later_check::schema_per_file));
   result.set(static_cast<size_t>(required_input::segments),
              has(later_check::segments_per_range) || has(later_check::matrix_per_range));
-  result.set(static_cast<size_t>(required_input::delete_set), needs_delete_set);
+  result.set(static_cast<size_t>(required_input::visibility), needs_visibility);
   result.set(static_cast<size_t>(required_input::checkpoint_iteration), has(later_check::key_held));
   return result;
 }

@@ -259,6 +259,29 @@ std::unique_ptr<operator_data> claim_concat_input(sirius_physical_concat& concat
 /**
  * @brief Create an int32 batch of @p num_rows rows (4 bytes per row).
  */
+/// A stored batch whose stored size differs from its decoded size, like a spilled
+/// compressed batch.
+class compressed_size_representation : public idata_representation {
+ public:
+  compressed_size_representation(memory_space& space, std::size_t stored, std::size_t decoded)
+    : idata_representation(space), _stored(stored), _decoded(decoded)
+  {
+  }
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return _stored; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return _decoded;
+  }
+  [[nodiscard]] std::unique_ptr<idata_representation> clone(::cuda::stream_ref) const override
+  {
+    return nullptr;
+  }
+
+ private:
+  std::size_t _stored;
+  std::size_t _decoded;
+};
+
 std::shared_ptr<data_batch> make_int32_batch(memory_space& space, std::size_t num_rows)
 {
   std::vector<int32_t> values(num_rows);
@@ -1739,36 +1762,36 @@ TEST_CASE("partitioned input replacement preserves partition and device metadata
   CHECK(input->get_data_batches() == std::vector<std::shared_ptr<data_batch>>{original});
 }
 
-TEST_CASE("BUILD_PROBE rejects a missing explicit build concatenation path",
-          "[physical_partition][physical_concat]")
+TEST_CASE("sirius_physical_concat counts compressed batches at their decoded size",
+          "[physical_concat]")
 {
-  bool const probe_initiates = GENERATE(false, true);
-  // MARK requires BUILD_PROBE even when the foldable capability is absent.
-  auto fixture = create_test_hash_join(duckdb::JoinType::MARK, {duckdb::LogicalType::BOOLEAN});
-  auto const types =
-    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
-  sirius_physical_partition build(
-    types, 0, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, true));
-  sirius_physical_partition probe(
-    types, 0, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
-  cucascade::shared_data_repository build_repo;
-  cucascade::shared_data_repository probe_repo;
-  auto attach = [](sirius_physical_operator& op, cucascade::shared_data_repository& repo) {
-    auto port  = std::make_unique<sirius_physical_operator::port>();
-    port->type = MemoryBarrierType::FULL;
-    port->repo = &repo;
-    op.add_port("default", std::move(port));
-  };
-  attach(build, build_repo);
-  attach(probe, probe_repo);
   auto* space = get_shared_mem_space();
-  build_repo.add_data_batch(make_int32_batch(*space, 1));
-  size_t id = 100;
-  number_operator_tree(build, id);
-  number_operator_tree(probe, id);
-  bind_partition_inputs(*fixture.hash_join, build, probe, nullptr);
-  auto& first = probe_initiates ? probe : build;
-  CHECK_THROWS_WITH(
-    first.get_next_task_input_data(),
-    Catch::Matchers::ContainsSubstring("BUILD_PROBE requires a bound build CONCAT"));
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;
+
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    false,
+    threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // Two batches stored at 100 bytes that decode to 800 each: together they exceed the
+  // threshold once decoded, so the first forms a group even though the source still runs.
+  for (int i = 0; i < 2; ++i) {
+    repo->add_data_batch(
+      data_batch::make(sirius::get_next_batch_id(),
+                       std::make_unique<compressed_size_representation>(*space, 100, 800)),
+      0);
+  }
+
+  auto hint = concat_op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::READY);
 }

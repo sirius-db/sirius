@@ -19,19 +19,20 @@
 // GPUs. Before replica support, the corresponding cross-device dereference is the
 // cudaErrorIllegalAddress reported by TPC-H Q2.
 
+#include "cudf/ast_compat.hpp"
 #include "dynamic_filter_replica_test_utils.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_transfer.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/pool_peer_access_requirement.hpp"
 #include "utils/sirius_test_env.hpp"
 
-#include <cudf/ast/expressions.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/aligned.hpp>
@@ -219,6 +220,8 @@ TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
   auto replica_spaces = get_replica_spaces(*memory_manager, device_count);
   if (!sirius::memory::try_grant_pool_access(replica_spaces.front().get_gpu_space(), 1) ||
       !sirius::memory::try_grant_pool_access(replica_spaces.front().get_gpu_space(), 2)) {
+    sirius::test::fail_if_pool_peer_access_required(
+      "dynamic-filter overlap test requires source-pool access from GPUs 1 and 2");
     WARN(
       "dynamic-filter overlap test requires source-pool access from GPUs 1 and 2; "
       "skipping");
@@ -524,16 +527,61 @@ TEST_CASE("replica fan-out skips recoverable failures and keeps fatal ones",
   {
     sirius::op::detail::replica_fanout_failures failures;
     REQUIRE(skips_replica_failure(failures, rmm::out_of_memory{"destination reservation"}));
+    REQUIRE(skips_replica_failure(failures, std::bad_alloc{}));
+    REQUIRE(skips_replica_failure(failures, rmm::bad_alloc{"allocation refused"}));
     REQUIRE(skips_replica_failure(failures, std::runtime_error{"host staging unavailable"}));
     REQUIRE_NOTHROW(failures.rethrow_if_fatal());
   }
   SECTION("CUDA errors propagate")
   {
     require_fatal_replica_failure(cucascade::cuda_error{"grant"});
+    require_fatal_replica_failure(::cuda::cuda_error{cudaErrorInvalidValue, "CCCL error"});
+    require_fatal_replica_failure(cudf::cuda_error{"cuDF error", cudaErrorInvalidValue});
+    require_fatal_replica_failure(cudf::fatal_cuda_error{"fatal cuDF error", cudaErrorUnknown});
+    require_fatal_replica_failure(rmm::cuda_error{"RMM error"});
   }
   SECTION("programming and configuration errors propagate")
   {
     require_fatal_replica_failure(std::invalid_argument{"device ID outside the visible set"});
     require_fatal_replica_failure(std::logic_error{"unrecognized pool access status"});
+    require_fatal_replica_failure(42);
   }
+}
+
+TEST_CASE("replica fan-out preserves the first fatal exception through later failures",
+          "[dynamic_filter][replica_failure]")
+{
+  sirius::op::detail::replica_fanout_failures failures;
+  REQUIRE_FALSE(
+    skips_replica_failure(failures, cudf::cuda_error{"first failure", cudaErrorInvalidValue}));
+  REQUIRE_FALSE(skips_replica_failure(failures, rmm::cuda_error{"later submission failure"}));
+  REQUIRE(skips_replica_failure(failures, std::runtime_error{"later unavailable staging"}));
+  try {
+    throw std::bad_alloc{};
+  } catch (...) {
+    failures.record_fatal("[test]", 0, 1);
+  }
+  try {
+    failures.rethrow_if_fatal();
+    FAIL("the first fatal error must propagate");
+  } catch (cudf::cuda_error const& error) {
+    REQUIRE(std::string{error.what()} == "first failure");
+    REQUIRE(error.error_code() == cudaErrorInvalidValue);
+  }
+}
+
+TEST_CASE("replica completion failures are fatal even for normally recoverable types",
+          "[dynamic_filter][replica_failure]")
+{
+  auto require_completion_failure = [](auto error) {
+    sirius::op::detail::replica_fanout_failures failures;
+    try {
+      throw error;
+    } catch (...) {
+      failures.record_fatal("[test]", 0, 1);
+    }
+    REQUIRE_THROWS_AS(failures.rethrow_if_fatal(), decltype(error));
+  };
+  require_completion_failure(std::runtime_error{"completion failure"});
+  require_completion_failure(std::bad_alloc{});
 }

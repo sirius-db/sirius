@@ -46,7 +46,6 @@
 
 #include <catch.hpp>
 #include <compression/decompression_pushdown_policy.hpp>
-#include <duckdb.hpp>
 #include <late_mat/column_origin.hpp>
 #include <late_mat/defer_directive.hpp>
 #include <late_mat/materialize.hpp>

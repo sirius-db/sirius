@@ -68,6 +68,25 @@ mount_paths;                    // directories for spill files
 memory_capacity = 1TB;          // total spill capacity
 ```
 
+## Parquet scan working sets
+
+Index estimates use the input rows in selected row groups, before reader filtering. A cuDF row index is UINT64 (8 B/row); a source index is INT32 (4 B/row), omitted for a single reader source. Estimates allow both pre-filter and filtered index columns to coexist.
+
+Iceberg scans without virtual columns use interval deletion before query predicates when deletes are present. They add no internal row/source index workspace and have no alternative position peak selected at split emission.
+
+Virtual scans already budget their output columns, reader indices and selection/cast scratch; deletion adds only missing index allowances and delete storage. Source costs are conservative before coalescing, so virtual estimates may retain a source allowance for a single-file split. Filename estimates include characters, offsets and construction buffers. Arithmetic saturates on overflow. These are buffer estimates, not an exact bound on all cuDF decoder scratch.
+
+File/split preparation charges retain the same additive row-group estimate from registration through consumption. Batch fill and execution omit the deletion-position allowance when the split's selected row groups contain no deletes. If groups with and without deletes share a filtered split, its position allowance covers every input row. Plain Parquet and Iceberg reader-mode virtual scans reserve one combined reader result rather than per-row-group table concatenation.
+
+Virtual scans eligible for reader-position deletion capture their dynamic-filter snapshot when the split is emitted. Admission
+checks the same snapshot and static reader translation as decode, on the target GPU. Without a
+usable reader predicate, the execution estimate excludes the internal position workspace and
+decode retains interval deletion; filters published later cannot enable positions for that split.
+User-requested virtual columns retain their own workspace. Pipeline memory history and retry
+floors still apply independently; this removes the position estimate, not other measured peaks.
+
+Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
+
 ## Memory Reservations
 
 Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:
@@ -131,6 +150,21 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 **Files:** `src/data/spill_chunked_converters.hpp`, `src/data/spill_chunked_converters.cpp`, `src/data/chunked_spill_copy.hpp`
 
 The builtin cucascade fast converter submits an entire batch's GPU→HOST copies as one monolithic batched call followed by one blocking synchronize (18–28 GB single submissions observed on q9-class partition spills). At context initialization Sirius replaces it with a chunked converter (`executor.downgrade.copy_chunk_bytes`, default 1 GiB; 0 keeps the builtin) that produces a byte-identical `host_data_representation` but flushes copies every ~chunk while the column tree is still being walked — overlapping each chunk's DMA with the next chunk's prep — and wraps each conversion in an NVTX range. The HOST→GPU restore direction deliberately stays on the builtin converter (it runs on instrumented pipeline threads and reconstructs from the self-describing `column_metadata`).
+
+### Spill Compression
+
+**Files:** `src/compression/spill_compression.hpp`, `src/compression/spill_compression.cpp`, `src/compression/compressed_disk_representation.hpp`, `src/compression/compression_converters.cpp`, `src/data/convertible_data_batch.hpp`
+
+With `compression.enable_spill_compression` on, `convertible_data_batch::convert` first offers a GPU batch of at least `spill_min_batch_bytes` to the Simpatico converters when it moves to the HOST or DISK tier, and falls back to the uncompressed converters when they decline or fail, so the feature can only change how a batch is stored, never whether it spills:
+
+| From | To | Converter |
+|------|----|-----------|
+| `gpu_table_representation` | `compressed_host_representation` | encode on the device, stage the payload in pinned host blocks |
+| `gpu_table_representation` | `compressed_disk_representation` | encode on the device, write an `.hpln` file under the disk space's mount path through its I/O backend |
+| `compressed_host_representation` | `compressed_disk_representation` | write the pinned header and payload as an `.hpln` file through the I/O backend (no decode) |
+| `compressed_disk_representation` | `gpu_table_representation` | read the header, then each compressed buffer straight into device memory, through the I/O backend; decode |
+
+The compressed host representation decodes with the converter `pin_table` already uses. Each column's plan follows from its type and a prefix sample: fixed-width columns up to 8 GiB are bitpacked (bitpack's encode scratch holds a column at full width as 2^31 32-bit words at most; larger ones are stored as is). Integer-valued columns up to 64 bits (integers, decimals, chrono types) copy a 64K-row prefix to the host and estimate the size of bitpack, delta → bitpack and delta → rle → bitpack from per-1024-value-chunk bit widths; a delta plan is used when it is estimated at least 10% smaller, which is the case for sorted join and group keys, especially those with repeats. The choice is made per batch, not cached: it costs about a millisecond per column. Strings are dictionary-encoded when a sample has few distinct values and otherwise split into ans-coded chars and delta → bitpack offsets, anything else is stored as is. The encode allocates from the GPU pool the batch is being evicted from, so it runs under a reservation of `spill_encode_reserve_fraction` of the batch's size, attached to the allocation tracker for the encode's duration. Under per-thread tracking the reservation covers the column-parallel encode on the stream pool; under per-stream tracking it covers only the downgrade stream, so the encode runs on that stream alone. The batch spills uncompressed when the reservation is not grantable, when every column's plan stores it as is (the encode would only copy the batch), or when the compressed form exceeds `spill_max_compressed_fraction` of the batch. A spilled compressed batch reports its compressed size from `get_size_in_bytes()`, so code that sizes GPU work from waiting batches (the PARTITION operator's partition count, CONCAT's `concat_batch_bytes` grouping) uses `get_uncompressed_data_size_in_bytes()`, the size the task will decode to. Decoding back to the GPU reserves the batch's uncompressed size, and a decode that runs out of device memory or streams throws `rmm::out_of_memory`, which the executor reschedules like any other OOM.
 
 ### Candidate Selection Strategy
 

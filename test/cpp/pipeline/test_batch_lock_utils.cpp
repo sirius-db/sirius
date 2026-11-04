@@ -46,7 +46,6 @@
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/error.hpp>

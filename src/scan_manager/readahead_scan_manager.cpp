@@ -16,10 +16,9 @@
 
 #include "scan_manager/readahead_scan_manager.hpp"
 
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
-#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "planner/query.hpp"

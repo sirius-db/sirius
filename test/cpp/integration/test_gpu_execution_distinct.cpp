@@ -33,7 +33,6 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
@@ -377,33 +376,6 @@ TEST_CASE_METHOD(DistinctFixture,
   // A failed restore would leak nocase into every later integration case.
   REQUIRE(con->Query("SELECT current_setting('default_collation');")->Collection().GetValue(0, 0) ==
           prior);
-}
-
-TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution distinct UNION falls back at plan time",
-                 "[integration][gpu_execution][distinct]")
-{
-  // Each plans as a DISTINCT over a UNION ALL, with at most an identity projection between, the
-  // shape the builder refuses. The message check pins the refusal to that guard: a fallback from
-  // any other refusal, such as a compress projection when compressed materialization is on, must
-  // fail here. Another fixture may have cleared the mask Sirius publishes at load, so restate it.
-  sirius::test::scoped_sirius_setting optimizer_mask{
-    *con, "disabled_optimizers", "in_clause,compressed_materialization,late_materialization"};
-  auto const expect_union_refused = [this](std::string const& query) {
-    expect_plan_fallback_matches_cpu(query);
-    sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
-    auto const result = con->Query(query);
-    REQUIRE(result);
-    REQUIRE(result->HasError());
-    REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("DISTINCT over a UNION"));
-  };
-  expect_union_refused("SELECT a FROM dist_t UNION SELECT a FROM dist_r");
-  expect_union_refused("SELECT a, x FROM dist_r UNION BY NAME SELECT x, a FROM dist_r");
-  expect_union_refused(
-    "SELECT a FROM dist_t UNION SELECT a FROM dist_r UNION SELECT k FROM dist_fd");
-  expect_union_refused(
-    "SELECT a FROM dist_t UNION ALL SELECT a FROM dist_r UNION SELECT k FROM dist_fd");
-  expect_union_refused("SELECT a FROM dist_t UNION SELECT a FROM dist_r ORDER BY a NULLS LAST");
 }
 
 TEST_CASE_METHOD(DistinctFixture,

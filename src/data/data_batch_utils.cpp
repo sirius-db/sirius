@@ -16,7 +16,7 @@
 
 #include "data/data_batch_utils.hpp"
 
-#include "compression/compressed_representation.hpp"
+#include "compression/simpatico_compressed_representation.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -54,10 +54,7 @@ std::optional<std::size_t> representation_num_rows(cucascade::idata_representati
   if (auto const* disk = dynamic_cast<cucascade::disk_data_representation const*>(&data)) {
     return first_column_rows(disk->get_disk_table().columns);
   }
-  if (auto const* compressed = dynamic_cast<compressed_host_representation const*>(&data)) {
-    return static_cast<std::size_t>(compressed->num_rows());
-  }
-  if (auto const* compressed = dynamic_cast<compressed_device_representation const*>(&data)) {
+  if (auto const* compressed = dynamic_cast<simpatico_compressed_representation const*>(&data)) {
     return static_cast<std::size_t>(compressed->num_rows());
   }
   return std::nullopt;

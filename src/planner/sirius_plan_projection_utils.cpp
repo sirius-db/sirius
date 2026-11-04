@@ -164,6 +164,28 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_projection(
   return fold_projection_with_child(std::move(projection_op));
 }
 
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_appending_projection(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> appended,
+  duckdb::vector<sirius::logical_type> appended_types,
+  std::size_t estimated_cardinality)
+{
+  auto types = child->types;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+  for (std::size_t c = 0; c < types.size(); ++c) {
+    select_list.push_back(std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{static_cast<uint32_t>(c), types[c]}));
+  }
+  for (auto& expression : appended) {
+    select_list.push_back(std::move(expression));
+  }
+  for (auto& type : appended_types) {
+    types.push_back(std::move(type));
+  }
+  return push_projection(
+    std::move(child), std::move(types), std::move(select_list), estimated_cardinality);
+}
+
 // Post-pass over the finished plan: recurse into children first, then fold any
 // PROJECTION chain at this node. Catches stacks that push_projection missed
 // (e.g. projections under joins or built in separate plan-builder steps).
