@@ -66,7 +66,8 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   [[nodiscard]] bool ordered() const noexcept;
 
   /// Unordered arrivals land in this source's port repository, where they can be spilled, only
-  /// while @p lifecycle grants this query work; without one they stay in a private queue.
+  /// while @p lifecycle grants this query work; once it stops, arrivals are dropped. Without
+  /// one they stay in a private queue.
   void set_query_lifecycle(exec::query_lifecycle_registry& lifecycle);
 
   /// Where to make the one empty batch handed on when the stream ends having brought nothing.
