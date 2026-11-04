@@ -579,6 +579,28 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::coalesce const& alt,
 {
   D_ASSERT(alt.children.size() > 1);
 
+  auto current_result = with_selective_retry([&] { return evaluate_coalesce_eagerly(alt); },
+                                             [&] { return evaluate_coalesce_selectively(alt); });
+
+  if (mode == evaluation_mode::AST) {
+    // A null-free reference short-circuits as a borrowed view; copy it so the temp column owns it.
+    // TODO: Avoid this copy: https://github.com/sirius-db/sirius/issues/2305.
+    if (current_result.is_column_view()) {
+      current_result = evaluate_result(
+        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr));
+    }
+    if (!current_result.is_owned_column()) {
+      throw internal_exception(
+        "[expression_evaluator:operator]: Expected an owned column after executing COALESCE "
+        "expression.");
+    }
+    return materialize_as_ast_column(current_result.release_column());
+  }
+  return current_result;
+}
+
+evaluate_result expression_evaluator::evaluate_coalesce_eagerly(sirius::ast::coalesce const& alt)
+{
   auto current_result = evaluate(*alt.children[0], evaluation_mode::MATERIALIZE);
   if (current_result.is_scalar()) {
     current_result = evaluate_result(cudf::make_column_from_scalar(
@@ -597,22 +619,23 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::coalesce const& alt,
         current_result.get_column_view(), replacement.get_column_view(), _stream, _mr));
     }
   }
-
-  if (mode == evaluation_mode::AST) {
-    // A null-free reference short-circuits as a borrowed view; copy it so the temp column owns it.
-    // TODO: Avoid this copy: https://github.com/sirius-db/sirius/issues/2305.
-    if (current_result.is_column_view()) {
-      current_result = evaluate_result(
-        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr));
-    }
-    if (!current_result.is_owned_column()) {
-      throw internal_exception(
-        "[expression_evaluator:operator]: Expected an owned column after executing COALESCE "
-        "expression.");
-    }
-    return materialize_as_ast_column(current_result.release_column());
-  }
   return current_result;
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_coalesce_selectively(
+  sirius::ast::coalesce const& alt)
+{
+  // DuckDB semantics: each argument sees only the rows that every earlier argument left NULL.
+  auto const type = require_cudf_type(alt.return_type());
+  auto result     = evaluate_on_selected_rows(*alt.children[0], nullptr, type);
+  for (std::size_t child_idx = 1; child_idx < alt.children.size() && result->has_nulls();
+       ++child_idx) {
+    auto const missing = cudf::is_null(result->view(), _stream, _mr);
+    auto const rows    = missing->view();
+    auto replacement   = evaluate_on_selected_rows(*alt.children[child_idx], &rows, type);
+    result             = scatter_selected(replacement->view(), result->view(), rows);
+  }
+  return result;
 }
 
 }  // namespace sirius

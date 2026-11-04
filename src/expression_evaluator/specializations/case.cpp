@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include <cudf/cudf_utils.hpp>
+
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
@@ -24,20 +26,73 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/replace.hpp>
+#include <cudf/unary.hpp>
 
 // standard library
+#include <algorithm>
+#include <optional>
 #include <ranges>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
 
+namespace {
+
+/// True for the implicit error() THEN that DuckDB inserts for a scalar subquery returning more
+/// than one row.
+bool is_error_branch(sirius::ast::node const& then)
+{
+  return then.holds<sirius::ast::function_call>() &&
+         then.get<sirius::ast::function_call>().function() == sirius::function_id::error;
+}
+
+[[noreturn]] void raise_subquery_error()
+{
+  throw internal_exception(
+    "[expression_evaluator:case]: More than one row returned by a subquery used as an "
+    "expression.");
+}
+
+}  // namespace
+
 evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt,
                                                evaluation_mode mode)
 {
+  D_ASSERT(!alt.cases.empty());
+
+  // The eager pass tests an error() THEN's WHEN on every row, ignoring earlier WHENs, which is
+  // exact only for the first WHEN. DuckDB generates no other, but SQL can spell one.
+  auto const selective      = [&] { return evaluate_case_selectively(alt); };
+  auto const eager_is_exact = std::ranges::none_of(
+    alt.cases | std::views::drop(1), [](auto const& c) { return is_error_branch(*c.then_); });
+  auto current_result = [&] {
+    if (eager_is_exact || _input_table.num_columns() == 0) {
+      return with_selective_retry([&] { return evaluate_case_eagerly(alt); }, selective);
+    }
+    ++_selective_evaluation_count;
+    return evaluate_result(selective());
+  }();
+
   //===----------MATERIALIZE (AST breaker)----------===//
   // CASE cannot be represented as a cudf AST operation, so we always materialize it. If the caller
-  // requested AST mode, we materialize the result and wrap it as a temporary column that the
-  // parent's AST tree can reference.
+  // requested AST mode, we wrap the result as a temporary column that the parent's AST tree can
+  // reference.
+  if (mode == evaluation_mode::AST) {
+    // Both passes produce an owned column, except an eager pass whose every THEN is error(), which
+    // returns ELSE as it is.
+    if (!current_result.is_owned_column()) {
+      throw internal_exception(
+        "[expression_evaluator:case]: Expected an owned column after executing CASE "
+        "expression.");
+    }
+    return materialize_as_ast_column(current_result.release_column());
+  }
+  return current_result;
+}
+
+evaluate_result expression_evaluator::evaluate_case_eagerly(sirius::ast::case_expr const& alt)
+{
   std::unique_ptr<cudf::column> output;
 
   // First, evaluate the ELSE
@@ -46,16 +101,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
   // Iterate in reverse so the THEN of the first true WHEN is copied to the
   // output column last (overwrites any later match). SQL CASE semantics:
   // first matching WHEN wins.
-  D_ASSERT(!alt.cases.empty());
-
   for (auto const& case_check : std::views::reverse(alt.cases)) {
     // Execute the WHEN expression to get a boolean array intermediate.
     auto current_mask = evaluate(*case_check.when_, evaluation_mode::MATERIALIZE);
 
     // Check for the implicit error() function that DuckDB inserts as a CASE THEN.
-    if (case_check.then_->holds<sirius::ast::function_call>() &&
-        case_check.then_->get<sirius::ast::function_call>().function() ==
-          sirius::function_id::error) {
+    if (is_error_branch(*case_check.then_)) {
       // If the THEN is true anywhere, raise the error eagerly.
       bool throw_error = false;
       if (current_mask.is_scalar()) {
@@ -70,11 +121,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
                                        _mr);
         throw_error     = static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value(_stream);
       }
-      if (throw_error) {
-        throw internal_exception(
-          "[expression_evaluator:case]: More than one row returned by a subquery used as an "
-          "expression.");
-      }
+      if (throw_error) { raise_subquery_error(); }
       continue;
     }
 
@@ -116,17 +163,61 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
     }
     current_result = evaluate_result(std::move(output));
   }
-  if (mode == evaluation_mode::AST) {
-    // The caller wants an AST node.
-    // Since at least one copy_if_else has been executed, current_result must have an owned column.
-    if (!current_result.is_owned_column()) {
-      throw internal_exception(
-        "[expression_evaluator:case]: Expected an owned column after executing CASE "
-        "expression.");
-    }
-    return materialize_as_ast_column(current_result.release_column());
-  }
   return current_result;
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
+  sirius::ast::case_expr const& alt)
+{
+  // DuckDB semantics: each WHEN sees only the rows no earlier WHEN matched, where NULL does not
+  // match; each THEN sees the rows its WHEN matched, and ELSE the rest. Every mask below is a
+  // null-free BOOL8 column over all input rows.
+  auto const num_rows  = _input_table.num_rows();
+  auto const type      = require_cudf_type(alt.return_type());
+  auto const condition = cudf::data_type{cudf::type_id::BOOL8};
+  auto const no        = cudf::numeric_scalar<bool>(false, true, _stream, _mr);
+
+  std::unique_ptr<cudf::column> result;
+  auto const assign = [&](sirius::ast::node const& branch, cudf::column_view const& rows) {
+    auto value = evaluate_on_selected_rows(branch, &rows, type);
+    if (!result) { result = sirius::make_null_column(value->view(), num_rows, _stream, _mr); }
+    result = scatter_selected(value->view(), result->view(), rows);
+  };
+
+  // Rows no WHEN has matched yet; empty while that is every row.
+  std::unique_ptr<cudf::column> unmatched;
+  for (auto const& case_check : alt.cases) {
+    auto const candidates =
+      unmatched ? std::optional<cudf::column_view>{unmatched->view()} : std::nullopt;
+    auto matched =
+      evaluate_on_selected_rows(*case_check.when_, candidates ? &*candidates : nullptr, condition);
+    if (matched->has_nulls()) { matched = cudf::replace_nulls(matched->view(), no, _stream, _mr); }
+    if (candidates) {
+      auto const none = cudf::make_column_from_scalar(no, num_rows, _stream, _mr);
+      matched         = scatter_selected(matched->view(), none->view(), *candidates);
+    }
+
+    if (is_error_branch(*case_check.then_)) {
+      if (!matched->view().is_empty()) {
+        auto const any = cudf::reduce(matched->view(),
+                                      *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
+                                      condition,
+                                      _stream,
+                                      _mr);
+        if (static_cast<cudf::scalar_type_t<bool> const&>(*any).value(_stream)) {
+          raise_subquery_error();
+        }
+      }
+    } else {
+      assign(*case_check.then_, matched->view());
+    }
+
+    unmatched = candidates
+                  ? cudf::copy_if_else(no, *candidates, matched->view(), _stream, _mr)
+                  : cudf::unary_operation(matched->view(), cudf::unary_operator::NOT, _stream, _mr);
+  }
+  assign(*alt.else_, unmatched->view());
+  return result;
 }
 
 }  // namespace sirius

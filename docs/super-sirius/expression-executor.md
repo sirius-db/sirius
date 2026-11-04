@@ -205,6 +205,34 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
+### Conditional evaluation and row-dependent errors
+
+DuckDB evaluates a CASE branch only on the rows that select it. A WHEN sees the rows no earlier
+WHEN matched (NULL does not match), a THEN sees the rows its WHEN matched, and ELSE sees the rest.
+A COALESCE argument sees the rows that every earlier argument left NULL. A branch therefore never
+raises an error for a row it does not produce, as in `CASE WHEN n = 1 THEN a + n ELSE a END` where
+`a + n` overflows on rows with other `n`.
+
+`case_expr` and `coalesce` first evaluate eagerly as described above: every CASE branch, and every
+COALESCE argument while nulls remain, over the whole batch. Checked operations reject the batch
+when any row is invalid. They raise `sirius::invalid_input_exception`, or
+`sirius::not_implemented_exception` when DuckDB must produce the error. On either exception,
+`with_selective_retry` releases the eager pass's temporaries and evaluates the expression again
+with DuckDB's semantics:
+
+- `evaluate_on_selected_rows` compacts the referenced input columns to the rows of a BOOL8 mask
+  and evaluates the branch in a child `expression_evaluator`. The parent's AST tree, temporaries
+  and caches stay intact, and the result has the branch's declared type.
+- `cudf::boolean_mask_scatter` writes each branch's rows into the result.
+
+An error from this second pass is legitimate and propagates. A query that succeeds eagerly pays
+nothing for the retry, and a new checked operation is covered without a list of fallible
+operations. Other exceptions, such as out-of-memory, propagate without a retry, and so does an
+error over an input without columns, which cannot carry a row count. The eager pass tests an
+`error()` THEN's WHEN on every row, which is exact only for the first WHEN, so a CASE with an
+`error()` THEN after its first WHEN evaluates selectively at once. Only hand-written SQL produces
+one. Tests are tagged `[conditional_errors]`.
+
 Handlers that read an operand as a column evaluate it with `evaluate_as_column`, which broadcasts
 a scalar result to the input's row count. These are the date parts (including `millisecond` and
 `microsecond`), `date_trunc`, `round`, the string functions `strlen`, `length`, `upper`, `lower`,
@@ -298,8 +326,10 @@ Tests are tagged `[decimal_integer_cast]`.
 `//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
 calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
 either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
-which preserves DuckDB's `error_on_division_by_zero` setting and guarded `CASE` semantics. With
-fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
+which preserves DuckDB's `error_on_division_by_zero` setting. A guarded
+`CASE WHEN b = 0 THEN NULL ELSE a // b END` stays on the GPU: the division is retried on the rows
+that ELSE selects (see [Conditional evaluation](#conditional-evaluation-and-row-dependent-errors)).
+With fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
 `TRY(...)` continues to use plan-time CPU fallback.
 
 Integer column divisors, including HUGEINT, first use an exact non-NULL range reduction. A minimum
@@ -415,6 +445,7 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the condi
 | `src/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
 | `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
 | `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
+| `src/expression_evaluator/selective_evaluation.cpp` | Selective retry of CASE and COALESCE on row subsets |
 | `src/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
 | `src/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
 | `src/expression_evaluator/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |

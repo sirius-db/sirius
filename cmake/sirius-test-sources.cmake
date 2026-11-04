@@ -84,6 +84,7 @@ set(TEST_SOURCES
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_evaluator/test_checked_division.cpp
+    test/cpp/expression_evaluator/test_conditional_unselected_errors.cpp
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
@@ -102,6 +103,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
+    test/cpp/integration/test_gpu_execution_conditional_errors.cpp
     test/cpp/integration/test_gpu_execution_constant_or_null.cpp
     test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
