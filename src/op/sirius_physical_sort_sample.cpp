@@ -419,6 +419,7 @@ void sirius_physical_sort_sample::compute_distributed_boundaries(
   }
 
   // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
+  // TODO(#2375): all_gather blocks this GPU worker thread until every rank's summary arrives.
   auto gathered = exchange::all_gather(*d.service, d.stream, summary, gpu, stream.get());
   std::vector<::cucascade::read_only_data_batch> parts;
   for (auto const& g : gathered) {
