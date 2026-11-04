@@ -108,6 +108,23 @@ TEST_CASE_METHOD(ParquetFilesFixture,
 }
 
 TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - sirius_analyze_parquet reads them ahead of a query",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  auto analyzed =
+    con->Query("SELECT files FROM sirius_analyze_parquet('" + (dir / "*.parquet").string() + "')");
+  REQUIRE_FALSE(analyzed->HasError());
+  CHECK(collect_rows(*analyzed)[0][0] == "2");
+
+  auto none = con->Query("SELECT files FROM sirius_analyze_parquet('" +
+                         (dir / "missing_*.parquet").string() + "')");
+  CHECK(none->HasError());
+
+  CHECK(cpu_plan("SELECT count(*) FROM v WHERE x > 1000", true).find("Empty Result") !=
+        std::string::npos);
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
                  "parquet footer statistics - a rewritten or added file is not described by stale "
                  "statistics",
                  "[integration][gpu_execution][transparent][parquet_footer_statistics]")

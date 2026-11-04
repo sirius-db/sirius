@@ -20,6 +20,8 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <cstddef>
+#include <string>
+#include <vector>
 
 namespace sirius::transparent {
 
@@ -38,5 +40,16 @@ namespace sirius::transparent {
 /// \return The number of scans given statistics.
 std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
                                           duckdb::LogicalOperator& plan);
+
+/// \brief Read the footer statistics of \p paths into the cache add_parquet_footer_statistics uses,
+/// so the first query over them does not pay for reading every footer.
+///
+/// The footers are read with DuckDB's default Parquet options. A scan whose options give a column
+/// another type finds no statistics for that column rather than wrong ones. Remote files are
+/// skipped.
+///
+/// \return The number of files whose statistics are cached.
+std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
+                                           std::vector<std::string> const& paths);
 
 }  // namespace sirius::transparent

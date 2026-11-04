@@ -831,8 +831,18 @@ modification time are unchanged; a modification time less than 10 seconds old is
 the same rule DuckDB's own file caches use. Scans with `union_by_name`, explicit
 `column_statistics`, a `schema` or remote files are left alone. At TPC-H SF1000 this makes the
 `delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
-to 0.50 s); the first query over a table pays for reading its footers (about 0.15 s for 61
-`lineitem` files).
+to 0.50 s).
+
+The footers are read when a query first scans the files, unless they were read ahead:
+`pin_table` reads the footers of the Parquet files it pins, and `sirius_analyze_parquet` reads
+those of any path or glob, returning the number of files read (an error when nothing matches).
+Reading ahead moves the cost, about 0.2 s for the 60 `lineitem` files at SF1000, from the first
+query to table loading. Footers read ahead use DuckDB's default Parquet options; a scan whose
+options give a column another type gets no statistics for that column.
+
+```sql
+SELECT files FROM sirius_analyze_parquet('/data/tpch_sf1000/lineitem/*.parquet');
+```
 
 The scan-task batch target is derived from effective GPU capacity. Advanced
 benchmark and test envelopes may still override `scan_task_batch_size` in YAML

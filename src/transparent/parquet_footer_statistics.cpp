@@ -206,4 +206,17 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
   return added;
 }
 
+std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
+                                           std::vector<std::string> const& paths)
+{
+  duckdb::ParquetOptions const options(context);
+  std::size_t cached = 0;
+  for (auto const& path : paths) {
+    if (duckdb::FileSystem::IsRemoteFile(path)) { continue; }
+    statistics_of(context, duckdb::OpenFileInfo(path), options);
+    ++cached;
+  }
+  return cached;
+}
+
 }  // namespace sirius::transparent
