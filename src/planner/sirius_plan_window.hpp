@@ -78,7 +78,7 @@ void validate_window_stages(duckdb::LogicalOperator const& plan);
 window_plan plan_window(duckdb::LogicalWindow const& window);
 
 /**
- * @brief Build the input side of a whole-partition window: prepare, PARTITION, then CONCAT.
+ * @brief Build the input side of a window: prepare, PARTITION, then CONCAT.
  *
  * Adds a projection on @p child that passes its columns through and appends the plan's hidden
  * expressions. Each `PARTITION BY` key or aggregate argument that is not a plain column reference

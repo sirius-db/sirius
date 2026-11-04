@@ -163,8 +163,7 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
       input_bytes,
       memory::saturating_mul(static_cast<std::size_t>(table.num_rows()), result_width));
     if (required > space.get_max_memory()) {
-      throw std::runtime_error(
-        "Whole-partition window input and results exceed GPU memory capacity");
+      throw std::runtime_error("Window input and results exceed GPU memory capacity");
     }
 
     auto columns = std::vector<cudf::column_view>(table.begin(), table.end());

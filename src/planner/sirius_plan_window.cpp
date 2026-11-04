@@ -47,7 +47,7 @@ namespace {
 /// Throw the NotImplementedException that sends the query to the CPU.
 [[noreturn]] void decline(char const* reason)
 {
-  throw duckdb::NotImplementedException("Unsupported whole-partition window: %s", reason);
+  throw duckdb::NotImplementedException("Unsupported window: %s", reason);
 }
 
 /// The numeric types the window evaluator accepts as an aggregate argument.
