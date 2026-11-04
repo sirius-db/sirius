@@ -8,6 +8,8 @@ size_t (*volatile error_message_size)(const sirius_error*) = &sirius_error_messa
 void (*volatile error_destroy)(sirius_error*)              = &sirius_error_destroy;
 uint32_t (*volatile abi_version)(void)                     = &sirius_abi_version;
 
+int plan_example(void);
+
 int main(void)
 {
   sirius_status statuses[] = {
@@ -16,5 +18,5 @@ int main(void)
   (void)statuses;
   (void)version;
   return error_message == NULL || error_message_size == NULL || error_destroy == NULL ||
-         abi_version == NULL;
+         abi_version == NULL || plan_example();
 }

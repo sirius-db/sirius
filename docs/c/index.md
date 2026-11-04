@@ -8,6 +8,8 @@ The public C API provides a C ABI for embedding Sirius. Include the headers unde
 - `<sirius-c/export.h>` defines visibility and C/C++ declaration helpers.
 - `<sirius-c/context/config_builder.h>` builds immutable context configurations.
 - `<sirius-c/context/context.h>` creates and owns an engine context.
+- `<sirius-c/schema.h>` constructs and inspects immutable typed schemas.
+- `<sirius-c/plan/plan.h>` constructs and inspects immutable physical plans.
 - `<sirius-c/error.h>` defines fixed-width status codes and owned diagnostics.
 - `<sirius-c/version.h>` declares the library's ABI revision.
 
@@ -65,6 +67,48 @@ with sirius_context_destroy(). Hardware discovery and resource allocation happen
 at creation. Only one active engine context per process is supported; callers
 must enforce that restriction. See sirius_context for process-wide settings and
 lifetime constraints.
+
+## Physical plan construction
+
+Construct plans without a context, GPU, or file access. The initial subset supports
+Boolean and Int64 fields, a local Parquet scan with an explicit schema, typed column
+references and literals, comparisons, and filters. Each factory returns a complete
+immutable object or an error. Schema names and column types are checked during
+construction. Field names are case-sensitive; file schemas and engine support
+belong to future preparation.
+
+```text
+ParquetScan(schema, path) → Filter(predicate) → Plan
+predicate = comparison(column, literal)
+```
+
+Use sirius_schema_create(), sirius_plan_scan_parquet(), sirius_expression_column(),
+sirius_expression_literal_int64(), sirius_expression_compare(), sirius_plan_filter(),
+and sirius_plan_from_root() to build a scan with an integer predicate. See the
+[complete C example](https://github.com/sirius-db/sirius/blob/main/test/cmake/installed_consumer/plan.c)
+for error handling and ownership cleanup.
+
+Nodes retain their inputs and expressions. Releasing temporary handles does not
+invalidate the finished plan. Column references belong to one exact input node;
+even a node with an identical schema has a different scope. Obtain new references
+from a filter's output when constructing another filter.
+
+Inspect the tree structure and output schemas through sirius_plan_root(), sirius_plan_node_get_kind(),
+sirius_plan_node_input(), sirius_plan_node_schema(), and sirius_schema_field().
+These functions expose the physical node structure; construction neither combines
+filters nor changes the chosen operators. sirius_plan_describe() provides a readable
+explanation with shared expression definitions. Its text is diagnostic, not a
+serialization format. Full expression-tree accessors are a separate addition.
+Borrowed inspection handles may be retained independently. Relative source paths
+are resolved using the working directory at future preparation time; the same
+relative description can therefore refer to different files in different directories.
+Paths identify a single literal filename; glob characters are never expanded.
+
+Plan nodes and expression trees currently support up to 256 levels. Unknown type
+and comparison identifiers, mismatched scopes, invalid schemas, and unsupported
+construction operations return SIRIUS_INVALID_ARGUMENT. Plans do not yet have a
+public preparation or execution operation. C++ builders and Rust wrappers can use
+these same C primitives in subsequent additions.
 
 ## Ownership and errors
 
