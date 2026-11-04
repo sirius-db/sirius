@@ -1223,25 +1223,27 @@ void SiriusContext::release_resources() noexcept
   }
   if (event_publisher_) event_publisher_->stop();
   query_lifecycle_.require_gpu_completion();
-  auto join_devices = [&](sirius::gpu_completion_point point) {
+  auto wait_for_current_device = [] {
+    if (!sirius::observe_gpu_completion(cudaDeviceSynchronize(),
+                                        sirius::gpu_completion_point::shutdown)) {
+      throw sirius::unjoined_gpu_work{};
+    }
+  };
+  try {
     if (memory_manager_) {
       for (auto const* space :
            memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-        bool joined = false;
-        try {
-          rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-          joined = sirius::observe_gpu_completion(cudaDeviceSynchronize(), point);
-        } catch (...) {
-        }
-        if (!joined) {
-          auto error = std::make_exception_ptr(sirius::unjoined_gpu_work{});
-          query_lifecycle_.report_failure(error);
-          std::rethrow_exception(error);
-        }
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
+        wait_for_current_device();
       }
     }
-  };
-  join_devices(sirius::gpu_completion_point::shutdown);
+    // Also check the caller's device, even when there are no managed GPU spaces.
+    wait_for_current_device();
+  } catch (...) {
+    auto error = std::make_exception_ptr(sirius::unjoined_gpu_work{});
+    query_lifecycle_.report_failure(error);
+    std::rethrow_exception(error);
+  }
   if (scan_manager_) { scan_manager_->stop(); }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
@@ -1263,9 +1265,6 @@ void SiriusContext::release_resources() noexcept
   // no borrower can outlive this.
   data_repository_registry_.clear();
 
-  // Destroying output columns can enqueue asynchronous frees on their task streams. Keep both
-  // those streams and their backing allocator alive through this second completion boundary.
-  join_devices(sirius::gpu_completion_point::retirement);
   task_creator_.reset();
   downgrade_executors_.clear();
   task_scheduler_.reset();

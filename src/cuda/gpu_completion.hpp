@@ -26,7 +26,7 @@
 #include <memory>
 
 namespace sirius {
-enum class gpu_completion_point { prepare, execute, failure, sink, retry, shutdown, retirement };
+enum class gpu_completion_point { prepare, execute, failure, sink, retry, shutdown };
 
 // Tests inject a failed observation only after the real CUDA wait succeeds. This permits
 // inspection and eventual destruction of retained owners without creating an unsafe callback.
