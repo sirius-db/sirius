@@ -181,12 +181,7 @@ carrier from its scan upward and accumulating four use flags:
   CONCAT/PARTITION and the join gather move narrow bytes) or into a group-key output of an
   eligible grouped aggregate (the exact preconditions of the HASH_GROUP_BY propagation case, so
   the aggregate exchange moves narrow key bytes);
-- **narrow comparison** — a comparison or `BETWEEN` whose other operands are constants
-  representable in the planned carrier, or a comparison of two carried references that share one
-  planned carrier (which marks both columns): the same eligibility the evaluator's narrow-domain
-  path applies, decided by the two shared predicates `narrow_domain_carrier_eligible` (carrier
-  against literals) and `narrow_domain_reference_pair_eligible` (carrier against carrier) so the
-  two cannot drift;
+- **narrow use** — a comparison against constants that fit the carrier, a comparison between references with the same carrier, or an integer cast whose target covers the carrier's full range. The same rule applies to `BETWEEN` and `TRY_CAST`.
 - **evaluator restore** — any other reference occurrence inside an evaluated expression, which
   the evaluator restores unconditionally;
 - **boundary restore** — the carrier dies where propagation inserts a restore projection: join
@@ -194,16 +189,7 @@ carrier from its scan upward and accumulating four use flags:
   a DELIM_JOIN sub-root (propagation restores the sub-root's children in place, so sub-root
   operators award no transport), or survival to the plan root.
 
-The verdict per column is: keep narrow iff transport, or (no boundary restore and (narrow
-comparison or no evaluator restore)). Every other column's sidecar entry is flipped back to
-native through the normal sidecar install (an all-native result drops the sidecar) before
-propagation runs, so downstream passes never see the retracted targets. Retraction never
-re-narrows and never touches logical types; its entire residual cost is one widening cast per
-column per batch during scan normalization of the pinned-narrow chunks (counted by
-`scan_columns_restored`). Columns with no surviving use stay narrow — they are never
-materialized wide. An operator the classifier does not model is by construction one propagation
-restores at, so the default under uncertainty is native. Retractions are counted by the
-plan-time `scan_narrow_targets_retracted` counter.
+Keep a column narrow if it can travel between operators at that width. Without transport, keep it narrow only if no boundary needs the native type and either an expression uses the narrow value or no expression needs to restore it. For an unrecognized operator, use the native type. Retraction preserves the SQL type. Use `scan_narrow_targets_retracted` to count plan-time retractions and `scan_columns_restored` to count columns widened during scan normalization.
 
 A compacted (filter-pushdown) Simpatico decode of a GPU-tier compressed chunk writes such a
 column directly in its restore type when the scan's output assembly is a leading identity, so the
@@ -223,11 +209,17 @@ Physical schemas propagate through operators that preserve column identity:
 - hash-join payload outputs;
 - group-key outputs of eligible grouped aggregates.
 
-Expressions compare a reference's actual carrier with its declared logical return type. Except for
-the eligible narrow-domain comparisons described below, a nested use restores a narrower integer or
-same-scale decimal before arithmetic, comparison, `IN`, or another semantic operation. The
-projection operator's pure-reference passthrough fast path can forward the narrow column without
-allocating a copy.
+Use the actual batch carrier when deciding whether a direct integer cast needs an overflow check. A plan can receive different carriers across batches.
+
+| Batch or query | CAST behavior |
+|---|---|
+| Logical `BIGINT` stored as `INT16`, cast to `INTEGER` | Every value fits. Both `CAST` and `TRY_CAST` can skip the check. |
+| Native `INT64` cast to `INTEGER` or `UBIGINT` | Check and convert the values in a separate GPU kernel. A JIT parent can fuse its remaining operations using the resulting column. |
+| `TRY_CAST` with an out-of-range value | Return NULL for that row. |
+| Strict integer `CAST` inside `CASE` or `COALESCE` | Report overflow only for rows that use the cast. A NULL `WHEN` condition skips that arm. |
+| Strict integer `CAST` with a selected out-of-range value | Report overflow in the batch that contains the value. |
+
+Pure-reference projections can forward the narrow column. Other expressions restore the reference before evaluation unless a narrow-domain rule applies.
 
 ### Narrow-domain comparisons
 
@@ -357,11 +349,7 @@ normalizes each chunk before it becomes a downstream batch, so heterogeneous cac
 reach `cudf::concatenate` together. HOST chunks retain their carrier and decimal scale in host
 metadata and transfer that reduced representation back to the GPU before normalization.
 
-Filter safety depends on the path. Fresh reads apply reader or post-decode static filters before
-scan-time narrowing. A cached chunk may already be narrow; comparisons against representable
-constants can execute in that narrow domain, while other expressions restore referenced carriers.
-Scans wired to a runtime dynamic-filter producer normalize their planned target columns to native
-before the downstream dynamic-filter operator; their other columns keep the plan carriers.
+Fresh reads apply static filters before narrowing. Cached chunks may already be narrow, so comparisons against representable constants and lossless integer casts can use the stored carrier directly. Scans feeding a runtime dynamic filter restore that filter's planned target columns to the native type. Other columns keep their planned carriers.
 
 The setting is sampled independently when a table is pinned and when a query plan is built. Changing
 it does not rewrite an existing cache entry:
