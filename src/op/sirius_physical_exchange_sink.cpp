@@ -146,6 +146,7 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   auto const batches  = input.get_read_only_batches();
   std::vector<std::shared_ptr<cucascade::data_batch>> slices;
   std::vector<std::size_t> ranks;
+  bool row_to_every_rank = false;
   if (!batches.empty()) {
     std::lock_guard lock{_input_schema_mutex};
     if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batches.front())); }
@@ -153,6 +154,24 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   for (std::size_t b = 0; b < handles.size(); ++b) {
     // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
     if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
+    if (_spec.null_keys_to_every_rank && !row_to_every_rank &&
+        !_every_rank_has_a_row.load(std::memory_order_acquire)) {
+      auto* space = batches[b].get_memory_space();
+      if (space == nullptr) {
+        throw sirius::internal_exception("exchange sink: the input batch is not resident");
+      }
+      auto const first = cudf::slice(get_cudf_table_view(batches[b]), {0, 1}, stream);
+      auto row         = make_data_batch(
+        std::make_unique<cudf::table>(first.front(), stream, space->get_default_allocator()),
+        *space,
+        stream,
+        batch_telemetry());
+      for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+        slices.push_back(row);
+        ranks.push_back(r);
+      }
+      row_to_every_rank = true;
+    }
     std::vector<std::shared_ptr<cucascade::data_batch>> routed;
     auto split = _spec.null_keys_to_every_rank
                    ? split_null_keys(batches[b], _spec.key_columns, stream, batch_telemetry())
@@ -175,6 +194,9 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
       ranks.push_back(r);
     }
   }
+  // Only now: a task rescheduled after an OOM above must send its row again. Two tasks racing
+  // may both send one, which is harmless.
+  if (row_to_every_rank) { _every_rank_has_a_row.store(true, std::memory_order_release); }
   return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks));
 }
 
