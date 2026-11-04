@@ -104,6 +104,11 @@ vcpkg_replace_string(
   "set_target_properties(spdlog::spdlog PROPERTIES POSITION_INDEPENDENT_CODE ON)"
 )
 
+# zstd device code on CUDA 12 too (RAPIDS uses LZ4 there); needs a CUDA
+# 12.4+ driver, below the 12.8 floor.
+vcpkg_replace_string("${SOURCE_PATH}/cpp/cmake/modules/ConfigureCUDA.cmake"
+                     "TUNE_FOR rapids" "TUNE_FOR size")
+
 # Sirius uses the existing brute-force and IVF-Flat kernels. Skip cuVS's
 # optional cuTile generation so distribution builds need no cuda.tile package.
 vcpkg_replace_string(

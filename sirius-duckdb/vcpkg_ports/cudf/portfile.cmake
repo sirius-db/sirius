@@ -27,6 +27,11 @@ vcpkg_from_github(
 # rapids-cmake otherwise downloads the CPM release asset during configure.
 include("${CMAKE_CURRENT_LIST_DIR}/../rapids_common.cmake")
 
+# zstd device code on CUDA 12 too (RAPIDS uses LZ4 there); needs a CUDA
+# 12.4+ driver, below the 12.8 floor.
+vcpkg_replace_string("${SOURCE_PATH}/cpp/cmake/Modules/ConfigureCUDA.cmake"
+                     "TUNE_FOR rapids" "TUNE_FOR size")
+
 vcpkg_from_github(
   OUT_SOURCE_PATH
   RAPIDS_LOGGER_PATH

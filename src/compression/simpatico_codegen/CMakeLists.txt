@@ -128,6 +128,11 @@ set_target_properties(
              CUDA_STANDARD_REQUIRED ON)
 if(VCPKG_BUILD)
   set_target_properties(simpatico PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  target_compile_options(
+    simpatico
+    PRIVATE
+      "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xfatbin=-compress-all;--compress-mode=size>"
+  )
 endif()
 target_compile_options(
   simpatico
