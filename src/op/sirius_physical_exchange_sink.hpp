@@ -22,6 +22,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -53,8 +54,11 @@ struct exchange_spec {
   /// hash: per-key cast before hashing, as PARTITION's; empty = hash as-is.
   std::vector<cudf::data_type> key_cast_types;
   std::uint32_t hash_seed = default_hash_seed;
-  /// hash: a row with a NULL in any key column goes to every rank. A MARK join's build needs
-  /// this: one NULL build key makes every unmatched probe row's mark NULL, on whichever rank.
+  /// hash: a row with a NULL in any key column goes to every rank, and so does one row of each
+  /// sender's input, so a rank's share is empty only when every rank's is. A MARK join's build
+  /// needs both: an unmatched probe row's mark is NULL when the build has a NULL key, or when the
+  /// probe key is NULL and the build is not empty, on whichever rank. The extra copy of a keyed row
+  /// never matches off its own rank: every probe row with its key hashes to that rank.
   bool null_keys_to_every_rank = false;
   /// range: the order of each key column.
   std::vector<cudf::order> column_order;
@@ -133,6 +137,8 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   mutable std::mutex _input_schema_mutex;
   /// Empty, with the columns of the first input batch.
   std::unique_ptr<cudf::table> _input_schema;
+  /// null_keys_to_every_rank: a row of this rank's input has gone to every rank.
+  std::atomic<bool> _every_rank_has_a_row{false};
 };
 
 }  // namespace sirius::op
