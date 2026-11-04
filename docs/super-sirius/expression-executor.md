@@ -216,6 +216,15 @@ constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d
 GPU as `month(DATE '2020-02-01')`.
 Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
 
+`date_trunc` must return the type DuckDB declares: a microsecond `TIMESTAMP`. A DATE input
+normally uses cuDF's day-resolution `TIMESTAMP_DAYS` type. If that type reaches a parent
+`CASE` or `COALESCE`, it cannot be combined with a TIMESTAMP branch.
+
+For a DATE input, every GPU-supported unit is a day or finer, so truncation does not change
+the date. The evaluator converts it to a `TIMESTAMP` with `cast_date_to_timestamp`, which
+preserves infinities. For a TIMESTAMP input, it uses `cudf::datetime::floor_datetimes` to
+round to the requested unit.
+
 `in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that.
 
 The AST lowering for IN joins per-entry equality comparisons with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to per-entry inequality comparisons joined by `NULL_LOGICAL_AND`. For non-floating operands these use primitive `EQUAL` and `NOT_EQUAL` nodes. FLOAT/DOUBLE comparisons instead use the shared NaN-aware comparison builder: equality expands to `EQUAL OR both_nan`, and inequality to `NOT(EQUAL OR both_nan)`, where `both_nan` means both operands are valid NaNs. These expressions retain ordinary comparison NULL propagation. The pinned cuDF implementation normalizes the expanded predicate before Parquet membership pruning; the floating inequality's `NOT` node must not be confused with negating a Bloom-filter membership answer (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values.

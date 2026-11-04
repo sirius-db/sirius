@@ -20,6 +20,7 @@
 #include <expression/function_id.hpp>
 #include <expression/substring_slice.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/date_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/cudf_regex_pattern.hpp>
@@ -668,6 +669,12 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
         freq_str);
     }
     auto input = evaluate_as_column(*args[1]);
+    // DATE has no sub-day component; return DuckDB's declared TIMESTAMP type so parent
+    // expressions can combine it with timestamp branches.
+    if (input.get_column_view().type().id() == cudf::type_id::TIMESTAMP_DAYS) {
+      return evaluate_result(cast_date_to_timestamp(
+        input.get_column_view(), output_type, /*try_cast=*/false, _stream, _mr));
+    }
 
     auto frequency = [](date_trunc_unit unit) -> cudf::datetime::rounding_frequency {
       switch (unit) {
