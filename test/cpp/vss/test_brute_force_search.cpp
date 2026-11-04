@@ -18,9 +18,8 @@
 #include <catch.hpp>
 
 // sirius
+#include <cuda/vss/brute_force_search.hpp>
 #include <cuda/vss/cudf_raft_interop.hpp>
-
-#include <../../../src/cuda/vss/brute_force_search.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
@@ -32,6 +31,7 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/device_resources.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -40,6 +40,8 @@
 
 #include <cuvs/distance/distance.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -212,4 +214,85 @@ TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
       q2_dev.data(), 1, dim + 1);
     REQUIRE_THROWS(brute_force_knn(res, dataset_view, bad_query, 1));
   }
+}
+
+TEST_CASE("brute_force_int8_topk preserves signed-byte L2 distances", "[vss][int8]")
+{
+  // Include every signed byte, unpadded corpus tails, k == n, and large code norms.
+  auto const shape        = GENERATE(std::array<int64_t, 4>{1, 1, 4, 1},
+                              std::array<int64_t, 4>{259, 256, 4, 7},
+                              std::array<int64_t, 4>{37, 17, 96, 37},
+                              std::array<int64_t, 4>{33, 3, 4096, 4});
+  auto const [n, m, d, k] = shape;
+  auto const take_sqrt    = GENERATE(false, true);
+  rmm::cuda_stream stream;
+  raft::device_resources res{stream.view()};
+  std::vector<std::int8_t> x(n * d), q(m * d);
+  for (int64_t i = 0; i < n; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      x[i * d + j] = static_cast<std::int8_t>((i * 13 + j * 19) % 256 - 128);
+    }
+  }
+  for (int64_t i = 0; i < m; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      q[i * d + j] = static_cast<std::int8_t>((i + j * 7) % 256 - 128);
+    }
+  }
+  rmm::device_buffer x_dev(x.data(), x.size(), stream.view());
+  rmm::device_buffer q_dev(q.data(), q.size(), stream.view());
+  auto result = sirius::vss::brute_force_int8_topk(res,
+                                                   static_cast<std::int8_t const*>(x_dev.data()),
+                                                   n,
+                                                   static_cast<std::int8_t const*>(q_dev.data()),
+                                                   m,
+                                                   d,
+                                                   k,
+                                                   take_sqrt);
+  stream.synchronize();
+  REQUIRE(result.n_queries == m);
+  REQUIRE(result.k == k);
+  auto const neighbors = to_host<int64_t>(result.neighbors->view());
+  auto const distances = to_host<float>(result.distances->view());
+  REQUIRE(neighbors.size() == m * k);
+  REQUIRE(distances.size() == m * k);
+  for (int64_t row = 0; row < m; ++row) {
+    std::vector<float> expected(n);
+    for (int64_t col = 0; col < n; ++col) {
+      int64_t squared = 0;
+      for (int64_t j = 0; j < d; ++j) {
+        auto const delta = static_cast<int>(q[row * d + j]) - x[col * d + j];
+        squared += delta * delta;
+      }
+      expected[col] = take_sqrt ? static_cast<float>(std::sqrt(static_cast<double>(squared)))
+                                : static_cast<float>(squared);
+    }
+    auto sorted = expected;
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<bool> seen(n, false);
+    for (int64_t col = 0; col < k; ++col) {
+      auto const id = neighbors[row * k + col];
+      REQUIRE(id >= 0);
+      REQUIRE(id < n);
+      REQUIRE_FALSE(seen[id]);
+      seen[id] = true;
+      REQUIRE(distances[row * k + col] == Approx(expected[id]));
+      REQUIRE(distances[row * k + col] == Approx(sorted[col]));
+    }
+  }
+}
+
+TEST_CASE("brute_force_int8_topk validates shapes and handles empty queries", "[vss][int8]")
+{
+  raft::device_resources res;
+  auto empty = sirius::vss::brute_force_int8_topk(res, nullptr, 1, nullptr, 0, 4, 1, false);
+  REQUIRE(empty.n_queries == 0);
+  REQUIRE(empty.k == 1);
+  REQUIRE(empty.neighbors->size() == 0);
+  REQUIRE(empty.distances->size() == 0);
+  for (auto const d : {0, 3, 131072}) {
+    REQUIRE_THROWS(sirius::vss::brute_force_int8_topk(res, nullptr, 1, nullptr, 0, d, 1, false));
+  }
+  REQUIRE_THROWS(sirius::vss::brute_force_int8_topk(res, nullptr, 1, nullptr, 0, 4, 0, false));
+  REQUIRE_THROWS(sirius::vss::brute_force_int8_topk(res, nullptr, 1, nullptr, 0, 4, 2, false));
+  REQUIRE_THROWS(sirius::vss::brute_force_int8_topk(res, nullptr, 1, nullptr, -1, 4, 1, false));
 }
