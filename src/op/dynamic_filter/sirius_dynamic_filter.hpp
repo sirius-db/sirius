@@ -457,8 +457,9 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                               rmm::device_async_resource_ref mr);
 
   /**
-   * @brief Builds a Bloom filter sized for @p capacity_keys keys, whatever @p keys holds, so
-   * filters built apart with the same capacity can be ORed together (merge_from()).
+   * @brief Builds a Bloom filter sized for @p capacity_keys keys (0: for the non-null rows of
+   * @p keys), whatever @p keys holds, so filters built apart with the same capacity can be ORed
+   * together (merge_from()).
    */
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                               std::size_t capacity_keys,
