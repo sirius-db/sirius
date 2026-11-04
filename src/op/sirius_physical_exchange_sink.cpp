@@ -275,8 +275,17 @@ void sirius_physical_exchange_sink::sink(const operator_data& input_data,
 {
   auto const& routed  = dynamic_cast<const routed_operator_data&>(input_data);
   auto const& batches = routed.get_data_batches();
+  auto const self     = _service->rank();
+  // A broadcast or NULL-key batch is one data_batch for every rank. This rank's copy lands in a
+  // spillable repository, and a spilled batch can no longer be sent, so the peers go first: each
+  // peer's send holds a read lock until its frames are staged. Order per destination is kept.
   for (std::size_t i = 0; i < batches.size(); ++i) {
-    _service->send(_stream, static_cast<exchange::rank_t>(routed.destinations()[i]), batches[i]);
+    auto const to = static_cast<exchange::rank_t>(routed.destinations()[i]);
+    if (to != self) { _service->send(_stream, to, batches[i]); }
+  }
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto const to = static_cast<exchange::rank_t>(routed.destinations()[i]);
+    if (to == self) { _service->send(_stream, to, batches[i]); }
   }
 }
 
