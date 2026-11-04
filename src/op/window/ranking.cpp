@@ -131,7 +131,8 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
     key_views.push_back(input.column(column));
   }
   cudf::table_view const keys(key_views);
-  // Equal partition values only need to be next to each other, so any order will do for them.
+  // Equal partition values only need to be next to each other, so any column order, direction and
+  // NULL placement will do for them.
   std::vector<cudf::order> const partition_directions(partition_columns.size(),
                                                       cudf::order::ASCENDING);
   std::vector<cudf::null_order> const partition_nulls(partition_columns.size(),
@@ -153,7 +154,7 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   auto sorted = cudf::gather(
     gathered_keys, row_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
 
-  // The partition columns come first in the sorted table.
+  // The partition columns come first in the sorted table, in the order of `partition_columns`.
   std::vector<cudf::size_type> sorted_partition_indices(partition_columns.size());
   std::iota(sorted_partition_indices.begin(), sorted_partition_indices.end(), 0);
   auto const partition_view = sorted->view().select(sorted_partition_indices);
