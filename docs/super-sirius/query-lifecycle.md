@@ -163,4 +163,12 @@ query retirement without retaining the original exception or its resources. Late
 replace it or overwrite a query's earlier error. Retired submission/work counts are zero because
 they describe outstanding activity, not lifetime totals.
 
-`unjoined_gpu_work` means GPU completion could not be established, even if host workers have returned. It disables GPU admission and CPU replay for the failed execution. Task inputs, outputs, reservations and stream leases remain owned; query cleanup must not release their plans, providers or allocators. Shutdown stops producers, checks completion on every device, releases outputs, and checks completion again before destroying their streams and allocator backing. If completion remains unproven, the runtime is retained until process exit. Construct initialized contexts through `SiriusContext::create()` so this retention also applies when the final context owner is released.
+## GPU completion and shutdown
+
+Create initialized contexts with `SiriusContext::create()` so GPU resources can outlive the last context handle if a wait fails.
+
+| Condition | Required behavior |
+|---|---|
+| A task reports `unjoined_gpu_work` | Close GPU admission, disable CPU replay for that execution, and retain the task's buffers, reservations, streams and their owners. |
+| GPU completion was already unconfirmed, or a shutdown wait fails | Keep the runtime alive until process exit. Do not retry the wait to reclaim resources. |
+| All shutdown waits succeed | Retained outputs and providers can be released. Their destructors may enqueue asynchronous frees that these waits do not cover. |
