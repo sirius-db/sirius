@@ -184,12 +184,15 @@ class dynamic_filter_publish_plan final {
   struct distributed_merge {
     std::shared_ptr<exchange::exchange_service> service;
     /// Admitted key i merges on stream first_stream + i, the same on every rank.
-    exchange::stream_id first_stream     = 0;
+    exchange::stream_id first_stream = 0;
+    /// Where this rank's contribution and the gathered filters are allocated; required.
     cucascade::memory::memory_space* gpu = nullptr;
     /// Every rank's Bloom is sized for this many keys.
     std::size_t bloom_keys = 0;
+    /// Shorter than all_gather's default: a late rank should cost the filter, not stall the build.
+    static constexpr std::chrono::milliseconds default_timeout{std::chrono::minutes{2}};
     /// A rank that has not sent its filter by then is given up on: the key publishes nothing.
-    std::chrono::milliseconds timeout{std::chrono::minutes{2}};
+    std::chrono::milliseconds timeout{default_timeout};
   };
   void set_distributed(distributed_merge merge)
   {
