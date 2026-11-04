@@ -89,8 +89,9 @@ struct ranking_order {
  * @throws std::invalid_argument if @p functions, @p partition_columns or `order.columns` is empty
  * or a column index is outside @p input.
  *
- * @note Temporary allocations made inside cuDF, including the sort and the group by, use cuDF's
- * current device resource.
+ * @note cuDF allocates the scratch memory inside a call, for example in the sort and in the grouped
+ * scan, from its current device resource and not from @p mr. @p mr only serves the memory that a
+ * call returns.
  */
 std::unique_ptr<cudf::table> evaluate_ranking_window(
   cudf::table_view input,

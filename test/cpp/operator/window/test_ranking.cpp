@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "cudf/cudf_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/window/ranking.hpp"
 #include "operator/operator_test_utils.hpp"
@@ -152,6 +154,8 @@ void check_against_duckdb(duckdb::Connection& con,
   for (auto const& function : functions) {
     select += (select.empty() ? "" : ",") + function + "() OVER (" + window + ")";
   }
+  // The id column of the input is 0, 1, 2, ... in row order, so ORDER BY id puts DuckDB's rows in
+  // the row order of the input, which is the row order of the evaluator's result.
   auto expected = con.Query("SELECT " + select + " FROM " + from + " ORDER BY id");
   REQUIRE_FALSE(expected->HasError());
   auto rows = expected->Fetch();
@@ -159,7 +163,9 @@ void check_against_duckdb(duckdb::Connection& con,
   REQUIRE(result.num_rows() == expected->RowCount());
   REQUIRE(result.num_columns() == static_cast<cudf::size_type>(functions.size()));
   for (cudf::size_type c = 0; c < result.num_columns(); ++c) {
-    CHECK(result.column(c).type() == cudf::data_type{cudf::type_id::INT64});
+    // The type DuckDB gives the window function is the type of the result column.
+    CHECK(result.column(c).type() ==
+          sirius::require_cudf_type(sirius::from_duckdb(expected->GetTypes()[c])));
     CHECK(result.column(c).null_count() == 0);
     auto values = host(result.column(c), stream);
     for (cudf::size_type row = 0; row < result.num_rows(); ++row) {

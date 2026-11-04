@@ -24,6 +24,7 @@
 #include <cudf/unary.hpp>
 
 #include <algorithm>
+#include <numeric>
 #include <stdexcept>
 
 namespace sirius::op {
@@ -150,11 +151,11 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   auto sorted = cudf::gather(
     gathered_keys, row_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
 
-  std::vector<cudf::column_view> partition_views;
-  for (std::size_t i = 0; i < partition_columns.size(); ++i) {
-    partition_views.push_back(sorted->view().column(static_cast<cudf::size_type>(i)));
-  }
-  cudf::groupby::groupby groups(cudf::table_view(partition_views),
+  // The partition columns come first in the sorted table.
+  std::vector<cudf::size_type> sorted_partition_indices(partition_columns.size());
+  std::iota(sorted_partition_indices.begin(), sorted_partition_indices.end(), 0);
+  auto const partition_view = sorted->view().select(sorted_partition_indices);
+  cudf::groupby::groupby groups(partition_view,
                                 cudf::null_policy::INCLUDE,
                                 cudf::sorted::YES,
                                 partition_directions,
@@ -167,7 +168,7 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   std::vector<cudf::groupby::scan_request> requests;
   for (auto const function : functions) {
     cudf::groupby::scan_request request;
-    request.values = function == ranking_function::row_number ? partition_views.front() : values;
+    request.values = function == ranking_function::row_number ? partition_view.column(0) : values;
     request.aggregations.push_back(make_scan(function));
     requests.push_back(std::move(request));
   }
@@ -181,15 +182,14 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   }
   scans.clear();
 
-  // The scan results are in sorted order. Put each one back at the position of its input row, in
-  // the type the scan produced. The cast to INT64 comes last, one column at a time, so only the
+  // The scan results are in sorted order and need to be permuted back into the input row order.
+  // Once that is done, apply any necessary result widening, one column at a time so that only the
   // narrow columns are live while the scatter runs.
   auto scanned   = std::make_unique<cudf::table>(std::move(scanned_columns));
   auto scattered = cudf::scatter(scanned->view(), row_order->view(), scanned->view(), stream, mr);
   scanned.reset();
   row_order.reset();
   auto columns = scattered->release();
-  scattered.reset();
   for (auto& column : columns) {
     if (column->type() != result_type) {
       column = cudf::cast(column->view(), result_type, stream, mr);
