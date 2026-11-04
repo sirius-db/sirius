@@ -31,6 +31,7 @@
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "operator/partitioned_join_test_utils.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/null_mask.hpp>
@@ -396,6 +397,37 @@ TEST_CASE("whole-build ranks merge even when one build is empty and another's ta
   CHECK(outcomes[0].publications_skipped_targets_drained == 0);
   CHECK(outcomes[1].publications_skipped_targets_drained == 1);
   CHECK(published_bloom(*joins[1]->channel) == nullptr);
+}
+
+TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter merge",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  accumulating_join rank0(c.all[0].service, 4096, 64 * KiB);
+
+  auto rank1_channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto rank1         = sirius::test::operator_utils::make_partitioned_join(
+    {.side_types  = {duckdb::LogicalType::BIGINT},
+             .filter_plan = filter_plan(rank1_channel, 64 * KiB)});
+  rank1.join->set_distributed_dynamic_filters(merge_over(c.all[1].service, 4096));
+  auto& build_concat = *rank1.join->children[1];
+  REQUIRE(build_concat.type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
+
+  std::chrono::steady_clock::duration rank0_merge{};
+  on_every_rank(2, [&](rank_t r) {
+    if (r == 1) {
+      build_concat.finalize_operator();
+      return;
+    }
+    auto const start = std::chrono::steady_clock::now();
+    rank0.build(keys_batch(0, 2, 2000));
+    rank0_merge = std::chrono::steady_clock::now() - start;
+  });
+
+  // Without rank 1's part, rank 0 would wait out the 30 s merge timeout.
+  CHECK(rank0_merge < std::chrono::seconds{5});
+  // Rank 1's session closed and finished its producer.
+  CHECK(rank1_channel->snapshot().terminal());
 }
 
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
