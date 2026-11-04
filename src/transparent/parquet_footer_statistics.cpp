@@ -27,10 +27,14 @@
 #include <parquet_multi_file_info.hpp>
 #include <parquet_reader.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -44,8 +48,9 @@ struct file_statistics {
   std::vector<std::pair<duckdb::Identifier, duckdb::unique_ptr<duckdb::BaseStatistics>>> columns;
 };
 
-/// Whether \p cached still describes \p current. A modification time is trusted the way DuckDB's
-/// own file caches trust it, only once it is old enough that a coarse clock cannot hide a rewrite.
+/// Whether \p cached still describes \p current. A version tag (an object store's ETag) decides
+/// when either side has one; otherwise a modification time is trusted the way DuckDB's own file
+/// caches trust it, only once it is old enough that a coarse clock cannot hide a rewrite.
 bool unchanged(duckdb::FileMetadata const& cached, duckdb::FileMetadata const& current)
 {
   return cached.file_size == current.file_size && cached.file_id == current.file_id &&
@@ -80,6 +85,48 @@ std::shared_ptr<file_statistics const> statistics_of(duckdb::ClientContext& cont
   }
   std::lock_guard guard(cache_mutex);
   cache[file.path] = result;
+  return result;
+}
+
+/// Opening a file costs a request on an object store, so footers are read this many at a time.
+constexpr std::size_t max_concurrent_footer_reads = 32;
+
+/// statistics_of for each of \p files, in order. Rethrows the first failure.
+std::vector<std::shared_ptr<file_statistics const>> statistics_of_all(
+  duckdb::ClientContext& context,
+  std::vector<duckdb::OpenFileInfo> const& files,
+  duckdb::ParquetOptions const& options)
+{
+  std::vector<std::shared_ptr<file_statistics const>> result(files.size());
+  std::atomic<std::size_t> next{0};
+  std::exception_ptr failure;
+  std::mutex failure_mutex;
+  auto work = [&] {
+    for (auto i = next.fetch_add(1); i < files.size(); i = next.fetch_add(1)) {
+      try {
+        result[i] = statistics_of(context, files[i], options);
+      } catch (...) {
+        std::lock_guard guard(failure_mutex);
+        if (!failure) { failure = std::current_exception(); }
+        next = files.size();
+      }
+    }
+  };
+  auto const workers = std::min(files.size(), max_concurrent_footer_reads);
+  if (workers <= 1) {
+    work();
+  } else {
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    for (std::size_t t = 1; t < workers; ++t) {
+      threads.emplace_back(work);
+    }
+    work();
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+  if (failure) { std::rethrow_exception(failure); }
   return result;
 }
 
@@ -165,13 +212,8 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   if (!reader || !reader->bind_data) { return false; }
   auto const& parquet_options = duckdb::ParquetScanFunction::GetFileOptions(*reader->bind_data);
   auto const all_files        = bind->file_list->GetAllFiles();
-  std::vector<std::shared_ptr<file_statistics const>> files;
-  files.reserve(all_files.size());
-  for (auto const& file : all_files) {
-    if (duckdb::FileSystem::IsRemoteFile(file.path)) { return false; }
-    files.push_back(statistics_of(context, file, parquet_options));
-  }
-  auto statistics = merged_statistics(*bind, files);
+  auto const files            = statistics_of_all(context, all_files, parquet_options);
+  auto statistics             = merged_statistics(*bind, files);
   if (statistics.IsNull()) { return false; }
   options.column_statistics = std::move(statistics);
   options.VerifyColumnStatistics(bind->names, bind->types);
@@ -210,13 +252,8 @@ std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
                                            std::vector<std::string> const& paths)
 {
   duckdb::ParquetOptions const options(context);
-  std::size_t cached = 0;
-  for (auto const& path : paths) {
-    if (duckdb::FileSystem::IsRemoteFile(path)) { continue; }
-    statistics_of(context, duckdb::OpenFileInfo(path), options);
-    ++cached;
-  }
-  return cached;
+  std::vector<duckdb::OpenFileInfo> const files(paths.begin(), paths.end());
+  return statistics_of_all(context, files, options).size();
 }
 
 }  // namespace sirius::transparent

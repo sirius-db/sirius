@@ -32,8 +32,9 @@ namespace sirius::transparent {
 /// `IS NOT NULL` on a column without NULLs. For each such scan this merges the footer statistics of
 /// all its files and hands them to DuckDB through the scan's `column_statistics` option, which the
 /// optimizer then uses as it would a single file's statistics. Per-file statistics are cached for
-/// the process and reused while the file keeps its size, inode and a modification time old enough
-/// to trust. Remote files are left alone, since checking them costs a request per file.
+/// the process and reused while the file keeps its size, inode and version tag (an object store's
+/// ETag) or a modification time old enough to trust. Checking a remote file costs one request, so
+/// the files are checked and read concurrently.
 ///
 /// Must run before DuckDB's optimizer, from the pre-optimizer hook.
 ///
@@ -45,8 +46,7 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
 /// so the first query over them does not pay for reading every footer.
 ///
 /// The footers are read with DuckDB's default Parquet options. A scan whose options give a column
-/// another type finds no statistics for that column rather than wrong ones. Remote files are
-/// skipped.
+/// another type finds no statistics for that column rather than wrong ones.
 ///
 /// \return The number of files whose statistics are cached.
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
