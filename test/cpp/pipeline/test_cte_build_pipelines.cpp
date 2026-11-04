@@ -59,10 +59,7 @@ duckdb::Connection tpch_connection()
   return con;
 }
 
-// Converts `query` and requires exactly one pipeline without an outgoing edge: the root.
-// `start_query` seeds only the first source and the active task creator reaches every other
-// pipeline by following edges downstream, so a second edgeless pipeline strands the rest.
-// Returns the number of pipelines whose sink is a CTE.
+// Requires the root to be the only pipeline without outgoing edges; returns the CTE sink count.
 std::size_t require_single_terminal(duckdb::Connection& con, const std::string& query)
 {
   std::size_t cte_sinks = 0;
@@ -86,8 +83,7 @@ std::size_t require_single_terminal(duckdb::Connection& con, const std::string& 
 
 }  // namespace
 
-// Statistics propagation proves `c` empty and replaces its only CTE_SCAN with an empty result,
-// after unused-CTE removal has run. The materialization is then unread and must not be planned.
+// Statistics propagation removes every reference; no materialization pipeline should remain.
 TEST_CASE("materialized CTE with every reference folded away plans no CTE pipeline",
           "[integration][pipeline][cte]")
 {

@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-// GPU-vs-CPU correctness for materialized CTEs. The plan-shape side of the unread-CTE case is
-// pinned in test/cpp/pipeline/test_cte_build_pipelines.cpp.
-
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -35,8 +32,7 @@ class CteFixture : public sirius::test::GpuExecutionFixture {
 
 }  // namespace
 
-// Statistics propagation proves the CTE empty and folds its only reference into an empty result,
-// leaving the materialization unread. Planning it used to strand the consumer: the query hung.
+// Regression: statistics propagation removes every CTE reference, which previously hung.
 TEST_CASE_METHOD(CteFixture,
                  "gpu_execution materialized CTE with every reference folded away",
                  "[integration][gpu_execution][cte]")
