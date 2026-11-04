@@ -26,6 +26,9 @@ namespace sirius::exchange {
 /// A process taking part in an exchange: 0 to world size - 1.
 using rank_t = std::uint32_t;
 
+/// The exchange's id for one logical flow of batches, the same on every rank.
+using stream_id = std::uint64_t;
+
 /**
  * @brief Fixed-size frames in one `cudaMalloc` region.
  *
