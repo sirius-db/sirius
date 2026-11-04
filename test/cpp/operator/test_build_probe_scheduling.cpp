@@ -30,7 +30,6 @@
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_partition.hpp"
 #include "operator_test_utils.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"

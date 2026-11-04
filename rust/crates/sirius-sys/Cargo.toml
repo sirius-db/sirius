@@ -1,0 +1,23 @@
+[package]
+name = "sirius-sys"
+version.workspace = true
+edition.workspace = true
+description = "Low-level bindings to the public Sirius C ABI."
+license = "Apache-2.0"
+links = "sirius"
+# Links a local Sirius build-tree artifact; not self-contained for crates.io.
+publish = false
+
+[lib]
+name = "sirius_sys"
+
+[features]
+# Link a bundled `libsirius.a` instead of `libsirius.so`; the C++ runtime is
+# linked separately. Point SIRIUS_BUILD_DIR at the build tree with that archive.
+static = []
+
+# Maintainer-only: ordinary builds use the checked-in declarations.
+generate-bindings = ["dep:bindgen"]
+
+[build-dependencies]
+bindgen = { version = "=0.73.2", optional = true, default-features = false, features = ["runtime", "prettyplease"] }

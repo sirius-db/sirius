@@ -24,7 +24,6 @@
 #include <sirius/exception.hpp>
 
 // cudf
-#include <cudf/column/column_factories.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>

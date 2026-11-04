@@ -16,7 +16,6 @@
 
 #include "op/scan/parquet_materialize.hpp"
 
-#include "io/io_context.hpp"
 #include "io/types.hpp"
 
 #include <cudf/io/datasource.hpp>

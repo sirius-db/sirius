@@ -20,11 +20,10 @@
 // databases. End-to-end coverage lives in test_pin_table_mvcc_insert.cpp.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <op/scan/duckdb_insert_delta.hpp>
 #include <unistd.h>

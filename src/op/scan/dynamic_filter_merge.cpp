@@ -18,7 +18,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -33,14 +32,12 @@
 #include <cuda_runtime_api.h>
 
 #include <data/data_batch_utils.hpp>
-#include <expression/ast/utils.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
-#include <sirius/exception.hpp>
 #include <telemetry/nvtx.hpp>
 
 #include <algorithm>
@@ -48,15 +45,12 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <concepts>
 #include <cstddef>
-#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <thread>

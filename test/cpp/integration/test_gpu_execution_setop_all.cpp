@@ -21,7 +21,6 @@
 // expect_plan_fallback_matches_cpu.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/pinned_table_guard.hpp>

@@ -17,11 +17,9 @@
 #include "planner/connector_registry.hpp"
 
 #include "exec/stream_plan_bindings.hpp"
-#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
-#include "op/scan/field_id_mapping.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
@@ -50,7 +48,6 @@
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
-#include <link.h>
 #include <parquet_extension.hpp>
 #include <parquet_multi_file_info.hpp>
 

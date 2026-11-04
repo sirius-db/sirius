@@ -11,7 +11,6 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
-#include "transparent/replay_admission.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>

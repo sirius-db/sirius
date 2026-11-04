@@ -1,5 +1,5 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
-#include "c_api/config_internal.hpp"
+#include "c_api/config_internal.hpp"  // IWYU pragma: keep
 #include "c_api/error_internal.hpp"
 #include "config_loading.hpp"
 

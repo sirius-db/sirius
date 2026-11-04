@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_nested_loop_join.hpp"
 
-#include "config.hpp"
 #include "cudf/ast_compat.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
@@ -24,12 +23,10 @@
 #include "duckdb/main/client_context.hpp"
 #include "expression_evaluator/comparison_expression.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
-#include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/cross_join_slicing.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"

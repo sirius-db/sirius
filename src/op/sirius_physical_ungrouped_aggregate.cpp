@@ -31,7 +31,7 @@
 #include "op/input_free_operator_data.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
-#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 

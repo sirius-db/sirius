@@ -11,7 +11,6 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
@@ -29,7 +28,6 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
@@ -37,7 +35,6 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <utils/table_filter_test_utils.hpp>
@@ -45,9 +42,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cerrno>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -56,7 +51,6 @@
 #include <fstream>
 #include <functional>
 #include <future>
-#include <iomanip>
 #include <iterator>
 #include <map>
 #include <memory>

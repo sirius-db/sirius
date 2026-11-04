@@ -17,7 +17,6 @@
 #include "event/query_event_publisher.hpp"
 
 #include <algorithm>
-#include <ranges>
 #include <utility>
 
 namespace sirius::event {

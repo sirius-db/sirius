@@ -32,7 +32,6 @@
 #include "utils/telemetry_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 
 #include <chrono>
 #include <future>

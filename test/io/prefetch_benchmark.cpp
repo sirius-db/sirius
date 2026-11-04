@@ -38,7 +38,6 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/table/table.hpp>
 
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 #include <glob.h>

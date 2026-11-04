@@ -19,7 +19,6 @@
 #include "data/sirius_converter_registry.hpp"
 #include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/scan/detail/read_retirement.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/scan_output_operator_data.hpp"

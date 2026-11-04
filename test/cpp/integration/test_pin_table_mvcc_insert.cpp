@@ -20,7 +20,6 @@
 // served/declined flips live in test_pin_table_mvcc_delete.cpp.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/pinned_entry_census.hpp>
 #include <utils/sirius_test_env.hpp>

@@ -17,7 +17,6 @@
 #include <cudf/strings/utilities.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/constants.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>

@@ -17,7 +17,6 @@
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/memory/common.hpp>
-#include <duckdb.hpp>
 #include <memory/pool_peer_access.hpp>
 #include <unistd.h>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -30,7 +29,6 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace {

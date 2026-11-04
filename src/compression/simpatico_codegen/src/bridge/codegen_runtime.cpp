@@ -53,7 +53,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -64,7 +63,6 @@
 // already compile fine without them.
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/codegen_bridge.hpp"
-#include "codegen/plan/plan_dsl.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
@@ -74,7 +72,6 @@
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda/stream>
 

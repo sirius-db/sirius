@@ -48,7 +48,6 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/error.hpp>

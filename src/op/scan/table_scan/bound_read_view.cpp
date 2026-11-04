@@ -24,7 +24,6 @@
 
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
-#include <duckdb/common/multi_file/multi_file_function.hpp>
 #include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -46,10 +45,8 @@
 #include <algorithm>
 #include <charconv>
 #include <cstring>
-#include <iomanip>
 #include <limits>
 #include <numeric>
-#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>

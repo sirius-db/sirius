@@ -37,7 +37,6 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <duckdb/common/optional_idx.hpp>
 #include <duckdb/common/types.hpp>

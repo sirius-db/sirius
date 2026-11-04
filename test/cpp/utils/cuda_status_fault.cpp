@@ -27,7 +27,6 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
-#include <utility>
 
 namespace {
 std::atomic<cudaError_t> acquisition_status{cudaSuccess};

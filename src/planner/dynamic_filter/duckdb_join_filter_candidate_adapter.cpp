@@ -16,11 +16,9 @@
 
 #include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 
-#include <duckdb/common/helper.hpp>
 #include <duckdb/common/typedefs.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/planner/table_filter.hpp>
 
 #include <algorithm>
 #include <cstddef>
