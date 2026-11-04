@@ -92,9 +92,6 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
     return sirius::OrderPreservationType::NO_ORDER;
   }
 
-  [[nodiscard]] exchange::stream_id stream() const noexcept { return _stream; }
-  [[nodiscard]] exchange_spec const& spec() const noexcept { return _spec; }
-
   /// range: the world size - 1 boundary rows, over key_columns only, ascending in the spec's
   /// order; rank i gets rows from boundary i - 1 (inclusive) to boundary i (exclusive).
   void set_range_boundaries(std::shared_ptr<cudf::table const> boundaries);
