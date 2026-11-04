@@ -23,6 +23,9 @@
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 
+// duckdb
+#include <duckdb/common/exception.hpp>
+
 // cudf
 #include <cudf/copying.hpp>
 #include <cudf/table/table.hpp>
@@ -41,18 +44,35 @@ using evaluate_result = expression_evaluator::evaluate_result;
 
 evaluate_result expression_evaluator::with_selective_retry(
   std::function<evaluate_result()> const& eager,
-  std::function<std::unique_ptr<cudf::column>()> const& selective)
+  std::function<std::unique_ptr<cudf::column>()> const& selective,
+  bool eager_is_exact)
 {
+  // A zero-column input cannot carry the row count of a selection, so its errors propagate.
+  if (_input_table.num_columns() == 0) { return eager(); }
+  if (_in_selective_pass || !eager_is_exact) {
+    ++_selective_evaluation_count;
+    return evaluate_result(selective());
+  }
+  // The enclosing conditional's retry covers this one. Retrying here too would repeat the passes
+  // over this subtree once per level of nesting.
+  if (_in_eager_conditional) { return eager(); }
+
+  struct eager_scope {
+    bool& in_eager;
+    explicit eager_scope(bool& flag) : in_eager(flag) { in_eager = true; }
+    ~eager_scope() { in_eager = false; }
+  };
   auto const first_temp_scalar = _temp_scalars.size();
   auto const first_temp_column = _temp_columns.size();
   try {
+    eager_scope const scope(_in_eager_conditional);
     return eager();
   } catch (invalid_input_exception const&) {
-    // A zero-column input cannot carry the row count of a selection.
-    if (_input_table.num_columns() == 0) { throw; }
+    // A checked operation rejected a row, perhaps one its branch does not select.
   } catch (not_implemented_exception const&) {
     // Unsupported shapes throw this too, and fail again in the selective pass.
-    if (_input_table.num_columns() == 0) { throw; }
+  } catch (duckdb::InvalidInputException const&) {
+    // A type the GPU cannot map, such as a hand-written error()'s, fails only the branch it is in.
   }
 
   // Release what the failed pass left. AST nodes built before it address temporaries by index, so
@@ -94,6 +114,8 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_on_selected_rows(
     to_compact.push_back(*selection);
     compacted =
       sirius::apply_retention_mask(cudf::table_view{to_compact}, *selection, _stream, _mr);
+    // DuckDB never evaluates a branch that no row selects, so its errors must not surface here.
+    if (compacted->num_rows() == 0) { return nullptr; }
 
     std::vector<cudf::column_view> slots(_input_table.num_columns(),
                                          compacted->get_column(referenced.size()).view());
@@ -107,12 +129,21 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_on_selected_rows(
   // full input, intact. Its evaluate() also restores the declared type of @p expr.
   expression_evaluator child(
     &expr, _mr, _stream, _policy, _min_ast_size, _like_swar_fastpath, _like_cache);
+  child._in_selective_pass = true;
+  // Fold the child's counters even when it raises, so tests also see the work of failed passes.
+  struct fold_counters {
+    expression_evaluator& parent;
+    expression_evaluator const& child;
+    ~fold_counters()
+    {
+      parent._like_shared_cache_lookup_count += child._like_shared_cache_lookup_count;
+      parent._ast_jit_evaluation_count += child._ast_jit_evaluation_count;
+      parent._selective_evaluation_count += child._selective_evaluation_count;
+      parent._restored_reference_cast_count += child._restored_reference_cast_count;
+      parent._narrow_domain_comparison_count += child._narrow_domain_comparison_count;
+    }
+  } const fold{*this, child};
   auto result = std::move(child.evaluate(input)->release()[0]);
-  _like_shared_cache_lookup_count += child._like_shared_cache_lookup_count;
-  _ast_jit_evaluation_count += child._ast_jit_evaluation_count;
-  _selective_evaluation_count += child._selective_evaluation_count;
-  _restored_reference_cast_count += child._restored_reference_cast_count;
-  _narrow_domain_comparison_count += child._narrow_domain_comparison_count;
 
   if (result->type() == type) { return result; }
   if (cudf::is_fixed_width(result->type()) && cudf::is_fixed_width(type)) {

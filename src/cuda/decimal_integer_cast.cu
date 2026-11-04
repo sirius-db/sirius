@@ -124,8 +124,8 @@ std::unique_ptr<cudf::column> convert(cudf::column_view const& input,
   auto [output_mask, null_count] = cudf::bools_to_mask(validity->view(), stream, mr);
   if ((!try_cast && null_count > input.null_count()) ||
       (uhugeint && unsupported_carrier.value(stream) != 0)) {
-    // CASE evaluates branches eagerly on the GPU. Replay also preserves DuckDB's behavior when
-    // the overflowing cast belongs to a branch the query does not select.
+    // Replay lets DuckDB raise its conversion error. In a CASE or COALESCE branch that the row
+    // does not select, the evaluator retries the cast without the row instead.
     throw not_implemented_exception(
       "DECIMAL value out of range for {} on the GPU; falling back to DuckDB", target.to_string());
   }

@@ -112,6 +112,11 @@ TEST_CASE_METHOD(ConditionalErrorsFixture,
   compare_gpu_vs_cpu("SELECT id, CASE WHEN i > -2147483648 THEN abs(i) ELSE 0 END FROM ints");
   compare_gpu_vs_cpu(
     "SELECT id, CASE WHEN i = -2147483648 THEN 'min' ELSE CAST(-i AS VARCHAR) END FROM ints");
+  // DuckDB never evaluates a branch that no row reaches, here a hand-written error() that the GPU
+  // cannot evaluate at all.
+  compare_gpu_vs_cpu(
+    "SELECT id, CASE WHEN i < 0 THEN 0 WHEN i = -2147483648 THEN error('boom') ELSE 1 END "
+    "FROM ints");
 }
 
 TEST_CASE_METHOD(ConditionalErrorsFixture,

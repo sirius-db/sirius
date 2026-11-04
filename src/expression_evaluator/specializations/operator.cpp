@@ -633,7 +633,8 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_coalesce_selectivel
     auto const missing = cudf::is_null(result->view(), _stream, _mr);
     auto const rows    = missing->view();
     auto replacement   = evaluate_on_selected_rows(*alt.children[child_idx], &rows, type);
-    result             = scatter_selected(replacement->view(), result->view(), rows);
+    if (!replacement) { break; }
+    result = scatter_selected(replacement->view(), result->view(), rows);
   }
   return result;
 }

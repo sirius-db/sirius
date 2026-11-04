@@ -63,28 +63,25 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
 
   // The eager pass tests an error() THEN's WHEN on every row, ignoring earlier WHENs, which is
   // exact only for the first WHEN. DuckDB generates no other, but SQL can spell one.
-  auto const selective      = [&] { return evaluate_case_selectively(alt); };
   auto const eager_is_exact = std::ranges::none_of(
     alt.cases | std::views::drop(1), [](auto const& c) { return is_error_branch(*c.then_); });
-  auto current_result = [&] {
-    if (eager_is_exact || _input_table.num_columns() == 0) {
-      return with_selective_retry([&] { return evaluate_case_eagerly(alt); }, selective);
-    }
-    ++_selective_evaluation_count;
-    return evaluate_result(selective());
-  }();
+  auto current_result = with_selective_retry([&] { return evaluate_case_eagerly(alt); },
+                                             [&] { return evaluate_case_selectively(alt); },
+                                             eager_is_exact);
 
   //===----------MATERIALIZE (AST breaker)----------===//
   // CASE cannot be represented as a cudf AST operation, so we always materialize it. If the caller
   // requested AST mode, we wrap the result as a temporary column that the parent's AST tree can
   // reference.
   if (mode == evaluation_mode::AST) {
-    // Both passes produce an owned column, except an eager pass whose every THEN is error(), which
-    // returns ELSE as it is.
-    if (!current_result.is_owned_column()) {
-      throw internal_exception(
-        "[expression_evaluator:case]: Expected an owned column after executing CASE "
-        "expression.");
+    // An eager pass whose every THEN is error() returns ELSE as it is: a scalar, or a borrowed
+    // view of an input column. The temporary column must own a full column.
+    if (current_result.is_scalar()) {
+      current_result = evaluate_result(cudf::make_column_from_scalar(
+        current_result.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    } else if (current_result.is_column_view()) {
+      current_result = evaluate_result(
+        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr));
     }
     return materialize_as_ast_column(current_result.release_column());
   }
@@ -170,27 +167,36 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
   sirius::ast::case_expr const& alt)
 {
   // DuckDB semantics: each WHEN sees only the rows no earlier WHEN matched, where NULL does not
-  // match; each THEN sees the rows its WHEN matched, and ELSE the rest. Every mask below is a
-  // null-free BOOL8 column over all input rows.
-  auto const num_rows  = _input_table.num_rows();
-  auto const type      = require_cudf_type(alt.return_type());
+  // match; each THEN sees the rows its WHEN matched, and ELSE the rest. A branch that no row
+  // reaches is not evaluated. Every mask below is a null-free BOOL8 column over all input rows.
+  auto const num_rows = _input_table.num_rows();
+  auto const type     = require_cudf_type(alt.return_type());
+  // No row reaches a branch of an empty input; ELSE gives the empty result its type.
+  if (num_rows == 0) { return evaluate_on_selected_rows(*alt.else_, nullptr, type); }
   auto const condition = cudf::data_type{cudf::type_id::BOOL8};
   auto const no        = cudf::numeric_scalar<bool>(false, true, _stream, _mr);
 
   std::unique_ptr<cudf::column> result;
   auto const assign = [&](sirius::ast::node const& branch, cudf::column_view const& rows) {
     auto value = evaluate_on_selected_rows(branch, &rows, type);
+    if (!value) { return; }
     if (!result) { result = sirius::make_null_column(value->view(), num_rows, _stream, _mr); }
     result = scatter_selected(value->view(), result->view(), rows);
   };
 
   // Rows no WHEN has matched yet; empty while that is every row.
   std::unique_ptr<cudf::column> unmatched;
+  bool exhausted = false;
   for (auto const& case_check : alt.cases) {
     auto const candidates =
       unmatched ? std::optional<cudf::column_view>{unmatched->view()} : std::nullopt;
     auto matched =
       evaluate_on_selected_rows(*case_check.when_, candidates ? &*candidates : nullptr, condition);
+    // Every row has matched an earlier WHEN, so no later WHEN or ELSE is evaluated.
+    if (!matched) {
+      exhausted = true;
+      break;
+    }
     if (matched->has_nulls()) { matched = cudf::replace_nulls(matched->view(), no, _stream, _mr); }
     if (candidates) {
       auto const none = cudf::make_column_from_scalar(no, num_rows, _stream, _mr);
@@ -198,15 +204,13 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
     }
 
     if (is_error_branch(*case_check.then_)) {
-      if (!matched->view().is_empty()) {
-        auto const any = cudf::reduce(matched->view(),
-                                      *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
-                                      condition,
-                                      _stream,
-                                      _mr);
-        if (static_cast<cudf::scalar_type_t<bool> const&>(*any).value(_stream)) {
-          raise_subquery_error();
-        }
+      auto const any = cudf::reduce(matched->view(),
+                                    *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
+                                    condition,
+                                    _stream,
+                                    _mr);
+      if (static_cast<cudf::scalar_type_t<bool> const&>(*any).value(_stream)) {
+        raise_subquery_error();
       }
     } else {
       assign(*case_check.then_, matched->view());
@@ -216,7 +220,11 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
                   ? cudf::copy_if_else(no, *candidates, matched->view(), _stream, _mr)
                   : cudf::unary_operation(matched->view(), cudf::unary_operator::NOT, _stream, _mr);
   }
-  assign(*alt.else_, unmatched->view());
+  if (!exhausted) { assign(*alt.else_, unmatched->view()); }
+  // Each row reached a THEN or ELSE that produced it, or an error() THEN that raised.
+  if (!result) {
+    throw internal_exception("[expression_evaluator:case]: no branch produced the CASE rows");
+  }
   return result;
 }
 

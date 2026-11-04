@@ -83,7 +83,8 @@ namespace {
  * signed-minimum/-1 pair throws not_implemented_exception before cuDF arithmetic,
  * requesting runtime CPU replay when enabled or safe query failure otherwise.
  * This guard neither mutates operands nor produces an arithmetic result. Replay
- * supplies DuckDB's errors/settings and guarded CASE semantics; the guard does not.
+ * supplies DuckDB's errors and settings. Inside CASE or COALESCE, the exception first
+ * makes the evaluator retry the division on only the rows its branch selects.
  */
 void require_safe_division(evaluate_result const& left_result,
                            evaluate_result const& right_result,

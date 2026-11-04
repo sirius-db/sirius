@@ -216,14 +216,22 @@ raises an error for a row it does not produce, as in `CASE WHEN n = 1 THEN a + n
 `case_expr` and `coalesce` first evaluate eagerly as described above: every CASE branch, and every
 COALESCE argument while nulls remain, over the whole batch. Checked operations reject the batch
 when any row is invalid. They raise `sirius::invalid_input_exception`, or
-`sirius::not_implemented_exception` when DuckDB must produce the error. On either exception,
-`with_selective_retry` releases the eager pass's temporaries and evaluates the expression again
-with DuckDB's semantics:
+`sirius::not_implemented_exception` when DuckDB must produce the error. A branch whose type the
+GPU cannot map, such as a hand-written `error()`, raises `duckdb::InvalidInputException`. On any of
+these, `with_selective_retry` releases the eager pass's temporaries and evaluates the expression
+again with DuckDB's semantics:
 
 - `evaluate_on_selected_rows` compacts the referenced input columns to the rows of a BOOL8 mask
   and evaluates the branch in a child `expression_evaluator`. The parent's AST tree, temporaries
   and caches stay intact, and the result has the branch's declared type.
+- A branch that no row reaches is not evaluated, as in DuckDB, so even an expression the GPU
+  cannot evaluate at all may sit there. A CASE stops at the first WHEN that no row reaches.
 - `cudf::boolean_mask_scatter` writes each branch's rows into the result.
+
+Only the outermost conditional retries. A conditional nested in an eager pass runs eagerly and
+leaves its error to the enclosing retry, and one nested in a selective pass runs selectively at
+once. Nested conditionals therefore cost at most one eager and one selective pass at any depth;
+retrying at every level would double the work per level.
 
 An error from this second pass is legitimate and propagates. A query that succeeds eagerly pays
 nothing for the retry, and a new checked operation is covered without a list of fallible
@@ -232,6 +240,11 @@ error over an input without columns, which cannot carry a row count. The eager p
 `error()` THEN's WHEN on every row, which is exact only for the first WHEN, so a CASE with an
 `error()` THEN after its first WHEN evaluates selectively at once. Only hand-written SQL produces
 one. Tests are tagged `[conditional_errors]`.
+
+AND, OR, BETWEEN and IN still evaluate every operand on every row. In filters and WHEN conditions,
+DuckDB evaluates AND and OR operands only on the rows the others leave undecided, in an order it
+adapts at run time. A guard written with AND instead of CASE can therefore raise on the GPU, or
+replay on the CPU, where DuckDB does not.
 
 Handlers that read an operand as a column evaluate it with `evaluate_as_column`, which broadcasts
 a scalar result to the input's row count. These are the date parts (including `millisecond` and

@@ -21,6 +21,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -361,9 +362,53 @@ TEST_CASE("nested CASE evaluates the inner CASE only on the outer branch's rows"
   auto expr   = make_case(n_is(sirius::comparison_type::lt, 100), std::move(inner), d(), date());
   auto result = evaluate(*expr, input.view(), strategy);
   CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{y2000, y2000 + 1, y2000, y2000});
-  // The inner CASE retries within the outer eager pass and still fails on the INT_MAX row, which
-  // only the outer WHEN excludes. The outer CASE then retries.
+  // The inner CASE fails the outer eager pass on the INT_MAX row, which only the outer WHEN
+  // excludes. The outer CASE retries, and the inner CASE evaluates selectively within that pass.
   CHECK(result.selective_evaluations == 2);
+}
+
+TEST_CASE("nested conditionals evaluate selectively once per level at any depth",
+          "[expression_evaluator][conditional_errors]")
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  auto const depth    = GENERATE(1, 2, 8);
+  CAPTURE(strategy, depth);
+  // Only the outermost level excludes the failing row; every inner level selects it. Retrying at
+  // every level made the work double per level.
+  SECTION("CASE")
+  {
+    auto const input = dates({int_max, 1});
+    auto expr        = d_plus_n();
+    for (int level = 1; level < depth; ++level) {
+      expr = make_case(n_is(sirius::comparison_type::gt, 0), std::move(expr), d(), date());
+    }
+    expr        = make_case(n_is(sirius::comparison_type::lt, 100), std::move(expr), d(), date());
+    auto result = evaluate(*expr, input.view(), strategy);
+    CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{y2000, y2000 + 1});
+    CHECK(result.selective_evaluations == static_cast<std::size_t>(depth));
+  }
+  SECTION("COALESCE")
+  {
+    auto const i  = column<int32_t>(cudf::type_id::INT32, {int_min, 1});
+    auto const a  = column<int32_t>(cudf::type_id::INT32, {5, std::nullopt});
+    auto const b  = column<int32_t>(cudf::type_id::INT32, {std::nullopt, std::nullopt});
+    auto coalesce = [](std::unique_ptr<ast_node> first, std::unique_ptr<ast_node> second) {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(std::move(first));
+      children.push_back(std::move(second));
+      return make_coalesce(std::move(children), integer());
+    };
+    auto expr = minus_i();
+    for (int level = 1; level < depth; ++level) {
+      expr = coalesce(make_ref_typed(2, integer()), std::move(expr));
+    }
+    expr        = coalesce(make_ref_typed(1, integer()), std::move(expr));
+    auto result = evaluate(*expr, cudf::table_view{{i->view(), a->view(), b->view()}}, strategy);
+    CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{5, -1});
+    CHECK(result.selective_evaluations == static_cast<std::size_t>(depth));
+  }
 }
 
 TEST_CASE("CASE skips errors under scalar and NULL conditions",
@@ -531,4 +576,97 @@ TEST_CASE("CASE raises error() only for rows its WHEN wins",
     CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{0, 0, 2});
     REQUIRE_THROWS_WITH(evaluate(*make(-1), input.view(), strategy), more_than_one_row);
   }
+}
+
+TEST_CASE("CASE does not evaluate a branch that no row reaches",
+          "[expression_evaluator][conditional_errors]")
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  // Branches the GPU cannot evaluate, whatever the rows: error() below the top of a branch has no
+  // GPU dispatch, and a hand-written error() returns SQLNULL, which has no cuDF type.
+  auto const sqlnull_error = GENERATE(false, true);
+  CAPTURE(strategy, sqlnull_error);
+  auto failing = [sqlnull_error]() -> std::unique_ptr<ast_node> {
+    if (sqlnull_error) {
+      return make_cast(call(function_id::error,
+                            logical_type::make(type_id::SQLNULL),
+                            make_str_const("more than one row")),
+                       integer(),
+                       false);
+    }
+    return call(function_id::add, integer(), error_call(), make_int_const(1));
+  };
+
+  SECTION("THEN")
+  {
+    auto expr = make_case(n_is(sirius::comparison_type::gt, 5), failing(), n(), integer());
+    auto const unselected = dates({1, 2});
+    auto result           = evaluate(*expr, unselected.view(), strategy);
+    CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{1, 2});
+    CHECK(result.selective_evaluations == 1);
+    auto const selected = dates({1, 6});
+    REQUIRE_THROWS(evaluate(*expr, selected.view(), strategy));
+  }
+  SECTION("WHEN after every row has matched")
+  {
+    std::vector<case_expr::when_then> cases;
+    cases.push_back({n_is(sirius::comparison_type::gt, 0), n()});
+    cases.push_back(
+      {make_cmp(sirius::comparison_type::gt, failing(), make_int_const(0)), make_int_const(0)});
+    auto expr        = make_case(std::move(cases), failing(), integer());
+    auto const input = dates({1, 2});
+    auto result      = evaluate(*expr, input.view(), strategy);
+    CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{1, 2});
+  }
+}
+
+TEST_CASE("retried CASE evaluates AST branches over compacted columns",
+          "[expression_evaluator][conditional_errors]")
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  CAPTURE(strategy);
+  // The THEN reads only j, so i and the strings column s fill their slots with placeholders while
+  // the THEN runs as a cuDF AST.
+  auto const i = column<int32_t>(cudf::type_id::INT32, {int_min, 4});
+  auto const s = cudf::make_column_from_scalar(cudf::string_scalar("unread"), 2);
+  auto const j = column<int32_t>(cudf::type_id::INT32, {10, 20});
+  auto j_plus_two =
+    call(function_id::add,
+         integer(),
+         call(function_id::add, integer(), make_ref_typed(2, integer()), make_int_const(1)),
+         make_int_const(1));
+  auto expr   = make_case(i_is_min(), std::move(j_plus_two), minus_i(), integer());
+  auto result = evaluate(*expr, cudf::table_view{{i->view(), s->view(), j->view()}}, strategy);
+  CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{12, -4});
+  CHECK(result.selective_evaluations == 1);
+}
+
+TEST_CASE("CASE whose THENs are all error() returns ELSE to an AST parent",
+          "[expression_evaluator][conditional_errors]")
+{
+  auto const strategy    = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  auto const scalar_else = GENERATE(false, true);
+  CAPTURE(strategy, scalar_else);
+  // DuckDB's scalar subquery shape. Its ELSE stays a view of the input or a scalar, which the AST
+  // parent must still reference as a column.
+  auto expr        = call(function_id::add,
+                   integer(),
+                   call(function_id::add,
+                        integer(),
+                        make_case(n_is(sirius::comparison_type::gt, 5),
+                                  error_call(),
+                                  scalar_else ? make_int_const(7) : n(),
+                                  integer()),
+                        make_int_const(1)),
+                   make_int_const(1));
+  auto const input = dates({1, 2});
+  auto result      = evaluate(*expr, input.view(), strategy);
+  CHECK(host_rows<int32_t>(result.column()) ==
+        (scalar_else ? rows<int32_t>{9, 9} : rows<int32_t>{3, 4}));
 }
