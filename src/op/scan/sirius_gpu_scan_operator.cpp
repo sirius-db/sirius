@@ -19,7 +19,6 @@
 #include "op/scan/table_scan/split_validation.hpp"
 
 #include <data/data_batch_utils.hpp>
-#include <data/sirius_converter_registry.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
@@ -45,10 +44,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 

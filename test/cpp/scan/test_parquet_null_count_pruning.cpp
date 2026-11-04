@@ -37,10 +37,8 @@
 #include <utils/parquet_fixture_utils.hpp>
 
 // duckdb
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/filter/null_filter.hpp>
 
 // standard library
 #include <cstdint>

@@ -18,19 +18,15 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
-#include <duckdb.hpp>
 #include <helper/logical_type.hpp>
 #include <op/sirius_physical_column_data_scan.hpp>
 #include <op/sirius_physical_delim_join.hpp>
-#include <op/sirius_physical_dummy_scan.hpp>
-#include <op/sirius_physical_grouped_aggregate.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 #include <op/sirius_physical_partition.hpp>
 #include <pipeline/repository_wiring.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
-#include <stdexcept>
 #include <string_view>
 #include <vector>
 

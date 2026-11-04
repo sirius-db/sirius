@@ -26,7 +26,6 @@
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <future>

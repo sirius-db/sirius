@@ -20,8 +20,6 @@
 #include "data/data_batch_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 
-#include <cudf/table/table.hpp>
-
 #include <catch.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
 

@@ -18,7 +18,6 @@
 
 #include <catch.hpp>
 #include <creator/task_creator.hpp>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>

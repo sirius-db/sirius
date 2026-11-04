@@ -22,7 +22,6 @@
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/main/attached_database.hpp>

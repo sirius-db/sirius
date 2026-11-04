@@ -1,0 +1,25 @@
+[package]
+name = "sirius-ffi"
+version.workspace = true
+edition.workspace = true
+description = "Existing Sirius C++ FFI bindings for execution and object stores."
+license = "Apache-2.0"
+links = "sirius"
+publish = false
+
+[features]
+static = []
+
+[dependencies]
+cxx.workspace = true
+arrow-array = { version = "60.1", features = ["ffi"] }
+arrow-schema = "60"
+
+[build-dependencies]
+cxx-build.workspace = true
+
+[dev-dependencies]
+substrait = "0.65"
+prost = "0.14"
+parquet = "60"
+tempfile = "3"

@@ -29,14 +29,12 @@
  * in isolated child processes with bounded deadlines.
  */
 
-#include "log/logging.hpp"
 #include "sirius_extension.hpp"
 #include "utils/pinned_entry_census.hpp"
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog_search_path.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_data.hpp>
@@ -47,7 +45,6 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
-#include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>

@@ -31,15 +31,15 @@ make = "*"
 ninja = "*"
 sccache = "=0.18.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
-clang = "21.*"
+clang = "22.*"
 wget = "*"
 pre-commit = "*"
 identify = "2.*"
-clang-tools = "21.*"
+clang-tools = "22.*"
 # Provides llvm-symbolizer (and friends) matching the clang version above, so
-# ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 21.*.
-llvm-tools = "21.*"
-lld = "21.*"
+# ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 22.*.
+llvm-tools = "22.*"
+lld = "22.*"
 pkg-config = "*"
 mold = "*"
 rust = "*"
@@ -77,6 +77,26 @@ fastavro = "1.*"
 # Differential fuzzer; see test/fuzz/README.md. Drives the DuckDB shell from the build.
 fuzz = { cmd = "PYTHONPATH=$PIXI_PROJECT_ROOT/test/fuzz python -m siriusfuzz", description = "Sirius fuzzer: run|doctor|replay|recheck|show-config|selftest (paths resolve from the current directory)" }
 fuzz-test = { cmd = "python -m unittest discover -s tests -t .", cwd = "test/fuzz", description = "Unit tests for the fuzzer harness (no GPU needed)" }
+
+[tasks._clang-tidy-configure]
+cmd = "cmake --preset clang-debug -B build/clang-tidy -U GIT_EXECUTABLE -DSIRIUS_TPCH_HAVOC=OFF"
+
+[tasks._clang-tidy-prepare]
+depends-on = ["_clang-tidy-configure"]
+cmd = """
+cmake --build build/clang-tidy --target cargo-build_telemetry_bridge simpatico_embedded_headers \
+  simpatico_codegen/tests/cache/fixtures/project/codegen/jit/embedded_headers.h \
+  simpatico_codegen/tests/cache/fixtures/cccl/codegen/jit/embedded_headers.h
+"""
+
+[tasks.clang-tidy]
+description = "Prepare generated headers and run advisory clang-tidy (optional source regexes and -j)."
+depends-on = ["_clang-tidy-prepare"]
+cmd = '''
+run-clang-tidy -p build/clang-tidy -warnings-as-errors='-*' \
+  -source-filter "$PIXI_PROJECT_ROOT/(src|test)/.*[.](c|cc|cpp|cxx)$" \
+  -header-filter "$PIXI_PROJECT_ROOT/(src|include|test)/"
+'''
 
 [tasks.duckdb]
 description = "Start the local DuckDB shell with Sirius loaded."
@@ -162,7 +182,7 @@ rust = "1.*"
 
 [feature.docs.tasks.docs-rust]
 description = "Build the Sirius Rust API reference without libsirius."
-cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps --target-dir build/docs/rust-target"
+cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius-ffi --lib --no-deps --target-dir build/docs/rust-target"
 env = { DOCS_RS = "1", RUSTDOCFLAGS = "-D warnings" }
 
 [feature.docs.tasks.docs-theme]

@@ -23,8 +23,6 @@
 
 #include <rmm/device_buffer.hpp>
 
-#include <duckdb.hpp>
-
 #include <cstdint>
 #include <cstring>
 #include <filesystem>

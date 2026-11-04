@@ -41,7 +41,6 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
-#include <duckdb/common/multi_file/multi_file_function.hpp>
 #include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/function/table/table_scan.hpp>
@@ -59,7 +58,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <csignal>
 #include <set>
 #include <stdexcept>
 #include <string>

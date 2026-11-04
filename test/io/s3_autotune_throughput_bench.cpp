@@ -55,7 +55,6 @@
 //       --config     autotune.yml
 
 #include "exec/scoped_dispatcher.hpp"
-#include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/types.hpp"
 #include "s3_autotune.hpp"

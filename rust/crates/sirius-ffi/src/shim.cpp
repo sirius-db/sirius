@@ -1,6 +1,6 @@
-#include "sirius-sys/src/shim.hpp"
+#include "sirius-ffi/src/shim.hpp"
 
-#include "sirius-sys/src/lib.rs.h"  // ObjectStoreConfigArgs (cxx-generated shared struct)
+#include "sirius-ffi/src/bridge.rs.h"  // ObjectStoreConfigArgs (cxx-generated shared struct)
 
 #include <utility>
 

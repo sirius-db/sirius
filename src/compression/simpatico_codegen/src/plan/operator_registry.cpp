@@ -13,7 +13,7 @@
 
 #include <nvcomp/version.h>
 
-#include <stdexcept>
+#include <stdexcept>  // IWYU pragma: keep
 #include <string_view>
 
 namespace simpatico {

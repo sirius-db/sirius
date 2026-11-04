@@ -23,7 +23,6 @@
 
 #include <catch.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
-#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 
 #include <limits>
 #include <type_traits>

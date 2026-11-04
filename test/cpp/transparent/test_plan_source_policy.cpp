@@ -18,7 +18,7 @@
 #include "helper/type_conversions.hpp"
 #include "log/sink.hpp"
 #include "sirius_context.hpp"
-#include "sirius_extension.hpp"
+#include "sirius_extension.hpp"  // IWYU pragma: keep
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -31,7 +31,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
-#include <duckdb/common/multi_file/multi_file_function.hpp>
+#include <duckdb/common/multi_file/multi_file_function.hpp>  // IWYU pragma: keep
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>

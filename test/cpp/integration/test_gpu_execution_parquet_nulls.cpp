@@ -56,7 +56,6 @@
 //   which is what is covered here.
 //
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 

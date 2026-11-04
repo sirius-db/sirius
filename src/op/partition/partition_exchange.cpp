@@ -18,7 +18,7 @@
 
 #include "log/logging.hpp"
 #include "op/sirius_physical_partition.hpp"
-#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 
 #include <algorithm>
 #include <stdexcept>

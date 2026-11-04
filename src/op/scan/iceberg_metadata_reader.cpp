@@ -15,7 +15,6 @@
  */
 
 #include "io/io_context.hpp"
-#include "io/types.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
@@ -25,23 +24,22 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <duckdb/common/types/vector.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/query_result_stream.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
-#include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
+#include <op/scan/parquet_delete_reader.hpp>
 #include <op/scan/puffin_reader.hpp>
 #include <sirius_context.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -428,26 +426,71 @@ void read_positional_delete_file(duckdb::ClientContext& context,
                                  std::string const& delete_file_path,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
-  auto internal = duckdb::SiriusContext::open_internal_connection(context);
-  auto& conn    = internal;
-
-  auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +
-                           escape_sql_string(delete_file_path) + "')");
-
-  if (!result || result->HasError()) {
-    throw std::runtime_error("[iceberg] Failed to read positional-delete file '" +
-                             delete_file_path +
-                             "': " + (result ? result->GetError() : "null result"));
+  using position_map = std::unordered_map<std::string, std::vector<int64_t>>;
+  std::deque<position_map> partials;
+  read_parquet_delete_batches(
+    context,
+    duckdb::OpenFileInfo(delete_file_path),
+    {},
+    [](auto const& columns, uint64_t) {
+      std::vector<uint64_t> projection;
+      for (auto const& required : {std::string("file_path"), std::string("pos")}) {
+        std::optional<uint64_t> found;
+        for (uint64_t i = 0; i < columns.size(); ++i) {
+          if (duckdb::StringUtil::CIEquals(columns[i].name, required)) {
+            if (found) throw std::runtime_error("[iceberg] Ambiguous position-delete column");
+            found = i;
+          }
+        }
+        auto type = required == "pos" ? duckdb::LogicalType::BIGINT : duckdb::LogicalType::VARCHAR;
+        if (!found || columns[*found].type != type)
+          throw std::runtime_error(
+            "[iceberg] Position deletes require file_path VARCHAR and pos BIGINT");
+        projection.push_back(*found);
+      }
+      return projection;
+    },
+    [&] {
+      auto& positions = partials.emplace_back();
+      return [&positions](duckdb::DataChunk& chunk) {
+        duckdb::UnifiedVectorFormat paths;
+        duckdb::UnifiedVectorFormat offsets;
+        chunk.data[0].ToUnifiedFormat(paths);
+        chunk.data[1].ToUnifiedFormat(offsets);
+        auto const* path_data = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(paths);
+        auto const* pos_data  = duckdb::UnifiedVectorFormat::GetData<int64_t>(offsets);
+        std::vector<int64_t>* target = nullptr;
+        duckdb::string_t target_key;
+        for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
+          auto const path_idx = paths.sel->get_index(i);
+          auto const pos_idx  = offsets.sel->get_index(i);
+          if (!paths.validity.RowIsValid(path_idx) || !offsets.validity.RowIsValid(pos_idx))
+            throw std::runtime_error("[iceberg] Invalid null position delete");
+          auto const& key = path_data[path_idx];
+          if (target == nullptr || !(key == target_key)) {
+            target     = &positions[key.GetString()];
+            target_key = key;
+          }
+          // Preserve signed legacy positions; visibility filtering excludes out-of-range values.
+          target->push_back(pos_data[pos_idx]);
+        }
+      };
+    });
+  std::unordered_map<std::string_view, size_t> remaining;
+  for (auto& partial : partials) {
+    out_map.merge(partial);
+    for (auto const& [path, positions] : partial)
+      remaining[path] += positions.size();
   }
-
-  while (true) {
-    auto chunk = result->Fetch();
-    if (!chunk || chunk->size() == 0) break;
-
-    for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-      auto file_path = chunk->GetValue(0, i).ToString();
-      auto pos_val   = chunk->GetValue(1, i).GetValue<int64_t>();
-      out_map[file_path].push_back(pos_val);
+  for (auto& partial : partials) {
+    for (auto& [path, positions] : partial) {
+      auto& dest = out_map.at(path);
+      auto total = remaining.extract(path);
+      // For small appends, retain vector's amortized growth across delete files.
+      if (!total.empty() && total.mapped() > dest.size())
+        dest.reserve(dest.size() + total.mapped());
+      dest.insert(dest.end(), positions.begin(), positions.end());
+      std::vector<int64_t>().swap(positions);
     }
   }
 }

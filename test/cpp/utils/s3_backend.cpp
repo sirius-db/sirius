@@ -18,9 +18,9 @@
 
 #include "io/rest/s3/sigv4.hpp"
 
-#include <arpa/inet.h>
+#include <arpa/inet.h>  // IWYU pragma: keep
 #include <curl/curl.h>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>

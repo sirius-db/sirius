@@ -30,7 +30,6 @@
 // unequal-length arms across many batches, and multi-GPU device placement.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/pinned_table_guard.hpp>
 #include <utils/scoped_sirius_setting.hpp>

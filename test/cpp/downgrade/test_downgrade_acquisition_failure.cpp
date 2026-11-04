@@ -19,7 +19,6 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
-#include "pipeline/task_submission.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>

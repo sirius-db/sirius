@@ -19,7 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/key_preparation.hpp"
-#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/utilities/traits.hpp>

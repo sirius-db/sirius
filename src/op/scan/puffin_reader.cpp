@@ -20,7 +20,6 @@
 
 #include <io/io_errors.hpp>
 #include <io/sirius_datasource.hpp>
-#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 
 // Vendored by DuckDB core and already on this target's include path; duckdb_static bundles its
@@ -31,7 +30,6 @@
 // duckdb-iceberg (`roaring_bitmap_portable_deserialize_size` + `Roaring::readSafe`).
 // The charged path shares the size check and expands containers without allocating a bitmap.
 #include <roaring/roaring.h>
-#include <roaring/roaring.hh>
 
 #include <algorithm>
 #include <bit>

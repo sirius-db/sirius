@@ -49,6 +49,7 @@ target_sources(
           scan/table_scan/bound_read_view.cpp
           scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
+          scan/parquet_delete_reader.cpp
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp
           scan/equality_delete_filter.cpp
