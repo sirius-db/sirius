@@ -204,7 +204,8 @@ enum class verdict_reason : uint16_t {
   callback_mismatch,
   iceberg_puffin_uri_unsupported,
   iceberg_puffin_remote_eager,
-  iceberg_delete_corrupt
+  iceberg_delete_corrupt,
+  provider_admission_refused
 };
 
 struct scan_publication_observation {
@@ -305,7 +306,7 @@ struct physical_check_counters {
   }
   std::atomic<uint64_t> checks{0};
   std::array<std::atomic<uint64_t>,
-             static_cast<std::size_t>(verdict_reason::iceberg_delete_corrupt) + 1>
+             static_cast<std::size_t>(verdict_reason::provider_admission_refused) + 1>
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};

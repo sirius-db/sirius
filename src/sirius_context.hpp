@@ -384,7 +384,7 @@ class SiriusContext : public ClientContextState {
     uint64_t checkpoint_revalidation_failures = 0;
     uint64_t lease_held_at_replay             = 0;
     static constexpr std::size_t semantic_reason_count =
-      static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_delete_corrupt) + 1;
+      static_cast<std::size_t>(sirius::op::scan::verdict_reason::provider_admission_refused) + 1;
     std::array<uint64_t, semantic_reason_count> semantic_declines{};
     std::array<uint64_t, 3> semantic_verdicts{};
     uint64_t certification_added_time_us_sum = 0;

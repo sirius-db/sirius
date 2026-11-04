@@ -235,10 +235,12 @@ struct preparation_request {
 };
 // Collect all requests before reserving. Prepare arenas before binding the sealed admission;
 // any preparation/binding exception rolls back every participating provider.
+// The optional receipt is cleared on entry and set after that rollback completes.
 admission_decision prepare_statement_resources(reservation_provider&,
                                                std::span<preparation_request>,
                                                memory_space_id,
-                                               uint32_t max_permits = 1);
+                                               uint32_t max_permits = 1,
+                                               bool* rollback_completed = nullptr);
 struct scan_dv_count {
   op::scan::scan_contract_id contract;
   uint64_t live_positions;
