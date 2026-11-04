@@ -83,7 +83,7 @@ void prefetching_scheduler::reset(std::span<const planner::prefetch_step> order)
                              .branch_id   = step.branch_id,
                              .mode        = step.mode,
                              .quantum     = quantum_of(step),
-                             .stage       = io::cache::scan_stage::none,
+                             .stage       = cucascade::io::cache::scan_stage::none,
                              .depleted    = false});
     prev = &step;
   }
@@ -101,7 +101,7 @@ void prefetching_scheduler::clear()
   _emitted = 0;
 }
 
-void prefetching_scheduler::update(std::size_t operator_id, io::cache::scan_stage stage)
+void prefetching_scheduler::update(std::size_t operator_id, cucascade::io::cache::scan_stage stage)
 {
   auto it = _by_operator.find(operator_id);
   if (it == _by_operator.end()) { return; }
@@ -110,7 +110,7 @@ void prefetching_scheduler::update(std::size_t operator_id, io::cache::scan_stag
   e.stage = stage;
   // `disposed` is the caller's assertion that this operator is finished, not
   // merely that one of its splits is -- see the note on the class.
-  if (stage == io::cache::scan_stage::disposed) { e.depleted = true; }
+  if (stage == cucascade::io::cache::scan_stage::disposed) { e.depleted = true; }
 
   advance();
 }
@@ -205,10 +205,10 @@ bool prefetching_scheduler::focus_member(std::size_t operator_id)
   return false;
 }
 
-io::cache::scan_stage prefetching_scheduler::stage_of(std::size_t operator_id) const
+cucascade::io::cache::scan_stage prefetching_scheduler::stage_of(std::size_t operator_id) const
 {
   auto it = _by_operator.find(operator_id);
-  if (it == _by_operator.end()) { return io::cache::scan_stage::none; }
+  if (it == _by_operator.end()) { return cucascade::io::cache::scan_stage::none; }
   return _entries[it->second].stage;
 }
 

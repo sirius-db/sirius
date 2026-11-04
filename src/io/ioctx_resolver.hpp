@@ -14,20 +14,18 @@
  * limitations under the License.
  */
 
-#include "io/uring/uring_ioctx.hpp"
+#pragma once
 
-#include "io/uring/uring_reactor.hpp"
+#include <cucascade/io/io_context.hpp>
 
-#include <format>
+#include <functional>
 #include <memory>
+#include <string_view>
 
-namespace sirius::io::uring {
+namespace sirius::io {
 
-uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx)
-  : templated_ioctx<uring_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
-      return std::make_unique<uring_reactor>(ctx, std::format("reactor-{}", i++));
-    })
-{
-}
+/// Resolves the ioctx that serves a given file path (s3:// -> rest, local -> uring/kvikio).
+/// Returns a valid ioctx or throws if no backend supports the path.
+using ioctx_resolver = std::function<std::shared_ptr<cucascade::io::ioctx>(std::string_view)>;
 
-}  // namespace sirius::io::uring
+}  // namespace sirius::io

@@ -24,14 +24,15 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
+// sirius
+#include "io/ioctx_resolver.hpp"
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <op/scan/batch_coalescer.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
 
-// rmm
-#include "io/io_context.hpp"
-
+// cccl
 #include <cuda/stream>
 
 // standard library
@@ -157,7 +158,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * The task returns scan metadata; a null callable means no work remains.
    * Readers that can be temporarily blocked override try_claim_split().
    */
-  virtual metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) = 0;
+  virtual metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver resolve) = 0;
 
   using metadata_unit  = scan_manager::preparation_unit_requirement;
   using metadata_job   = scan_manager::preparation_job;

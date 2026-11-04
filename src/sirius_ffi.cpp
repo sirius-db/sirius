@@ -38,7 +38,6 @@
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "io/io_errors.hpp"               // sirius::io::credential_error
 #include "io/rest/s3/endpoint.hpp"        // sirius::io::rest::s3::parse_endpoint
 #include "io/s3/scope_policy.hpp"
 #include "log/logging.hpp"                    // SIRIUS_LOG_INFO
@@ -50,6 +49,8 @@
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
 #include "sirius_ffi_testing.hpp"
+
+#include <cucascade/io/io_errors.hpp>  // cucascade::io::credential_error
 
 #include <algorithm>
 #include <array>
@@ -208,7 +209,7 @@ void check_endpoint(const std::string& endpoint)
   }
   try {
     (void)sirius::io::rest::s3::parse_endpoint(endpoint);
-  } catch (sirius::io::credential_error const&) {
+  } catch (cucascade::io::credential_error const&) {
     invalid_field("endpoint", "malformed");
   }
 }

@@ -19,6 +19,8 @@
 #include "scan_manager/coordinator_pool.hpp"
 #include "transparent/replay_admission.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+
 #include <bitset>
 #include <compare>
 #include <condition_variable>
@@ -56,7 +58,7 @@ struct unit_record {
 struct footer_input {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
   std::shared_ptr<op::scan::parquet_input_approval const> approval;
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
 };
 struct segments_input {
   std::shared_ptr<op::scan::physical_profile_table> profiles;
