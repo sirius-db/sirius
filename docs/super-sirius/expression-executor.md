@@ -216,6 +216,13 @@ constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d
 GPU as `month(DATE '2020-02-01')`.
 Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
 
+`date_trunc` returns DuckDB's declared `TIMESTAMP` (microseconds). For TIMESTAMP input,
+`cudf::datetime::floor_datetimes` keeps the input resolution. DATE input skips the floor: every
+GPU-supported unit is a day or finer, so the value is unchanged and only converted with the
+DATE-to-TIMESTAMP cast (`cast_date_to_timestamp`, which keeps infinities). Returning cuDF's
+`TIMESTAMP_DAYS` would break parents such as CASE (`cudf::copy_if_else`) that need every input
+to have the same type.
+
 `in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that.
 
 The AST lowering for IN joins per-entry equality comparisons with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to per-entry inequality comparisons joined by `NULL_LOGICAL_AND`. For non-floating operands these use primitive `EQUAL` and `NOT_EQUAL` nodes. FLOAT/DOUBLE comparisons instead use the shared NaN-aware comparison builder: equality expands to `EQUAL OR both_nan`, and inequality to `NOT(EQUAL OR both_nan)`, where `both_nan` means both operands are valid NaNs. These expressions retain ordinary comparison NULL propagation. The pinned cuDF implementation normalizes the expanded predicate before Parquet membership pruning; the floating inequality's `NOT` node must not be confused with negating a Bloom-filter membership answer (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values.
