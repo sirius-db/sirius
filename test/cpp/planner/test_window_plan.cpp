@@ -577,6 +577,44 @@ TEST_CASE("window adapter restores narrow inputs and removes hidden slots", "[wi
         std::vector<__int128_t>{40, 60, 40, 60});
 }
 
+TEST_CASE("ranking window adapter ranks narrow inputs without restoring them",
+          "[window_adapter][gpu]")
+{
+  using namespace sirius::op;
+  using namespace sirius::test::operator_utils;
+  using sirius::logical_type;
+  using sirius::type_id;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto& space  = *manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  // The partition key and the order key are compressed INTEGERs.
+  auto batch = make_two_column_batch<int8_t, int8_t>(
+    space, {1, 2, 1, 2}, {30, 10, 20, 40}, cudf::type_id::INT8, std::nullopt, cudf::type_id::INT8);
+  auto stream = space.acquire_stream();
+  sirius_physical_window window(
+    {logical_type::make(type_id::INTEGER),
+     logical_type::make(type_id::INTEGER),
+     logical_type::make(type_id::BIGINT)},
+    {logical_type::make(type_id::INTEGER), logical_type::make(type_id::INTEGER)},
+    2,
+    {0},
+    ranking_order{{1}, {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}},
+    {ranking_function::rank},
+    4);
+  pipelineable_operator_data input({batch});
+  input.prepare_for_processing(&space, stream);
+  auto result = window.execute(input, stream);
+  stream.sync();
+  auto batches = dynamic_cast<pipelineable_operator_data&>(*result).get_read_only_batches();
+  REQUIRE(batches.size() == 1);
+  auto table = sirius::get_cudf_table_view(batches[0]);
+  REQUIRE(table.num_columns() == 3);
+  // The payload keeps its carrier, and the ranks follow the order of the narrow keys.
+  CHECK(table.column(0).type().id() == cudf::type_id::INT8);
+  CHECK(table.column(1).type().id() == cudf::type_id::INT8);
+  CHECK(table.column(2).type().id() == cudf::type_id::INT64);
+  CHECK(copy_column_to_host<int64_t>(table.column(2)) == std::vector<int64_t>{2, 1, 1, 2});
+}
+
 TEST_CASE("window source drains assembled batches across repository partition gaps",
           "[window_adapter][gpu]")
 {
