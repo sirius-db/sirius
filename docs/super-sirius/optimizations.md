@@ -177,6 +177,8 @@ FILTER   EXISTS:     mn <> outer.x OR mx <> outer.x      (per subquery; projecti
 
 `EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
 
+Plain SEMI/ANTI joins (`delim_join_as_cte = true`) are merged only when they are estimated not to fit on the GPU. Each such join hashes its subquery's rows, which beats the merged aggregate while those rows fit (q21 at SF1000 on a 256 GB GPU: 0.475 s against 0.531 s merged) but spills once they do not (SF3000 on a 32 GB GPU: 271 s against 57 s merged). The estimate is the largest subquery scan's base-table row count times its key and value widths, since DuckDB's estimates of the subqueries' filters can be several times too low. The budget is the smallest GPU's downgrade threshold (`downgrade_trigger_fraction` of its capacity). Delim joins are merged regardless, as the merge was faster in both measured cases.
+
 Because the merged plan reads one view fewer times than the original, `compare_read_views` (`src/transparent/read_view_registry.cpp`) accepts a candidate that reads an identical view fewer times, while still rejecting one that reads a new view, reads a view more often, or drops the only scan of a view.
 
 **Limits:**

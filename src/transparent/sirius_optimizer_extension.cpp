@@ -37,10 +37,13 @@
 #include <log/logging.hpp>
 #include <util/duckdb_error_message.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::transparent {
@@ -75,6 +78,22 @@ bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
   }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+}
+
+/// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
+/// off it. 0 when no GPU capacity is configured.
+std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
+{
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!runtime) { return 0; }
+  std::uint64_t budget = 0;
+  for (auto const& space : runtime->get_config().get_memory_space_configs()) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
+    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
+    budget                        = budget == 0 ? threshold : std::min(budget, threshold);
+  }
+  return budget;
 }
 
 using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
@@ -283,7 +302,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     if (exists_minmax_rewrite_enabled(context)) {
       try {
         sirius::planner::rewrite_correlated_inequality_exists(
-          context, input.optimizer.binder, copy);
+          context, input.optimizer.binder, copy, gpu_memory_budget(context));
       } catch (std::exception& e) {
         SIRIUS_LOG_WARN(
           "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",

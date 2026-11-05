@@ -100,6 +100,7 @@ struct exists_match {
   LogicalType value_type;
   bool key_null_safe   = false;       ///< `IS NOT DISTINCT FROM` rather than `=`
   bool value_null_safe = false;       ///< `IS DISTINCT FROM` rather than `<>`
+  bool plain           = false;       ///< A plain SEMI or ANTI join rather than a delim join
   std::optional<ColumnBinding> mark;  ///< The mark a replaced FILTER(mark) consumed
 };
 
@@ -278,6 +279,7 @@ std::optional<exists_match> match_plain_exists(LogicalOperator& node)
   exists_match match;
   match.replaced    = &node;
   match.join        = &join;
+  match.plain       = true;
   match.outer_child = type == JoinType::SEMI || type == JoinType::ANTI ? 0 : 1;
   match.negated     = type == JoinType::ANTI || type == JoinType::RIGHT_ANTI;
   match.t           = &join.children[1 - match.outer_child];
@@ -696,10 +698,12 @@ unique_ptr<Expression> move_onto(unique_ptr<Expression> expression,
 
 /// Rewrite a chain of two or more matched joins (innermost first) over the same scan, one level
 /// nested in the next through its outer rows. Returns null, consuming nothing, when the subqueries
-/// cannot share one scan.
+/// cannot share one scan, or when they are plain joins estimated to fit in @p gpu_memory_budget
+/// bytes (0: unknown).
 unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
                                            duckdb::Binder& binder,
-                                           std::vector<exists_match>& chain)
+                                           std::vector<exists_match>& chain,
+                                           std::uint64_t gpu_memory_budget)
 {
   std::vector<peeled_scan> scans;
   for (auto& match : chain) {
@@ -740,6 +744,29 @@ unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
   }
   auto output = output_map(*chain.back().replaced, *outer, chain.back().mark);
   if (!output) { return nullptr; }
+  if (gpu_memory_budget > 0 &&
+      std::ranges::all_of(chain, [](auto const& match) { return match.plain; })) {
+    // The plain joins hash each subquery's rows on the GPU, which is cheaper than the aggregate
+    // until those rows no longer fit and spill. The base-table row count is used because
+    // estimates of the subqueries' filters can be far too low.
+    std::uint64_t join_bytes = 0;
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+      auto const& get = *scans[i].get;
+      if (!get.has_estimated_cardinality) { continue; }
+      auto const row_bytes = duckdb::GetTypeIdSize(chain[i].key_type.InternalType()) +
+                             duckdb::GetTypeIdSize(chain[i].value_type.InternalType());
+      join_bytes = std::max<std::uint64_t>(join_bytes, get.estimated_cardinality * row_bytes);
+    }
+    bool const spills = join_bytes == 0 || join_bytes > gpu_memory_budget;
+    SIRIUS_LOG_INFO(
+      "[sirius_plan_exists_rewrite] {} {} sibling EXISTS/NOT EXISTS: their joins would hold an "
+      "estimated {} bytes against a GPU budget of {} bytes",
+      spills ? "Merging" : "Not merging",
+      chain.size(),
+      join_bytes,
+      gpu_memory_budget);
+    if (!spills) { return nullptr; }
+  }
 
   // ---- Nothing below declines: consume the original nodes. ----
   // The shared scan's pushed-down filters have become its subquery's predicate, so it must return
@@ -813,21 +840,23 @@ void rewrite_tree(duckdb::ClientContext& context,
                   duckdb::Binder& binder,
                   unique_ptr<LogicalOperator>& slot,
                   duckdb::column_binding_map_t<std::size_t> const& reads,
+                  std::uint64_t gpu_memory_budget,
                   std::size_t& rewrites)
 {
   // Only sibling subqueries are rewritten: a lone one trades its join for a GROUP BY over the
   // same rows, which is rarely faster.
   if (auto chain = match_chain(*slot, reads); chain.size() >= 2) {
-    if (auto merged = rewrite_merged(context, binder, chain)) {
+    if (auto merged = rewrite_merged(context, binder, chain, gpu_memory_budget)) {
       slot = std::move(merged);
       rewrites += chain.size();
       // The merged node's outer rows may hold further subqueries.
-      rewrite_tree(context, binder, slot->children[0]->children[0], reads, rewrites);
+      rewrite_tree(
+        context, binder, slot->children[0]->children[0], reads, gpu_memory_budget, rewrites);
       return;
     }
   }
   for (auto& child : slot->children) {
-    rewrite_tree(context, binder, child, reads, rewrites);
+    rewrite_tree(context, binder, child, reads, gpu_memory_budget, rewrites);
   }
 }
 
@@ -835,12 +864,13 @@ void rewrite_tree(duckdb::ClientContext& context,
 
 std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
                                                  duckdb::Binder& binder,
-                                                 duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+                                                 duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
+                                                 std::uint64_t gpu_memory_budget)
 {
   duckdb::column_binding_map_t<std::size_t> reads;
   count_reads(*plan, reads);
   std::size_t rewrites = 0;
-  rewrite_tree(context, binder, plan, reads, rewrites);
+  rewrite_tree(context, binder, plan, reads, gpu_memory_budget, rewrites);
   if (rewrites > 0) {
     SIRIUS_LOG_INFO(
       "[sirius_plan_exists_rewrite] Rewrote {} EXISTS/NOT EXISTS on a key and a value inequality "

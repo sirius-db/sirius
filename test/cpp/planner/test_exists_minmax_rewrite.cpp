@@ -30,6 +30,7 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -46,7 +47,8 @@ template <class Consume>
 std::size_t with_resolved_plan(Connection& con,
                                std::string const& query,
                                bool rewrite,
-                               Consume&& consume)
+                               Consume&& consume,
+                               std::uint64_t gpu_memory_budget = 0)
 {
   std::size_t rewrites = 0;
   auto& context        = *con.context;
@@ -71,8 +73,8 @@ std::size_t with_resolved_plan(Connection& con,
       plan = optimizer.Optimize(std::move(plan));
     }
     if (rewrite) {
-      rewrites =
-        sirius::planner::rewrite_correlated_inequality_exists(context, *planner.binder, plan);
+      rewrites = sirius::planner::rewrite_correlated_inequality_exists(
+        context, *planner.binder, plan, gpu_memory_budget);
     }
     plan->ResolveOperatorTypes();
     duckdb::ColumnBindingResolver verifier(true);
@@ -140,9 +142,9 @@ struct exists_rewrite_fixture {
   }
 
   /// Subqueries the rewrite replaces in @p query's optimized plan, independent of the setting.
-  std::size_t rewrites(std::string const& query)
+  std::size_t rewrites(std::string const& query, std::uint64_t gpu_memory_budget = 0)
   {
-    return with_resolved_plan(*con, query, true, [](ClientContext&, auto&) {});
+    return with_resolved_plan(*con, query, true, [](ClientContext&, auto&) {}, gpu_memory_budget);
   }
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> physical_plan(std::string const& query)
@@ -255,4 +257,18 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
   auto merged = physical_plan(q21_shape_query);
   CHECK(delim_join_types(merged.get()) == std::vector{duckdb::JoinType::LEFT});
   CHECK(collect(merged.get(), T::GPU_SCAN).size() == 2);
+}
+
+TEST_CASE_METHOD(exists_rewrite_fixture,
+                 "exists rewrite merges plain joins only when they would not fit on the GPU",
+                 "[exists_rewrite][plan]")
+{
+  // `fact` has 5000 rows of a BIGINT key and an INTEGER value: 60,000 bytes per join.
+  {
+    sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
+    CHECK(rewrites(q21_shape_query, 1 << 20) == 0);
+    CHECK(rewrites(q21_shape_query, 1 << 10) == 2);
+  }
+  // Delim joins are merged whatever the budget.
+  CHECK(rewrites(q21_shape_query, 1 << 20) == 2);
 }
