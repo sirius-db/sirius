@@ -52,11 +52,10 @@ struct downgrade_executor_config {
   std::size_t copy_chunk_bytes{1ull << 30};
 
   /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
-  /// When set, the GPU->HOST downgrade dispatch uses
-  /// cucascade::memory::any_memory_space_in_tier_with_preference{Tier::HOST, *preferred_numa_node}
-  /// so batches downgrade to the NUMA-local host memory_space when capacity is available,
-  /// with cross-NUMA fallback. When unset (nullopt), the downgrade dispatch uses the
-  /// unpreferred any_memory_space_in_tier{Tier::HOST} strategy (single-GPU default behavior).
+  /// When set, the GPU->HOST downgrade orders the matching HOST memory_space(s) first in its
+  /// target list, so batches downgrade to the NUMA-local host memory_space when capacity is
+  /// available, with cross-NUMA fallback. When unset (nullopt), HOST spaces are tried in the
+  /// reservation manager's order (single-GPU default behavior).
   /// Populated by SiriusContext from config_.get_hw_topology().gpus[device_id].numa_node.
   std::optional<int> preferred_numa_node;
 };

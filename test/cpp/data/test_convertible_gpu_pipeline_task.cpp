@@ -29,8 +29,11 @@
 #include <pipeline/gpu_pipeline_task.hpp>
 #include <utils/telemetry_utils.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -379,4 +382,47 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
 
   // Queue is interrupted and empty — task was destroyed, not pushed
   REQUIRE(queue.empty());
+}
+
+// A non-blocking request must not wait on a batch another thread holds exclusively (e.g. a task
+// restoring a shared input while it waits for the memory this downgrade is meant to free). Both
+// the size probe and the conversion skip the held batch and return promptly.
+TEST_CASE("non-blocking convert and bytes_in_space skip a batch held by another thread",
+          "[convertible_gpu_pipeline_task]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto held_batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto free_batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5, 6, 7}, cudf::type_id::INT32);
+  auto const free_size = get_batch_size(*free_batch);
+  auto task            = make_test_gpu_task(1, {held_batch, free_batch});
+  REQUIRE(queue.push(std::move(task)));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd != nullptr);
+
+  // Stands in for the other thread's exclusive hold.
+  std::optional<cucascade::mutable_data_batch> held;
+  held.emplace(held_batch->to_mutable());
+
+  auto probe          = std::async(std::launch::async, [&] {
+    auto bytes  = cd->bytes_in_space(e.gpu_space);
+    auto result = cd->convert({e.host_space}, e.stream(), *e.mgr, /*blocking=*/false);
+    return std::pair{bytes, std::move(result)};
+  });
+  bool const returned = probe.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  CHECK(returned);
+  held.reset();  // release before joining, so a probe that blocked can still finish
+  auto [bytes, result] = probe.get();
+  REQUIRE(returned);
+  REQUIRE(bytes == free_size);
+  REQUIRE(result.has_value());
+  REQUIRE((*result)[0] == free_size);
+  REQUIRE(get_batch_tier(*free_batch) == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*held_batch) == cucascade::memory::Tier::GPU);
 }

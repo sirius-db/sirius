@@ -136,7 +136,7 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
 3. For each request, the processing loop fetches candidates lazily in tiered order:
    - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
-   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
+   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue. Only the task's batches in the executor's source space are moved; inputs it holds in other spaces are left to that space's executor
 4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. The `predicate` is evaluated both **before dispatching each candidate** (a request that is already satisfied — e.g. the caller's reservation landed, or the running query freed memory — spills nothing) and after each conversion. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
 
 **Byte-targeted requests** (`downgrade_request::target_bytes`, set by monitor requests and `request_free_memory`) additionally stop dispatching once the *planned* bytes (freed + in-flight) cover the target, bounding overshoot to less than one batch regardless of pool width, and right-size the final pick per repository (`spill_policy.hpp`: smallest candidate that still covers the remaining deficit, ties in policy order). Together these keep a marginal overflow from evicting a whole extra multi-GB partition — the q9-class partition-spill cliff, where +0.1% of input rows doubled the spilled set and its host round-trips.
@@ -171,7 +171,7 @@ The compressed host representation decodes with the converter `pin_table` alread
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
 1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
-2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. A queued task can hold inputs in several spaces (inputs that were only partly spilled, a build batch shared from another GPU); only the batches still in the source space are converted, and the request is credited with the bytes that actually moved. Tasks are returned to the queue via RAII on all code paths.
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
 

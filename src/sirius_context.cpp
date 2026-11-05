@@ -1099,16 +1099,14 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // Managers are created per execution window (begin_execution_window), not here; the registry
   // starts empty and only ever holds entries for in-flight queries.
 
-  // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
-  // so pointers are available for injection into gpu_pipeline_executors.
-  // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
+  // Create the downgrade executors BEFORE task_scheduler, so pointers are available for
+  // injection into gpu_pipeline_executors: one per GPU memory space (spills GPU -> HOST/DISK)
+  // and one per HOST memory space (spills HOST -> DISK).
   //
-  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto main PR #579 shape):
-  // each GPU's downgrade_executor gets its own copy of downgrade_executor_config with
-  // preferred_numa_node populated from hw_topology().gpus[device_id].numa_node. The config
-  // copy flows into downgrade_task via processing_loop so GPU->HOST dispatch prefers the
-  // NUMA-local host memory_space via cucascade's
-  // any_memory_space_in_tier_with_preference strategy.
+  // Per-GPU NUMA-aware downgrade: each GPU's downgrade_executor gets its own copy of
+  // downgrade_executor_config with preferred_numa_node populated from
+  // hw_topology().gpus[device_id].numa_node, so processing_loop orders the NUMA-local host
+  // memory_space first in its target list.
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
     auto spaces          = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& base_cfg = config_.get_downgrade_executor_config();
