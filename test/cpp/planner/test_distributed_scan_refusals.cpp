@@ -23,13 +23,16 @@
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
+#include <planner/substrait_scan_ranges.hpp>
 #include <sirius/exception.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -154,5 +157,19 @@ TEST_CASE("a distributed plan refuses scans it cannot split", "[planner][distrib
     CHECK_THAT(
       lowering_error(con, duckdb::StringUtil::Replace(sql, "{}", source)),
       Catch::Matchers::ContainsSubstring("filename or file_index of a table split across ranks"));
+  }
+
+  SECTION("a plan that carries its own byte ranges")
+  {
+    std::map<std::string, std::vector<sirius::planner::scan_byte_range>> ranges;
+    ranges[parquet.string()] = {{0, 100}};
+    con.context->registered_state->Insert(
+      sirius::planner::scan_byte_ranges_state::kStateKey,
+      duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+    CHECK_THAT(lowering_error(con,
+                              "SELECT sum(k) FROM read_parquet(" +
+                                sirius::test::sql_literal(parquet.string()) + ")"),
+               Catch::Matchers::ContainsSubstring("a plan that carries its own byte ranges"));
+    con.context->registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
   }
 }
