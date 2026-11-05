@@ -70,8 +70,6 @@ enum class placement {
 /// size on every rank, since every rank plans the same estimate.
 constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
 constexpr std::size_t max_bloom_keys = std::size_t{1} << 30;
-/// Stream ids a join reserves for merging its filters, one per admitted key.
-constexpr std::uint32_t max_filter_keys = 64;
 /// A join whose estimated build is smaller publishes no filters: its build can be empty on some
 /// rank, and an empty build only takes part in the merge once its probe has finished, while the
 /// ranks with build rows hold their probe until the merge completes.
@@ -206,8 +204,10 @@ struct rewriter {
       shape += "f";
       return;
     }
-    auto const first = stream();
-    next_stream += max_filter_keys;
+    // One stream per admitted key: key k merges on first + k. The keys are fixed while planning,
+    // so every rank reserves the same streams.
+    auto const first = exchange::make_stream_id(query, next_stream);
+    next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
     join.set_distributed_dynamic_filters(
       {.service      = service,
        .first_stream = first,
