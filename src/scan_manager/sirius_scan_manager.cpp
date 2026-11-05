@@ -2362,15 +2362,24 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
       return it->second;
     }
   }
-  // Explained once, when it first failed. The key carries the config snapshot,
-  // so a newly installed S3 secret gets a fresh attempt; the same config could
-  // only fail the same way.
-  if (_unavailable_io_ctxs.contains(cache_key)) { return nullptr; }
-  auto io_ctx = make_ioctx_or_explain(type, snapshot ? snapshot->config.get() : nullptr);
+  // A failed build is remembered per config snapshot. A failure the
+  // configuration explains (an unconfigured object store) is final: the same
+  // config can only fail the same way, and a newly installed S3 secret changes
+  // the key. Any other failure is tried again on every lookup and explained only
+  // the first time: cuCascade's factories return null for every exception their
+  // construction throws, which includes transient ones (an allocation failure,
+  // no spare file descriptor for the reactor's wakeup eventfd), so one such
+  // failure must not leave the backend unavailable for the manager's lifetime.
+  auto const failed = _failed_io_ctxs.find(cache_key);
+  if (failed != _failed_io_ctxs.end() && failed->second) { return nullptr; }
+  auto [io_ctx, failure] = make_ioctx_or_explain(type,
+                                                 snapshot ? snapshot->config.get() : nullptr,
+                                                 /*explain=*/failed == _failed_io_ctxs.end());
   if (!io_ctx) {
-    _unavailable_io_ctxs.insert(cache_key);
+    _failed_io_ctxs.insert_or_assign(cache_key, failure.by_configuration);
     return nullptr;
   }
+  _failed_io_ctxs.erase(cache_key);
   io_ctx->start();
   init_cache_for(*io_ctx);
   std::lock_guard lk{_routed_io_ctxs_mtx};
@@ -2419,8 +2428,10 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
   return {.cause = "the io registry has no factory for this backend", .by_configuration = false};
 }
 
-std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::make_ioctx_or_explain(
-  cucascade::io::io_context_type type, cucascade::io::object_store_config const* scoped)
+sirius_scan_manager::ioctx_build sirius_scan_manager::make_ioctx_or_explain(
+  cucascade::io::io_context_type type,
+  cucascade::io::object_store_config const* scoped,
+  bool explain)
 {
   std::shared_ptr<cucascade::io::ioctx> io_ctx;
   if (scoped == nullptr) {
@@ -2434,16 +2445,18 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::make_ioctx_or_explain
     io_ctx = cucascade::io::io_context_registry{backend_config.to_io_config(), _reservation_manager}
                .make_ioctx(type);
   }
-  if (io_ctx) { return io_ctx; }
-  auto const failure = explain_ioctx_failure(type, scoped);
-  if (failure.by_configuration) {
+  if (io_ctx) { return {.io_ctx = std::move(io_ctx), .failure = {}}; }
+  auto failure = explain_ioctx_failure(type, scoped);
+  if (!explain) {
+    // Explained on an earlier attempt with this configuration.
+  } else if (failure.by_configuration) {
     SIRIUS_LOG_WARN(
       "[sirius_scan_manager] {} backend unavailable: {}", to_string(type), failure.cause);
   } else {
     SIRIUS_LOG_ERROR(
       "[sirius_scan_manager] {} backend unavailable: {}", to_string(type), failure.cause);
   }
-  return nullptr;
+  return {.io_ctx = nullptr, .failure = std::move(failure)};
 }
 
 bool sirius_scan_manager::init_cache_for(cucascade::io::ioctx& io_ctx)
@@ -2472,6 +2485,7 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
   std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
   for (auto const type :
        {cucascade::io::io_context_type::restful, cucascade::io::io_context_type::kvikio}) {
+    _failed_io_ctxs.erase(routed_ioctx_key{type, *superseded_id});
     auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
     if (it != _routed_io_ctxs.end()) {
       retired.push_back(std::move(it->second));

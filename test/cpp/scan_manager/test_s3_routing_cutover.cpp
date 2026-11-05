@@ -33,8 +33,11 @@
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/curl_handle.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1000,4 +1003,71 @@ TEST_CASE("backend=kvikio without an object store rejects s3 paths with a clear 
   REQUIRE(local != nullptr);
   REQUIRE(local->io_ctx() != nullptr);
   CHECK(local->io_ctx()->type() == io_context_type::kvikio);
+}
+
+namespace {
+
+/// Lowers the soft RLIMIT_NOFILE to the lowest unused descriptor for the scope,
+/// so every descriptor-creating call in it fails with EMFILE. Descriptors that
+/// are already open are unaffected, and the saved limit is restored on exit.
+class scoped_descriptor_exhaustion {
+ public:
+  scoped_descriptor_exhaustion()
+  {
+    REQUIRE(::getrlimit(RLIMIT_NOFILE, &_saved) == 0);
+    int const probe = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(probe >= 0);
+    REQUIRE(::close(probe) == 0);
+    rlimit limited   = _saved;
+    limited.rlim_cur = static_cast<rlim_t>(probe);
+    REQUIRE(::setrlimit(RLIMIT_NOFILE, &limited) == 0);
+  }
+  ~scoped_descriptor_exhaustion() { ::setrlimit(RLIMIT_NOFILE, &_saved); }
+
+  scoped_descriptor_exhaustion(scoped_descriptor_exhaustion const&)            = delete;
+  scoped_descriptor_exhaustion& operator=(scoped_descriptor_exhaustion const&) = delete;
+
+ private:
+  rlimit _saved{};
+};
+
+}  // namespace
+
+TEST_CASE("scan_manager retries a routed S3 ioctx after a transient construction failure",
+          "[s3][routing]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
+  scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle,
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
+    *fixture.memory,
+    fixture.topology};
+  auto const uri = std::string{"s3://routing-bucket/data.parquet"};
+
+  // The REST reactor creates its wakeup eventfd in its constructor. With no
+  // descriptor available that throws, cuCascade's factory reports a null
+  // context, and the manager has no backend for the path. curl's process-wide
+  // state is initialized outside the window so only the reactor sees the
+  // shortage.
+  cucascade::io::rest::global_curl_context::instance();
+  {
+    scoped_descriptor_exhaustion no_descriptors;
+    CHECK(manager.create_datasource(uri) == nullptr);
+    CHECK_THROWS_WITH(manager.s3_list_max_matches(uri),
+                      Catch::Matchers::ContainsSubstring("does not route to an object-store"));
+  }
+
+  // The configuration did not change, so the next lookup must try again.
+  auto datasource = manager.create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  CHECK(datasource->io_ctx()->type() == io_context_type::restful);
+
+  // LIST resolves the recovered context too, and later lookups reuse it.
+  CHECK_NOTHROW(manager.s3_list_max_matches(uri));
+  auto again = manager.create_datasource(uri);
+  REQUIRE(again != nullptr);
+  CHECK(again->io_ctx().get() == datasource->io_ctx().get());
 }

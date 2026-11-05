@@ -1089,8 +1089,8 @@ class sirius_scan_manager {
 
   /// Why the registry could not build a backend, as far as Sirius can tell.
   struct ioctx_failure {
-    std::string cause;      ///< the most likely reason, for the log line and exceptions
-    bool by_configuration;  ///< absent by configuration (logged as WARN), not broken (ERROR)
+    std::string cause;              ///< the most likely reason, for the log line and exceptions
+    bool by_configuration = false;  ///< absent by configuration (WARN), not broken (ERROR)
   };
 
   /// The most likely reason the registry could not build a backend of @p type.
@@ -1101,14 +1101,22 @@ class sirius_scan_manager {
     cucascade::io::io_context_type type,
     cucascade::io::object_store_config const* scoped = nullptr) const;
 
+  /// The outcome of one backend construction: the ioctx, or why there is none.
+  struct ioctx_build {
+    std::shared_ptr<cucascade::io::ioctx> io_ctx;  ///< null when the build failed
+    ioctx_failure failure;                         ///< meaningful only when io_ctx is null
+  };
+
   /// Build an ioctx of @p type, logging @ref explain_ioctx_failure when that
-  /// returns nullptr.  Without @p scoped this is `_ioctx_registry.make_ioctx(type)`;
-  /// with a path-scoped S3 config the default config's object store is replaced
-  /// by @p scoped.  An unconfigured object store is a WARN, since that is the
-  /// normal state of a local-only deployment; anything else is an ERROR.
-  [[nodiscard]] std::shared_ptr<cucascade::io::ioctx> make_ioctx_or_explain(
+  /// returns nullptr and @p explain is set.  Without @p scoped this is
+  /// `_ioctx_registry.make_ioctx(type)`; with a path-scoped S3 config the default
+  /// config's object store is replaced by @p scoped.  An unconfigured object store
+  /// is a WARN, since that is the normal state of a local-only deployment;
+  /// anything else is an ERROR.
+  [[nodiscard]] ioctx_build make_ioctx_or_explain(
     cucascade::io::io_context_type type,
-    cucascade::io::object_store_config const* scoped = nullptr);
+    cucascade::io::object_store_config const* scoped = nullptr,
+    bool explain                                     = true);
 
   /// Give @p io_ctx a prefetching cache when the configuration and the backend
   /// both allow one, and warn when it could not be built.  Returns whether a cache
@@ -1165,12 +1173,13 @@ class sirius_scan_manager {
   };
   std::unordered_map<routed_ioctx_key, std::shared_ptr<cucascade::io::ioctx>, routed_ioctx_key_hash>
     _routed_io_ctxs;
-  /// Backends that failed to build, keyed like `_routed_io_ctxs`, so a path routed
-  /// to one does not re-run its factory (and repeat the explanation) on every
-  /// lookup.  A config snapshot is immutable, so a retry with the same key could
-  /// only fail the same way; installing a new S3 secret yields a new key.
-  /// Guarded by `_routed_io_ctxs_build_mtx`.
-  std::unordered_set<routed_ioctx_key, routed_ioctx_key_hash> _unavailable_io_ctxs;
+  /// Backends that failed to build, keyed like `_routed_io_ctxs`; the value is
+  /// `ioctx_failure::by_configuration`.  A failure the configuration explains is
+  /// final for that key: a config snapshot is immutable, so a retry could only
+  /// fail the same way, and installing a new S3 secret yields a new key.  Any
+  /// other failure is retried on the next lookup and only its explanation is
+  /// suppressed.  Guarded by `_routed_io_ctxs_build_mtx`.
+  std::unordered_map<routed_ioctx_key, bool, routed_ioctx_key_hash> _failed_io_ctxs;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
