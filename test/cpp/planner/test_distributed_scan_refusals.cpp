@@ -144,4 +144,15 @@ TEST_CASE("a distributed plan refuses scans it cannot split", "[planner][distrib
                                 sirius::test::sql_literal(parquet.string()) + ")"),
                Catch::Matchers::ContainsSubstring("read_parquet of one remote URI"));
   }
+
+  SECTION("file_index or filename of a split table")
+  {
+    auto const source = "read_parquet(" + sirius::test::sql_literal(parquet.string()) + ")";
+    auto const sql    = GENERATE(as<std::string>{},
+                              "SELECT file_index, count(*) FROM {} GROUP BY 1",
+                              "SELECT count(*) FROM {} WHERE filename <> ''");
+    CHECK_THAT(
+      lowering_error(con, duckdb::StringUtil::Replace(sql, "{}", source)),
+      Catch::Matchers::ContainsSubstring("filename or file_index of a table split across ranks"));
+  }
 }
