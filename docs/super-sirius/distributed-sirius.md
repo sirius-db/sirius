@@ -6,7 +6,7 @@ between ranks with two operators, `EXCHANGE_SINK` and `EXCHANGE_SOURCE`, over
 [NIXL](https://github.com/ai-dynamo/nixl). Rank 0 returns the query's result.
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 SET enable_duckdb_fallback = false;
 SET sirius_exchange_peers = '10.0.0.1:27000,10.0.0.2:27000,10.0.0.3:27000,10.0.0.4:27000';
 SET sirius_exchange_rank = 2;            -- this process's position in the list
