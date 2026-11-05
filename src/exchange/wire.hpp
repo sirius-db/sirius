@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
@@ -50,6 +51,9 @@ struct batch_header {
   /// Each column's buffers at offsets into the stream.
   std::vector<cucascade::memory::column_metadata> columns;
 };
+
+/// A column of @p type can travel: fixed-width or STRING.
+[[nodiscard]] bool sendable(cudf::data_type type);
 
 [[nodiscard]] std::vector<std::uint8_t> encode_header(batch_header const& header);
 
