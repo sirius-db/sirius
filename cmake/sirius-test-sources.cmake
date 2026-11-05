@@ -56,7 +56,9 @@ set(TEST_SOURCES
     test/cpp/exchange/test_exchange_batch_io.cpp
     test/cpp/exchange/test_exchange_byte_ranges.cpp
     test/cpp/exchange/test_exchange_collectives.cpp
+    test/cpp/exchange/test_exchange_distribute_plan.cpp
     test/cpp/exchange/test_exchange_operators.cpp
+    test/cpp/exchange/test_exchange_plan_reuse.cpp
     test/cpp/exchange/test_exchange_query_windows.cpp
     test/cpp/exchange/test_exchange_transport.cpp
     test/cpp/exchange/test_exchange_wire.cpp
@@ -289,6 +291,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
+    test/cpp/planner/test_distributed_scan_refusals.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp

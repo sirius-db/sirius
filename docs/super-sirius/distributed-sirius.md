@@ -216,7 +216,9 @@ A nested-loop join refuses the types that emit unmatched build rows (`RIGHT`, `O
 `RIGHT_SEMI`, `RIGHT_ANTI`), since every rank holds the whole build.
 
 Refused with `not_implemented_exception`: a delim join whose join keys are not its delim columns,
-`COUNT(DISTINCT)` with grouping sets, `ORDER BY` on an expression, and any other operator.
+`COUNT(DISTINCT)` with grouping sets, `ORDER BY` on an expression, a DuckDB table (#2374), a
+`read_parquet` of one remote URI (#2377), and any other operator. Only Parquet tables read through
+`read_parquet`'s file list are split across ranks.
 Running such an operator on each rank's share would return a wrong answer.
 
 - **Scan shares.** A table's local parquet files are laid end to end and cut into equal byte

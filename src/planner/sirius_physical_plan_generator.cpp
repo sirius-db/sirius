@@ -377,6 +377,11 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
         "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
         "has no URI parameter");
     }
+    // One URI, expanded only when read: nothing splits it, so every rank would read all of it.
+    if (op_params.distributed()) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: read_parquet of one remote URI; every rank would read all of it");
+    }
     info->resolved_file_paths = std::move(resolved_file_paths);
   } else {
     if (resolved_file_paths.empty()) {
@@ -2074,6 +2079,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
   duckdb::ClientContext& context,
   sirius::op::scan::dynamic_filter_apply_mode mode)
 {
+  // Nothing splits a DuckDB table by rank: every rank would scan all of it.
+  if (op_params.distributed()) {
+    throw sirius::not_implemented_exception(
+      "distributed execution: a DuckDB table; read the table from Parquet files instead");
+  }
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
