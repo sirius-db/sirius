@@ -426,15 +426,25 @@ struct rewriter {
 /// Fails the query on every rank unless every rank planned the same shape.
 void require_same_shape(rewriter& r)
 {
-  auto const hash = static_cast<std::int64_t>(std::hash<std::string>{}(r.shape));
-  auto column     = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64}, 1);
-  RMM_CUDA_TRY(cudaMemcpy(
-    column->mutable_view().data<std::int64_t>(), &hash, sizeof(hash), cudaMemcpyHostToDevice));
+  auto const hash   = static_cast<std::int64_t>(std::hash<std::string>{}(r.shape));
+  auto const stream = r.gpu->acquire_stream();
+  auto column       = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                          1,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          r.gpu->get_default_allocator());
+  RMM_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<std::int64_t>(),
+                               &hash,
+                               sizeof(hash),
+                               cudaMemcpyHostToDevice,
+                               stream.get()));
+  // The exchange sends from its own stream.
+  stream.sync();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(column));
   auto mine = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                       *r.gpu,
-                                      cudf::get_default_stream(),
+                                      stream,
                                       telemetry::batch_telemetry_info{});
   // The query's last stream id: the rewrite numbers its exchanges up from 1.
   auto const all = exchange::all_gather(
@@ -442,15 +452,21 @@ void require_same_shape(rewriter& r)
     exchange::make_stream_id(r.query, (std::uint64_t{1} << exchange::query_stream_bits) - 1),
     mine,
     *r.gpu,
-    cudf::get_default_stream());
+    stream.get());
+  std::vector<std::int64_t> theirs(all.size());
+  // Held until the copies finish, so nothing spills the hashes meanwhile.
+  std::vector<decltype(all.front()->to_read_only())> held;
   for (exchange::rank_t rank = 0; rank < all.size(); ++rank) {
-    std::int64_t theirs = 0;
-    auto ro             = all[rank]->to_read_only();
-    RMM_CUDA_TRY(cudaMemcpy(&theirs,
-                            get_cudf_table_view(ro).column(0).data<std::int64_t>(),
-                            sizeof(theirs),
-                            cudaMemcpyDeviceToHost));
-    if (theirs != hash) {
+    auto const& ro = held.emplace_back(all[rank]->to_read_only());
+    RMM_CUDA_TRY(cudaMemcpyAsync(&theirs[rank],
+                                 get_cudf_table_view(ro).column(0).data<std::int64_t>(),
+                                 sizeof(std::int64_t),
+                                 cudaMemcpyDeviceToHost,
+                                 stream.get()));
+  }
+  stream.sync();
+  for (exchange::rank_t rank = 0; rank < all.size(); ++rank) {
+    if (theirs[rank] != hash) {
       throw sirius::invalid_input_exception(
         "distributed execution: rank {} planned this query differently from rank {}",
         rank,
