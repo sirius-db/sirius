@@ -828,7 +828,8 @@ column without NULLs, which can pick the wrong join order and build side. With
 `parquet_footer_statistics` on, the pre-optimizer hook merges the footers' null counts and numeric,
 date and decimal bounds and hands them to DuckDB through the scan's `column_statistics` option.
 DuckDB then also uses them to prove filters always true or always false, as it does for one file.
-Each file's statistics are read once per process and reused while its size, inode and version
+Each file's statistics are read once per process for each set of Parquet reader options (options
+such as `can_have_nan` change the bounds a footer reads as), and reused while its size, inode and version
 tag (an S3 object's ETag) or modification time are unchanged; a modification time less than 10
 seconds old is not trusted, the same rule DuckDB's own file caches use. Checking an S3 file costs
 one request per query, so up to 32 files are checked and read at a time. Scans with
@@ -840,8 +841,8 @@ The footers are read when a query first scans the files, unless they were read a
 `pin_table` reads the footers of the Parquet files it pins, and `sirius_analyze_parquet` reads
 those of any path or glob, including `s3://` globs, returning the number of files read (an error when nothing matches).
 Reading ahead moves the cost, about 0.2 s for the 60 `lineitem` files at SF1000, from the first
-query to table loading. Footers read ahead use DuckDB's default Parquet options; a scan whose
-options give a column another type gets no statistics for that column.
+query to table loading. Footers read ahead use DuckDB's default Parquet options, so only scans
+with those options reuse them; a scan with other options reads the footers again.
 
 ```sql
 SELECT files FROM sirius_analyze_parquet('/data/tpch_sf1000/lineitem/*.parquet');

@@ -1617,8 +1617,17 @@ static void ProfilerStopFunction(ClientContext& context,
 
 struct SiriusAnalyzeParquetData : public TableFunctionData {
   std::string path;
+};
+
+struct SiriusAnalyzeParquetState : public GlobalTableFunctionState {
   bool finished = false;
 };
+
+static unique_ptr<GlobalTableFunctionState> SiriusAnalyzeParquetInit(ClientContext& context,
+                                                                     TableFunctionInitInput& input)
+{
+  return make_uniq<SiriusAnalyzeParquetState>();
+}
 
 static unique_ptr<FunctionData> SiriusAnalyzeParquetBind(ClientContext& context,
                                                          TableFunctionBindInput& input,
@@ -1639,8 +1648,9 @@ static void SiriusAnalyzeParquetFunction(ClientContext& context,
                                          TableFunctionInput& data_p,
                                          DataChunk& output)
 {
-  auto& data = data_p.bind_data->CastNoConst<SiriusAnalyzeParquetData>();
-  if (data.finished) { return; }
+  auto const& data = data_p.bind_data->Cast<SiriusAnalyzeParquetData>();
+  auto& state      = data_p.global_state->Cast<SiriusAnalyzeParquetState>();
+  if (state.finished) { return; }
   std::vector<std::string> paths;
   for (auto const& file : FileSystem::GetFileSystem(context).GlobFiles(data.path)) {
     paths.push_back(file.path);
@@ -1648,7 +1658,7 @@ static void SiriusAnalyzeParquetFunction(ClientContext& context,
   auto const cached = sirius::transparent::read_parquet_footer_statistics(context, paths);
   output.data[0].Append(Value::UBIGINT(cached));
   output.CheckCardinality(1);
-  data.finished = true;
+  state.finished = true;
 }
 
 struct SiriusSetQueryLabelData : public TableFunctionData {
@@ -2450,7 +2460,8 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   TableFunction analyze_parquet("sirius_analyze_parquet",
                                 {LogicalType::VARCHAR},
                                 SiriusAnalyzeParquetFunction,
-                                SiriusAnalyzeParquetBind);
+                                SiriusAnalyzeParquetBind,
+                                SiriusAnalyzeParquetInit);
   CreateTableFunctionInfo analyze_parquet_info(analyze_parquet);
   catalog.CreateTableFunction(transaction, analyze_parquet_info);
 

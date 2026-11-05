@@ -16,6 +16,8 @@
 
 #include "transparent/parquet_footer_statistics.hpp"
 
+#include "op/scan/table_scan/bound_read_view.hpp"
+
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/multi_file/table_function_multi_file.hpp>
@@ -62,18 +64,24 @@ bool unchanged(duckdb::FileMetadata const& cached, duckdb::FileMetadata const& c
                                             current.last_modification_time);
 }
 
+// Keyed by the reader options as well as the path: options such as can_have_nan change the
+// statistics a footer reads as without changing the column's type.
 std::mutex cache_mutex;
 std::unordered_map<std::string, std::shared_ptr<file_statistics const>> cache;
 
 std::shared_ptr<file_statistics const> statistics_of(duckdb::ClientContext& context,
                                                      duckdb::OpenFileInfo const& file,
-                                                     duckdb::ParquetOptions const& options)
+                                                     duckdb::ParquetOptions const& options,
+                                                     std::string const& options_identity)
 {
   auto& fs           = duckdb::FileSystem::GetFileSystem(context);
   auto const current = fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ)->Stats();
+  auto key           = options_identity;
+  key += '\0';
+  key += file.path;
   {
     std::lock_guard guard(cache_mutex);
-    auto found = cache.find(file.path);
+    auto found = cache.find(key);
     if (found != cache.end() && unchanged(found->second->file, current)) { return found->second; }
   }
   auto result  = std::make_shared<file_statistics>();
@@ -84,7 +92,7 @@ std::shared_ptr<file_statistics const> statistics_of(duckdb::ClientContext& cont
     if (stats) { result->columns.emplace_back(column.name, std::move(stats)); }
   }
   std::lock_guard guard(cache_mutex);
-  cache[file.path] = result;
+  cache[key] = result;
   return result;
 }
 
@@ -98,13 +106,14 @@ std::vector<std::shared_ptr<file_statistics const>> statistics_of_all(
   duckdb::ParquetOptions const& options)
 {
   std::vector<std::shared_ptr<file_statistics const>> result(files.size());
+  auto const options_identity = op::scan::parquet_options_identity(options);
   std::atomic<std::size_t> next{0};
   std::exception_ptr failure;
   std::mutex failure_mutex;
   auto work = [&] {
     for (auto i = next.fetch_add(1); i < files.size(); i = next.fetch_add(1)) {
       try {
-        result[i] = statistics_of(context, files[i], options);
+        result[i] = statistics_of(context, files[i], options, options_identity);
       } catch (...) {
         std::lock_guard guard(failure_mutex);
         if (!failure) { failure = std::current_exception(); }

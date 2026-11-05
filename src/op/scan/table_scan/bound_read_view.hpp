@@ -35,6 +35,7 @@ class LogicalGet;
 class LogicalOperator;
 class PhysicalOperator;
 class PhysicalTableScan;
+struct ParquetOptions;
 }  // namespace duckdb
 namespace sirius::op {
 class sirius_physical_table_scan;
@@ -157,6 +158,10 @@ struct logical_bound_read_view_capture {
   uint64_t planning_generation = 0;
   std::vector<logical_bound_read_view> views;
 };
+
+// Canonical text of the Parquet reader options that change what a file reads as, including
+// the encryption configuration. Equal text means equal options.
+std::string parquet_options_identity(duckdb::ParquetOptions const& options);
 
 // Maps original file order to evidence order without retaining another path inventory.
 // An empty result means the paths are already sorted; use the original file position.
