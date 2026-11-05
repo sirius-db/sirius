@@ -15,7 +15,7 @@ SELECT sum(i) FROM range(1000000) t(i);
 
 query IIIIII
 SELECT driver_found, cuda_driver_version, backend, backend_loaded, gpu_execution,
-       fallback_reason LIKE 'Sirius requires an NVIDIA driver supporting CUDA 12 or newer: %'
+       fallback_reason LIKE 'Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: %'
 FROM sirius_status();
 ----
 false	NULL	NULL	false	false	true
@@ -31,12 +31,12 @@ SET gpu_execution = false;
 statement error
 SET gpu_execution = true;
 ----
-Sirius requires an NVIDIA driver supporting CUDA 12 or newer
+Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer
 
 statement error
 SET GLOBAL gpu_execution = true;
 ----
-Sirius requires an NVIDIA driver supporting CUDA 12 or newer
+Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer
 
 # A refused SET leaves the setting off.
 query I
@@ -50,12 +50,12 @@ RESET gpu_execution;
 statement error
 SELECT * FROM gpu_execution('SELECT 42');
 ----
-Sirius requires an NVIDIA driver supporting CUDA 12 or newer
+Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer
 
 statement error
 SELECT * FROM gpu_execution('SELECT 42', enable_optimizer => false);
 ----
-Sirius requires an NVIDIA driver supporting CUDA 12 or newer
+Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer
 
 query I
 SELECT count(*) FROM range(10) t(i) WHERE i % 2 = 0;

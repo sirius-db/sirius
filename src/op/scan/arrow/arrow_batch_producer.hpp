@@ -20,9 +20,11 @@
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <atomic>
+#include <memory>
 #include <variant>
 
 namespace sirius::op::scan {
+struct physical_check_counters;
 // Shared by producers whose retained inputs must not occupy two temporary permits.
 // One coordinator performs claims through a shared gate. Bind wake before execution;
 // do not rebind it while claims or final-owner releases can run.
@@ -96,7 +98,8 @@ class arrow_push_queue final : public arrow_batch_producer {
  public:
   arrow_push_queue(materialization_program,
                    arrow_push_limits,
-                   std::function<void(std::exception_ptr)> report_failure);
+                   std::function<void(std::exception_ptr)> report_failure,
+                   std::shared_ptr<physical_check_counters> counters = {});
   ~arrow_push_queue() override;
   bool offer(offered_arrow_input const&);
   void finish();

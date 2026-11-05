@@ -484,8 +484,10 @@ void preparation_ledger::close() noexcept
 admission_decision prepare_statement_resources(reservation_provider& provider,
                                                std::span<preparation_request> requests,
                                                memory_space_id space,
-                                               uint32_t max_permits)
+                                               uint32_t max_permits,
+                                               bool* rollback_completed)
 {
+  if (rollback_completed) *rollback_completed = false;
   std::vector<scan_envelope> envelopes;
   envelopes.reserve(requests.size());
   for (auto const& request : requests) {
@@ -505,6 +507,7 @@ admission_decision prepare_statement_resources(reservation_provider& provider,
   } catch (...) {
     for (auto it = requests.rbegin(); it != requests.rend(); ++it)
       it->rollback();
+    if (rollback_completed) *rollback_completed = true;
     throw;
   }
   return decision;

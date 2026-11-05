@@ -820,6 +820,35 @@ Evaluators retain their own policy values rather than reading mutable global def
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+| `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of a multi-file Parquet scan. |
+
+DuckDB reads column statistics for a scan of several Parquet files only with `union_by_name`.
+Without them its optimizer estimates every scan filter at a fixed 20%, even an `IS NOT NULL` on a
+column without NULLs, which can pick the wrong join order and build side. With
+`parquet_footer_statistics` on, the pre-optimizer hook merges the footers' null counts and numeric,
+date and decimal bounds and hands them to DuckDB through the scan's `column_statistics` option.
+DuckDB then also uses them to prove filters always true or always false, as it does for one file.
+Each file's statistics are read once per process for each set of Parquet reader options (options
+such as `can_have_nan` change the bounds a footer reads as). They are reused while a local file's
+size, inode and modification time are unchanged, but never while that time is less than 10 seconds
+old (the rule DuckDB's own file caches use), and while an S3 object's size and strong ETag are
+unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
+these, so checking costs no request; footers that must be read are read in parallel on DuckDB's
+worker threads. Scans with
+`union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes the
+`delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
+to 0.50 s).
+
+The footers are read when a query first scans the files, unless they were read ahead:
+`pin_table` reads the footers of the Parquet files it pins, and `sirius_analyze_parquet` reads
+those of any path or glob, including `s3://` globs, returning the number of files read (an error when nothing matches).
+Reading ahead moves the cost, about 0.2 s for the 60 `lineitem` files at SF1000, from the first
+query to table loading. Footers read ahead use DuckDB's default Parquet options, so only scans
+with those options reuse them; a scan with other options reads the footers again.
+
+```sql
+SELECT files FROM sirius_analyze_parquet('/data/tpch_sf1000/lineitem/*.parquet');
+```
 
 The scan-task batch target is derived from effective GPU capacity. Advanced
 benchmark and test envelopes may still override `scan_task_batch_size` in YAML

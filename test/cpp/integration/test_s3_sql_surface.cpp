@@ -1555,6 +1555,52 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
 }
 
+TEST_CASE("transparent S3 footer statistics follow an equal-size overwrite",
+          "[s3][integration][sql][transparent][glob][parquet_footer_statistics]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  // Plain, uncompressed files of equal row counts have equal sizes whatever the values.
+  sirius::test::scratch_dir dir("s3_footer_statistics");
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto write_plain = [&](std::string const& name, int from, int to) {
+    require_query_ok(con,
+                     "COPY (SELECT range AS x FROM range(" + std::to_string(from) + ", " +
+                       std::to_string(to) + ")) TO " + dir.file_literal(name) +
+                       " (FORMAT parquet, COMPRESSION uncompressed)");
+    std::ifstream in(dir.file(name), std::ios::binary);
+    REQUIRE(in.is_open());
+    return std::vector<std::uint8_t>{std::istreambuf_iterator<char>{in},
+                                     std::istreambuf_iterator<char>{}};
+  };
+  auto const low         = write_plain("low.parquet", 0, 100);
+  auto const middle      = write_plain("middle.parquet", 100, 200);
+  auto const replacement = write_plain("replacement.parquet", 1000, 1100);
+  REQUIRE(middle.size() == replacement.size());
+  if (!sirius::test::put_s3_test_object("footer-statistics/a.parquet", low)) {
+    SUCCEED("managed SeaweedFS is required for the footer statistics overwrite test");
+    return;
+  }
+  REQUIRE(sirius::test::put_s3_test_object("footer-statistics/b.parquet", middle));
+
+  auto const glob = s3_uri(env->bucket, "footer-statistics/*.parquet");
+  auto analyzed   = require_query_ok(
+    fixture.con, "SELECT files FROM sirius_analyze_parquet(" + sql_quote(glob) + ")");
+  REQUIRE(collect_rows(*analyzed) == std::vector<std::vector<std::string>>{{"2"}});
+
+  auto const query = "SELECT count(*) FROM read_parquet(" + sql_quote(glob) + ") WHERE x >= 1000";
+  REQUIRE(collect_rows(*require_query_ok(fixture.con, query)) ==
+          std::vector<std::vector<std::string>>{{"0"}});
+  REQUIRE(sirius::test::put_s3_test_object("footer-statistics/b.parquet", replacement));
+  CHECK(collect_rows(*require_query_ok(fixture.con, query)) ==
+        std::vector<std::vector<std::string>>{{"100"}});
+}
+
 TEST_CASE("transparent S3 glob refuses semantic type drift before decoding",
           "[s3][integration][sql][transparent][glob]")
 {

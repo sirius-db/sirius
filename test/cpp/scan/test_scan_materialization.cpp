@@ -957,8 +957,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Adapter mapping hook runs without an Iceberg physical schema",
-                 "[materialization][scan][mapping][adapter][integration]")
+                 "[materialization][scan][mapping][adapter][integration][fw_s4]")
 {
+  auto defect = std::string{GENERATE(
+    "valid", "foreign_contract", "foreign_metadata", "missing_datasource", "foreign_identity")};
+  CAPTURE(defect);
   sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
   auto written =
@@ -996,11 +999,48 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   for (auto& split : coalescer->flush())
     splits.push_back(std::move(split));
   REQUIRE(splits.size() == 1);
+  auto& split = dynamic_cast<parquet_split_info&>(*splits.front());
+  REQUIRE(split.field_mapping);
+  REQUIRE(split.rg_slices.size() == 1);
   auto context = sirius::test::get_registered_sirius_context(*con);
-  auto* space  = context->get_memory_manager().get_memory_space(
+  if (defect == "foreign_contract") {
+    auto program = split.field_mapping->program();
+    ++program.contract;
+    split.field_mapping = std::make_shared<field_id_mapping const>(field_id_mapping::compile(
+      split.field_mapping->metadata(),
+      split.field_mapping->identity(),
+      std::move(program),
+      std::vector<field_requirement>{{1, duckdb::LogicalType::BIGINT, {}, true}}));
+  } else if (defect == "foreign_metadata") {
+    split.rg_slices.front().file_metadata.reset();
+  } else if (defect == "missing_datasource") {
+    split.rg_slices.front().datasource.reset();
+  } else if (defect == "foreign_identity") {
+    auto other_path = directory.file("other.parquet");
+    std::filesystem::copy_file(path, other_path);
+    auto& slice      = split.rg_slices.front();
+    slice.datasource = context->get_scan_manager().create_datasource(other_path);
+    REQUIRE(slice.file_metadata == split.field_mapping->metadata()->file_metadata());
+    REQUIRE(slice.datasource->get_io_object().identity_cache_key() !=
+            split.field_mapping->identity());
+  }
+  auto* space = context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
   REQUIRE(space);
   rmm::cuda_stream stream;
+  if (defect != "valid") {
+    try {
+      ingestible->materialize_metadata_to_table(split, *space, stream, false, nullptr);
+      FAIL("expected mapped-split certificate refusal");
+    } catch (sirius::transparent::classified_execution_error const& error) {
+      CHECK(error.cause == sirius::transparent::late_failure_cause::certificate);
+      CHECK(error.reason.empty());
+      CHECK(std::string(error.what()) == (defect == "foreign_contract"
+                                            ? "mapped split belongs to another scan"
+                                            : "mapped split does not match its approved file"));
+    }
+    return;
+  }
   auto batch =
     ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
   REQUIRE(batch.execution);
@@ -1563,7 +1603,7 @@ TEST_CASE("Default field mapping preserves row-count carrier eligibility",
 }
 
 TEST_CASE("Bound Arrow validators reject stale or foreign evidence",
-          "[materialization][scan][split_validator]")
+          "[materialization][scan][split_validator][fw_s4]")
 {
   int releases  = 0;
   auto fixture  = std::make_shared<arrow_fixture>(releases);
@@ -1592,8 +1632,14 @@ TEST_CASE("Bound Arrow validators reject stale or foreign evidence",
                   certificate_incomplete);
   program.input_types = std::vector{cudf::data_type{cudf::type_id::INT64}};
   auto wrong_schema   = owned_arrow_split_validator(program);
-  CHECK_THROWS_AS(validate_split_for_gpu(91, required, {}, split, *wrong_schema, 7, profiles),
-                  certificate_incomplete);
+  try {
+    validate_split_for_gpu(91, required, {}, split, *wrong_schema, 7, profiles);
+    FAIL("expected Arrow schema-drift refusal");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::physical_input);
+    CHECK(error.reason == sirius::transparent::kArrowSchemaDrift);
+    CHECK(std::string(error.what()) == "Arrow schema does not match its bound program");
+  }
   CHECK_THROWS_AS(validate_split_for_gpu(
                     91, check_bit(later_check::key_held), {}, split, *validator, 7, profiles),
                   certificate_incomplete);

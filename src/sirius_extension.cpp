@@ -73,6 +73,7 @@ extern "C" int cudaProfilerStop();
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/unsupported_optimizers.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
@@ -116,6 +117,8 @@ extern "C" int cudaProfilerStop();
 // pin pipeline always routes through ioctx when one is available.
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
+
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <cmath>
@@ -960,6 +963,27 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 
 }  // namespace
 
+static bool parquet_footer_statistics_enabled(ClientContext& context)
+{
+  Value setting;
+  return context.TryGetCurrentSetting("parquet_footer_statistics", setting) && !setting.IsNull() &&
+         setting.GetValue<bool>();
+}
+
+// Statistics are an optimization: a footer that cannot be read leaves its scans as they were,
+// and the scan itself reports the file's error.
+static std::size_t warm_parquet_footer_statistics(ClientContext& context,
+                                                  std::vector<std::string> const& paths)
+{
+  if (!parquet_footer_statistics_enabled(context)) { return 0; }
+  try {
+    return sirius::transparent::read_parquet_footer_statistics(context, paths);
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("No footer statistics read ahead: {}", e.what());
+    return 0;
+  }
+}
+
 unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context,
                                                           TableFunctionBindInput& input,
                                                           vector<LogicalType>& return_types,
@@ -1198,6 +1222,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
         return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
       });
+      warm_parquet_footer_statistics(context, file_paths);
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -1588,6 +1613,52 @@ static void ProfilerStopFunction(ClientContext& context,
   output.data[0].Append(Value::BOOLEAN(true));
   output.CheckCardinality(1);
   data.finished = true;
+}
+
+struct SiriusAnalyzeParquetData : public TableFunctionData {
+  std::string path;
+};
+
+struct SiriusAnalyzeParquetState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> SiriusAnalyzeParquetInit(ClientContext& context,
+                                                                     TableFunctionInitInput& input)
+{
+  return make_uniq<SiriusAnalyzeParquetState>();
+}
+
+static unique_ptr<FunctionData> SiriusAnalyzeParquetBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<Identifier>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_analyze_parquet requires a non-NULL path or glob");
+  }
+  auto result  = make_uniq<SiriusAnalyzeParquetData>();
+  result->path = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::UBIGINT);
+  names.push_back("files");
+  return std::move(result);
+}
+
+static void SiriusAnalyzeParquetFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output)
+{
+  auto const& data = data_p.bind_data->Cast<SiriusAnalyzeParquetData>();
+  auto& state      = data_p.global_state->Cast<SiriusAnalyzeParquetState>();
+  if (state.finished) { return; }
+  std::vector<std::string> paths;
+  for (auto const& file : FileSystem::GetFileSystem(context).GlobFiles(data.path)) {
+    paths.push_back(file.path);
+  }
+  auto const cached = sirius::transparent::read_parquet_footer_statistics(context, paths);
+  output.data[0].Append(Value::UBIGINT(cached));
+  output.CheckCardinality(1);
+  state.finished = true;
 }
 
 struct SiriusSetQueryLabelData : public TableFunctionData {
@@ -2385,6 +2456,14 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   auto sirius_read_parquet = GetSiriusReadParquetFunction();
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
+
+  TableFunction analyze_parquet("sirius_analyze_parquet",
+                                {LogicalType::VARCHAR},
+                                SiriusAnalyzeParquetFunction,
+                                SiriusAnalyzeParquetBind,
+                                SiriusAnalyzeParquetInit);
+  CreateTableFunctionInfo analyze_parquet_info(analyze_parquet);
+  catalog.CreateTableFunction(transaction, analyze_parquet_info);
 
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},
@@ -3387,6 +3466,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::BOOLEAN(true),
     SetEnableLikeSwarFastpath);
 
+  config.AddExtensionOption(
+    "parquet_footer_statistics",
+    "Whether a scan of several Parquet files gives DuckDB's optimizer the merged statistics of "
+    "all their footers, which DuckDB itself reads only with union_by_name",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(true));
+
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
                             "Maximum bytes per sort partition (0 = auto based on "
@@ -3687,6 +3773,27 @@ static void default_to_explicit_delim_joins(DBConfig& config)
   Settings::Set<DelimJoinAsCteSetting>(config, SetScope::GLOBAL, Value::BOOLEAN(false));
 }
 
+// CUDA 12.8+ builds call cudaMemcpyBatchAsync, which older drivers lack. Keep this guard in sync
+// with the `CUDART_VERSION >= 12080` batch-copy paths (device_transfer.cpp,
+// duckdb_native_decoder.cpp, spill_chunked_converters.cpp). The sirius loader checks this too,
+// but a backend loaded directly bypasses it.
+static void check_cuda_driver_version()
+{
+#if CUDART_VERSION >= 12080 && CUDART_VERSION < 13000
+  int version = 0;
+  if (cudaDriverGetVersion(&version) != cudaSuccess || version == 0) {
+    throw InvalidInputException(
+      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: no driver found");
+  }
+  if (version < 12080) {
+    throw InvalidInputException(
+      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: reported CUDA version %d.%d",
+      version / 1000,
+      (version % 1000) / 10);
+  }
+#endif
+}
+
 static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
@@ -3701,6 +3808,7 @@ static void LoadInternal(ExtensionLoader& loader)
   bool const sirius_disabled = callback_ptr->is_disabled();
 
   if (!sirius_disabled) {
+    check_cuda_driver_version();
     // Config parsing above must remain NVTX-free. initialize_context creates Quent
     // before resolving hardware or constructing any instrumented runtime objects.
     callback_ptr->initialize_context();
