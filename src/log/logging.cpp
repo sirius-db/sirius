@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "log/cucascade_sink.hpp"
 #include "log/noop_sink.hpp"
 #include "log/sink.hpp"
 
@@ -47,6 +48,22 @@ void set_sink(std::shared_ptr<sink> sink)
   if (auto old_sink = state().active.exchange(std::move(new_sink), std::memory_order_acq_rel)) {
     old_sink->flush();
   }
+  // cuCascade's records reach the new sink through the bridge, which looks the
+  // sink up on every record; this only installs the bridge the first time.
+  attach_cucascade_logging();
+}
+
+void set_sink(std::shared_ptr<sink> sink, level lvl)
+{
+  if (sink) { sink->set_level(lvl); }
+  set_sink(std::move(sink));
+  set_cucascade_log_level(lvl);
+}
+
+void set_level(level lvl)
+{
+  get_sink()->set_level(lvl);
+  set_cucascade_log_level(lvl);
 }
 
 std::shared_ptr<sink> get_sink()

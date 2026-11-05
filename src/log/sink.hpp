@@ -61,7 +61,22 @@ class sink {
 ///
 /// If `sink` holds a nullptr, this installs a new instance of the no-op sink
 /// instead, such that get_sink() never returns a nullptr.
+///
+/// cuCascade's log records are forwarded to whichever sink is installed, at
+/// cuCascade's own level threshold; use the overload taking a level to keep the
+/// two in step.
 void set_sink(std::shared_ptr<sink> sink);
+
+/// Sets `sink`'s level to `lvl`, installs it as by set_sink(sink), and mirrors
+/// `lvl` into cuCascade's level threshold, so cuCascade formats only the
+/// records `sink` would keep.
+void set_sink(std::shared_ptr<sink> sink, level lvl);
+
+/// Sets the installed sink's level to `lvl` and mirrors it into cuCascade's
+/// level threshold.
+///
+/// Thread safe.
+void set_level(level lvl);
 
 /// Returns the currently installed sink.
 ///

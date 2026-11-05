@@ -808,6 +808,10 @@ requires startup configuration.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
 
+Messages from the embedded cuCascade library (memory tiers, spilling, I/O) go to the same sink
+and are gated by the same `sirius_log_level`. With the `duckdb` backend, cuCascade messages are
+still gated by `sirius_log_level` first, then by DuckDB's own level.
+
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
