@@ -18,8 +18,10 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <unordered_map>
 
@@ -76,6 +78,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
     if (op.children[0]->HasSideEffects()) {
       throw duckdb::NotImplementedException("Side-effecting materialized CTE not supported");
     }
+    // DuckDB still plans the definition's scans; read-view validation must account for them.
+    read_views->record_skipped_scans(
+      sirius::op::scan::capture_bound_read_views(*op.children[0], context));
     return create_plan(*op.children[1]);
   }
 

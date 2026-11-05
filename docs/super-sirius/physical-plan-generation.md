@@ -224,7 +224,7 @@ for (auto& scan : cte_scans) {
 children[1]->build_pipelines(current, meta_pipeline);  // Reference side
 ```
 
-The materialization pipeline's only outgoing edges are its CTE scans, and the active task creator reaches every pipeline other than the first-scheduled source by following edges. So `create_plan(LogicalMaterializedCTE&)` plans only the reference side when no `LOGICAL_CTE_REF` reads the CTE (DuckDB's statistics propagation can fold every reference into an empty result after unused-CTE removal has run).
+The materialization pipeline's only outgoing edges are its CTE scans, and the active task creator reaches every pipeline other than the first-scheduled source by following edges. So `create_plan(LogicalMaterializedCTE&)` plans only the reference side when no `LOGICAL_CTE_REF` reads the CTE (DuckDB's statistics propagation can fold every reference into an empty result after unused-CTE removal has run). DuckDB's own plan still scans the skipped definition, so the planner records those scans in the read-view registry and transparent validation matches them against DuckDB's scans like planned ones.
 
 ### Pipeline Finalization
 

@@ -55,6 +55,28 @@ TEST_CASE_METHOD(CteFixture,
     "SELECT c1, count(*) FROM c GROUP BY c1");
 }
 
+// The consumer folds to an empty result but DuckDB keeps the definition's scan, which the GPU
+// plan drops. Read-view validation must accept that scan rather than reject the GPU plan.
+TEST_CASE_METHOD(CteFixture,
+                 "gpu_execution materialized CTE whose skipped definition scans a table",
+                 "[integration][gpu_execution][cte]")
+{
+  compare_gpu_vs_cpu(
+    "WITH c AS MATERIALIZED (SELECT k FROM ct) "
+    "SELECT min(k) AS m FROM c HAVING min(k) > 100");
+
+  // The outer CTE's scan is reachable only through the unread inner CTE.
+  compare_gpu_vs_cpu(
+    "WITH o AS MATERIALIZED (SELECT k FROM ct), c AS MATERIALIZED (SELECT k FROM o) "
+    "SELECT min(k) AS m FROM c HAVING min(k) > 100");
+
+  // A planned scan of the same table still corresponds to its own original.
+  compare_gpu_vs_cpu(
+    "WITH c AS MATERIALIZED (SELECT k FROM ct) "
+    "SELECT min(k) AS m FROM c HAVING min(k) > 100 "
+    "UNION ALL SELECT max(g) FROM ct");
+}
+
 // An unreferenced modifying CTE must still execute. If Sirius cannot plan its write, the
 // statement must fall back to DuckDB rather than silently discarding the CTE definition.
 TEST_CASE_METHOD(CteFixture,
