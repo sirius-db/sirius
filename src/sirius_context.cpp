@@ -1349,7 +1349,14 @@ void SiriusContext::abort_distributed_query(sirius::query_id_t window,
     }
     SIRIUS_LOG_WARN("Distributed query {} failed; aborting it on every rank: {}", query, what);
     service->abort(query, what);
-  } catch (...) {  // best effort: the peers' own timeouts remain
+  } catch (std::exception const& e) {  // best effort: the peers' own timeouts remain
+    try {
+      SIRIUS_LOG_WARN("Aborting distributed window {} on the other ranks failed: {}",
+                      sirius::value_of(window),
+                      e.what());
+    } catch (...) {
+    }
+  } catch (...) {
   }
 }
 
