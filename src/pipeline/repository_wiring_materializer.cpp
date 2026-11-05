@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -73,6 +74,9 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
                       std::make_unique<op::sirius_physical_operator::port>(
                         wiring.barrier_type, repo, wiring.source_pipeline, dest_pipeline));
     wiring.source_op->add_next_port_after_sink({next_op, wiring.port_id});
+    if (next_op->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
+      next_op->Cast<op::sirius_physical_sort_sample>().register_boundaries(data_repo_manager);
+    }
   }
 }
 

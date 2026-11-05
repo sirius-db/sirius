@@ -35,7 +35,7 @@ uint64_t get_batch_bytes(const std::shared_ptr<::cucascade::data_batch>& batch)
   if (!batch) { return 0; }
   auto ro = batch->to_read_only();
   if (!ro.get_data()) { return 0; }
-  return ro.get_data()->get_size_in_bytes();
+  return ro.get_data()->get_uncompressed_data_size_in_bytes();
 }
 
 bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
@@ -95,6 +95,22 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
 {
 }
 
+void sirius_physical_sort_sample::register_boundaries(
+  cucascade::shared_data_repository_manager& manager)
+{
+  manager.add_new_repository(
+    get_operator_id(), "sort_boundaries", std::make_unique<cucascade::shared_data_repository>());
+  _boundary_repo = manager.get_repository(get_operator_id(), "sort_boundaries").get();
+}
+
+void sirius_physical_sort_sample::clear_partition_boundaries()
+{
+  if (_boundary_repo && _partition_boundaries) {
+    _boundary_repo->pop_data_batch_by_id(_partition_boundaries->get_batch_id(), 0);
+  }
+  _partition_boundaries.reset();
+}
+
 std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
 {
   const auto state = _boundary_state.load(std::memory_order_acquire);
@@ -130,7 +146,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
   const auto state = _boundary_state.load(std::memory_order_acquire);
 
   // After boundaries are computed, process one batch at a time (passthrough mode).
-  if (state == BoundaryState::DONE) { return sirius_physical_operator::get_next_task_input_data(); }
+  if (state == BoundaryState::DONE) {
+    auto input = sirius_physical_operator::get_next_task_input_data();
+    if (!input) { return input; }
+    auto batches = dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches();
+    // The boundary batch is an ordinary admitted input: preparation restores or clones it
+    // onto the task device, and the read lock protects it through partition execution.
+    if (_partition_boundaries) { batches.push_back(_partition_boundaries); }
+    return std::make_unique<sort_sample_input>(std::move(batches));
+  }
 
   // Boundary input already claimed by the in-flight boundary task.
   if (state == BoundaryState::SCHEDULED) { return nullptr; }
@@ -167,9 +191,13 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   const auto& input_batches = input.get_read_only_batches();
 
   // Fast path: boundaries already computed — just pass through.
-  if (_boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE) {
+  if (dynamic_cast<const sort_sample_input*>(&input_data)) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    auto batches = input.get_data_batches();
+    if (!_partition_boundaries) { return std::make_unique<sort_sample_output>(std::move(batches)); }
+    auto boundary = input_batches.back();
+    batches.pop_back();
+    return std::make_unique<sort_sample_output>(std::move(batches), std::move(boundary));
   }
 
   // do boundary computation
@@ -190,6 +218,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
+
+  std::shared_ptr<cucascade::data_batch> output_boundaries;
 
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory), leave the state
   // at SCHEDULED and rethrow. The rescheduled task carries the same input and re-enters here to
@@ -277,11 +307,18 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         num_parts);
     }
 
+    // Retrying the boundary-producing task must preserve ranges already used by other tasks.
+    if (_boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE) {
+      num_parts = _num_partitions;
+    }
+
     // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)
     if (num_parts <= 1 || total_rows == 0) {
       // Single partition — no boundaries needed
-      _num_partitions = 1;
-      _partition_boundaries.reset();
+      if (_boundary_state.load(std::memory_order_acquire) != BoundaryState::DONE) {
+        _num_partitions = 1;
+        _partition_boundaries.reset();
+      }
     } else {
       // Compute boundary row indices: [total_rows/P, 2*total_rows/P, ..., (P-1)*total_rows/P]
       size_t num_boundaries = num_parts - 1;
@@ -304,21 +341,23 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                     num_boundaries * sizeof(int32_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
+      // Copy from pageable memory must complete before return. But let's not queue up
+      // too much work before syncing.
+      stream.sync();
 
-      // Extract only the sort key columns from merged sample for the boundaries
-      std::vector<cudf::column_view> sort_key_cols;
-      for (int idx : order_key_idx) {
-        sort_key_cols.push_back(merged_sample_view.column(idx));
+      auto sort_keys_view = merged_sample_view.select(order_key_idx.begin(), order_key_idx.end());
+      auto boundary_table = cudf::gather(sort_keys_view,
+                                         indices_col->view(),
+                                         cudf::out_of_bounds_policy::DONT_CHECK,
+                                         stream,
+                                         space->get_default_allocator());
+      output_boundaries =
+        make_data_batch(std::move(boundary_table), *space, stream, batch_telemetry());
+      if (_boundary_state.load(std::memory_order_acquire) != BoundaryState::DONE) {
+        _partition_boundaries = output_boundaries;
+        if (_boundary_repo) { _boundary_repo->add_data_batch(_partition_boundaries, 0); }
+        _num_partitions = num_parts;
       }
-      cudf::table_view sort_keys_view(sort_key_cols);
-
-      // Gather boundary rows
-      _partition_boundaries = cudf::gather(sort_keys_view,
-                                           indices_col->view(),
-                                           cudf::out_of_bounds_policy::DONT_CHECK,
-                                           stream,
-                                           space->get_default_allocator());
-      _num_partitions       = num_parts;
     }
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this
@@ -335,10 +374,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   SIRIUS_LOG_DEBUG("Sort sample: computed {} partitions with {} boundaries in {:.2f} ms",
                    _num_partitions,
-                   _partition_boundaries ? _partition_boundaries->num_rows() : 0,
+                   _num_partitions - 1,
                    duration.count() / 1000.0);
 
-  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+  return std::make_unique<sort_sample_output>(
+    input.get_data_batches(),
+    output_boundaries
+      ? std::optional<cucascade::read_only_data_batch>(output_boundaries->to_read_only())
+      : std::nullopt);
 }
 
 }  // namespace op
