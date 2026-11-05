@@ -473,7 +473,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const dynamic_filter_enabled =
     sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter;
 
-  bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
+  bool const build_filtered =
+    dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1], &context);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
   bool const build_evidence = build_filtered || build_opaque;
 

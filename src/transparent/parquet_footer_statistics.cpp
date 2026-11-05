@@ -47,6 +47,7 @@ namespace sirius::transparent {
 namespace {
 
 struct file_statistics {
+  std::size_t rows{0};
   std::vector<std::pair<duckdb::Identifier, duckdb::unique_ptr<duckdb::BaseStatistics>>> columns;
 };
 
@@ -110,6 +111,11 @@ struct cache_entry {
 std::mutex cache_mutex;
 std::unordered_map<std::string, cache_entry> cache;
 
+// The latest row count read from each file's footer, keyed by path alone since it does not depend
+// on the reader options. Not revalidated: a copied plan's file list has lost the listing's
+// versions, and the counts only steer cost decisions, never results. Guarded by cache_mutex.
+std::unordered_map<std::string, std::size_t> row_counts;
+
 std::string cache_key(std::string const& options_identity, std::string const& path)
 {
   auto key = options_identity;
@@ -145,16 +151,16 @@ std::shared_ptr<file_statistics const> statistics_of(
   }
   auto result = std::make_shared<file_statistics>();
   duckdb::ParquetReader reader(context, file, options);
+  result->rows = reader.NumRows();
   for (auto const& column : reader.columns) {
     auto stats = reader.GetStatistics(context, column.name);
     if (stats) { result->columns.emplace_back(column.name, std::move(stats)); }
   }
   // The version describes the file as listed or opened before this read, so a rewrite between the
   // two leaves an entry that the next sighting of the new version misses.
-  if (version) {
-    std::lock_guard guard(cache_mutex);
-    cache[key] = {std::move(*version), result};
-  }
+  std::lock_guard guard(cache_mutex);
+  row_counts[file.path] = result->rows;
+  if (version) { cache[key] = {std::move(*version), result}; }
   return result;
 }
 
@@ -320,6 +326,28 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
   std::size_t added = 0;
   visit(context, plan, added);
   return added;
+}
+
+std::optional<std::size_t> cached_parquet_row_count(duckdb::LogicalGet const& get)
+{
+  auto const& name = get.function.GetName().GetIdentifierName();
+  if (name != "read_parquet" && name != "parquet_scan") { return std::nullopt; }
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (!bind || !bind->file_list) { return std::nullopt; }
+  try {
+    auto const files = bind->file_list->GetAllFiles();
+    if (files.empty()) { return std::nullopt; }
+    std::size_t rows = 0;
+    std::lock_guard guard(cache_mutex);
+    for (auto const& file : files) {
+      auto const found = row_counts.find(file.path);
+      if (found == row_counts.end()) { return std::nullopt; }
+      rows += found->second;
+    }
+    return rows;
+  } catch (...) {
+    return std::nullopt;
+  }
 }
 
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,

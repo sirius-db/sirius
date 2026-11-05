@@ -18,8 +18,10 @@
 
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/logical_operator.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -51,5 +53,13 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
 /// \return The number of files whose statistics are cached.
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
                                            std::vector<std::string> const& paths);
+
+/// \brief The number of rows in all files of the Parquet scan \p get, from the footers last read,
+/// or nothing when any of its files has not been read. Does no I/O, so a file rewritten since its
+/// footer was read reports its old count; use it for cost decisions only.
+///
+/// DuckDB's cardinality estimate for such a scan needs the bind's initial file reader, which a
+/// copied plan no longer has.
+std::optional<std::size_t> cached_parquet_row_count(duckdb::LogicalGet const& get);
 
 }  // namespace sirius::transparent

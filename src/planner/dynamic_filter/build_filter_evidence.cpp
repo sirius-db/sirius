@@ -18,6 +18,10 @@
 
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
+
+#include <cstddef>
+#include <optional>
 
 namespace sirius::planner {
 namespace {
@@ -42,20 +46,50 @@ bool is_plain_deduplication(duckdb::LogicalAggregate const& aggregate)
   return true;
 }
 
+/// Share of the table's rows above which a GET filter is not filter evidence.
+constexpr double k_negligible_filter_keep_ratio = 0.99;
+
+std::optional<std::size_t> table_rows(duckdb::LogicalGet const& get, duckdb::ClientContext& context)
+{
+  if (get.function.cardinality && get.bind_data) {
+    auto const table = get.function.cardinality(context, get.bind_data.get());
+    if (table && table->has_estimated_cardinality) { return table->estimated_cardinality; }
+  }
+  return sirius::transparent::cached_parquet_row_count(get);
+}
+
+bool keeps_nearly_all_rows(duckdb::LogicalGet const& get, duckdb::ClientContext& context)
+{
+  if (!get.has_estimated_cardinality) { return false; }
+  try {
+    auto const rows = table_rows(get, context);
+    if (!rows || *rows == 0) { return false; }
+    return static_cast<double>(get.estimated_cardinality) >=
+           k_negligible_filter_keep_ratio * static_cast<double>(*rows);
+  } catch (...) {
+    // Optional evidence must not fail query planning.
+    return false;
+  }
+}
+
 }  // namespace
 
-bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
+bool build_subtree_is_filtering(duckdb::LogicalOperator const& op, duckdb::ClientContext* context)
 {
   switch (op.type) {
-    case duckdb::LogicalOperatorType::LOGICAL_GET:
-      return op.Cast<duckdb::LogicalGet>().table_filters.HasFilters() ||
-             op.Cast<duckdb::LogicalGet>().table_filters.HasMultiColumnFilters();
+    case duckdb::LogicalOperatorType::LOGICAL_GET: {
+      auto const& get = op.Cast<duckdb::LogicalGet>();
+      if (!get.table_filters.HasFilters() && !get.table_filters.HasMultiColumnFilters()) {
+        return false;
+      }
+      return context == nullptr || !keeps_nearly_all_rows(get, *context);
+    }
     case duckdb::LogicalOperatorType::LOGICAL_FILTER:
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N: return true;
     default: break;
   }
   for (auto const& child : op.children) {
-    if (child && build_subtree_is_filtering(*child)) { return true; }
+    if (child && build_subtree_is_filtering(*child, context)) { return true; }
   }
   return false;
 }

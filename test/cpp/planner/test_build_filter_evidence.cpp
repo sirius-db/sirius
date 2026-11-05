@@ -22,6 +22,7 @@
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 
 #include <catch.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/function/aggregate/distributive_functions.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
@@ -168,6 +169,27 @@ TEST_CASE("a GET with a table filter carries evidence", "[dynamic_filter][eviden
 {
   auto const get = make_filtered_get();
   REQUIRE(build_subtree_is_filtering(*get));
+}
+
+TEST_CASE("a GET filter that keeps nearly every row carries no evidence",
+          "[dynamic_filter][evidence]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto get = make_filtered_get();
+  duckdb::TableFunction function;
+  function.cardinality = [](duckdb::ClientContext&, duckdb::FunctionData const*) {
+    return duckdb::make_uniq<duckdb::NodeStatistics>(1000);
+  };
+  get->function  = duckdb::BoundTableFunction(function);
+  get->bind_data = duckdb::make_uniq<duckdb::TableFunctionData>();
+  get->SetEstimatedCardinality(995);
+
+  REQUIRE_FALSE(build_subtree_is_filtering(*get, con.context.get()));
+  REQUIRE(build_subtree_is_filtering(*get));
+
+  get->SetEstimatedCardinality(500);
+  REQUIRE(build_subtree_is_filtering(*get, con.context.get()));
 }
 
 TEST_CASE("a bare FILTER carries evidence", "[dynamic_filter][evidence]")

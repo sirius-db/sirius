@@ -17,6 +17,7 @@
 #pragma once
 
 namespace duckdb {
+class ClientContext;
 class LogicalOperator;
 }  // namespace duckdb
 
@@ -24,8 +25,13 @@ namespace sirius::planner {
 
 /**
  * @brief Mirrors DuckDB's join-filter test for GET filters, FILTER, TOP_N, or a containing subtree
+ *
+ * With @p context, GET filters that DuckDB estimates keep nearly all of the table's rows do not
+ * count. Such filters are typically ranges DuckDB derives from the other join side's statistics
+ * (`c_custkey <= 149999999` in TPC-H q18), and a dynamic filter built from them rejects nothing.
  */
-[[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
+[[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op,
+                                              duckdb::ClientContext* context = nullptr);
 
 /**
  * @brief Tests for a DELIM_GET or CTE_REF behind projections or ordinary deduplication.
