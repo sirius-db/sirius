@@ -20,6 +20,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/unary.hpp>
 
@@ -39,9 +40,6 @@ void validate(cudf::table_view input,
               std::vector<ranking_function> const& functions)
 {
   if (functions.empty()) { throw std::invalid_argument("Ranking window has no functions"); }
-  if (partition_columns.empty()) {
-    throw std::invalid_argument("Ranking window needs at least one partition column");
-  }
   if (order.columns.empty()) {
     throw std::invalid_argument("Ranking window needs at least one order key");
   }
@@ -122,6 +120,15 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
     return std::make_unique<cudf::table>(std::move(empty));
   }
 
+  // Without PARTITION BY the whole input is one partition, and a constant column is its key. A
+  // constant column is already in sorted order, so it takes no part in the sort or the gather.
+  std::unique_ptr<cudf::column> unpartitioned;
+  if (partition_columns.empty()) {
+    cudf::numeric_scalar<int8_t> const zero(0, true, stream, mr);
+    unpartitioned = cudf::make_column_from_scalar(zero, input.num_rows(), stream, mr);
+  }
+  std::size_t const partition_count = partition_columns.size();
+
   // The partition columns followed by the order keys, sorted together.
   std::vector<cudf::column_view> key_views;
   for (auto const column : partition_columns) {
@@ -132,13 +139,15 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   }
   cudf::table_view const keys(key_views);
   // Equal partition values only need to be next to each other, so any column order, direction and
-  // NULL placement will do for them.
-  std::vector<cudf::order> const partition_directions(partition_columns.size(),
-                                                      cudf::order::ASCENDING);
-  std::vector<cudf::null_order> const partition_nulls(partition_columns.size(),
-                                                      cudf::null_order::BEFORE);
-  auto directions = partition_directions;
-  auto nulls      = partition_nulls;
+  // NULL placement will do for them. There is one entry for each partition key, and the constant
+  // key of a window without PARTITION BY counts as one.
+  std::size_t const key_count = std::max<std::size_t>(partition_count, 1);
+  std::vector<cudf::order> const partition_directions(key_count, cudf::order::ASCENDING);
+  std::vector<cudf::null_order> const partition_nulls(key_count, cudf::null_order::BEFORE);
+  std::vector<cudf::order> directions(partition_directions.begin(),
+                                      partition_directions.begin() + partition_count);
+  std::vector<cudf::null_order> nulls(partition_nulls.begin(),
+                                      partition_nulls.begin() + partition_count);
   directions.insert(directions.end(), order.directions.begin(), order.directions.end());
   nulls.insert(nulls.end(), order.nulls.begin(), order.nulls.end());
   auto row_order = cudf::stable_sorted_order(keys, directions, nulls, stream, mr);
@@ -147,17 +156,24 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   bool const needs_order = std::any_of(functions.begin(), functions.end(), [](auto function) {
     return function != ranking_function::row_number;
   });
-  cudf::table_view const gathered_keys(
-    needs_order ? key_views
-                : std::vector<cudf::column_view>(key_views.begin(),
-                                                 key_views.begin() + partition_columns.size()));
-  auto sorted = cudf::gather(
-    gathered_keys, row_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  std::size_t const gathered_count = needs_order ? key_views.size() : partition_count;
+  std::unique_ptr<cudf::table> sorted;
+  if (gathered_count > 0) {
+    cudf::table_view const gathered_keys(std::vector<cudf::column_view>(
+      key_views.begin(), key_views.begin() + static_cast<std::ptrdiff_t>(gathered_count)));
+    sorted = cudf::gather(
+      gathered_keys, row_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  }
 
   // The partition columns come first in the sorted table, in the order of `partition_columns`.
-  std::vector<cudf::size_type> sorted_partition_indices(partition_columns.size());
-  std::iota(sorted_partition_indices.begin(), sorted_partition_indices.end(), 0);
-  auto const partition_view = sorted->view().select(sorted_partition_indices);
+  cudf::table_view partition_view;
+  if (unpartitioned) {
+    partition_view = cudf::table_view(std::vector<cudf::column_view>{unpartitioned->view()});
+  } else {
+    std::vector<cudf::size_type> sorted_partition_indices(partition_count);
+    std::iota(sorted_partition_indices.begin(), sorted_partition_indices.end(), 0);
+    partition_view = sorted->view().select(sorted_partition_indices);
+  }
   cudf::groupby::groupby groups(partition_view,
                                 cudf::null_policy::INCLUDE,
                                 cudf::sorted::YES,
@@ -165,9 +181,7 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
                                 partition_nulls);
 
   cudf::column_view values;
-  if (needs_order) {
-    values = order_values(sorted->view(), partition_columns.size(), order.columns.size());
-  }
+  if (needs_order) { values = order_values(sorted->view(), partition_count, order.columns.size()); }
   std::vector<cudf::groupby::scan_request> requests;
   for (auto const function : functions) {
     cudf::groupby::scan_request request;
@@ -178,6 +192,7 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   auto [labels, scans] = groups.scan(requests, stream, mr);
   labels.reset();
   sorted.reset();
+  unpartitioned.reset();
 
   std::vector<std::unique_ptr<cudf::column>> scanned_columns;
   for (auto& scan : scans) {
