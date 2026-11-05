@@ -68,9 +68,19 @@ class LogicalSetOperation;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
 class TableFilterSet;
+class Binder;
 }  // namespace duckdb
 
 namespace sirius::planner {
+
+/// Rewrite nested decorrelated `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)`
+/// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: a LEFT
+/// DELIM_JOIN against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery plus a filter. The replacement
+/// emits the same column bindings as the nodes it replaces. Returns the number of subqueries
+/// rewritten.
+std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
+                                                 duckdb::Binder& binder,
+                                                 duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
 
 /// Attribution attached to every scan contract created by one plan build.
 /// Execution-time plans carry a window id; plans built before an execution
