@@ -62,7 +62,9 @@ std::unique_ptr<operator_data> execute_slice(const pipelineable_operator_data& i
     throw internal_exception("Limit slice exceeds input rows");
   }
   if (slice_begin == 0 && slice_count == static_cast<std::size_t>(view.num_rows())) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches(), position);
+    // The next inline operator runs without another preparation step. Keep the prepared readers
+    // alive across input replacement, including against spill requests selected before this task.
+    return input.forward_with_read_only_locks(position);
   }
   auto slices = cudf::slice(view,
                             {static_cast<cudf::size_type>(slice_begin),

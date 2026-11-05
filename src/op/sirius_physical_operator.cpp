@@ -130,6 +130,14 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
   return ro_batches;
 }
 
+std::unique_ptr<pipelineable_operator_data>
+pipelineable_operator_data::forward_with_read_only_locks(std::optional<std::size_t> position) const
+{
+  auto output = std::make_unique<pipelineable_operator_data>(_data_batches, position);
+  output->_read_only_data_batches = get_read_only_batches();
+  return output;
+}
+
 void pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
 {

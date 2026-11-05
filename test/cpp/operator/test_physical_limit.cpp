@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "data/convertible_data_batch.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 
@@ -446,6 +447,96 @@ TEST_CASE("unordered limit execution claims offset and limit and drops positions
   }
   CHECK(rows == std::vector<int64_t>{12, 13, 14, 15, 16, 17, 18});
   CHECK(limit.is_limit_exhausted());
+}
+
+TEST_CASE("forwarded payload retains read protection across replacement and cleanup",
+          "[operator_data][ordered_limit_cpu]")
+{
+  limit_metadata_inputs inputs;
+  auto explicit_cleanup = GENERATE(false, true);
+  auto batch            = inputs.add(10).lock();
+  REQUIRE(batch);
+  inputs.repo.pop_next_data_batch();
+  auto input = std::make_unique<pipelineable_operator_data>(std::vector{batch}, 7);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    auto output = input->forward_with_read_only_locks(7);
+    CHECK(output->get_data_batches().front() == batch);
+    CHECK(output->get_position() == 7);
+    input.reset();
+    CHECK_FALSE(batch->try_to_mutable());
+    // Forwarding a protected output again must also retain protection across replacement.
+    auto next = output->forward_with_read_only_locks(std::nullopt);
+    output.reset();
+    CHECK_FALSE(next->get_position());
+    CHECK_FALSE(batch->try_to_mutable());
+    if (explicit_cleanup) {
+      next->remove_read_only_lock();
+      CHECK(batch->try_to_mutable().has_value());
+    }
+    next.reset();
+    CHECK(batch->try_to_mutable().has_value());
+    // A retry can prepare and forward the original batch again without leaked locks.
+    input = std::make_unique<pipelineable_operator_data>(std::vector{batch}, 7);
+  }
+}
+
+TEST_CASE("whole-batch LIMIT protects GPU input against a previously selected spill",
+          "[physical_limit][limit_input_protection]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu    = manager->get_memory_space(Tier::GPU, 0);
+  auto* host   = manager->get_memory_space(Tier::HOST, 0);
+  REQUIRE(gpu);
+  REQUIRE(host);
+  rmm::cuda_stream stream;
+  auto batch = make_range_batch(*gpu, 0, 10);
+  // Save the cleanup request before the task subscribes/prepares its input.
+  sirius::convertible_data_batch saved_spill(batch);
+  std::unique_ptr<operator_data> input;
+  std::unique_ptr<sirius_physical_operator> limit;
+  SECTION("ordered LIMIT retains position")
+  {
+    limit = std::make_unique<sirius_physical_streaming_limit>(
+      duckdb::vector<sirius::logical_type>{sirius::from_duckdb(LogicalType::BIGINT)},
+      BoundLimitNode::ConstantValue(10),
+      BoundLimitNode(),
+      10,
+      true);
+    data_repository repo;
+    repo.add_data_batch_at_position(batch, 7);
+    limit->add_port("default",
+                    std::make_unique<sirius_physical_operator::port>(
+                      MemoryBarrierType::FULL, &repo, nullptr, nullptr));
+    input                            = limit->get_next_task_input_data();
+    limit->get_port("default")->repo = nullptr;
+  }
+  SECTION("unordered LIMIT discards position")
+  {
+    limit = std::make_unique<sirius_physical_unordered_streaming_limit>(
+      duckdb::vector<sirius::logical_type>{sirius::from_duckdb(LogicalType::BIGINT)},
+      BoundLimitNode::ConstantValue(10),
+      BoundLimitNode(),
+      10,
+      true);
+    input = std::make_unique<pipelineable_operator_data>(std::vector{batch}, 7);
+  }
+  REQUIRE(input);
+  auto position = limit->type == SiriusPhysicalOperatorType::STREAMING_LIMIT
+                    ? std::optional<std::size_t>{7}
+                    : std::nullopt;
+  input->prepare_for_processing(gpu, stream);
+  input        = limit->execute(*input, stream);
+  auto& output = dynamic_cast<pipelineable_operator_data&>(*input);
+  CHECK(output.get_data_batches().front() == batch);
+  CHECK(output.get_position() == position);
+  // Resume the saved request in the window before the next inline GPU read.
+  CHECK_FALSE(saved_spill.convert({host}, stream, *manager, false));
+  CHECK(collect_all_rows(output.get_data_batches()) ==
+        std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+  stream.synchronize();
+  input.reset();
+  REQUIRE(saved_spill.convert({host}, stream, *manager, false).has_value());
+  CHECK(batch->to_read_only().get_memory_space() == host);
 }
 
 TEST_CASE("unordered limit zero produces an empty GPU batch", "[physical_limit][unordered_limit]")

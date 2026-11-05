@@ -317,6 +317,17 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches() const;
 
   /**
+   * @brief Forward the same batches in a plain payload, retaining their read locks.
+   *
+   * Copies prepared read handles, or acquires read handles if this payload is unprepared, before
+   * returning. Replacing the input with this output therefore leaves no gap in protection against
+   * conversion. The output owns its locks until remove_read_only_lock() or destruction.
+   * @param position Logical output position; nullopt discards input ordering.
+   */
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> forward_with_read_only_locks(
+    std::optional<std::size_t> position) const;
+
+  /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
    */
   void remove_read_only_lock()
