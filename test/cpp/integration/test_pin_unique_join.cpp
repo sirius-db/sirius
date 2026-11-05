@@ -251,8 +251,9 @@ std::string join_query_on(fs::path const& fact, fs::path const& dim, std::string
 }
 
 /// A Hive-partitioned dimension, `year=2020` and `year=2021`, whose files also hold a physical
-/// column `year` that is distinct across the table (100000 + n and 200000 + n). Read with Hive
-/// partitioning on, the scan's `year` is the directory's value, which repeats.
+/// column `year` that is distinct across the table (3000 + n and 5000 + n). Read with Hive
+/// partitioning on, the scan's `year` is the directory's value, which repeats. The physical values
+/// lie within the fact's keys, so the footers' statistics cannot prove the join empty.
 void generate_hive_dim(fs::path const& dir)
 {
   sirius::test::scoped_sirius_disable disable_sirius;
@@ -262,7 +263,7 @@ void generate_hive_dim(fs::path const& dir)
     auto const part_dir = dir / ("year=" + std::to_string(year));
     fs::create_directories(part_dir);
     run_generator(gen,
-                  "COPY (SELECT range + " + std::to_string(year == 2020 ? 100000 : 200000) +
+                  "COPY (SELECT range + " + std::to_string(year == 2020 ? 3000 : 5000) +
                     " AS year, range AS payload FROM range(500)) TO " +
                     sirius::test::sql_literal((part_dir / "part.parquet").string()) +
                     " (FORMAT PARQUET);");
