@@ -258,7 +258,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
   if (valid_batches.empty() || !space) {
     if (_distributed) {
-      compute_distributed_boundaries({}, 1, column_order, null_precedence, stream);
+      compute_distributed_boundaries({}, 0, 1, column_order, null_precedence, stream);
     }
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
@@ -354,7 +354,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     cudf::table_view const sort_keys_view(sort_key_cols);
     if (_distributed) {
       compute_distributed_boundaries(
-        sort_keys_view, num_parts, column_order, null_precedence, stream);
+        sort_keys_view, total_sample_bytes, num_parts, column_order, null_precedence, stream);
     } else if (num_parts <= 1 || total_rows == 0) {
       // Single partition — no boundaries needed
       _num_partitions = 1;
@@ -391,6 +391,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
 void sirius_physical_sort_sample::compute_distributed_boundaries(
   cudf::table_view sample_keys,
+  std::size_t sample_bytes,
   std::size_t num_parts,
   std::vector<cudf::order> const& column_order,
   std::vector<cudf::null_order> const& null_precedence,
@@ -408,10 +409,23 @@ void sirius_physical_sort_sample::compute_distributed_boundaries(
       throw sirius::internal_exception(
         "[sort_sample] the boundary all-gather failed part way and cannot be retried");
     }
-    // 1. This rank's summary: up to distributed_summary_rows evenly spaced rows of its sample.
+    // 1. This rank's summary: evenly spaced rows of its sample, enough to give each of num_parts
+    // partitions summary_rows_per_partition rows of the global sample in this rank's range. Fewer
+    // when the sample fell short of sort_sample_bytes, so a rank with little input has little say
+    // in where the ranges fall. Not the local sample alone: it describes the rows this rank sends,
+    // not the ones it receives.
     std::shared_ptr<::cucascade::data_batch> summary;
     if (auto const rows = sample_keys.num_rows(); rows > 0) {
-      auto const take = std::min<std::size_t>(rows, distributed_summary_rows);
+      auto const full = std::max(distributed_summary_rows, summary_rows_per_partition * num_parts);
+      auto const share =
+        _sort_sample_bytes == 0
+          ? 1.0
+          : std::min(1.0,
+                     static_cast<double>(sample_bytes) / static_cast<double>(_sort_sample_bytes));
+      auto const take =
+        std::clamp<std::size_t>(static_cast<std::size_t>(share * static_cast<double>(full)),
+                                1,
+                                static_cast<std::size_t>(rows));
       std::vector<int32_t> indices(take);
       for (std::size_t i = 0; i < take; ++i) {
         indices[i] = static_cast<int32_t>(i * static_cast<std::size_t>(rows) / take);
