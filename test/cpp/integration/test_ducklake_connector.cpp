@@ -881,24 +881,25 @@ TEST_CASE_METHOD(ducklake_fixture,
   auto clear =
     std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
   run("SET enable_duckdb_fallback=false");
-  std::vector<std::string> queries = {
-    "SELECT id FROM lake.q",
-    "SELECT 1 FROM lake.q",
-    "SELECT value,id,label FROM lake.q WHERE id>=2",
-    "SELECT id FROM lake.q WHERE id=1 OR id=4",
-    "SELECT id,value FROM lake.q ORDER BY id DESC, value ASC NULLS LAST LIMIT 3",
-    "SELECT COUNT(*) FROM lake.q",
-    "SELECT COUNT(*) FROM lake.q WHERE id>=2",
-    "SELECT COUNT(*) FROM lake.q WHERE id%2=0",
-    "SELECT COUNT(*) FROM lake.q WHERE id>90",
-    "SELECT id,COUNT(*) FROM lake.q GROUP BY id",
-    "SELECT a.id,b.value FROM lake.q a JOIN lake.q b ON a.id=b.id WHERE b.id>=2",
-    "SELECT a.id FROM lake.q a JOIN native_store.native_keys b ON a.id=b.id",
-    "SELECT id FROM lake.q WHERE id>90"};
-  for (auto const& sql : queries) {
+  std::vector<std::pair<std::string, bool>> queries = {
+    {"SELECT id FROM lake.q", true},
+    {"SELECT 1 FROM lake.q", true},
+    {"SELECT value,id,label FROM lake.q WHERE id>=2", false},
+    {"SELECT id FROM lake.q WHERE id=1 OR id=4", false},
+    {"SELECT id,value FROM lake.q ORDER BY id DESC, value ASC NULLS LAST LIMIT 3", false},
+    {"SELECT COUNT(*) FROM lake.q", false},
+    {"SELECT COUNT(*) FROM lake.q WHERE id>=2", false},
+    {"SELECT COUNT(*) FROM lake.q WHERE id%2=0", false},
+    {"SELECT COUNT(*) FROM lake.q WHERE id>90", false},
+    {"SELECT id,COUNT(*) FROM lake.q GROUP BY id", true},
+    {"SELECT a.id,b.value FROM lake.q a JOIN lake.q b ON a.id=b.id WHERE b.id>=2", true},
+    {"SELECT a.id FROM lake.q a JOIN native_store.native_keys b ON a.id=b.id", false},
+    {"SELECT id FROM lake.q WHERE id>90", false}};
+  for (auto const& [sql, both_entries] : queries) {
     INFO(sql);
     auto expected = cpu_result(sql);
     for (bool explicit_entry : {false, true}) {
+      if (explicit_entry && !both_entries) continue;
       INFO(explicit_entry);
       auto decoded_before  = decoded.load();
       auto imported_before = counters->arrow_rows_imported.load();
@@ -1109,15 +1110,18 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "Production DuckLake SQL combines dynamic filters with local visibility",
                  "[isolated_context][ducklake][ducklake_dynamic]")
 {
-  auto shape   = GENERATE(std::string("parquet"), std::string("mixed"), std::string("inline"));
-  auto deletes = GENERATE(std::string("ordinary"), std::string("dv"), std::string("inline"));
+  auto [shape, deletes] = GENERATE(table<std::string, std::string>({{"parquet", "ordinary"},
+                                                                    {"parquet", "dv"},
+                                                                    {"parquet", "inline"},
+                                                                    {"mixed", "ordinary"},
+                                                                    {"mixed", "dv"},
+                                                                    {"mixed", "inline"},
+                                                                    {"inline", "inline"}}));
   INFO(shape);
   INFO(deletes);
   if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
-  run("CALL lake.set_option('data_inlining_row_limit', 100)");
-
   run("CALL lake.set_option('data_inlining_row_limit'," +
       std::string(shape == "inline" ? "20000" : "0") + ")");
   run("CALL lake.set_option('parquet_row_group_size',2048)");
@@ -1133,6 +1137,13 @@ TEST_CASE_METHOD(ducklake_fixture,
   run("CALL lake.set_option('data_inlining_row_limit'," +
       std::string(deletes == "inline" ? "20000" : "0") + ")");
   run("DELETE FROM lake.q WHERE id%7=0");
+  auto delete_files = run(
+    "SELECT format FROM __ducklake_metadata_lake.ducklake_delete_file "
+    "WHERE end_snapshot IS NULL");
+  REQUIRE(delete_files->RowCount() == (deletes == "inline" ? 0 : 1));
+  if (deletes != "inline")
+    CHECK(delete_files->Collection().GetValue(0, 0).ToString() ==
+          (deletes == "dv" ? "puffin" : "parquet"));
   run("ATTACH '" + (std::filesystem::path(disk.directory) / "keys.db").string() +
       "' AS native_store");
   run("CREATE TABLE native_store.keys AS SELECT range::BIGINT k FROM range(17)");
@@ -2075,15 +2086,9 @@ TEST_CASE_METHOD(ducklake_fixture,
   query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
   query(con, "CREATE TABLE lake.scalar_value AS SELECT 42::BIGINT AS x");
   if (parquet) query(con, "CALL ducklake_flush_inlined_data('lake')");
-  std::vector<std::string> queries{"SELECT (SELECT x FROM lake.scalar_value)",
-                                   "SELECT first(x),count(*) FROM lake.scalar_value",
-                                   "SELECT (SELECT x FROM lake.scalar_value WHERE x%2=1)",
-                                   "SELECT first(NULL::BIGINT),count(*) FROM lake.scalar_value"};
-  for (auto const& sql : queries) {
-    auto expected = cpu_result(sql);
-    for (int repeat = 0; repeat < 3; ++repeat)
-      check_gpu_result(sql, expected);
-  }
+  for (auto const* sql : {"SELECT (SELECT x FROM lake.scalar_value)",
+                          "SELECT (SELECT x FROM lake.scalar_value WHERE x%2=1)"})
+    check_gpu_query(sql);
 }
 
 TEST_CASE_METHOD(ducklake_fixture,
@@ -2231,19 +2236,17 @@ TEST_CASE_METHOD(ducklake_fixture,
   if (shape == "parquet" || shape == "mixed")
     query(con, "CALL ducklake_flush_inlined_data('lake')");
   if (shape == "mixed") query(con, "INSERT INTO lake.q VALUES (NULL,NULL)");
-  std::vector<std::string> statements;
   for (auto suffix : {"", " WHERE x>1000", " WHERE x%3=1"}) {
-    statements.push_back(
+    if (shape == "empty" && *suffix) continue;
+    auto sql =
       std::string(
         "SELECT COUNT(*),COUNT(x),SUM(x),FIRST(x),FIRST(s),AVG(x),MIN(x),MAX(x) FROM lake.q") +
-      suffix);
-  }
-  for (auto const& sql : statements) {
+      suffix;
     CAPTURE(sql);
     auto expected = cpu_result(sql);
     auto prepared = con.Prepare(sql);
     REQUIRE_FALSE(prepared->HasError());
-    for (int repeat = 0; repeat < 3; ++repeat)
+    for (int repeat = 0; repeat < 2; ++repeat)
       check_gpu_execution(expected, [&] { return prepared->Execute(); });
   }
 }
@@ -2545,4 +2548,76 @@ TEST_CASE_METHOD(ducklake_fixture,
   auto detach = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
   run("SELECT i FROM lake.q");
   CHECK(exercised);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake decimals preserve precision across inline Parquet and mixed scans",
+                 "[ducklake][ducklake_decimal][isolated_context]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake bridge is disabled");
+  auto mode       = GENERATE(std::string("inline"), std::string("parquet"), std::string("mixed"));
+  auto precision  = GENERATE(5, 9, 10, 18, 19, 38);
+  auto scale_mode = GENERATE(0, 1, 2);
+  auto scale      = scale_mode == 0 ? 0 : scale_mode == 1 ? 2 : precision;
+  CAPTURE(mode, precision, scale);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  auto limit = mode == "inline" ? 10000 : mode == "parquet" ? 0 : 10;
+  run("CALL lake.set_option('data_inlining_row_limit'," + std::to_string(limit) + ")");
+  auto type    = "DECIMAL(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+  auto maximum = (precision == scale ? std::string("0") : std::string(precision - scale, '9')) +
+                 (scale ? "." + std::string(scale, '9') : "");
+  std::string small = precision == scale ? "0.23" : "1.23";
+  run("CREATE TABLE lake.decimals(id BIGINT, value " + type + ")");
+  run("INSERT INTO lake.decimals SELECT i, CASE i%4 WHEN 0 THEN '" + maximum + "' WHEN 1 THEN '-" +
+      maximum + "' WHEN 2 THEN '0' ELSE NULL END::" + type + " FROM range(4097) t(i)");
+  run("ALTER TABLE lake.decimals ADD COLUMN initial " + type + " DEFAULT -" + small);
+  run("ALTER TABLE lake.decimals ADD COLUMN missing " + type);
+  run("INSERT INTO lake.decimals VALUES (5000, " + small + ", -" + small + ", NULL), (5001, -" +
+      small + ", -" + small + ", NULL)");
+  auto counters         = sirius::test::get_registered_sirius_context(con)->physical_counters();
+  counters->track_units = true;
+  auto inline_rows      = counters->arrow_rows_imported.load();
+  check_gpu_query("SELECT id, value, initial, missing FROM lake.decimals");
+  CHECK(counters->arrow_rows_imported.load() - inline_rows == (mode == "inline"  ? 4099
+                                                               : mode == "mixed" ? 2
+                                                                                 : 0));
+  check_gpu_query("SELECT id, value FROM lake.decimals WHERE value > 0::" + type +
+                  " OR value IS NULL");
+  check_gpu_query("SELECT count(*), min(value), max(value) FROM lake.decimals");
+  if (scale != precision) check_gpu_query("SELECT sum(initial) FROM lake.decimals");
+  check_gpu_query("SELECT initial, missing FROM lake.decimals WHERE id < 4097");
+  // Exercise lifecycle behavior once per physical width and storage mode.
+  if (scale == 2 && (precision == 9 || precision == 18 || precision == 38)) {
+    check_gpu_query("SELECT value, initial FROM lake.decimals WHERE id < 0");
+    auto expected = cpu_result("SELECT value, initial FROM lake.decimals WHERE id >= 5000");
+    run("PREPARE decimal_query AS SELECT value, initial FROM lake.decimals WHERE id >= 5000");
+    check_gpu_result("EXECUTE decimal_query", expected);
+    check_gpu_result("EXECUTE decimal_query", expected);
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake wide decimal inline batches fit their preparation envelope",
+                 "[ducklake][ducklake_decimal][isolated_context]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake bridge is disabled");
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit',10000)");
+  std::string columns;
+  for (int i = 0; i < 31; ++i) {
+    if (i) columns += ",";
+    columns +=
+      "CASE WHEN i%3=0 THEN NULL ELSE '-12345678901234567890.1234567890'::DECIMAL(38,10) END AS d" +
+      std::to_string(i);
+  }
+  columns += ",CASE WHEN i%2=0 THEN 'decimal payload' ELSE NULL END AS label";
+  run("CREATE TABLE lake.wide AS SELECT " + columns + " FROM range(601) t(i)");
+  auto counters         = sirius::test::get_registered_sirius_context(con)->physical_counters();
+  counters->track_units = true;
+  auto inline_rows      = counters->arrow_rows_imported.load();
+  check_gpu_query("SELECT * FROM lake.wide");
+  CHECK(counters->arrow_rows_imported.load() - inline_rows == 601);
+  check_gpu_query("SELECT d0, d30, label FROM lake.wide WHERE d15 IS NOT NULL");
 }

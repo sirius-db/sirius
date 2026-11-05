@@ -22,6 +22,7 @@
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/preparation_gate.hpp"
 #include "expression/ast/from_duckdb.hpp"
+#include "helper/hugeint.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/scan/arrow/arrow_staging_resource.hpp"
 #include "op/scan/scan_plan.hpp"
@@ -30,8 +31,6 @@
 
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
-#include <duckdb/common/types/date.hpp>
-#include <duckdb/common/types/timestamp.hpp>
 
 #include <array>
 #include <cstring>
@@ -50,47 +49,12 @@ struct arrow_tree {
   ArrowArray* arrays[columns]{};
   void const* root_buffers[1]{nullptr};
   void const* buffers[columns][3]{};
+  char formats[columns][24]{};
 };
 constexpr size_t tree_bytes = (sizeof(arrow_tree) + 7) / 8 * 8;
 size_t column_bytes(size_t rows) { return rows * sizeof(int64_t) + rows / 8; }
 static_assert(inline_batch_producer::max_batch_cells / inline_batch_producer::max_columns >= 64);
 static_assert(inline_batch_producer::max_string_bytes <= INT32_MAX);
-template <class T>
-void copy_scalar(std::byte* output, size_t row, duckdb::Value const& value)
-{
-  auto typed = value.GetValue<T>();
-  std::memcpy(output + row * sizeof(T), &typed, sizeof(T));
-}
-void copy_fixed_scalar(std::byte* output, size_t row, duckdb::Value const& value)
-{
-  using D = duckdb::LogicalTypeId;
-  switch (value.type().id()) {
-    case D::BOOLEAN:
-      if (value.GetValue<bool>()) reinterpret_cast<uint8_t*>(output)[row / 8] |= 1u << (row % 8);
-      break;
-    case D::TINYINT: copy_scalar<int8_t>(output, row, value); break;
-    case D::SMALLINT: copy_scalar<int16_t>(output, row, value); break;
-    case D::INTEGER: copy_scalar<int32_t>(output, row, value); break;
-    case D::BIGINT: copy_scalar<int64_t>(output, row, value); break;
-    case D::UTINYINT: copy_scalar<uint8_t>(output, row, value); break;
-    case D::USMALLINT: copy_scalar<uint16_t>(output, row, value); break;
-    case D::UINTEGER: copy_scalar<uint32_t>(output, row, value); break;
-    case D::UBIGINT: copy_scalar<uint64_t>(output, row, value); break;
-    case D::FLOAT: copy_scalar<float>(output, row, value); break;
-    case D::DOUBLE: copy_scalar<double>(output, row, value); break;
-    case D::DATE: {
-      auto days = duckdb::DateValue::Get(value).days;
-      std::memcpy(output + row * sizeof(days), &days, sizeof(days));
-      break;
-    }
-    case D::TIMESTAMP: {
-      auto micros = duckdb::TimestampValue::Get(value).value;
-      std::memcpy(output + row * sizeof(micros), &micros, sizeof(micros));
-      break;
-    }
-    default: throw std::invalid_argument("DuckLake inline scalar type is outside its profile");
-  }
-}
 struct arrow_capacity {
   std::shared_ptr<void> claim;
   sm::charged_block backing, characters;
@@ -117,13 +81,59 @@ struct inline_evidence final : scan::prepared_visibility {
   uint64_t sequence;
 };
 }  // namespace
+inline_column_layout::inline_column_layout(duckdb::LogicalType bound_type)
+  : type(std::move(bound_type))
+{
+  auto scalar_format = fixed_scalar_arrow_format(type);
+  if (!scalar_format && !is_string())
+    throw std::invalid_argument("DuckLake inline scalar type is outside its profile");
+  device_type   = *scan::field_mapping_type(type);
+  format        = is_string() ? "u" : *scalar_format;
+  value_bytes   = is_string() ? sizeof(int32_t) : cudf::size_of(device_type);
+  storage_bytes = std::max<size_t>(8, value_bytes);
+  decimal_precision =
+    type.id() == duckdb::LogicalTypeId::DECIMAL ? duckdb::DecimalType::GetWidth(type) : 0;
+}
+size_t inline_column_layout::copy_fixed_values(duckdb::Vector const& source,
+                                               size_t offset,
+                                               size_t count,
+                                               std::byte* values,
+                                               uint8_t* validity) const
+{
+  if (source.GetType() != type || is_string() || offset > source.size() ||
+      count > source.size() - offset)
+    throw std::invalid_argument("DuckLake inline vector differs from its bound layout");
+  duckdb::UnifiedVectorFormat data;
+  source.ToUnifiedFormat(data);
+  size_t nulls = 0;
+  for (size_t row = 0; row < count; ++row) {
+    auto index = data.sel->get_index(offset + row);
+    if (!data.validity.RowIsValid(index)) {
+      ++nulls;
+      continue;
+    }
+    auto* input = data.data + index * value_bytes;
+    if (type.id() == duckdb::LogicalTypeId::BOOLEAN) {
+      if (*input) reinterpret_cast<uint8_t*>(values)[row / 8] |= 1u << (row % 8);
+    } else if (device_type.id() == cudf::type_id::DECIMAL128) {
+      auto value =
+        sirius::to_int128(duckdb::UnifiedVectorFormat::GetData<duckdb::hugeint_t>(data)[index]);
+      std::memcpy(values + row * value_bytes, &value, value_bytes);
+    } else {
+      std::memcpy(values + row * value_bytes, input, value_bytes);
+    }
+    validity[row / 8] |= 1u << (row % 8);
+  }
+  return nulls;
+}
 struct inline_batch_producer::impl {
   std::shared_ptr<binding_handle> handle;
   std::shared_ptr<inline_binding const> binding;
   scan::arrow_import_binding import;
   std::unique_ptr<inline_reader> reader;  // query-owner lane only; reset by close.
   duckdb::DataChunk const* chunk = nullptr;
-  size_t offset = 0, width = 0, row_limit = 0, column_stride = 0;
+  size_t offset = 0, width = 0, row_limit = 0, wide_columns = 0;
+  std::vector<inline_column_layout> layouts;
   std::vector<size_t> selected;
   std::vector<size_t> strings;
   std::atomic<bool> cancelled{false};
@@ -163,11 +173,13 @@ struct inline_batch_producer::impl {
         throw std::invalid_argument(
           "DuckLake initial inline profile requires 1..32 selected fixed scalar/VARCHAR columns");
     }
-    width         = count_only ? 0 : selected.size();
-    row_limit     = batch_rows(width);
-    column_stride = column_bytes(row_limit);
-    for (size_t i = 0; i < width; ++i)
-      if (types[selected[i]] == duckdb::LogicalType::VARCHAR) strings.push_back(i);
+    width     = count_only ? 0 : selected.size();
+    row_limit = batch_rows(width);
+    for (auto index : selected) {
+      auto const& column = layouts.emplace_back(types[index]);
+      wide_columns += column.storage_bytes > 8;
+      if (column.is_string()) strings.push_back(layouts.size() - 1);
+    }
     import.read_identity  = binding;
     import.display_name   = "DuckLake inline unit";
     import.profiles       = options.profiles ? std::move(options.profiles)
@@ -192,7 +204,8 @@ struct inline_batch_producer::impl {
     duckdb::vector<sirius::logical_type> returned_types;
     std::vector<std::optional<size_t>> positions;
     for (size_t i = 0; i < width; ++i) {
-      program.input_types->push_back(*scan::field_mapping_type(types[selected[i]]));
+      program.input_types->push_back(layouts[i].device_type);
+      program.decimal_precisions.push_back(layouts[i].decimal_precision);
       column_ids.emplace_back(i);
       returned_types.push_back(sirius::from_duckdb(types[selected[i]]));
       positions.emplace_back(i);
@@ -241,6 +254,11 @@ struct inline_batch_producer::impl {
       offset = 0;
       if (!chunk) return scan::arrow_end_of_stream{};
     }
+    if (width && chunk->ColumnCount() != width)
+      throw std::invalid_argument("DuckLake inline chunk differs from its binding");
+    for (size_t col = 0; col < width; ++col)
+      if (chunk->data[col].GetType() != layouts[col].type)
+        throw std::invalid_argument("DuckLake inline vector differs from its bound layout");
     size_t count = std::min(row_limit, static_cast<size_t>(chunk->size()) - offset);
     std::array<size_t, columns> string_sizes{};
     if (!strings.empty()) {
@@ -275,7 +293,7 @@ struct inline_batch_producer::impl {
     // last GPU input read. Pending then needs neither a cursor advance nor a
     // second retained-payload budget or custom wakeup scheduler.
     auto& allocator = input.allocator;
-    auto base_bytes = batch_capacity(width);
+    auto base_bytes = batch_capacity(width, 0, wide_columns);
     auto allocation = allocator.allocate(base_bytes);
     // Arrow buffers are independently owned. Character storage need not be
     // adjacent to the schema, fixed-width values or import staging arena.
@@ -302,22 +320,28 @@ struct inline_batch_producer::impl {
     auto* payload           = capacity->data() + tree_bytes;
     auto* chars             = capacity->characters.data();
     for (size_t col = 0; col < width; ++col) {
-      auto& schema = tree->children_schema[col];
-      auto& array  = tree->children[col];
-      bool is_string =
-        binding->unit.read_view->bound_types[selected[col]] == duckdb::LogicalType::VARCHAR;
-      schema.format =
-        is_string ? "u"
-                  : fixed_scalar_arrow_format(binding->unit.read_view->bound_types[selected[col]]);
-      schema.flags   = ARROW_FLAG_NULLABLE;
-      schema.release = [](ArrowSchema* p) { p->release = nullptr; };
-      auto* values   = payload + col * column_stride;
-      auto* valid    = reinterpret_cast<uint8_t*>(values + row_limit * sizeof(int64_t));
+      auto& schema       = tree->children_schema[col];
+      auto& array        = tree->children[col];
+      auto const& layout = layouts[col];
+      bool is_string     = layout.is_string();
+      auto const& format = layout.format;
+      if (format.size() >= sizeof(tree->formats[col]))
+        throw std::logic_error("DuckLake Arrow format exceeds owned schema storage");
+      std::memcpy(tree->formats[col], format.c_str(), format.size() + 1);
+      schema.format      = tree->formats[col];
+      schema.flags       = ARROW_FLAG_NULLABLE;
+      schema.release     = [](ArrowSchema* p) { p->release = nullptr; };
+      auto column_stride = row_limit * layout.storage_bytes + row_limit / 8;
+      auto* values       = payload;
+      payload += column_stride;
+      auto* valid = reinterpret_cast<uint8_t*>(values + row_limit * layout.storage_bytes);
       std::memset(values, 0, column_stride);
       auto* offsets      = reinterpret_cast<int32_t*>(values);
       size_t char_offset = 0;
-      for (size_t row = 0; row < count; ++row) {
-        if (is_string) {
+      if (!is_string)
+        array.null_count = layout.copy_fixed_values(chunk->data[col], offset, count, values, valid);
+      else
+        for (size_t row = 0; row < count; ++row) {
           auto value = borrow_inline_varchar(chunk->data[col], offset + row);
           if (value) {
             if (value->size() > string_sizes[col] - char_offset)
@@ -328,18 +352,7 @@ struct inline_batch_producer::impl {
           } else
             ++array.null_count;
           offsets[row + 1] = static_cast<int32_t>(char_offset);
-        } else {
-          auto value = chunk->GetValue(col, offset + row);
-          if (value.IsNull())
-            ++array.null_count;
-          else {
-            if (value.type() != binding->unit.read_view->bound_types[selected[col]])
-              throw std::invalid_argument("DuckLake inline value type differs from its binding");
-            copy_fixed_scalar(values, row, value);
-            valid[row / 8] |= 1u << (row % 8);
-          }
         }
-      }
       if (is_string) {
         if (char_offset != string_sizes[col])
           throw std::logic_error("DuckLake borrowed VARCHAR changed during detach");
@@ -372,17 +385,19 @@ size_t inline_batch_producer::batch_rows(size_t columns)
   // also preserve alignment of each following column's fixed values/offsets.
   return columns ? std::min(max_batch_rows, (max_batch_cells / columns / 64) * 64) : max_batch_rows;
 }
-uint64_t inline_batch_producer::batch_capacity(size_t n, size_t string_columns)
+uint64_t inline_batch_producer::batch_capacity(size_t n, size_t string_columns, size_t wide_columns)
 {
-  if (n > max_columns || string_columns > n)
+  if (n > max_columns || string_columns > n || wide_columns > n - string_columns)
     throw std::invalid_argument("DuckLake inline column limit");
-  return tree_bytes + n * column_bytes(batch_rows(n)) + (string_columns ? max_string_bytes : 0) +
-         (n ? max_staging_bytes : 0);
+  return tree_bytes + n * column_bytes(batch_rows(n)) + wide_columns * batch_rows(n) * 8 +
+         (string_columns ? max_string_bytes : 0) + (n ? max_staging_bytes : 0);
 }
-sm::unit_envelope inline_batch_producer::envelope(size_t columns, size_t string_columns)
+sm::unit_envelope inline_batch_producer::envelope(size_t columns,
+                                                  size_t string_columns,
+                                                  size_t wide_columns)
 {
-  (void)batch_capacity(columns, string_columns);
-  sm::unit_envelope result{{batch_capacity(columns)}, 0};
+  (void)batch_capacity(columns, string_columns, wide_columns);
+  sm::unit_envelope result{{batch_capacity(columns, 0, wide_columns)}, 0};
   if (string_columns) result.temporary.push_back(max_string_bytes);
   return result;
 }
@@ -415,7 +430,8 @@ sm::preparation_execution_domain inline_batch_producer::execution_domain() const
 }
 scan::arrow_producer_limits inline_batch_producer::limits() const
 {
-  return {static_cast<int64_t>(impl_->row_limit), envelope(impl_->width, impl_->strings.size())};
+  return {static_cast<int64_t>(impl_->row_limit),
+          envelope(impl_->width, impl_->strings.size(), impl_->wide_columns)};
 }
 void inline_batch_producer::preflight() { impl_->handle->validate_statement(); }
 scan::arrow_readiness inline_batch_producer::readiness() const noexcept

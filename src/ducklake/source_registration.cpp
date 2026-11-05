@@ -87,12 +87,14 @@ std::optional<scan_manager::preparation_request> prepare_scan(op::sirius_physica
   auto selected                          = std::make_shared<scan_layout>(layout(scan));
   selected->options.scan_task_batch_size = params.scan_task_batch_size;
   auto const& types                      = scan.bound_view->identity->bound_types;
-  auto strings =
-    std::count_if(selected->selected.begin(), selected->selected.end(), [&](auto index) {
-      return types[index] == duckdb::LogicalType::VARCHAR;
-    });
+  size_t strings = 0, wide_columns = 0;
+  for (auto index : selected->selected) {
+    inline_column_layout column(types[index]);
+    strings += column.is_string();
+    wide_columns += column.storage_bytes > 8;
+  }
   return scan_manager::preparation_request{
-    {{scan_ingestible::envelope(selected->selected.size(), strings)}, {}, true, 1},
+    {{scan_ingestible::envelope(selected->selected.size(), strings, wide_columns)}, {}, true, 1},
     [](scan_manager::preparation_ledger&) {},
     [&scan, binding, selected](std::shared_ptr<scan_manager::preparation_admission> admission) {
       auto const& entry = scan.read_views->entry(scan.contract_id);

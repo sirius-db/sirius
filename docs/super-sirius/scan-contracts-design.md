@@ -48,7 +48,7 @@ The connector verifies the provider callbacks and reads the original binding's s
 | Input or condition | Behavior |
 |---|---|
 | Local Parquet, inline or mixed data | GPU scan through existing SQL and bound-plan entrypoints. |
-| Selected columns | Up to 32 flat Boolean, integer, FLOAT/DOUBLE, VARCHAR, DATE or microsecond TIMESTAMP columns, including NULLs. |
+| Selected columns | Up to 32 flat Boolean, integer, FLOAT/DOUBLE, VARCHAR, DATE, microsecond TIMESTAMP or DECIMAL columns, including NULLs. DECIMAL precision 5–38 is supported; file and bound precision/scale must match. |
 | Schema evolution | Match stable field IDs; use typed `initial_default` for missing fields. INTEGER-to-BIGINT and FLOAT-to-DOUBLE widening are supported. |
 | Ordinary Parquet deletes, local DVs and inline deletes | Combine visibility in the original file-row domain before residual filtering and projection. |
 | Nested selections, external name/Hive mappings or other conversions | Reject GPU execution. Unselected nested columns do not prevent scalar reads. |
@@ -130,6 +130,8 @@ Unbounded inputs, the statement deletion-vector limit, or insufficient host capa
 Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, query-owned callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
 
 ### Host Arrow batch source contract
+
+Owned Arrow trees and their backing remain immutable until release. Layout and payload checks are cached per owned batch; each execution boundary still checks its bound schema and execution identity. Foreign push inputs are validated before capacity waiting and are not covered by this cache.
 
 The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through the retirement lane. `materialize_arrow_stream()` consumes a sequential internal `arrow_batch_source`: each item carries an independently owned batch, a contiguous sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker. The verifier compares the declared row count with the imported batch, sends results directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink failure. Producers acquire preparation/output capacity and split oversized input before returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
 

@@ -20,6 +20,7 @@
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/scan_ingestible.hpp"
 #include "ducklake/unit_descriptor.hpp"
+#include "helper/hugeint.hpp"
 #include "io/io_errors.hpp"
 #include "planner/connector_registry.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -36,6 +37,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <future>
 
@@ -181,28 +183,6 @@ scan::field_id_mapping compile_test(std::shared_ptr<pq::FileMetaData> footer,
   return compile_field_mapping(metadata, "object", program, std::move(fields));
 }
 }  // namespace
-TEST_CASE("DuckLake evolution binds historical defaults without lossy conversion",
-          "[ducklake_units]")
-{
-  using duckdb::LogicalType;
-  using duckdb::Value;
-  auto null = bind_field(4, LogicalType::BIGINT, Value());
-  REQUIRE(null.missing_value);
-  CHECK(null.missing_value->IsNull());
-  CHECK(null.missing_value->type() == LogicalType::BIGINT);
-  auto integer = bind_field(4, LogicalType::BIGINT, Value::INTEGER(-2147483647));
-  REQUIRE(integer.missing_value);
-  CHECK(integer.missing_value->GetValue<int64_t>() == -2147483647);
-  CHECK(integer.allow_int32_to_int64);
-  CHECK_FALSE(integer.allow_float_to_double);
-  CHECK_THROWS(bind_field(4, LogicalType::BIGINT, Value::DOUBLE(1.5)));
-  CHECK_THROWS(bind_field(4, LogicalType::BIGINT, Value("7")));
-  CHECK_THROWS(bind_field(0, LogicalType::BIGINT, Value()));
-  CHECK_THROWS(bind_field(duckdb::MultiFileReader::ROW_ID_FIELD_ID, LogicalType::BIGINT, Value()));
-  auto other = bind_field(4, LogicalType::DOUBLE, Value::DOUBLE(1.5));
-  CHECK(other.missing_value);
-  CHECK(other.allow_float_to_double);
-}
 TEST_CASE("DuckLake stable IDs allow renamed dropped reordered and missing fields",
           "[ducklake_units]")
 {
@@ -358,11 +338,21 @@ TEST_CASE("DuckLake fixed scalar defaults keep exact types and only qualified wi
     REQUIRE(field.missing_value);
     CHECK(field.missing_value->type() == value.type());
     CHECK(Value::NotDistinctFrom(*field.missing_value, value));
+    CHECK(field.allow_float_to_double == (value.type() == LogicalType::DOUBLE));
     auto null = bind_field(4, value.type(), Value());
     REQUIRE(null.missing_value);
     CHECK(null.missing_value->IsNull());
     CHECK(null.missing_value->type() == value.type());
   }
+  auto integer = bind_field(4, LogicalType::BIGINT, Value::INTEGER(-2147483647));
+  REQUIRE(integer.missing_value);
+  CHECK(integer.missing_value->GetValue<int64_t>() == -2147483647);
+  CHECK(integer.allow_int32_to_int64);
+  CHECK_FALSE(integer.allow_float_to_double);
+  CHECK_THROWS(bind_field(4, LogicalType::BIGINT, Value::DOUBLE(1.5)));
+  CHECK_THROWS(bind_field(4, LogicalType::BIGINT, Value("7")));
+  CHECK_THROWS(bind_field(0, LogicalType::BIGINT, Value()));
+  CHECK_THROWS(bind_field(duckdb::MultiFileReader::ROW_ID_FIELD_ID, LogicalType::BIGINT, Value()));
   auto widened = bind_field(4, LogicalType::DOUBLE, Value::FLOAT(1.25f));
   CHECK(widened.allow_float_to_double);
   CHECK(widened.missing_value->GetValue<double>() == 1.25);
@@ -370,7 +360,7 @@ TEST_CASE("DuckLake fixed scalar defaults keep exact types and only qualified wi
   CHECK_THROWS(bind_field(4, LogicalType::UINTEGER, Value::INTEGER(-1)));
   CHECK_THROWS(bind_field(4, LogicalType::INTEGER, Value::BIGINT(7)));
   CHECK_FALSE(fixed_scalar_arrow_format(LogicalType::VARCHAR));
-  CHECK_FALSE(fixed_scalar_arrow_format(LogicalType::DECIMAL(10, 2)));
+  CHECK(fixed_scalar_arrow_format(LogicalType::DECIMAL(10, 2)) == "d:10,2,64");
   CHECK_FALSE(fixed_scalar_arrow_format(LogicalType::TIMESTAMP_NS));
 }
 
@@ -452,8 +442,8 @@ TEST_CASE("DuckLake temporal defaults preserve units and reject adjacent logical
     CHECK_THROWS(bind_field(99, value.type(), Value::BIGINT(-1)));
     CHECK_THROWS(bind_field(99, value.type(), Value("1970-01-01")));
   }
-  CHECK(std::string(fixed_scalar_arrow_format(LogicalType::DATE)) == "tdD");
-  CHECK(std::string(fixed_scalar_arrow_format(LogicalType::TIMESTAMP)) == "tsu:");
+  CHECK(*fixed_scalar_arrow_format(LogicalType::DATE) == "tdD");
+  CHECK(*fixed_scalar_arrow_format(LogicalType::TIMESTAMP) == "tsu:");
   CHECK_THROWS(bind_field(99, LogicalType::TIMESTAMP, Value::DATE(duckdb::date_t(0))));
   for (auto const& type : std::vector<LogicalType>{LogicalType::TIMESTAMP_S,
                                                    LogicalType::TIMESTAMP_MS,
@@ -461,10 +451,7 @@ TEST_CASE("DuckLake temporal defaults preserve units and reject adjacent logical
                                                    LogicalType::TIMESTAMP_TZ,
                                                    LogicalType::TIME,
                                                    LogicalType::TIME_TZ,
-                                                   LogicalType::INTERVAL,
-                                                   LogicalType::DECIMAL(4, 2),
-                                                   LogicalType::DECIMAL(18, 6),
-                                                   LogicalType::DECIMAL(38, 10)}) {
+                                                   LogicalType::INTERVAL}) {
     INFO(type.ToString());
     CHECK_FALSE(fixed_scalar_arrow_format(type));
     CHECK_FALSE(scan::field_mapping_type(type));
@@ -808,4 +795,146 @@ TEST_CASE("DuckLake narrow scans admit without reserving unused string capacity"
     }
   }
   CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("DuckLake decimal mapping requires exact precision and scale",
+          "[ducklake_units][decimal]")
+{
+  using duckdb::LogicalType;
+  using duckdb::Value;
+  auto precision = GENERATE(5, 9, 10, 18, 19, 38);
+  auto type      = LogicalType::DECIMAL(precision, 2);
+  auto value     = Value::DECIMAL(int64_t{-123}, precision, 2);
+  auto field     = bind_field(4, type, value);
+  REQUIRE(field.missing_value);
+  CHECK(Value::NotDistinctFrom(*field.missing_value, value));
+  CHECK_THROWS(bind_field(4, type, Value::DECIMAL(int64_t{123}, precision, 1)));
+  auto footer              = mapping_footer();
+  auto& column             = footer->schema[1];
+  column.type              = precision <= 9    ? pq::Type::INT32
+                             : precision <= 18 ? pq::Type::INT64
+                                               : pq::Type::FIXED_LEN_BYTE_ARRAY;
+  column.type_length       = precision > 18 ? 16 : 0;
+  column.converted_type    = pq::ConvertedType::DECIMAL;
+  column.decimal_precision = precision;
+  column.decimal_scale     = 2;
+  CHECK_NOTHROW(compile_test(footer, {field}));
+  column.decimal_scale = 1;
+  CHECK_THROWS(compile_test(footer, {field}));
+  column.decimal_scale     = 2;
+  column.decimal_precision = precision == 38 ? 37 : precision + 1;
+  CHECK_THROWS(compile_test(footer, {field}));
+  CHECK_NOTHROW(compile_test(mapping_footer(), {bind_field(99, type, value)}));
+  CHECK_NOTHROW(compile_test(mapping_footer(), {bind_field(99, type, Value(type))}));
+}
+
+TEST_CASE("DuckLake inline budgets include wide decimal storage", "[ducklake_units][decimal]")
+{
+  for (size_t columns : {size_t{1}, size_t{3}, size_t{32}}) {
+    auto rows = inline_batch_producer::batch_rows(columns);
+    auto base = inline_batch_producer::batch_capacity(columns);
+    auto wide = inline_batch_producer::batch_capacity(columns, 0, columns);
+    CHECK(wide == base + columns * rows * 8);
+    auto envelope = inline_batch_producer::envelope(columns, 0, columns);
+    CHECK(envelope.temporary.front() == wide);
+  }
+  CHECK_THROWS(inline_batch_producer::batch_capacity(2, 1, 2));
+}
+
+TEST_CASE("DuckLake keeps the engine small decimal admission boundary", "[ducklake_units][decimal]")
+{
+  for (int precision = 1; precision <= 4; ++precision) {
+    auto type = duckdb::LogicalType::DECIMAL(precision, precision);
+    CHECK_FALSE(fixed_scalar_arrow_format(type));
+    CHECK_THROWS(bind_field(4, type, duckdb::Value(type)));
+  }
+}
+
+TEST_CASE("DuckLake scalar layouts preserve decimal Boolean and temporal vector encodings",
+          "[ducklake_units]")
+{
+  using duckdb::LogicalType;
+  using duckdb::Value;
+  auto type     = GENERATE(LogicalType(LogicalType::BOOLEAN),
+                       LogicalType(LogicalType::DATE),
+                       LogicalType(LogicalType::TIMESTAMP),
+                       LogicalType::DECIMAL(5, 2),
+                       LogicalType::DECIMAL(9, 2),
+                       LogicalType::DECIMAL(10, 2),
+                       LogicalType::DECIMAL(18, 2),
+                       LogicalType::DECIMAL(19, 2),
+                       LogicalType::DECIMAL(38, 2));
+  auto encoding = GENERATE(0, 1, 2, 3, 4);
+  CAPTURE(type.ToString(), encoding);
+  auto decimal   = type.id() == duckdb::LogicalTypeId::DECIMAL;
+  auto precision = decimal ? duckdb::DecimalType::GetWidth(type) : 0;
+  inline_column_layout layout(type);
+  if (decimal) {
+    CHECK(layout.decimal_precision == precision);
+    CHECK(layout.storage_bytes == (precision > 18 ? 16 : 8));
+  }
+  duckdb::Vector flat(type, 13);
+  for (int row = 0; row < 13; ++row) {
+    auto value = decimal ? Value::DECIMAL(int64_t{(row - 6) * 123}, precision, 2)
+                 : type == LogicalType::BOOLEAN ? Value::BOOLEAN(row % 2 == 0)
+                 : type == LogicalType::DATE
+                   ? Value::DATE(duckdb::date_t{row - 6})
+                   : Value::TIMESTAMP(duckdb::timestamp_t{(row - 6) * 1000001LL});
+    flat.Append(row % 4 == 1 ? Value(type) : value);
+  }
+  duckdb::SelectionVector selected(13), outer(13);
+  for (size_t row = 0; row < 13; ++row) {
+    selected.set_index(row, row * 5 % 13);
+    outer.set_index(row, (row + 3) % 13);
+  }
+  duckdb::Vector dictionary(flat, selected, 13);
+  duckdb::Vector nested(dictionary, outer, 13);
+  duckdb::Vector constant(flat.GetValue(2), duckdb::count_t(13));
+  duckdb::Vector null(Value(type), duckdb::count_t(13));
+  auto const& source = encoding == 0   ? flat
+                       : encoding == 1 ? dictionary
+                       : encoding == 2 ? nested
+                       : encoding == 3 ? constant
+                                       : null;
+  std::array<std::byte, 192> values{};
+  std::array<uint8_t, 2> validity{};
+  auto nulls            = layout.copy_fixed_values(source, 1, 12, values.data(), validity.data());
+  size_t expected_nulls = 0;
+  for (size_t row = 0; row < 12; ++row) {
+    auto expected = source.GetValue(row + 1);
+    CHECK(bool(validity[row / 8] & (1u << (row % 8))) == !expected.IsNull());
+    if (expected.IsNull()) {
+      ++expected_nulls;
+      continue;
+    }
+    if (type == LogicalType::BOOLEAN) {
+      auto actual = (std::to_integer<uint8_t>(values[row / 8]) >> (row % 8)) & 1;
+      CHECK(bool(actual) == expected.GetValue<bool>());
+    } else {
+      __int128_t actual = 0;
+      if (layout.value_bytes == 4) {
+        int32_t value;
+        std::memcpy(&value, values.data() + row * 4, 4);
+        actual = value;
+      } else if (layout.value_bytes == 8) {
+        int64_t value;
+        std::memcpy(&value, values.data() + row * 8, 8);
+        actual = value;
+      } else
+        std::memcpy(&actual, values.data() + row * 16, 16);
+      auto expected_value = decimal ? sirius::to_int128(duckdb::IntegralValue::Get(expected))
+                            : type == LogicalType::DATE
+                              ? duckdb::DateValue::Get(expected).days
+                              : duckdb::TimestampValue::Get(expected).value;
+      CHECK(actual == expected_value);
+    }
+  }
+  CHECK(nulls == expected_nulls);
+  CHECK((validity[1] & 0xf0) == 0);
+  CHECK(layout.copy_fixed_values(source, 13, 0, values.data(), validity.data()) == 0);
+  CHECK_THROWS(layout.copy_fixed_values(source, 12, 2, values.data(), validity.data()));
+  if (decimal) {
+    inline_column_layout other(LogicalType::DECIMAL(precision, 1));
+    CHECK_THROWS(other.copy_fixed_values(source, 0, 1, values.data(), validity.data()));
+  }
 }

@@ -32,7 +32,9 @@ class scan_ingestible final : public op::scan::gpu_ingestible {
                   bool count_only,
                   unit_scan_options);
   ~scan_ingestible();
-  static scan_manager::unit_envelope envelope(size_t columns, size_t string_columns);
+  static scan_manager::unit_envelope envelope(size_t columns,
+                                              size_t string_columns,
+                                              size_t wide_columns = 0);
   void preflight_for_query() override;
   bool has_processed_all_metadata() const override;
   metadata_scan_task_t next_split_provider(io::ioctx_resolver) override;

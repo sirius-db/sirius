@@ -23,8 +23,8 @@ op::scan::field_requirement bind_field(int32_t id,
                                        duckdb::LogicalType const& type,
                                        duckdb::Value const& initial_default);
 // Fixed scalar intersection of provider, mapper and owned Arrow importer.
-// nullptr denotes a type outside the current inline/default profile.
-char const* fixed_scalar_arrow_format(duckdb::LogicalType const&);
+// An empty optional denotes a type outside the inline/default profile.
+std::optional<std::string> fixed_scalar_arrow_format(duckdb::LogicalType const&);
 // Empty means all bound columns; repeated/out-of-range source indices are invalid.
 std::vector<size_t> required_field_indices(size_t bound_count, std::vector<size_t> selected);
 // Stable-ID top-level scalar selections; name maps and visibility are gated by the unit.

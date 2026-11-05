@@ -675,9 +675,10 @@ TEST_CASE("Arrow push rejects schema and bound drift before waiting", "[arrow_dr
   auto error = capture_rejection([&] { q->offer(offered); });
   auto drift = mode == 0 || mode == 4;
   std::string expected =
-    mode == 0 ? "Arrow offered schema drift"
-              : (mode == 3 || mode == 5 ? "unsupported or invalid arrow_host_flat_v1 input"
-                                        : "Arrow offered input exceeds its declared bounds");
+    (mode == 0 || mode == 4)
+      ? "Arrow schema does not match its bound program"
+      : (mode == 3 || mode == 5 ? "unsupported or invalid arrow_host_flat_v1 input"
+                                : "Arrow offered input exceeds its declared bounds");
   check_physical_failure(error, expected, drift);
   CHECK(reported == error);
   check_physical_failure(reported, expected, drift);
@@ -990,14 +991,20 @@ TEST_CASE("Arrow push copies nullable Boolean slices and bound decimal precision
 TEST_CASE("Arrow push refuses decimal precision drift even when the scale matches",
           "[arrow_driver][fw_s4]")
 {
+  auto bits = GENERATE(32, 64, 128);
+  CAPTURE(bits);
   auto track_units           = GENERATE(false, true);
   auto counters              = make_counters(track_units);
   auto program               = integer_program();
-  program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL128, -2}};
+  program.output_types       = {cudf::data_type{bits == 32   ? cudf::type_id::DECIMAL32
+                                                : bits == 64 ? cudf::type_id::DECIMAL64
+                                                             : cudf::type_id::DECIMAL128,
+                                                -2}};
   program.input_types        = program.output_types;
-  program.decimal_precisions = {9};
+  program.decimal_precisions = {8};
   auto owner                 = std::make_shared<integer_tree>(0);
-  owner->field.format        = "d:10,2";
+  auto format                = "d:9,2," + std::to_string(bits);
+  owner->field.format        = format.c_str();
   int failures               = 0;
   std::exception_ptr reported;
   auto q = queue(counters, program, [&](auto error) {
@@ -1005,9 +1012,14 @@ TEST_CASE("Arrow push refuses decimal precision drift even when the scale matche
     reported = error;
   });
   harness h(counters, q, program);
-  auto error = capture_rejection([&] { q->offer(owner->offer(owner)); });
+  auto offered = std::async(
+    std::launch::async, [&] { return capture_rejection([&] { q->offer(owner->offer(owner)); }); });
+  auto status = offered.wait_for(2s);
+  if (status != std::future_status::ready) q->cancel();
+  auto error = offered.get();
+  REQUIRE(status == std::future_status::ready);
   CHECK(reported == error);
-  check_physical_failure(error, "Arrow offered decimal precision drift", true);
+  check_physical_failure(error, "Arrow decimal precision does not match its bound program", true);
   CHECK(failures == 1);
   CHECK(h.profiles->counters == counters);
   CHECK(counters->arrow_schema_drift_refusals == 1);

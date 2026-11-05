@@ -159,9 +159,11 @@ scan_ingestible::scan_ingestible(std::shared_ptr<binding_handle> binding,
     });
 }
 scan_ingestible::~scan_ingestible() = default;
-sm::unit_envelope scan_ingestible::envelope(size_t columns, size_t string_columns)
+sm::unit_envelope scan_ingestible::envelope(size_t columns,
+                                            size_t string_columns,
+                                            size_t wide_columns)
 {
-  auto result              = inline_batch_producer::envelope(columns, string_columns);
+  auto result              = inline_batch_producer::envelope(columns, string_columns, wide_columns);
   result.temporary.front() = std::max<uint64_t>(dv_max_file_bytes, result.temporary.front());
   result.retained = 14 * dv_max_footer_bytes + 512 + 4 * dv_max_positions * sizeof(int64_t);
   return result;

@@ -43,7 +43,7 @@ std::vector<size_t> required_field_indices(size_t bound_count, std::vector<size_
       throw std::invalid_argument("DuckLake required column index is invalid or repeated");
   return selected;
 }
-char const* fixed_scalar_arrow_format(duckdb::LogicalType const& type)
+std::optional<std::string> fixed_scalar_arrow_format(duckdb::LogicalType const& type)
 {
   using D = duckdb::LogicalTypeId;
   switch (type.id()) {
@@ -60,33 +60,40 @@ char const* fixed_scalar_arrow_format(duckdb::LogicalType const& type)
     case D::DOUBLE: return "g";
     case D::DATE: return "tdD";
     case D::TIMESTAMP: return "tsu:";
-    default: return nullptr;
+    case D::DECIMAL: {
+      if (duckdb::DecimalType::GetWidth(type) < 5) return std::nullopt;
+      auto mapped = scan::field_mapping_type(type);
+      if (!mapped) return std::nullopt;
+      return "d:" + std::to_string(duckdb::DecimalType::GetWidth(type)) + "," +
+             std::to_string(duckdb::DecimalType::GetScale(type)) + "," +
+             std::to_string(8 * cudf::size_of(*mapped));
+    }
+    default: return std::nullopt;
   }
 }
 scan::field_requirement bind_field(int32_t id,
                                    duckdb::LogicalType const& type,
                                    duckdb::Value const& initial_default)
 {
-  if (id <= 0 || internal_id(id) || !scan::field_mapping_type(type))
+  if (id <= 0 || internal_id(id) ||
+      (!fixed_scalar_arrow_format(type) && type != duckdb::LogicalType::VARCHAR))
     throw std::invalid_argument("DuckLake field requires a qualified scalar type and user ID");
   scan::field_requirement result{id, type, std::nullopt};
   // Fixed scalars and exact VARCHAR values receive default approval. Values are
   // copied exactly; the two explicit widening pairs are shared mapper operations.
-  if (fixed_scalar_arrow_format(type) || type == duckdb::LogicalType::VARCHAR) {
-    result.allow_int32_to_int64  = type == duckdb::LogicalType::BIGINT;
-    result.allow_float_to_double = type == duckdb::LogicalType::DOUBLE;
-    if (initial_default.IsNull())
-      result.missing_value = duckdb::Value(type);
-    else if (initial_default.type() == type)
-      result.missing_value = initial_default;
-    else if (result.allow_int32_to_int64 && initial_default.type() == duckdb::LogicalType::INTEGER)
-      result.missing_value = duckdb::Value::BIGINT(initial_default.GetValue<int32_t>());
-    else if (result.allow_float_to_double && initial_default.type() == duckdb::LogicalType::FLOAT)
-      result.missing_value = duckdb::Value::DOUBLE(initial_default.GetValue<float>());
-    else
-      throw std::invalid_argument(
-        "DuckLake initial default requires an exact or qualified widening value");
-  }
+  result.allow_int32_to_int64  = type == duckdb::LogicalType::BIGINT;
+  result.allow_float_to_double = type == duckdb::LogicalType::DOUBLE;
+  if (initial_default.IsNull())
+    result.missing_value = duckdb::Value(type);
+  else if (initial_default.type() == type)
+    result.missing_value = initial_default;
+  else if (result.allow_int32_to_int64 && initial_default.type() == duckdb::LogicalType::INTEGER)
+    result.missing_value = duckdb::Value::BIGINT(initial_default.GetValue<int32_t>());
+  else if (result.allow_float_to_double && initial_default.type() == duckdb::LogicalType::FLOAT)
+    result.missing_value = duckdb::Value::DOUBLE(initial_default.GetValue<float>());
+  else
+    throw std::invalid_argument(
+      "DuckLake initial default requires an exact or qualified widening value");
   return result;
 }
 scan::field_id_mapping compile_field_mapping(std::shared_ptr<scan::parquet_metadata const> metadata,
@@ -143,11 +150,12 @@ scan::field_id_mapping compile_field_mapping(std::shared_ptr<scan::parquet_metad
                                           internal_fields,
                                           scan::field_mapping_scope::top_level_scalars);
   }
-  return scan::field_id_mapping::compile(std::move(metadata),
-                                         identity,
-                                         std::move(program),
-                                         std::move(fields),
-                                         scan::field_mapping_scope::top_level_scalars,
-                                         scan::row_count_carrier_policy::include_temporal);
+  return scan::field_id_mapping::compile(
+    std::move(metadata),
+    identity,
+    std::move(program),
+    std::move(fields),
+    scan::field_mapping_scope::top_level_scalars,
+    scan::row_count_carrier_policy::include_temporal_and_decimal);
 }
 }  // namespace sirius::ducklake

@@ -19,6 +19,19 @@
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
 namespace sirius::ducklake {
 class binding_handle;
+// One bound column layout drives both detached storage and scalar export.
+struct inline_column_layout {
+  explicit inline_column_layout(duckdb::LogicalType type);
+  duckdb::LogicalType type;
+  cudf::data_type device_type;
+  std::string format;
+  size_t value_bytes, storage_bytes;
+  int decimal_precision;
+  bool is_string() const { return type == duckdb::LogicalType::VARCHAR; }
+  // Destination values and validity must be zeroed and sized for count rows.
+  size_t copy_fixed_values(
+    duckdb::Vector const&, size_t offset, size_t count, std::byte* values, uint8_t* validity) const;
+};
 struct unit_scan_options;
 // Reads on the original query owner and detaches each admitted Arrow input.
 class inline_batch_producer final : public op::scan::arrow_batch_producer {
@@ -29,8 +42,12 @@ class inline_batch_producer final : public op::scan::arrow_batch_producer {
   static constexpr size_t max_string_bytes  = 1024 * 1024;
   static constexpr size_t max_staging_bytes = 64 * 1024;
   static size_t batch_rows(size_t columns);
-  static uint64_t batch_capacity(size_t columns, size_t string_columns = 0);
-  static scan_manager::unit_envelope envelope(size_t columns, size_t string_columns = 0);
+  static uint64_t batch_capacity(size_t columns,
+                                 size_t string_columns = 0,
+                                 size_t wide_columns   = 0);
+  static scan_manager::unit_envelope envelope(size_t columns,
+                                              size_t string_columns = 0,
+                                              size_t wide_columns   = 0);
   scan_manager::preparation_execution_domain execution_domain() const noexcept override;
   op::scan::arrow_producer_limits limits() const override;
   void preflight() override;
