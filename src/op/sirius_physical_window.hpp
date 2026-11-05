@@ -42,6 +42,12 @@ class sirius_physical_window : public sirius_physical_operator {
  public:
   static constexpr auto TYPE = SiriusPhysicalOperatorType::WINDOW;
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    // Hash buckets do not preserve the input's global sequence.
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   /// A window of aggregates over the whole partition.
   sirius_physical_window(duckdb::vector<logical_type> output_types,
                          duckdb::vector<logical_type> prepared_types,

@@ -1963,10 +1963,22 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
       wrap_dense_count_join(*slot, compressed_materialization_observer);
       break;
-    case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT:
+    case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT: {
       // Children are fully expanded: global ORDER BY/TOP N now end in their merge operators.
       // An unresolved INSERTION_ORDER leaf is not proof of unordered input.
-      if (slot->children.at(0)->output_order() == sirius::OrderPreservationType::NO_ORDER) {
+      auto const has_inline_replicate = [](sirius::op::sirius_physical_operator const& input) {
+        auto const* current = &input;
+        while (!current->is_source()) {
+          if (current->type == sirius::op::SiriusPhysicalOperatorType::REPLICATE) { return true; }
+          if (current->children.size() != 1) { break; }
+          current = current->children.front().get();
+        }
+        return false;
+      };
+      // REPLICATE can return several batches in one task, including through projection/filter.
+      // The barrier publishes them separately so LIMIT's one-batch claims remain valid.
+      if (slot->children.at(0)->output_order() == sirius::OrderPreservationType::NO_ORDER &&
+          !has_inline_replicate(*slot->children.at(0))) {
         auto& limit      = slot->Cast<sirius::op::sirius_physical_streaming_limit>();
         auto replacement = duckdb::make_uniq<sirius::op::sirius_physical_unordered_streaming_limit>(
           limit.types,
@@ -1992,6 +2004,7 @@ void insert_gpu_pipeline_operators_recursive(
         return sink;
       });
       break;
+    }
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:

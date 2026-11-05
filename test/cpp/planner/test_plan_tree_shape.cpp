@@ -2856,3 +2856,24 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(limit->output_order() == sirius::OrderPreservationType::NO_ORDER);
   }
 }
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "limit separates a replicate task's output batches before claiming rows",
+                 "[plan_tree_shape][ordering][isolated_context]")
+{
+  for (auto const& projection : {std::string("id"), std::string("id + 1")}) {
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT " + projection +
+        " FROM (SELECT id FROM big_left EXCEPT ALL SELECT rid FROM small_right) t LIMIT 7");
+    INFO(tree_to_string(plan.get()));
+    REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::REPLICATE));
+    REQUIRE_FALSE(find_first(plan.get(), SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT));
+    auto* limit = find_first(plan.get(), SiriusPhysicalOperatorType::STREAMING_LIMIT);
+    REQUIRE(limit);
+    REQUIRE(limit->children.size() == 1);
+    auto* boundary = limit->children.front().get();
+    REQUIRE(boundary->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+    CHECK(limit->input_barrier_for(*boundary) == sirius::op::MemoryBarrierType::FULL);
+  }
+}

@@ -1220,7 +1220,7 @@ TEST_CASE("refresh_cross_schedule rejects a SEMI or MARK build partition that is
   f.hash_join->operator_id = 1;
   cucascade::shared_data_repository build_repo;
   cucascade::shared_data_repository probe_repo;
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_pipeline>(ctx);
   for (auto [name, repo] : {std::pair{"build", &build_repo}, std::pair{"default", &probe_repo}}) {
     auto port          = std::make_unique<sirius::op::sirius_physical_operator::port>();

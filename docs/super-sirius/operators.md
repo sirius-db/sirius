@@ -60,12 +60,15 @@ per-batch sorting; their expanded global result is established by `MERGE_SORT` a
 The planner can query `limit.children[0]->output_order()` before choosing a LIMIT implementation
 and its pipeline boundary. The planner chooses `UNORDERED_STREAMING_LIMIT` only for a resolved `NO_ORDER`;
 `FIXED_ORDER` and unresolved `INSERTION_ORDER` retain `STREAMING_LIMIT` and its full barrier.
+An inline `REPLICATE` also retains that barrier: it can emit several batches per task, and
+publication separates them for LIMIT's one-batch claims.
 
 | Operator | `output_order_preservation()` |
 |---|---|
 | MERGE_SORT, MERGE_TOP_N | `FIXED_ORDER` |
 | ORDER_BY (local sort), TOP_N (local top-N), SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
 | PARTITION, CONCAT, UNION | `NO_ORDER` |
+| WINDOW, REPLICATE | `NO_ORDER` |
 | HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN, LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN | `NO_ORDER` |
 | HASH_GROUP_BY, UNGROUPED_AGGREGATE, MERGE_GROUP_BY, MERGE_AGGREGATE | `NO_ORDER` |
 | GPU_SCAN, UNORDERED_STREAMING_LIMIT | `NO_ORDER` |

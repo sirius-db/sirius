@@ -489,7 +489,7 @@ TEST_CASE("MARK join runs an orphan task issued before the empty-build latch",
   auto f          = create_mark_join();
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -1268,7 +1268,7 @@ TEST_CASE(
   auto f          = create_mark_join();
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -1384,7 +1384,7 @@ TEST_CASE(
   auto f          = create_mark_join();
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -1759,7 +1759,7 @@ TEST_CASE("Nested-loop floating comparisons follow DuckDB NaN and NULL semantics
   };
   auto const type = single_precision ? LogicalType::FLOAT : LogicalType::DOUBLE;
   auto child      = [&] {
-    return duckdb::make_uniq<sirius_physical_operator>(
+    return duckdb::make_uniq<test_physical_operator>(
       SiriusPhysicalOperatorType::PROJECTION,
       sirius::from_duckdb_vec(duckdb::vector<LogicalType>{type, LogicalType::INTEGER}),
       domain.size());
