@@ -333,27 +333,27 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 - **Joins:** a nested-loop join that emits unmatched build rows, and a delim join whose join
   keys are not its delim columns, are refused rather than run per rank.
 - **Remote files:** an S3 table needs at least as many files as there are ranks; local files
-  split by byte range have no such limit.
+  split by byte range have no such limit (#2377).
 - **Query start:** every rank must run the same statements in the same order, which is what
   numbers the exchanges' streams. So one connection per process runs distributed queries; another
   connection's distributed query is refused until that one closes. With `max_concurrent_queries`
-  above 1, other connections can run local queries alongside it.
+  above 1, other connections can run local queries alongside it (#2378).
 - **Unspillable buffers:** an unordered `EXCHANGE_SOURCE` queues arrivals in its port's
   repository, where they spill like any port's batches. Arrivals before the port is wired, an
   ordered gather's batches, and batches held for a stream not yet attached stay outside any
   repository and cannot spill. Sends block once a rank's queued sends exceed 1 GiB
-  (`transport::options::max_queued_bytes`).
+  (`transport::options::max_queued_bytes`; #2376).
 - **Blocking collectives:** `SORT_SAMPLE` and Bloom merges block a GPU worker thread until every
-  rank's contribution arrives.
+  rank's contribution arrives (#2375).
 - **Failures:** a query that fails on one rank (an error, an exhausted retry) is aborted on every
   rank: the rank tells its peers (`exchange_service::abort`), and each fails that query's sources
   and all-gathers at once instead of waiting; the next query runs normally. A lost peer or a
   failed transport is fail-stop: every later distributed query fails, saying the transport failed
   earlier, and nothing reconnects. To recover, restart every rank: a restarted rank alone cannot
   reconnect to peers whose transport failed, and its `SET sirius_exchange_rank` fails after the
-  2-minute connect timeout.
+  2-minute connect timeout (#2373).
 - **Hosts:** every run so far used one host. Ranks on several hosts, and networks without RDMA,
-  are untested.
+  are untested (#2372).
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
 - **Ring memory:** the rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU (192 MiB at 2 ranks,
