@@ -24,6 +24,7 @@
 #include "op/dynamic_filter/dynamic_filter_replica_transfer.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/pool_peer_access_requirement.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cudf/filling.hpp>
@@ -219,6 +220,8 @@ TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
   auto replica_spaces = get_replica_spaces(*memory_manager, device_count);
   if (!sirius::memory::try_grant_pool_access(replica_spaces.front().get_gpu_space(), 1) ||
       !sirius::memory::try_grant_pool_access(replica_spaces.front().get_gpu_space(), 2)) {
+    sirius::test::fail_if_pool_peer_access_required(
+      "dynamic-filter overlap test requires source-pool access from GPUs 1 and 2");
     WARN(
       "dynamic-filter overlap test requires source-pool access from GPUs 1 and 2; "
       "skipping");
