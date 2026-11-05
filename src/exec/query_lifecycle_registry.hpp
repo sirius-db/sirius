@@ -267,22 +267,19 @@ class query_lifecycle_registry {
   /// Does not wait for work (safe inside workers) or replace the caller's original exception.
   bool report_failure(std::exception_ptr error, std::optional<query_id_t> id = {}) noexcept
   {
-    auto status         = fatal_device_status(error);
-    bool const unjoined = is_unjoined_gpu_work(error);
-    if (!status && !unjoined) {
-      if (id) record_error(*id, error);
-      return false;
-    }
-    if (unjoined) {
+    std::optional<cudaError_t> status;
+    bool unjoined = false;
+    try {
+      if (error) std::rethrow_exception(error);
+    } catch (unjoined_gpu_work const& failure) {
+      unjoined = true;
       unsafe_completion_.store(true, std::memory_order_release);
-      try {
-        std::rethrow_exception(error);
-      } catch (unjoined_gpu_work const& failure) {
-        if (failure.error_code() != cudaSuccess) status = failure.error_code();
-      } catch (...) {
-      }
+      if (failure.error_code() != cudaSuccess) status = failure.error_code();
+    } catch (...) {
+      status = fatal_device_status(error);
     }
     if (id) record_error(*id, error);
+    if (!status && !unjoined) return false;
     // Format outside the registry lock. Retain text/status, not an exception_ptr
     // whose custom exception could keep query resources alive after retirement.
     auto message = exception_message(error);
