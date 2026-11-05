@@ -217,6 +217,8 @@ void walk(column_metadata const& c, std::vector<stream_buffer>& out)
 
 }  // namespace
 
+bool sendable(cudf::data_type type) { return is_string(type.id()) || is_fixed_width(type.id()); }
+
 std::vector<std::uint8_t> encode_header(batch_header const& header)
 {
   std::vector<std::uint8_t> out(magic.begin(), magic.end());
@@ -306,7 +308,7 @@ std::vector<column_metadata> plan_stream(cudf::table_view const& table,
   columns.reserve(table.num_columns());
   for (auto const& col : table) {
     auto const id = col.type().id();
-    if (!is_string(id) && !is_fixed_width(id)) {
+    if (!sendable(col.type())) {
       throw sirius::invalid_input_exception("exchange cannot send type id {}",
                                             static_cast<std::int32_t>(id));
     }
