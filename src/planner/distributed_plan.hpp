@@ -42,21 +42,19 @@ namespace sirius::planner {
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of
  * @p service, each over its own share of the scanned files.
  *
- * Exchanges go where the single-process plan already partitions:
- * - a hash join: both sides hash-exchanged on the join keys, below each side's PARTITION;
- * - a grouped aggregate: partial results hash-exchanged on the group keys, before the merge;
- * - an ungrouped aggregate: partial results gathered to rank 0, before the merge;
- * - an ORDER BY: rows range-exchanged after SORT_SAMPLE, whose boundaries every rank agrees on;
- * - the result: gathered to rank 0, ordered by rank after an ORDER BY.
- * Rank 0's result is the query's; the other ranks' are empty, or meaningless after a gather.
+ * Exchanges go where the single-process plan already partitions; "The plan rewrite" in
+ * docs/super-sirius/distributed-sirius.md lists every plan shape and its exchange. Rank 0's
+ * result is the query's; the other ranks' are empty, or meaningless after a gather.
  *
- * Every rank must plan the same query: the plan's shape is compared across ranks, and a
- * mismatch fails the query on every rank.
+ * Every rank must plan the same query: before returning, this blocks until every rank of
+ * @p service has planned it, comparing the plans' shapes in an all-gather.
  *
  * @param query This query's number, the same on every rank: its exchanges' stream ids.
  * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
  * @throws sirius::not_implemented_exception on an operator distributed execution does not
- *         support, rather than a wrong answer.
+ *         support, rather than a wrong answer; this rank throws before the all-gather.
+ * @throws sirius::invalid_input_exception when another rank planned a different shape, on every
+ *         rank.
  */
 void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,
