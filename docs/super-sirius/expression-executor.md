@@ -267,6 +267,14 @@ FILTER drops. The planner marks this CASE `eager`. An eager CASE evaluates its W
 rather than a predicate, evaluates every branch on every row, and does not retry. A CASE inside `x`
 still retries on its own, as DuckDB evaluates it lazily.
 
+DuckDB also computes a derived table's columns on every row in their own projection, so in
+`SELECT CASE WHEN n < 100 THEN x ELSE a END FROM (SELECT a, n, a + n AS x FROM t)` the sum `a + n`
+raises for every row. [Projection folding](physical-plan-generation.md#projection-folding) would
+substitute `a + n` into the THEN, where it sees only some rows. It therefore keeps an inner
+expression other than a column or a constant in its own projection when the outer one reads it in
+a slot that may skip rows: a THEN, an ELSE, a WHEN after the first, a COALESCE argument after the
+first, or an AND or OR operand after the first inside a WHEN.
+
 Handlers that read an operand as a column evaluate it with `evaluate_as_column`, which broadcasts
 a scalar result to the input's row count. These are the date parts (including `millisecond` and
 `microsecond`), `date_trunc`, `round`, the string functions `strlen`, `length`, `upper`, `lower`,

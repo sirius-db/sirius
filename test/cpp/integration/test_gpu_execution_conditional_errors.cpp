@@ -212,3 +212,38 @@ TEST_CASE_METHOD(ConditionalErrorsFixture,
   compare_gpu_vs_cpu(
     "SELECT max(CASE WHEN n < 100 THEN a + n END) FILTER (WHERE id <> 2) FROM dates");
 }
+
+TEST_CASE_METHOD(ConditionalErrorsFixture,
+                 "a derived table's column raises errors for every row, as in DuckDB",
+                 "[integration][gpu_execution][conditional_errors]")
+{
+  strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  // DuckDB computes a derived table's columns on every row before the CASE or COALESCE above
+  // reads them, so x raises on id 1 whichever branch reads it. Projection folding must not move
+  // a + n into the branch.
+  run_ok("CREATE TABLE dates(id INTEGER, a DATE, n INTEGER)");
+  run_ok(
+    "INSERT INTO dates VALUES (1, '2000-01-01', 2147483647), (2, '2000-01-01', 1), "
+    "(3, '2000-01-01', -5)");
+  run_ok("CREATE TABLE ints(id INTEGER, i INTEGER)");
+  run_ok("INSERT INTO ints VALUES (1, -2147483648), (2, 1), (3, 7)");
+  run_ok("CHECKPOINT");
+
+  std::string const derived = " FROM (SELECT id, a, n, a + n AS x FROM dates) s";
+  expect_error("SELECT CASE WHEN n < 100 THEN x ELSE a END" + derived, "Date out of range");
+  expect_error("SELECT CASE WHEN n > 100 THEN a ELSE x END" + derived, "Date out of range");
+  expect_error("SELECT CASE WHEN n > 100 THEN 0 WHEN x > a THEN 1 ELSE 2 END" + derived,
+               "Date out of range");
+  expect_error("SELECT CASE WHEN n < 100 AND x > a THEN 1 ELSE 0 END" + derived,
+               "Date out of range");
+  expect_error("SELECT CASE WHEN x > a THEN 1 ELSE 0 END" + derived, "Date out of range");
+  expect_error("SELECT COALESCE(a, x)" + derived, "Date out of range");
+  expect_error("SELECT sum(CASE WHEN n < 100 THEN x - a ELSE 0 END)" + derived,
+               "Date out of range");
+  expect_error(
+    "SELECT CASE WHEN i > -2147483648 THEN m ELSE 0 END FROM (SELECT id, i, -i AS m FROM ints) s",
+    "Overflow in negation");
+  // A derived column that raises on no row returns the same values.
+  compare_gpu_vs_cpu(
+    "SELECT id, CASE WHEN n < 100 THEN m ELSE 0 END FROM (SELECT id, n, n < 50 AS m FROM dates) s");
+}
