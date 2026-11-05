@@ -216,16 +216,16 @@ void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
 
 /**
  * @brief Distributed: the keys every rank sizes each admitted key's Bloom for, alike on every rank
- * and on either publication path, so the Blooms merge. While a key merges, a rank holds every key's
- * Bloom, the copy it sends and the world - 1 gathered ones, so the cap is shared among that many
- * arrays. 0: no Bloom fits.
+ * and on either publication path, so the Blooms merge. The cap is shared among the admitted keys'
+ * Blooms only. A merge also holds the copy it sends and the world - 1 gathered ones for a moment;
+ * counting those too cut a 73M-row SF1000 build to ~10 bits per key and cost Q03 7% on 2 GPUs, so
+ * they wait for the streaming OR (#2375). 0: no Bloom fits.
  */
 std::size_t distributed_bloom_keys(dynamic_filter_publish_plan const& plan)
 {
-  auto const& d = *plan.distributed();
-  return std::min(d.bloom_keys,
-                  bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(),
-                                        plan.admitted_keys().size() + d.service->world_size()));
+  return std::min(
+    plan.distributed()->bloom_keys,
+    bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), plan.admitted_keys().size()));
 }
 
 }  // namespace
