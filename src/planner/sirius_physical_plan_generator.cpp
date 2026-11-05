@@ -2443,7 +2443,12 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_scan_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
-  if (sirius_ctx && op_params.distributed()) {
+  if (op_params.distributed()) {
+    // The scans above took this rank's share; without the exchanges each rank's answer is partial.
+    if (!sirius_ctx) {
+      throw sirius::internal_exception(
+        "distributed execution: sirius_exchange_peers set on a connection without Sirius state");
+    }
     auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
     sirius::planner::distribute_plan(plan,
                                      sirius_ctx->get_exchange_service(op_params),
