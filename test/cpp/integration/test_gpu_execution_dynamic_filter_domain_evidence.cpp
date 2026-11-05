@@ -54,6 +54,9 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
     : gpu_on(*con, "gpu_execution", true),
       native_keys(*con, "enable_compressed_materialization", false),
       zone_maps_off(*con, "enable_dynamic_zone_map_filter", false),
+      // Every build key here is distinct, so pin-time proofs would make each pinned key eligible
+      // and hide whether a declaration did. Tests of the proof path enable it themselves.
+      no_pin_proofs(*con, "pin_table_prove_unique_keys", false),
       shape(*con, "statistics_propagation,join_order,build_side_probe_side")
   {
     write("probe.parquet",
@@ -189,6 +192,7 @@ class DomainEvidenceFixture : public sirius::test::GpuExecutionFixture {
   scoped_sirius_setting gpu_on;
   scoped_sirius_setting native_keys;
   scoped_sirius_setting zone_maps_off;
+  scoped_sirius_setting no_pin_proofs;
   sirius::test::disabled_optimizers_guard shape;
 };
 
@@ -254,6 +258,22 @@ TEST_CASE_METHOD(DomainEvidenceFixture,
   {
     pin("build.parquet", tier, declaration::none);
     check(query(directory.file_literal("build.parquet"), 95), {.rows = 190}, {"build.parquet"});
+  }
+  SECTION("a pin-time uniqueness proof gates without a declaration")
+  {
+    // The planner keeps one proven column per scan, so `k` must be the only distinct output.
+    write("proven.parquet",
+          "SELECT (i % 10)::BIGINT AS payload, (i * 1000003 + 7)::BIGINT AS k, "
+          "((i % 5) * 1000003 + 7)::BIGINT AS other, i::INTEGER AS marker FROM range(100) t(i)");
+    scoped_sirius_setting proofs(*con, "pin_table_prove_unique_keys", true);
+    pin("proven.parquet", tier, declaration::none);
+    check(query(directory.file_literal("proven.parquet"), 95),
+          {.rows = 190, .gated = true},
+          {"proven.parquet"});
+    // `other` repeats values, so the pin cannot prove it.
+    check(query(directory.file_literal("proven.parquet"), 95, "other"),
+          {.rows = 190},
+          {"proven.parquet"});
   }
   SECTION("a declaration for k cannot gate the other source column")
   {
