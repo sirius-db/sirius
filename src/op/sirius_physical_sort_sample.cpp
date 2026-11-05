@@ -402,25 +402,35 @@ void sirius_physical_sort_sample::compute_distributed_boundaries(
   auto const world = d.service->world_size();
   auto const rank  = d.service->rank();
 
-  // 1. This rank's summary: up to distributed_summary_rows evenly spaced rows of its sample.
-  std::shared_ptr<::cucascade::data_batch> summary;
-  if (auto const rows = sample_keys.num_rows(); rows > 0) {
-    auto const take = std::min<std::size_t>(rows, distributed_summary_rows);
-    std::vector<int32_t> indices(take);
-    for (std::size_t i = 0; i < take; ++i) {
-      indices[i] = static_cast<int32_t>(i * static_cast<std::size_t>(rows) / take);
+  if (!_gathered) {
+    // A gather that failed part way left the peers past it; a retry would wait out the timeout.
+    if (_gather_entered) {
+      throw sirius::internal_exception(
+        "[sort_sample] the boundary all-gather failed part way and cannot be retried");
     }
-    auto const column = index_column(indices, stream, mr);
-    summary           = make_data_batch(
-      cudf::gather(sample_keys, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr),
-      gpu,
-      stream,
-      batch_telemetry());
-  }
+    // 1. This rank's summary: up to distributed_summary_rows evenly spaced rows of its sample.
+    std::shared_ptr<::cucascade::data_batch> summary;
+    if (auto const rows = sample_keys.num_rows(); rows > 0) {
+      auto const take = std::min<std::size_t>(rows, distributed_summary_rows);
+      std::vector<int32_t> indices(take);
+      for (std::size_t i = 0; i < take; ++i) {
+        indices[i] = static_cast<int32_t>(i * static_cast<std::size_t>(rows) / take);
+      }
+      auto const column = index_column(indices, stream, mr);
+      summary           = make_data_batch(
+        cudf::gather(
+          sample_keys, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr),
+        gpu,
+        stream,
+        batch_telemetry());
+    }
 
-  // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
-  // TODO(#2375): all_gather blocks this GPU worker thread until every rank's summary arrives.
-  auto gathered = exchange::all_gather(*d.service, d.stream, summary, gpu, stream.get());
+    // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
+    // TODO(#2375): all_gather blocks this GPU worker thread until every rank's summary arrives.
+    _gather_entered = true;
+    _gathered       = exchange::all_gather(*d.service, d.stream, summary, gpu, stream.get());
+  }
+  auto const& gathered = *_gathered;
   std::vector<::cucascade::read_only_data_batch> parts;
   for (auto const& g : gathered) {
     if (g) { parts.push_back(g->to_read_only()); }

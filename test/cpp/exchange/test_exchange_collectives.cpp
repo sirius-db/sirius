@@ -38,6 +38,7 @@
 #include <cudf/table/table.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
@@ -48,6 +49,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -649,6 +651,48 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
     }
   }
   CHECK(samples[0]->get_num_partitions() > 1);
+}
+
+TEST_CASE("an OOM after the boundary all-gather retries without gathering again",
+          "[exchange][collectives]")
+{
+  rank_t const world = 2;
+  ranks c(world);
+  std::vector<std::unique_ptr<sirius_physical_sort_sample>> samples;
+  std::vector<std::shared_ptr<cudf::table const>> boundaries(world);
+  bool failed_once = false;
+  for (rank_t r = 0; r < world; ++r) {
+    samples.push_back(make_sample());
+    samples[r]->set_distributed(
+      {c.all[r].service,
+       22,
+       env().gpu,
+       [&boundaries, &failed_once, r](std::shared_ptr<cudf::table const> b) {
+         // Runs after the all-gather has returned.
+         if (r == 0 && !std::exchange(failed_once, true)) {
+           throw rmm::out_of_memory("injected after the all-gather");
+         }
+         boundaries[r] = std::move(b);
+       }});
+  }
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> inputs(world);
+  inputs[0]        = {keys_batch(0, 1, 20'000)};
+  inputs[1]        = {keys_batch(0, 7, 20'000)};
+  auto const start = std::chrono::steady_clock::now();
+  on_every_rank(world, [&](rank_t r) {
+    pipelineable_operator_data data{inputs[r]};
+    if (r == 0) {
+      CHECK_THROWS_AS(samples[r]->execute(data, utils::default_stream()), rmm::out_of_memory);
+      CHECK_FALSE(samples[r]->boundaries_computed());
+    }
+    static_cast<void>(samples[r]->execute(data, utils::default_stream()));
+  });
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+  for (rank_t r = 0; r < world; ++r) {
+    REQUIRE(samples[r]->boundaries_computed());
+    REQUIRE(boundaries[r] != nullptr);
+  }
+  CHECK(keys_of(*boundaries[0]) == keys_of(*boundaries[1]));
 }
 
 TEST_CASE("a DESC NULLS LAST range exchange keeps rank order and puts NULLs on the last rank",
