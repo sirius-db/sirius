@@ -207,7 +207,10 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
       throw std::runtime_error("parse_list_objects_v2: <Contents> without <Size> for key '" +
                                object_key + "'");
     }
-    page.entries.push_back({std::move(object_key), parse_size(*size)});
+    auto const etag = element_text(block, "ETag");
+    page.entries.push_back({std::move(object_key),
+                            parse_size(*size),
+                            etag.has_value() ? xml_unescape(trim(*etag)) : std::string{}});
     pos = ce + k_contents_close.size();
   }
 

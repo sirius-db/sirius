@@ -195,3 +195,39 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   REQUIRE_FALSE(added->HasError());
   CHECK(collect_rows(*added)[0][0] == "150");
 }
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - a file rewritten in place within its modification "
+                 "time's second is not described by stale statistics",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  // Plain, uncompressed files of equal row counts have equal sizes whatever the values.
+  auto const write_plain = [&](fs::path const& path, int from, int to) {
+    run_ok("COPY (SELECT range AS x FROM range(" + std::to_string(from) + ", " +
+           std::to_string(to) + ")) TO '" + path.string() +
+           "' (FORMAT parquet, COMPRESSION uncompressed);");
+  };
+  fs::create_directories(dir / "inplace");
+  auto const target = dir / "inplace" / "a.parquet";
+  write_plain(dir / "inplace" / "b.parquet", 0, 100);
+  write_plain(target, 100, 200);
+  write_plain(dir / "replacement.parquet", 1000, 1100);
+  REQUIRE(fs::file_size(target) == fs::file_size(dir / "replacement.parquet"));
+
+  auto const query = "SELECT count(*) FROM read_parquet('" +
+                     (dir / "inplace" / "*.parquet").string() + "') WHERE x >= 1000";
+  run_ok("SET gpu_execution = false;");
+  auto before = con->Query(query);
+  REQUIRE_FALSE(before->HasError());
+  REQUIRE(collect_rows(*before)[0][0] == "0");
+
+  // Same inode, size and modification time: what a clock with one-second resolution shows for a
+  // rewrite within the same second.
+  auto const modified = fs::last_write_time(target);
+  fs::copy_file(dir / "replacement.parquet", target, fs::copy_options::overwrite_existing);
+  fs::last_write_time(target, modified);
+  auto after = con->Query(query);
+  run_ok("SET gpu_execution = true;");
+  REQUIRE_FALSE(after->HasError());
+  CHECK(collect_rows(*after)[0][0] == "100");
+}

@@ -474,6 +474,9 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
           info.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
           info.extended_info->options["file_size"] =
             duckdb::Value::BIGINT(static_cast<int64_t>(entry.size));
+          if (!entry.etag.empty()) {
+            info.extended_info->options["etag"] = duckdb::Value(entry.etag);
+          }
         }
         matches.push_back(std::move(info));
       }

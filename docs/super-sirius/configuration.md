@@ -829,10 +829,12 @@ column without NULLs, which can pick the wrong join order and build side. With
 date and decimal bounds and hands them to DuckDB through the scan's `column_statistics` option.
 DuckDB then also uses them to prove filters always true or always false, as it does for one file.
 Each file's statistics are read once per process for each set of Parquet reader options (options
-such as `can_have_nan` change the bounds a footer reads as), and reused while its size, inode and version
-tag (an S3 object's ETag) or modification time are unchanged; a modification time less than 10
-seconds old is not trusted, the same rule DuckDB's own file caches use. Checking an S3 file costs
-one request per query, so up to 32 files are checked and read at a time. Scans with
+such as `can_have_nan` change the bounds a footer reads as). They are reused while a local file's
+size, inode and modification time are unchanged, but never while that time is less than 10 seconds
+old (the rule DuckDB's own file caches use), and while an S3 object's size and strong ETag are
+unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
+these, so checking costs no request; footers that must be read are read in parallel on DuckDB's
+worker threads. Scans with
 `union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes the
 `delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
 to 0.50 s).
