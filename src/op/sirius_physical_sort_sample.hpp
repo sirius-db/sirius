@@ -138,6 +138,11 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
                                       ::cuda::stream_ref stream);
 
   std::optional<distributed_sampling> _distributed;
+  //! Distributed: the all-gather's result, kept for an OOM retry of the boundary task, since the
+  //! peers will not gather on that stream again. Only one boundary task runs at a time.
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _gathered;
+  //! Distributed: this rank has entered the all-gather.
+  bool _gather_entered = false;
   //! Partition boundary rows (P-1 rows containing sort key column values)
   std::unique_ptr<cudf::table> _partition_boundaries;
 
