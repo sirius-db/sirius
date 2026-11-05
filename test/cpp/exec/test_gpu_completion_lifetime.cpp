@@ -32,17 +32,21 @@
 
 namespace {
 struct output_observation {
+  bool unsafe_completion                = false;
   bool destroyed                        = false;
   cudaError_t destruction_stream_status = cudaErrorUnknown;
 };
 
 struct owned_gpu_output {
   std::shared_ptr<output_observation> observation;
+  sirius::exec::query_lifecycle_registry& lifecycle;
   rmm::device_buffer buffer;
 
   owned_gpu_output(cucascade::memory::memory_space& space,
-                   std::shared_ptr<output_observation> observation)
+                   std::shared_ptr<output_observation> observation,
+                   sirius::exec::query_lifecycle_registry& lifecycle)
     : observation(std::move(observation)),
+      lifecycle(lifecycle),
       buffer(4096, space.acquire_stream(), space.get_default_allocator())
   {
     REQUIRE(cudaMemsetAsync(buffer.data(), 42, buffer.size(), buffer.stream().get()) ==
@@ -52,6 +56,7 @@ struct owned_gpu_output {
   {
     // The actual buffer destructor enqueues its free immediately after this body.
     observation->destruction_stream_status = cudaStreamQuery(buffer.stream().get());
+    observation->unsafe_completion         = lifecycle.unsafe_completion();
     observation->destroyed                 = true;
   }
 };
@@ -77,11 +82,11 @@ TEST_CASE("shutdown completes ordered release after completion failure",
     auto& manager = context.get_memory_manager();
     auto* space   = manager.get_memory_space(cucascade::memory::Tier::GPU, 0);
     REQUIRE(space);
-    auto output     = std::make_shared<owned_gpu_output>(*space, observation);
     auto id         = sirius::make_query_id(37);
     auto& lifecycle = context.get_query_lifecycle_registry();
     lifecycle.open_query(id);
-    lifecycle.retain_resources(id, std::move(output));
+    lifecycle.retain_resources(id,
+                               std::make_shared<owned_gpu_output>(*space, observation, lifecycle));
     expected_waits = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() + 1;
     if (failure == 3) {
       // Real work completes before simulating an earlier unconfirmed wait.
@@ -99,6 +104,7 @@ TEST_CASE("shutdown completes ordered release after completion failure",
   }
   CHECK(waits == expected_waits);
   CHECK(observation->destroyed);
+  CHECK(observation->unsafe_completion == (failure != 0));
   CHECK(observation->destruction_stream_status == cudaSuccess);
   CHECK(cudf::get_pinned_memory_resource() == previous_pinned);
   CHECK(cudf::get_allocate_host_as_pinned_threshold() == previous_threshold);
@@ -130,9 +136,7 @@ TEST_CASE("context destruction restores pinned resources when shutdown error log
     }
     void log(sirius::log::level, const std::source_location&, std::string_view message) override
     {
-      if (message.find("GPU shutdown completion unconfirmed") ==
-          std::string_view::npos)
-        return;
+      if (message.find("GPU shutdown completion unconfirmed") == std::string_view::npos) return;
       ++attempts;
       if (throws_) throw std::runtime_error("teardown diagnostic failed");
     }
@@ -168,7 +172,7 @@ TEST_CASE("shutdown checks both GPUs before ordered release even when a wait fai
 {
   int const failed_wait      = GENERATE(0, 1, 2, 3);
   auto const previous_pinned = cudf::get_pinned_memory_resource();
-  auto context = std::make_unique<duckdb::SiriusContext>();
+  auto context               = std::make_unique<duckdb::SiriusContext>();
   auto config = sirius::test::integration_config_path().parent_path() / "integration-2gpu.yaml";
   context->initialize(sirius::parsed_sirius_config::from_file(config));
   auto& manager   = context->get_memory_manager();
@@ -181,7 +185,8 @@ TEST_CASE("shutdown checks both GPUs before ordered release even when a wait fai
     auto id = sirius::make_query_id(device + 1);
     lifecycle.open_query(id);
     outputs[device] = std::make_shared<output_observation>();
-    lifecycle.retain_resources(id, std::make_shared<owned_gpu_output>(*space, outputs[device]));
+    lifecycle.retain_resources(
+      id, std::make_shared<owned_gpu_output>(*space, outputs[device], lifecycle));
   }
   auto spaces = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   REQUIRE(spaces.size() == 2);
@@ -204,6 +209,7 @@ TEST_CASE("shutdown checks both GPUs before ordered release even when a wait fai
   CHECK(waited_devices == std::vector<int>{first, second, first});
   for (auto const& output : outputs) {
     CHECK(output->destroyed);
+    CHECK(output->unsafe_completion == (failed_wait != 0));
     CHECK(output->destruction_stream_status == cudaSuccess);
   }
   CHECK(cudf::get_pinned_memory_resource() == previous_pinned);

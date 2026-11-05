@@ -1207,13 +1207,9 @@ void SiriusContext::release_resources() noexcept
     });
   } else if (memory_manager_) {
     auto wait_for_current_device = [&] {
-      try {
-        sirius::observe_gpu_completion(cudaDeviceSynchronize(),
-                                       sirius::gpu_completion_point::shutdown)
-          .throw_if_failed();
-      } catch (...) {
-        record_shutdown_failure(std::current_exception());
-      }
+      auto completion = sirius::observe_gpu_completion(cudaDeviceSynchronize(),
+                                                       sirius::gpu_completion_point::shutdown);
+      if (!completion) record_shutdown_failure(std::make_exception_ptr(completion.error));
     };
     for (auto const* space :
          memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
@@ -1228,7 +1224,7 @@ void SiriusContext::release_resources() noexcept
     }
     wait_for_current_device();
   }
-  if (scan_manager_) { scan_manager_->stop(); }
+  if (scan_manager_) { scan_manager_->reset_all(); }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.

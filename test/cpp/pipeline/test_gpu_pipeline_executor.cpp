@@ -609,10 +609,10 @@ TEST_CASE("unjoined execution retains task and stream but releases the host work
     std::function<void(void*, void (*)(void*))> retain;
 
    protected:
-    sirius::exec::invocable<void() noexcept> get_per_thread_init() override
+    sirius::exec::invocable<void()> get_per_thread_init() override
     {
       auto init = gpu_pipeline_executor::get_per_thread_init();
-      return [init = std::move(init), retain = retain]() mutable noexcept {
+      return [init = std::move(init), retain = retain]() mutable {
         init();
         thread_local sirius::gpu_completion_test_hooks hooks;
         hooks.retain = retain;
@@ -658,7 +658,7 @@ TEST_CASE("unjoined execution retains task and stream but releases the host work
       throw sirius::unjoined_gpu_work{};
     }
   };
-  sirius::op::sirius_physical_operator terminal(
+  sirius::op::test_physical_operator terminal(
     sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0);
   sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> requests;
   observing_executor executor(lifecycle,
@@ -849,10 +849,10 @@ TEST_CASE("production preparation retains task and stream when error logging thr
     std::function<void(void*, void (*)(void*))> retain;
 
    protected:
-    sirius::exec::invocable<void() noexcept> get_per_thread_init() override
+    sirius::exec::invocable<void()> get_per_thread_init() override
     {
       auto init = gpu_pipeline_executor::get_per_thread_init();
-      return [init = std::move(init), retain = retain]() mutable noexcept {
+      return [init = std::move(init), retain = retain]() mutable {
         init();
         thread_local sirius::gpu_completion_test_hooks hooks;
         hooks.retain = retain;
@@ -868,7 +868,7 @@ TEST_CASE("production preparation retains task and stream when error logging thr
   lifecycle.open_query(query);
   auto completion = std::make_shared<sirius::pipeline::completion_handler>();
   auto done       = completion->get_awaitable();
-  sirius::op::sirius_physical_operator terminal(
+  sirius::op::test_physical_operator terminal(
     sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0);
   auto pipe = std::make_shared<sirius::pipeline::sirius_pipeline>(
     sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
