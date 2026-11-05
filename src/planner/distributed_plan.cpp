@@ -255,7 +255,8 @@ struct rewriter {
         merge_filters_across_ranks(join);
         // Each side's rows meet their matches once both are exchanged on the join keys. A MARK
         // join's NULL build keys match nothing yet turn a missed probe row's mark NULL, so every
-        // rank needs them.
+        // rank needs them; its sink also sends every rank one build row, so that a NULL probe
+        // key's mark is NULL on any rank once the build has rows.
         hash_below(probe);
         hash_below(build, join.join_type == duckdb::JoinType::MARK);
         return done(placement::spread);
