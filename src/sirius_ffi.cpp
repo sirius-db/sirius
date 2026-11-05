@@ -494,7 +494,7 @@ struct Context::Impl {
   void bring_up(const sirius::parsed_sirius_config& config)
   {
     install_log_sink_from_env();
-    context = duckdb::SiriusContext::create();
+    context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.

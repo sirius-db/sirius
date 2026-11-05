@@ -28,6 +28,8 @@
 #include "utils/telemetry_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
+#include <rmm/device_buffer.hpp>
+
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
@@ -579,7 +581,9 @@ TEST_CASE("unjoined execution retains task and stream but releases the host work
           "[gpu_pipeline_executor][unsafe_completion]")
 {
   using namespace std::chrono_literals;
-  int mode = GENERATE(0, 1, 2, 3, 4);
+  // Retry, cancelled retry, and reservation waiters in the same or another query.
+  int mode = GENERATE(1, 2, 3, 4);
+  CAPTURE(mode);
   cucascade::memory::reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(64 * 1024 * 1024)
@@ -787,4 +791,142 @@ TEST_CASE("reservation wait exits on query cancellation or executor stop",
   CHECK(space->get_total_reserved_memory() == reservation->size());
   reservation.reset();
   CHECK(space->make_reservation_or_null(kReservationBytes) != nullptr);
+}
+
+TEST_CASE("production preparation retains task and stream when error logging throws",
+          "[gpu_pipeline_executor][unsafe_completion]")
+{
+  using namespace std::chrono_literals;
+  struct observation {
+    bool input_destroyed = false;
+    bool task_destroyed  = false;
+    cudaStream_t stream{};
+  };
+  class prepared_input : public sirius::op::operator_data {
+   public:
+    explicit prepared_input(std::shared_ptr<observation> state) : state(std::move(state)) {}
+    ~prepared_input() override { state->input_destroyed = true; }
+    void prepare_for_processing(cucascade::memory::memory_space const* space,
+                                ::cuda::stream_ref stream) override
+    {
+      state->stream = stream.get();
+      buffer = std::make_unique<rmm::device_buffer>(4096, stream, space->get_default_allocator());
+      if (cudaMemsetAsync(buffer->data(), 42, buffer->size(), stream.get()) != cudaSuccess)
+        throw std::runtime_error("input initialization failed");
+    }
+    std::shared_ptr<observation> state;
+    std::unique_ptr<rmm::device_buffer> buffer;
+  };
+  class prepared_task : public sirius::pipeline::gpu_pipeline_task {
+   public:
+    prepared_task(std::shared_ptr<test_gpu_pipeline_task_global_state> global,
+                  std::shared_ptr<observation> state)
+      : gpu_pipeline_task(1,
+                          {},
+                          std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+                            std::make_unique<prepared_input>(state), 0),
+                          std::move(global)),
+        state(std::move(state))
+    {
+    }
+    ~prepared_task() override { state->task_destroyed = true; }
+    sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+      cucascade::memory::memory_space const*) const override
+    {
+      sirius::pipeline::reservation_size_info info;
+      info.reservation_size = kReservationBytes;
+      return info;
+    }
+    std::vector<sirius::op::sirius_physical_operator*> get_output_consumers() override
+    {
+      return {};
+    }
+    std::shared_ptr<observation> state;
+  };
+  class observing_executor : public sirius::pipeline::gpu_pipeline_executor {
+   public:
+    using gpu_pipeline_executor::gpu_pipeline_executor;
+    std::function<void(void*, void (*)(void*))> retain;
+
+   protected:
+    sirius::exec::invocable<void() noexcept> get_per_thread_init() override
+    {
+      auto init = gpu_pipeline_executor::get_per_thread_init();
+      return [init = std::move(init), retain = retain]() mutable noexcept {
+        init();
+        thread_local sirius::gpu_completion_test_hooks hooks;
+        hooks.retain = retain;
+        hooks.fail   = [](auto point) { return point == sirius::gpu_completion_point::prepare; };
+      };
+    }
+  };
+  auto manager = initialize_memory_manager(1);
+  auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto query = sirius::make_query_id(7);
+  lifecycle.open_query(query);
+  auto completion = std::make_shared<sirius::pipeline::completion_handler>();
+  auto done       = completion->get_awaitable();
+  sirius::op::sirius_physical_operator terminal(
+    sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0);
+  auto pipe = std::make_shared<sirius::pipeline::sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipe, terminal);
+  build_state.set_pipeline_sink(*pipe, &terminal, 1);
+  pipe->set_query_id(query);
+  pipe->set_completion_handler(completion);
+  auto global = std::make_shared<test_gpu_pipeline_task_global_state>();
+  global->set_pipeline(pipe);
+  global->set_completion_handler(completion);
+  class preparation_error_sink : public throwing_error_sink {
+   public:
+    void log(sirius::log::level level,
+             const std::source_location& location,
+             std::string_view message) override
+    {
+      if (message.find("Unknown error in prepare_for_processing") != std::string_view::npos)
+        throwing_error_sink::log(level, location, message);
+    }
+  };
+  auto previous_sink = sirius::log::get_sink();
+  auto sink          = std::make_shared<preparation_error_sink>();
+  sirius::log::set_sink(sink);
+  absl::Cleanup restore_sink = [&] { sirius::log::set_sink(previous_sink); };
+  std::vector<std::unique_ptr<void, void (*)(void*)>> retained;
+  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> requests;
+  observing_executor executor(lifecycle,
+                              {1, "preparation-logging"},
+                              space,
+                              requests.make_publisher(),
+                              nullptr,
+                              sirius::test::make_test_telemetry_context());
+  executor.retain = [&](void* owner, void (*destroy)(void*)) {
+    retained.emplace_back(owner, destroy);
+  };
+  auto state = std::make_shared<observation>();
+  executor.start();
+  REQUIRE(executor.schedule(std::make_unique<prepared_task>(global, state)));
+  REQUIRE(done.wait_for(5s) == std::future_status::ready);
+  CHECK_THROWS_AS(done.get(), sirius::unjoined_gpu_work);
+  executor.stop();
+  CHECK(lifecycle.activity(query).work == 0);
+  CHECK(lifecycle.unsafe_completion());
+  CHECK_FALSE(lifecycle.accepts_work(query));
+  CHECK_THROWS_AS(lifecycle.open_query(sirius::make_query_id(8)),
+                  sirius::exec::query_lifecycle_registry::runtime_unavailable_error);
+  REQUIRE(retained.size() == 2);
+  CHECK_FALSE(state->input_destroyed);
+  CHECK_FALSE(state->task_destroyed);
+  REQUIRE(state->stream != nullptr);
+  CHECK(cudaStreamQuery(state->stream) == cudaSuccess);
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_ERROR
+  CHECK(sink->attempts == 1);
+#endif
+  retained.clear();
+  CHECK(state->input_destroyed);
+  CHECK(state->task_destroyed);
+  space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>()
+    ->reset_stream_reservation(::cuda::stream_ref{state->stream});
 }

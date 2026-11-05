@@ -702,9 +702,12 @@ TEST_CASE("unjoined GPU work closes admission without releasing query resources"
   // Host workers draining does not prove that their submitted GPU work completed.
   REQUIRE_THROWS_AS(registry.release_resources(first), sirius::unjoined_gpu_work);
   REQUIRE_THROWS_AS(registry.close(first), sirius::unjoined_gpu_work);
-  REQUIRE_THROWS_AS(registry.clear(), sirius::unjoined_gpu_work);
   REQUIRE_FALSE(weak.expired());
   REQUIRE(registry.size() == 2);
+  // Final shutdown still releases in the established order after workers stop.
+  REQUIRE_NOTHROW(registry.clear());
+  REQUIRE(weak.expired());
+  REQUIRE(registry.unsafe_completion());
 }
 
 TEST_CASE("a retained HOST reservation cannot strand another query after a fatal completion",
@@ -783,4 +786,27 @@ TEST_CASE("HOST staging makes progress when allocations outlive their reservatio
   REQUIRE(reservation);
   CHECK(reservation->size() == 0);
   REQUIRE_NOTHROW(resource->allocate_multiple_blocks(config.block_size, reservation.get()));
+}
+
+TEST_CASE("unconfirmed completion preserves CUDA status and earlier diagnostics",
+          "[query_lifecycle_gate][unsafe_completion]")
+{
+  bool const earlier_error = GENERATE(false, true);
+  query_lifecycle_registry registry;
+  auto id = make_query_id(1);
+  registry.open_query(id);
+  auto point =
+    earlier_error ? sirius::gpu_completion_point::failure : sirius::gpu_completion_point::execute;
+  auto result = sirius::observe_gpu_completion(cudaErrorIllegalAddress, point);
+  REQUIRE_FALSE(result);
+  if (earlier_error)
+    result.error.remember_prior_error(
+      std::make_exception_ptr(std::runtime_error("operator failed")));
+  REQUIRE(registry.report_failure(std::make_exception_ptr(result.error), id));
+  auto message = registry.runtime_failure_message();
+  CHECK(message.find("cudaErrorIllegalAddress") != std::string::npos);
+  CHECK(message.find(sirius::completion_point_name(point)) != std::string::npos);
+  if (earlier_error) CHECK(message.find("operator failed") != std::string::npos);
+  registry.report_failure(std::make_exception_ptr(sirius::unjoined_gpu_work{}), id);
+  CHECK(registry.runtime_failure_message() == message);
 }

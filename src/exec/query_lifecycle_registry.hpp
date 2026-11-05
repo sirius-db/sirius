@@ -267,11 +267,22 @@ class query_lifecycle_registry {
   /// Does not wait for work (safe inside workers) or replace the caller's original exception.
   bool report_failure(std::exception_ptr error, std::optional<query_id_t> id = {}) noexcept
   {
-    if (id) record_error(*id, error);
     auto status         = fatal_device_status(error);
     bool const unjoined = is_unjoined_gpu_work(error);
-    if (!status && !unjoined) return false;
-    if (unjoined) unsafe_completion_.store(true, std::memory_order_release);
+    if (!status && !unjoined) {
+      if (id) record_error(*id, error);
+      return false;
+    }
+    if (unjoined) {
+      unsafe_completion_.store(true, std::memory_order_release);
+      try {
+        std::rethrow_exception(error);
+      } catch (unjoined_gpu_work const& failure) {
+        if (failure.error_code() != cudaSuccess) status = failure.error_code();
+      } catch (...) {
+      }
+    }
+    if (id) record_error(*id, error);
     // Format outside the registry lock. Retain text/status, not an exception_ptr
     // whose custom exception could keep query resources alive after retirement.
     auto message = exception_message(error);
@@ -528,7 +539,7 @@ class query_lifecycle_registry {
   /// This is an incomplete teardown: settle outstanding users before retrying, never reopen gates.
   void clear()
   {
-    require_gpu_completion();
+    // Final runtime teardown also clears failed queries after all host users stop.
     decltype(queries_) retired;
     {
       std::lock_guard registry_lock(mutex_);
@@ -550,6 +561,19 @@ class query_lifecycle_registry {
     try {
       try {
         if (error) std::rethrow_exception(error);
+      } catch (unjoined_gpu_work const& e) {
+        std::string message = e.what();
+        message += " at ";
+        message += completion_point_name(e.point());
+        if (e.error_code() != cudaSuccess) {
+          message += ": ";
+          message += cudaGetErrorName(e.error_code());
+        }
+        if (*e.prior_error()) {
+          message += "; earlier error: ";
+          message += e.prior_error();
+        }
+        return message;
       } catch (std::exception const& e) {
         return e.what();
       } catch (...) {

@@ -476,9 +476,12 @@ void gpu_pipeline_executor::process_task(
           } catch (task_reschedule_exception& ex) {
             // Cancellation may already have won the query result, but it cannot release an
             // intermediate input until submitted work has completed.
-            if (!join_gpu_work(::cuda::stream_ref{exc_stream.get()}, gpu_completion_point::retry)) {
+            auto retry_completion =
+              join_gpu_work(::cuda::stream_ref{exc_stream.get()}, gpu_completion_point::retry);
+            if (!retry_completion) {
               owners->retry_input = ex.release_intermediate_data();
-              throw unjoined_gpu_work{};
+              retry_completion.error.remember_prior_error(std::current_exception());
+              throw retry_completion.error;
             }
             if (completion && completion->has_error()) { return; }
             auto* gpu_task = cast_to_gpu_pipeline_task(task.get());

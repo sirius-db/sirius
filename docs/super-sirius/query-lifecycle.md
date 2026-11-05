@@ -165,10 +165,11 @@ they describe outstanding activity, not lifetime totals.
 
 ## GPU completion and shutdown
 
-Create initialized contexts with `SiriusContext::create()` so GPU resources can outlive the last context handle if a wait fails.
-
 | Condition | Required behavior |
 |---|---|
-| A task reports `unjoined_gpu_work` | Close GPU admission, disable CPU replay for that execution, and retain the task's buffers, reservations, streams and their owners. |
-| GPU completion was already unconfirmed, or a shutdown wait fails | Keep the runtime alive until process exit. Do not retry the wait to reclaim resources. |
-| All shutdown waits succeed | Retained outputs and providers can be released. Their destructors may enqueue asynchronous frees that these waits do not cover. |
+| A task reports `unjoined_gpu_work` | Close GPU admission, disable CPU replay for that execution, and retain the task's buffers, reservations and streams while the runtime remains alive. |
+| Query cleanup follows unconfirmed completion | Keep registered query resources. Drained host-work counts do not establish GPU completion. |
+| Runtime shutdown follows unconfirmed completion | Preserve the recorded failure and complete the existing ordered teardown, including restoring the cuDF pinned resource. |
+| A shutdown wait fails | Record and log the failure, then continue ordered teardown. Runtime destruction still releases the backing resources. |
+
+Resource retention across runtime destruction requires separate runtime ownership. Shutdown waits also do not cover asynchronous frees submitted by output destructors afterward.

@@ -2138,12 +2138,25 @@ TEST_CASE("GPU task retains live data when completion cannot be confirmed",
   auto task = create_pipeline_task(f, global, std::move(batch), 1ULL << 20, 1);
   sirius::gpu_completion_test_hooks hooks;
   std::vector<std::unique_ptr<void, void (*)(void*)>> owners;
-  hooks.fail = [mode](sirius::gpu_completion_point point) {
-    using enum sirius::gpu_completion_point;
-    return point == (mode == 0 ? prepare : mode == 1 ? execute : mode == 3 ? sink : failure);
+  using enum sirius::gpu_completion_point;
+  auto const expected_point = mode == 0   ? prepare
+                              : mode == 1 ? execute
+                              : mode == 3 ? sink
+                                          : failure;
+  hooks.status              = [expected_point](auto point) {
+    return point == expected_point ? cudaErrorIllegalAddress : cudaSuccess;
   };
   hooks.retain = [&](void* owner, void (*destroy)(void*)) { owners.emplace_back(owner, destroy); };
-  REQUIRE_THROWS_AS(task->execute(stream), sirius::unjoined_gpu_work);
+  try {
+    task->execute(stream);
+    FAIL("expected unconfirmed completion");
+  } catch (sirius::unjoined_gpu_work const& error) {
+    CHECK(error.error_code() == cudaErrorIllegalAddress);
+    CHECK(error.point() == expected_point);
+    if (mode == 2)
+      CHECK(std::string(error.prior_error()).find("operator failed") != std::string::npos);
+    if (mode == 4) CHECK(std::string(error.prior_error()).find("sink failed") != std::string::npos);
+  }
   REQUIRE(hooks.joined);
   REQUIRE_FALSE(owners.empty());
   CHECK(calls == (mode == 0 ? 0 : 1));

@@ -216,33 +216,6 @@ bool sirius_disabled_by_env()
 
 SiriusContext::SiriusContext() = default;
 
-shared_ptr<SiriusContext> SiriusContext::create()
-{
-  auto result = shared_ptr<SiriusContext>(new SiriusContext(), [](SiriusContext* context) noexcept {
-    if (context->is_initialized_) {
-      try {
-        context->terminate();
-      } catch (...) {
-        // Stopped runtime owners keep their original addresses, including allocator views,
-        // query plans, repositories and stream pools. Never destroy them after a failed drain.
-        context->restore_cudf_pinned_memory_resource();
-        try {
-          SIRIUS_LOG_ERROR(
-            "GPU shutdown could not establish safe cleanup; retaining runtime "
-            "resources until process exit");
-        } catch (...) {
-        }
-        auto retained = std::unique_ptr<SiriusContext>(context);
-        sirius::retain_unjoined_owner(retained);
-        return;
-      }
-    }
-    delete context;
-  });
-  result->managed_lifetime_ = true;
-  return result;
-}
-
 SiriusContext::~SiriusContext() noexcept
 {
   release_resources();
@@ -924,8 +897,6 @@ void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
 
 void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 {
-  if (!managed_lifetime_)
-    throw std::logic_error("Initialized Sirius contexts require SiriusContext::create()");
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
   if (query_lifecycle_.runtime_failed()) {
     throw std::runtime_error("Cannot reinitialize a context after a fatal runtime failure");
@@ -1221,28 +1192,41 @@ void SiriusContext::release_resources() noexcept
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
-  if (event_publisher_) event_publisher_->stop();
-  query_lifecycle_.require_gpu_completion();
-  auto wait_for_current_device = [] {
-    if (!sirius::observe_gpu_completion(cudaDeviceSynchronize(),
-                                        sirius::gpu_completion_point::shutdown)) {
-      throw sirius::unjoined_gpu_work{};
-    }
+  if (is_initialized_ && event_publisher_) event_publisher_->stop();
+  auto record_shutdown_failure = [&](std::exception_ptr error) {
+    query_lifecycle_.report_failure(error);
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_ERROR("GPU shutdown completion unconfirmed: {}",
+                       query_lifecycle_.runtime_failure_message());
+    });
   };
-  try {
-    if (memory_manager_) {
-      for (auto const* space :
-           memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+  if (query_lifecycle_.unsafe_completion()) {
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_ERROR("GPU shutdown preserves earlier completion failure: {}",
+                       query_lifecycle_.runtime_failure_message());
+    });
+  } else if (memory_manager_) {
+    auto wait_for_current_device = [&] {
+      try {
+        sirius::observe_gpu_completion(cudaDeviceSynchronize(),
+                                       sirius::gpu_completion_point::shutdown)
+          .throw_if_failed();
+      } catch (...) {
+        record_shutdown_failure(std::current_exception());
+      }
+    };
+    for (auto const* space :
+         memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      try {
         rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
         wait_for_current_device();
+      } catch (...) {
+        sirius::unjoined_gpu_work error{cudaErrorUnknown, sirius::gpu_completion_point::shutdown};
+        error.remember_prior_error(std::current_exception());
+        record_shutdown_failure(std::make_exception_ptr(error));
       }
     }
-    // Also check the caller's device, even when there are no managed GPU spaces.
     wait_for_current_device();
-  } catch (...) {
-    auto error = std::make_exception_ptr(sirius::unjoined_gpu_work{});
-    query_lifecycle_.report_failure(error);
-    std::rethrow_exception(error);
   }
   if (scan_manager_) { scan_manager_->stop(); }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
@@ -1255,9 +1239,8 @@ void SiriusContext::release_resources() noexcept
   query_lifecycle_.clear();
   scan_manager_.reset();
 
-  // Free pinned cuVS indexes and release their GPU reservations while the
-  // memory manager is still alive. The device was synchronized just above, so
-  // no kernels are still reading the index buffers being freed here.
+  // Release indexes and reservations while the memory manager is still alive.
+  // Shutdown keeps the existing release order even if completion was unconfirmed.
   cuvs_index_cache_.reset();
 
   // Drop any remaining per-query repositories while the memory manager is still alive. The
@@ -2262,7 +2245,7 @@ void SiriusContextExtensionCallback::initialize_context()
 {
   if (disabled_ || context_) { return; }
 
-  auto context = SiriusContext::create();
+  auto context = make_shared_ptr<SiriusContext>();
   context->initialize(config_);
   context_ = std::move(context);
 }

@@ -2783,8 +2783,8 @@ void sirius_scan_manager::start() {}
 
 void sirius_scan_manager::stop_workers()
 {
-  // Runtime admission must be closed before taking this snapshot. Retain providers until the
-  // caller has also established GPU completion; host worker retirement alone is insufficient.
+  // Runtime admission must be closed before taking this snapshot. Retain providers while the
+  // caller checks GPU completion; host worker retirement alone is insufficient.
   std::vector<std::shared_ptr<query_scan_manager_state>> states;
   {
     std::lock_guard lock(_query_states_mutex);

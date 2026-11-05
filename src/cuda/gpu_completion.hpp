@@ -24,14 +24,24 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace sirius {
-enum class gpu_completion_point { prepare, execute, failure, sink, retry, shutdown };
+struct gpu_completion_result {
+  bool confirmed;
+  unjoined_gpu_work error;
+  explicit operator bool() const noexcept { return confirmed; }
+  void throw_if_failed() const
+  {
+    if (!confirmed) throw error;
+  }
+};
 
 // Tests inject a failed observation only after the real CUDA wait succeeds. This permits
 // inspection and eventual destruction of retained owners without creating an unsafe callback.
 struct gpu_completion_test_hooks {
   std::function<bool(gpu_completion_point)> fail;
+  std::function<cudaError_t(gpu_completion_point)> status;
   std::function<void()> before_task_owner_allocation;
   std::function<void(void*, void (*)(void*))> retain;
   bool joined = false;
@@ -43,22 +53,25 @@ struct gpu_completion_test_hooks {
   gpu_completion_test_hooks& operator=(gpu_completion_test_hooks const&) = delete;
 };
 
-inline bool observe_gpu_completion(cudaError_t status, gpu_completion_point point) noexcept
+inline gpu_completion_result observe_gpu_completion(cudaError_t status,
+                                                    gpu_completion_point point) noexcept
 {
   auto* hooks = gpu_completion_test_hooks::current;
   if (hooks) {
     hooks->joined = status == cudaSuccess;
-    if (hooks->joined && hooks->fail) {
+    if (hooks->joined) {
       try {
-        if (hooks->fail(point)) return false;
+        if (hooks->status) status = hooks->status(point);
+        if (hooks->fail && hooks->fail(point)) return {false, unjoined_gpu_work{status, point}};
       } catch (...) {
-        return false;
+        return {false, unjoined_gpu_work{status, point}};
       }
     }
   }
-  return status == cudaSuccess;
+  return {status == cudaSuccess, unjoined_gpu_work{status, point}};
 }
-inline bool join_gpu_work(::cuda::stream_ref stream, gpu_completion_point point) noexcept
+inline gpu_completion_result join_gpu_work(::cuda::stream_ref stream,
+                                           gpu_completion_point point) noexcept
 {
   return observe_gpu_completion(cudaStreamSynchronize(stream.get()), point);
 }
@@ -73,8 +86,25 @@ inline bool is_unjoined_gpu_work(std::exception_ptr error) noexcept
   return false;
 }
 
-// No allocation on the production failure path. The containing runtime must retain the
-// allocator/backing and stream too; this owner is deliberately never destroyed in that case.
+// Preserve an existing safety error without retrying its wait. A failed cleanup wait
+// carries a bounded copy of the original diagnostic, without retaining its exception object.
+inline std::optional<unjoined_gpu_work> failure_after_gpu_work(std::exception_ptr original,
+                                                               ::cuda::stream_ref stream)
+{
+  try {
+    if (original) std::rethrow_exception(original);
+  } catch (unjoined_gpu_work const& error) {
+    return error;
+  } catch (...) {
+  }
+  auto result = join_gpu_work(stream, gpu_completion_point::failure);
+  if (result) return std::nullopt;
+  result.error.remember_prior_error(original);
+  return result.error;
+}
+
+// No allocation on the production failure path. The caller must keep the allocator backing
+// and stream alive while the runtime remains active.
 template <class T>
 void retain_unjoined_owner(std::unique_ptr<T>& owner) noexcept
 {

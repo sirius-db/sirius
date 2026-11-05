@@ -430,8 +430,6 @@ class SiriusContext : public ClientContextState {
   };
 
   SiriusContext();
-  /// Initialized runtimes use a deleter that retains GPU owners if shutdown cannot join work.
-  static shared_ptr<SiriusContext> create();
   ~SiriusContext() noexcept override;
 
   // Non-copyable and non-movable
@@ -918,7 +916,6 @@ class SiriusContext : public ClientContextState {
   std::atomic<bool> runtime_unavailable_{false};
   void release_resources() noexcept;
   bool is_initialized_ = false;
-  bool managed_lifetime_ = false;
   sirius::sirius_config config_;
   // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
   // operator_params.use_hw_decompression is set and every GPU's CUDA driver
