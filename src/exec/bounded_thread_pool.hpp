@@ -119,7 +119,21 @@ class bounded_thread_pool {
         std::ignore = sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
       }
       if (!cpu_ids.empty()) {
-        std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
+        if (!sirius::exec::thread_util::set_thread_affinity(t, cpu_ids)) {
+          log::log_noexcept([&] {
+            std::string ids;
+            for (int id : cpu_ids) {
+              if (!ids.empty()) { ids += ','; }
+              ids += std::to_string(id);
+            }
+            SIRIUS_LOG_WARN(
+              "Thread pool '{}': failed to set CPU affinity for worker {} to requested CPUs [{}]; "
+              "worker will retain inherited CPU affinity",
+              name,
+              i,
+              ids);
+          });
+        }
       }
     }
 
