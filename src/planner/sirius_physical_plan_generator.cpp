@@ -231,6 +231,21 @@ void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
     info.resolved_file_paths = std::move(files);
     return;
   }
+  // A rank numbers the files of its own share from 0, so their index and a filter on their name
+  // would mean different files on different ranks.
+  using kind              = sirius::op::scan::scan_plan::parquet_virtual_column_kind;
+  auto const names_a_file = [&](auto const& column) {
+    return column.HasPrimaryIndex() &&
+           std::any_of(
+             info.virtual_columns.begin(), info.virtual_columns.end(), [&](auto const& v) {
+               return v.column_id == column.GetPrimaryIndex() &&
+                      (v.kind == kind::FILENAME || v.kind == kind::FILE_INDEX);
+             });
+  };
+  if (std::any_of(info.column_ids.begin(), info.column_ids.end(), names_a_file)) {
+    throw sirius::not_implemented_exception(
+      "distributed execution: filename or file_index of a table split across ranks");
+  }
   auto const world  = op_params.exchange_peers.size();
   auto const rank   = op_params.exchange_rank;
   auto const remote = std::any_of(
