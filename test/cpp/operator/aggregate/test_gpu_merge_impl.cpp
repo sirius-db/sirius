@@ -18,6 +18,7 @@
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/aggregate/carried_columns.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/order/gpu_order_impl.hpp"
@@ -912,6 +913,54 @@ void validate_carried_output(data_batch& output, std::map<int64_t, int64_t> cons
 }
 
 }  // namespace
+
+TEST_CASE("Carried row selector keeps its identity when another request follows it",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  auto* space       = get_shared_mem_space();
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = space->get_default_allocator();
+  auto input =
+    make_int64_batch({{2, 1, 2, 1}, {200, 100, 201, 101}, {-200, -100, -201, -101}}, *space);
+  auto const input_view = sirius::get_cudf_table_view(*input);
+  std::vector<cudf::groupby::aggregation_request> requests;
+
+  bool const preceding_request        = GENERATE(false, true);
+  auto const append_auxiliary_request = [&] {
+    cudf::groupby::aggregation_request request;
+    request.values = input_view.column(1);
+    request.aggregations.push_back(cudf::make_max_aggregation<cudf::groupby_aggregation>());
+    requests.push_back(std::move(request));
+  };
+  if (preceding_request) { append_auxiliary_request(); }
+  auto selector =
+    sirius::op::detail::append_carried_row_selector(requests, input_view.num_rows(), stream, mr);
+  append_auxiliary_request();
+  REQUIRE(selector.request_idx == static_cast<std::size_t>(preceding_request));
+  REQUIRE(selector.request_idx + 1 < requests.size());
+
+  cudf::groupby::groupby groupby(input_view.select({0}), cudf::null_policy::INCLUDE);
+  auto result         = groupby.aggregate(requests, stream, mr);
+  auto output_columns = result.first->release();
+  auto carried        = sirius::op::detail::gather_carried_columns(
+    input_view.select({1, 2}),
+    result.second[selector.request_idx].results.front()->view(),
+    stream,
+    mr);
+  for (auto& column : carried) {
+    output_columns.push_back(std::move(column));
+  }
+  auto output = std::make_unique<cudf::table>(std::move(output_columns));
+  std::vector<std::vector<int64_t>> actual(3);
+  copy_data_to_host(output->view(), actual);
+  REQUIRE(output->num_rows() == 2);
+  std::set<int64_t> keys;
+  for (cudf::size_type row = 0; row < output->num_rows(); ++row) {
+    CHECK(keys.insert(actual[0][row]).second);
+    CHECK(actual[1][row] == 100 * actual[0][row]);
+    CHECK(actual[2][row] == -actual[1][row]);
+  }
+}
 
 TEST_CASE("Grouped aggregate carries columns from one row of each group",
           "[operator][merge_grouped_agg][distinct]")

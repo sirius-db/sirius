@@ -86,6 +86,11 @@ TEST_CASE("mixed stddev partial schema includes grouping-set columns",
   auto const prefix        = local->num_output_group_columns();
   REQUIRE(prefix == (grouping_sets ? 3 : 1));
   REQUIRE(local->local_types.size() == prefix + 5);
+  auto const layout = local->partial_layout();
+  CHECK(layout.num_keys() == prefix);
+  CHECK(layout.num_partials() == 5);
+  CHECK(layout.num_carried() == 0);
+  CHECK(layout.num_columns() == local->local_types.size());
   REQUIRE(local->local_types[0].id() == sirius::type_id::DOUBLE);
   if (grouping_sets) {
     REQUIRE(local->local_types[1].id() == sirius::type_id::INTEGER);
@@ -124,6 +129,35 @@ TEST_CASE("a FIRST before a bounded decimal SUM leaves the bound on the SUM requ
   CHECK(aggregate.cudf_aggregate_input_max_abs ==
         std::vector<std::optional<std::uint64_t>>{
           std::uint64_t{5000}, std::uint64_t{5000}, std::nullopt});
+}
+
+TEST_CASE("grouped partial layout agrees with mixed expanded slots and carried columns",
+          "[physical_grouped_aggregate_merge][unit][distinct]")
+{
+  using Traits = gpu_type_traits<double>;
+  auto defs    = sirius::test::create_aggregate_expressions<Traits>(
+    {0}, {"first", "avg", "sum", "stddev_samp", "first"}, {1, 2, 2, 2, 3});
+  sirius_physical_grouped_aggregate aggregate(
+    std::move(defs.output_types), std::move(defs.aggregates), std::move(defs.groups), 1);
+  sirius_physical_grouped_aggregate_merge merge(&aggregate);
+  auto const layout = aggregate.partial_layout();
+
+  REQUIRE(aggregate.has_first());
+  REQUIRE(merge.has_first());
+  CHECK(layout.num_keys() == 1);
+  CHECK(layout.num_partials() == 4);
+  CHECK(layout.num_carried() == 2);
+  REQUIRE(aggregate.local_types.size() == layout.num_columns());
+  CHECK(layout.num_columns() == 7);
+  CHECK(layout.partial_column(0) == 1);
+  CHECK(layout.carried_column(0) == 5);
+  CHECK(layout.carried_column(1) == 6);
+  CHECK(aggregate.local_types[layout.partial_column(1)].id() == sirius::type_id::BIGINT);
+  CHECK(aggregate.local_types[layout.partial_column(3)].id() == sirius::type_id::STRUCT);
+  CHECK(aggregate.local_types[layout.carried_column(0)].id() == sirius::type_id::DOUBLE);
+  CHECK(aggregate.local_types[layout.carried_column(1)].id() == sirius::type_id::DOUBLE);
+  CHECK(merge.partial_layout().num_columns() == layout.num_columns());
+  CHECK_FALSE(merge.partials_are_output());
 }
 
 TEST_CASE("grouped merge returns its partials as output only when they are in output order",

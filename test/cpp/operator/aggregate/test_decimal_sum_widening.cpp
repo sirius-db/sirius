@@ -24,7 +24,7 @@
  * (2^31 - 1 or 2^63 - 1). The extremes below sit exactly on that boundary, including the most
  * negative values (-2^31, -2^63), whose magnitude is one more than the maximum.
  *
- * The "aggregate slots" cases test all_slots_plain and has_slot over every AggregateSlot
+ * The "aggregate slots" cases test all_slots_plain and has_slot over every aggregate_slot
  * alternative.
  */
 
@@ -592,24 +592,24 @@ TEST_CASE("wide integer sum - one-pass 128-bit reduction of INT64 and INT32",
 
 namespace {
 
-using sirius::op::AggregateSlot;
+using sirius::op::aggregate_slot;
 using sirius::op::all_slots_plain;
 using sirius::op::has_slot;
 using sirius::op::plain_slot;
 
-/// Checks the slot queries on lists holding alternative @p I of AggregateSlot, alone and beside a
+/// Checks the slot queries on lists holding alternative @p I of aggregate_slot, alone and beside a
 /// plain slot.
 template <std::size_t I>
 void check_slot_kind()
 {
-  using Kind           = std::variant_alternative_t<I, AggregateSlot>;
+  using Kind           = std::variant_alternative_t<I, aggregate_slot>;
   constexpr bool plain = std::is_same_v<Kind, plain_slot>;
-  INFO("AggregateSlot alternative " << I);
-  std::vector<AggregateSlot> const alone{Kind{}};
+  INFO("aggregate_slot alternative " << I);
+  std::vector<aggregate_slot> const alone{Kind{}};
   CHECK(all_slots_plain(alone) == plain);
   CHECK(has_slot<Kind>(alone));
   CHECK(has_slot<plain_slot>(alone) == plain);
-  std::vector<AggregateSlot> const beside_plain{plain_slot{}, Kind{}};
+  std::vector<aggregate_slot> const beside_plain{plain_slot{}, Kind{}};
   CHECK(all_slots_plain(beside_plain) == plain);
   CHECK(has_slot<Kind>(beside_plain));
 }
@@ -661,7 +661,7 @@ std::map<int32_t, std::optional<__int128_t>> grouped_split_sums(cudf::column_vie
 
 TEST_CASE("aggregate slots - an empty list is all plain and holds no kind", "[aggregate][distinct]")
 {
-  std::vector<AggregateSlot> const none;
+  std::vector<aggregate_slot> const none;
   CHECK(all_slots_plain(none));
   CHECK_FALSE(has_slot<plain_slot>(none));
   CHECK_FALSE(has_slot<sirius::op::first_slot>(none));
@@ -669,8 +669,8 @@ TEST_CASE("aggregate slots - an empty list is all plain and holds no kind", "[ag
 
 TEST_CASE("aggregate slots - a list of plain slots is all plain", "[aggregate][distinct]")
 {
-  std::vector<AggregateSlot> const plain{plain_slot{.partial_idx = 0},
-                                         plain_slot{.partial_idx = 1}};
+  std::vector<aggregate_slot> const plain{plain_slot{.partial_idx = 0},
+                                          plain_slot{.partial_idx = 1}};
   CHECK(all_slots_plain(plain));
   CHECK(has_slot<plain_slot>(plain));
   CHECK_FALSE(has_slot<sirius::op::avg_slot>(plain));
@@ -682,16 +682,16 @@ TEST_CASE("aggregate slots - a list of plain slots is all plain", "[aggregate][d
 TEST_CASE("aggregate slots - every kind but plain_slot makes a list non-plain",
           "[aggregate][distinct]")
 {
-  // Covers every alternative, so a kind added to AggregateSlot later is checked here too.
+  // Covers every alternative, so a kind added to aggregate_slot later is checked here too.
   []<std::size_t... I>(std::index_sequence<I...>) {
     (check_slot_kind<I>(), ...);
-  }(std::make_index_sequence<std::variant_size_v<AggregateSlot>>{});
+  }(std::make_index_sequence<std::variant_size_v<aggregate_slot>>{});
 }
 
 TEST_CASE("aggregate slots - the wide integer SUM mask marks plain and AVG SUM entries",
           "[aggregate][wide_integer_sum]")
 {
-  std::vector<AggregateSlot> const slots{
+  std::vector<aggregate_slot> const slots{
     plain_slot{.partial_idx = 0},
     plain_slot{.partial_idx = 1, .is_wide_integer_sum = true},
     sirius::op::first_slot{.input_idx = 3, .carried_idx = 0},

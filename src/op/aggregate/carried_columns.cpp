@@ -43,7 +43,7 @@ std::unique_ptr<cudf::table> aggregate_carried_columns_only(cudf::table_view inp
                         mr);
 }
 
-std::unique_ptr<cudf::column> append_carried_row_selector(
+carried_row_selector append_carried_row_selector(
   std::vector<cudf::groupby::aggregation_request>& requests,
   cudf::size_type num_rows,
   ::cuda::stream_ref stream,
@@ -54,22 +54,18 @@ std::unique_ptr<cudf::column> append_carried_row_selector(
   cudf::groupby::aggregation_request request;
   request.values = row_positions->view();
   request.aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
+  auto const request_idx = requests.size();
   requests.push_back(std::move(request));
-  return row_positions;
+  return {.row_positions = std::move(row_positions), .request_idx = request_idx};
 }
 
-std::vector<std::unique_ptr<cudf::column>> gather_carried_columns(
-  cudf::table_view carried,
-  std::vector<cudf::groupby::aggregation_result> const& results,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+std::vector<std::unique_ptr<cudf::column>> gather_carried_columns(cudf::table_view carried,
+                                                                  cudf::column_view row_positions,
+                                                                  ::cuda::stream_ref stream,
+                                                                  rmm::device_async_resource_ref mr)
 {
   // The selector has no nulls, so every gathered row is in range.
-  return cudf::gather(carried,
-                      results.back().results.front()->view(),
-                      cudf::out_of_bounds_policy::DONT_CHECK,
-                      stream,
-                      mr)
+  return cudf::gather(carried, row_positions, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr)
     ->release();
 }
 

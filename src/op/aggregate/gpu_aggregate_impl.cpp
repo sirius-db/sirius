@@ -536,11 +536,11 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     requests.push_back(std::move(request));
   }
 
-  // The selector is the last request and outside input_col_order, so the result loop skips it.
+  // The selector is outside input_col_order, so the result loop skips it.
   // It survives the M2 path below, which sorts every request's values.
-  std::unique_ptr<cudf::column> row_positions;
+  std::optional<detail::carried_row_selector> row_selector;
   if (!carried_idx.empty()) {
-    row_positions =
+    row_selector =
       detail::append_carried_row_selector(requests, input_table.num_rows(), stream, mr);
   }
 
@@ -604,7 +604,9 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     }
   }
 
-  output_cols.resize(group_idx.size() + aggregate_idx.size());
+  auto const layout =
+    grouped_aggregate_layout{group_idx.size(), aggregate_idx.size(), carried_idx.size()};
+  output_cols.resize(layout.carried_column(0));
   for (size_t i = 0; i < input_col_order.size(); ++i) {
     int aggregate_col_id     = input_col_order[i];
     auto& aggregation_result = groupby_result.second[i];
@@ -616,7 +618,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
         auto count = std::move(aggregation_result.results[result_idx++]);
         auto mean  = std::move(aggregation_result.results[result_idx++]);
         auto m2    = std::move(aggregation_result.results[result_idx++]);
-        output_cols[group_idx.size() + output_idx[j]] =
+        output_cols[layout.partial_column(output_idx[j])] =
           make_stddev_state(std::move(count), std::move(mean), std::move(m2), stream, mr);
         continue;
       }
@@ -654,15 +656,18 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
         aggregation_result.results[k] =
           cudf::cast(aggregation_result.results[k]->view(), original_type, stream, mr);
       }
-      size_t output_col_id       = group_idx.size() + output_idx[j];
+      size_t output_col_id       = layout.partial_column(output_idx[j]);
       output_cols[output_col_id] = std::move(aggregation_result.results[k]);
     }
   }
 
-  if (row_positions) {
+  if (row_selector) {
     std::vector<cudf::size_type> const carried(carried_idx.begin(), carried_idx.end());
     for (auto& column : detail::gather_carried_columns(
-           input_table.select(carried), groupby_result.second, stream, mr)) {
+           input_table.select(carried),
+           groupby_result.second[row_selector->request_idx].results.front()->view(),
+           stream,
+           mr)) {
       output_cols.push_back(std::move(column));
     }
   }

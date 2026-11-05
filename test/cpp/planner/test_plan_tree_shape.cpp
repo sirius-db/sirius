@@ -1600,7 +1600,7 @@ TEST_CASE_METHOD(
     auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
     REQUIRE(merge != nullptr);
     auto& merge_op = merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>();
-    CHECK(merge_op.has_first);
+    CHECK(merge_op.has_first());
     CHECK(merge_op.cudf_aggregates.empty());
     CHECK(merge_op.partials_are_output());
     REQUIRE(merge->children.size() == 1);
@@ -1617,7 +1617,7 @@ TEST_CASE_METHOD(
     CHECK(aggregate.cudf_aggregate_idx.empty());
     CHECK_FALSE(aggregate.has_avg);
     CHECK_FALSE(aggregate.has_count_distinct);
-    CHECK(aggregate.has_first);
+    CHECK(aggregate.has_first());
     // DISTINCT builds no grouping set and a plain GROUP BY builds one.
     CHECK(aggregate.grouping_sets.size() <= 1);
     CHECK(aggregate.get_types().size() == aggregate.group_idx.size() + first_inputs.size());
@@ -1734,7 +1734,7 @@ TEST_CASE_METHOD(
     auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
     REQUIRE(hgb != nullptr);
     auto const& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
-    CHECK(aggregate.has_first);
+    CHECK(aggregate.has_first());
     CHECK(aggregate.cudf_aggregates ==
           std::vector<cudf::aggregation::Kind>{cudf::aggregation::Kind::SUM});
     REQUIRE(aggregate.aggregate_slots.size() == 2);
@@ -1817,7 +1817,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     *con, "SELECT id, first(val), sum(val) FILTER (WHERE val > 0) FROM big_left GROUP BY id");
   auto* local = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
   REQUIRE(local != nullptr);
-  CHECK(local->Cast<sirius::op::sirius_physical_grouped_aggregate>().has_first);
+  CHECK(local->Cast<sirius::op::sirius_physical_grouped_aggregate>().has_first());
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

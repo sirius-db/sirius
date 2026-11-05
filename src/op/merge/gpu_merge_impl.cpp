@@ -265,8 +265,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
-  int const num_partial_cols = num_group_cols + static_cast<int>(aggregates.size());
-  if (input_cudf_table_views[0].num_columns() != num_partial_cols + num_carried) {
+  auto const layout = grouped_aggregate_layout{static_cast<std::size_t>(num_group_cols),
+                                               aggregates.size(),
+                                               static_cast<std::size_t>(num_carried)};
+  if (static_cast<std::size_t>(input_cudf_table_views[0].num_columns()) != layout.num_columns()) {
     throw std::runtime_error(
       "`num columns = num_group_cols + num aggregates + num_carried` not true in "
       "`merge_grouped_aggregate()`");
@@ -287,7 +289,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   std::vector<cudf::size_type> wide_sum_cols;
   for (size_t i = 0; i < is_wide_integer_sum.size() && i < aggregates.size(); ++i) {
     if (is_wide_integer_sum[i]) {
-      wide_sum_cols.push_back(num_group_cols + static_cast<cudf::size_type>(i));
+      wide_sum_cols.push_back(static_cast<cudf::size_type>(layout.partial_column(i)));
     }
   }
   std::vector<std::unique_ptr<cudf::column>> widened_partials;
@@ -404,7 +406,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
                                    key_null_order);
   std::vector<cudf::groupby::aggregation_request> requests;
   for (size_t i = 0; i < aggregates.size(); ++i) {
-    int aggregate_col_id = num_group_cols + static_cast<int>(i);
+    auto const aggregate_col_id = static_cast<cudf::size_type>(layout.partial_column(i));
     cudf::groupby::aggregation_request request;
     request.values = widened_inputs[i] ? widened_inputs[i]->view()
                                        : concatenated->get_column(aggregate_col_id).view();
@@ -443,9 +445,9 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     requests.push_back(std::move(request));
   }
 
-  std::unique_ptr<cudf::column> row_positions;
+  std::optional<detail::carried_row_selector> row_selector;
   if (num_carried > 0) {
-    row_positions =
+    row_selector =
       detail::append_carried_row_selector(requests, concatenated->num_rows(), stream, mr);
   }
 
@@ -465,13 +467,17 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     output_cols.push_back(std::move(groupby_result.second[i].results[0]));
   }
 
-  if (row_positions) {
+  if (row_selector) {
     // Every carried column of a partial row came from one input row, so gathering them all by one
     // selector keeps them from one row.
     std::vector<cudf::size_type> carried(static_cast<std::size_t>(num_carried));
-    std::iota(carried.begin(), carried.end(), num_partial_cols);
+    std::iota(
+      carried.begin(), carried.end(), static_cast<cudf::size_type>(layout.carried_column(0)));
     auto carried_columns = detail::gather_carried_columns(
-      concatenated->view().select(carried), groupby_result.second, stream, mr);
+      concatenated->view().select(carried),
+      groupby_result.second[row_selector->request_idx].results.front()->view(),
+      stream,
+      mr);
     SIRIUS_LOG_DEBUG(
       "merge_grouped_agg: gathered {} carried column(s) by MIN row position ({} batches, {} rows "
       "in, {} groups)",

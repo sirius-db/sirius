@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -206,8 +207,8 @@ struct stddev_samp_slot {
 
 /** @brief FIRST: no cuDF request; child column `input_idx` is carried at `carried_idx`. */
 struct first_slot {
-  int input_idx{-1};          ///< Child column whose value this slot carries
-  std::size_t carried_idx{};  ///< Position in the carried block that follows the partials
+  cudf::size_type input_idx{-1};  ///< Child column whose value this slot carries
+  std::size_t carried_idx{};      ///< Position in the carried block that follows the partials
 };
 
 /**
@@ -217,8 +218,51 @@ struct first_slot {
  * after merge. COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts
  * list elements.
  */
-using AggregateSlot =
+using aggregate_slot =
   std::variant<plain_slot, avg_slot, count_distinct_slot, stddev_samp_slot, first_slot>;
+
+/**
+ * @brief Column positions shared by grouped aggregation, merge, and finalization
+ *
+ * Partial batches contain group keys, expanded cuDF partials, then carried FIRST columns. Indices
+ * passed to `partial_column` and `carried_column` are relative to their respective blocks.
+ */
+class grouped_aggregate_layout {
+ public:
+  grouped_aggregate_layout(std::size_t num_keys, std::size_t num_partials, std::size_t num_carried)
+    : _num_keys(num_keys), _num_partials(num_partials), _num_carried(num_carried)
+  {
+  }
+
+  grouped_aggregate_layout(std::size_t num_keys,
+                           std::size_t num_partials,
+                           std::span<aggregate_slot const> slots);
+
+  [[nodiscard]] std::size_t num_keys() const noexcept { return _num_keys; }
+  [[nodiscard]] std::size_t num_partials() const noexcept { return _num_partials; }
+  [[nodiscard]] std::size_t num_carried() const noexcept { return _num_carried; }
+  [[nodiscard]] std::size_t partial_column(std::size_t index) const noexcept
+  {
+    return _num_keys + index;
+  }
+  [[nodiscard]] std::size_t carried_column(std::size_t index) const noexcept
+  {
+    return partial_column(_num_partials) + index;
+  }
+  [[nodiscard]] std::size_t num_columns() const noexcept { return carried_column(_num_carried); }
+
+  /**
+   * @brief Whether final slot order and types need no post-merge projection
+   *
+   * HUGEINT carrier widening is checked separately against the runtime columns.
+   */
+  [[nodiscard]] bool matches_output(std::span<aggregate_slot const> slots) const noexcept;
+
+ private:
+  std::size_t _num_keys;
+  std::size_t _num_partials;
+  std::size_t _num_carried;
+};
 
 /**
  * @brief Result of converting DuckDB aggregate expressions to cuDF compute definitions.
@@ -236,19 +280,17 @@ struct CudfAggregateDefinitions {
 
   /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions or,
   /// for a FIRST, to its carried column.
-  std::vector<AggregateSlot> aggregate_slots;
+  std::vector<aggregate_slot> aggregate_slots;
   /// Runtime partial schema: group keys, expanded aggregate carriers, then the FIRST carried
   /// columns.
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
-  /// True if any aggregate is FIRST. Presence only; each FIRST is a column of the carried block.
-  bool has_first = false;
 };
 
 /// Parallel to a cudf_aggregates vector of @p num_cudf_aggregates entries: true at the SUM entry
 /// of every wide integer SUM or AVG among @p slots.
-std::vector<bool> wide_integer_sum_mask(std::vector<AggregateSlot> const& slots,
+std::vector<bool> wide_integer_sum_mask(std::vector<aggregate_slot> const& slots,
                                         std::size_t num_cudf_aggregates);
 
 /**
@@ -274,7 +316,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
  * @param aggregate_slots One entry per aggregate expression
  * @return The columns a grouped aggregate carries after its partials, in carried-block order
  */
-std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slots);
+std::vector<int> carried_inputs(std::vector<aggregate_slot> const& aggregate_slots);
 
 /**
  * @brief Whether every slot in @p aggregate_slots holds a `plain_slot`
@@ -282,7 +324,7 @@ std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slot
  * Any other `AggregateSlot` alternative, including one added later, makes the result false. An
  * empty list is all plain.
  */
-[[nodiscard]] bool all_slots_plain(std::vector<AggregateSlot> const& aggregate_slots);
+[[nodiscard]] bool all_slots_plain(std::vector<aggregate_slot> const& aggregate_slots);
 
 /**
  * @brief Whether any slot in @p aggregate_slots holds the alternative `Kind`
@@ -290,10 +332,10 @@ std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slot
  * @tparam Kind One of the `AggregateSlot` alternatives; any other type does not compile
  */
 template <typename Kind>
-[[nodiscard]] bool has_slot(std::vector<AggregateSlot> const& aggregate_slots)
+[[nodiscard]] bool has_slot(std::vector<aggregate_slot> const& aggregate_slots)
 {
   return std::ranges::any_of(
-    aggregate_slots, [](AggregateSlot const& slot) { return std::holds_alternative<Kind>(slot); });
+    aggregate_slots, [](aggregate_slot const& slot) { return std::holds_alternative<Kind>(slot); });
 }
 /// Whether @p keys is in ascending order with nulls last, i.e. valid input for
 /// `cudf::sorted::YES` with `cudf::null_order::AFTER`. Null-free fixed-width integer, boolean,

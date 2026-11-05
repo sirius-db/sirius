@@ -93,13 +93,19 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::atomic<std::int64_t> _last_batch_groups{-1};
 
   // Partial aggregate layout and finalization metadata
-  std::vector<AggregateSlot> aggregate_slots;
+  std::vector<aggregate_slot> aggregate_slots;
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
-  bool has_first          = false;
 
  public:
+  [[nodiscard]] bool has_first() const { return has_slot<first_slot>(aggregate_slots); }
+
+  [[nodiscard]] grouped_aggregate_layout partial_layout() const
+  {
+    return {num_output_group_columns(), cudf_aggregates.size(), aggregate_slots};
+  }
+
   /// Whether the aggregate computes several grouping sets or GROUPING() functions. The local
   /// output then has a set id column and one column per GROUPING() function after the keys.
   [[nodiscard]] bool has_grouping_sets() const noexcept

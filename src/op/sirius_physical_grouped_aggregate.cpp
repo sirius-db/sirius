@@ -81,9 +81,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   local_types                       = std::move(cudf_defs.local_types);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
-  has_first                         = cudf_defs.has_first;
   // `create_plan(LogicalAggregate&)` refuses FIRST over several grouping sets or beside GROUPING().
-  D_ASSERT(!(has_first && has_grouping_sets()));
+  D_ASSERT(!(has_first() && has_grouping_sets()));
   // Grouping-set expansion inserts the set id and GROUPING() values before the partial
   // aggregate carriers. Keep their types from the planner's final schema; AVG may expand
   // the aggregate suffix, and STDDEV_SAMP / COUNT(DISTINCT) replace its scalar carriers.
@@ -96,7 +95,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   }
   // A bound belongs to the aggregate's SUM slot; AVG's COUNT_VALID slot (sum_idx + 1) needs none.
   cudf_aggregate_input_max_abs.assign(cudf_aggregates.size(), std::nullopt);
-  auto const bounded_idx = [](AggregateSlot const& slot) -> std::optional<std::size_t> {
+  auto const bounded_idx = [](aggregate_slot const& slot) -> std::optional<std::size_t> {
     if (auto const* plain = std::get_if<plain_slot>(&slot)) { return plain->partial_idx; }
     if (auto const* avg = std::get_if<avg_slot>(&slot)) { return avg->sum_idx; }
     if (auto const* stddev = std::get_if<stddev_samp_slot>(&slot)) { return stddev->partial_idx; }
@@ -116,7 +115,7 @@ duckdb::vector<sirius::logical_type>
 sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {
   auto const aggregate_offset = num_output_group_columns();
-  if (!has_count_distinct || has_avg || has_first ||
+  if (!has_count_distinct || has_avg || has_first() ||
       types.size() != aggregate_offset + aggregate_slots.size()) {
     throw std::runtime_error(
       "COUNT(DISTINCT) local schema requires a non-AVG, non-FIRST one-slot-per-aggregate layout");
@@ -139,10 +138,9 @@ bool sirius_physical_grouped_aggregate::has_stddev_samp() const
 std::vector<std::optional<cudf::data_type>>
 sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
 {
-  auto const aggregate_offset = num_output_group_columns();
-  auto const num_carried      = carried_inputs(aggregate_slots).size();
-  if (types.size() != aggregate_offset + cudf_aggregates.size() + num_carried) { return {}; }
-  auto const alternate_partial = [](AggregateSlot const& slot) -> std::optional<std::size_t> {
+  auto const layout = partial_layout();
+  if (types.size() != layout.num_columns()) { return {}; }
+  auto const alternate_partial = [](aggregate_slot const& slot) -> std::optional<std::size_t> {
     if (auto const* plain = std::get_if<plain_slot>(&slot);
         plain && (plain->is_wide_integer_sum || plain->returns_hugeint)) {
       return plain->partial_idx;
@@ -157,7 +155,7 @@ sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
   for (auto const& slot : aggregate_slots) {
     auto const partial = alternate_partial(slot);
     if (!partial) { continue; }
-    auto const column  = aggregate_offset + *partial;
+    auto const column  = layout.partial_column(*partial);
     alternates[column] = sirius::require_cudf_type(types[column]) == wide_integer_sum_type()
                            ? cudf::data_type{cudf::type_id::INT64}
                            : wide_integer_sum_type();
