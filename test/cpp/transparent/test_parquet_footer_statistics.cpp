@@ -148,9 +148,14 @@ TEST_CASE_METHOD(ParquetFilesFixture,
                  "[integration][gpu_execution][transparent][parquet_footer_statistics]")
 {
   // Each file holds 1.0, -1.0 and NaN, and its footer gives a maximum of 1.0 without a NaN count.
-  // With can_have_nan the maximum does not bound the NaNs, so `d > 1` must keep them.
-  auto const source = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
-                      "duckdb/data/parquet-testing/arrow_nan.parquet";
+  // With can_have_nan the maximum does not bound the NaNs, so `d > 1` must keep them. DuckDB's own
+  // writer omits the bounds of a column holding NaN, so the file comes from DuckDB's test data.
+#ifdef SIRIUS_PROJECT_ROOT
+  auto const data = fs::path(SIRIUS_PROJECT_ROOT) / "test/cpp/integration/data";
+#else
+  auto const data = fs::path(__FILE__).parent_path().parent_path() / "integration/data";
+#endif
+  auto const source = data / "parquet/arrow_nan.parquet";
   REQUIRE(fs::exists(source));
   fs::create_directories(dir / "nan");
   for (auto const* name : {"n0.parquet", "n1.parquet"}) {
