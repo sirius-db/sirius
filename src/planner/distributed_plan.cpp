@@ -16,9 +16,11 @@
 
 #include "planner/distributed_plan.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/wire.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -90,6 +92,16 @@ std::uint64_t estimated_bytes(op::sirius_physical_operator const& node)
            : rows * width;
 }
 
+/// The cuDF types of @p types; a type cuDF cannot hold is left out.
+std::vector<cudf::data_type> physical_types_of(duckdb::vector<sirius::logical_type> const& types)
+{
+  std::vector<cudf::data_type> out;
+  for (auto const& type : types) {
+    if (auto const cudf_type = get_cudf_type(type)) { out.push_back(*cudf_type); }
+  }
+  return out;
+}
+
 /// Join types that never emit a build row without a probe match, so a build seen by every rank
 /// yields each output row on one rank only.
 bool emits_build_rows_only_with_probe(duckdb::JoinType type)
@@ -127,6 +139,16 @@ struct rewriter {
                                             exchange_spec spec,
                                             bool ordered)
   {
+    // Refused before any rank runs: the wire would refuse the first batch. Grouped STDDEV_SAMP
+    // partials are STRUCT columns, an ungrouped COUNT(DISTINCT) partial a LIST.
+    for (auto const& type : slot->has_physical_overrides() ? slot->get_physical_types()
+                                                           : physical_types_of(slot->types)) {
+      if (!exchange::sendable(type)) {
+        throw sirius::not_implemented_exception(
+          "distributed execution: an exchange of a column of cuDF type id {}",
+          static_cast<std::int32_t>(type.id()));
+      }
+    }
     auto child       = std::move(slot);
     auto const id    = stream();
     auto const types = child->types;
