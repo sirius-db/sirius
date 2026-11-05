@@ -26,12 +26,9 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
-#include <cudf/replace.hpp>
-#include <cudf/unary.hpp>
 
 // standard library
 #include <algorithm>
-#include <optional>
 #include <ranges>
 
 namespace sirius {
@@ -78,14 +75,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
   if (mode == evaluation_mode::AST) {
     // An eager pass whose every THEN is error() returns ELSE as it is: a scalar, or a borrowed
     // view of an input column. The temporary column must own a full column.
-    if (current_result.is_scalar()) {
-      current_result = evaluate_result(cudf::make_column_from_scalar(
-        current_result.get_scalar(), _input_table.num_rows(), _stream, _mr));
-    } else if (current_result.is_column_view()) {
-      current_result = evaluate_result(
-        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr));
-    }
-    return materialize_as_ast_column(current_result.release_column());
+    return materialize_as_ast_column(to_owned_column(std::move(current_result)));
   }
   return current_result;
 }
@@ -176,8 +166,6 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
   auto const type     = require_cudf_type(alt.return_type());
   // No row reaches a branch of an empty input; ELSE gives the empty result its type.
   if (num_rows == 0) { return evaluate_on_selected_rows(*alt.else_, nullptr, type); }
-  auto const condition = cudf::data_type{cudf::type_id::BOOL8};
-  auto const no        = cudf::numeric_scalar<bool>(false, true, _stream, _mr);
 
   std::unique_ptr<cudf::column> result;
   auto const assign = [&](sirius::ast::node const& branch, cudf::column_view const& rows) {
@@ -191,25 +179,17 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
   std::unique_ptr<cudf::column> unmatched;
   bool exhausted = false;
   for (auto const& case_check : alt.cases) {
-    auto const candidates =
-      unmatched ? std::optional<cudf::column_view>{unmatched->view()} : std::nullopt;
-    auto matched = evaluate_on_selected_rows(
-      *case_check.when_, candidates ? &*candidates : nullptr, condition, /*predicate=*/true);
+    auto const matched = evaluate_mask_on_selected_rows(*case_check.when_, unmatched.get());
     // Every row has matched an earlier WHEN, so no later WHEN or ELSE is evaluated.
     if (!matched) {
       exhausted = true;
       break;
     }
-    if (matched->has_nulls()) { matched = cudf::replace_nulls(matched->view(), no, _stream, _mr); }
-    if (candidates) {
-      auto const none = cudf::make_column_from_scalar(no, num_rows, _stream, _mr);
-      matched         = scatter_selected(matched->view(), none->view(), *candidates);
-    }
 
     if (is_error_branch(*case_check.then_)) {
       auto const any = cudf::reduce(matched->view(),
                                     *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
-                                    condition,
+                                    cudf::data_type{cudf::type_id::BOOL8},
                                     _stream,
                                     _mr);
       if (static_cast<cudf::scalar_type_t<bool> const&>(*any).value(_stream)) {
@@ -219,9 +199,7 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
       assign(*case_check.then_, matched->view());
     }
 
-    unmatched = candidates
-                  ? cudf::copy_if_else(no, *candidates, matched->view(), _stream, _mr)
-                  : cudf::unary_operation(matched->view(), cudf::unary_operator::NOT, _stream, _mr);
+    unmatched = undecided_rows(unmatched.get(), matched->view());
   }
   if (!exhausted) { assign(*alt.else_, unmatched->view()); }
   // Each row reached a THEN or ELSE that produced it, or an error() THEN that raised.

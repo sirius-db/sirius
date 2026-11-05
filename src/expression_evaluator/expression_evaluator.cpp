@@ -273,6 +273,33 @@ void expression_evaluator::release_temporaries(
   }
 }
 
+std::unique_ptr<cudf::column> expression_evaluator::to_owned_column(evaluate_result result)
+{
+  if (result.is_scalar()) {
+    return cudf::make_column_from_scalar(
+      result.get_scalar(), _input_table.num_rows(), _stream, _mr);
+  }
+  if (result.is_column_view()) {
+    return std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
+  }
+  return result.release_column();
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::cast_to_type(
+  std::unique_ptr<cudf::column> column, cudf::data_type type)
+{
+  if (column->type() == type) { return column; }
+  // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
+  if (!IsFixedWidth(column->type()) || !IsFixedWidth(type)) {
+    throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
+                             cudf::type_to_name(column->type()),
+                             cudf::type_to_name(type));
+  }
+  // Final result-type reconciliation is a physical schema restore. The declared output type
+  // provides the provenance needed to restore a narrowed DATE representation.
+  return sirius::cast_through_rep(column->view(), type, _stream, _mr);
+}
+
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
 {
   return evaluate_roots(input, /*predicates=*/false);
@@ -314,32 +341,9 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate_roots(cudf::table_vi
     } else {
       // Cast the `result` from libcudf to the node's return type if `result` has a different
       // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
-      // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
-      // STRING/LIST/STRUCT).
-      auto const cudf_return_type = sirius::require_cudf_type(expr.return_type());
-      std::unique_ptr<cudf::column> result_column;
-      if (result.is_scalar()) {
-        result_column =
-          cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr);
-      } else if (result.is_column_view()) {
-        result_column = std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
-      } else {
-        result_column = result.release_column();
-      }
-      if (result_column->type() != cudf_return_type) {
-        // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
-        if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
-          // Final result-type reconciliation is a physical schema restore. The declared output
-          // type provides the provenance needed to restore a narrowed DATE representation.
-          result_column =
-            sirius::cast_through_rep(result_column->view(), cudf_return_type, _stream, _mr);
-        } else {
-          throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
-                                   cudf::type_to_name(result_column->type()),
-                                   cudf::type_to_name(cudf_return_type));
-        }
-      }
-      _output_columns.push_back(std::move(result_column));
+      // int64_t.
+      _output_columns.push_back(cast_to_type(to_owned_column(std::move(result)),
+                                             sirius::require_cudf_type(expr.return_type())));
     }
   };
 

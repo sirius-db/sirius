@@ -573,6 +573,27 @@ class expression_evaluator {
                                                  cudf::column_view const& target,
                                                  cudf::column_view const& selection);
 
+  /**
+   * @brief Evaluates the predicate @p expr on the rows @p candidates selects, or on all rows when
+   * it is nullptr.
+   *
+   * @return A null-free BOOL8 column over all input rows, true where @p expr passed and false
+   * elsewhere, or nullptr when @p candidates selects no row.
+   */
+  std::unique_ptr<cudf::column> evaluate_mask_on_selected_rows(sirius::ast::node const& expr,
+                                                               cudf::column const* candidates);
+
+  /// The rows @p candidates selects, or all rows when it is nullptr, where @p decided is false.
+  std::unique_ptr<cudf::column> undecided_rows(cudf::column const* candidates,
+                                               cudf::column_view const& decided);
+
+  /// @p result as an owned column: a scalar fills every input row and a view is copied.
+  std::unique_ptr<cudf::column> to_owned_column(evaluate_result result);
+
+  /// @p column cast to @p type when its type differs. Both types must be fixed-width.
+  std::unique_ptr<cudf::column> cast_to_type(std::unique_ptr<cudf::column> column,
+                                             cudf::data_type type);
+
   evaluate_result evaluate_case_eagerly(sirius::ast::case_expr const& expr);
   std::unique_ptr<cudf::column> evaluate_case_selectively(sirius::ast::case_expr const& expr);
   evaluate_result evaluate_coalesce_eagerly(sirius::ast::coalesce const& expr);

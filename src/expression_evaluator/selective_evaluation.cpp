@@ -20,7 +20,6 @@
 #include <expression/ast/node.hpp>
 #include <expression/ast/utils.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
-#include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
@@ -28,15 +27,17 @@
 
 // cudf
 #include <cudf/copying.hpp>
+#include <cudf/replace.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/utilities/traits.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
+#include <cudf/unary.hpp>
 
 // standard library
 #include <algorithm>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius {
@@ -107,21 +108,21 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_on_selected_rows(
     std::ranges::sort(referenced);
     referenced.erase(std::unique(referenced.begin(), referenced.end()), referenced.end());
 
-    // Compact only the referenced columns, plus the selection itself: its compacted copy has the
-    // selected row count and fills the slots @p expr does not read.
+    // Compact only the referenced columns. The first compacted column fills the slots @p expr does
+    // not read; when it reads none, the compacted selection does, carrying the row count.
     std::vector<cudf::column_view> to_compact;
-    to_compact.reserve(referenced.size() + 1);
+    to_compact.reserve(std::max<std::size_t>(referenced.size(), 1));
     for (auto const index : referenced) {
       to_compact.push_back(_input_table.column(index));
     }
-    to_compact.push_back(*selection);
+    if (referenced.empty()) { to_compact.push_back(*selection); }
     compacted =
       sirius::apply_retention_mask(cudf::table_view{to_compact}, *selection, _stream, _mr);
     // DuckDB never evaluates a branch that no row selects, so its errors must not surface here.
     if (compacted->num_rows() == 0) { return nullptr; }
 
     std::vector<cudf::column_view> slots(_input_table.num_columns(),
-                                         compacted->get_column(referenced.size()).view());
+                                         compacted->get_column(0).view());
     for (std::size_t i = 0; i < referenced.size(); ++i) {
       slots[referenced[i]] = compacted->get_column(i).view();
     }
@@ -146,15 +147,37 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_on_selected_rows(
       parent._narrow_domain_comparison_count += child._narrow_domain_comparison_count;
     }
   } const fold{*this, child};
-  auto result = std::move(child.evaluate_roots(input, predicate)->release()[0]);
+  return cast_to_type(std::move(child.evaluate_roots(input, predicate)->release()[0]), type);
+}
 
-  if (result->type() == type) { return result; }
-  if (cudf::is_fixed_width(result->type()) && cudf::is_fixed_width(type)) {
-    return sirius::cast_through_rep(result->view(), type, _stream, _mr);
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_mask_on_selected_rows(
+  sirius::ast::node const& expr, cudf::column const* candidates)
+{
+  auto const rows = candidates ? std::optional{candidates->view()} : std::nullopt;
+  auto mask       = evaluate_on_selected_rows(expr,
+                                        rows ? &*rows : nullptr,
+                                        cudf::data_type{cudf::type_id::BOOL8},
+                                        /*predicate=*/true);
+  if (!mask) { return nullptr; }
+  // A NULL predicate does not pass.
+  if (mask->has_nulls()) {
+    mask = cudf::replace_nulls(
+      mask->view(), cudf::numeric_scalar<bool>(false, true, _stream, _mr), _stream, _mr);
   }
-  throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
-                           cudf::type_to_name(result->type()),
-                           cudf::type_to_name(type));
+  if (!rows) { return mask; }
+  auto const none =
+    sirius::make_constant_column<bool>(false, _input_table.num_rows(), _stream, _mr);
+  return scatter_selected(mask->view(), none->view(), *rows);
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::undecided_rows(cudf::column const* candidates,
+                                                                   cudf::column_view const& decided)
+{
+  if (!candidates) {
+    return cudf::unary_operation(decided, cudf::unary_operator::NOT, _stream, _mr);
+  }
+  return cudf::copy_if_else(
+    cudf::numeric_scalar<bool>(false, true, _stream, _mr), *candidates, decided, _stream, _mr);
 }
 
 std::unique_ptr<cudf::column> expression_evaluator::scatter_selected(

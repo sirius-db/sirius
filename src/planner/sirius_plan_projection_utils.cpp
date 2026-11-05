@@ -92,22 +92,21 @@ void mark_conditional_uses(sirius::ast::node const& expr,
                     std::is_same_v<T, sirius::ast::constant>) {
         // A leaf sees the rows of the slot that holds it.
       } else if constexpr (std::is_same_v<T, sirius::ast::case_expr>) {
-        for (std::size_t i = 0; i < alt.cases.size(); i++) {
-          if (alt.eager) {
-            descend(alt.cases[i].when_, false);
-            descend(alt.cases[i].then_, false);
-            continue;
-          }
-          if (i == 0) {
-            descend(alt.cases[i].when_, true);
-          } else {
-            conditional(alt.cases[i].when_);
-          }
-          conditional(alt.cases[i].then_);
-        }
         if (alt.eager) {
+          for (auto const& c : alt.cases) {
+            descend(c.when_, false);
+            descend(c.then_, false);
+          }
           descend(alt.else_, false);
         } else {
+          for (std::size_t i = 0; i < alt.cases.size(); i++) {
+            if (i == 0) {
+              descend(alt.cases[i].when_, true);
+            } else {
+              conditional(alt.cases[i].when_);
+            }
+            conditional(alt.cases[i].then_);
+          }
           conditional(alt.else_);
         }
       } else if constexpr (std::is_same_v<T, sirius::ast::coalesce>) {

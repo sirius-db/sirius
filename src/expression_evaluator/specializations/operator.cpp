@@ -585,16 +585,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::coalesce const& alt,
   if (mode == evaluation_mode::AST) {
     // A null-free reference short-circuits as a borrowed view; copy it so the temp column owns it.
     // TODO: Avoid this copy: https://github.com/sirius-db/sirius/issues/2305.
-    if (current_result.is_column_view()) {
-      current_result = evaluate_result(
-        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr));
-    }
-    if (!current_result.is_owned_column()) {
-      throw internal_exception(
-        "[expression_evaluator:operator]: Expected an owned column after executing COALESCE "
-        "expression.");
-    }
-    return materialize_as_ast_column(current_result.release_column());
+    return materialize_as_ast_column(to_owned_column(std::move(current_result)));
   }
   return current_result;
 }
