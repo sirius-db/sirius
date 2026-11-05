@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// CASE and COALESCE must not raise errors for rows a branch does not produce (#2203, #2052).
+// CASE, COALESCE, and AND and OR in filters must not raise errors for rows a branch or operand
+// does not see (#2203, #2052).
 
 #include "ast_test_support.hpp"
 
@@ -174,6 +175,50 @@ std::unique_ptr<ast_node> i_is_min()
 std::unique_ptr<ast_node> error_call()
 {
   return call(function_id::error, integer(), make_str_const("more than one row"));
+}
+
+std::unique_ptr<ast_node> both(std::unique_ptr<ast_node> first, std::unique_ptr<ast_node> second)
+{
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(first));
+  children.push_back(std::move(second));
+  return make_conj(sirius::ast::conjunction::kind::op_and, std::move(children));
+}
+
+std::unique_ptr<ast_node> either(std::unique_ptr<ast_node> first, std::unique_ptr<ast_node> second)
+{
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(first));
+  children.push_back(std::move(second));
+  return make_conj(sirius::ast::conjunction::kind::op_or, std::move(children));
+}
+
+// d + n > d, which overflows where d + n does.
+std::unique_ptr<ast_node> d_plus_n_after_d()
+{
+  return make_cmp(sirius::comparison_type::gt, d_plus_n(), d());
+}
+
+struct selection {
+  rows<int32_t> n;  ///< The n of each selected row
+  std::size_t selective_evaluations;
+};
+
+// Selects the rows of @p input that pass @p predicate, as a FILTER operator does, or as a scan
+// does when @p short_circuit is false.
+selection filter_rows(ast_node const& predicate,
+                      date_table const& input,
+                      expression_evaluator_strategy strategy,
+                      bool short_circuit = true)
+{
+  sirius::expression_evaluator evaluator(predicate,
+                                         cudf::get_current_device_resource_ref(),
+                                         cudf::get_default_stream(),
+                                         sirius::expression_query_policy{strategy});
+  if (short_circuit) { evaluator.enable_short_circuit(); }
+  auto const table = evaluator.select(input.view());
+  return {host_rows<int32_t>(table->view().column(1)),
+          evaluator.selective_evaluation_count_for_testing()};
 }
 
 }  // namespace
@@ -669,4 +714,114 @@ TEST_CASE("CASE whose THENs are all error() returns ELSE to an AST parent",
   auto result      = evaluate(*expr, input.view(), strategy);
   CHECK(host_rows<int32_t>(result.column()) ==
         (scalar_else ? rows<int32_t>{9, 9} : rows<int32_t>{3, 4}));
+}
+
+TEST_CASE("a filter's AND and OR evaluate each operand only on the rows still undecided",
+          "[expression_evaluator][conditional_errors]")
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  CAPTURE(strategy);
+  using sirius::comparison_type;
+  auto const date_out_of_range = Catch::Matchers::ContainsSubstring("Date out of range");
+  // d + n overflows on the INT_MAX row.
+  auto const input = dates({int_max, 1, -5, std::nullopt});
+
+  SECTION("AND")
+  {
+    auto const result =
+      filter_rows(*both(n_is(comparison_type::lt, 100), d_plus_n_after_d()), input, strategy);
+    CHECK(result.n == rows<int32_t>{1});
+    CHECK(result.selective_evaluations == 1);
+  }
+  SECTION("OR")
+  {
+    auto const result =
+      filter_rows(*either(n_is(comparison_type::ge, 100), d_plus_n_after_d()), input, strategy);
+    CHECK(result.n == rows<int32_t>{int_max, 1});
+    CHECK(result.selective_evaluations == 1);
+  }
+  SECTION("OR within AND")
+  {
+    auto predicate    = both(n_is(comparison_type::gt, -100),
+                          either(n_is(comparison_type::ge, 100), d_plus_n_after_d()));
+    auto const result = filter_rows(*predicate, input, strategy);
+    CHECK(result.n == rows<int32_t>{int_max, 1});
+    CHECK(result.selective_evaluations == 2);
+  }
+  SECTION("a row that passes the earlier operands still raises")
+  {
+    REQUIRE_THROWS_WITH(
+      filter_rows(*both(n_is(comparison_type::gt, 0), d_plus_n_after_d()), input, strategy),
+      date_out_of_range);
+  }
+  SECTION("a scan evaluates every operand on every row")
+  {
+    REQUIRE_THROWS_WITH(filter_rows(*both(n_is(comparison_type::lt, 100), d_plus_n_after_d()),
+                                    input,
+                                    strategy,
+                                    /*short_circuit=*/false),
+                        date_out_of_range);
+  }
+  SECTION("an AND in a value evaluates every operand on every row")
+  {
+    REQUIRE_THROWS_WITH(
+      evaluate(*both(n_is(comparison_type::lt, 100), d_plus_n_after_d()), input.view(), strategy),
+      date_out_of_range);
+  }
+  SECTION("a WHEN's AND")
+  {
+    auto expr   = make_case(both(n_is(comparison_type::lt, 100), d_plus_n_after_d()),
+                          make_int_const(1),
+                          make_int_const(0),
+                          integer());
+    auto result = evaluate(*expr, input.view(), strategy);
+    CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{0, 1, 0, 0});
+    // The CASE retries, and the AND in its WHEN evaluates selectively within that pass.
+    CHECK(result.selective_evaluations == 2);
+  }
+}
+
+TEST_CASE("an eager CASE raises the errors of every row, as an aggregate FILTER does",
+          "[expression_evaluator][conditional_errors]")
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  CAPTURE(strategy);
+  using sirius::comparison_type;
+  auto const date_out_of_range = Catch::Matchers::ContainsSubstring("Date out of range");
+  auto const input             = dates({int_max, 1});
+  auto eager                   = [](std::unique_ptr<ast_node> expr) {
+    expr->get<case_expr>().eager = true;
+    return expr;
+  };
+
+  SECTION("THEN")
+  {
+    auto make = [] {
+      return make_case(n_is(comparison_type::lt, 100), d_plus_n(), make_null_const(date()), date());
+    };
+    auto result = evaluate(*make(), input.view(), strategy);
+    CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{std::nullopt, y2000 + 1});
+    REQUIRE_THROWS_WITH(evaluate(*eager(make()), input.view(), strategy), date_out_of_range);
+  }
+  SECTION("an AND in the WHEN")
+  {
+    auto expr = eager(make_case(both(n_is(comparison_type::lt, 100), d_plus_n_after_d()),
+                                d(),
+                                make_null_const(date()),
+                                date()));
+    REQUIRE_THROWS_WITH(evaluate(*expr, input.view(), strategy), date_out_of_range);
+  }
+  SECTION("a CASE in the THEN still evaluates its branches on their rows")
+  {
+    auto inner  = make_case(n_is(comparison_type::lt, 100), d_plus_n(), d(), date());
+    auto expr   = eager(make_case(
+      n_is(comparison_type::gt, -100), std::move(inner), make_null_const(date()), date()));
+    auto result = evaluate(*expr, input.view(), strategy);
+    CHECK(host_rows<int32_t>(result.column()) == rows<int32_t>{y2000, y2000 + 1});
+    CHECK(result.selective_evaluations == 1);
+  }
 }

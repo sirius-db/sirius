@@ -48,8 +48,12 @@ class case_expr {
 
   case_expr(std::vector<when_then> cases,
             std::unique_ptr<node> else_clause,
-            sirius::logical_type return_type)
-    : cases(std::move(cases)), else_(std::move(else_clause)), return_type_(std::move(return_type))
+            sirius::logical_type return_type,
+            bool eager = false)
+    : cases(std::move(cases)),
+      else_(std::move(else_clause)),
+      eager(eager),
+      return_type_(std::move(return_type))
   {
   }
 
@@ -64,6 +68,10 @@ class case_expr {
 
   std::vector<when_then> cases;
   std::unique_ptr<node> else_;
+  /// Evaluates every WHEN and branch on every row, so any of them raises its errors, where a SQL
+  /// CASE evaluates a branch only on its rows. The planner sets it on the CASE that lowers an
+  /// aggregate FILTER: DuckDB computes the aggregate's arguments and FILTER on every row.
+  bool eager = false;
 
   std::size_t cudf_ast_op_count() const;
 

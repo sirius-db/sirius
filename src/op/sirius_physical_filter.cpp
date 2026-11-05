@@ -67,6 +67,9 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
                                          expression_evaluator::default_min_ast_size,
                                          like_swar_fastpath_enabled(),
                                          like_cache());
+  // The predicate's operands are in plan order, which DuckDB's filter keeps whenever an operand
+  // can raise, so an AND or OR evaluates each operand only on the rows still undecided, as there.
+  evaluator.enable_short_circuit();
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

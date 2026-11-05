@@ -275,6 +275,12 @@ void expression_evaluator::release_temporaries(
 
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
 {
+  return evaluate_roots(input, /*predicates=*/false);
+}
+
+std::unique_ptr<cudf::table> expression_evaluator::evaluate_roots(cudf::table_view input,
+                                                                  bool predicates)
+{
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
 
@@ -351,7 +357,8 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
         "from_duckdb returned nullptr for an unsupported expression; "
         "cannot evaluate on GPU");
     }
-    auto result = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
+    auto result = predicates ? evaluate_predicate(*ast_expr)
+                             : evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
     post_process(*ast_expr, std::move(result));
   }
 
@@ -364,7 +371,7 @@ std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_vie
   // A filter predicate must be BOOLEAN. Read the type natively from the Sirius AST.
   D_ASSERT(_ast_expressions[0]->return_type().id() == sirius::type_id::BOOLEAN);
 
-  return std::move(evaluate(input)->release()[0]);
+  return std::move(evaluate_roots(input, _short_circuit)->release()[0]);
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::select(

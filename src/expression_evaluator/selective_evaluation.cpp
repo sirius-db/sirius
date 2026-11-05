@@ -92,7 +92,10 @@ evaluate_result expression_evaluator::with_selective_retry(
 }
 
 std::unique_ptr<cudf::column> expression_evaluator::evaluate_on_selected_rows(
-  sirius::ast::node const& expr, cudf::column_view const* selection, cudf::data_type type)
+  sirius::ast::node const& expr,
+  cudf::column_view const* selection,
+  cudf::data_type type,
+  bool predicate)
 {
   cudf::table_view input = _input_table;
   std::unique_ptr<cudf::table> compacted;
@@ -143,7 +146,7 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_on_selected_rows(
       parent._narrow_domain_comparison_count += child._narrow_domain_comparison_count;
     }
   } const fold{*this, child};
-  auto result = std::move(child.evaluate(input)->release()[0]);
+  auto result = std::move(child.evaluate_roots(input, predicate)->release()[0]);
 
   if (result->type() == type) { return result; }
   if (cudf::is_fixed_width(result->type()) && cudf::is_fixed_width(type)) {

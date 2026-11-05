@@ -65,9 +65,11 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
   // exact only for the first WHEN. DuckDB generates no other, but SQL can spell one.
   auto const eager_is_exact = std::ranges::none_of(
     alt.cases | std::views::drop(1), [](auto const& c) { return is_error_branch(*c.then_); });
-  auto current_result = with_selective_retry([&] { return evaluate_case_eagerly(alt); },
-                                             [&] { return evaluate_case_selectively(alt); },
-                                             eager_is_exact);
+  auto current_result = alt.eager
+                          ? evaluate_case_eagerly(alt)
+                          : with_selective_retry([&] { return evaluate_case_eagerly(alt); },
+                                                 [&] { return evaluate_case_selectively(alt); },
+                                                 eager_is_exact);
 
   //===----------MATERIALIZE (AST breaker)----------===//
   // CASE cannot be represented as a cudf AST operation, so we always materialize it. If the caller
@@ -167,8 +169,9 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
   sirius::ast::case_expr const& alt)
 {
   // DuckDB semantics: each WHEN sees only the rows no earlier WHEN matched, where NULL does not
-  // match; each THEN sees the rows its WHEN matched, and ELSE the rest. A branch that no row
-  // reaches is not evaluated. Every mask below is a null-free BOOL8 column over all input rows.
+  // match, and evaluates as a predicate; each THEN sees the rows its WHEN matched, and ELSE the
+  // rest. A branch that no row reaches is not evaluated. Every mask below is a null-free BOOL8
+  // column over all input rows.
   auto const num_rows = _input_table.num_rows();
   auto const type     = require_cudf_type(alt.return_type());
   // No row reaches a branch of an empty input; ELSE gives the empty result its type.
@@ -190,8 +193,8 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_case_selectively(
   for (auto const& case_check : alt.cases) {
     auto const candidates =
       unmatched ? std::optional<cudf::column_view>{unmatched->view()} : std::nullopt;
-    auto matched =
-      evaluate_on_selected_rows(*case_check.when_, candidates ? &*candidates : nullptr, condition);
+    auto matched = evaluate_on_selected_rows(
+      *case_check.when_, candidates ? &*candidates : nullptr, condition, /*predicate=*/true);
     // Every row has matched an earlier WHEN, so no later WHEN or ELSE is evaluated.
     if (!matched) {
       exhausted = true;

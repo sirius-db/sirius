@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// CASE and COALESCE must not raise errors for rows a branch does not produce (#2203, #2052).
+// CASE, COALESCE, and AND and OR in filters must not raise errors for rows a branch or operand
+// does not see (#2203, #2052), while DuckDB's errors for every row still raise.
 // compare_gpu_vs_cpu requires one GPU execution and no fallback, which is disabled besides.
 
 #include <catch.hpp>
@@ -163,4 +164,51 @@ TEST_CASE_METHOD(ConditionalErrorsFixture,
     "SELECT CASE WHEN n > 0 THEN CASE WHEN n > 1 THEN a + n ELSE a END ELSE a END FROM dates",
     "Date out of range");
   expect_error("SELECT COALESCE(a, -i) FROM ints", "Overflow in negation");
+}
+
+TEST_CASE_METHOD(ConditionalErrorsFixture,
+                 "AND and OR in filters and WHENs skip errors on rows earlier operands decide",
+                 "[integration][gpu_execution][conditional_errors]")
+{
+  strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  // n // (b - c) overflows on id 1, where b - c = -1. Each guard reads two columns, so DuckDB keeps
+  // it in the filter instead of pushing it into the scan.
+  run_ok("CREATE TABLE t(id INTEGER, n INTEGER, b INTEGER, c INTEGER)");
+  run_ok(
+    "INSERT INTO t VALUES (1, -2147483648, 0, 1), (2, 12, 5, 2), (3, 7, NULL, 1), (4, 9, 4, 1), "
+    "(5, 2, 3, 1)");
+  run_ok("CHECKPOINT");
+
+  compare_gpu_vs_cpu("SELECT id FROM t WHERE b - c <> -1 AND n // (b - c) > 1");
+  compare_gpu_vs_cpu("SELECT id FROM t WHERE b - c = -1 OR n // (b - c) > 1");
+  compare_gpu_vs_cpu("SELECT id FROM t WHERE id > 0 AND (b - c = -1 OR n // (b - c) > 1)");
+  compare_gpu_vs_cpu(
+    "SELECT id FROM t GROUP BY id HAVING max(b) - max(c) <> -1 AND max(n) // (max(b) - max(c)) > "
+    "1");
+  compare_gpu_vs_cpu(
+    "SELECT id, CASE WHEN b - c <> -1 AND n // (b - c) > 1 THEN 'big' ELSE 'small' END FROM t");
+}
+
+TEST_CASE_METHOD(ConditionalErrorsFixture,
+                 "aggregate FILTER and AND in a value raise errors for every row, as in DuckDB",
+                 "[integration][gpu_execution][conditional_errors]")
+{
+  strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  // DuckDB computes an aggregate's arguments and FILTER on every row before it filters. a + n
+  // overflows on id 1.
+  run_ok("CREATE TABLE dates(id INTEGER, a DATE, n INTEGER)");
+  run_ok(
+    "INSERT INTO dates VALUES (1, '2000-01-01', 2147483647), (2, '2000-01-01', 1), "
+    "(3, '2000-01-01', -5)");
+  run_ok("CHECKPOINT");
+
+  expect_error("SELECT max(a + n) FILTER (WHERE n < 100) FROM dates", "Date out of range");
+  expect_error("SELECT id % 2, max(a + n) FILTER (WHERE n < 100) FROM dates GROUP BY id % 2",
+               "Date out of range");
+  expect_error("SELECT count(*) FILTER (WHERE n < id + 100 AND a + n > a) FROM dates",
+               "Date out of range");
+  expect_error("SELECT n < id + 100 AND a + n > a FROM dates", "Date out of range");
+  // A CASE in the argument still evaluates its branches only on their rows.
+  compare_gpu_vs_cpu(
+    "SELECT max(CASE WHEN n < 100 THEN a + n END) FILTER (WHERE id <> 2) FROM dates");
 }

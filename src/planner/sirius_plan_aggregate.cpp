@@ -283,12 +283,18 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   }
   masked_inputs.clear();
   if (expressions.empty()) { return child; }
-  child = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
+  child       = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
+  auto inputs = translate_expressions(std::move(expressions));
+  // DuckDB computes an aggregate's arguments and FILTER on every row before it filters, so they
+  // raise their errors even for the rows the FILTER drops.
+  for (auto const column : masked_columns) {
+    if (inputs[column] && inputs[column]->holds<sirius::ast::case_expr>()) {
+      inputs[column]->get<sirius::ast::case_expr>().eager = true;
+    }
+  }
   auto const estimated_cardinality = child->estimated_cardinality;
-  return push_projection(std::move(child),
-                         sirius::from_duckdb_vec(types),
-                         translate_expressions(std::move(expressions)),
-                         estimated_cardinality);
+  return push_projection(
+    std::move(child), sirius::from_duckdb_vec(types), std::move(inputs), estimated_cardinality);
 }
 
 /// Column positions a fused COUNT-join reads from the two join inputs. Each index addresses the

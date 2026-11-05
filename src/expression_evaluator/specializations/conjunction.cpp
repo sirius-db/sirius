@@ -23,6 +23,13 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/replace.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/unary.hpp>
+
+// standard library
+#include <optional>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
@@ -119,6 +126,68 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::conjunction const& a
     output = evaluate_result(std::move(output_column));
   }
   return output;
+}
+
+evaluate_result expression_evaluator::evaluate_predicate(sirius::ast::node const& expr)
+{
+  if (!expr.holds<sirius::ast::conjunction>()) {
+    return evaluate(expr, evaluation_mode::MATERIALIZE);
+  }
+  auto const& alt = expr.get<sirius::ast::conjunction>();
+  return with_selective_retry([&] { return evaluate(alt, evaluation_mode::MATERIALIZE); },
+                              [&] { return evaluate_conjunction_selectively(alt); });
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_conjunction_selectively(
+  sirius::ast::conjunction const& alt)
+{
+  // DuckDB's Select: AND evaluates each operand on the rows that every earlier operand passed, and
+  // OR on the rows that none passed, where NULL does not pass. Every mask below is a null-free
+  // BOOL8 column over all input rows.
+  auto const num_rows  = _input_table.num_rows();
+  auto const condition = cudf::data_type{cudf::type_id::BOOL8};
+  if (num_rows == 0) { return cudf::make_empty_column(condition); }
+  auto const no     = cudf::numeric_scalar<bool>(false, true, _stream, _mr);
+  bool const is_and = alt.op == sirius::ast::conjunction::kind::op_and;
+
+  // The rows the next operand evaluates; empty while that is every row.
+  std::unique_ptr<cudf::column> pending;
+  // OR: the rows an operand passed.
+  std::unique_ptr<cudf::column> passed;
+  for (auto const& child : alt.children) {
+    auto const candidates =
+      pending ? std::optional<cudf::column_view>{pending->view()} : std::nullopt;
+    auto outcome = evaluate_on_selected_rows(
+      *child, candidates ? &*candidates : nullptr, condition, /*predicate=*/true);
+    // Every row is decided, so no later operand is evaluated.
+    if (!outcome) { break; }
+    if (outcome->has_nulls()) { outcome = cudf::replace_nulls(outcome->view(), no, _stream, _mr); }
+    if (candidates) {
+      auto const none = cudf::make_column_from_scalar(no, num_rows, _stream, _mr);
+      outcome         = scatter_selected(outcome->view(), none->view(), *candidates);
+    }
+
+    if (is_and) {
+      pending = std::move(outcome);
+      continue;
+    }
+    pending = candidates
+                ? cudf::copy_if_else(no, *candidates, outcome->view(), _stream, _mr)
+                : cudf::unary_operation(outcome->view(), cudf::unary_operator::NOT, _stream, _mr);
+    passed  = passed ? cudf::binary_operation(passed->view(),
+                                             outcome->view(),
+                                             cudf::binary_operator::LOGICAL_OR,
+                                             condition,
+                                             _stream,
+                                             _mr)
+                     : std::move(outcome);
+  }
+  auto result = is_and ? std::move(pending) : std::move(passed);
+  if (!result) {
+    throw invalid_input_exception(
+      "[expression_evaluator:conjunction] conjunction has no children — malformed AST.");
+  }
+  return result;
 }
 
 }  // namespace sirius

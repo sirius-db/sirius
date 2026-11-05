@@ -241,10 +241,31 @@ error over an input without columns, which cannot carry a row count. The eager p
 `error()` THEN after its first WHEN evaluates selectively at once. Only hand-written SQL produces
 one. Tests are tagged `[conditional_errors]`.
 
-AND, OR, BETWEEN and IN still evaluate every operand on every row. In filters and WHEN conditions,
-DuckDB evaluates AND and OR operands only on the rows the others leave undecided, in an order it
-adapts at run time. A guard written with AND instead of CASE can therefore raise on the GPU, or
-replay on the CPU, where DuckDB does not.
+In a predicate, DuckDB's Select evaluates an AND operand only on the rows every earlier operand
+passed, and an OR operand only on the rows none passed. Predicates are FILTER conditions and
+WHEN conditions. DuckDB keeps the plan's operand order whenever an operand can raise. So
+`WHERE b - c <> -1 AND n // (b - c) > 1` never divides on a row where `b - c` is -1. The GPU
+matches this in two places:
+
+- `evaluate_predicate` evaluates an AND or OR at the top of a predicate eagerly. If that raises
+  one of the errors above, it evaluates each operand on its rows through
+  `evaluate_on_selected_rows`, and each operand is itself a predicate. The result reads false for
+  rows that do not pass, where an eager AND or OR may read NULL; a predicate does not tell the two
+  apart.
+- A CASE evaluates its WHENs as predicates when it retries. `select()` evaluates its predicate
+  this way only after `enable_short_circuit()`, which the FILTER operator calls.
+
+Scans leave it off. DuckDB orders a scan's filters by estimated cost, and Sirius does not
+reproduce that order. Short-circuiting in another order could return rows where DuckDB raises an
+error. Outside predicates DuckDB evaluates every AND and OR operand on every row, and so does the
+GPU, as in a projection's `SELECT b - c <> -1 AND n // (b - c) > 1`. BETWEEN and IN evaluate every
+operand on every row in both, too.
+
+The planner lowers `agg(x) FILTER (WHERE f)` to `agg(CASE WHEN f THEN x ELSE NULL END)`. DuckDB
+instead computes `x` and `f` on every row and filters afterwards, so their errors raise for rows the
+FILTER drops. The planner marks this CASE `eager`. An eager CASE evaluates its WHEN as a value
+rather than a predicate, evaluates every branch on every row, and does not retry. A CASE inside `x`
+still retries on its own, as DuckDB evaluates it lazily.
 
 Handlers that read an operand as a column evaluate it with `evaluate_as_column`, which broadcasts
 a scalar result to the input's row count. These are the date parts (including `millisecond` and
@@ -458,7 +479,7 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the condi
 | `src/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
 | `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
 | `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
-| `src/expression_evaluator/selective_evaluation.cpp` | Selective retry of CASE and COALESCE on row subsets |
+| `src/expression_evaluator/selective_evaluation.cpp` | Selective retry of CASE, COALESCE, and a predicate's AND and OR on row subsets |
 | `src/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
 | `src/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
 | `src/expression_evaluator/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |
