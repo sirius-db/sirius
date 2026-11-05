@@ -40,6 +40,9 @@ inline constexpr std::size_t default_max_scanned_objects = 1'000'000;
 struct list_entry {
   std::string key;
   std::uint64_t size = 0;
+  /// The object's ETag, quotes preserved as a HEAD or GET returns it; empty when
+  /// the listing omits it.
+  std::string etag;
 };
 
 /// One parsed page of an S3 ListObjectsV2 response.

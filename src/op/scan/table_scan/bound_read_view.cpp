@@ -552,6 +552,11 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
 }
 }  // namespace
 
+std::string parquet_options_identity(duckdb::ParquetOptions const& options)
+{
+  return parquet_options_text(options);
+}
+
 // Map each file's input position to its position in the sorted evidence arrays.
 std::vector<std::size_t> make_read_view_evidence_index(std::span<std::string const> paths)
 {
