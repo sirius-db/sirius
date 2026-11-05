@@ -59,7 +59,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     duckdb::idx_t estimated_cardinality,
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan = nullptr,
     std::uint64_t validated_plan_pin_epoch                                         = 0,
-    std::optional<uint64_t> captured_transaction_id                                = std::nullopt);
+    std::optional<uint64_t> captured_transaction_id                                = std::nullopt,
+    std::uint64_t validated_distributed_query                                      = 0);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -124,6 +125,10 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// pin-derived decisions, and pin/unpin can land between that window and this operator's
   /// execution window, so the plan is reused only while the epoch still matches.
   std::uint64_t validated_plan_pin_epoch_ = 0;
+
+  /// The distributed query validated_sirius_plan_ runs, 0 if none. The window that reuses the
+  /// plan adopts it, so a failure aborts it on the peers and retirement waits for its sends.
+  std::uint64_t validated_distributed_query_ = 0;
 };
 
 }  // namespace sirius::transparent

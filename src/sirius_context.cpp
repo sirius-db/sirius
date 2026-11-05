@@ -1322,6 +1322,14 @@ void SiriusContext::release_distributed_connection(ClientContext& context)
   if (distributed_connection_ == context.GetConnectionId()) { distributed_connection_.reset(); }
 }
 
+void SiriusContext::adopt_distributed_query(ClientContext& context, uint64_t query)
+{
+  auto state = get_sirius_connection_state(context);
+  if (query == 0 || !state || state->active_window == 0) { return; }
+  std::lock_guard lock{exchange_mutex_};
+  distributed_by_window_[state->active_window] = query;
+}
+
 uint64_t SiriusContext::distributed_query_of(sirius::query_id_t window)
 {
   std::lock_guard lock{exchange_mutex_};
@@ -2087,6 +2095,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       validated_sirius_plan = planner->create_plan(std::move(logical_plan));
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
+    // The plan's distributed query number, if it has one: a later statement that reuses the plan
+    // (EXECUTE of a prepared statement) ties it to its own execution window.
+    auto const validated_distributed_query = conn_state ? conn_state->planned_distributed_query : 0;
 
     duckdb::Value read_view_injection;
     if (context.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",
@@ -2148,7 +2159,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       0,
       std::move(validated_sirius_plan),
       validated_plan_pin_epoch,
-      context.transaction.ActiveTransaction().global_transaction_id);
+      context.transaction.ActiveTransaction().global_transaction_id,
+      validated_distributed_query);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.

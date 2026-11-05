@@ -827,6 +827,10 @@ class SiriusContext : public ClientContextState {
   /// \brief The distributed query execution window @p window runs, or 0.
   [[nodiscard]] uint64_t distributed_query_of(sirius::query_id_t window);
 
+  /// \brief @p context's open execution window runs distributed query @p query, which an earlier
+  /// statement planned (a prepared statement's validated plan). No-op for 0 or without a window.
+  void adopt_distributed_query(ClientContext& context, uint64_t query);
+
   /// \brief Window @p window's query failed with @p error: if it is a distributed query, every
   /// peer's run of it fails too, rather than waiting for this rank's batches.
   void abort_distributed_query(sirius::query_id_t window, std::exception_ptr const& error) noexcept;
