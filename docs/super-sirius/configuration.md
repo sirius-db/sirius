@@ -969,8 +969,10 @@ surface.
 
 ### Distributed Execution
 
-See [Distributed Execution](distributed-sirius.md). These settings must be set before the connection's first
-distributed query and cannot change after it.
+See [Distributed Execution](distributed-sirius.md). The exchange belongs to the process, not the
+connection: with `sirius_exchange_peers` already set, `SET sirius_exchange_rank` connects it and
+waits for every peer; set the other way round, the first distributed query connects it. Once it is
+connected, none of these settings can change, on any connection.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
