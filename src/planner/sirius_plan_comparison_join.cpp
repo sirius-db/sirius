@@ -575,7 +575,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto* const stats          = &sirius_context->get_dynamic_filter_stats();
     bool const multi_partition = op_params.enable_dynamic_filter_multi_partition;
     // Distributed: no BUILD_FILTER is planned, so right semi and anti joins publish nothing.
-    bool const early_publication = multi_partition && op_params.exchange_peers.empty();
+    bool const early_publication = multi_partition && !op_params.distributed();
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
