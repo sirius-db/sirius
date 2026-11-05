@@ -130,6 +130,20 @@ static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
   return {};
 }
 
+/// Names the scan column that output ordinal @p ordinal reads, for the dynamic-filter target log.
+/// Best effort: a scan without a resolvable name reports `#<ordinal>`.
+static std::string describe_scan_output_column(sirius::op::sirius_physical_table_scan const& scan,
+                                               std::size_t ordinal)
+{
+  auto const fallback = "#" + std::to_string(ordinal);
+  auto const limit = scan.projection_ids.empty() ? scan.column_ids.size() : scan.projection_ids.size();
+  if (ordinal >= limit) { return fallback; }
+  auto const slot = scan.projection_ids.empty() ? ordinal : scan.projection_ids[ordinal];
+  if (slot >= scan.column_ids.size()) { return fallback; }
+  auto const column = scan.column_ids[slot].GetPrimaryIndex();
+  return column < scan.names.size() ? scan.names[column] : fallback;
+}
+
 /// Returns a set of output column indices proven to form a unique key for the
 /// given logical operator subtree, or an empty set if uniqueness cannot be proven.
 static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::SiriusContext* sirius_context,
@@ -651,6 +665,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
              .channel_push_ordinal = terminal.ordinal,
              .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
+          SIRIUS_LOG_DEBUG(
+            "[dynamic_filter_target] join_type={} key={} route=scan scan={} first_column={} "
+            "column={}",
+            duckdb::JoinTypeToString(op.join_type),
+            key_index,
+            scan.function.GetName().GetIdentifierName(),
+            scan.names.empty() ? std::string{} : scan.names[0],
+            describe_scan_output_column(scan, terminal.ordinal));
           scan_bound = true;
         }
         if (scan_bound) { continue; }
@@ -667,8 +689,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           std::move(left),
           static_cast<std::size_t>(key.probe_key_ordinal),
           policy,
-          [&site_channels, &op_params, stats](sirius::op::sirius_physical_operator const& site)
+          [&site_channels, &op_params, stats, &op, key_index](
+            sirius::op::sirius_physical_operator const& site)
             -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
+            SIRIUS_LOG_DEBUG("[dynamic_filter_target] join_type={} key={} route=direct site={}",
+                             duckdb::JoinTypeToString(op.join_type),
+                             key_index,
+                             sirius::op::SiriusPhysicalOperatorToString(site.type));
             auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
             auto consumer = sirius::op::scan::make_dynamic_filter_consumer(
               channel,
