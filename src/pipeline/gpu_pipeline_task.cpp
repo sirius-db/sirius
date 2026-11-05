@@ -246,10 +246,9 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
     // Keep a second owner until construction succeeds, including allocation failures.
     return input->with_batches_preserving_rows(*output);
   } catch (...) {
-    if (is_unjoined_gpu_work(std::current_exception()) ||
-        !join_gpu_work(stream, gpu_completion_point::failure)) {
+    if (auto failure = failure_after_gpu_work(std::current_exception(), stream)) {
       retain_unjoined_owner(output);
-      throw unjoined_gpu_work{};
+      throw *failure;
     }
     throw;
   }
@@ -284,16 +283,16 @@ std::unique_ptr<op::operator_data> run_one_operator(
     effective_input.set_delivery(delivery);
     operator_output_data = op.execute(effective_input, stream);
     auto sticky          = cudaGetLastError();
-    if (!join_gpu_work(stream, gpu_completion_point::execute)) throw unjoined_gpu_work{};
+    join_gpu_work(stream, gpu_completion_point::execute).throw_if_failed();
     check_cuda_health(sticky);
     if (sticky != cudaSuccess)
       throw std::runtime_error(std::string("CUDA operator failed: ") + cudaGetErrorName(sticky));
   } catch (...) {
     auto error = std::current_exception();
-    if (is_unjoined_gpu_work(error) || !join_gpu_work(stream, gpu_completion_point::failure)) {
+    if (auto failure = failure_after_gpu_work(error, stream)) {
       retain_unjoined_owner(operator_output_data);
       retain_unjoined_owner(materialized);
-      throw unjoined_gpu_work{};
+      throw *failure;
     }
     check_cuda_health(cudaGetLastError());
     throw;
@@ -632,12 +631,11 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, ::cuda::s
   try {
     materialized = materialize_sink_input(output_data, stream);
     publish_output(output_data, materialized.get(), stream);
-    if (!join_gpu_work(stream, gpu_completion_point::sink)) throw unjoined_gpu_work{};
+    join_gpu_work(stream, gpu_completion_point::sink).throw_if_failed();
   } catch (...) {
-    if (is_unjoined_gpu_work(std::current_exception()) ||
-        !join_gpu_work(stream, gpu_completion_point::failure)) {
+    if (auto failure = failure_after_gpu_work(std::current_exception(), stream)) {
       retain_unjoined_owner(materialized);
-      throw unjoined_gpu_work{};
+      throw *failure;
     }
     throw;
   }
@@ -744,13 +742,12 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   try {
     try {
       local_state._input_data->prepare_for_processing(requested_memory_space, stream);
-      if (!join_gpu_work(stream, gpu_completion_point::prepare)) throw unjoined_gpu_work{};
+      join_gpu_work(stream, gpu_completion_point::prepare).throw_if_failed();
     } catch (...) {
-      if (is_unjoined_gpu_work(std::current_exception()) ||
-          !join_gpu_work(stream, gpu_completion_point::failure)) {
+      if (auto failure = failure_after_gpu_work(std::current_exception(), stream)) {
         _unsafe_completion = true;
         retain_unjoined_owner(local_state._input_data);
-        throw unjoined_gpu_work{};
+        throw *failure;
       }
       throw;
     }
@@ -794,9 +791,11 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       local_state._start_operator_index,
       std::string("OOM while preparing batches for processing: ") + oom.what());
   } catch (const std::exception& e) {
-    SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
-                     pipeline->get_pipeline_id(),
-                     e.what());
+    log::log_noexcept([&] {
+      SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
+                       pipeline->get_pipeline_id(),
+                       e.what());
+    });
     throw;
   }
 
@@ -833,7 +832,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       try {
         materialized = materialize_sink_input(*output_data, stream);
       } catch (const rmm::out_of_memory& oom) {
-        if (!join_gpu_work(stream, gpu_completion_point::failure)) throw unjoined_gpu_work{};
+        if (auto failure = failure_after_gpu_work(std::current_exception(), stream)) throw *failure;
         auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
         auto const bytes_to_materialize_input =
           local_state.get_reservation_size_info()->bytes_to_materialize_input;
@@ -866,7 +865,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       publish_output(*output_data, materialized.get(), stream);
     }
 
-    if (!join_gpu_work(stream, gpu_completion_point::sink)) throw unjoined_gpu_work{};
+    join_gpu_work(stream, gpu_completion_point::sink).throw_if_failed();
 
     // Record memory metrics for future reservation estimates. Measured after publish_output, not
     // before: peak_allocated_bytes is a running high-water mark for the whole stream, so recording
@@ -910,12 +909,11 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         local_state.get_reservation_size_info()->bytes_to_materialize_input);
     }
   } catch (...) {
-    if (is_unjoined_gpu_work(std::current_exception()) ||
-        !join_gpu_work(stream, gpu_completion_point::failure)) {
+    if (auto failure = failure_after_gpu_work(std::current_exception(), stream)) {
       _unsafe_completion = true;
       retain_unjoined_owner(output_data);
       retain_unjoined_owner(materialized);
-      throw unjoined_gpu_work{};
+      throw *failure;
     }
     throw;
   }
