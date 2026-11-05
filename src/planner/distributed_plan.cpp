@@ -318,9 +318,7 @@ struct rewriter {
         // probe rows and gets the whole build side, so each pair meets once; an unmatched build
         // row would be emitted by every rank, so no join type that emits those.
         auto const join_type = node.Cast<op::sirius_physical_nested_loop_join>().join_type;
-        if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
-            join_type == duckdb::JoinType::RIGHT_SEMI ||
-            join_type == duckdb::JoinType::RIGHT_ANTI) {
+        if (!emits_build_rows_only_with_probe(join_type)) {
           throw sirius::not_implemented_exception("distributed execution: a {} nested-loop join",
                                                   duckdb::JoinTypeToString(join_type));
         }
