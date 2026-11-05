@@ -25,7 +25,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdint>
 #include <stdexcept>
 
 namespace sirius::io::cache {
@@ -132,6 +131,12 @@ void buffer_pool::deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexc
   auto b = multiple_blocks_allocation::create(std::move(out), *arena.mr, arena.reservation.get());
   b.reset(nullptr);
   _n_allocated_chunks.fetch_sub(count, std::memory_order_relaxed);
+}
+
+void buffer_pool::deallocate_bulk(std::span<std::byte* const> blocks, int numa) noexcept
+{
+  if (blocks.empty()) return;
+  deallocate_bulk(std::vector<std::byte*>(blocks.begin(), blocks.end()), numa);
 }
 
 size_t buffer_pool::reservation_size_for_prefetching() const noexcept { return _reserved_size; }

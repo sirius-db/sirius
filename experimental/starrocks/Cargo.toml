@@ -22,7 +22,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 # Keep the generated protobuf stack on ProtoX and Prost 0.14.
 prost = "0.14"
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
 parquet = { version = "60", default-features = false, features = ["arrow", "async"] }
 heck = "0.5"
 prettyplease = "0.3.0"
@@ -31,8 +31,8 @@ quote = "1"
 syn = { version = "3", features = ["full", "parsing"] }
 substrait = { version = "0.65.0", features = ["protox"] }
 thiserror = "2"
-thrift = "0.24"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+thrift = "0.25"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
@@ -45,7 +45,7 @@ uuid = "1"
 # tests buildable without a Sirius build tree or a GPU.
 default = ["sirius-engine"]
 # Bring up an embedded Sirius engine context for the compute node.
-sirius-engine = ["dep:sirius"]
+sirius-engine = ["dep:sirius-ffi"]
 
 [dependencies]
 anyhow.workspace = true
@@ -58,7 +58,7 @@ parquet.workspace = true
 prost.workspace = true
 # Optional: links the local Sirius engine build tree (gated by the
 # `sirius-engine` feature). Path dependency on the sibling `rust/` workspace.
-sirius = { path = "../../rust/crates/sirius", optional = true }
+sirius-ffi = { path = "../../rust/crates/sirius-ffi", optional = true }
 starrocks-plan-translator = { path = "crates/starrocks-plan-translator" }
 starrocks-thrift = { path = "crates/starrocks-thrift" }
 thiserror.workspace = true

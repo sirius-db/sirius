@@ -27,7 +27,6 @@
 
 #include <catch.hpp>
 #include <cuvs/distance/distance.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -35,7 +34,6 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <vss/cuvs_index_cache.hpp>
 
-#include <cstdlib>
 #include <numbers>
 #include <set>
 #include <string>
@@ -54,7 +52,7 @@ std::vector<std::vector<std::string>> ok_col(duckdb::Connection& con, const std:
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
+  auto& mat = *r;
   return sirius::test::GpuExecutionFixture::collect_rows(mat, /*sort=*/true);
 }
 
@@ -66,8 +64,11 @@ sirius::duckdb_table_identity table_identity(duckdb::Connection& con,
   sirius::duckdb_table_identity identity;
   con.BeginTransaction();
   try {
-    auto& entry = duckdb::Catalog::GetEntry(
-                    *con.context, duckdb::CatalogType::TABLE_ENTRY, catalog, "main", table)
+    auto& entry = duckdb::Catalog::GetEntry(*con.context,
+                                            duckdb::CatalogType::TABLE_ENTRY,
+                                            duckdb::Identifier(catalog),
+                                            "main",
+                                            duckdb::Identifier(table))
                     .Cast<duckdb::DuckTableEntry>();
     identity = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
     con.Rollback();
@@ -340,10 +341,10 @@ TEST_CASE_METHOD(VectorSearchFixture,
                       ", k => 10, output_columns => ['id']) ORDER BY distance;");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
-  auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
+  auto& mat = *r;
   REQUIRE(mat.RowCount() == 10);
   for (duckdb::idx_t i = 0; i < mat.RowCount(); i++) {
-    double const d        = mat.GetValue(0, i).GetValue<double>();
+    double const d        = mat.Collection().GetValue(0, i).GetValue<double>();
     double const expected = std::numbers::sqrt3 * static_cast<double>(i);
     REQUIRE(d == Approx(expected).epsilon(1e-4).margin(1e-4));
   }
@@ -383,12 +384,12 @@ TEST_CASE_METHOD(VectorSearchFixture,
                           "ORDER BY distance;");
   REQUIRE(enn_d);
   REQUIRE_FALSE(enn_d->HasError());
-  auto& enn_mat   = enn_d->Cast<duckdb::MaterializedQueryResult>();
-  auto& exact_mat = exact_d->Cast<duckdb::MaterializedQueryResult>();
+  auto& enn_mat   = *enn_d;
+  auto& exact_mat = *exact_d;
   REQUIRE(enn_mat.RowCount() == exact_mat.RowCount());
   for (duckdb::idx_t i = 0; i < enn_mat.RowCount(); i++) {
-    double const got      = enn_mat.GetValue(0, i).GetValue<double>();
-    double const expected = exact_mat.GetValue(0, i).GetValue<double>();
+    double const got      = enn_mat.Collection().GetValue(0, i).GetValue<double>();
+    double const expected = exact_mat.Collection().GetValue(0, i).GetValue<double>();
     INFO("rank " << i << " got=" << got << " expected=" << expected);
     REQUIRE(got == Approx(expected).epsilon(1e-4).margin(1e-3));
   }
@@ -422,7 +423,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("explicit output_columns error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
-    REQUIRE(r->Cast<duckdb::MaterializedQueryResult>().RowCount() == 5);
+    REQUIRE(r->RowCount() == 5);
   }
 
   // Same query with output_columns omitted: the default expands to the pinned
@@ -464,11 +465,11 @@ TEST_CASE_METHOD(VectorSearchFixture,
     if (r->HasError()) { UNSCOPED_INFO("empty-table search error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
     // Schema is still the requested output columns plus the trailing distance.
-    REQUIRE(r->names.size() == 3);
-    REQUIRE(r->names[0] == "id");
-    REQUIRE(r->names[1] == "payload");
-    REQUIRE(r->names[2] == "distance");
-    REQUIRE(r->Cast<duckdb::MaterializedQueryResult>().RowCount() == 0);
+    REQUIRE(r->GetNames().size() == 3);
+    REQUIRE(r->GetNames()[0] == "id");
+    REQUIRE(r->GetNames()[1] == "payload");
+    REQUIRE(r->GetNames()[2] == "distance");
+    REQUIRE(r->RowCount() == 0);
   }
 
   run_ok("SELECT * FROM unpin_table('vs_empty');");
@@ -616,11 +617,11 @@ TEST_CASE_METHOD(VectorSearchFixture,
     INFO("execution #" << exec);
     // allow_stream_result = false so we get a materialized result to count rows.
     duckdb::vector<duckdb::Value> params;
-    auto res = prep->Execute(params, /*allow_stream_result=*/false);
+    auto res = prep->Execute(params);
     REQUIRE(res);
     if (res->HasError()) { UNSCOPED_INFO("execute error: " << res->GetError()); }
     REQUIRE_FALSE(res->HasError());
-    auto& mat = res->Cast<duckdb::MaterializedQueryResult>();
+    auto& mat = *res;
     REQUIRE(mat.RowCount() == 1);  // rebuilt and returned its success row
   }
 
@@ -657,7 +658,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto catq = con->Query("SELECT current_database();");
   REQUIRE(catq);
   REQUIRE_FALSE(catq->HasError());
-  auto const catalog = catq->GetValue(0, 0).ToString();
+  auto const catalog = catq->Collection().GetValue(0, 0).ToString();
   using Metric       = cuvs::distance::DistanceType;
 
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -709,7 +710,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto catq = con->Query("SELECT current_database();");
   REQUIRE(catq);
   REQUIRE_FALSE(catq->HasError());
-  auto const catalog = catq->GetValue(0, 0).ToString();
+  auto const catalog = catq->Collection().GetValue(0, 0).ToString();
   using Metric       = cuvs::distance::DistanceType;
 
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -768,7 +769,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto catq = con->Query("SELECT current_database();");
   REQUIRE(catq);
   REQUIRE_FALSE(catq->HasError());
-  auto const catalog = catq->GetValue(0, 0).ToString();
+  auto const catalog = catq->Collection().GetValue(0, 0).ToString();
   using Metric       = cuvs::distance::DistanceType;
 
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -786,7 +787,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("drop error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
-    REQUIRE(r->GetValue(0, 0).GetValue<bool>());
+    REQUIRE(r->Collection().GetValue(0, 0).GetValue<bool>());
   }
   REQUIRE(index_cache.find_by_column(
             catalog, "main", "vs_drop", oid, "vec", Metric::L2SqrtExpanded) == nullptr);
@@ -796,7 +797,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     auto r = con->Query("SELECT * FROM sirius_drop_ann_index('vs_drop', 'vec', metric => 'l2');");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
-    REQUIRE_FALSE(r->GetValue(0, 0).GetValue<bool>());
+    REQUIRE_FALSE(r->Collection().GetValue(0, 0).GetValue<bool>());
   }
 
   run_ok("SELECT * FROM unpin_table('vs_drop');");
@@ -818,7 +819,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto catq = con->Query("SELECT current_database();");
   REQUIRE(catq);
   REQUIRE_FALSE(catq->HasError());
-  auto const catalog = catq->GetValue(0, 0).ToString();
+  auto const catalog = catq->Collection().GetValue(0, 0).ToString();
   using Metric       = cuvs::distance::DistanceType;
 
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -842,7 +843,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("drop-all error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
-    REQUIRE(r->GetValue(0, 0).GetValue<bool>());
+    REQUIRE(r->Collection().GetValue(0, 0).GetValue<bool>());
   }
   REQUIRE(index_cache.find_by_column(
             catalog, "main", "vs_drop_all", oid, "vec", Metric::L2SqrtExpanded) == nullptr);
@@ -871,11 +872,11 @@ TEST_CASE_METHOD(VectorSearchFixture,
       con->Query("SELECT * FROM sirius_knn_search('vs_schema', 'vec', " + origin + ", k => 3);");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
-    REQUIRE(r->names.size() == 3);
-    REQUIRE(r->names[0] == "id");
-    REQUIRE(r->names[1] == "vec");
-    REQUIRE(r->names[2] == "distance");
-    REQUIRE(r->Cast<duckdb::MaterializedQueryResult>().RowCount() == 3);
+    REQUIRE(r->GetNames().size() == 3);
+    REQUIRE(r->GetNames()[0] == "id");
+    REQUIRE(r->GetNames()[1] == "vec");
+    REQUIRE(r->GetNames()[2] == "distance");
+    REQUIRE(r->RowCount() == 3);
   }
 
   SECTION("subset + explicit order is honored, distance appended last")
@@ -884,10 +885,10 @@ TEST_CASE_METHOD(VectorSearchFixture,
                         ", k => 3, output_columns => ['vec', 'id']);");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
-    REQUIRE(r->names.size() == 3);
-    REQUIRE(r->names[0] == "vec");
-    REQUIRE(r->names[1] == "id");
-    REQUIRE(r->names[2] == "distance");
+    REQUIRE(r->GetNames().size() == 3);
+    REQUIRE(r->GetNames()[0] == "vec");
+    REQUIRE(r->GetNames()[1] == "id");
+    REQUIRE(r->GetNames()[2] == "distance");
   }
 
   SECTION("k larger than the table clamps to the row count")
@@ -896,7 +897,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
                         ", k => 100, output_columns => ['id']);");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
-    REQUIRE(r->Cast<duckdb::MaterializedQueryResult>().RowCount() == 5);
+    REQUIRE(r->RowCount() == 5);
   }
 
   run_ok("SELECT * FROM unpin_table('vs_schema');");
@@ -1149,11 +1150,11 @@ TEST_CASE_METHOD(VectorSearchFixture,
     "n_probes => 16);");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
-  auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
+  auto& mat = *r;
   REQUIRE(mat.RowCount() == 1);
-  REQUIRE(mat.GetValue(0, 0).GetValue<int64_t>() == 50000);
-  INFO("payload was: " << mat.GetValue(1, 0).ToString());
-  REQUIRE(mat.GetValue(1, 0).IsNull());
+  REQUIRE(mat.Collection().GetValue(0, 0).GetValue<int64_t>() == 50000);
+  INFO("payload was: " << mat.Collection().GetValue(1, 0).ToString());
+  REQUIRE(mat.Collection().GetValue(1, 0).IsNull());
 
   run_ok("SELECT * FROM unpin_table('vs_null');");
 }

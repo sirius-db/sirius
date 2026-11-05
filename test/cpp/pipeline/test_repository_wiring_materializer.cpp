@@ -14,21 +14,19 @@
  * limitations under the License.
  */
 
+#include "operator/partition_test_utils.hpp"
+
 #include <catch.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
-#include <duckdb.hpp>
 #include <helper/logical_type.hpp>
 #include <op/sirius_physical_column_data_scan.hpp>
 #include <op/sirius_physical_delim_join.hpp>
-#include <op/sirius_physical_dummy_scan.hpp>
-#include <op/sirius_physical_grouped_aggregate.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 #include <op/sirius_physical_partition.hpp>
 #include <pipeline/repository_wiring.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
-#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -271,12 +269,9 @@ TEST_CASE("materialize: delim join destinations use the generic path with no sib
     /*estimated_cardinality=*/0,
     duckdb::optional_idx());
 
-  // partition_join target — its `type` field is read by sirius_physical_partition's
-  // ctor; NESTED_LOOP_JOIN takes a no-op branch.
-  auto fake_parent = duckdb::make_uniq<sirius_physical_operator>(
-    SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, empty_types, 0);
-  auto partition_join =
-    duckdb::make_uniq<sirius_physical_partition>(empty_types, 0, fake_parent.get());
+  // The fanout target needs only a single-destination routing specification.
+  auto partition_join = duckdb::make_uniq<sirius_physical_partition>(
+    empty_types, 0, sirius::test::operator_utils::single_partition_spec());
   right_delim->partition_join = partition_join.get();
 
   sirius_physical_operator unused_sink;

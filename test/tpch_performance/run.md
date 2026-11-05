@@ -17,6 +17,13 @@ Benchmarking tools for comparing DuckDB (CPU) vs Sirius (GPU) on TPC-H queries a
 3. Ensure parquet data exists (auto-generated if missing via `generate_tpch_data.sh`).
    - On the GB300 machine, the SF1000 dataset is at `/home/nvidia/tpch_parquet_sf1000`.
 
+For `generate_tpch_data.sh --format duckdb`, keys use `INTEGER` until their full
+dataset range requires `BIGINT`, matching tpchgen-rs's Parquet defaults. Each key
+family widens across all tables together: order keys at integer SF358, part keys
+at SF10,738, customer keys at SF14,317, and supplier keys at SF214,749. Nation and
+region keys stay `INTEGER`. Clustered DuckDB datasets use the same widths.
+Regenerate existing datasets to apply the new types.
+
 ## Running Benchmarks
 
 All commands run from the **project root** directory.
@@ -62,7 +69,7 @@ Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 - `comparison.txt` — cold/warm timing table with speedup ratios
 - `timings.csv` — long-format iteration runtimes (engine,query,iteration,runtime_s)
 
-**Note:** The DuckDB baseline uses the same Sirius-built binary (`build/release/duckdb`) but with `SIRIUS_CONFIG_FILE` unset so the Sirius extension does not initialize. This means DuckDB runs on CPU using all available cores.
+**Note:** Both engines use `sirius-duckdb/build/release/duckdb`. The Sirius runner loads the extension explicitly; the DuckDB baseline leaves it unloaded and runs on CPU.
 
 ### Running individual queries
 
@@ -93,19 +100,21 @@ Environment variables:
 ### Generating telemetry
 
 Telemetry is controlled by the Sirius YAML config used for the run. Enable Quent
-export and choose the output directory:
+export and choose the output directory. NVTX capture is off by default; set
+`enable_nvtx: true` to include NVTX ranges in the Quent output:
 
 ```yaml
 sirius:
   telemetry:
     enable_quent: true
+    enable_nvtx: true
     output_directory: telemetry_data
     engine_name: siriusDB
 ```
 
 `run_tpch_parquet_and_generate_telemetry.sh` runs TPC-H queries in Sirius,
 labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
-Quent postcard files to `sirius.telemetry.output_directory`.
+Quent NDJSON files to `sirius.telemetry.output_directory`.
 
 ```bash
 pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \

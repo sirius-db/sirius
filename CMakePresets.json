@@ -1,0 +1,6 @@
+{
+  "include": [
+    "cmake/CMakePresets.json"
+  ],
+  "version": 6
+}

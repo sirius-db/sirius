@@ -44,7 +44,7 @@
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
-#include <cub/cub.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cuda/cmath>
 #include <cuda/std/algorithm>
 #include <cuda_runtime.h>

@@ -545,7 +545,7 @@ TEST_CASE("unequal completion queues across 8 and 16 lanes drain independently",
       expected += 100 + i * 7;
     }
   }
-  CHECK(poll.drain_all() == expected);
+  CHECK(poll.drain_all() == static_cast<std::size_t>(expected));
   for (int i = 0; i < count; ++i) {
     CHECK(retired[i] == (i % 2 ? 100 + i * 7 : 0));
   }

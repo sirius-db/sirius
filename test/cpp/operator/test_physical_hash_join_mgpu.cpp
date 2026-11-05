@@ -44,13 +44,11 @@
 //   3. Repeated back-to-back invocations of BUILD_PROBE don't wedge on the
 //      leftover hash table state from the prior query (DESTROYED → NOT_BUILT).
 
-#include "log/logging.hpp"
 #include "mgpu_test_utils.hpp"
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -166,10 +164,10 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
 
   scoped_mgpu_env env(yaml_path);
 
-  // BUILD_PROBE trigger: build side MUST be smaller than
-  // max_build_hash_table_bytes (configured 90 MiB above) so the planner
-  // chooses BUILD_PROBE rather than MIXED_JOIN. 5000-row × 16 B ≈ 80 KiB,
-  // well under the threshold.
+  // BUILD_PROBE trigger: the build's estimated hash table (5000 rows x 16 B
+  // = 80 KiB) MUST stay under max_build_hash_table_bytes (configured 90 MiB
+  // above) so the planner chooses BUILD_PROBE rather than MIXED_JOIN; the
+  // payload is equally tiny, so the resident bound never binds here.
   auto inner_query =
     "SELECT probe.k, probe.v, build.v AS build_v "
     "FROM read_parquet('" +
@@ -229,8 +227,9 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
   mgpu_env_params params{};
   params.cache                = "none";
   params.hash_partition_bytes = 1'000'000;
-  // Force MIXED_JOIN by lowering max_build_hash_table_bytes below our
-  // 64 MiB per-side surface.
+  // Force MIXED_JOIN by lowering max_build_hash_table_bytes below the
+  // estimated hash table of our 64 MiB / ~2M-row per-side surface (2M rows
+  // x 16 B = 32 MiB, and >= 16 MiB per GPU when hash-partitioned).
   params.max_build_hash_table_bytes = 1'000'000;
   params.pipeline_num_threads       = 4;
   params.task_creator_num_threads   = 4;
@@ -792,5 +791,60 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
   REQUIRE(log_dir_contains(log_dir.path(), "dynamic-filter publication:"));
   REQUIRE_FALSE(log_dir_contains(log_dir.path(), "build is not one whole delivery"));
 
+  fs::remove_all(tmp, ec);
+}
+
+TEST_CASE("native prepared join keys compare with CPU through multi-partition execution",
+          "[mgpu][multi_gpu][native_join_keys][gpu_execution]")
+{
+  if (!require_two_gpus()) return;
+  auto tmp = make_tmp("native-keys");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+  generate_large_probe_side(tmp / "left");
+  generate_large_probe_side(tmp / "right");
+  mgpu_env_params params{};
+  params.cache                      = "none";
+  params.hash_partition_bytes       = 8'000'000;
+  params.max_build_hash_table_bytes = 1'000'000;
+  auto yaml                         = tmp / "native-keys.yaml";
+  write_mgpu_yaml(yaml, params);
+  scoped_log_dir logs(tmp / "logs", "debug");
+  scoped_mgpu_env env(yaml);
+  auto con                        = env.make_connection();
+  auto multi_partition_join_count = [&] {
+    (void)sirius::log::get_sink()->flush();
+    std::size_t count = 0;
+    std::error_code log_error;
+    for (auto const& entry : fs::recursive_directory_iterator(logs.path(), log_error)) {
+      if (!entry.is_regular_file()) { continue; }
+      std::ifstream in(entry.path());
+      std::string line;
+      while (std::getline(in, line)) {
+        if (line.find("sirius_physical_hash_join id ") == std::string::npos) { continue; }
+        const std::string marker = "partition strategy: ";
+        auto const position      = line.find(marker);
+        if (position == std::string::npos) { continue; }
+        std::istringstream strategy(line.substr(position + marker.size()));
+        int partitions = 0;
+        if (strategy >> partitions && partitions > 1) { ++count; }
+      }
+    }
+    return count;
+  };
+  for (auto const& predicate : {"CAST(l.k AS INTEGER) = r.k",
+                                "CAST(l.k AS DECIMAL(18,1)) = CAST(r.k AS DECIMAL(18,2))",
+                                "l.k + 1 = r.k + 1",
+                                "l.k = r.k AND CAST(l.v AS INTEGER) IS NOT DISTINCT FROM r.v"}) {
+    INFO(predicate);
+    auto const before = multi_partition_join_count();
+    auto query        = "SELECT l.k, count(*) FROM read_parquet('" + parquet_glob(tmp / "left") +
+                 "') l JOIN read_parquet('" + parquet_glob(tmp / "right") + "') r ON " + predicate +
+                 " GROUP BY l.k ORDER BY l.k LIMIT 50";
+    require_gpu_matches_cpu(con, query, /*force_cpu_reference=*/true);
+    // Execution-time sizing must choose multiple partitions for this query's hash join.
+    REQUIRE(multi_partition_join_count() > before);
+  }
   fs::remove_all(tmp, ec);
 }

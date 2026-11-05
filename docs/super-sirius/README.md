@@ -17,6 +17,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | Document | Description |
 |----------|-------------|
 | [Architecture Overview](architecture-overview.md) | Component diagram, thread model, ownership hierarchy, execution lifecycle |
+| [Concurrent Queries](concurrent-queries.md) | Admission, maintenance, settings, error isolation, memory progress and qualification scope |
+| [Query Lifecycle](query-lifecycle.md) | Per-query submission guards, work leases, spill borrows and retirement barriers |
 | [Execution Flow](execution-flow.md) | End-to-end query trace with file:line references |
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
@@ -24,6 +26,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
+| [Scan Contracts](scan-contracts-design.md) | How scans verify their inputs, protect native reads during checkpoints, and decide whether CPU fallback is allowed |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Streaming Sessions](streaming-sessions.md) | Fragment boundaries for distributed queries: `exec::batch_stream`, streaming source/sink, the id-addressed `stream_session` |
@@ -52,5 +55,3 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 10. **Data Management** — data batch lifecycle and port wiring
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
-
-<!-- last-updated-commit: f03762faf2aba9966050102d632c92cb770ff14d -->

@@ -233,6 +233,35 @@ void test_render_plan_tree()
   }
 }
 
+// A channel that its node does not output has no port, and a tree whose edge names one is rejected
+// rather than wired to port 0.
+void test_output_port()
+{
+  std::string err;
+  auto tree = simpatico::plan_tree_from_dsl(
+    "input -> for -> deltas, references\n"
+    "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    &err);
+  expect(tree.has_value(), err.empty() ? "parse failed" : err.c_str());
+  simpatico::NodeId const bitpack = 2;
+  expect(tree->nodes[bitpack].op == "bitpack", "bitpack node id");
+  expect(simpatico::output_port(*tree, bitpack, "chunk_bits") == simpatico::ChannelId{2},
+         "known channel port");
+  expect(!simpatico::output_port(*tree, bitpack, "references").has_value(),
+         "channel of another node has no port");
+  expect(!simpatico::output_port(*tree, 99, "packed").has_value(), "missing node has no port");
+  expect(simpatico::output_port(*tree, 0, "for") == simpatico::ChannelId{0}, "input port");
+
+  tree->nodes[1].children.front().channel = "unknown";
+  bool rejected                           = false;
+  try {
+    simpatico::compute_input_sources(*tree);
+  } catch (std::invalid_argument const&) {
+    rejected = true;
+  }
+  expect(rejected, "edge naming an unknown channel must be rejected");
+}
+
 }  // namespace
 
 int main()
@@ -245,6 +274,7 @@ int main()
     test_value_id_key_contract();
     test_operator_registry();
     test_render_plan_tree();
+    test_output_port();
     std::printf("test_plan_tree: PASS\n");
     return 0;
   } catch (std::exception const& e) {

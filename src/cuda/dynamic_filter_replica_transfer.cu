@@ -14,43 +14,28 @@
  * limitations under the License.
  */
 
+#include "memory/runtime_stream_pool.hpp"
+
+#include <cudf/utilities/error.hpp>
+
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime.h>
 
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <log/logging.hpp>
+#include <memory/device_transfer.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 
-#include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <stdexcept>
-#include <vector>
+#include <string_view>
 
 namespace sirius::op::detail {
-
-namespace {
-
-cucascade::memory::fixed_size_host_memory_resource& get_host_staging_resource(
-  cucascade::memory::memory_space const& space)
-{
-  if (space.get_tier() != cucascade::memory::Tier::HOST) {
-    throw std::invalid_argument(
-      "[enqueue_replica_copy] dynamic-filter staging requires a HOST memory space");
-  }
-  auto* const resource =
-    space.get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-  if (resource == nullptr) {
-    throw std::runtime_error(
-      "[enqueue_replica_copy] dynamic-filter HOST memory space has no fixed-size staging "
-      "resource");
-  }
-  return *resource;
-}
-
-}  // namespace
 
 replica_transfer_route enqueue_replica_copy(
   void* destination,
@@ -62,160 +47,81 @@ replica_transfer_route enqueue_replica_copy(
   cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy)
 {
-  if (bytes == 0) { return replica_transfer_route::none; }
-  if (destination == nullptr || source == nullptr) {
-    throw std::invalid_argument(
-      "[enqueue_replica_copy] non-null pointers for a non-empty copy required");
+  if (bytes != 0 && (destination == nullptr || source == nullptr)) {
+    throw std::invalid_argument("[enqueue_replica_copy] nonempty copies require non-null pointers");
   }
-  if (source_space.get_tier() != cucascade::memory::Tier::GPU) {
-    throw std::invalid_argument(
-      "[enqueue_replica_copy] dynamic-filter source requires a GPU memory space");
+  return sirius::memory::enqueue_device_copy({static_cast<std::byte*>(destination), bytes},
+                                             destination_device,
+                                             destination_stream,
+                                             {static_cast<std::byte const*>(source), bytes},
+                                             rmm::cuda_device_id{source_space.get_device_id()},
+                                             &source_space,
+                                             sirius::memory::source_already_complete{},
+                                             &host_staging_space,
+                                             policy);
+}
+
+bool replica_fanout_failures::skip_if_recoverable(std::string_view filter_name,
+                                                  int source_device,
+                                                  int destination_device) noexcept
+{
+  auto const failure = std::current_exception();
+  try {
+    std::rethrow_exception(failure);
+  } catch (cucascade::cuda_error const&) {
+  } catch (::cuda::cuda_error const&) {
+  } catch (cudf::cuda_error const&) {
+  } catch (rmm::cuda_error const&) {
+  } catch (std::logic_error const&) {
+  } catch (std::exception const& e) {
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_WARN(
+        "{} replica GPU {} -> GPU {} unavailable: {}. That GPU will skip this optional filter.",
+        filter_name,
+        source_device,
+        destination_device,
+        e.what());
+    });
+    return true;
+  } catch (...) {
   }
-  auto const source_device = rmm::cuda_device_id{source_space.get_device_id()};
+  record_fatal(filter_name, source_device, destination_device);
+  return false;
+}
 
-  if (destination_device == source_device && policy == replica_transfer_policy::automatic) {
-    rmm::cuda_set_device_raii guard{destination_device};
-    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-      destination, source, bytes, cudaMemcpyDeviceToDevice, destination_stream.get()));
-    return replica_transfer_route::local;
+void replica_fanout_failures::record_fatal(std::string_view filter_name,
+                                           int source_device,
+                                           int destination_device) noexcept
+{
+  auto const failure = std::current_exception();
+  if (!_fatal) {
+    _fatal = failure;
+    return;
   }
-
-  bool const peer_dma =
-    policy == replica_transfer_policy::automatic &&
-    cucascade::memory::probe_peer_dma_works(source_device.value(), destination_device.value());
-  if (peer_dma) {
-    rmm::cuda_set_device_raii guard{destination_device};
-    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(destination,
-                                           destination_device.value(),
-                                           source,
-                                           source_device.value(),
-                                           bytes,
-                                           destination_stream.get()));
-    return replica_transfer_route::peer_dma;
-  }
-
-  auto& staging_resource = get_host_staging_resource(host_staging_space);
-  auto staging           = staging_resource.allocate_multiple_blocks(bytes);
-  auto& allocation       = *staging;
-
-  std::vector<void*> d2h_destinations;
-  std::vector<void const*> d2h_sources;
-  std::vector<std::size_t> d2h_sizes;
-  d2h_destinations.reserve(allocation.size());
-  d2h_sources.reserve(allocation.size());
-  d2h_sizes.reserve(allocation.size());
-  std::size_t offset = 0;
-  for (std::size_t block_index = 0; offset < bytes; ++block_index) {
-    auto const block      = allocation.at(block_index);
-    auto const copy_bytes = std::min(block.size(), bytes - offset);
-    d2h_destinations.push_back(block.data());
-    d2h_sources.push_back(static_cast<std::byte const*>(source) + offset);
-    d2h_sizes.push_back(copy_bytes);
-    offset += copy_bytes;
-  }
-
-  auto const source_stream = source_space.acquire_stream();
-  {
-    rmm::cuda_set_device_raii guard{source_device};
-    if (d2h_sizes.size() == 1) {
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(d2h_destinations.front(),
-                                         d2h_sources.front(),
-                                         d2h_sizes.front(),
-                                         cudaMemcpyDeviceToHost,
-                                         source_stream.get()));
-    } else {
-#if CUDART_VERSION >= 12080
-      cudaMemcpyAttributes attributes{};
-      attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-      attributes.flags          = cudaMemcpyFlagDefault;
-#if CUDART_VERSION < 13000
-      CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(d2h_destinations.data(),
-                                              d2h_sources.data(),
-                                              d2h_sizes.data(),
-                                              d2h_sizes.size(),
-                                              attributes,
-                                              nullptr,
-                                              source_stream.get()));
-#else
-      CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(d2h_destinations.data(),
-                                              d2h_sources.data(),
-                                              d2h_sizes.data(),
-                                              d2h_sizes.size(),
-                                              attributes,
-                                              source_stream.get()));
-#endif
-#else
-      for (std::size_t i = 0; i < d2h_sizes.size(); ++i) {
-        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(d2h_destinations[i],
-                                           d2h_sources[i],
-                                           d2h_sizes[i],
-                                           cudaMemcpyDeviceToHost,
-                                           source_stream.get()));
-      }
-#endif
+  sirius::log::log_noexcept([&] {
+    try {
+      std::rethrow_exception(failure);
+    } catch (std::exception const& error) {
+      SIRIUS_LOG_ERROR(
+        "{} replica GPU {} -> GPU {} failed during cleanup: {}. Preserving the first fatal error.",
+        filter_name,
+        source_device,
+        destination_device,
+        error.what());
+    } catch (...) {
+      SIRIUS_LOG_ERROR(
+        "{} replica GPU {} -> GPU {} failed during cleanup with a non-standard exception. "
+        "Preserving the first fatal error.",
+        filter_name,
+        source_device,
+        destination_device);
     }
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(source_stream.get()));
-  }
+  });
+}
 
-  std::vector<void*> h2d_destinations;
-  std::vector<void const*> h2d_sources;
-  std::vector<std::size_t> h2d_sizes;
-  h2d_destinations.reserve(allocation.size());
-  h2d_sources.reserve(allocation.size());
-  h2d_sizes.reserve(allocation.size());
-  offset = 0;
-  for (std::size_t block_index = 0; offset < bytes; ++block_index) {
-    auto const block      = allocation.at(block_index);
-    auto const copy_bytes = std::min(block.size(), bytes - offset);
-    h2d_destinations.push_back(static_cast<std::byte*>(destination) + offset);
-    h2d_sources.push_back(block.data());
-    h2d_sizes.push_back(copy_bytes);
-    offset += copy_bytes;
-  }
-
-  {
-    rmm::cuda_set_device_raii guard{destination_device};
-    if (h2d_sizes.size() == 1) {
-      CUCASCADE_CUDA_TRY(cudaMemcpyAsync(h2d_destinations.front(),
-                                         h2d_sources.front(),
-                                         h2d_sizes.front(),
-                                         cudaMemcpyHostToDevice,
-                                         destination_stream.get()));
-    } else {
-#if CUDART_VERSION >= 12080
-      cudaMemcpyAttributes attributes{};
-      attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-      attributes.flags          = cudaMemcpyFlagDefault;
-#if CUDART_VERSION < 13000
-      CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(h2d_destinations.data(),
-                                              h2d_sources.data(),
-                                              h2d_sizes.data(),
-                                              h2d_sizes.size(),
-                                              attributes,
-                                              nullptr,
-                                              destination_stream.get()));
-#else
-      CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(h2d_destinations.data(),
-                                              h2d_sources.data(),
-                                              h2d_sizes.data(),
-                                              h2d_sizes.size(),
-                                              attributes,
-                                              destination_stream.get()));
-#endif
-#else
-      for (std::size_t i = 0; i < h2d_sizes.size(); ++i) {
-        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(h2d_destinations[i],
-                                           h2d_sources[i],
-                                           h2d_sizes[i],
-                                           cudaMemcpyHostToDevice,
-                                           destination_stream.get()));
-      }
-#endif
-    }
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(destination_stream.get()));
-  }
-  staging.reset();
-  return replica_transfer_route::host_staging;
+void replica_fanout_failures::rethrow_if_fatal() const
+{
+  if (_fatal) { std::rethrow_exception(_fatal); }
 }
 
 }  // namespace sirius::op::detail

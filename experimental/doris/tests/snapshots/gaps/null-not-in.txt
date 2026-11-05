@@ -1,0 +1,33 @@
+# null-not-in: 3 fragments (root first):
+#   fragment_id=3 sink=RESULT_SINK nodes=[SORT_NODE > EXCHANGE_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[HASH_JOIN_NODE > FILE_SCAN_NODE > EXCHANGE_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/gaps/null-not-in/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_boolean
+  @  3: extension:sirius:explain-only
+Functions:
+  #  1 @  1: equal
+  #  2 @  2: not
+  #  3 @  3: in_list
+
+=== Plan
+Root[n_nationkey]
+  Project[$0]
+    Sort[($0, &AscNullsFirst) => $0]
+      Project[$0]
+        Project[$0]
+          Filter[not($1):boolean? => $0, $1]
+            Join[&LeftMark, equal($0, $1):boolean? => $0, $1]
+              Project[$0]
+                Filter[in_list($0, 0:i32, 1:i32, 2:i32):boolean? => $0]
+                  Read["local_files:/tmp/tpch-sf1/nation/part.0.parquet" => n_nationkey:i32?]
+              Project[(if_then(equal($0, 1:i32):boolean? -> (null:i32?)::!i32?, _ -> $0))::!i32?]
+                Filter[in_list($0, 0:i32, 1:i32):boolean? => $0]
+                  Read["local_files:/tmp/tpch-sf1/region/part.0.parquet" => r_regionkey:i32?]

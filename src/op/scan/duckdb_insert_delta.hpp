@@ -112,8 +112,7 @@ struct insert_delta_row_group {
 /// the prepare window because checkpoints are suppressed while pinned and
 /// committed segments are never rewritten in place.
 struct insert_delta_plan {
-  duckdb::TransactionData transaction{
-    duckdb::TransactionData(duckdb::transaction_t{0}, duckdb::transaction_t{0})};
+  duckdb::TransactionData transaction{duckdb::TransactionData::Unversioned()};
   duckdb::BufferManager* buffer_manager{nullptr};
   std::size_t n_cache{0};
   std::size_t n_total{0};  ///< GetTotalRows() snapshot; all walks clamp to it

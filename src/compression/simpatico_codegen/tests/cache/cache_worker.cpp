@@ -1,0 +1,131 @@
+// A fresh process is essential: the production cache location is process-cached.
+#include "codegen/jit/kernel_cache.hpp"
+
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+
+#include <dlfcn.h>
+#include <nvrtc.h>
+
+#include <barrier>
+#include <cstdio>
+#include <exception>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace jit = codegen::jit;
+
+static const std::string embedded_source = R"(
+#include "codegen/stdint_shim.hpp"
+#include "codegen/decode/rle_block.cuh"
+#include <cuda/std/type_traits>
+#include <thrust/tuple.h>
+#ifndef SIMPATICO_CACHE_TEST_VALUE
+#define SIMPATICO_CACHE_TEST_VALUE 1
+#endif
+extern "C" __global__ void cache_test(int* out) {
+  thrust::tuple<int> value{SIMPATICO_CACHE_TEST_VALUE};
+  *out = thrust::get<0>(value);
+}
+)";
+static const std::string external_source = R"(
+#include <cache_fallback.cuh>
+extern "C" __global__ void cache_test(int* out) { *out = CACHE_FALLBACK_VALUE; }
+)";
+
+static int launch(const jit::CompiledKernel* kernel)
+{
+  int* device = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&device), sizeof(int)) != cudaSuccess)
+    throw std::runtime_error("cudaMalloc failed");
+  void* arguments[] = {&device};
+  const auto status = cuLaunchKernel(
+    kernel->func_for_current_device(), 1, 1, 1, 1, 1, 1, 0, nullptr, arguments, nullptr);
+  int result        = -1;
+  const auto copied = cudaMemcpy(&result, device, sizeof(int), cudaMemcpyDeviceToHost);
+  cudaFree(device);
+  if (status != CUDA_SUCCESS || copied != cudaSuccess)
+    throw std::runtime_error("kernel launch failed");
+  return result;
+}
+
+int main(int argc, char** argv)
+{
+  try {
+    const std::string mode = argc > 1 ? argv[1] : "embedded";
+    if (mode == "clear") {
+      jit::clear_jit_disk_cache();
+      std::puts("RESULT cleared");
+      return 0;
+    }
+    if (mode == "compiler-path") {
+      Dl_info library{};
+      if (!dladdr(reinterpret_cast<const void*>(&nvrtcVersion), &library) || !library.dli_fname)
+        throw std::runtime_error("cannot resolve compiler path");
+      std::printf("NVRTC %s\n", library.dli_fname);
+      return 0;
+    }
+    if (cudaSetDevice(0) != cudaSuccess) throw std::runtime_error("cudaSetDevice failed");
+    jit::CompileOptions options{jit::arch_cc_for_current_device()};
+    auto& cache = jit::KernelCache::instance();
+    if (mode == "threads") {
+      constexpr int count = 6;
+      std::barrier start(count);
+      std::vector<std::shared_ptr<const jit::CompiledKernel>> kernels(count);
+      std::vector<std::exception_ptr> errors(count);
+      std::vector<std::thread> workers;
+      for (int i = 0; i < count; ++i) {
+        workers.emplace_back([&, i] {
+          // Every thread must reach the barrier, including error paths.
+          const auto status = cudaSetDevice(0);
+          start.arrive_and_wait();
+          try {
+            if (status != cudaSuccess) throw std::runtime_error("thread cudaSetDevice failed");
+            kernels[i] = cache.get_or_compile_plain(embedded_source, "cache_test", options);
+            if (launch(kernels[i].get()) != 1) throw std::runtime_error("thread kernel result");
+          } catch (...) {
+            errors[i] = std::current_exception();
+          }
+        });
+      }
+      for (auto& worker : workers)
+        worker.join();
+      for (int i = 0; i < count; ++i) {
+        if (errors[i]) std::rethrow_exception(errors[i]);
+        if (kernels[i] != kernels[0]) throw std::runtime_error("thread deduplication failed");
+      }
+      if (kernels[0] != cache.get_or_compile_plain(embedded_source, "cache_test", options))
+        throw std::runtime_error("post-thread memory lookup failed");
+      std::puts("RESULT value=1");
+      return 0;
+    }
+    const auto& source = mode == "external" ? external_source : embedded_source;
+    auto first         = cache.get_or_compile_plain(source, "cache_test", options);
+    const int value    = launch(first.get());
+    if (mode == "prune-once") {
+      // Let the process harness seed stale entries after first-use maintenance.
+      std::puts("READY first lookup");
+      std::fflush(stdout);
+      if (std::getchar() != '\n') throw std::runtime_error("missing test continuation");
+    }
+    auto second = cache.get_or_compile_plain(source, "cache_test", options);
+    if (launch(second.get()) != value) throw std::runtime_error("second launch changed result");
+    if (first != second || cache.size() != 1) throw std::runtime_error("unexpected memory reuse");
+    if (mode == "prune-once") {
+      cache.clear();
+      const auto reloaded = cache.get_or_compile_plain(source, "cache_test", options);
+      if (launch(reloaded.get()) != value)
+        throw std::runtime_error("post-maintenance disk lookup changed result");
+    }
+    std::printf("RESULT value=%d\n", value);
+    return 0;
+  } catch (const jit::CompileError& error) {
+    std::fprintf(stderr, "%s\n%s\n", error.what(), error.log.c_str());
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "%s\n", error.what());
+  }
+  return 1;
+}

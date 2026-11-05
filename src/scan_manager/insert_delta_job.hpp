@@ -87,6 +87,11 @@ struct insert_delta_job_request {
   std::vector<sirius::logical_type> union_types;  ///< parallel to union_cols
   std::size_t approximate_batch_size{sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE};
   std::string entry_name;
+  op::scan::scan_contract_id first_consuming_contract = 0;
+  std::shared_ptr<op::scan::physical_profile_table> profiles =
+    std::make_shared<op::scan::physical_profile_table>();
+  uint64_t storage_version = 0;
+  std::optional<op::scan::key_held_witness> checkpoint_witness;
 
   /// Filled by the job. The plan owns the segment refs the bundles index into.
   op::scan::insert_delta_plan plan;
@@ -181,6 +186,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager);
+  duckdb::SingleFileBlockManager const* block_manager,
+  op::scan::scan_contract_id contract_id);
 
 }  // namespace sirius::scan_manager

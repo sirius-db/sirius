@@ -21,9 +21,11 @@
 // expect_plan_fallback_matches_cpu.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/pinned_table_guard.hpp>
 #include <utils/scoped_sirius_setting.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
 
 #include <cstdint>
 #include <string>
@@ -32,9 +34,9 @@ namespace {
 
 using sirius::test::scoped_sirius_setting;
 
-// `sa` and `sb` hold the multiplicities of every relation between m and n, NULL keys included:
-// 1 is in sa 3 times and sb once, 2 once and twice, 3 twice and twice, 4 only in sa, 5 only in sb,
-// NULL twice and once.
+// `sa` and `sb` hold the multiplicities of every relation between m and n, NULL keys included. By
+// k: 1 is in sa 4 times and sb 3, 2 once and twice, 3 twice and twice, 4 only in sa, 5 only in sb,
+// NULL twice and once. By (k, v): (1, 'a') is in sa 3 times and sb once, (1, NULL) once and twice.
 class SetOpAllFixture : public sirius::test::GpuExecutionFixture {
  public:
   SetOpAllFixture()
@@ -65,6 +67,10 @@ class SetOpAllFixture : public sirius::test::GpuExecutionFixture {
       "(-0.0::DOUBLE, -0.0::REAL), ('nan'::DOUBLE, 'nan'::REAL), (NULL, NULL), "
       "(1.5::DOUBLE, 1.5::REAL)) "
       "t(d, r);");
+    run_ok(
+      "CREATE TABLE sarray AS SELECT * FROM (VALUES (1, [0.0]::DOUBLE[1], [1, 2]::INTEGER[2]), "
+      "(2, [-0.0]::DOUBLE[1], [1, 2]::INTEGER[2]), (3, [1.5]::DOUBLE[1], [3, 4]::INTEGER[2])) "
+      "t(id, d, i);");
     run_ok("CHECKPOINT;");
   }
 
@@ -109,6 +115,16 @@ TEST_CASE_METHOD(SetOpAllFixture,
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,
+                 "gpu_execution EXCEPT ALL and INTERSECT ALL cast an input to the common type",
+                 "[integration][gpu_execution][setop_all]")
+{
+  // DuckDB casts the narrower input in its own projection: INTEGER to BIGINT, SMALLINT to INTEGER.
+  compare_both("SELECT k FROM sa", "SELECT i64 FROM styped");
+  compare_both("SELECT i64 FROM styped", "SELECT k FROM sa");
+  compare_both("SELECT i16 FROM styped", "SELECT k FROM sa");
+}
+
+TEST_CASE_METHOD(SetOpAllFixture,
                  "gpu_execution EXCEPT ALL and INTERSECT ALL with an empty input",
                  "[integration][gpu_execution][setop_all]")
 {
@@ -116,9 +132,10 @@ TEST_CASE_METHOD(SetOpAllFixture,
   compare_both("SELECT k, v FROM sa", "SELECT k, v FROM sempty");
   compare_both("SELECT k, v FROM sempty", "SELECT k, v FROM sa");
   compare_both("SELECT k, v FROM sempty", "SELECT k, v FROM sempty");
-  // An input filtered to nothing at run time.
-  compare_gpu_vs_cpu("SELECT k FROM sa WHERE k > 1 EXCEPT ALL SELECT k FROM sb WHERE k > 100");
-  compare_gpu_vs_cpu("SELECT k FROM sa WHERE k > 100 INTERSECT ALL SELECT k FROM sb");
+  // An input filtered to nothing at run time: statistics cannot rule out k = 2 AND v = 'a'.
+  compare_gpu_vs_cpu(
+    "SELECT k FROM sa WHERE k > 1 EXCEPT ALL SELECT k FROM sb WHERE k = 2 AND v = 'a'");
+  compare_gpu_vs_cpu("SELECT k FROM sa WHERE k = 2 AND v = 'a' INTERSECT ALL SELECT k FROM sb");
   // An input empty at plan time, whether or not DuckDB folds the set operation away.
   compare_gpu_vs_cpu("SELECT k FROM sa WHERE k > 1 EXCEPT ALL SELECT k FROM sb WHERE false");
   compare_gpu_vs_cpu("SELECT k FROM sa EXCEPT ALL SELECT k FROM sb WHERE false");
@@ -143,17 +160,19 @@ TEST_CASE_METHOD(SetOpAllFixture,
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,
-                 "gpu_execution EXCEPT ALL and INTERSECT ALL over an aggregate's narrowed type",
+                 "gpu_execution EXCEPT ALL and INTERSECT ALL over an aggregate's HUGEINT type",
                  "[integration][gpu_execution][setop_all]")
 {
-  // DuckDB types sum(INTEGER) as HUGEINT and Sirius plans it as BIGINT. Grouped by k, sa's sums
-  // hold 4 twice and NULL once.
+  // Grouped by k, sa's HUGEINT sums hold 4 twice and NULL once.
   compare_both("SELECT sum(k) FROM sa GROUP BY k", "SELECT sum(k) FROM sb GROUP BY k");
   compare_both("SELECT v, sum(k) FROM sa GROUP BY v", "SELECT v, sum(k) FROM sb GROUP BY v");
-  // A parent reads the narrowed column.
+  // A parent reads the HUGEINT column.
   compare_gpu_vs_cpu(
     "SELECT s * 2 FROM (SELECT sum(k) AS s FROM sa GROUP BY k "
     "EXCEPT ALL SELECT sum(k) FROM sb GROUP BY k) t");
+  // Against a plain column, which DuckDB casts to HUGEINT and Sirius plans as declared.
+  compare_both("SELECT sum(k) FROM sa GROUP BY k", "SELECT k FROM sb");
+  compare_both("SELECT k FROM sb", "SELECT sum(k) FROM sa GROUP BY k");
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,
@@ -177,6 +196,22 @@ TEST_CASE_METHOD(SetOpAllFixture,
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,
+                 "gpu_execution EXCEPT ALL and INTERSECT ALL over a CTE input wider than its body",
+                 "[integration][gpu_execution][setop_all]")
+{
+  // The CTE's definition is (v VARCHAR, k INTEGER) and its body one INTEGER column. The pin gives
+  // the scan a narrowed sidecar, so the compressed-schema pass runs over the CTE.
+  sirius::test::pinned_table_guard pin{*con, "sb"};
+
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+  compare_both("SELECT k FROM sa",
+               "(WITH m AS MATERIALIZED (SELECT v, k FROM sb) "
+               "SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+}
+
+TEST_CASE_METHOD(SetOpAllFixture,
                  "gpu_execution EXCEPT ALL splits a hot key's copies across batches",
                  "[integration][gpu_execution][setop_all]")
 {
@@ -184,7 +219,7 @@ TEST_CASE_METHOD(SetOpAllFixture,
     "CREATE TABLE shot AS SELECT 7 AS k, 'hot' AS v FROM range(1000000) "
     "UNION ALL SELECT i AS k, 'cold' AS v FROM range(1000) t(i);");
   run_ok("CHECKPOINT;");
-  // About 12 MB of copies against a 1 MiB cap: REPLICATE emits the hot key in many batches.
+  // About 15 MB of copies against a 1 MiB cap: REPLICATE emits the hot key in many batches.
   scoped_sirius_setting const batch_bytes{*con, "concat_batch_bytes", std::uint64_t{1} << 20};
   compare_gpu_vs_cpu(
     "SELECT k, v, count(*) FROM (SELECT k, v FROM shot EXCEPT ALL SELECT k, v FROM sb) t "
@@ -192,6 +227,29 @@ TEST_CASE_METHOD(SetOpAllFixture,
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM (SELECT k, v FROM shot INTERSECT ALL "
     "SELECT k, v FROM shot WHERE k = 7 OR k < 10) t");
+}
+
+TEST_CASE_METHOD(
+  SetOpAllFixture,
+  "gpu_execution EXCEPT ALL and INTERSECT ALL under a selective join filter each arm",
+  "[integration][gpu_execution][setop_all][dynamic_filter]")
+{
+  run_ok("CREATE TABLE sjoin_a AS SELECT (i % 5000)::BIGINT AS k FROM range(100000) t(i);");
+  run_ok("CREATE TABLE sjoin_b AS SELECT (i % 7000)::BIGINT AS k FROM range(80000) t(i);");
+  run_ok("CREATE TABLE sjoin_build AS SELECT i::BIGINT AS k, i % 100 AS g FROM range(10000) t(i);");
+  run_ok("CHECKPOINT;");
+  // A zone map would be a second push to the same scan, so one reached arm could also count 2.
+  scoped_sirius_setting const zone_maps{*con, "enable_dynamic_zone_map_filter", false};
+  for (std::string const form : {"INTERSECT ALL", "EXCEPT ALL"}) {
+    INFO(form);
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+    compare_gpu_vs_cpu("SELECT t.k, count(*) FROM (SELECT k FROM sjoin_a " + form +
+                       " SELECT k FROM sjoin_b) t JOIN sjoin_build b ON t.k = b.k "
+                       "WHERE b.g = 7 GROUP BY t.k");
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+    // Two pushes for one key: one per arm's scan, which only descent through REPLICATE reaches.
+    REQUIRE(after.filters_pushed - before.filters_pushed >= 2);
+  }
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,
@@ -202,6 +260,19 @@ TEST_CASE_METHOD(SetOpAllFixture,
     auto const left = "SELECT " + column + " FROM sfloat";
     auto const right =
       "SELECT " + column + " FROM sfloat WHERE " + column + " IS NULL OR " + column + " <> 1.5";
+    expect_plan_fallback_matches_cpu(left + " EXCEPT ALL " + right);
+    expect_plan_fallback_matches_cpu(left + " INTERSECT ALL " + right);
+  }
+}
+
+TEST_CASE_METHOD(SetOpAllFixture,
+                 "gpu_execution EXCEPT ALL and INTERSECT ALL on ARRAY keys fall back",
+                 "[integration][gpu_execution][setop_all]")
+{
+  // [0.0] and [-0.0] compare equal, so one group would print only one of them.
+  for (std::string const column : {"d", "i"}) {
+    auto const left  = "SELECT " + column + " FROM sarray";
+    auto const right = "SELECT " + column + " FROM sarray WHERE id <> 3";
     expect_plan_fallback_matches_cpu(left + " EXCEPT ALL " + right);
     expect_plan_fallback_matches_cpu(left + " INTERSECT ALL " + right);
   }

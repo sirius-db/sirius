@@ -90,6 +90,7 @@ export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET expression_evaluator_strategy = 'as
 export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
 export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
 export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
+export SIRIUS_EXP_LOWCARD_GROUPBY="${SIRIUS_EXP_LOWCARD_GROUPBY:-1}"
 
 echo "db        : $DB"
 echo "refresh   : $REFRESH"
@@ -113,7 +114,7 @@ for ((i = 1; i <= PROBE_TRIES; i++)); do
   if SIRIUS_CONFIG_FILE="$PROBE_CFG" python3 - <<'PYEOF' >/dev/null 2>&1
 import duckdb
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
+con.execute("LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension'")
 con.close()
 PYEOF
   then

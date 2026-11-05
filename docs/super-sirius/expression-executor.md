@@ -1,6 +1,6 @@
 # Expression Evaluator
 
-This document covers the GPU expression-evaluation subsystem used by FILTER and PROJECTION operators.
+This document covers GPU expression evaluation for FILTER, PROJECTION, and join operands.
 
 ## Overview
 
@@ -18,6 +18,68 @@ This document covers the GPU expression-evaluation subsystem used by FILTER and 
 Both methods accept a `cudf::table_view` and return a new `cudf::table` with the result. The `rmm::cuda_stream_view` and memory resource are passed to the constructor and stored as members — they are not per-call arguments.
 
 The evaluator can be constructed from a `duckdb::vector<std::unique_ptr<sirius::ast::node>>` (the full operator expression list), from a single `sirius::ast::node`, from a non-owning `sirius::ast::node const*`, or from a non-owning `std::vector<sirius::ast::node const*>`. The PROJECTION operator uses the non-owning vector form to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `evaluate()` returns one output column per supplied expression, in order. Unsupported expressions never reach the evaluator: the plan builders reject any expression that `from_duckdb` cannot translate during GPU plan construction (throwing `NotImplementedException`, which triggers the transparent CPU fallback — see [Physical Plan Generation](physical-plan-generation.md)). A null slot in the evaluator's expression list therefore indicates a planner bug, and the evaluator throws `sirius::internal_exception` as a defensive backstop rather than dereferencing it.
+
+## Native expression consumers
+
+Operators inspect and evaluate the Sirius AST directly. `node::return_type()`
+provides logical types, and `ast::visit_references` visits references through all
+child expressions, including casts. Reference collection preserves column indices;
+consumers deduplicate them within each input's index space. Hash joins use these
+sets for mixed-join reference-overlap checks and residual validity columns.
+A direct-reference check is stricter than traversal: finding a reference beneath
+a cast does not make the expression eligible for direct-column dynamic filtering.
+
+DuckDB translation is an input boundary, not an execution dependency. CPU fallback
+uses separately preserved DuckDB planning state and a prepared CPU plan (see
+[Physical Plan Generation](physical-plan-generation.md)); it does not reconstruct
+DuckDB expressions from the Sirius AST. Type, value, and comparison adapters remain
+available at interfaces that require DuckDB types.
+
+### Shared hash-join key preparation
+
+`materialize_expression_join_keys` in
+[`sirius_physical_hash_join.cpp`](../../src/op/sirius_physical_hash_join.cpp)
+prepares join operands in child projections. Direct references must match their
+input schema. Each operation, including a cast of a reference, becomes a hidden
+projection column evaluated by the native evaluator; its condition operand becomes
+a reference to that column. Projection maps keep these hidden columns out of the
+visible result. Both the comparison-join planner and the hash-join constructor use
+this preparation boundary, so direct native construction has the same contract.
+
+The join publishes prepared key descriptors containing left and right column
+indices, a common cuDF type, and whether the condition is a hash equality key.
+Operands with different physical types are rejected. Partitioning consumes these
+descriptors rather than interpreting expressions independently. It uses all prepared
+equality keys, including null-safe keys routed to the mixed-join predicate; the join
+hash table uses the descriptors marked as hash keys. Predicate routing retains the
+distinction between ordinary equality and `IS NOT DISTINCT FROM`.
+
+Both partitioning and hash joining use
+[`restore_prepared_key`](../../src/op/key_preparation.hpp) to restore
+narrowed carriers to the prepared type before hashing. This shared representation
+is a correctness requirement: equal numeric values in different physical types can
+hash differently, sending matching rows to different partitions. Carrier restoration
+is distinct from evaluating a SQL cast; see
+[Compressed Materialization](compressed-materialization.md).
+
+### Nested-loop operands and conversion semantics
+
+[`sirius_physical_nested_loop_join.cpp`](../../src/op/sirius_physical_nested_loop_join.cpp)
+reuses a direct input column only when its physical type matches the reference's
+logical type mapped to cuDF. Other operands, including references to narrowed
+carriers, pass through the native evaluator on the join's stream and memory resource.
+Evaluated tables and cuDF AST operand storage remain alive for the join call.
+
+A cast is an operation with a target type, `try_cast`, and `cast_kind`, not a
+transparent reference wrapper. Native evaluation preserves nested conversions and
+the distinction between semantic casts and carrier restoration. In particular,
+semantic timestamp conversions use the checked conversion behavior described under
+[Temporal semantics](#temporal-semantics).
+
+Each condition evaluates its own operands. Repeated expressions can therefore incur
+repeated evaluation and allocation. Sharing results requires proven expression
+identity or equivalence; a hash value alone cannot establish that two operands have
+the same meaning.
 
 ## Sirius AST Type Hierarchy
 
@@ -54,10 +116,10 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `between` | `sirius::ast::between` | `BETWEEN … AND …` |
 | `case_expr` | `sirius::ast::case_expr` | `CASE WHEN … THEN … ELSE … END` |
 | `cast` | `sirius::ast::cast` | `CAST(x AS T)` |
-| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `-x`, arithmetic binary ops (`+`, `-`, `*`, `/`) |
+| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `x IS NULL`, `x IS NOT NULL` |
 | `coalesce` | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | `in_list` | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
-| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) — `sirius::function_id` enum |
+| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) and arithmetic (`a + b`, `-x`) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
 
 **Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
@@ -78,25 +140,25 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 
 **File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
-The evaluator supports three strategies, selected via the `strategy` constructor parameter (default from `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`):
+The evaluator supports three strategies, selected via `policy.strategy` in the `expression_query_policy` constructor argument:
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
-| `MATERIALIZE` | Every expression node becomes a single kernel. Intermediate results are materialized as `cudf::column`s. | `cudf::unary_operation`, `cudf::binary_operation`, etc. (one per node) |
+| `MATERIALIZE` | Materializes intermediate results as `cudf::column`s. Floating comparisons use small interpreted ASTs for NaN semantics; this strategy never selects AST JIT. | `cudf::unary_operation`, `cudf::binary_operation`, `cudf::compute_column` |
 | `AST_INTERPRET` (default) | Builds a `cudf::ast::tree` and interprets it with a single monolithic kernel. | `cudf::compute_column` |
 | `AST_JIT` | Builds a `cudf::ast::tree` and JIT-compiles it into a fused kernel. | `cudf::compute_column_jit` |
 
 ### Tree of AST Trees
 
-Not every DuckDB expression has a cuDF AST equivalent — these are called **AST breakers** (e.g. `CASE`, `LIKE`, `SUBSTRING`, unsupported `CAST` types). For AST strategies, the evaluator walks the DuckDB expression and greedily builds AST subtrees up to each breaker. When it hits a breaker, it materializes that subtree as a `cudf::column`, stashes it internally, and references it from the enclosing AST subtree via a `cudf::ast::column_reference`.
+Not every DuckDB expression has a cuDF AST equivalent — these are called **AST breakers** (e.g. `CASE`, `LIKE`, `SUBSTRING`, unsupported `CAST` types). For AST strategies, the evaluator walks the Sirius AST and greedily builds AST subtrees up to each breaker. When it hits a breaker, it materializes that subtree as a `cudf::column`, stashes it internally, and references it from the enclosing AST subtree via a `cudf::ast::column_reference`.
 
 The result is a tree of AST trees whose edges are AST breakers. Each AST tree is evaluated by `cudf::compute_column` (or `compute_column_jit`) in `evaluate_ast()`.
 
 ### `min_ast_size` — per-subtree mode selection
 
-An AST subtree with only one operator gains little from AST execution and would pay the launch overhead of `compute_column`. The `min_ast_size` constructor parameter (default `2`) sets the threshold: before adding a subtree to the AST tree, the evaluator calls `cudf_ast_op_count()` on it; if the count is below `min_ast_size`, the subtree is evaluated operator-by-operator in MATERIALIZE mode instead.
+For nodes that use size-based mode selection, the `min_ast_size` constructor parameter (default `2`) controls whether a subtree is materialized operator-by-operator or built as an AST. The evaluator uses `cudf_ast_op_count()` to estimate its size; a subtree below the threshold normally materializes unless its parent requests AST mode. This is a heuristic, not a universal rule: floating comparisons, BETWEEN, and floating membership may require NaN-aware ASTs independently of the threshold.
 
-This means `MATERIALIZE` strategy is effectively `AST_INTERPRET` with `min_ast_size = ∞`.
+`MATERIALIZE` and `AST_INTERPRET` with `min_ast_size = ∞` are therefore not interchangeable. In particular, an all-constant FLOAT/DOUBLE IN list uses `cudf::contains` under `MATERIALIZE`, but follows the floating comparison AST path under `AST_INTERPRET` even when the threshold exceeds the expression size. Floating lists with nonconstant entries retain the comparison chain under either strategy. AST evaluation requested under `MATERIALIZE` is interpreted; only `AST_JIT` selects the JIT backend.
 
 ### `evaluation_mode` (internal)
 
@@ -110,6 +172,19 @@ The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
 ```
 
+### Policy ownership
+
+At query initialization, Sirius snapshots the connection's settings into immutable
+`operator_params`. Operators derive an `expression_query_policy` from that snapshot and
+pass it to their evaluators. Scan materialization and residual filtering forward the
+same policy explicitly; pin operations supply their own settings snapshot.
+
+Each evaluator owns a constant copy of both the execution strategy and the regex JIT
+flag. Evaluation therefore uses the settings captured at construction, including when
+it runs on a different worker thread. It does not consult thread-local settings or
+mutable process globals. Standalone callers may omit the policy to use fixed defaults
+(`AST_INTERPRET`, regex JIT enabled), or pass an explicit policy.
+
 ## Supported Expression Types
 
 | Expression Type | Sirius AST alternative | Example |
@@ -118,7 +193,8 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 | Constant | `sirius::ast::constant` | `42`, `'hello'` |
 | Comparison | `sirius::ast::comparison` | `a > b`, `x = 10`, `a IS NOT DISTINCT FROM b` |
 | Conjunction | `sirius::ast::conjunction` | `a AND b`, `x OR y` |
-| Arithmetic / unary | `sirius::ast::unary_op` | `a + b`, `NOT x`, `-x` |
+| Arithmetic | `sirius::ast::function_call` | `a + b`, `-x` |
+| Unary predicate | `sirius::ast::unary_op` | `NOT x`, `x IS NULL` |
 | COALESCE | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | IN-list | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
 | Function call | `sirius::ast::function_call` | `UPPER(name)`, `YEAR(date)`, `a \|\| b` |
@@ -129,15 +205,160 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
-`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted.
+Handlers that read an operand as a column evaluate it with `evaluate_as_column`, which broadcasts
+a scalar result to the input's row count. These are the date parts (including `millisecond` and
+`microsecond`), `date_trunc`, `round`, the string functions `strlen`, `length`, `upper`, `lower`,
+`substring`, `contains`, `prefix`, `suffix`, `LIKE` and `regexp_replace`, the `IN` probe, `NOT`,
+`IS [NOT] NULL`, and one side of constant-only arithmetic. Comparisons and the `BETWEEN` input
+broadcast a constant the same way on the materialize path. DuckDB does not always fold
+all-constant calls: statistics propagation reduces `coalesce(<non-null constant>, x)` to the
+constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d))` reaches the
+GPU as `month(DATE '2020-02-01')`.
+Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
+
+`date_trunc` must return the type DuckDB declares: a microsecond `TIMESTAMP`. A DATE input
+normally uses cuDF's day-resolution `TIMESTAMP_DAYS` type. If that type reaches a parent
+`CASE` or `COALESCE`, it cannot be combined with a TIMESTAMP branch.
+
+For a DATE input, every GPU-supported unit is a day or finer, so truncation does not change
+the date. The evaluator converts it to a `TIMESTAMP` with `cast_date_to_timestamp`, which
+preserves infinities. For a TIMESTAMP input, it uses `cudf::datetime::floor_datetimes` to
+round to the requested unit.
+
+`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that.
+
+The AST lowering for IN joins per-entry equality comparisons with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to per-entry inequality comparisons joined by `NULL_LOGICAL_AND`. For non-floating operands these use primitive `EQUAL` and `NOT_EQUAL` nodes. FLOAT/DOUBLE comparisons instead use the shared NaN-aware comparison builder: equality expands to `EQUAL OR both_nan`, and inequality to `NOT(EQUAL OR both_nan)`, where `both_nan` means both operands are valid NaNs. These expressions retain ordinary comparison NULL propagation. The pinned cuDF implementation normalizes the expanded predicate before Parquet membership pruning; the floating inequality's `NOT` node must not be confused with negating a Bloom-filter membership answer (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values.
+
+Under `MATERIALIZE`, all-constant lists (including FLOAT/DOUBLE) use `cudf::contains` over the non-NULL entries; this lookup treats NaNs and signed zeros as equal. When the list also has a NULL, the evaluator combines the result with a NULL scalar using `NULL_LOGICAL_OR`. Floating lists with nonconstant entries retain the NaN-aware comparison chain.
 
 ### String concatenation
 
 String concatenation covers the `concat(a, b, …)` function and the `||` operator, which have **different** NULL semantics and therefore resolve to **distinct** ids: `concat()` ignores NULL arguments (`concat(NULL, 'x') = 'x'`) and maps to `function_id::concat`; the `||` operator propagates NULL (`'a' || NULL = NULL`) and maps to `function_id::concat_operator` (DuckDB lowers `||` to a function named `"||"`). Both are dispatched as a materialize-only function in `src/expression_evaluator/specializations/function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The two semantics are selected by the narep scalar: a valid empty string for `concat()` (NULL → `""`, ignored) and an invalid narep for `||` (NULL → NULL, propagated).
 
+### String case conversion
+
+`upper()` and `lower()` materialize their input and call `cudf::strings::to_upper` and
+`cudf::strings::to_lower`, respectively. NULLs propagate and empty strings remain empty.
+These functions are AST breakers and can compose inside projections, filters, and materialized
+join-condition operands.
+
+Case conversion follows cuDF's Unicode semantics, which differ from DuckDB
+for some inputs. For example `upper('ß')` produces `SS`, and `lower('İ')`
+produces `i` followed by combining dot U+0307. In contrast DuckDB produces
+`ẞ` and `i`. So cuDF round-trips `upper(lower('İ'))` as the identity, where
+DuckDB produces `upper(lower('İ')) == I`, in contrast cuDF produces
+`lower(upper('ß')) == ss` whereas DuckDB produces `ß` for the round-trip.
+See cuDF's [Unicode
+limitations](https://docs.rapids.ai/api/libcudf/stable/md_doxygen_unicode)
+for its supported code points and context-sensitive conversion limitations.
+### Temporal semantics
+
+`src/helper/timestamp_semantics.hpp` defines reusable GPU helpers in `sirius::temporal`.
+The current contract matches DuckDB: signed epoch ticks reserve exactly `+MAX` and
+`-MAX` for infinity, while `MIN` remains finite. NULLs propagate. Frontends must
+normalize their temporal values to this representation before using these helpers;
+the helpers do not depend on DuckDB types or a frontend identity.
+
+`cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
+columns to microseconds. It checks finite values before multiplying, preserves
+infinity, and truncates nanoseconds toward zero. Overflow raises
+`sirius::invalid_input_exception`; reading the overflow result synchronizes the
+supplied stream. The cast evaluator dispatches to this helper for semantic casts.
+
+`finite_mask()` returns a nullable boolean column for DATE or any timestamp
+precision. Both checked conversion and millisecond/microsecond extraction use it,
+so sentinel handling has one implementation. The evaluator boundary regressions
+are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
+tagged `[timestamp_extraction]`.
+
+### HUGEINT
+
+HUGEINT is carried as cuDF DECIMAL128 with scale 0, an exact 128-bit integer with the layout of
+`duckdb::hugeint_t`; its constants are `sirius::decimal128` values with scale 0. Like DECIMAL
+(`logical_type::has_fixed_point_carrier`), HUGEINT arithmetic is materialized rather than lowered
+to the cuDF AST. `//` and `%` accept column divisors on the GPU after the checks described below.
+A cast from HUGEINT to a narrower integer or DECIMAL first checks the
+column's range and throws `not_implemented_exception` when a value does not fit, so the query falls
+back and DuckDB raises its conversion error (or returns NULL under `TRY_CAST`). Such casts never
+lower to the AST, whose integer casts wrap (`ast_supports_cast`); a cast to DOUBLE does. A cast to
+VARCHAR uses `cudf::strings::from_fixed_point`. Tests are tagged `[hugeint]`.
+
+`DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
+match their already-bound signatures and execute through `date_arithmetic_checked()`.
+The helper uses a libcudf JIT transform with public CCCL overflow helpers and error
+collection; DATE inputs are bitcast to day counts without copying. Scalar operands
+use one-row columns broadcast by `cudf::scalar_column_view`, with the output row
+count passed explicitly so scalar-only and empty inputs retain the input shape.
+Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
+collisions. Date differences widen both day counts before subtraction and return
+BIGINT. These operations materialize under every evaluator strategy; standalone
+cuDF AST translation declines them because it cannot implement the checks.
+The existing reference evaluator restores compressed operands before execution.
+
+### DECIMAL to integer casts
+
+DECIMAL-to-integer casts round to the nearest integer, with ties away from zero, then check the
+destination range. NULLs remain NULL. On overflow, `TRY_CAST` returns NULL and `CAST` replays on
+the CPU. A UHUGEINT result above UINT64 also replays on the CPU, including under `TRY_CAST`.
+Tests are tagged `[decimal_integer_cast]`.
+
+### Division and modulo
+
+`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
+calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
+either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
+which preserves DuckDB's `error_on_division_by_zero` setting and guarded `CASE` semantics. With
+fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
+`TRY(...)` continues to use plan-time CPU fallback.
+
+Integer column divisors, including HUGEINT, first use an exact non-NULL range reduction. A minimum
+above zero or a maximum below -1 rules out both exceptional divisors and skips the row checks.
+Inconclusive ranges retain the exact checks, including their paired-NULL semantics.
+
+A proven nonzero constant divisor other than -1 can use the existing cuDF AST path. Other divisors
+materialize under every evaluation strategy; the standalone translator declines them as well, so
+join and scan predicates cannot bypass the checks. The shared `ast_supports_function` predicate
+keeps those decisions aligned. Ordinary floating-point `/` retains its existing route. Regression
+tests are tagged `[checked_division]`.
+
+### Arity and negation
+
+`from_duckdb_function_name` resolves a (name, argument count) pair against one signature table
+in `function_id.cpp`: a one-argument `-` is `function_id::negate`, a two-argument `-` is
+`function_id::sub`, and an arity no GPU handler takes stays on the CPU. A one-argument `+`
+translates to its operand. The `function_call` constructor throws on a mismatched arity.
+
+`negate` runs `cudf::unary_operation(NEGATE)` on signed integers, FLOAT, DOUBLE and DECIMAL,
+keeping the input type (`-0.0` matches DuckDB). Negating a signed integer's minimum raises
+DuckDB's `Overflow in negation of numeric value!`; the check is a `cudf::contains` shared with
+`abs` (one stream sync). Unsigned, HUGEINT and INTERVAL negation, and a result type that differs
+from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagged `[negate]`.
+
+### Rounding
+
+`round(x)` and `round(x, n)` on FLOAT and DOUBLE map to `function_id::round` and run in
+`round_floating_point` (`src/cuda/sirius_round_floating_point.cu`), one elementwise kernel that
+reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double precision as
+`round(x * 10^n) / 10^n`, or `round(x / 10^-n) * 10^-n` for negative `n`, with ties away from
+zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
+identical to DuckDB. The precision must be a constant INTEGER.
+DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
+
+### Absolute value
+
+`abs(x)` on FLOAT, DOUBLE, DECIMAL and the integer types other than HUGEINT maps to
+`function_id::abs` and runs `cudf::unary_operation` with `ABS`. NaN and infinities are preserved and
+`abs(-0.0)` is `0.0`. The result has the input's type. The absolute value of the smallest value of a
+signed integer type wraps in cuDF, where DuckDB raises an overflow error, so the evaluator checks
+with `cudf::contains` whether the input holds that value and throws. The query then falls back to the
+CPU, which raises DuckDB's error. Unsigned integers have no such value and are returned as they are.
+HUGEINT falls back at plan time.
+
 ### Logical AND/OR NULL semantics
 
-SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — never the null-propagating `LOGICAL_*` variants. The plain `LOGICAL_AND` still appears for internal structural conjunctions where operands cannot be NULL, such as the BETWEEN lowering and the AND that combines multi-condition join predicates.
+SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so SQL conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — rather than the strictly null-propagating `LOGICAL_*` variants.
+
+BETWEEN follows the same rule: `(val >= lower) AND (val <= upper)` uses `NULL_LOGICAL_AND` in the evaluator's AST and materialized paths and in the standalone translator. Its comparison operands can be NULL. For example, `(val, lower, upper) = (2, NULL, 1)` gives `NULL AND FALSE`, which is FALSE; reversing the conjunction to `FALSE AND NULL` also gives FALSE. NOT BETWEEN negates that result and therefore returns TRUE in this example.
 
 Per-expression-type dispatch lives in `src/expression_evaluator/specializations/` (one file per Sirius AST alternative: `comparison.cpp`, `case.cpp`, etc.). Each specialization decides how to emit cuDF AST nodes, materialize, or fall back based on the effective evaluation mode.
 
@@ -151,7 +372,7 @@ The following translate directly into cuDF AST nodes:
 | Comparison | `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NOT DISTINCT FROM` (via `NULL_EQUALS`) |
 | Logical | `AND`, `OR` (Kleene `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR`), `NOT` |
 | BETWEEN | Translated to `(val >= lower) AND (val <= upper)` |
-| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`) |
+| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`); from HUGEINT only `DOUBLE` (`ast_supports_cast`) |
 
 Anything outside this set is an AST breaker and forces materialization at that node.
 
@@ -184,7 +405,7 @@ A second overload, `translate_expression_with_names`, produces `cudf::ast::colum
 These return `nullopt`, causing the caller to fall back to row-by-row evaluation:
 - `case_expr` nodes
 - `coalesce` nodes and `TRY`
-- `cast` with non-fixed-width target types (e.g., VARCHAR)
+- `cast` with non-fixed-width target types (e.g., VARCHAR), and a HUGEINT cast to anything but DOUBLE
 - `IS DISTINCT FROM` (throws `NotImplementedException`)
 
 ### Join Condition Translation

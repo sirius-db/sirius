@@ -115,6 +115,8 @@ for (auto& batch : output_batches) {
 }
 ```
 
+`push_data_batch()` calls the receiving operator's `on_input_batch_pushed(port_id, batch)` hook inside the pushing task, before the batch becomes poppable. The hook must not block or touch device memory. The default does nothing; the build PARTITION of a join that accumulates dynamic filters records each arrival in its `build_arrival_ledger` (see [Dynamic Filters](dynamic-filters.md#multi-partition-build-accumulation)).
+
 `next_port_after_sink` is configured when repository wiring is materialized: the pipeline converter emits pure-data `repository_wiring` descriptors at plan time, and `pipeline::materialize_repository_wiring(wirings, *repo_manager)` creates the repositories and calls `source_op->add_next_port_after_sink({next_op, port_id})` at query setup (see [Multi-GPU Architecture](multi-gpu-architecture.md) for the two-phase split).
 
 ### Port Names
@@ -129,6 +131,10 @@ Operators access their ports by string name:
 
 Minimal empty base class. Provides a generic extension point for any type of operator data — signaling objects, metadata-only data, or non-batch representations can derive from `operator_data` without being forced into the batch model.
 
+### `input_free_operator_data`
+
+Used by GPU_VALUES and zero-input ungrouped aggregate finalization. It owns no batches and captures the reserved GPU memory space during `prepare_for_processing()`. Its estimated byte basis accounts for output allocation. An empty relation may finish with zero batches; operators that must produce an empty-input result schedule work explicitly. There is no universal requirement for an operator to emit a batch.
+
 ### `pipelineable_operator_data`
 
 Extends `operator_data` with batch-based data flow. Holds two optional internal stores that are
@@ -141,6 +147,8 @@ Key methods:
 - `get_read_only_batches(bool leave_locked)` — acquires `to_read_only()` on each idle batch; if `leave_locked=true`, caches result in `_read_only_data_batches`.
 - `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_or_prepare_batch()` for each batch (clones/converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches` and resets `_data_batches` to `std::nullopt` — accessor *i* may reference a cross-GPU *clone* rather than the original batch, so the idle view is lazily rebuilt from the accessors rather than kept alongside them. Called by the GPU pipeline executor before `execute()`.
 - `remove_read_only_lock()` — releases `_read_only_data_batches` while ensuring `_data_batches` is populated first (so the data stays alive).
+- `original_batch_ids()` — the IDs of the non-null input batches in input order, as constructed. Preparation may replace a batch with a cross-GPU clone that has a new ID, and a retry reuses the same object, so these IDs identify the logical inputs across both (used by multi-partition dynamic filters). Only a replacement records an ID; other batches answer with their current ID.
+- A certified dynamic-filter input may spill and re-upgrade before contribution. Only its original ID, exact row count, and active key types must match; payload child layouts may change during conversion.
 - Created by `get_next_task_input_data()` from port pops.
 - Passed through the operator chain during `execute()`.
 
@@ -152,6 +160,7 @@ Extends `pipelineable_operator_data` with a partition index (`get_partition_idx(
 
 ```
 operator_data                       (empty generic base)
+  ├── input_free_operator_data       (reservation space, no batches)
   └── pipelineable_operator_data    (batch vector + data flow methods)
        └── partitioned_operator_data (adds partition_idx)
 ```

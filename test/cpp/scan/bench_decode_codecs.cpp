@@ -25,9 +25,6 @@
 #include "scan/rle_synth.hpp"
 #include "scan/strings_synth.hpp"
 
-#include <cudf/column/column.hpp>
-#include <cudf/strings/strings_column_view.hpp>
-
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -45,7 +42,6 @@
 #include <cstring>
 #include <fstream>
 #include <string>
-#include <variant>
 #include <vector>
 
 using duckdb::CompressionType;

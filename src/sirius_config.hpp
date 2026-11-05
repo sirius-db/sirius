@@ -19,6 +19,8 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "expression_evaluator/query_policy.hpp"
+#include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -26,7 +28,13 @@
 
 #include <cmath>
 #include <filesystem>
+#include <memory>
+#include <stdexcept>
 #include <string>
+
+namespace YAML {
+class Node;
+}
 
 namespace sirius {
 
@@ -39,18 +47,28 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 
 /// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
 /// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
-/// once per process (memoized). operator_params derives its batch members from this,
-/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// once per process (memoized). Hardware resolution derives operator batch sizes
+/// from this value. When YAML explicitly configures an
 /// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 2 * DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MiB
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+
+/// Fallback BUILD_PROBE budgets with the default hash partition size equal to batch size.
+/// Resolution derives the index budget from startup hash_partition_bytes; the resident budget
+/// remains batch-derived. At >= 4 bytes per row, an 8x index budget covers the former 2x payload
+/// threshold, subject to the cuDF row limit and the independent resident budget.
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES     = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024;  // 256 MiB
+
+/// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
+/// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
+constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -113,18 +131,37 @@ constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
 /// Budget when GPU tier capacity cannot be read at planning time.
 constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
+/// 0 = auto: a share of the pinning GPU memory space's capacity, below.
+constexpr uint64_t DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES = 0;
+
+/// Share of the GPU memory space capacity that the values retained across all columns may occupy
+/// in the pin-time exact uniqueness check when its cap is auto. The check's peak is about three
+/// times the retained bytes, so this keeps it near 30% of the space.
+constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
 /// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+/// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
+  /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
+  static operator_params with_batch_size(uint64_t batch_size);
+
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
-  bool like_swar_fastpath = false;
+  bool like_swar_fastpath                           = false;
+  expression_evaluator_strategy expression_strategy = expression_query_policy{}.strategy;
+  bool enable_regex_jit                             = expression_query_policy{}.regex_jit;
+
+  [[nodiscard]] expression_query_policy expression_policy() const noexcept
+  {
+    return {expression_strategy, enable_regex_jit};
+  }
 
   /// Target batch size (bytes) for DuckDB scan tasks.
-  uint64_t scan_task_batch_size = config::derived_default_batch_size();
+  uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
@@ -133,18 +170,30 @@ struct operator_params {
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
-  uint64_t hash_partition_bytes = config::derived_default_batch_size();
+  uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
-  /// Target size (bytes) for the concat operator output batch.
-  uint64_t concat_batch_bytes = config::derived_default_batch_size();
+  /// Target output batch size (bytes) for CONCAT and REPLICATE. REPLICATE may exceed the target by
+  /// one row.
+  uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+
+  /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
+  /// join is larger is split into tasks over row ranges of the left batch.
+  uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
-  uint64_t sort_sample_bytes = config::derived_default_batch_size();
+  uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
-  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
-  /// batch default. May be larger than concat_batch_bytes; build-side batches will be
-  /// concatenated if needed.
-  uint64_t max_build_hash_table_bytes = 2 * config::derived_default_batch_size();
+  /// Estimated per-GPU cuco hash-table byte budget for BUILD_PROBE, computed from measured rows.
+  /// Defaults to 8x startup-resolved hash_partition_bytes unless explicitly configured.
+  /// SET hash_partition_bytes does not re-derive it; 0 disables BUILD_PROBE including MARK.
+  uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Per-GPU decoded build payload budget for BUILD_PROBE. The folded batch stays read-locked
+  /// for the probe stream, and folding may temporarily hold both inputs and output. Admission
+  /// uses a per-partition average for hash partitioning, so skew and concurrent joins can exceed
+  /// available memory. Defaults to 8x batch size; 0 disables BUILD_PROBE including MARK.
+  // SET/RESET overrides are connection-local and captured in the query options snapshot.
+  uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
@@ -170,6 +219,13 @@ struct operator_params {
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
 
+  /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
+  bool enable_dynamic_filter_multi_partition = true;
+
+  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
+  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
+    sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
@@ -187,6 +243,11 @@ struct operator_params {
 
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
+
+  /// Decide decimal and wide integer SUM widening from base-table statistics at plan time: an
+  /// aggregate input with a proven magnitude bound skips the per-batch min/max scan and its stream
+  /// synchronization (planner::resolve_sum_input_bounds). Off: every batch is measured.
+  bool enable_decimal_sum_stats_bound = true;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
@@ -207,6 +268,22 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
+  /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
+  /// When on, pin_table observes every column it is not already asked to observe; an observed
+  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
+  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
+  /// late materialization asks for.
+  bool prove_unique_keys{true};
+
+  /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
+  /// sorts a whole column when its chunks overlap in range. Earlier columns take priority when the
+  /// cap is short; the check's peak GPU use is about three times the cap. A column that no longer
+  /// fits stays unproven. 0 = a share (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the
+  /// pinning GPU memory space's capacity. Applies to every observed column, whether late
+  /// materialization or join-key proofs asked for it.
+  uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
@@ -230,12 +307,15 @@ struct operator_params {
   uint64_t avg_variable_column_bytes = 32;
 };
 
+constexpr std::string QUENT_NDJSON_EXPORTER = "ndjson";
+
 struct telemetry_config {
   bool enable_quent{true};
-  /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
-  /// Roughly doubles telemetry volume; no-op when enable_quent is false.
-  bool enable_batch_events{true};
-  std::string exporter{"ndjson"};
+  /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
+  /// enable_quent is false.
+  bool enable_nvtx{false};
+
+  std::string exporter{QUENT_NDJSON_EXPORTER};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
   /// Optional override naming an NVTX injection library. Normally Sirius uses
@@ -244,9 +324,9 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression. The unprefixed fields apply to
+/// pin_table(tier=>'host'); the spill_ fields apply to batches the downgrade
+/// executor spills to the host or disk tier.
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
@@ -273,14 +353,48 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Store batches the downgrade executor spills to the host or disk tier
+  /// Simpatico-compressed, with per-type default plans, and decode them on their way
+  /// back to the GPU. A batch whose compressed form saves too little (see
+  /// spill_max_compressed_fraction) or fails to encode spills uncompressed.
+  bool enable_spill_compression{false};
+
+  /// Batches smaller than this spill uncompressed.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// Keep a spilled batch compressed only when its header + payload is at most this
+  /// fraction of the batch's device size. Finite and non-negative; values above 1
+  /// allow compressed forms that expand relative to the original batch.
+  double spill_max_compressed_fraction{0.75};
+
+  /// Encode a spilled batch only when this fraction of its size could be reserved in
+  /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
+  /// In [0, 1]; 0 skips the check.
+  double spill_encode_reserve_fraction{0.5};
 };
 
+class configuration_input_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class parsed_sirius_config;
+
 struct sirius_config {
-  sirius_config();
+  sirius_config()  = default;
   ~sirius_config() = default;
 
+  // Explicit hardware-resolving helpers for internal configuration consumers.
+  // Runtime startup takes parsed_sirius_config instead.
   void load_from_file(const std::filesystem::path& config_path);
+  /// Replace all settings with hardware-resolved defaults. Apply programmatic
+  /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
+  [[nodiscard]] int max_concurrent_queries() const noexcept
+  {
+    return _scan_manager_config.max_concurrent_queries;
+  }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -307,6 +421,10 @@ struct sirius_config {
   /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
   /// get_scan_manager_config() reflects the actual scan_manager state.
   void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
+
+  /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
+  /// Set this before initializing consumers of the scan-manager configuration.
+  void set_object_store_config(io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -341,11 +459,12 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
+  friend class parsed_sirius_config;
+
   /// Apply the knobs derived from the rest of the configuration: the readahead
   /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called from the end of both @ref load_from_file
-  /// and @ref apply_defaults so a missing config file derives the same values
-  /// an empty one does; each step is idempotent.
+  /// override, in that order. Called by parsed_sirius_config::resolve after
+  /// memory capacities and operator defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -354,13 +473,6 @@ struct sirius_config {
   /// the override takes effect. Called from @ref finalize_derived_config.
   void enforce_sirius_backend_for_multi_gpu();
 
-  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
-  /// CONFIGURED pipeline pool size. The struct default can only use the
-  /// compile-time thread count, so resizing the pipeline in config would
-  /// otherwise leave the readahead budget behind. Called from
-  /// @ref finalize_derived_config; an explicit config value is left alone.
-  void derive_uring_scan_budget();
-
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
   /// latency-bound, so the readahead needs several splits in flight per pipeline
@@ -368,7 +480,7 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
-  cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
@@ -379,6 +491,29 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+};
+
+/// Validated configuration intent. Construction and parsing never discover hardware.
+/// Resolution produces a separate value and leaves the specification unchanged.
+class parsed_sirius_config {
+ public:
+  parsed_sirius_config();
+  static parsed_sirius_config from_file(const std::filesystem::path& path);
+  static parsed_sirius_config from_node(const YAML::Node& root,
+                                        const std::filesystem::path& source_path = {});
+  [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
+  [[nodiscard]] const operator_params& get_operator_params() const noexcept;
+  [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
+  /// embedder check backend-dependent options before the engine is brought up.
+  [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
+  [[nodiscard]] sirius_config resolve(
+    const cucascade::memory::system_topology_info& topology) const;
+
+ private:
+  struct Impl;
+  explicit parsed_sirius_config(std::shared_ptr<const Impl> impl);
+  std::shared_ptr<const Impl> impl_;
 };
 
 }  // namespace sirius

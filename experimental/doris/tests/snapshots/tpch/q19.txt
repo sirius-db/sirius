@@ -1,0 +1,41 @@
+# q19: 4 fragments (root first):
+#   fragment_id=4 sink=RESULT_SINK nodes=[AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=3 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q19/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: AGGREGATION_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_boolean
+  @  3: extension:io.substrait:functions_arithmetic
+  @  4: extension:io.substrait:functions_aggregate_generic
+  @  5: extension:sirius:explain-only
+Functions:
+  #  1 @  1: equal
+  #  2 @  1: gte
+  #  3 @  1: lte
+  #  4 @  2: and
+  #  5 @  2: or
+  #  6 @  3: subtract
+  #  7 @  3: multiply
+  #  8 @  4: sum
+  #  9 @  5: in_list
+
+=== Plan
+Root[revenue]
+  Project[$0]
+    Project[($0)::!decimal?<38, 4>]
+      Aggregate[_ => sum(multiply($0, subtract(1.00:decimal<16, 2>, ($1)::!decimal?<16, 2>):decimal?<16, 2>):decimal?<31, 4>):decimal?<38, 4>]
+        Project[$2, $3]
+          Join[&Inner, and(equal($0, $4):boolean?, or(or(and(and(equal($5, 'Brand#12'):boolean?, in_list($7, 'SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'):boolean?):boolean?, and(lte($1, 11.00:decimal<15, 2>):boolean?, lte($6, 5:i32):boolean?):boolean?):boolean?, and(and(and(equal($5, 'Brand#23'):boolean?, in_list($7, 'MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'):boolean?):boolean?, gte($1, 10.00:decimal<15, 2>):boolean?):boolean?, and(lte($1, 20.00:decimal<15, 2>):boolean?, lte($6, 10:i32):boolean?):boolean?):boolean?):boolean?, and(and(equal($5, 'Brand#34'):boolean?, in_list($7, 'LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'):boolean?):boolean?, gte($1, 20.00:decimal<15, 2>):boolean?):boolean?):boolean?):boolean? => $0, $1, $2, $3, $4, $5, $6, $7]
+            Project[$0, $1, $2, $3]
+              Filter[and(in_list($5, 'AIR', 'AIR REG'):boolean?, equal($4, 'DELIVER IN PERSON'):boolean?, gte($1, 1.00:decimal<15, 2>):boolean?, lte($1, 30.00:decimal<15, 2>):boolean?):boolean? => $0, $1, $2, $3, $4, $5]
+                Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_partkey:i32?, l_quantity:decimal?<15, 2>, l_extendedprice:decimal?<15, 2>, l_discount:decimal?<15, 2>, l_shipinstruct:string?, l_shipmode:string?]
+            Project[$0, $1, $2, $3]
+              Filter[and(gte($2, 1:i32):boolean?, lte($2, 15:i32):boolean?, in_list($1, 'Brand#12', 'Brand#23', 'Brand#34'):boolean?, in_list($3, 'SM CASE', 'SM BOX', 'SM PACK', 'SM PKG', 'MED BAG', 'MED BOX', 'MED PKG', 'MED PACK', 'LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'):boolean?, or(or(and(and(equal($1, 'Brand#12'):boolean?, in_list($3, 'SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'):boolean?):boolean?, lte($2, 5:i32):boolean?):boolean?, and(and(equal($1, 'Brand#23'):boolean?, in_list($3, 'MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'):boolean?):boolean?, lte($2, 10:i32):boolean?):boolean?):boolean?, and(equal($1, 'Brand#34'):boolean?, in_list($3, 'LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'):boolean?):boolean?):boolean?):boolean? => $0, $1, $2, $3]
+                Read["local_files:/tmp/tpch-sf1/part/part.0.parquet" => p_partkey:i32?, p_brand:string?, p_size:i32?, p_container:string?]

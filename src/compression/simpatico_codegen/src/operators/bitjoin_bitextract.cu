@@ -12,6 +12,7 @@
 
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -246,8 +247,10 @@ void launch_check_truncation(cudf::column_view const& input_col,
 // ── bitextract_compressed_representation::decompress ─────────────────────────
 
 std::unique_ptr<cudf::column> bitextract_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
   if (fields.empty()) {
     throw std::invalid_argument("bitextract decompress: no field columns stored");
   }
@@ -260,10 +263,12 @@ std::unique_ptr<cudf::column> bitextract_compressed_representation::decompress(
     out_type, static_cast<cudf::size_type>(n), cudf::mask_state::UNALLOCATED, stream, mr);
 
   // Zero-initialise
-  cudaMemsetAsync(out_col->mutable_view().head<void>(),
-                  0,
-                  static_cast<size_t>(n) * static_cast<size_t>(cudf::size_of(out_type)),
-                  stream.get());
+  throw_if_cuda_error(
+    cudaMemsetAsync(out_col->mutable_view().head<void>(),
+                    0,
+                    static_cast<size_t>(n) * static_cast<size_t>(cudf::size_of(out_type)),
+                    stream.get()),
+    "bitextract decompress clear");
 
   // Compute total output width in bits
   uint32_t out_width_bits = static_cast<uint32_t>(cudf::size_of(out_type)) * 8;
@@ -282,8 +287,7 @@ std::unique_ptr<cudf::column> bitextract_compressed_representation::decompress(
                          stream.get());
     offset_from_msb += field_spec.bits;
   }
-  cudaStreamSynchronize(stream.get());
-  throw_if_cuda_error(cudaGetLastError(), "bitextract decompress sync");
+  throw_if_cuda_error(cudaGetLastError(), "bitextract decompress launch");
   return out_col;
 }
 

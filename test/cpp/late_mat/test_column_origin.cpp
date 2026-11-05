@@ -28,9 +28,7 @@
 #include <catch.hpp>
 #include <late_mat/column_origin.hpp>
 
-#include <cstdlib>
 #include <memory>
-#include <string>
 
 using sirius::late_mat::column_origin;
 using sirius::late_mat::pin_entry_handle;

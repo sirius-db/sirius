@@ -33,7 +33,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <map>
 #include <memory>
 #include <set>
@@ -379,7 +378,7 @@ TEST_CASE("streaming_sink SNK-10: source to filter to sink round-trips native ba
   source.close_input(0);
 
   // FILTER: col0 > 3.
-  auto filter_expr_duck = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+  auto filter_expr_duck = duckdb::BoundComparisonExpression::Create(
     duckdb::ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(
       duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), 0),

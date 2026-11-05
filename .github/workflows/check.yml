@@ -5,6 +5,7 @@
 #     - Explicitly allowed third-party actions:
 #       prefix-dev/setup-pixi@*
 #       mozilla-actions/sccache-action@*
+#       dtolnay/rust-toolchain@*
 #     - Require actions to be pinned to a full-length commit SHA: NO
 #
 # Adding a new action? You must:
@@ -18,7 +19,34 @@ on:
   merge_group:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
+
 jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
+        with:
+          pixi-version: v0.81.0
+          environments: bindings
+          locked: true
+          cache: false
+      - name: Check generated Rust declarations
+        run: |
+          pixi run --locked -e bindings generate-bindings
+          git diff --exit-code -- rust/crates/sirius-sys/src/generated.rs
+      - name: Lint binding generation
+        env:
+          DOCS_RS: "1"
+        run: pixi run --locked -e bindings cargo clippy --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings -- -D warnings
+      - name: Install Miri
+        uses: dtolnay/rust-toolchain@0c5191052c6bf2ba7dee1704a526ce23acd9a454 # miri
+      - name: Check public Rust ownership with Miri
+        run: cargo miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
+
   lint:
     runs-on: ubuntu-24.04
     env:
@@ -27,6 +55,10 @@ jobs:
       CONDA_OVERRIDE_CUDA: "13"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check DuckDB source revisions
+        run: |
+          [[ "$(git rev-parse HEAD:duckdb)" == "$(git rev-parse HEAD:sirius-duckdb/duckdb)" ]]
 
       - name: Test thread sweep harness
         run: |
@@ -41,12 +73,15 @@ jobs:
           cat /tmp/harness.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
-          pixi-version: v0.71.1
+          locked: true
+          pixi-version: v0.81.0
+          # cmakelang (cmake-format hook) crashes on Python 3.15: its re.Scanner
+          # patterns use capturing groups, which 3.15 rejects. Match pixi.toml.
           global-environments: |
-            pre-commit
+            pre-commit --with python=3.14
 
       - run: |
           set -o pipefail
@@ -114,32 +149,33 @@ jobs:
       fail-fast: false
     name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-
-      ${{ matrix.build.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
-        || matrix.build.arch == 'x64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-lg"]')
-        || matrix.build.arch == 'arm64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "arm-lg"]') }}
+      ${{ fromJSON(format('["self-hosted", "ubuntu-24.04", "{0}{1}"]',
+          github.event_name == 'pull_request' && 'pr-' || '',
+          matrix.build.environment == 'vcpkg' && 'cpu-xl'
+            || matrix.build.arch == 'x64' && 'cpu-lg'
+            || matrix.build.arch == 'arm64' && 'arm-lg')) }}
     timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Init build submodules
-        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+        run: git submodule update --init --depth=1 --jobs 4 duckdb sirius-duckdb/duckdb substrait cucascade
 
       - name: Init vcpkg with full history for version overrides
         if: matrix.build.environment == 'vcpkg'
         run: |
-          git submodule update --init vcpkg
-          if [[ "$(git -C vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
-            git -C vcpkg fetch --unshallow
+          git submodule update --init sirius-duckdb/vcpkg
+          git submodule update --init --depth=1 sirius-duckdb/extension-ci-tools
+          if [[ "$(git -C sirius-duckdb/vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -C sirius-duckdb/vcpkg fetch --unshallow
           fi
 
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
-          pixi-version: v0.71.1
+          locked: true
+          pixi-version: v0.81.0
           activate-environment: ${{ matrix.build.environment != 'vcpkg' && matrix.build.cudf-channel != 'nightly' }}
           environments: >-
             ${{ matrix.build.cudf-channel == 'nightly' && 'nightly-runner'
@@ -166,7 +202,7 @@ jobs:
 
       - run: |
           set -o pipefail
-          ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc) 2>&1 | tee /tmp/build.log
+          ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run --locked -e nightly-runner nightly-run', '') }} make ${{ case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc) 2>&1 | tee /tmp/build.log
         if: matrix.build.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"
@@ -179,32 +215,37 @@ jobs:
           grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Python DuckDB version check
-        if: >-
-          matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
-          && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
-          && matrix.build.cudf-channel == 'stable'
+      - name: Check the pinned DuckDB revisions
         run: |
-          pixi run python - <<'PY'
-          import json
-          from pathlib import Path
+          engine=$(git rev-parse HEAD:duckdb)
+          wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
+          [[ "$engine" == "$wrapper" ]]
 
-          import duckdb
+          declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+          tag=
+          if [[ "$declared" == v* ]]; then
+            tag=$declared
+            git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
+            declared=$(git -C duckdb rev-parse "${declared}^{commit}")
+          fi
 
-          presets = json.loads(Path("cmake/CMakePresets.json").read_text())
-          base = next(preset for preset in presets["configurePresets"] if preset["name"] == "base")
-          expected = base["cacheVariables"]["OVERRIDE_GIT_DESCRIBE"]
-          actual = duckdb.sql("SELECT version()").fetchone()[0]
-          assert actual == expected, f"Python DuckDB {actual} does not match Sirius DuckDB {expected}"
-          PY
+          [[ "$declared" == "$engine" ]]
 
-      # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
-      # Run on a single representative entry. `cargo test --no-run` compiles the
-      # cxx glue against the Sirius FFI header and links the proof-of-life test
-      # against the single Sirius library built above (build.rs discovers it under
-      # build/release). It is NOT run here: constructing a context does GPU
-      # bring-up, and these are CPU runners — the actual run belongs on a GPU
-      # runner (test workflow).
+          # DUCKDB_EXPLICIT_VERSION must name the declared tag everywhere, or nowhere for a SHA.
+          files=(sirius-duckdb/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
+          explicit=$(grep -h 'DUCKDB_EXPLICIT_VERSION' "${files[@]}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | sort -u || true)
+          if [[ -n "$tag" ]]; then
+            [[ "$explicit" == "$tag" ]]
+            for f in "${files[@]}"; do grep 'DUCKDB_EXPLICIT_VERSION' "$f" | grep -qF "$tag"; done
+            grep -qF "$engine" sirius-duckdb/Makefile
+            grep -qF "$engine" cmake/sirius-duckdb-provider.cmake
+          else
+            [[ -z "$explicit" ]]
+          fi
+
+      # Compile all Rust bindings against the library on one representative entry.
+      # The public configuration tests do not initialize GPUs, but sirius-ffi
+      # tests do. The full suite runs in the GPU test workflow.
       - name: Rust bindings checks
         if: >-
           matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
@@ -212,16 +253,41 @@ jobs:
           && matrix.build.cudf-channel == 'stable'
         run: |
           set -euo pipefail
-          pixi run cargo fmt --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --check
-          pixi run cargo clippy --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --all-targets -- -D warnings
-          pixi run cargo test --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys
+          pixi run --locked cargo fmt --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi --check
+          pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi --all-targets -- -D warnings
+          RUSTFLAGS="--cfg miri" pixi run --locked cargo clippy --locked --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --test miri -- -D warnings
+          pixi run --locked cargo test --locked --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi
 
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'
+        env:
+          VCPKG_CUDA_ARCHITECTURES: "100"
         run: |
           set -o pipefail
-          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release 2>&1 | tee /tmp/vcpkg.log
-          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo 2>&1 | tee -a /tmp/vcpkg.log
+          pixi run --locked -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
+            --x-manifest-root=sirius-duckdb \
+            --x-install-root=build/static-dependencies --clean-buildtrees-after-build \
+            2>&1 | tee /tmp/vcpkg.log
+
+      - name: Check the installed static package
+        if: matrix.build.environment == 'vcpkg'
+        run: |
+          mkdir -p build
+          mv build/static-dependencies build/static-install
+          pixi run --locked -e vcpkg cmake -S test/cmake/installed_consumer -B build/static-consumer -G Ninja \
+            -DSIRIUS_TARGET=sirius::sirius_static \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_INSTALLED_DIR="$PWD/build/static-install" -DVCPKG_MANIFEST_INSTALL=OFF
+          pixi run --locked -e vcpkg cmake --build build/static-consumer
+          for consumer in consumer c_consumer c_configuration_consumer cpp_configuration_consumer; do
+            readelf -d "build/static-consumer/$consumer" > "build/static-consumer/$consumer.dynamic.txt"
+            while read -r library; do
+              case "$library" in
+                libcuda.so.1|libnvidia-ml.so.1|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|ld-linux*.so.*) ;;
+                *) echo "$consumer: unexpected runtime dependency: $library"; exit 1 ;;
+              esac
+            done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' "build/static-consumer/$consumer.dynamic.txt")
+          done
 
       - name: Surface build errors (vcpkg)
         if: failure() && matrix.build.environment == 'vcpkg'

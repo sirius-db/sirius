@@ -199,6 +199,26 @@ TEST_CASE("a host-tier entry is not served", "[late_mat][resolver]")
   REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
 }
 
+TEST_CASE("a resolved source records the memory space its chunk lives in", "[late_mat][resolver]")
+{
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
+  auto mgr          = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space   = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  // A consumer on another GPU reaches a chunk through this record, so the
+  // materializer can gather it where it lives.
+  fake_entry pin({16, 16}, "l_shipdate", stream);
+  pin.entry.chunk_memory_spaces = {gpu_space, gpu_space};
+
+  auto column = resolve_pinned_column(pin.origin());
+  REQUIRE(column.has_value());
+  REQUIRE(column->batches.size() == 2);
+  for (auto const& batch : column->batches) {
+    REQUIRE(batch.memory_space == gpu_space);
+  }
+}
+
 TEST_CASE("a compressed chunk with no readable table is not deferred", "[late_mat][resolver]")
 {
   auto const stream = ::cuda::stream_ref{cudaStream_t{}};

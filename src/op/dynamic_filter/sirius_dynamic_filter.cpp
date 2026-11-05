@@ -14,20 +14,23 @@
  * limitations under the License.
  */
 
-#include <cudf/ast/expressions.hpp>
+#include "cudf/ast_compat.hpp"
+#include "memory/runtime_stream_pool.hpp"
+
 #include <cudf/fixed_point/fixed_point.hpp>
-#include <cudf/search.hpp>
-#include <cudf/utilities/traits.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
 #include <rmm/cuda_device.hpp>
 
+#include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -192,7 +195,7 @@ std::unique_ptr<cudf::scalar> clone_scalar_to_device(cudf::scalar const& source,
       return std::make_unique<cudf::string_scalar>(value, valid, target_stream, target_mr);
     }
     default:
-      throw std::runtime_error(
+      throw std::logic_error(
         "[sirius_dynamic_zone_map_filter] Unsupported scalar type for device replication");
   }
 }
@@ -390,42 +393,62 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
 
   // Publication synchronizes construction before replication.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{_source_device}};
-  auto const source_stream = source->get_gpu_space().acquire_stream();
+  auto source_lease        = sirius::memory::runtime_stream_pool::acquire(source->get_gpu_space());
+  auto const source_stream = source_lease.get();
 
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (is_available_on_device(device_id)) { continue; }
+    std::optional<sirius::memory::runtime_stream_pool::lease> target_lease;
+    std::unique_ptr<device_zones> replica;
+    bool completing = false;
     try {
-      auto replica       = std::make_unique<device_zones>();
+      replica            = std::make_unique<device_zones>();
       replica->device_id = device_id;
-
       {
         rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{device_id}};
-        auto const target_stream = target_space.acquire_stream();
+        target_lease.emplace(sirius::memory::runtime_stream_pool::acquire(target_space));
+        auto const target_stream = target_lease->get();
         auto const target_mr     = target_space.get_default_allocator();
         replica->zones.reserve(_zones.size());
         for (auto const& zone : _zones) {
-          replica->zones.push_back(
-            {clone_scalar_to_device(
-               *zone.min, _source_device, source_stream, target_stream, target_mr),
-             clone_scalar_to_device(
-               *zone.max, _source_device, source_stream, target_stream, target_mr)});
+          auto& cloned = replica->zones.emplace_back();
+          cloned.min   = clone_scalar_to_device(
+            *zone.min, _source_device, source_stream, target_stream, target_mr);
+          cloned.max = clone_scalar_to_device(
+            *zone.max, _source_device, source_stream, target_stream, target_mr);
         }
-        target_stream.sync();
+        completing = true;
+        CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.get()));
+        completing = false;
       }
       SIRIUS_LOG_DEBUG("[sirius_dynamic_zone_map_filter] replicated {} zone(s) GPU {} -> GPU {}.",
                        _zones.size(),
                        _source_device,
                        device_id);
       _replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_zone_map_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _source_device,
-        device_id,
-        e.what());
+    } catch (...) {
+      if (completing) {
+        failures.record_fatal("[sirius_dynamic_zone_map_filter]", _source_device, device_id);
+      } else {
+        (void)failures.skip_if_recoverable(
+          "[sirius_dynamic_zone_map_filter]", _source_device, device_id);
+      }
+      // Earlier scalar constructors may have queued work. Keep their owners and stream lease alive
+      // through both joins, even if the first join fails.
+      auto join = [&](int device, ::cuda::stream_ref stream) noexcept {
+        try {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+          CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+        } catch (...) {
+          failures.record_fatal("[sirius_dynamic_zone_map_filter]", _source_device, device_id);
+        }
+      };
+      join(_source_device, source_stream);
+      if (target_lease) { join(device_id, target_lease->get()); }
+      failures.rethrow_if_fatal();
     }
   }
 }
@@ -468,11 +491,18 @@ struct sirius_dynamic_filter_set::state {
   struct producer_state {
     bool terminal     = false;
     completion result = completion::SKIPPED;
+    /// Pushes the producer may still make, per planned target column.
+    std::vector<std::pair<std::size_t, std::size_t>> room;
+  };
+
+  /// The filters on one target column, with capacity for every push its producers may still make.
+  struct column_filters {
+    std::vector<std::shared_ptr<sirius_dynamic_filter const>> filters;
+    std::size_t reserved = 0;  ///< Pushes registered for the column; never below `filters.size()`
   };
 
   mutable std::mutex mutex;
-  std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
-    filters;
+  std::unordered_map<std::size_t, column_filters> filters;
   std::unordered_set<std::size_t> ignored_columns;
   std::set<std::size_t> planned_columns;
   std::vector<producer_state> producers;
@@ -512,17 +542,23 @@ sirius_dynamic_filter_set::producer::~producer()
   finish();
 }
 
+//===----------sirius_dynamic_filter_set::producer----------===//
 bool sirius_dynamic_filter_set::producer::push_filter(
-  std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> filter) const
+  std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> filter) const noexcept
 {
   if (!_channel || !filter) { return false; }
   std::scoped_lock lock(_channel->mutex);
-  if (_channel->producers[_index].terminal ||
-      !_channel->accepting.load(std::memory_order_relaxed) ||
+  auto& self = _channel->producers[_index];
+  if (self.terminal || !_channel->accepting.load(std::memory_order_relaxed) ||
       _channel->ignored_columns.contains(col_idx)) {
     return false;
   }
-  _channel->filters[col_idx].push_back(std::move(filter));
+  auto const room =
+    std::ranges::find(self.room, col_idx, &std::pair<std::size_t, std::size_t>::first);
+  if (room == self.room.end() || room->second == 0) { return false; }
+  --room->second;
+  // Registration reserved this push, so appending does not allocate.
+  _channel->filters.find(col_idx)->second.filters.push_back(std::move(filter));
   _channel->filter_count.fetch_add(1, std::memory_order_release);
   return true;
 }
@@ -537,14 +573,15 @@ void sirius_dynamic_filter_set::producer::finish(completion result) const noexce
   slot.terminal = true;
   ++_channel->completed_producers;
 }
+//===--------------------------------------------------===//
 
 dynamic_filter_snapshot sirius_dynamic_filter_set::snapshot() const
 {
   std::scoped_lock lock(_state->mutex);
   dynamic_filter_snapshot result;
   result._entries.reserve(_state->filter_count.load(std::memory_order_relaxed));
-  for (auto const& [column, filters] : _state->filters) {
-    for (auto const& filter : filters) {
+  for (auto const& [column, column_state] : _state->filters) {
+    for (auto const& filter : column_state.filters) {
       result._entries.push_back({column, filter});
     }
   }
@@ -560,11 +597,26 @@ void sirius_dynamic_filter_set::ignore_columns(std::vector<std::size_t> const& c
 }
 
 sirius_dynamic_filter_set::producer sirius_dynamic_filter_set::register_producer(
-  std::vector<std::size_t> planned_target_columns)
+  std::vector<std::size_t> planned_target_columns, std::size_t filters_per_column)
 {
   std::scoped_lock lock(_state->mutex);
   if (_state->registration_frozen) {
     throw std::logic_error("Dynamic-filter producers must register before execution");
+  }
+  state::producer_state registered;
+  for (auto const column : planned_target_columns) {
+    auto room =
+      std::ranges::find(registered.room, column, &std::pair<std::size_t, std::size_t>::first);
+    if (room == registered.room.end()) { room = registered.room.insert(room, {column, 0}); }
+    room->second += filters_per_column;
+  }
+  // Reserve every push before the producer exists, so a failed allocation registers nothing.
+  for (auto const& [column, pushes] : registered.room) {
+    auto& column_state = _state->filters[column];
+    column_state.filters.reserve(column_state.reserved + pushes);
+  }
+  for (auto const& [column, pushes] : registered.room) {
+    _state->filters[column].reserved += pushes;
   }
   if (planned_target_columns.empty()) {
     _state->unscoped.store(true, std::memory_order_release);
@@ -572,7 +624,7 @@ sirius_dynamic_filter_set::producer sirius_dynamic_filter_set::register_producer
     _state->planned_columns.insert(planned_target_columns.begin(), planned_target_columns.end());
   }
   auto const index = _state->producers.size();
-  _state->producers.emplace_back();
+  _state->producers.push_back(std::move(registered));
   _state->producer_count.fetch_add(1, std::memory_order_release);
   return producer{_state, index};
 }

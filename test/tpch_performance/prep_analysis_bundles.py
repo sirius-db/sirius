@@ -34,7 +34,7 @@ Reports are therefore mapped to manifest entries by TIMESTAMP JOIN, never by
 index: each report's absolute capture window (TARGET_INFO_SESSION_START_TIME
 + ANALYSIS_DETAILS from its sqlite export) is intersected with each manifest
 range's wall-clock window (the manifest's own start/stop_epoch_ns when
-present; otherwise the quent query's Init..Exit window for that phase/query).
+present; otherwise the quent query's Init..Finished window for that phase/query).
 Every manifest entry is accounted for explicitly:
 
   mapped     exactly one report covers exactly this range
@@ -134,7 +134,7 @@ def manifest_windows(manifest, quent_windows):
 
     Prefers harness-recorded start/stop_epoch_ns in the manifest entry
     (written by tpch_power_throughput.py around profiler_start/stop); falls
-    back to the quent query's Init..Exit window for that (phase, query). The
+    back to the quent query's Init..Finished window for that (phase, query). The
     throughput interval spans every tput_s* quent window.
     """
     tput = [w for (g, _), w in quent_windows.items() if g.startswith("tput_s")]
@@ -310,7 +310,7 @@ def main():
                     "cannot be timestamp-mapped and will look dropped"
                 )
 
-    # quent: (group label, query label) -> query uuid + Init..Exit wall window
+    # Map generated events to query UUIDs and complete query windows.
     ctx_dirs = [
         d for d in glob.glob(os.path.join(args.quent_dir, "0*")) if os.path.isdir(d)
     ]
@@ -326,23 +326,23 @@ def main():
         rec = json.loads(line)
         decl = rec["data"].get("Declaration")
         if decl:
-            # instance_name is "<engine>-<label>"; keep the label part
-            group_names[rec["id"]] = decl["instance_name"].split("-", 1)[1]
+            # Group labels retain the engine prefix; manifest phases omit it.
+            group_names[rec["id"]] = decl["label"].split("-", 1)[1]
 
     queries = {}  # (group label, query label) -> query uuid
     quent_windows = {}  # (group label, query label) -> (init_ns, exit_ns)
     uuid_key = {}
     for line in open(glob.glob(os.path.join(ctx, "query", "*.ndjson"))[0]):
         rec = json.loads(line)
-        state = rec["data"].get("state")
-        init = state.get("Init") if isinstance(state, dict) else None
+        event = rec["data"]
+        init = event.get("Init")
         if init:
-            glabel = group_names.get(init["query_group_id"], "?")
+            glabel = group_names.get(init["query_group_id"]["target"], "?")
             key = (glabel, init["instance_name"])
             queries[key] = rec["id"]
             uuid_key[rec["id"]] = key
             quent_windows[key] = (rec["timestamp"], rec["timestamp"])
-        elif state == "Exit" and rec["id"] in uuid_key:
+        elif "Finished" in event and rec["id"] in uuid_key:
             key = uuid_key[rec["id"]]
             quent_windows[key] = (quent_windows[key][0], rec["timestamp"])
 

@@ -33,7 +33,6 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/planner/table_filter.hpp>
 
 #include <cstddef>
 #include <initializer_list>
@@ -49,12 +48,10 @@ namespace {
 
 duckdb::JoinCondition make_condition(duckdb::ExpressionType comparison)
 {
-  duckdb::JoinCondition cond;
-  cond.left =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL);
-  cond.right =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL);
-  cond.comparison = comparison;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL),
+    comparison);
   return cond;
 }
 
@@ -76,8 +73,9 @@ duckdb::JoinFilterPushdownFilter make_target(duckdb::shared_ptr<duckdb::DynamicT
   pi.dynamic_filters = std::move(dyn);
   for (duckdb::idx_t i = 0; i < column_count; ++i) {
     duckdb::JoinFilterPushdownColumn col;
-    col.probe_column_index = duckdb::ColumnBinding{0, i};
-    col.storage_type       = duckdb::LogicalType::INTEGER;
+    col.probe_column_index =
+      duckdb::ColumnBinding{duckdb::TableIndex(0), duckdb::ProjectionIndex(i)};
+    col.storage_type = duckdb::LogicalType::INTEGER;
     pi.columns.push_back(col);
   }
   return pi;
@@ -97,11 +95,11 @@ duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> make_pushdown_info(
 duckdb::unique_ptr<duckdb::LogicalGet> make_get()
 {
   return duckdb::make_uniq<duckdb::LogicalGet>(
-    /*table_index=*/0,
-    duckdb::TableFunction(),
+    duckdb::TableIndex(/*table_index=*/0),
+    duckdb::BoundTableFunction(duckdb::TableFunction()),
     /*bind_data=*/nullptr,
     duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
-    duckdb::vector<duckdb::string>{"a"});
+    duckdb::vector<duckdb::Identifier>{"a"});
 }
 
 /// The malformed contract: only `kind` is meaningful; every other field is default/empty.

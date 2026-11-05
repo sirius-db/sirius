@@ -24,6 +24,7 @@
 #include "io/object_store_config.hpp"
 #include "io/rest/config.hpp"
 #include "io/uring/config.hpp"
+#include "scan_manager/preparation_options.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -37,7 +38,7 @@
 namespace sirius::scan_manager {
 
 /// Default uring reactor count; counted in the scan-manager sizing budget below.
-inline constexpr std::size_t default_uring_n_reactors = 1;
+inline constexpr std::size_t default_uring_n_reactors = 4;
 
 /// Default scan-manager pool size: every core left after the other default pools
 /// (downgrade, task_creator, pipeline, uring reactor), never below 4.
@@ -205,8 +206,11 @@ struct memory_prefetcher_config {
  *  - @c object_store — object-store credentials and endpoint.
  */
 struct scan_manager_config {
+  preparation_config preparation;
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
+  /// Admission limit, also accepted through the legacy scan-manager configuration path.
+  int max_concurrent_queries{1};
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::sirius};
 
@@ -290,6 +294,11 @@ struct scan_manager_config {
     // Without a cache the readahead has nowhere to read into: a prefetched
     // chunk would be dropped before its scan ever asked for it.
     if (!cache.enabled()) { return plan; }
+    // A backend budget of zero is the backend opting out of readahead entirely
+    // (see io::uring::config::n_max_concurrent_scans).  Honor it even under the
+    // opportunistic strategy, which would otherwise substitute the pipeline
+    // width and run a readahead the backend asked not to have.
+    if (backend_budget == 0) { return plan; }
     // Opportunistic schedules against what the executor can run, not what the
     // device can queue: one prefetch per non-scan deployment is only useful
     // while a pipeline thread could still pick up another scan.
@@ -300,4 +309,10 @@ struct scan_manager_config {
   }
 };
 
+// Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
+inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
+{
+  (void)config.preparation.resolve(config.thread_pool.num_threads);
+  return config;
+}
 }  // namespace sirius::scan_manager

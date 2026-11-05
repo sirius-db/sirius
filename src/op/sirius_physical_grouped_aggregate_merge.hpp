@@ -27,6 +27,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
@@ -77,19 +78,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
-  //! The grouping sets
-  duckdb::GroupedAggregateData grouped_aggregate_data;
-
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
-  //! The radix partitioned hash tables (one per grouping set)
-  duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
-  duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
-  //! A recreation of the input chunk, with nulls for everything that isn't a group
-  duckdb::vector<sirius::logical_type> input_group_types;
-
-  // Filters given to sink and friends
-  duckdb::unsafe_vector<std::size_t> non_distinct_filter;
-  duckdb::unsafe_vector<std::size_t> distinct_filter;
 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }
@@ -105,12 +94,27 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   bool has_avg            = false;
   bool has_count_distinct = false;
 
+  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
+  /// (AggregateSlot::is_wide_integer_sum). Derived from aggregate_slots (wide_integer_sum_mask).
+  std::vector<bool> cudf_aggregate_is_wide_integer_sum;
+
+  /// Number of group columns after the `group_idx` keys: the set id and GROUPING() columns of
+  /// an aggregate over several grouping sets, see
+  /// `sirius_physical_grouped_aggregate::has_grouping_sets()`.
+  std::size_t num_grouping_set_columns = 0;
+
   std::size_t current_partition_index = 0;
 
  public:
+  /// Number of leading input and output columns that the merge groups by.
+  [[nodiscard]] std::size_t num_output_group_columns() const noexcept
+  {
+    return group_idx.size() + num_grouping_set_columns;
+  }
+
   std::vector<int> get_output_grouping_indices() const
   {
-    std::vector<int> indices(group_idx.size());
+    std::vector<int> indices(num_output_group_columns());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;
   }
@@ -137,12 +141,15 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Decide the partition count for the upstream PARTITION operator that feeds this merge
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
  private:
+  /// Consumer-owned sizing target; batch-only receivers have no sizing configuration.
+  uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 

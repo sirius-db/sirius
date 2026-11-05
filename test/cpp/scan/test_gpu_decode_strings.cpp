@@ -27,16 +27,17 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/callback_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/version_config.hpp>
 
 #include <cuda/scan/gpu_decode_strings.cuh>
 #include <cuda/scan/strings/dict_fsst.cuh>
 #include <cuda/scan/strings/dictionary.cuh>
 #include <cuda/scan/strings/fsst.cuh>
+#include <cuda/stream>
 
 #include <catch.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -62,13 +63,24 @@ namespace {
 // Prevent decoder kernels from reading beyond the small backing allocation.
 struct reject_decode_allocation_resource {
   size_t allocations = 0;
-  rmm::mr::callback_memory_resource resource{
-    [](size_t, cuda::stream_ref, void* arg) -> void* {
+  rmm::mr::callback_memory_resource resource
+  {
+// RMM 26.12 puts the stream first and adds an alignment argument.
+#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+    [](::cuda::stream_ref, size_t, size_t, void* arg) -> void* {
+#else
+    [](size_t, ::cuda::stream_ref, void* arg) -> void* {
+#endif
       ++*static_cast<size_t*>(arg);
       throw std::logic_error("invalid metadata reached decode scratch allocation");
     },
-    [](void*, size_t, cuda::stream_ref, void*) {},
-    &allocations};
+#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+      [](::cuda::stream_ref, void*, size_t, size_t, void*) {},
+#else
+      [](void*, size_t, ::cuda::stream_ref, void*) {},
+#endif
+      &allocations
+  };
 };
 
 /// Stage segment bytes on device; build a single-segment string column input
@@ -380,7 +392,7 @@ TEST_CASE("gpu_decode_strings DICT_FSST admits no symbol table when only the NUL
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   rmm::device_buffer device(bytes.data(), bytes.size(), stream);
-  auto const rows = mode == 1 ? 1u : 0u;
+  uint32_t const rows = mode == 1 ? 1u : 0u;
   gpu_string_codec_run run{CompressionType::COMPRESSION_DICT_FSST,
                            {{static_cast<uint8_t const*>(device.data()),
                              static_cast<uint32_t>(bytes.size()),
@@ -394,8 +406,8 @@ TEST_CASE("gpu_decode_strings DICT_FSST admits no symbol table when only the NUL
   input.has_nulls  = false;
   input.data.push_back(run);
   auto column = gpu_decode_strings_column(input, stream, mr);
-  REQUIRE(column->size() == rows);
-  REQUIRE(column->null_count() == rows);
+  REQUIRE(column->size() == static_cast<cudf::size_type>(rows));
+  REQUIRE(column->null_count() == static_cast<cudf::size_type>(rows));
 }
 
 TEST_CASE("gpu_decode_strings DICT_FSST rejects cumulative dictionary offset overflow",

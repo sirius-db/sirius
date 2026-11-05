@@ -22,9 +22,9 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Motivation:** During pipeline executor drain (e.g., for error recovery or pipeline transitions), in-flight task creation must be safely completed before operator destruction.
 
-**Mechanism:** `drain_pending_tasks()` drains the task creation queue via `_task_creation_queue.drain()` and waits for in-flight task creation lambdas via `_kiosk.wait_all()`.
+**Current mechanism:** `discard_pending_tasks(query_id)` disposes of queued requests/callables. The runtime owner then waits for work leases before `reset(query_id)` releases creator state and lookahead hints. Other queries remain active. See [Query lifetime and retirement](query-lifecycle.md).
 
-**Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`
+**Code path:** `src/creator/task_creator.cpp` — `discard_pending_tasks()` and `reset()`
 
 ### 3-Phase Sort Pipeline (PR #866)
 
@@ -72,7 +72,7 @@ details.
 
 **Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
 
-**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+**Mechanism:** The task creator retains a per-query `lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on query drain/reset). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
 
 **Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/creator/config.hpp` — `request_type`
 
@@ -100,8 +100,8 @@ look-ahead is not a user-selectable YAML setting.
 
 **Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
 - `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
-- per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
-- the join is neither RIGHT-family nor `MIXED_JOIN`
+- two independent per-GPU bounds hold: the estimated cuco hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission including MARK) stay under `max_build_hash_table_bytes`, and the folded build payload that stays GPU-resident for the whole probe stream stays under `max_build_probe_resident_bytes`; the build must fold to a single batch per partition
+- the join is neither RIGHT-family, `MIXED_JOIN`, nor full `OUTER`
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
@@ -109,7 +109,7 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing by the join's partition placement
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB)
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) and `max_build_probe_resident_bytes` (folded resident build payload; default: 8× the derived batch size)
 
 ### COUNT DISTINCT Optimization (PR #414)
 
@@ -151,6 +151,57 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Sorted-Key Grouped Aggregation
+
+**Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
+
+**Mechanism:** For a batch with a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate, `grouped_aggregate_table()` verifies with `keys_ascending()` (`src/cuda/sorted_keys.cu`) that the key is ascending and, if so, builds the group-by with `cudf::sorted::YES`, so cuDF reduces runs of equal keys instead of hashing. Unsorted batches keep the hash path, so correctness never depends on the data layout. For integer, boolean, timestamp, duration and fixed-point keys the check is one `thrust::is_sorted` pass that stops at the first descent; `cudf::is_sorted`'s generic row comparator is about 2.4 times slower on a sorted INT64 column (SF1000 q18: 0.620 s with it, 0.597 s with the typed pass). Other keys use `cudf::is_sorted`. Verified-sorted keys also let the stable STDDEV_SAMP path skip its own sort.
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`
+
+**Config:** Always on. TPC-H SF1000 on a GB300, together with natural-order pinning: q18 1.148 s → 0.830 s.
+
+### Order-Preserving Partition and Sorted Merge
+
+**Motivation:** After a sorted-key partial aggregation each partial is sorted, and with a table pinned in key order the partials cover consecutive key ranges. `cudf::hash_partition` does not keep row order, so the merge had to hash and re-aggregate everything (q18: 352 ms of merge kernels at SF1000).
+
+**Mechanism:** Both parts decide from the data, so there is no setting:
+1. **Partition:** `hash_partition()` checks whether a single fixed-width, non-floating-point partition key is ascending. If so it uses a stable partition (`cudf::stable_sorted_order` of the partition ids, then a gather) that keeps the input order within each partition; otherwise it calls `cudf::hash_partition` as before. Both assign a row by its MurmurHash3 row hash modulo the partition count, so batches of one input may take either path and a key still lands in one partition.
+2. **Merge:** for a single fixed-width, non-floating-point group key, `merge_grouped_aggregate()` orders the incoming partials by their first key (gathered into one column, sorted on the device and read back with one synchronization), concatenates them, verifies the result with `keys_ascending()`, and uses the sorted-keys group-by if it passes. Any other input keeps the hash merge.
+
+**Code path:** `src/op/partition/gpu_partition_impl.cpp` — `hash_partition()`; `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`
+
+**Config:** None. TPC-H SF1000 on a GB300, on top of the sorted-key aggregation: q18 0.830 s → 0.639 s; no other query moved by more than run-to-run noise.
+
+### Natural-Order Parquet Pinning
+
+**Motivation:** `pin_table` lists local parquet files in directory order, and each pinned chunk packs several files, so a table stored sorted across numbered files (`part.0`, `part.1`, …) pinned into chunks whose rows are out of order: at TPC-H SF1000 only 3 of q18's 39 lineitem batches were in `l_orderkey` order.
+
+**Mechanism:** `pin_table` sorts the file list with glibc `strverscmp` (digit runs compared numerically, so `part.2` precedes `part.10`) before materializing, so chunks hold consecutive files. Nothing relies on the order for correctness: the consumers verify sortedness themselves, and matching a scan's files to a pinned entry ignores order.
+
+**Code path:** `src/sirius_extension.cpp` — pin file list
+
+**Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply.
+
+### Low-Cardinality Grouped Aggregation (experimental)
+
+**Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
+
+**Mechanism:** A custom CUDA kernel path, tried first by `grouped_aggregate_table()`:
+1. `find_groups_kernel` builds a 16-bit code from up to two one-character string keys, verifies every key length, and records the codes present and one representative row per code.
+2. The host maps the codes to at most 64 dense groups.
+3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
+4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
+
+It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+
+**Code path:**
+- `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
+- `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
+
+**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
@@ -164,6 +215,25 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_columns()`, `src/op/sirius_physical_hash_join.cpp` — distinct hash table construction
 
+Parquet scans declare no PRIMARY KEY; for them, [Pin-Proven Unique Join Keys](#pin-proven-unique-join-keys) supplies the proof from pin-time facts.
+
+### Pin-Proven Unique Join Keys
+
+**Motivation:** The distinct hash join needs a proof that the build keys are unique, and for a base table the only proof was a declared PRIMARY KEY. Parquet tables declare none, so every join over pinned parquet took the two-pass `cudf::hash_join` (a count pass, then a retrieve pass), even for keys such as `o_orderkey` or `s_suppkey`. The runtime distinctness check is off by default (issue #1600).
+
+**Mechanism:** Two parts:
+1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports an output column whose pinned column was proven distinct at pin time. Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
+2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column automatically, in addition to the columns late materialization names. An automatic column must be an integer, and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`.
+
+Composite keys are not covered, because the proof is per column.
+
+**Code path:**
+- `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_from_pin()`, `prove_unique_columns()`
+- `src/late_mat/pin_uniqueness.cpp` — `pin_unique_automatic_selection()`, `unique_probe`, `exact_uniqueness_byte_cap()`
+- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — selection and attaching the facts
+
+**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the automatic probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `n_name`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
+
 ### Scan Scheduling Tuning (PR #507)
 
 **Motivation:** Eagerly depleting all scan sources at query startup wastes GPU memory on multi-scan plans (e.g., joins with two scanned tables).
@@ -174,7 +244,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) — independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
 ### Zero-Copy Projection Passthrough (PR #991)
 
@@ -213,6 +283,35 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 - `src/planner/sirius_plan_projection_utils.cpp` — `push_projection()`, `fold_adjacent_projections()`
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
 - `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
+
+### Decimal SUM Width Selection
+
+**Motivation:** A decimal SUM must not overflow, but the widest type is also the slowest. cuDF sums
+64-bit decimals much faster than 128-bit ones, especially in a grouped aggregation with few groups,
+where 128-bit accumulation contends on the same groups. DuckDB v2 types some sums wider than their
+values need: the TPC-H Q9 profit `l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity`
+is `DECIMAL(19,4)`, held as DECIMAL128, although every value fits 64 bits. At SF1000 its group-by
+took 3.8 s instead of 28 ms.
+
+**Mechanism:** Per batch, grouped and ungrouped aggregations pick the width of each decimal SUM (and
+of AVG's SUM) from one exact
+proof: a sum of n values of magnitude at most m is at most n * m. A DECIMAL32 or DECIMAL64 input is
+widened to the next type only when rows * max|value| exceeds its storage width. A DECIMAL128 input is
+narrowed to DECIMAL64 at the same scale when rows * max|value| is at most 2^63 - 1, and the result is
+cast back to DECIMAL128, so no value and no partial sum of any group can leave the 64-bit range, and
+the merge combines the per-batch partials at the original 128-bit width. The
+bound comes from base-table statistics when the SUM input is a scan column
+(`planner::resolve_sum_input_bounds`); otherwise the batch is measured with `cudf::minmax`,
+costing one stream synchronization per batch for all measured columns together.
+
+**Code path:**
+- `src/op/aggregate/aggregate_op_util.cpp` — `sums_to_widen`, `decimal_sums_to_narrow`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — per-batch request rewriting in the grouped aggregation
+- `src/op/sirius_physical_ungrouped_aggregate.cpp` — per-batch input casts in the ungrouped reduction
+- `src/planner/decimal_sum_input_bounds.cpp` — plan-time bounds from scan statistics
+
+**Config:** `enable_decimal_sum_stats_bound` (default: `true`) lets plan-time bounds skip the
+per-batch measurement.
 
 ## Memory Optimizations
 
@@ -315,6 +414,20 @@ result materialization restore native carriers.
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
 
+### Decode to Restore Type
+
+**Motivation:** With compressed materialization, a pinned column stored in a narrow carrier is cast back to its native type by the scan whenever a type-sensitive consumer needs it. TPC-H q1 restores four DECIMAL32 columns to DECIMAL64 in every batch: a separate read and write of each column, about 25 ms of cast kernels at SF1000.
+
+**Mechanism:** When the scan's output assembly is a leading identity, it passes its restore targets down to the Simpatico decode (`pushdown_request::output_types` → `scan_filter_request::output_types` → `decode_selection::output_type`). For a compacted (filter-pushdown) decode whose root is a bitpack node, the JIT renderer declares the kernel's output in the wider element type (entry symbol suffix `_to_<type>`), so the kernel widens in its store, and the decode allocates the output column in the target type. The scan's restore cast then finds the column already restored. Supported widenings: signed integer to a wider signed integer, same-scale DECIMAL widening, and a raw signed integer to DECIMAL or `TIMESTAMP_DAYS`. Other decodes keep the restore cast. The JIT decoder only has signed element types (`int8_t` through `__int128`), so unsigned storage is not widened in place, and only a compacted decode with a bitpack root writes in the restore type.
+
+**Code path:**
+- `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/op/scan/sirius_gpu_scan_operator_data.cpp` — restore targets
+- `src/compression/compressed_scan.cpp` — `pushdown_request::output_types`, `decompression_pushdown_scan::with_output_types()`
+- `src/compression/simpatico_codegen/src/plan/decompress.cpp` — `widened_element_dtype()`, `decode_fused_subtree_impl()`
+- `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
+
+**Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
+
 ### Late Materialization (unreleased, experimental)
 
 **Motivation:** A query that selects wide columns carries them from the scan to whatever finally
@@ -344,7 +457,7 @@ distinctness proof.
 
 **Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
 `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
-which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+which no group-by-rowid ride is admissible. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
 floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.
@@ -381,9 +494,9 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** The scan's post-decode filter path gathered every decoded column and then dropped pure-filter columns (read only for the predicate) during projection — materializing data just to throw it away. The standalone `FILTER` operator had the same waste for columns not needed downstream.
 
-**Mechanism:** `expression_evaluator::select(input, output_indices)` evaluates the predicate over the full input (pure-filter columns stay visible to it) but gathers only the requested output columns. Because `scan_plan::data_columns` is laid out output-first, the kept columns are the contiguous prefix `[0, K)`, so existing assembly and prefix projection apply unchanged. For the FILTER operator, `sirius_plan_filter` translates DuckDB's `LogicalFilter::projection_map` into `output_indices` on `sirius_physical_filter` (empty means keep all). `count(*)`-style filters with no output columns use the all-columns overload, since a 0-column/N-row gather result is unrepresentable.
+**Mechanism:** `expression_evaluator::select(input, output_indices)` evaluates the predicate over the full input (filter-only columns stay visible to it) but gathers only the requested output columns. The planner records the output boundary before appending filter reads. `scan_plan` resolves it into materialized slot roles and ordered output positions; the reader still places outputs before filter-only columns. A row-count carrier has its own role and is retained for column-less scans. For the FILTER operator, `sirius_plan_filter` translates DuckDB's `LogicalFilter::projection_map` into `output_indices` on `sirius_physical_filter` (empty means keep all). `count(*)`-style filters with no output columns use the all-columns overload, since a 0-column/N-row gather result is unrepresentable. On a GPU-pinned Simpatico-compressed chunk whose filtered decode applied the scan's whole filter, the decode itself omits the filter-only slots (`pushdown_outcome::filter_only_columns_dropped`): they are tested while the selection is built but never decoded, and the batch can be taken over by the scan without a copy when its planned output layout is a leading identity (see [Compressed Pinning](compressed-pinning.md)).
 
-**Code path:** `src/expression_evaluator/expression_evaluator.hpp` — `select()` overloads, `compute_mask()`; `src/op/scan/scan_plan.hpp` — `output_data_positions()`; `src/op/scan/parquet_gpu_ingestible.cpp`, `duckdb_native_gpu_ingestible.cpp`; `src/planner/sirius_plan_filter.cpp`
+**Code path:** `src/expression_evaluator/expression_evaluator.hpp` — `select()` overloads, `compute_mask()`; `src/op/scan/scan_plan.hpp` — `output_data_positions()`; `src/op/scan/parquet_gpu_ingestible.cpp`, `duckdb_native_gpu_ingestible.cpp`; `src/planner/sirius_plan_filter.cpp`; decode-time variant: `src/compression/compressed_scan.cpp`, `src/compression/simpatico_codegen/src/simpatico_codegen.cpp`, `src/op/scan/scan_plan.cpp`
 
 **Config:** none
 
@@ -504,7 +617,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Scan splits arrive sized by metadata-parse completion rather than by the configured batch size, so batches could come out smaller than requested, and multi-GPU runs need scan inputs spread across devices. Opportunistic prefetch hints issued in metadata-completion order also rob the head-of-line pipeline of lead time.
 
-**Mechanism:** The scan manager owns a `load_balancing_scan_batch_coalescer`. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. A single sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
+**Mechanism:** The scan manager creates a `load_balancing_scan_batch_coalescer` for each query. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. That query's sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
 
 **Code path:**
 - `src/scan_manager/load_balancing_scan_batch_coalescer.cpp` — per-pipeline slots, sequencer loop, coalesce + place + push

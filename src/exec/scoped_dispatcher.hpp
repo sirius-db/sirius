@@ -22,8 +22,11 @@
 
 #include <concepts>
 #include <condition_variable>
+#include <functional>
+#include <limits>
 #include <mutex>
 #include <source_location>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -37,10 +40,13 @@ concept scoped_dispatcher_task = std::invocable<F> || std::invocable<F, std::sto
 
 class scoped_dispatcher {
  public:
-  scoped_dispatcher(static_thread_pool& pool, std::size_t max_concurrent_task = 0)
+  scoped_dispatcher(static_thread_pool& pool,
+                    std::size_t max_concurrent_task = 0,
+                    queue_priority priority         = 0)
     : pool_(pool),
       max_inflight_(max_concurrent_task == 0 ? pool.num_threads()
-                                             : std::min(max_concurrent_task, pool.num_threads()))
+                                             : std::min(max_concurrent_task, pool.num_threads())),
+      priority_(priority)
   {
   }
 
@@ -57,9 +63,11 @@ class scoped_dispatcher {
   scoped_dispatcher(const scoped_dispatcher&)            = delete;
   scoped_dispatcher& operator=(const scoped_dispatcher&) = delete;
 
-  // @brief Non-blocking. Always returns immediately. Overflow goes to the
-  // dispatcher-local pending queue (unbounded by contract).
-  // After request_stop(), enqueue is a silent no-op.
+  // @brief Does not wait for an inflight slot. Overflow goes to the dispatcher-local
+  // pending queue (unbounded by contract). Callable wrapping and queue insertion can throw.
+  // A pool submission failure cancels pending work, releases the reserved slot, and rethrows.
+  // Once stopped, successfully wrapped calls silently drop their task. Wrapping happens
+  // before the stop check and can still throw even when the dispatcher is already stopped.
   void enqueue(scoped_dispatcher_task auto&& f)
   {
     auto task = wrap(std::forward<decltype(f)>(f));
@@ -70,7 +78,7 @@ class scoped_dispatcher {
     if (inflight_ < max_inflight_) {
       ++inflight_;
       lk.unlock();
-      pool_.schedule(std::move(task));
+      submit(std::move(task));
     } else {
       pending_.push_back(std::move(task));
     }
@@ -85,20 +93,53 @@ class scoped_dispatcher {
 
     std::unique_lock lk(mu_);
     bool ok = cv_slot_.wait(lk, stop_.get_token(), [this] { return inflight_ < max_inflight_; });
-    if (!ok) return false;  // stop requested
+    if (!ok || stop_.stop_requested()) return false;
 
     ++inflight_;
     lk.unlock();
-    pool_.schedule(std::move(task));
+    submit(std::move(task));
     return true;
   }
 
-  void request_stop()
+  // Bind once before stopping. Called once, outside mu_, after stopped work and its
+  // captures drain. The callback must not throw and must own its captured state;
+  // wait_for_all() may return while the notification is still being delivered.
+  void set_stop_drain_callback(std::function<void()> notify)
   {
-    std::lock_guard lk(mu_);
-    stop_.request_stop();  // wakes cv_slot_ waiters via stop_callback
-    pending_.clear();      // drop queued-but-not-started work
-    if (inflight_ == 0) { cv_done_.notify_all(); }
+    std::lock_guard lock(mu_);
+    if (!notify || stop_.stop_requested() || stop_drained_)
+      throw std::logic_error("dispatcher drain notification must bind once before stop");
+    stop_drained_ = std::move(notify);
+  }
+
+  // Signal stop and dispose at most max_discard queued captures on this caller.
+  // False means the caller must continue cleanup; running work drains independently.
+  // The default preserves synchronous queue disposal for non-coordinator callers.
+  bool request_stop(std::size_t max_discard = std::numeric_limits<std::size_t>::max())
+  {
+    {
+      std::lock_guard lk(mu_);
+      // Keep wait_for_all() blocked until callbacks and discarded captures have retired,
+      // including when another caller is stopping the dispatcher concurrently.
+      ++inflight_;
+    }
+    // Stop callbacks may reenter the dispatcher, so request cancellation outside mu_.
+    stop_.request_stop();
+    for (std::size_t count = 0;; ++count) {
+      task_t discarded;
+      {
+        std::unique_lock lk(mu_);
+        if (pending_.empty() || count == max_discard) {
+          bool const empty = pending_.empty();
+          release_slot(lk);
+          return empty;
+        }
+        discarded = std::move(pending_.front());
+        pending_.pop_front();
+      }
+      // Destroy outside mu_. Moving one callable at a time avoids allocating a temporary
+      // container, so this cleanup is also usable after an allocation failure in submit().
+    }
   }
 
   void wait_for_all()
@@ -135,7 +176,6 @@ class scoped_dispatcher {
           log_exception_ptr(std::current_exception());
         }
       }
-      on_task_done();
     };
   }
 
@@ -149,35 +189,92 @@ class scoped_dispatcher {
     }
   }
 
-  void on_task_done()
+  // Retain the slot across handoffs so wait_for_all() includes queued continuations.
+  // A null task means this continuation must claim pending work on the worker.
+  void run(task_t task) noexcept
   {
-    task_t next;
-    bool have_next = false;
-    {
-      std::lock_guard lk(mu_);
-      if (!stop_.stop_requested() && !pending_.empty()) {
-        // Hand the slot to a queued task; inflight_ unchanged → no slot opened.
-        next = std::move(pending_.front());
+    bool can_yield = true;
+    for (;;) {
+      if (!task) {
+        std::unique_lock lk(mu_);
+        if (stop_.stop_requested() || pending_.empty()) {
+          release_slot(lk);
+          return;
+        }
+        task = std::move(pending_.front());
         pending_.pop_front();
-        have_next = true;
-      } else {
-        --inflight_;
-        cv_slot_.notify_one();  // a real slot opened — wake one schedule()
-        if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
+      }
+      try {
+        task();
+      } catch (...) {
+        try {
+          log_exception_ptr(std::current_exception());
+        } catch (...) {
+        }
+      }
+      task = nullptr;  // Captures may reenter the dispatcher; destroy outside mu_.
+      {
+        std::unique_lock lk(mu_);
+        if (stop_.stop_requested() || pending_.empty()) {
+          release_slot(lk);
+          return;
+        }
+      }
+      if (can_yield) {
+        try {
+          // Pending tasks stay in the dispatcher until the continuation runs, so
+          // a failed submission cannot destroy or lose the next task.
+          pool_.schedule([this] { run(nullptr); }, priority_);
+          return;
+        } catch (...) {
+          // Already on a worker: drain locally if the pool cannot accept a handoff.
+          // Avoid repeated failing allocations and preserve the outstanding slot.
+          can_yield = false;
+        }
       }
     }
-    if (have_next) pool_.schedule(std::move(next));
+  }
+
+  // Terminal handoff: unlock before notification and do not touch the dispatcher
+  // afterwards. Its waiter may release the last owner as soon as work drains.
+  void release_slot(std::unique_lock<std::mutex>& lock) noexcept
+  {
+    std::function<void()> notify;
+    --inflight_;
+    cv_slot_.notify_one();
+    if (inflight_ == 0 && pending_.empty()) {
+      cv_done_.notify_all();
+      if (stop_.stop_requested()) notify = std::move(stop_drained_);
+    }
+    lock.unlock();
+    if (notify) notify();
+  }
+
+  void submit(task_t task)
+  {
+    try {
+      pool_.schedule([this, task = std::move(task)]() mutable { run(std::move(task)); }, priority_);
+    } catch (...) {
+      // No worker owns this slot. Cancel pending work without executing user tasks on the
+      // producer thread, then release the failed slot and propagate the original exception.
+      request_stop();
+      std::unique_lock lk(mu_);
+      release_slot(lk);
+      throw;
+    }
   }
 
   static_thread_pool& pool_;
   std::size_t max_inflight_;
+  const queue_priority priority_;
 
   std::mutex mu_;
   std::condition_variable cv_done_;      // drained signal; not stop-aware
   std::condition_variable_any cv_slot_;  // slot-open signal; stop-aware via wait(token, pred)
   std::deque<task_t> pending_;
-  std::size_t inflight_ = 0;
+  std::size_t inflight_ = 0;  // Worker slots plus active cancellation cleanup calls.
   std::stop_source stop_;
+  std::function<void()> stop_drained_;
 };
 
 }  // namespace sirius::exec

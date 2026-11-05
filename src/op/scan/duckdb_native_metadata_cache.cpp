@@ -18,10 +18,10 @@
 
 #include "log/logging.hpp"
 #include "op/scan/metadata_walk_parallel.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 
 #include <duckdb/main/attached_database.hpp>
-#include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/struct_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/storage_index.hpp>
 #include <duckdb/storage/storage_manager.hpp>
@@ -51,47 +51,18 @@ bool cache_env_disabled()
   return disabled;
 }
 
-/// @brief Key equality for the product cache's prunable filters.
-///
-/// TableFilter::Equals is not parameter-complete for every subclass (the base
-/// compares only filter_type), so only types with known-complete overrides are
-/// trusted, structural wrappers are recursed by hand, and anything else is
-/// never key-equal. A refusal only costs a product-cache miss.
+// Cache only immutable predicates whose statistics can be evaluated without
+// runtime filter state. Expression equality includes constant values and bind data.
 bool product_filter_key_equal(const duckdb::TableFilter& a, const duckdb::TableFilter& b)
 {
-  if (a.filter_type != b.filter_type) { return false; }
-  switch (a.filter_type) {
-    case duckdb::TableFilterType::CONSTANT_COMPARISON:
-    case duckdb::TableFilterType::IN_FILTER:
-    case duckdb::TableFilterType::EXPRESSION_FILTER: return a.Equals(b);
-    case duckdb::TableFilterType::IS_NULL:
-    case duckdb::TableFilterType::IS_NOT_NULL: return true;  // parameterless
-    case duckdb::TableFilterType::CONJUNCTION_AND: {
-      auto const& ca = a.Cast<duckdb::ConjunctionAndFilter>();
-      auto const& cb = b.Cast<duckdb::ConjunctionAndFilter>();
-      if (ca.child_filters.size() != cb.child_filters.size()) { return false; }
-      for (std::size_t i = 0; i < ca.child_filters.size(); ++i) {
-        if (!product_filter_key_equal(*ca.child_filters[i], *cb.child_filters[i])) { return false; }
-      }
-      return true;
-    }
-    case duckdb::TableFilterType::CONJUNCTION_OR: {
-      auto const& ca = a.Cast<duckdb::ConjunctionOrFilter>();
-      auto const& cb = b.Cast<duckdb::ConjunctionOrFilter>();
-      if (ca.child_filters.size() != cb.child_filters.size()) { return false; }
-      for (std::size_t i = 0; i < ca.child_filters.size(); ++i) {
-        if (!product_filter_key_equal(*ca.child_filters[i], *cb.child_filters[i])) { return false; }
-      }
-      return true;
-    }
-    case duckdb::TableFilterType::STRUCT_EXTRACT: {
-      auto const& sa = a.Cast<duckdb::StructFilter>();
-      auto const& sb = b.Cast<duckdb::StructFilter>();
-      return sa.child_idx == sb.child_idx &&
-             product_filter_key_equal(*sa.child_filter, *sb.child_filter);
-    }
-    default: return false;  // unknown / runtime-mutable payloads: never key-equal
+  if (a.filter_type != duckdb::TableFilterType::EXPRESSION_FILTER ||
+      b.filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) {
+    return false;
   }
+  auto const& lhs = a.Cast<duckdb::ExpressionFilter>();
+  auto const& rhs = b.Cast<duckdb::ExpressionFilter>();
+  return sirius::scan_manager::filter_safe_for_stats(lhs) &&
+         sirius::scan_manager::filter_safe_for_stats(rhs) && lhs.Equals(rhs);
 }
 
 bool product_key_matches(const walk_product_key& stored, const walk_product_key_view& query)

@@ -6,20 +6,22 @@
  */
 
 #include "catch.hpp"
-#include "io/rest/rest_ioctx.hpp"
+#include "io/io_errors.hpp"
+#include "io/kvikio/kvikio_context.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
+#include "op/scan/parquet_delete_reader.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
-#include <arpa/inet.h>
-#include <duckdb.hpp>
+#include <arpa/inet.h>  // IWYU pragma: keep
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
-#include <duckdb/storage/buffer/buffer_handle.hpp>
-#include <duckdb/storage/caching_file_system.hpp>
+#include <duckdb/common/virtual_file_system.hpp>
+#include <duckdb/storage/external_file_cache/caching_file_system.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -31,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -56,7 +59,7 @@ struct s3_test_env {
 
 std::optional<s3_test_env> read_s3_test_env()
 {
-  if (!sirius::test::ensure_s3_container_env()) { return std::nullopt; }
+  if (!sirius::test::ensure_s3_test_env()) { return std::nullopt; }
 
   auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -218,7 +221,8 @@ void load_sirius_extension(duckdb::DuckDB& db)
 
 class sirius_httpfs_config_env_guard {
  public:
-  explicit sirius_httpfs_config_env_guard(s3_test_env const& env)
+  explicit sirius_httpfs_config_env_guard(s3_test_env const& /*env*/,
+                                          bool perf_instrumentation = false)
   {
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -255,20 +259,6 @@ class sirius_httpfs_config_env_guard {
            "    scan_manager:\n"
            "      cache:\n"
            "        mode: none\n"
-           "      object_store:\n"
-           "        endpoint: "
-        << yaml_quote(env.endpoint)
-        << "\n"
-           "        region: "
-        << yaml_quote(env.region)
-        << "\n"
-           "        access_key: "
-        << yaml_quote(env.access_key)
-        << "\n"
-           "        secret_key: "
-        << yaml_quote(env.secret_key)
-        << "\n"
-           "        tls_verify: false\n"
            "      rest:\n"
            "        request_timeout_s: 30\n";
     out.close();
@@ -308,7 +298,16 @@ class sirius_httpfs_fixture {
   explicit sirius_httpfs_fixture(s3_test_env const& env) : config_env(env), db(nullptr), con(db)
   {
     load_sirius_extension(db);
-    REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
+    auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    sirius::io::object_store_config object_store;
+    object_store.endpoint   = env.endpoint;
+    object_store.region     = env.region;
+    object_store.access_key = env.access_key;
+    object_store.secret_key = env.secret_key;
+    object_store.tls_verify = false;
+    context->get_config().set_object_store_config(object_store);
+    context->get_scan_manager().install_s3_config("s3://" + env.bucket, object_store);
     setenv("SIRIUS_DISABLE", "1", 1);
   }
 
@@ -317,15 +316,14 @@ class sirius_httpfs_fixture {
   duckdb::Connection con;
 };
 
-std::unique_ptr<duckdb::MaterializedQueryResult> require_query_ok(duckdb::Connection& con,
-                                                                  std::string const& sql)
+std::unique_ptr<duckdb::QueryResult> require_query_ok(duckdb::Connection& con,
+                                                      std::string const& sql)
 {
   auto result = con.Query(sql);
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
-  return std::unique_ptr<duckdb::MaterializedQueryResult>(
-    static_cast<duckdb::MaterializedQueryResult*>(result.release()));
+  return std::unique_ptr<duckdb::QueryResult>(static_cast<duckdb::QueryResult*>(result.release()));
 }
 
 void set_gpu_execution(duckdb::Connection& con, bool enabled)
@@ -361,6 +359,28 @@ class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
 };
 
 }  // namespace
+
+TEST_CASE("Sirius S3 filesystem keeps precedence over later S3 handlers", "[s3][filesystem]")
+{
+  class later_s3_fs final : public duckdb::FileSystem {
+   public:
+    bool CanHandleFile(const std::string& path) override { return path.rfind("s3://", 0) == 0; }
+    std::string GetName() const override { return "LaterS3FS"; }
+    duckdb::unique_ptr<duckdb::FileHandle> OpenFile(
+      const std::string&, duckdb::FileOpenFlags, duckdb::optional_ptr<duckdb::FileOpener>) override
+    {
+      throw duckdb::IOException("later S3 handler was selected");
+    }
+  };
+
+  duckdb::VirtualFileSystem fs;
+  fs.RegisterSubSystem(duckdb::make_uniq<sirius::io::s3::sirius_httpfs>());
+  fs.RegisterSubSystem(duckdb::make_uniq<later_s3_fs>());
+  auto const message = thrown_message([&] {
+    fs.OpenFile("s3://bucket/object.parquet", duckdb::FileFlags::FILE_FLAGS_READ, nullptr);
+  });
+  CHECK(message.find("[sirius_httpfs]") != std::string::npos);
+}
 
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
 {
@@ -489,7 +509,7 @@ TEST_CASE("sirius_httpfs positional reads fail on short reads and negative sizes
 TEST_CASE("sirius_httpfs exposes S3 ETags as DuckDB version tags",
           "[.][s3][integration][filesystem]")
 {
-  SECTION("plain and glob opens preserve the quoted MinIO ETag")
+  SECTION("plain and glob opens preserve the quoted SeaweedFS ETag")
   {
     auto env = read_s3_test_env();
     if (skip_if_no_s3_env(env)) { return; }
@@ -552,8 +572,8 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
   }
 
   std::string const key = "efc/overwrite-invalidation.bin";
-  if (!sirius::test::put_s3_container_object(key, first)) {
-    SUCCEED("managed MinIO is required for the overwrite invalidation test");
+  if (!sirius::test::put_s3_test_object(key, first)) {
+    SUCCEED("managed SeaweedFS is required for the overwrite invalidation test");
     return;
   }
 
@@ -566,10 +586,10 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
   auto read_cached_range = [&] {
     auto handle =
       caching_fs.OpenFile(duckdb::OpenFileInfo{uri}, duckdb::FileFlags::FILE_FLAGS_READ);
-    duckdb::data_ptr_t data = nullptr;
-    auto pin                = handle->Read(data, read_size, read_offset);
-    REQUIRE(data != nullptr);
-    return std::vector<std::uint8_t>(data, data + read_size);
+    auto pin = handle->Read(read_size, read_offset);
+    std::vector<std::uint8_t> data(read_size);
+    pin.CopyTo(data.data(), data.size());
+    return data;
   };
 
   auto first_read = read_cached_range();
@@ -581,9 +601,144 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
       " AND loaded AND location <= " + std::to_string(read_offset) +
       " AND location + nr_bytes >= " + std::to_string(read_offset + read_size));
   REQUIRE(cache_rows->RowCount() == 1);
-  CHECK(cache_rows->GetValue(0, 0).GetValue<std::int64_t>() >= 1);
+  CHECK(cache_rows->Collection().GetValue(0, 0).GetValue<std::int64_t>() >= 1);
 
-  REQUIRE(sirius::test::put_s3_container_object(key, second));
+  REQUIRE(sirius::test::put_s3_test_object(key, second));
   auto second_read = read_cached_range();
   CHECK(std::equal(second_read.begin(), second_read.end(), second.begin() + read_offset));
+}
+
+TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admission",
+          "[.][s3][integration][parquet_delete_sirius_s3]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) return;
+  auto directory = fs::temp_directory_path() / ("sirius-s3-delete-" + std::to_string(::getpid()));
+  fs::create_directories(directory);
+  struct cleanup {
+    fs::path directory;
+    ~cleanup()
+    {
+      std::error_code ec;
+      fs::remove_all(directory, ec);
+    }
+  } remove_directory{directory};
+  auto local_path = (directory / "deletes.parquet").string();
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    auto result = con.Query(
+      "COPY (SELECT 'data.parquet' AS file_path, i::BIGINT AS pos FROM range(10000) t(i)) TO " +
+      sql_quote(local_path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE_FALSE(result->HasError());
+  }
+  std::ifstream input(local_path, std::ios::binary);
+  std::vector<uint8_t> bytes(std::istreambuf_iterator<char>{input}, {});
+  auto const key = "parquet-delete-reader/sirius-positions.parquet";
+  if (!sirius::test::put_s3_test_object(key, bytes))
+    SKIP("Uploads only to the managed local S3 backend");
+
+  sirius_httpfs_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET enable_external_file_cache=false");
+  auto uri = s3_uri(env->bucket, key);
+  // Prove the filesystem actually selected is Sirius's production S3 adapter.
+  auto& filesystem = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+  auto handle      = filesystem.OpenFile(uri, duckdb::FileFlags::FILE_FLAGS_READ);
+  REQUIRE(handle->file_system.GetName() == "SiriusHttpFS");
+  handle.reset();
+
+  sirius::op::scan::iceberg_delete_discovery discovery;
+  discovery.positional_delete_files.push_back(uri);
+  sirius::io::kvikio_context unused_equality_io;
+  auto read = [&] {
+    return sirius::op::scan::load_delete_payload(
+      *fixture.con.context, "s3-table", &unused_equality_io, {}, discovery);
+  };
+  fixture.con.BeginTransaction();
+  auto result           = read();
+  auto const& positions = result->positional_deletes.at("data.parquet");
+  REQUIRE(positions.size() == 10000);
+  REQUIRE(positions.front() == 0);
+  REQUIRE(positions.back() == 9999);
+  fixture.con.Commit();
+
+  set_gpu_execution(fixture.con, false);
+  fixture.con.BeginTransaction();
+  REQUIRE_THROWS_WITH(read(), Catch::Matchers::ContainsSubstring("requires GPU execution"));
+  fixture.con.Rollback();
+  set_gpu_execution(fixture.con, true);
+  fixture.con.BeginTransaction();
+  REQUIRE(read()->positional_deletes.at("data.parquet").size() == 10000);
+  fixture.con.Commit();
+
+  auto replacement_path = (directory / "replacement.parquet").string();
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    require_query_ok(con,
+                     "COPY (SELECT 'data.parquet' AS file_path, (i+10000)::BIGINT AS pos "
+                     "FROM range(10000) t(i)) TO " +
+                       sql_quote(replacement_path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+  }
+  std::ifstream replacement_input(replacement_path, std::ios::binary);
+  std::vector<uint8_t> replacement(std::istreambuf_iterator<char>{replacement_input}, {});
+  bool const replace_during_batches = GENERATE(false, true);
+  CAPTURE(replace_during_batches);
+  bool replaced       = false;
+  auto replace_object = [&] {
+    if (!sirius::test::put_s3_test_object(key, replacement))
+      throw std::runtime_error("S3 replacement requires managed test backend");
+    replaced = true;
+  };
+  auto const threads = GENERATE(1, 2);
+  CAPTURE(threads);
+  require_query_ok(fixture.con, "SET threads=" + std::to_string(threads));
+  // Leave later row groups unread until the first batch replaces the object.
+  require_query_ok(fixture.con, "SET read_ahead_depth=1");
+  std::mutex consume_mutex;
+  uint64_t consumed  = 0;
+  auto read_complete = [&] {
+    std::vector<int64_t> pending;
+    sirius::op::scan::read_parquet_delete_batches(
+      *fixture.con.context,
+      duckdb::OpenFileInfo(uri),
+      {},
+      [&](auto const&, uint64_t) {
+        if (!replace_during_batches) replace_object();
+        return std::vector<uint64_t>{1};
+      },
+      [&] {
+        return [&](duckdb::DataChunk& chunk) {
+          std::lock_guard lock(consume_mutex);
+          for (duckdb::idx_t i = 0; i < chunk.size(); ++i)
+            pending.push_back(chunk.GetValue(0, i).GetValue<int64_t>());
+          consumed += chunk.size();
+          if (replace_during_batches && !replaced) replace_object();
+        };
+      });
+    return pending;
+  };
+  fixture.con.BeginTransaction();
+  std::vector<int64_t> published;
+  if (replace_during_batches) {
+    REQUIRE_THROWS_AS(published = read_complete(), sirius::io::object_changed_error);
+    REQUIRE(consumed > 0);
+  } else {
+    REQUIRE_THROWS_WITH(published = read_complete(),
+                        Catch::Matchers::ContainsSubstring("object changed"));
+    REQUIRE(consumed == 0);
+  }
+  REQUIRE(replaced);
+  REQUIRE(published.empty());
+  fixture.con.Rollback();
+
+  // A rejected read must leave the connection usable for the new object.
+  fixture.con.BeginTransaction();
+  auto recovered            = read();
+  auto const& new_positions = recovered->positional_deletes.at("data.parquet");
+  REQUIRE(new_positions.size() == 10000);
+  for (int64_t i = 0; i < 10000; ++i)
+    REQUIRE(new_positions[i] == i + 10000);
+  fixture.con.Commit();
 }

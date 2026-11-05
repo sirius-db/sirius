@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "exec/config.hpp"
 #include "io/types.hpp"
 
 #include <cstddef>
@@ -27,16 +26,18 @@ struct config {
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once.  Zero disables readahead for it entirely.
   ///
-  /// Local NVMe saturates at modest queue depth and every in-flight scan pins
-  /// staging buffers, so one scan per pipeline executor thread is enough to
-  /// keep the decoders fed without over-committing the pinned pool.
-  std::size_t n_max_concurrent_scans{
-    static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads)};
+  /// Local NVMe has no round trip to hide, so a readahead competes with the
+  /// executor's own reads for the same device and just reorders the queue
+  /// rather than adding throughput.  Measured on SF1000 local-parquet, turning
+  /// it off is a large net win, so the local backend defaults to 0 (off).  Set
+  /// a positive value (or `max_readahead_scans`) to opt the local path back in.
+  std::size_t n_max_concurrent_scans{0};
 
-  /// Whether the config named @c n_max_concurrent_scans explicitly. Needed
-  /// because the derived default follows the configured pipeline width and can
-  /// legitimately equal the struct default. Without this provenance, an
-  /// explicit value equal to the struct default is silently overwritten.
+  /// Whether the config named @c n_max_concurrent_scans explicitly. Preserved
+  /// for parity with the REST backend (whose budget is still derived from the
+  /// pipeline width) so an explicit value is always distinguishable from the
+  /// struct default -- including an explicit 0, which opts the local path out
+  /// as deliberately as the default does.
   bool n_max_concurrent_scans_explicit{false};
 
   /// When false, worker-planned operations use the buffered page-cache handle.

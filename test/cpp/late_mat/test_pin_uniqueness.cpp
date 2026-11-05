@@ -25,12 +25,15 @@
 // of value order, because `part.10` globs before `part.2`.
 
 #include "operator/operator_test_utils.hpp"
+#include "sirius_config.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+
+#include <rmm/error.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
@@ -45,8 +48,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
+#include <new>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -302,6 +308,323 @@ TEST_CASE("the exact check decides what the range test could not", "[late_mat][p
   REQUIRE_FALSE(exact_distinct_over_chunks(with_nulls, stream).has_value());
 }
 
+TEST_CASE("the join-key gate observes every other column automatically",
+          "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::pin_unique_automatic_selection;
+  std::vector<bool> const explicit_columns{true, false, false};
+  REQUIRE(pin_unique_automatic_selection(explicit_columns, /*prove_unique_keys=*/false) ==
+          std::vector<bool>{false, false, false});
+  REQUIRE(pin_unique_automatic_selection(explicit_columns, /*prove_unique_keys=*/true) ==
+          std::vector<bool>{false, true, true});
+}
+
+TEST_CASE("an automatic column is settled where an explicit one is only undecided",
+          "[late_mat][pin_uniqueness]")
+{
+  // Observing every column of a fact table must not hand each of them to the exact stage's sort,
+  // so an automatic column must be an integer, and an unsorted chunk is sorted on the spot to find
+  // a repeat.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+
+  // Columns: explicit unsorted, automatic unsorted with a repeat, automatic float, automatic
+  // sorted, automatic unsorted but distinct.
+  unique_probe probe{std::vector<bool>{true, true, true, true, true},
+                     std::vector<bool>{false, true, true, true, true}};
+  auto explicit_unsorted  = int64_column({7, 5, 6}, stream);
+  auto automatic_unsorted = int64_column({7, 5, 7}, stream);
+  auto automatic_float    = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT64}, 3, cudf::mask_state::UNALLOCATED, stream);
+  auto automatic_sorted   = int64_column({10, 11, 12}, stream);
+  auto automatic_distinct = int64_column({12, 10, 11}, stream);
+  std::vector<cudf::column_view> cols{explicit_unsorted->view(),
+                                      automatic_unsorted->view(),
+                                      automatic_float->view(),
+                                      automatic_sorted->view(),
+                                      automatic_distinct->view()};
+  probe.observe(cudf::table_view{cols}, stream);
+
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided,
+                                                          unique_verdict::refused,
+                                                          unique_verdict::refused,
+                                                          unique_verdict::proven,
+                                                          unique_verdict::proven});
+  REQUIRE_FALSE(probe.candidate(1));
+  REQUIRE_FALSE(probe.candidate(2));
+  REQUIRE(probe.candidate(3));
+  REQUIRE(probe.candidate(4));
+}
+
+TEST_CASE("an automatic column is dropped, not the pin, when its sort cannot be reserved",
+          "[late_mat][pin_uniqueness]")
+{
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+
+  // An unsorted automatic column that is distinct, a sorted automatic one (needs no sort) and an
+  // unsorted explicit one (never sorted).
+  auto const make_probe = [] {
+    return unique_probe{std::vector<bool>{true, true, true}, std::vector<bool>{true, true, false}};
+  };
+  auto unsorted_distinct = int64_column({12, 10, 11}, stream);
+  auto sorted            = int64_column({10, 11, 12}, stream);
+  auto explicit_unsorted = int64_column({7, 5, 6}, stream);
+  std::vector<cudf::column_view> cols{
+    unsorted_distinct->view(), sorted->view(), explicit_unsorted->view()};
+
+  SECTION("a granted reservation sorts the chunk and proves the column")
+  {
+    auto probe = make_probe();
+    std::vector<std::size_t> asked;
+    probe.observe(cudf::table_view{cols}, stream, [&](std::size_t bytes) {
+      asked.push_back(bytes);
+      return true;
+    });
+    REQUIRE(asked == std::vector<std::size_t>{3 * sizeof(std::int64_t) *
+                                              sirius::late_mat::sort_scratch_factor});
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::proven,
+                                                            unique_verdict::proven,
+                                                            unique_verdict::undecided});
+  }
+
+  SECTION("a declined reservation drops only the column that needed the sort")
+  {
+    auto probe = make_probe();
+    probe.observe(cudf::table_view{cols}, stream, [](std::size_t) { return false; });
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused,
+                                                            unique_verdict::proven,
+                                                            unique_verdict::undecided});
+    REQUIRE_FALSE(probe.candidate(0));
+    REQUIRE(probe.candidate(1));
+  }
+
+  SECTION("a gate that throws costs the column its proof, never the observation")
+  {
+    auto probe = make_probe();
+    REQUIRE_NOTHROW(probe.observe(cudf::table_view{cols}, stream, [](std::size_t) -> bool {
+      throw std::runtime_error("out of memory");
+    }));
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused,
+                                                            unique_verdict::proven,
+                                                            unique_verdict::undecided});
+  }
+}
+
+TEST_CASE(
+  "an automatic column the exact stage cannot settle is not sorted again once chunks overlap",
+  "[late_mat][pin_uniqueness]")
+{
+  // Unsorted, distinct chunks: each one costs a sort. Once the exact stage is out of reach only
+  // chunks that never overlap in range can prove the column, so an overlapping chunk is dropped
+  // before it is sorted.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+
+  auto const observe_two =
+    [&](bool exact_available, std::vector<std::int64_t> const& second, std::size_t& sorts) {
+      unique_probe probe{std::vector<bool>{true}, std::vector<bool>{true}};
+      auto const count_sorts = [&](std::size_t) {
+        ++sorts;
+        return true;
+      };
+      auto first_chunk  = int64_column({12, 10, 11}, stream);
+      auto second_chunk = int64_column(second, stream);
+      {
+        std::vector<cudf::column_view> cols{first_chunk->view()};
+        probe.observe(cudf::table_view{cols}, stream, count_sorts);
+      }
+      if (!exact_available) { probe.exact_unavailable(0); }
+      {
+        std::vector<cudf::column_view> cols{second_chunk->view()};
+        probe.observe(cudf::table_view{cols}, stream, count_sorts);
+      }
+      return probe;
+    };
+
+  SECTION("with the exact stage available an overlapping chunk is sorted and left undecided")
+  {
+    std::size_t sorts = 0;
+    auto probe        = observe_two(/*exact_available=*/true, {11, 13, 9}, sorts);
+    REQUIRE(sorts == 2);
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
+  }
+
+  SECTION("without it an overlapping chunk is dropped before its sort")
+  {
+    std::size_t sorts = 0;
+    auto probe        = observe_two(/*exact_available=*/false, {11, 13, 9}, sorts);
+    REQUIRE(sorts == 1);
+    REQUIRE_FALSE(probe.candidate(0));
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused});
+  }
+
+  SECTION("without it a chunk that does not overlap is still sorted and the column is proven")
+  {
+    std::size_t sorts = 0;
+    auto probe        = observe_two(/*exact_available=*/false, {22, 20, 21}, sorts);
+    REQUIRE(sorts == 2);
+    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::proven});
+  }
+}
+
+TEST_CASE("an explicit column keeps its chances when the exact stage becomes unavailable",
+          "[late_mat][pin_uniqueness]")
+{
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+  unique_probe probe{std::vector<bool>{true}};
+  auto first  = int64_column({1, 5, 9}, stream);
+  auto second = int64_column({2, 6, 8}, stream);
+  probe.exact_unavailable(0);
+  for (auto const* column : {&first, &second}) {
+    std::vector<cudf::column_view> cols{(*column)->view()};
+    probe.observe(cudf::table_view{cols}, stream);
+  }
+  // Overlapping ranges: not provable by chunks alone, but not refused either.
+  REQUIRE(probe.candidate(0));
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
+}
+
+TEST_CASE("an optional retained copy yields to the batches the pin still has to store",
+          "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::retention_has_headroom;
+  using sirius::late_mat::retention_headroom_batches;
+  constexpr std::size_t mib = 1024 * 1024;
+  // The reviewer's example: 100 MiB of capacity, four 19 MiB batches stored and 8 MiB of key copies
+  // retained leave 16 MiB free. The fifth batch needs 19 MiB, so no further copy may be kept, and
+  // the 8 MiB copy itself would already have left too little.
+  REQUIRE_FALSE(
+    retention_has_headroom(/*available=*/16 * mib, /*copy=*/8 * mib, /*batch=*/19 * mib));
+  // With room for a copy and the headroom beside it, the copy is kept.
+  REQUIRE(retention_has_headroom(
+    /*available=*/8 * mib + retention_headroom_batches * 19 * mib, 8 * mib, 19 * mib));
+  // One byte short of that is not enough.
+  REQUIRE_FALSE(
+    retention_has_headroom(8 * mib + retention_headroom_batches * 19 * mib - 1, 8 * mib, 19 * mib));
+  // Nothing to protect: an empty batch needs only the copy itself.
+  REQUIRE(retention_has_headroom(8 * mib, 8 * mib, 0));
+}
+
+TEST_CASE("required work is retried once after the optional copies are given back",
+          "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::retry_after_releasing_optional;
+  int runs     = 0;
+  int releases = 0;
+
+  SECTION("work that succeeds is run once and nothing is released")
+  {
+    auto const result = retry_after_releasing_optional(
+      [&] {
+        ++runs;
+        return 7;
+      },
+      [&] {
+        ++releases;
+        return true;
+      });
+    REQUIRE(result == 7);
+    REQUIRE(runs == 1);
+    REQUIRE(releases == 0);
+  }
+
+  SECTION("an out-of-memory failure releases the copies and runs the work again")
+  {
+    auto const result = retry_after_releasing_optional(
+      [&] {
+        if (++runs == 1) { throw rmm::out_of_memory("the pin's decode"); }
+        return 7;
+      },
+      [&] {
+        ++releases;
+        return true;
+      });
+    REQUIRE(result == 7);
+    REQUIRE(runs == 2);
+    REQUIRE(releases == 1);
+  }
+
+  SECTION("with nothing to release the original failure propagates without a retry")
+  {
+    REQUIRE_THROWS_AS(retry_after_releasing_optional(
+                        [&]() -> int {
+                          ++runs;
+                          throw std::bad_alloc();
+                        },
+                        [&] {
+                          ++releases;
+                          return false;
+                        }),
+                      std::bad_alloc);
+    REQUIRE(runs == 1);
+    REQUIRE(releases == 1);
+  }
+
+  SECTION("a second failure propagates and the copies are released only once")
+  {
+    REQUIRE_THROWS_AS(retry_after_releasing_optional(
+                        [&]() -> int {
+                          ++runs;
+                          throw rmm::out_of_memory("the pin's decode");
+                        },
+                        [&] {
+                          ++releases;
+                          return true;
+                        }),
+                      rmm::out_of_memory);
+    REQUIRE(runs == 2);
+    REQUIRE(releases == 1);
+  }
+
+  SECTION("a failure that is not about memory is not retried")
+  {
+    REQUIRE_THROWS_AS(retry_after_releasing_optional(
+                        [&]() -> int {
+                          ++runs;
+                          throw std::runtime_error("corrupt file");
+                        },
+                        [&] {
+                          ++releases;
+                          return true;
+                        }),
+                      std::runtime_error);
+    REQUIRE(runs == 1);
+    REQUIRE(releases == 0);
+  }
+}
+
+TEST_CASE("an automatic column with sorted, overlapping chunks is left to the exact stage",
+          "[late_mat][pin_uniqueness]")
+{
+  // SF1000 `orders`: every chunk is sorted by o_orderkey, but the chunks overlap in range.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+  unique_probe probe{std::vector<bool>{true}, std::vector<bool>{true}};
+  auto first  = int64_column({1, 5, 9}, stream);
+  auto second = int64_column({2, 6, 8}, stream);
+  for (auto const* column : {&first, &second}) {
+    std::vector<cudf::column_view> cols{(*column)->view()};
+    probe.observe(cudf::table_view{cols}, stream);
+  }
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
+  REQUIRE(probe.candidate(0));
+}
+
+TEST_CASE("the exact-stage byte cap is a share of GPU memory unless set",
+          "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::exact_uniqueness_byte_cap;
+  constexpr std::uint64_t gib = 1ULL << 30;
+  // An explicit cap wins over the derived one.
+  REQUIRE(exact_uniqueness_byte_cap(1000, 100 * gib) == 1000u);
+  // 0 derives the cap from the GPU memory space's capacity.
+  REQUIRE(
+    exact_uniqueness_byte_cap(0, 100 * gib) ==
+    static_cast<std::size_t>(100 * gib * sirius::config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION));
+}
+
 TEST_CASE("a chunk of the wrong width abandons the proof", "[late_mat][pin_uniqueness]")
 {
   ::cuda::stream_ref const stream{cudaStream_t{}};
@@ -346,7 +669,8 @@ void pin_columns(sirius_scan_manager& manager,
                  cucascade::memory::memory_space& space,
                  std::string const& table,
                  std::vector<std::string> const& names,
-                 ::cuda::stream_ref stream)
+                 ::cuda::stream_ref stream,
+                 sirius::scan_manager::pinned_entry_metadata metadata = {})
 {
   sirius::scan_manager::cache_entry_info info;
   info.table_name     = table;
@@ -361,17 +685,19 @@ void pin_columns(sirius_scan_manager& manager,
     names.size(),
     sirius::pinned_column_storage_meta{cudf::data_type{cudf::type_id::INT32}, false})};
   manager.insert_pinned_entry_device(
-    table, std::move(info), std::move(chunks), space, std::move(storage));
+    table, std::move(info), std::move(chunks), space, std::move(storage), std::move(metadata));
 }
 
 /// Pin `names` under `table` through the merge-capable GPU path (one INT32
 /// column each, one chunk of 8 rows), and report which columns the insert
 /// actually stored.
-std::vector<std::string> pin_columns_mergeable(sirius_scan_manager& manager,
-                                               cucascade::memory::memory_space& space,
-                                               std::string const& table,
-                                               std::vector<std::string> const& names,
-                                               ::cuda::stream_ref stream)
+std::vector<std::string> pin_columns_mergeable(
+  sirius_scan_manager& manager,
+  cucascade::memory::memory_space& space,
+  std::string const& table,
+  std::vector<std::string> const& names,
+  ::cuda::stream_ref stream,
+  sirius::scan_manager::pinned_entry_metadata metadata = {})
 {
   sirius::scan_manager::cache_entry_info info;
   info.table_name     = table;
@@ -402,7 +728,8 @@ std::vector<std::string> pin_columns_mergeable(sirius_scan_manager& manager,
                                      {&space},
                                      duckdb::vector<duckdb::LogicalType>{},
                                      {},
-                                     std::move(storage));
+                                     std::move(storage),
+                                     std::move(metadata));
 }
 
 std::vector<bool> proven_of(sirius_scan_manager const& manager, std::string_view table)
@@ -423,19 +750,17 @@ TEST_CASE("the pinned entry records the proof by name", "[late_mat][pin_uniquene
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
-  pin_columns(manager, *space, "customer", {"c_name", "c_custkey"}, stream);
-  REQUIRE(proven_of(manager, "customer").empty());  // no fact yet = unknown
-
-  std::vector<std::string> const proven{"c_custkey"};
-  manager.attach_proven_unique_columns("customer", proven);
-  // By NAME: the proof lands on position 1, not on the first column.
-  REQUIRE(proven_of(manager, "customer") == std::vector<bool>{false, true});
-
-  // A name that matches no pinned column is ignored rather than mispositioned.
-  std::vector<std::string> const stranger{"o_orderkey"};
-  manager.attach_proven_unique_columns("customer", stranger);
+  pin_columns(manager,
+              *space,
+              "customer",
+              {"c_name", "c_custkey"},
+              stream,
+              {.proven_unique_columns = {"c_custkey", "o_orderkey"}});
+  // The first visible generation includes the proof by name, at position 1.
+  // Unknown names are ignored rather than mispositioned.
   REQUIRE(proven_of(manager, "customer") == std::vector<bool>{false, true});
 }
 
@@ -445,11 +770,11 @@ TEST_CASE("a replacing re-pin starts with no facts", "[late_mat][pin_uniqueness]
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
-  pin_columns(manager, *space, "customer", {"c_custkey"}, stream);
-  std::vector<std::string> const proven{"c_custkey"};
-  manager.attach_proven_unique_columns("customer", proven);
+  pin_columns(
+    manager, *space, "customer", {"c_custkey"}, stream, {.proven_unique_columns = {"c_custkey"}});
   REQUIRE(proven_of(manager, "customer") == std::vector<bool>{true});
 
   // Re-pinning the name with a different column set replaces the entry. The
@@ -459,37 +784,45 @@ TEST_CASE("a replacing re-pin starts with no facts", "[late_mat][pin_uniqueness]
   REQUIRE(std::count(after.begin(), after.end(), true) == 0);
 }
 
-TEST_CASE("a merge reports only the columns it actually stored", "[late_mat][pin_uniqueness]")
+TEST_CASE("a merge publishes proofs only for columns it actually stored",
+          "[late_mat][pin_uniqueness]")
 {
   // The merge path keeps an already-cached column's chunks and DROPS the
   // incoming ones. A uniqueness verdict describes the values the pin driver just
   // read, so attaching it to a retained column would assert distinctness about
   // bytes that never entered the cache — and this flag admits a group key. The
-  // insert therefore reports what it stored, and the caller filters by it.
+  // insertion must filter the supplied proofs before publishing the new generation.
   ::cuda::stream_ref const stream{cudaStream_t{}};
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
   // First pin stores both of its columns.
-  auto const first =
-    pin_columns_mergeable(manager, *space, "customer", {"c_custkey", "c_name"}, stream);
+  auto const first = pin_columns_mergeable(manager,
+                                           *space,
+                                           "customer",
+                                           {"c_custkey", "c_name"},
+                                           stream,
+                                           {.proven_unique_columns = {"c_name"}});
   REQUIRE(first == std::vector<std::string>{"c_custkey", "c_name"});
 
   // Same row count, one column already cached: only c_nationkey is stored, and
   // c_custkey keeps the chunks it was pinned with.
   auto const merged =
-    pin_columns_mergeable(manager, *space, "customer", {"c_custkey", "c_nationkey"}, stream);
+    pin_columns_mergeable(manager,
+                          *space,
+                          "customer",
+                          {"c_custkey", "c_nationkey"},
+                          stream,
+                          {.proven_unique_columns = {"c_custkey", "c_nationkey"}});
   REQUIRE(merged == std::vector<std::string>{"c_nationkey"});
 
-  // What the caller does with that: a verdict for the retained column is not
-  // attached, so the entry claims nothing about data this pin never stored.
-  std::vector<std::string> const attachable{"c_nationkey"};
-  manager.attach_proven_unique_columns("customer", attachable);
+  // A proof for discarded incoming c_custkey bytes cannot change the retained column.
   auto const proven = proven_of(manager, "customer");
   REQUIRE(proven.size() == 3u);
   REQUIRE(proven[0] == false);  // c_custkey — retained, and unclaimed
-  REQUIRE(proven[1] == false);  // c_name
+  REQUIRE(proven[1] == true);   // c_name keeps its existing proof
   REQUIRE(proven[2] == true);   // c_nationkey — newly stored
 }

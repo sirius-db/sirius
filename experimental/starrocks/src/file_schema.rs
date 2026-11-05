@@ -50,6 +50,83 @@ pub(crate) async fn parquet_file_schema(path: &str) -> Result<Vec<PSlotDescripto
     Ok(slots)
 }
 
+/// Footer reads in flight at once; bounds open file descriptors on a large FILES() glob.
+const MAX_CONCURRENT_FOOTER_READS: usize = 16;
+
+/// Reads every file's schema, in `paths` order, with up to [`MAX_CONCURRENT_FOOTER_READS`]
+/// footers in flight. The first failure is returned and the remaining reads are aborted.
+async fn read_schemas_concurrently(paths: &[String]) -> Result<Vec<Vec<PSlotDescriptor>>, String> {
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FOOTER_READS));
+    let mut reads = tokio::task::JoinSet::new();
+    for (idx, path) in paths.iter().cloned().enumerate() {
+        let permits = permits.clone();
+        reads.spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            (idx, parquet_file_schema(&path).await)
+        });
+    }
+    // Reads finish in any order; settle them in path order so the reported error is the
+    // first failing path, not whichever read lost the race.
+    let mut settled: Vec<Option<Result<Vec<PSlotDescriptor>, String>>> =
+        (0..paths.len()).map(|_| None).collect();
+    let mut schemas = Vec::with_capacity(paths.len());
+    while let Some(joined) = reads.join_next().await {
+        let (idx, schema) =
+            joined.map_err(|err| format!("parquet footer read task failed: {err}"))?;
+        settled[idx] = Some(schema);
+        while let Some(result) = settled.get_mut(schemas.len()).and_then(Option::take) {
+            schemas.push(result?);
+        }
+    }
+    Ok(schemas)
+}
+
+/// Infers one schema for a multi-file FILES() call.
+///
+/// The schema comes from the first file; every other file must agree on column names
+/// (exactly: the GPU scan looks projected columns up by case-sensitive name) and types. Positional
+/// slot fields (id/slot_idx/column_pos) are per-file bookkeeping and are not compared.
+///
+/// Deliberately stricter than native StarRocks, which samples `schema_sample_file_count`
+/// files and promotes conflicting types: the scan reads every file with the inferred
+/// schema, so whole-set agreement is the correct fail-closed contract here.
+pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<Vec<PSlotDescriptor>, String> {
+    let (first, rest) = paths
+        .split_first()
+        .ok_or_else(|| "no file paths to infer a schema from".to_string())?;
+    let mut schemas = read_schemas_concurrently(paths).await?.into_iter();
+    let slots = schemas
+        .next()
+        .expect("one schema per path, and paths is non-empty");
+    for (path, other) in rest.iter().zip(schemas) {
+        if other.len() != slots.len() {
+            return Err(format!(
+                "FILES() schema mismatch: '{path}' has {} columns but '{first}' has {}",
+                other.len(),
+                slots.len()
+            ));
+        }
+        for (idx, (expected, found)) in slots.iter().zip(&other).enumerate() {
+            if expected.col_name != found.col_name {
+                return Err(format!(
+                    "FILES() schema mismatch: column {idx} is named '{}' in '{first}' but '{}' in '{path}'",
+                    expected.col_name, found.col_name
+                ));
+            }
+            if expected.slot_type != found.slot_type {
+                return Err(format!(
+                    "FILES() schema mismatch: column '{}' has a different type in '{path}' than in '{first}'",
+                    expected.col_name
+                ));
+            }
+        }
+    }
+    Ok(slots)
+}
+
 /// Resolves a StarRocks file path to a local filesystem path, rejecting remote URIs.
 ///
 /// Accepts `file:/abs`, `file:///abs`, and `file://localhost/abs`; remote schemes
@@ -330,6 +407,110 @@ mod tests {
         let result = parquet_file_schema("s3://bucket/lineitem.parquet").await;
         assert!(
             result.as_ref().is_err_and(|err| err.contains("s3://")),
+            "{result:?}"
+        );
+    }
+
+    /// Runs `parquet_files_schema` over already-written fixture files and removes them.
+    async fn files_schema(paths: &[&std::path::PathBuf]) -> Result<Vec<PSlotDescriptor>, String> {
+        let strings: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
+        let result = parquet_files_schema(&strings).await;
+        for path in paths {
+            std::fs::remove_file(path).ok();
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn multi_file_agreeing_schemas_infer_the_single_file_slots() {
+        let message = "message m { optional int64 a; optional double b; }";
+        let first = write_parquet("agree_a", message);
+        let second = write_parquet("agree_b", message);
+        let single = parquet_file_schema(first.to_str().unwrap()).await.unwrap();
+        let multi = files_schema(&[&first, &second]).await.unwrap();
+        assert_eq!(multi, single);
+    }
+
+    #[tokio::test]
+    async fn multi_file_rejects_column_count_mismatch() {
+        let first = write_parquet(
+            "arity_a",
+            "message m { optional int64 a; optional double b; }",
+        );
+        let second = write_parquet("arity_b", "message m { optional int64 a; }");
+        let result = files_schema(&[&first, &second]).await;
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("has 1 columns but") && err.contains("has 2"),
+            "{err}"
+        );
+        assert!(
+            err.contains(first.to_str().unwrap()) && err.contains(second.to_str().unwrap()),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_rejects_column_name_mismatch() {
+        let first = write_parquet(
+            "name_a",
+            "message m { optional int64 a; optional double l_tax; }",
+        );
+        let second = write_parquet(
+            "name_b",
+            "message m { optional int64 a; optional double l_taxx; }",
+        );
+        let err = files_schema(&[&first, &second]).await.unwrap_err();
+        assert!(
+            err.contains("column 1 is named 'l_tax'") && err.contains("but 'l_taxx'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_rejects_column_type_mismatch() {
+        let first = write_parquet("type_a", "message m { optional int64 l_quantity; }");
+        let second = write_parquet("type_b", "message m { optional double l_quantity; }");
+        let err = files_schema(&[&first, &second]).await.unwrap_err();
+        assert!(
+            err.contains("column 'l_quantity' has a different type"),
+            "{err}"
+        );
+        assert!(err.contains(second.to_str().unwrap()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn multi_file_rejects_case_differing_column_names() {
+        let first = write_parquet("case_a", "message m { optional int64 L_ORDERKEY; }");
+        let second = write_parquet("case_b", "message m { optional int64 l_orderkey; }");
+        let err = files_schema(&[&first, &second]).await.unwrap_err();
+        assert!(
+            err.contains("is named 'L_ORDERKEY'") && err.contains("but 'l_orderkey'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_reports_the_first_failing_path() {
+        let paths: Vec<String> = (0..32)
+            .map(|idx| format!("/nonexistent/sr_cn_missing_{idx}.parquet"))
+            .collect();
+        let err = parquet_files_schema(&paths).await.unwrap_err();
+        assert!(err.contains("sr_cn_missing_0.parquet"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn multi_file_missing_file_error_names_its_path() {
+        let first = write_parquet("missing_a", "message m { optional int64 a; }");
+        let missing = "/nonexistent/sr_cn_missing_b.parquet".to_string();
+        let result =
+            parquet_files_schema(&[first.to_str().unwrap().to_string(), missing.clone()]).await;
+        std::fs::remove_file(&first).ok();
+        assert!(
+            result.as_ref().is_err_and(|err| err.contains(&missing)),
             "{result:?}"
         );
     }

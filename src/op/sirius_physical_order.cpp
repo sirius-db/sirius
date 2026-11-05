@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_order.hpp"
 
-#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"
@@ -55,10 +54,10 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   null_precedence.reserve(orders.size());
 
   for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("Order by only supports bound reference expressions");
     }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     order_key_idx.push_back(idx);
     column_order.push_back(to_cudf_order(ord.type));
     null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));

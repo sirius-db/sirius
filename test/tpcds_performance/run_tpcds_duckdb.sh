@@ -29,7 +29,7 @@ export SIRIUS_DISABLE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DUCKDB="$PROJECT_DIR/build/release/duckdb"
+DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 QUERY_DIR="$SCRIPT_DIR/queries"
 
 # --- Parse arguments ---
@@ -129,8 +129,8 @@ if [ -n "$PARQUET_DIR" ]; then
     for TABLE_NAME in "${TPCDS_TABLES[@]}"; do
         FILES=()
         for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" \
-                 "$PARQUET_DIR/${TABLE_NAME}_"*.parquet \
-                 "$PARQUET_DIR/${TABLE_NAME}/"*.parquet; do
+                 "$PARQUET_DIR/${TABLE_NAME}/"*.parquet \
+                 "$PARQUET_DIR/${TABLE_NAME}_"[0-9]*.parquet; do
             [ -f "$f" ] && FILES+=("'$f'")
         done
         if [ ${#FILES[@]} -eq 0 ]; then

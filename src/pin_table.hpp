@@ -15,7 +15,7 @@
  */
 
 #pragma once
-
+#include "expression_evaluator/query_policy.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 
 #include <cudf/types.hpp>
@@ -95,6 +95,9 @@ class scan_info;
 namespace io {
 class ioctx;
 }  // namespace io
+namespace scan_manager {
+class host_pin_placement;
+}  // namespace scan_manager
 
 /**
  * @brief Physical-type metadata for one cached column in one pinned chunk.
@@ -169,6 +172,7 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 
 /// Per-pin materialization behavior, sampled from config at pin time.
 struct pin_materialization_options {
+  expression_query_policy expression_policy;
   bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
   /// Positional with the pinned columns: observe this column for whole-table
@@ -176,6 +180,13 @@ struct pin_materialization_options {
   /// leaves the probe off, which is the default; the caller derives it from
   /// @c late_mat::pin_unique_probe_selection.
   std::vector<bool> probe_unique_columns;
+  /// Positional with @c probe_unique_columns: true = the column is observed automatically
+  /// (see @c late_mat::pin_unique_automatic_selection). Empty = none.
+  std::vector<bool> probe_unique_automatic;
+  /// Cap on the bytes retained for the exact uniqueness stage across all columns together, a shared
+  /// budget rather than a per-column allowance; 0 = a share of the GPU memory space's capacity
+  /// (see @c late_mat::exact_uniqueness_byte_cap).
+  std::uint64_t unique_exact_max_bytes = 0;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
@@ -284,6 +295,8 @@ struct device_pin_result {
 ///                            skips capture (statless pin).
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
+/// \param placement           Scan-manager-owned cursor, shared across host pins. GPU order
+///                            interleaves the resolved destination host spaces.
 /// \param options             Per-pin materialization behavior (zone-map capture, carrier
 ///                            narrowing). Narrowing runs before compression, so a compressed
 ///                            chunk stores narrow columns and decompresses straight back to them.
@@ -294,6 +307,7 @@ host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
+  scan_manager::host_pin_placement& placement,
   io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,

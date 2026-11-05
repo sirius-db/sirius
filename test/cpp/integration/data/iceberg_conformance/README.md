@@ -32,7 +32,7 @@ not paper over it by re-recording from our own engine.
 ```bash
 python3 test/cpp/integration/data/iceberg_conformance/run_conformance.py \
         test/cpp/integration/data/iceberg_conformance \
-        --duckdb build/release/duckdb
+        --duckdb sirius-duckdb/build/release/duckdb
 ```
 
 Each case runs in its **own process behind a timeout**, and each issues a *second* query

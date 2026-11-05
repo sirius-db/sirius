@@ -1,84 +1,49 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+//! Print the resource tree of one YAML-schema telemetry context.
 
-//! Print the resource-group tree of a Sirius telemetry session directory —
-//! the same tree the Quent viewer renders as collapsible rows.
-//!
-//! Usage:
-//!   cargo run -p sirius-telemetry-analyzer --example print_resource_tree -- \
-//!       <telemetry_output_dir>/<session_uuid>
-
-use instrumentation_model::Sirius;
-use quent_analyzer::resource::collection::ResourceCollection;
-use quent_analyzer::resource::tree::ResourceTreeNode;
-use quent_analyzer::{Entity, Model};
-use quent_query_engine_analyzer::ui::UiAnalyzer;
+use quent_analyzer::{Entity, resource::tree::ResourceTreeNode};
+use quent_query_engine_analyzer::{QueryEngineModel, ui::UiAnalyzer};
+use quent_store::{
+    context::ContextSet,
+    event::{CombinedEventLoader, filesystem::Loader},
+};
 use sirius_telemetry_analyzer::SiriusUiAnalyzer;
+use sirius_telemetry_store::{Sirius, SiriusEvent};
 use uuid::Uuid;
 
-fn print_node(
-    model: &sirius_telemetry_analyzer::model::SiriusModel,
-    node: &ResourceTreeNode,
-    depth: usize,
-) {
-    let indent = "  ".repeat(depth);
-    match node {
-        ResourceTreeNode::ResourceGroup(id, children) => {
-            let group = model.resource_group(*id).expect("group in tree");
-            println!(
-                "{indent}[{}] {} ({id})",
-                group.type_name(),
-                group.instance_name()
-            );
-            for child in children {
-                print_node(model, child, depth + 1);
-            }
-        }
-        ResourceTreeNode::Resource(id) => {
-            let resource = model.resource(*id).expect("resource in tree");
-            println!(
-                "{indent}<{}> {} ({id})",
-                resource.type_name(),
-                resource.instance_name()
-            );
-        }
+fn print_node(node: &ResourceTreeNode, depth: usize) {
+    println!(
+        "{}{}{}",
+        "  ".repeat(depth),
+        if node.is_resource { "<" } else { "[" },
+        node.entity_id
+    );
+    for child in &node.children {
+        print_node(child, depth + 1);
     }
 }
 
-fn main() {
-    let dir = std::path::PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .expect("usage: print_resource_tree <session_dir>"),
-    );
-
-    // The engine id is the `id` of the first engine event in the session.
-    let engine_file = std::fs::read_dir(dir.join("engine"))
-        .expect("session dir has an engine/ subdirectory")
-        .next()
-        .expect("engine/ contains an event file")
-        .expect("readable dir entry")
-        .path();
-    let first_line = std::fs::read_to_string(&engine_file)
-        .expect("readable engine event file")
-        .lines()
-        .next()
-        .expect("non-empty engine event file")
-        .to_owned();
-    let id_start = first_line.find("\"id\":\"").expect("engine event has id") + 6;
-    let engine_id: Uuid = first_line[id_start..id_start + 36]
-        .parse()
-        .expect("valid engine uuid");
-
-    let events: Vec<_> = Sirius::import_events(&dir)
-        .expect("importable session dir")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("importable events");
-    let analyzer =
-        SiriusUiAnalyzer::try_new(engine_id, events.into_iter()).expect("analyzable events");
-    let model = &analyzer.model;
-
-    let root_id = model.root().expect("model has a root group").id();
-    let tree = ResourceTreeNode::try_new(model, root_id).expect("resource tree");
-    print_node(model, &tree, 0);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::args()
+        .nth(1)
+        .ok_or("usage: print_resource_tree <context_dir>")?;
+    let dir = std::path::Path::new(&dir);
+    let context_id: Uuid = dir
+        .file_name()
+        .ok_or("missing context id")?
+        .to_str()
+        .ok_or("invalid context id")?
+        .parse()?;
+    let root = dir.parent().ok_or("missing context root")?;
+    let events = Loader::<Sirius>::new(root, ContextSet::one(context_id))
+        .combined_events()?
+        .collect::<Result<Vec<_>, _>>()?;
+    let engine_id = events
+        .iter()
+        .find_map(|event| matches!(event.data, SiriusEvent::Engine(_)).then_some(event.id))
+        .ok_or("missing engine event")?;
+    let analyzer = SiriusUiAnalyzer::try_new(engine_id, events.into_iter())?;
+    let tree = ResourceTreeNode::try_new(&analyzer.model)?;
+    println!("engine {}", analyzer.model.engine()?.id());
+    print_node(&tree, 0);
+    Ok(())
 }

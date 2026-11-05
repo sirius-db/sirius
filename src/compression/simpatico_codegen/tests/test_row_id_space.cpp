@@ -22,11 +22,9 @@
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <set>
-#include <stdexcept>
 #include <vector>
 
 using sirius::codegen::build_chunk_row_set;

@@ -1,0 +1,38 @@
+# Drives SiriusContext::initialize() to fail AFTER it installs the cuDF pinned
+# memory resource: the 160 MB host pool fits one uring reactor's 64 MiB staging
+# but not four, so starting the reactors throws. Used by the regression test
+# "SiriusContext init failure restores the cuDF pinned resource" to verify the
+# rollback restores cuDF's global pinned resource/threshold instead of leaving
+# it dangling at the freed slab allocator.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.05
+      reservation_limit_fraction: 0.04
+      downgrade_trigger_fraction: 0.04
+      downgrade_stop_fraction: 0.02
+    host:
+      capacity_bytes: 160000000
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.7
+    disk:
+      disk_id: 0
+      capacity_bytes: 1000000000
+      downgrade_root_dirs: "/tmp/sirius_disk_memory"
+  executor:
+    pipeline:
+      num_threads: 4
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+    scan_manager:
+      # Four reactors reserve 4 x 64 MiB = 256 MiB of pinned staging, which
+      # overruns the 160 MB host pool above and makes reactor startup throw.
+      uring_n_reactors: 4
+  telemetry:
+    enable_quent: false
+    output_directory: "/tmp/sirius_telemetry_config_test"
+    engine_name: "sirius_config_test"

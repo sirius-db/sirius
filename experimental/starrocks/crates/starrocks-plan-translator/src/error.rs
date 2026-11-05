@@ -38,7 +38,7 @@ pub enum TranslateError {
         reason: &'static str,
     },
     /// A FILE_SCAN broker scan range is outside the supported v1 slice (e.g. a
-    /// non-parquet format, or byte-range splits that do not tile their file).
+    /// non-parquet format or overlapping byte-range splits).
     #[error("unsupported scan range at node {node_id}: {reason}")]
     UnsupportedScanRange {
         /// StarRocks plan-node id of the scan.

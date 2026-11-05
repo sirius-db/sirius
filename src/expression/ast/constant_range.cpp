@@ -97,7 +97,7 @@ namespace {
 bool carried_narrow(sirius::logical_type const& logical, cudf::data_type carrier)
 {
   if (!sirius::is_narrowable_numeric_type(logical)) { return false; }
-  auto const native = sirius::try_get_cudf_type(logical);
+  auto const native = sirius::get_cudf_type(logical);
   return native && sirius::can_restore_to(carrier, *native);
 }
 

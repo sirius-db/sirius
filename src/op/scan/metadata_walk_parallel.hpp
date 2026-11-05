@@ -17,6 +17,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -26,6 +27,9 @@
 #include <vector>
 
 namespace sirius::op::scan {
+
+/// Completed metadata passes that used more than one worker.
+inline std::atomic<std::size_t> parallel_metadata_walks_for_testing{0};
 
 /// @brief Worker cap for the metadata walk's per-row-group passes. Env
 /// `SIRIUS_METADATA_WALK_THREADS` overrides; 1 forces the serial path.
@@ -90,6 +94,7 @@ inline void parallel_over_row_groups(std::size_t n,
   for (auto& e : errors) {
     if (e) { std::rethrow_exception(e); }
   }
+  parallel_metadata_walks_for_testing.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace sirius::op::scan

@@ -16,14 +16,12 @@
 
 #include "op/sirius_physical_filter.hpp"
 
-#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <duckdb/common/exception.hpp>
 
 namespace sirius {
 namespace op {
@@ -65,7 +63,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   sirius::expression_evaluator evaluator(*expression,
                                          cudf::get_current_device_resource_ref(),
                                          stream,
-                                         strategy_from_config(),
+                                         expression_policy(),
                                          expression_evaluator::default_min_ast_size,
                                          like_swar_fastpath_enabled(),
                                          like_cache());

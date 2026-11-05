@@ -9,7 +9,8 @@
 #include <stdexcept>
 #include <string>
 
-extern "C" void configure_injection(bool enabled, const char* library);
+extern "C" bool injection_armed();
+extern "C" bool configure_injection(bool enabled, const char* library);
 
 static void require(bool condition, const char* message)
 {
@@ -19,16 +20,20 @@ static void require(bool condition, const char* message)
 int main(int argc, char** argv)
 {
   try {
+    // No configuration published yet, as on SIRIUS_DISABLE.
+    require(!injection_armed(), "static NVTX injection enabled by default");
+
     auto* process = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL);
     require(process != nullptr, "ordinary dlopen request was not forwarded");
     dlclose(process);
 
     unsetenv("NVTX_INJECTION64_PATH");
-    configure_injection(false, "");
+    require(!configure_injection(false, ""), "disabled telemetry armed static injection");
     require(getenv("NVTX_INJECTION64_PATH") == nullptr, "disabled telemetry changed discovery");
 
     setenv("NVTX_INJECTION64_PATH", "existing-injector", 1);
-    configure_injection(true, "configured-injector");
+    require(configure_injection(true, "configured-injector"),
+            "NVTX opt-in did not arm static injection");
     require(std::string(getenv("NVTX_INJECTION64_PATH")) == "existing-injector",
             "existing environment did not take precedence");
 

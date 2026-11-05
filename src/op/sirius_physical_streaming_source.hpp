@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/batch_stream.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cucascade/data/data_repository.hpp>
@@ -40,7 +41,17 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     std::shared_ptr<cucascade::shared_data_repository> input_repository,
-    std::set<exec::sender_id_t> expected_senders);
+    std::set<exec::sender_id_t> expected_senders,
+    std::shared_ptr<sirius::transparent::read_view_registry> read_views = nullptr,
+    scan::scan_contract_id contract_id                                  = 0);
+
+  [[nodiscard]] scan::bound_table_scan const& scan_contract() const;
+  [[nodiscard]] scan::scan_contract_id contract_id() const noexcept { return _contract_id; }
+  [[nodiscard]] std::shared_ptr<sirius::transparent::read_view_registry> const& read_views()
+    const noexcept
+  {
+    return _read_views;
+  }
 
   /// Wire EOS → update_pipeline_status(false); on_data → schedule(head) (self-nomination).
   /// Without on_data, a WAITING source stays dropped until a task completes — which never happens.
@@ -95,6 +106,8 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
  private:
   /// Shared so producer threads co-own the stream past this operator.
   std::shared_ptr<exec::batch_stream> _input;
+  std::shared_ptr<sirius::transparent::read_view_registry> _read_views;
+  scan::scan_contract_id _contract_id = 0;
 };
 
 }  // namespace sirius::op

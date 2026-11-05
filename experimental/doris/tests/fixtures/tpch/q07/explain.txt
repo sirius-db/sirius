@@ -1,0 +1,273 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    supp_nation[#128]
+    cust_nation[#129]
+    l_year[#130]
+    revenue[#131]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  21:VMERGING-EXCHANGE
+     offset: 0
+     distribute expr lists: supp_nation[#128], cust_nation[#129], l_year[#130]
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: supp_nation[#120], cust_nation[#121], l_year[#122]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    UNPARTITIONED
+IS_MERGE: true
+
+  20:VSORT(1572)
+  |  order by: supp_nation[#128] ASC, cust_nation[#129] ASC, l_year[#130] ASC
+  |  algorithm: full sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  19:VAGGREGATE (merge finalize)(1568)
+  |  output: sum(partial_sum(volume)[#123])[#127]
+  |  group by: supp_nation[#120], cust_nation[#121], l_year[#122]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: supp_nation[#120], cust_nation[#121], l_year[#122]
+  |  
+  18:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: HASH_PARTITIONED: l_suppkey[#67]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    HASH_PARTITIONED: supp_nation[#120], cust_nation[#121], l_year[#122]
+
+  17:VAGGREGATE (update serialize)(1560)
+  |  STREAMING
+  |  output: partial_sum(volume[#119])[#123]
+  |  group by: supp_nation[#116], cust_nation[#117], l_year[#118]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  16:VHASH JOIN(1552)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (c_nationkey[#106] = n_nationkey[#18])
+  |  equal join conjunct: (s_nationkey[#102] = n_nationkey[#16])
+  |  cardinality=1
+  |  vec output tuple id: 21
+  |  output tuple id: 21
+  |  vIntermediate tuple ids: 20 
+  |  hash output slot ids: 17 19 103 104 105 
+  |  final projections: n_name[#113], n_name[#115], year(l_shipdate[#110]), (l_extendedprice[#108] * (1.00 - CAST(l_discount[#109] AS decimalv3(16,2))))
+  |  final project output tuple id: 21
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----4:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  15:VHASH JOIN(1514)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (o_custkey[#94] = c_custkey[#28])
+  |  cardinality=1
+  |  vec output tuple id: 19
+  |  output tuple id: 19
+  |  vIntermediate tuple ids: 18 
+  |  hash output slot ids: 90 91 92 93 29 
+  |  final projections: s_nationkey[#95], l_extendedprice[#96], l_discount[#97], l_shipdate[#98], c_nationkey[#101]
+  |  final project output tuple id: 19
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----6:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  14:VHASH JOIN(1497)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (l_orderkey[#79] = o_orderkey[#39])
+  |  cardinality=1
+  |  vec output tuple id: 17
+  |  output tuple id: 17
+  |  vIntermediate tuple ids: 16 
+  |  hash output slot ids: 80 81 82 40 78 
+  |  final projections: s_nationkey[#83], l_extendedprice[#85], l_discount[#86], l_shipdate[#87], o_custkey[#89]
+  |  final project output tuple id: 17
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----8:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  13:VHASH JOIN(1480)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (l_suppkey[#67] = s_suppkey[#48])
+  |  cardinality=1
+  |  vec output tuple id: 15
+  |  output tuple id: 15
+  |  vIntermediate tuple ids: 14 
+  |  hash output slot ids: 49 66 68 69 70 
+  |  final projections: s_nationkey[#77], l_orderkey[#71], l_extendedprice[#73], l_discount[#74], l_shipdate[#75]
+  |  final project output tuple id: 15
+  |  distribute expr lists: l_suppkey[#67]
+  |  distribute expr lists: s_suppkey[#48]
+  |  
+  |----10:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  12:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    HASH_PARTITIONED: l_suppkey[#67]
+
+  11:VTVF_SCAN_NODE(1455)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_shipdate[#60] >= '1995-01-01'), (_tvf_local.l_shipdate[#60] <= '1996-12-31')
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_orderkey[#50], _tvf_local.l_suppkey[#52], _tvf_local.l_extendedprice[#55], _tvf_local.l_discount[#56], _tvf_local.l_shipdate[#60]
+     final project output tuple id: 13
+
+PLAN FRAGMENT 4
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    HASH_PARTITIONED: s_suppkey[#48]
+
+  9:VTVF_SCAN_NODE(1468)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=690978, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.s_suppkey[#41], _tvf_local.s_nationkey[#44]
+     final project output tuple id: 11
+
+PLAN FRAGMENT 5
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 08
+    UNPARTITIONED
+
+  7:VTVF_SCAN_NODE(1485)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=41097446, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.o_orderkey[#30], _tvf_local.o_custkey[#31]
+     final project output tuple id: 9
+
+PLAN FRAGMENT 6
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    UNPARTITIONED
+
+  5:VTVF_SCAN_NODE(1502)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=10766836, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.c_custkey[#20], _tvf_local.c_nationkey[#23]
+     final project output tuple id: 7
+
+PLAN FRAGMENT 7
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    UNPARTITIONED
+
+  3:VNESTED LOOP JOIN(1544)
+  |  join op: INNER JOIN()
+  |  join conjuncts: (((n_name[#13] = 'FRANCE') AND (n_name[#15] = 'GERMANY')) OR ((n_name[#13] = 'GERMANY') AND (n_name[#15] = 'FRANCE')))
+  |  cardinality=0
+  |  vIntermediate tuple ids: 4 
+  |  final projections: n_nationkey[#12], n_name[#13], n_nationkey[#14], n_name[#15]
+  |  final project output tuple id: 5
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  2:VTVF_SCAN_NODE(1519)
+     table: null.null.LocalTableValuedFunction
+     predicates: _tvf_local.n_name[#7] IN ('FRANCE', 'GERMANY')
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_nationkey[#6], _tvf_local.n_name[#7]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 8
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    UNPARTITIONED
+
+  0:VTVF_SCAN_NODE(1528)
+     table: null.null.LocalTableValuedFunction
+     predicates: _tvf_local.n_name[#1] IN ('GERMANY', 'FRANCE')
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_nationkey[#0], _tvf_local.n_name[#1]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

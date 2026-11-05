@@ -1,6 +1,6 @@
 -- Loads TPC-H SF1 data from .tbl files and exports to Parquet.
 -- Used by CI to prepare benchmark data without tpchgen-rs.
--- Run from the project root: ./build/release/duckdb -f scripts/tpch_to_parquet.sql
+-- Run from the project root: ./sirius-duckdb/build/release/duckdb -f scripts/tpch_to_parquet.sql
 
 DROP TABLE IF EXISTS nation;
 DROP TABLE IF EXISTS region;

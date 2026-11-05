@@ -33,20 +33,15 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/scoped_sirius_setting.hpp"
 #include "utils/scoped_temp_directory.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
-#include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/function/table/table_scan.hpp>
-#include <duckdb/main/config.hpp>
-#include <duckdb/optimizer/optimizer.hpp>
-#include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
-#include <duckdb/planner/planner.hpp>
 
 #include <cstdint>
 #include <filesystem>
@@ -69,44 +64,23 @@ struct set_operation_planner : sirius::planner::sirius_physical_plan_generator {
   using sirius_physical_plan_generator::sirius_physical_plan_generator;
 };
 
-//! Masks the optimizers Sirius masks at load and holds a transaction open while planning.
+//! Holds a transaction open while planning.
 class planning_scope {
  public:
-  explicit planning_scope(duckdb::Connection& con)
-    : _con(con), _saved(duckdb::DBConfig::GetConfig(*con.context).options.disabled_optimizers)
+  explicit planning_scope(duckdb::Connection& con) : _con(con)
   {
-    auto& disabled = duckdb::DBConfig::GetConfig(*con.context).options.disabled_optimizers;
-    disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
-    disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-    disabled.insert(duckdb::OptimizerType::LATE_MATERIALIZATION);
     sirius::test::query(_con, "BEGIN TRANSACTION");
   }
 
   ~planning_scope()
   {
-    _con.Query("ROLLBACK");
-    duckdb::DBConfig::GetConfig(*_con.context).options.disabled_optimizers = _saved;
+    auto const rolled_back = _con.Query("ROLLBACK");
+    // CHECK (not REQUIRE): destructors must not throw; a failed rollback still fails the test.
+    CHECK_FALSE(rolled_back->HasError());
   }
 
   planning_scope(planning_scope const&)            = delete;
   planning_scope& operator=(planning_scope const&) = delete;
-
- private:
-  duckdb::Connection& _con;
-  duckdb::set<duckdb::OptimizerType> _saved;
-};
-
-//! Sets `default_collation` for its lifetime.
-class scoped_default_collation {
- public:
-  scoped_default_collation(duckdb::Connection& con, std::string const& collation) : _con(con)
-  {
-    sirius::test::query(_con, "SET default_collation = '" + collation + "'");
-  }
-  ~scoped_default_collation() { _con.Query("RESET default_collation"); }
-
-  scoped_default_collation(scoped_default_collation const&)            = delete;
-  scoped_default_collation& operator=(scoped_default_collation const&) = delete;
 
  private:
   duckdb::Connection& _con;
@@ -127,29 +101,16 @@ duckdb::LogicalSetOperation* find_set_operation(duckdb::LogicalOperator& op)
   return nullptr;
 }
 
-//! Plans the first set operation in @p query's optimized logical plan; throws what the builder
-//! throws. With @p through_dispatch, enters through the generator's dispatch switch instead.
+//! Plans the first set operation in @p query's optimized logical plan, under the optimizer mask
+//! the extension publishes at load; throws what the builder throws. With @p through_dispatch,
+//! enters through the generator's dispatch switch instead.
 duckdb::unique_ptr<sirius_physical_operator> plan_set_operation(duckdb::Connection& con,
                                                                 std::string const& query,
                                                                 bool through_dispatch = false)
 {
   auto& context = *con.context;
   planning_scope const scope(con);
-
-  duckdb::Parser parser(context.GetParserOptions());
-  parser.ParseQuery(query);
-  REQUIRE(parser.statements.size() == 1);
-
-  duckdb::Planner planner(context);
-  planner.CreatePlan(std::move(parser.statements[0]));
-  REQUIRE(planner.plan);
-  auto plan = std::move(planner.plan);
-
-  duckdb::Optimizer optimizer(*planner.binder, context);
-  plan = optimizer.Optimize(std::move(plan));
-  plan->ResolveOperatorTypes();
-  duckdb::ColumnBindingResolver resolver;
-  resolver.VisitOperator(*plan);
+  auto plan = sirius::test::extract_logical_plan_sirius_order(context, query).logical_plan;
 
   auto* set_operation = find_set_operation(*plan);
   REQUIRE(set_operation != nullptr);
@@ -158,11 +119,6 @@ duckdb::unique_ptr<sirius_physical_operator> plan_set_operation(duckdb::Connecti
     return generator.create_plan(static_cast<duckdb::LogicalOperator&>(*set_operation));
   }
   return generator.create_plan(*set_operation);
-}
-
-duckdb::vector<sirius::logical_type> sirius_types(duckdb::vector<duckdb::LogicalType> const& types)
-{
-  return sirius::from_duckdb_vec(types);
 }
 
 //! Requires @p node to be a constant holding exactly @p expected.
@@ -300,7 +256,7 @@ std::string scanned_table(sirius_physical_operator& root)
     auto const& scan = root.Cast<sirius::op::sirius_physical_table_scan>();
     auto const* bind = dynamic_cast<duckdb::TableScanBindData const*>(scan.bind_data.get());
     REQUIRE(bind != nullptr);
-    return bind->table.name;
+    return bind->table.name.GetIdentifierName();
   }
   for (auto& child : root.children) {
     if (subtree_contains(*child, SiriusPhysicalOperatorType::TABLE_SCAN)) {
@@ -326,12 +282,14 @@ class set_operation_lowering_fixture {
     sirius::test::query(*con, "CREATE TABLE icollated (s VARCHAR COLLATE NOCASE)");
     sirius::test::query(*con, "CREATE TABLE iduration (i INTERVAL)");
     sirius::test::query(*con, "CREATE TABLE ilist (l INTEGER[])");
+    sirius::test::query(*con, "CREATE TABLE iarray (i INTEGER[2], d DOUBLE[1])");
     sirius::test::query(*con, "INSERT INTO ia VALUES (1, 'a'), (2, 'b'), (3, 'c'), (NULL, 'n')");
     sirius::test::query(*con, "INSERT INTO ib VALUES (3, 'c'), (4, 'd'), (NULL, 'n')");
     sirius::test::query(*con, "INSERT INTO iwide VALUES (100), (200)");
     sirius::test::query(*con, "INSERT INTO icollated VALUES ('a'), ('A')");
     sirius::test::query(*con, "INSERT INTO iduration VALUES (INTERVAL 1 MONTH), (INTERVAL 30 DAY)");
     sirius::test::query(*con, "INSERT INTO ilist VALUES ([1, 2]), ([3])");
+    sirius::test::query(*con, "INSERT INTO iarray VALUES ([1, 2], [-0.0]), ([3, 4], [0.0])");
   }
 
   duckdb::unique_ptr<sirius_physical_operator> lower(std::string const& query)
@@ -360,7 +318,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - an ALL form plans both inputs at the common super-type",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::BIGINT});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT});
   auto const plan  = lower("SELECT k FROM ia INTERSECT ALL SELECT k FROM iwide");
   require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
 }
@@ -369,7 +327,8 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - INTERSECT ALL lowers to two tag sums and min copies",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
+  auto const types =
+    sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
   auto const plan  = lower("SELECT k, v FROM ia INTERSECT ALL SELECT k, v FROM ib");
   auto const chain = require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
 
@@ -399,13 +358,14 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - concat_batch_bytes = 0 caps REPLICATE batches at one byte",
+                 "set_operation - concat_batch_bytes = 0 leaves REPLICATE without a byte cap",
                  "[planner][set_operation][isolated_context]")
 {
   sirius::test::scoped_sirius_setting const bytes{*con, "concat_batch_bytes", std::uint64_t{0}};
   auto const plan = lower("SELECT k FROM ia EXCEPT ALL SELECT k FROM ib");
   REQUIRE(plan->type == SiriusPhysicalOperatorType::REPLICATE);
-  CHECK(plan->Cast<sirius::op::sirius_physical_replicate>().output_limits().max_bytes == 1);
+  CHECK(plan->Cast<sirius::op::sirius_physical_replicate>().output_limits().max_bytes ==
+        std::numeric_limits<std::size_t>::max());
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
@@ -413,12 +373,14 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "[planner][set_operation][isolated_context]")
 {
   for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
-    auto const distinct_plan =
+    auto const distinct =
       plan_set_operation(*con, "SELECT k FROM ia " + keyword + " SELECT k FROM ib", true);
-    CHECK(distinct_plan->type == SiriusPhysicalOperatorType::HASH_JOIN);
-    auto const all_plan =
+    auto const join_type = keyword == "EXCEPT" ? duckdb::JoinType::ANTI : duckdb::JoinType::SEMI;
+    require_hash_join(
+      *distinct, join_type, sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER}));
+    auto const plan =
       plan_set_operation(*con, "SELECT k FROM ia " + keyword + " ALL SELECT k FROM ib", true);
-    CHECK(all_plan->type == SiriusPhysicalOperatorType::REPLICATE);
+    CHECK(plan->type == SiriusPhysicalOperatorType::REPLICATE);
   }
 }
 
@@ -447,11 +409,20 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form carries an aggregate's narrowed type",
+                 "set_operation - an ALL form on an ARRAY key is refused",
                  "[planner][set_operation][isolated_context]")
 {
-  // DuckDB types sum(INTEGER) as HUGEINT; the Sirius aggregate plans it as BIGINT.
-  auto const types = sirius_types({duckdb::LogicalType::BIGINT});
+  REQUIRE_THROWS_WITH(lower("SELECT d FROM iarray EXCEPT ALL SELECT d FROM iarray"),
+                      ContainsSubstring("EXCEPT ALL on column 0 (DOUBLE[1]): ARRAY keys"));
+  REQUIRE_THROWS_WITH(lower("SELECT i FROM iarray INTERSECT ALL SELECT i FROM iarray"),
+                      ContainsSubstring("INTERSECT ALL on column 0 (INTEGER[2]): ARRAY keys"));
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - an ALL form preserves an aggregate's HUGEINT type",
+                 "[planner][set_operation][isolated_context]")
+{
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::HUGEINT});
   SECTION("EXCEPT ALL")
   {
     auto const plan = lower("SELECT sum(k) FROM ia EXCEPT ALL SELECT sum(k) FROM ib");
@@ -465,34 +436,49 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form whose inputs plan one column differently is refused",
+                 "set_operation - an ALL form preserves HUGEINT across aggregate and cast inputs",
                  "[planner][set_operation][isolated_context]")
 {
-  REQUIRE_THROWS_WITH(
-    lower("SELECT sum(k) FROM ia INTERSECT ALL SELECT k::HUGEINT FROM ib"),
-    ContainsSubstring("INTERSECT ALL inputs plan column 0 as BIGINT and HUGEINT"));
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::HUGEINT});
+  SECTION("aggregate input first")
+  {
+    auto const plan = lower("SELECT sum(k) FROM ia INTERSECT ALL SELECT k::HUGEINT FROM ib");
+    require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
+  }
+  SECTION("aggregate input second")
+  {
+    auto const plan = lower("SELECT k::HUGEINT FROM ia EXCEPT ALL SELECT sum(k) FROM ib");
+    require_replicate_plan(*plan, types, {{1}, {-1}});
+  }
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form whose CTE input is wider than its body is refused",
+                 "set_operation - an ALL form whose CTE input differs from its body is accepted",
                  "[planner][set_operation][isolated_context]")
 {
-  REQUIRE_THROWS_WITH(lower("SELECT k FROM ia "
-                            "INTERSECT ALL "
-                            "(WITH m AS MATERIALIZED (SELECT k, v FROM ib) "
-                            " SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)"),
-                      ContainsSubstring("INTERSECT ALL input 1 is planned with 2 columns, not 1"));
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
+  // Both definitions are wider than the body; "v, k" also puts a VARCHAR at its column 0.
+  for (std::string const definition : {"k, v", "v, k"}) {
+    INFO(definition);
+    auto const plan =
+      lower("SELECT k FROM ia INTERSECT ALL (WITH m AS MATERIALIZED (SELECT " + definition +
+            " FROM ib) SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+    auto const chain = require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
+    REQUIRE(chain.union_op.children[1]->children.size() == 1);
+    CHECK(chain.union_op.children[1]->children[0]->type == SiriusPhysicalOperatorType::CTE);
+  }
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - an ALL form whose CTE input matches its body is accepted",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
-  auto const plan  = lower(
+  auto const types =
+    sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
+  auto const plan = lower(
     "SELECT k, v FROM ia "
-     "INTERSECT ALL "
-     "(WITH m AS MATERIALIZED (SELECT k, v FROM ib) SELECT k, v FROM m)");
+    "INTERSECT ALL "
+    "(WITH m AS MATERIALIZED (SELECT k, v FROM ib) SELECT k, v FROM m)");
   auto const chain = require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
   REQUIRE(chain.union_op.children[1]->children.size() == 1);
   CHECK(chain.union_op.children[1]->children[0]->type == SiriusPhysicalOperatorType::CTE);
@@ -509,7 +495,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
   }
   SECTION("a plain VARCHAR column under a default collation")
   {
-    scoped_default_collation const nocase(*con, "nocase");
+    sirius::test::scoped_sirius_setting const nocase{*con, "default_collation", "nocase"};
     REQUIRE_THROWS_WITH(lower("SELECT v FROM ia INTERSECT ALL SELECT v FROM ib"),
                         ContainsSubstring("INTERSECT ALL on column 0"));
   }
@@ -525,7 +511,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - EXCEPT ALL lowers to one signed tag sum and clamped copies",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
   auto const plan  = lower("SELECT k FROM ia EXCEPT ALL SELECT k FROM ib");
   auto const chain = require_replicate_plan(*plan, types, {{1}, {-1}});
 
@@ -547,7 +533,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - INTERSECT lowers to a null-safe SEMI hash join",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
   auto const plan  = lower("SELECT k FROM ia INTERSECT SELECT k FROM ib");
   auto& join       = require_hash_join(*plan, duckdb::JoinType::SEMI, types);
   REQUIRE(join.conditions.size() == 1);
@@ -558,9 +544,10 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - INTERSECT keys every column in column order",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
-  auto const plan  = lower("SELECT k, v FROM ia INTERSECT SELECT k, v FROM ib");
-  auto& join       = require_hash_join(*plan, duckdb::JoinType::SEMI, types);
+  auto const types =
+    sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
+  auto const plan = lower("SELECT k, v FROM ia INTERSECT SELECT k, v FROM ib");
+  auto& join      = require_hash_join(*plan, duckdb::JoinType::SEMI, types);
   REQUIRE(join.conditions.size() == 2);
   require_null_safe_column_key(join.conditions[0], 0, types[0]);
   require_null_safe_column_key(join.conditions[1], 1, types[1]);
@@ -570,7 +557,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - INTERSECT plans both inputs at the common super-type",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::BIGINT});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT});
   auto const plan  = lower("SELECT k FROM ia INTERSECT SELECT k FROM iwide");
   auto& join       = require_hash_join(*plan, duckdb::JoinType::SEMI, types);
   REQUIRE(join.conditions.size() == 1);
@@ -578,26 +565,32 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - a CTE input whose definition is wider than its body is refused",
+                 "set_operation - a distinct form uses its CTE input's consumer schema",
                  "[planner][set_operation][isolated_context]")
 {
-  // MATERIALIZED keeps the CTE from being inlined; the self-join keeps `v` in the definition.
-  REQUIRE_THROWS_WITH(lower("SELECT k FROM ia "
-                            "INTERSECT "
-                            "(WITH m AS MATERIALIZED (SELECT k, v FROM ib) "
-                            " SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)"),
-                      ContainsSubstring("INTERSECT input 1 is planned with 2 columns, not 1"));
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
+  for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
+    INFO(keyword);
+    // The CTE materializes two columns but its consumer emits just k.
+    auto const plan      = lower("SELECT k FROM ia " + keyword +
+                            " (WITH m AS MATERIALIZED (SELECT k, v FROM ib) "
+                                 "SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+    auto const join_type = keyword == "EXCEPT" ? duckdb::JoinType::ANTI : duckdb::JoinType::SEMI;
+    auto& join           = require_hash_join(*plan, join_type, types);
+    CHECK(join.children[1]->type == SiriusPhysicalOperatorType::CTE);
+  }
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - a CTE input whose definition matches its body is accepted",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
-  auto const plan  = lower(
+  auto const types =
+    sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
+  auto const plan = lower(
     "SELECT k, v FROM ia "
-     "INTERSECT "
-     "(WITH m AS MATERIALIZED (SELECT k, v FROM ib) SELECT k, v FROM m)");
+    "INTERSECT "
+    "(WITH m AS MATERIALIZED (SELECT k, v FROM ib) SELECT k, v FROM m)");
   auto& join = require_hash_join(*plan, duckdb::JoinType::SEMI, types);
   CHECK(join.children[1]->type == SiriusPhysicalOperatorType::CTE);
 }
@@ -613,7 +606,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
   }
   SECTION("a plain VARCHAR column under a default collation")
   {
-    scoped_default_collation const nocase(*con, "nocase");
+    sirius::test::scoped_sirius_setting const nocase{*con, "default_collation", "nocase"};
     REQUIRE_THROWS_WITH(lower("SELECT v FROM ia INTERSECT SELECT v FROM ib"),
                         ContainsSubstring("INTERSECT on column 0"));
   }
@@ -633,19 +626,21 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an input planned narrower than the output type is refused",
+                 "set_operation - distinct forms preserve aggregate HUGEINT keys",
                  "[planner][set_operation][isolated_context]")
 {
-  // DuckDB types sum(INTEGER) as HUGEINT; the Sirius aggregate plans it as BIGINT.
-  REQUIRE_THROWS_WITH(lower("SELECT sum(k) FROM ia INTERSECT SELECT sum(k) FROM ib"),
-                      ContainsSubstring("INTERSECT input 0 plans column 0 as BIGINT, not HUGEINT"));
+  auto const types     = sirius::from_duckdb_vec({duckdb::LogicalType::HUGEINT});
+  auto const intersect = lower("SELECT sum(k) FROM ia INTERSECT SELECT sum(k) FROM ib");
+  require_hash_join(*intersect, duckdb::JoinType::SEMI, types);
+  auto const except = lower("SELECT sum(k) FROM ia EXCEPT SELECT sum(k) FROM ib");
+  require_hash_join(*except, duckdb::JoinType::ANTI, types);
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - EXCEPT lowers to a null-safe ANTI hash join",
                  "[planner][set_operation][isolated_context]")
 {
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
   auto const plan  = lower("SELECT k FROM ia EXCEPT SELECT k FROM ib");
   auto& join       = require_hash_join(*plan, duckdb::JoinType::ANTI, types);
   REQUIRE(join.conditions.size() == 1);
@@ -657,7 +652,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "[planner][set_operation][isolated_context]")
 {
   // Input 0 stays on the probe side whatever the inputs' estimated sizes.
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
   {
     auto const plan = lower("SELECT k FROM ia EXCEPT SELECT k FROM ib WHERE k > 2");
     auto& join      = require_hash_join(*plan, duckdb::JoinType::ANTI, types);
@@ -677,7 +672,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "[planner][set_operation][isolated_context]")
 {
   // DuckDB folds an empty INTERSECT input away but keeps the EXCEPT node.
-  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::INTEGER});
   auto const plan  = lower("SELECT k FROM ia EXCEPT SELECT k FROM ib WHERE false");
   auto& join       = require_hash_join(*plan, duckdb::JoinType::ANTI, types);
   CHECK(subtree_contains(*join.children[1], SiriusPhysicalOperatorType::EMPTY_RESULT));

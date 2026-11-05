@@ -26,6 +26,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/error_data.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -96,9 +97,11 @@ insert_delta_workset prepare_insert_delta_tasks(
     try {
       request.plan =
         op::scan::prepare_insert_delta_capture(*request.storage, *request.context, request.n_cache);
+    } catch (duckdb::InterruptException const&) {
+      throw;
     } catch (std::exception const& e) {
-      throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + request.entry_name +
-                               "': " + e.what());
+      duckdb::ErrorData(e).Throw("[prepare_insert_delta_tasks] pinned entry '" +
+                                 request.entry_name + "': ");
     }
     request.bundles.clear();
   }
@@ -133,13 +136,31 @@ insert_delta_workset prepare_insert_delta_tasks(
         try {
           work_ptr->out = op::scan::capture_insert_delta_row_group_range(
             req->plan, work_ptr->rg_begin, work_ptr->rg_end, req->union_cols, req->union_types);
+        } catch (op::scan::unsupported_physical_input const& e) {
+          throw op::scan::unsupported_physical_input(
+            req->first_consuming_contract,
+            req->entry_name + "|" + e.input_identity,
+            e.reason,
+            "[prepare_insert_delta_tasks] pinned entry '" + req->entry_name + "': " + e.what());
+        } catch (duckdb::InterruptException const&) {
+          throw;
         } catch (std::exception const& e) {
-          throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + req->entry_name +
-                                   "': " + e.what());
+          duckdb::ErrorData(e).Throw("[prepare_insert_delta_tasks] pinned entry '" +
+                                     req->entry_name + "': ");
         }
       });
     }
-    fan_out_and_join(dispatcher, std::move(range_tasks), "insert-delta capture");
+    try {
+      fan_out_and_join(dispatcher, std::move(range_tasks), "insert-delta capture");
+    } catch (op::scan::unsupported_physical_input const& error) {
+      for (auto const& request : requests) {
+        if (request.first_consuming_contract == error.contract) {
+          if (request.profiles->counters) request.profiles->counters->record(error.reason);
+          break;
+        }
+      }
+      throw;
+    }
     for (auto& work : range_works) {
       for (std::size_t i = 0; i < work->out.size(); ++i) {
         work->request->plan.row_groups[work->rg_begin + i] = std::move(work->out[i]);
@@ -324,7 +345,8 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager)
+  duckdb::SingleFileBlockManager const* block_manager,
+  op::scan::scan_contract_id contract_id)
 {
   std::vector<std::size_t> union_idx;
   union_idx.reserve(op_projected_cols.size());
@@ -353,6 +375,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
       d.max_string_length = s.max_string_length;
       d.bytes_size        = s.bytes_size;
       d.all_null          = s.all_null;
+      d.is_transient      = s.is_transient;
       d.segment_stats     = s.segment_stats;
       if (s.is_transient) {
         d.block_id     = -1;
@@ -422,7 +445,51 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
     auto info             = std::make_unique<op::scan::duckdb_native_scan_info>(
       std::move(row_groups), std::move(split_datasource), block_manager);
     info->host_backed_only = !any_file_read;
+    info->is_insert_delta  = true;
     if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
+
+    std::vector<op::scan::split_materializer_certificate> certificates;
+    std::vector<op::scan::split_dependencies> dependencies;
+    certificates.reserve(info->row_groups.size());
+    dependencies.reserve(info->row_groups.size());
+    for (std::size_t row_index = 0; row_index < info->row_groups.size(); ++row_index) {
+      auto const& row_group = info->row_groups[row_index];
+      auto const& original  = request.plan.row_groups[bundle.rg_indices[row_index]];
+      op::scan::validation_set validation;
+      auto add_segments = [&](auto const& segments) {
+        for (auto const& segment : segments) {
+          validation |= segment.is_transient
+                          ? op::scan::check_bit(op::scan::later_check::host_staged)
+                          : op::scan::check_bit(op::scan::later_check::segments_per_range) |
+                              op::scan::check_bit(op::scan::later_check::matrix_per_range);
+        }
+      };
+      for (auto ui : union_idx) {
+        auto const& column = original.columns[ui];
+        add_segments(column.data_segments);
+        add_segments(column.validity_segments);
+        add_segments(column.array_child_data_segments);
+        add_segments(column.array_child_validity_segments);
+      }
+      if (request.checkpoint_witness)
+        validation |= op::scan::check_bit(op::scan::later_check::key_held);
+      std::vector<sirius::logical_type> selected_types;
+      for (auto ui : union_idx)
+        selected_types.push_back(request.union_types.at(ui));
+      if (request.profiles->counters)
+        request.profiles->counters->record(op::scan::verdict_reason::none);
+      auto profile = request.profiles->add(
+        op::scan::native_row_group_profile(row_group, selected_types, request.storage_version));
+      certificates.push_back(
+        {contract_id,
+         static_cast<uint64_t>(row_group.row_group_index),
+         request.entry_name + "|row_group=" + std::to_string(row_group.row_group_index),
+         profile,
+         validation,
+         request.checkpoint_witness});
+      dependencies.push_back({nullptr, info->datasource, std::nullopt, request.profiles});
+    }
+    info->set_contract_payload(contract_id, std::move(certificates), std::move(dependencies));
 
     out.push_back({std::move(info), bundle.mask, bundle.preferred_device});
   }

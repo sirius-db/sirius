@@ -23,13 +23,10 @@
 // Requires SIRIUS_EXP_LATE_MAT=1 in the ENVIRONMENT: the gate is read per process.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <late_mat/defer_directive.hpp>
-#include <late_mat/defer_policy.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <cstdint>
-#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -55,13 +52,14 @@ std::string query(bool filtered)
          "ORDER BY c.c_custkey";
 }
 
-std::vector<std::string> rows_of(duckdb::MaterializedQueryResult& result)
+std::vector<std::string> rows_of(duckdb::QueryResult& result)
 {
   std::vector<std::string> rows;
-  for (duckdb::idx_t i = 0; i < result.RowCount(); ++i) {
+  auto result_rows = result.Collection().GetRows();
+  for (duckdb::idx_t i = 0; i < result_rows.size(); ++i) {
     std::string row;
     for (duckdb::idx_t c = 0; c < result.ColumnCount(); ++c) {
-      row += result.GetValue(c, i).ToString() + "|";
+      row += result_rows.GetValue(c, i).ToString() + "|";
     }
     rows.push_back(std::move(row));
   }

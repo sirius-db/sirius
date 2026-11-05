@@ -43,6 +43,10 @@ namespace {
 // Serves one batch, then holds the stream open until released, then ends it. push_split is
 // private, so the connector is fed through drain_cached_provider, as the sequencer feeds it.
 struct gated_provider final : databatch_provider {
+  gated_provider()
+  {
+    validation.identity = validation.layout = validation.structure = {true, true};
+  }
   std::shared_ptr<cucascade::data_batch> first;
   std::promise<void> release;
   std::shared_future<void> released = release.get_future().share();
@@ -130,4 +134,15 @@ TEST_CASE("split_connector::get_next_split wakes on a push, parks again, then en
   REQUIRE(second_empty.load());  // closed and drained
   REQUIRE(pops.load() == 2);
   REQUIRE(connector.is_closed());
+}
+
+TEST_CASE("split_connector failure before the first pop remains schedulable",
+          "[split_connector][scan_manager]")
+{
+  split_connector connector;
+  connector.close(std::make_exception_ptr(std::runtime_error("early metadata refusal")));
+  connector.close();
+  CHECK_FALSE(connector.is_closed());
+  CHECK(connector.is_discovery_complete());
+  CHECK_THROWS_WITH(connector.get_next_split(), "early metadata refusal");
 }

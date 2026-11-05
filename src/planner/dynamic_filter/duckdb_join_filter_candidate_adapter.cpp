@@ -16,11 +16,9 @@
 
 #include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 
-#include <duckdb/common/helper.hpp>
 #include <duckdb/common/typedefs.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/planner/table_filter.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -262,7 +260,7 @@ duckdb_join_filter_candidate extract(duckdb::LogicalComparisonJoin const& op)
       return malformed();
     }
     condition_indexes.push_back(condition_index);
-    condition_comparisons.push_back(op.conditions[condition_index].comparison);
+    condition_comparisons.push_back(op.conditions[condition_index].GetComparisonType());
   }
 
   if (info.probe_info.empty()) {

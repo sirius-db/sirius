@@ -70,6 +70,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -92,13 +94,29 @@ namespace sirius::late_mat {
 [[nodiscard]] std::vector<bool> pin_unique_probe_selection(
   std::span<std::string const> column_names);
 
-/// Row cap for the exact stage (SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS, default 300M).
+/// Columns the probe observes automatically, positional with @p explicitly_selected: every column
+/// not already selected explicitly when @p prove_unique_keys is set (the
+/// `pin_table_prove_unique_keys` option, which lets the join planner use pin-time facts as join-key
+/// proofs), otherwise none.
 ///
-/// The exact check sorts the whole assembled column, so on a fact table it is
-/// pin-time work measured in seconds — for a fact nobody asked for, since the
-/// tables whose keys unlock a ride are dimensions. Above the cap the column
-/// stays UNKNOWN, which costs an optimization and never an answer.
-[[nodiscard]] std::size_t exact_uniqueness_row_cap();
+/// An automatic column is held to a stricter standard than an explicit one: it must be an integer
+/// column, and a chunk that is not sorted is sorted on the spot to count its distinct values, so a
+/// value repeated within a chunk refuses the column at once instead of retaining it for the exact
+/// stage. A column that stays a candidate is sorted again on each of its unsorted chunks; a
+/// repeat across chunks is caught only by the exact stage. Most columns of a fact table repeat a
+/// value in their first chunk and are refused there. Join keys of TPC-H pins (`o_orderkey`,
+/// `p_partkey`, `s_suppkey`, ...) pass.
+[[nodiscard]] std::vector<bool> pin_unique_automatic_selection(
+  std::vector<bool> const& explicitly_selected, bool prove_unique_keys);
+
+/// Byte cap on what the exact stage retains across all columns
+/// (`pin_table_unique_exact_max_bytes`):
+/// @p configured_bytes when non-zero, otherwise `config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION`
+/// of @p gpu_capacity_bytes.
+/// The check's peak GPU use is about three times the cap; a column that no longer fits stays
+/// UNKNOWN.
+[[nodiscard]] std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
+                                                    std::uint64_t gpu_capacity_bytes);
 
 /// What the per-chunk pass concluded about one pinned column. The distinction
 /// that matters is @c refused vs @c undecided: a refused column is one the
@@ -112,6 +130,42 @@ enum class unique_verdict : std::uint8_t {
   undecided,         ///< chunk-distinct everywhere, but the chunk ranges overlap
   proven,            ///< distinct across the whole pinned table
 };
+
+/// GPU bytes to set aside, per byte of a column, for the sort an automatic column's chunk may
+/// undergo: the sorted copy plus the radix sort's own buffers.
+inline constexpr std::size_t sort_scratch_factor = 3;
+
+/// How many batches' worth of free GPU memory the pin keeps beside an optional retained copy: the
+/// next required batch and its working data (narrowing and compression buffers).
+inline constexpr std::size_t retention_headroom_batches = 2;
+
+/// Whether a copy of @p copy_bytes may be retained for the exact stage while @p available_bytes
+/// of GPU memory are free and a decoded batch is @p batch_bytes. The copy is optional and the
+/// batches the pin still has to decode and store are not, so the copy yields when it would leave
+/// less than retention_headroom_batches batches free.
+[[nodiscard]] constexpr bool retention_has_headroom(std::size_t available_bytes,
+                                                    std::size_t copy_bytes,
+                                                    std::size_t batch_bytes) noexcept
+{
+  return available_bytes >= copy_bytes + retention_headroom_batches * batch_bytes;
+}
+
+/// Runs @p required, work the pin cannot do without, and survives an out-of-memory failure caused
+/// by optional copies. When @p required throws std::bad_alloc (which covers rmm::out_of_memory) and
+/// @p release_optional returns true, having given the optional memory back, @p required runs once
+/// more. A second failure, a failure with nothing to release (@p release_optional returns false)
+/// and any other exception propagate unchanged. Only for work that leaves nothing behind when it
+/// fails, so that repeating it is safe.
+template <typename Required, typename ReleaseOptional>
+auto retry_after_releasing_optional(Required&& required, ReleaseOptional&& release_optional)
+{
+  try {
+    return required();
+  } catch (std::bad_alloc const&) {
+    if (!release_optional()) { throw; }
+  }
+  return required();
+}
 
 /// Exact whole-column check, for the columns the cheap per-chunk pass could not
 /// decide: assemble @p chunks into one column, sort it, and count consecutive
@@ -146,7 +200,9 @@ enum class unique_verdict : std::uint8_t {
 class unique_probe {
  public:
   /// @param selected  positional with the pinned columns; true = observe.
-  explicit unique_probe(std::vector<bool> selected);
+  /// @param automatic positional with @p selected; true = observed automatically, so held to the
+  ///                  stricter standard of pin_unique_automatic_selection. Empty = none.
+  explicit unique_probe(std::vector<bool> selected, std::vector<bool> const& automatic = {});
 
   /// True while at least one column is still a candidate — the drivers use this
   /// to skip the call (and its stream work) entirely.
@@ -156,10 +212,31 @@ class unique_probe {
   /// the selection; a mismatch abandons the whole proof (fails closed) rather
   /// than risking a positional misread. Runs on @p stream and synchronizes it
   /// via the scalar reads it performs.
-  void observe(cudf::table_view const& chunk, ::cuda::stream_ref stream);
+  /// An automatic column whose chunk is unsorted is sorted on the spot, which needs about
+  /// sort_scratch_factor times the column's bytes of GPU memory. @p try_reserve_sort_memory is
+  /// asked for that many bytes first and is expected to reserve them until its next call; when it
+  /// declines, or the sort fails for want of memory, the column is dropped without a proof and the
+  /// pin goes on. The reservation is a pledge only: cuDF's sort takes its temporary buffers from
+  /// the current device resource, so they cannot be allocated from it.
+  void observe(cudf::table_view const& chunk,
+               ::cuda::stream_ref stream,
+               std::function<bool(std::size_t bytes)> const& try_reserve_sort_memory = {});
 
   /// Per-column verdicts, positional with the selection.
   [[nodiscard]] std::vector<unique_verdict> verdicts() const;
+
+  /// Tells the probe that the exact stage can no longer settle @p column_pos: it was declined for
+  /// want of budget, or the pin abandoned the stage. An automatic column that only chunk ranges
+  /// that never overlap could still prove is then dropped as soon as a chunk's range overlaps an
+  /// earlier one, before that chunk is sorted. Explicit columns are left alone.
+  void exact_unavailable(std::size_t column_pos);
+
+  /// True while the column is still possibly unique. The pin driver retains values for the exact
+  /// stage only for these columns.
+  [[nodiscard]] bool candidate(std::size_t column_pos) const
+  {
+    return column_pos < _columns.size() && _columns[column_pos].candidate;
+  }
 
   /// Shorthand for `verdicts()[i] == unique_verdict::proven`.
   [[nodiscard]] std::vector<bool> proven() const;
@@ -171,7 +248,7 @@ class unique_probe {
  private:
   /// Value domain of the observed ranges. Wide enough to hold INT64 and UINT64
   /// together, so signed and unsigned columns compare without a special case.
-  using value_type = __int128;
+  using value_type = __int128_t;
 
   struct range {
     value_type min{0};
@@ -181,10 +258,13 @@ class unique_probe {
   struct column_state {
     bool observed{false};   ///< selected for the probe
     bool candidate{false};  ///< still possibly unique
+    bool automatic{false};  ///< observed automatically (stricter standard)
     /// The cheap stage cannot judge this column (not an integer, or its
     /// min/max could not be read). Not a refusal — the exact check may still
     /// decide it, so the verdict is `undecided` rather than `refused`.
     bool cheap_undecidable{false};
+    /// The exact stage may still settle this column. Cleared by exact_unavailable().
+    bool exact_available{true};
     std::vector<range> ranges;  ///< one per observed non-empty chunk
   };
 

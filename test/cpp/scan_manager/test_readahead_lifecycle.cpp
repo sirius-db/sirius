@@ -68,7 +68,9 @@ constexpr auto PIPELINE_THREADS =
 
 TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][readahead]")
 {
-  CHECK(sirius::io::uring::config{}.n_max_concurrent_scans == PIPELINE_THREADS);
+  // The local (uring) backend defaults to 0 (readahead off): on local NVMe a
+  // prefetch only reorders the executor's own reads against the same device.
+  CHECK(sirius::io::uring::config{}.n_max_concurrent_scans == 0);
   CHECK(sirius::io::rest::config{}.n_max_concurrent_scans == 2 * PIPELINE_THREADS);
   // kvikIO has no prefetching cache to read ahead into, so it publishes no
   // depth at all and there is no knob that could give it one.
@@ -366,8 +368,7 @@ class single_scan_query {
       std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{pipeline},
       _telemetry->context(),
       id,
-      sirius::telemetry::query_telemetry_info{
-        _telemetry->engine_id(), _telemetry->worker_id(), id});
+      sirius::telemetry::query_telemetry_info{quent::now_v7(), _telemetry->worker_id().raw(), id});
   }
 
   [[nodiscard]] const sirius::planner::query& get() const { return *_query; }
@@ -623,8 +624,7 @@ class empty_query {
       std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
       _telemetry->context(),
       id,
-      sirius::telemetry::query_telemetry_info{
-        _telemetry->engine_id(), _telemetry->worker_id(), id});
+      sirius::telemetry::query_telemetry_info{quent::now_v7(), _telemetry->worker_id().raw(), id});
   }
 
   [[nodiscard]] const sirius::planner::query& get() const { return *_query; }
@@ -656,8 +656,9 @@ TEST_CASE("a zero readahead budget builds no manager for the query", "[scan_mana
   // Control: a usable budget does build one, so the check below is about the
   // budget rather than about the query having nothing to scan.
   {
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
     sirius::scan_manager::sirius_scan_manager manager{
-      config_with_readahead_budget(4), *memory, topology};
+      scan_lifecycle, config_with_readahead_budget(4), *memory, topology};
     manager.prepare_for_query(query.get(), false, std::vector<int>{0});
     CHECK(manager.has_readahead_for_testing());
   }
@@ -666,8 +667,9 @@ TEST_CASE("a zero readahead budget builds no manager for the query", "[scan_mana
   // its worker still subscribes it to the publisher, which then buffers one
   // event per deployed task in a mailbox nothing drains -- for the whole query.
   {
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
     sirius::scan_manager::sirius_scan_manager manager{
-      config_with_readahead_budget(0), *memory, topology};
+      scan_lifecycle, config_with_readahead_budget(0), *memory, topology};
     manager.prepare_for_query(query.get(), false, std::vector<int>{0});
     CHECK_FALSE(manager.has_readahead_for_testing());
   }
@@ -691,13 +693,18 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
   cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
   cfg.cache.mode              = cache_mode::sirius;
   cfg.pipeline_width          = PIPELINE_THREADS;
+  // Local readahead is off by default now; opt it back in so this test still
+  // proves kvikIO is dropped despite a sibling backend carrying positive depth.
+  cfg.uring.n_max_concurrent_scans = PIPELINE_THREADS;
   cfg.apply_cache_mode();
   REQUIRE(cfg.uring.n_max_concurrent_scans > 0);
   REQUIRE(cfg.rest.n_max_concurrent_scans > 0);
   REQUIRE_FALSE(cfg.max_readahead_scans.has_value());
   REQUIRE_FALSE(cfg.readahead_strategy.has_value());
 
-  sirius::scan_manager::sirius_scan_manager manager{cfg, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius::scan_manager::sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
   REQUIRE(manager.io_ctx() != nullptr);
   REQUIRE_FALSE(manager.io_ctx()->can_use_prefetching_cache());
 

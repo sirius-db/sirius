@@ -9,7 +9,6 @@
 #include "log/logging.hpp"
 
 #include <cudf/copying.hpp>
-#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
@@ -200,8 +199,8 @@ std::string format_decimal_value(T raw, int abs_scale)
 std::string format_decimal128_value(__int128_t raw, int abs_scale)
 {
   bool negative = raw < 0;
-  // Use unsigned __int128 for magnitude to handle MIN correctly
-  using U128 = unsigned __int128;
+  // Use __uint128_t for magnitude to handle MIN correctly
+  using U128 = __uint128_t;
   U128 magnitude =
     negative ? static_cast<U128>(0) - static_cast<U128>(raw) : static_cast<U128>(raw);
 

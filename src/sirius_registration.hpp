@@ -25,7 +25,8 @@
 #include <utility>
 
 namespace sirius {
-struct sirius_config;
+struct operator_params;
+struct compression_config;
 }  // namespace sirius
 
 namespace duckdb {
@@ -37,23 +38,32 @@ struct DBConfig;
 // optimizer sees a real cardinality estimate via the registered cardinality
 // callback instead of falling back to "unknown table function output".
 struct SiriusReadParquetBindData : public FunctionData {
-  SiriusReadParquetBindData(std::string uri, std::size_t total_num_rows)
-    : uri(std::move(uri)), total_num_rows(total_num_rows)
+  SiriusReadParquetBindData(std::string uri,
+                            std::size_t total_num_rows,
+                            vector<LogicalType> bound_types = {},
+                            vector<string> bound_names      = {})
+    : uri(std::move(uri)),
+      total_num_rows(total_num_rows),
+      bound_types(std::move(bound_types)),
+      bound_names(std::move(bound_names))
   {
   }
 
   std::string uri;
   std::size_t total_num_rows{0};
+  vector<LogicalType> bound_types;
+  vector<string> bound_names;
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows);
+    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows, bound_types, bound_names);
   }
 
   bool Equals(FunctionData const& other_p) const override
   {
     auto const& other = other_p.Cast<SiriusReadParquetBindData>();
-    return uri == other.uri && total_num_rows == other.total_num_rows;
+    return uri == other.uri && total_num_rows == other.total_num_rows &&
+           bound_types == other.bound_types && bound_names == other.bound_names;
   }
 };
 
@@ -64,12 +74,16 @@ struct SiriusReadParquetBindData : public FunctionData {
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext& context,
                                                         FunctionData const* bind_data);
 
+TableFunction GetSiriusReadParquetFunction();
+
 class SiriusRegistration {
  public:
-  /// Register Sirius's extension options. @p defaults supplies the registered default for every
-  /// option DuckDB stores per connection, so a sirius.yaml value reaches those connections as
+  /// Register Sirius's extension options using the supplied operator and compression defaults.
+  /// Defaults for options DuckDB stores per connection carry sirius.yaml values as
   /// their inherited starting point instead of being shadowed by the compiled default.
-  static void InitialGPUConfigs(DBConfig& db, const sirius::sirius_config& defaults);
+  static void InitialGPUConfigs(DBConfig& db,
+                                const sirius::operator_params& operator_defaults,
+                                const sirius::compression_config& compression_defaults);
   static void RegisterGPUFunctions(DatabaseInstance& catalog);
   static void GPUExecutionFunction(ClientContext& context,
                                    TableFunctionInput& data_p,
@@ -77,7 +91,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> GPUExecutionBind(ClientContext& context,
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
-                                                   vector<string>& names);
+                                                   vector<Identifier>& names);
   /// Per-execution state factory for gpu_execution(): a reusable prepared
   /// statement gets fresh execution state (result/connection/interface) on
   /// every execute instead of reusing bind-held state.
@@ -90,7 +104,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> PinTableBind(ClientContext& context,
                                                TableFunctionBindInput& input,
                                                vector<LogicalType>& return_types,
-                                               vector<string>& names);
+                                               vector<Identifier>& names);
 
   static void UnpinTableFunction(ClientContext& context,
                                  TableFunctionInput& data_p,
@@ -98,7 +112,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> UnpinTableBind(ClientContext& context,
                                                  TableFunctionBindInput& input,
                                                  vector<LogicalType>& return_types,
-                                                 vector<string>& names);
+                                                 vector<Identifier>& names);
 
   /// reset_sirius_cache(): drop every ioctx's prefetching cache and rebuild it
   /// empty, so the next query pays its own IO instead of reading what the last
@@ -110,7 +124,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> ResetSiriusCacheBind(ClientContext& context,
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
-                                                       vector<string>& names);
+                                                       vector<Identifier>& names);
 
 #ifdef SIRIUS_ENABLE_LEGACY
   static bool buffer_is_initialized;

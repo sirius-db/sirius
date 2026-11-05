@@ -18,6 +18,8 @@
 
 #include "sirius/exception.hpp"
 
+#include <duckdb/main/client_context.hpp>
+
 #include <string>
 #include <utility>
 

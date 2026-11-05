@@ -55,9 +55,10 @@ class controllable_pipeline final : public sirius_pipeline {
 
 class recording_task_creator final : public sirius::creator::task_creator {
  public:
-  recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  recording_task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
+                         sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                          sirius::creator::request_type strategy)
-    : task_creator(sirius::creator::task_creator_config{.strategy = strategy}, mem_mgr)
+    : task_creator(lifecycle, sirius::creator::task_creator_config{.strategy = strategy}, mem_mgr)
   {
   }
 
@@ -81,6 +82,7 @@ class recording_task_creator final : public sirius::creator::task_creator {
 class union_fixture {
  private:
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> _memory_manager;
+  sirius::exec::query_lifecycle_registry lifecycle;
   recording_task_creator _creator;
 
  public:
@@ -88,7 +90,7 @@ class union_fixture {
     std::size_t num_arms,
     sirius::creator::request_type strategy = sirius::creator::request_type::active)
     : _memory_manager(sirius::test::operator_utils::initialize_memory_manager()),
-      _creator(*_memory_manager, strategy),
+      _creator(lifecycle, *_memory_manager, strategy),
       union_op({}, 0),
       union_pipeline(std::make_shared<sirius_pipeline>(pipeline_build_context{nullptr, true}))
   {

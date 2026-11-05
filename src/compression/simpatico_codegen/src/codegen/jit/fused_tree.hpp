@@ -3,8 +3,8 @@
 // the encode/decode JIT renderers (`encode/jit/renderer.cpp`,
 // `decode/jit/renderer.cpp`) walk it and emit plain CUDA source text,
 // which is then compiled at runtime via NVRTC and cached by shape (see
-// `KernelCache`/`ShapeKey` in `kernel_cache.hpp`, keyed on a hash of
-// the rendered source).  The beam-search explorer enumerates hundreds
+// `KernelCache` in `kernel_cache.hpp`, keyed on compilation inputs).
+// The beam-search explorer enumerates hundreds
 // of thousands of candidate shapes, so this has to be a runtime value
 // rather than a compile-time template instantiation per shape.
 //
@@ -31,6 +31,16 @@ enum class OpKind : int { Bitpack, For, Delta, Rle, Raw, Zigzag, None };
 
 inline constexpr int kChunkSize = 1024;
 inline constexpr int kTBSize    = 128;
+
+// Bitpack's live packed-word count is summed into a `lw_shards` slab of
+// kBitpackLiveWordShards uint32 counters, one every kBitpackLiveWordShardStride
+// words (128 bytes, so each shard has its own L2 line); chunk c adds to shard
+// c % kBitpackLiveWordShards. The renderer sizes the slab and emits the atomicAdd
+// from these; the host reads the shards back with the same stride.
+inline constexpr std::size_t kBitpackLiveWordShards      = 16;
+inline constexpr std::size_t kBitpackLiveWordShardStride = 32;
+static_assert((kBitpackLiveWordShards & (kBitpackLiveWordShards - 1)) == 0,
+              "the kernel picks a shard with a mask");
 
 inline constexpr int32_t num_chunks_for(int64_t n) noexcept
 {

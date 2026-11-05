@@ -23,6 +23,16 @@ pub(crate) fn bool_type() -> Type {
     }
 }
 
+/// Builds a BIGINT type, which DuckDB returns for date parts and string lengths.
+pub(crate) fn i64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::I64(r#type::I64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
 /// Builds an FP64 type used to lower arithmetic Sirius cannot execute on decimal columns.
 pub(crate) fn fp64_type(nullable: bool) -> Type {
     Type {
@@ -222,6 +232,39 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
     Ok(Type { kind: Some(kind) })
 }
 
+/// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
+/// an input stream's schema.
+pub fn duckdb_type_name(ty: &Type) -> Result<String> {
+    let kind = ty
+        .kind
+        .as_ref()
+        .ok_or_else(|| TranslateError::malformed("stream input column has no type"))?;
+    let name = match kind {
+        r#type::Kind::Bool(_) => "BOOLEAN".to_string(),
+        r#type::Kind::I8(_) => "TINYINT".to_string(),
+        r#type::Kind::I16(_) => "SMALLINT".to_string(),
+        r#type::Kind::I32(_) => "INTEGER".to_string(),
+        r#type::Kind::I64(_) => "BIGINT".to_string(),
+        r#type::Kind::Fp32(_) => "FLOAT".to_string(),
+        r#type::Kind::Fp64(_) => "DOUBLE".to_string(),
+        r#type::Kind::FixedChar(_) | r#type::Kind::Varchar(_) | r#type::Kind::String(_) => {
+            "VARCHAR".to_string()
+        }
+        r#type::Kind::Binary(_) | r#type::Kind::FixedBinary(_) => "BLOB".to_string(),
+        r#type::Kind::Date(_) => "DATE".to_string(),
+        r#type::Kind::PrecisionTimestamp(_) => "TIMESTAMP".to_string(),
+        r#type::Kind::Decimal(decimal) => {
+            format!("DECIMAL({},{})", decimal.precision, decimal.scale)
+        }
+        _ => {
+            return Err(TranslateError::malformed(
+                "stream input column type has no DuckDB name",
+            ));
+        }
+    };
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +284,51 @@ mod tests {
             map_scalar_type(&decimal(19), true).unwrap().kind,
             Some(r#type::Kind::Fp64(_))
         ));
+    }
+
+    /// Every mapped kind renders as the DuckDB type name the engine parses for a stream column.
+    #[test]
+    fn duckdb_type_name_covers_every_mapped_kind() {
+        let cases = [
+            (r#type::Kind::Bool(Default::default()), "BOOLEAN"),
+            (r#type::Kind::I8(Default::default()), "TINYINT"),
+            (r#type::Kind::I16(Default::default()), "SMALLINT"),
+            (r#type::Kind::I32(Default::default()), "INTEGER"),
+            (r#type::Kind::I64(Default::default()), "BIGINT"),
+            (r#type::Kind::Fp32(Default::default()), "FLOAT"),
+            (r#type::Kind::Fp64(Default::default()), "DOUBLE"),
+            (r#type::Kind::FixedChar(Default::default()), "VARCHAR"),
+            (r#type::Kind::Varchar(Default::default()), "VARCHAR"),
+            (r#type::Kind::String(Default::default()), "VARCHAR"),
+            (r#type::Kind::Binary(Default::default()), "BLOB"),
+            (r#type::Kind::FixedBinary(Default::default()), "BLOB"),
+            (r#type::Kind::Date(Default::default()), "DATE"),
+            (
+                r#type::Kind::PrecisionTimestamp(Default::default()),
+                "TIMESTAMP",
+            ),
+            (
+                r#type::Kind::Decimal(r#type::Decimal {
+                    precision: 15,
+                    scale: 2,
+                    ..Default::default()
+                }),
+                "DECIMAL(15,2)",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let name = duckdb_type_name(&Type { kind: Some(kind) }).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    /// A kind with no DuckDB name, or no kind at all, is an error rather than a guessed name.
+    #[test]
+    fn duckdb_type_name_rejects_unmapped_kinds() {
+        let interval = Type {
+            kind: Some(r#type::Kind::IntervalYear(Default::default())),
+        };
+        assert!(duckdb_type_name(&interval).is_err());
+        assert!(duckdb_type_name(&Type { kind: None }).is_err());
     }
 }

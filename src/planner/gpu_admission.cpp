@@ -23,25 +23,32 @@
 
 namespace sirius::planner {
 
-void collect_gpu_scans(const op::sirius_physical_operator& node,
-                       std::vector<const op::sirius_physical_operator*>& out)
+void for_each_gpu_scan(const op::sirius_physical_operator& node,
+                       absl::FunctionRef<void(const op::sirius_physical_operator&)> visit)
 {
-  if (node.type == op::SiriusPhysicalOperatorType::GPU_SCAN) { out.push_back(&node); }
+  if (node.type == op::SiriusPhysicalOperatorType::GPU_SCAN) { visit(node); }
 
   for (auto& child : node.children) {
-    if (child) { collect_gpu_scans(*child, out); }
+    if (child) { for_each_gpu_scan(*child, visit); }
   }
 
   if (node.type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
       node.type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& delim = node.Cast<op::sirius_physical_delim_join>();
-    if (delim.join) { collect_gpu_scans(*delim.join, out); }
-    if (delim.distinct_root) { collect_gpu_scans(*delim.distinct_root, out); }
+    if (delim.join) { for_each_gpu_scan(*delim.join, visit); }
+    if (delim.distinct_root) { for_each_gpu_scan(*delim.distinct_root, visit); }
   }
   if (node.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     auto& rc = node.Cast<op::sirius_physical_result_collector>();
-    collect_gpu_scans(rc.plan, out);
+    for_each_gpu_scan(rc.plan, visit);
   }
+}
+
+void collect_gpu_scans(const op::sirius_physical_operator& node,
+                       std::vector<const op::sirius_physical_operator*>& out)
+{
+  for_each_gpu_scan(node,
+                    [&out](const op::sirius_physical_operator& scan) { out.push_back(&scan); });
 }
 
 }  // namespace sirius::planner

@@ -464,7 +464,7 @@ def main() -> int:
     parser.add_argument(
         "--unittest",
         type=Path,
-        default=ROOT / "build/release/extension/sirius/test/cpp/sirius_unittest",
+        default=ROOT / "build/release/test/cpp/sirius_unittest",
     )
     parser.add_argument(
         "--config",

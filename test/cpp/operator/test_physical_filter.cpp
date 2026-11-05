@@ -20,7 +20,6 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -80,7 +79,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
       *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   }
 
-  auto filter_duckdb = duckdb::make_uniq<BoundComparisonExpression>(
+  auto filter_duckdb = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                                 0),

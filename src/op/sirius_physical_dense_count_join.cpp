@@ -28,7 +28,6 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
@@ -45,9 +44,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -210,6 +213,24 @@ dense_count_join_input::dense_count_join_input(
 {
 }
 
+std::unique_ptr<pipelineable_operator_data> dense_count_join_input::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  if (batches.size() != _preserved_count + _counted_count) {
+    throw std::invalid_argument(
+      "dense_count_join_input: a row-preserving replacement must replace each batch in place");
+  }
+  auto const counted_begin = batches.begin() + static_cast<std::ptrdiff_t>(_preserved_count);
+  std::vector<std::shared_ptr<::cucascade::data_batch>> preserved(
+    std::make_move_iterator(batches.begin()), std::make_move_iterator(counted_begin));
+  std::vector<std::shared_ptr<::cucascade::data_batch>> counted(
+    std::make_move_iterator(counted_begin), std::make_move_iterator(batches.end()));
+  auto replacement =
+    std::make_unique<dense_count_join_input>(std::move(preserved), std::move(counted));
+  replacement->adopt_partition_identity(*this);
+  return replacement;
+}
+
 sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
@@ -330,11 +351,14 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
       }
     }
   }
-  return partition_strategy{
-    num_partitions,
-    /*broadcast=*/false,
-    /*build_probe=*/false,
-    partition_placement::round_robin(static_cast<std::size_t>(num_partitions), active_gpu_ids())};
+  // The histogram/hash state is task-local; a lone partition needs no fixed GPU.
+  return partition_strategy{num_partitions,
+                            /*broadcast=*/false,
+                            /*build_probe=*/false,
+                            num_partitions == 1
+                              ? partition_placement::unpinned(1)
+                              : partition_placement::round_robin(
+                                  static_cast<std::size_t>(num_partitions), active_gpu_ids())};
 }
 
 std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_task_hint()
@@ -434,7 +458,7 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
       ? std::min(static_cast<std::size_t>(_planned_histogram_bytes), admission_ceiling)
       : admission_ceiling;
 
-  auto const key_width      = sirius::get_cudf_type(types[0]).id() == cudf::type_id::INT32
+  auto const key_width      = sirius::require_cudf_type(types[0]).id() == cudf::type_id::INT32
                                 ? sizeof(int32_t)
                                 : sizeof(int64_t);
   auto const cudf_row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
@@ -510,7 +534,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   auto* space = ro_batches.front().get_memory_space();
   auto mr     = space->get_default_allocator();
 
-  auto const key_type   = sirius::get_cudf_type(types[0]);
+  auto const key_type   = sirius::require_cudf_type(types[0]);
   auto require_key_type = [&](cudf::column_view const& col, char const* side) {
     if (col.type().id() != key_type.id()) {
       throw sirius::internal_exception(

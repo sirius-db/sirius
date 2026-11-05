@@ -146,7 +146,8 @@ TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "
     R"(<?xml version="1.0" encoding="UTF-8"?>)"
     R"(<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">)"
     R"(<Name>bucket</Name><Prefix>lake/</Prefix>)"
-    R"(<Contents><Key>lake/a&amp;b.parquet</Key><Size>12</Size></Contents>)"
+    R"(<Contents><Key>lake/a&amp;b.parquet</Key><Size>12</Size>)"
+    R"(<ETag>&quot;9b2cf535f27731c974343645a3985328&quot;</ETag></Contents>)"
     R"(<Contents><Key>lake/year=2024/file.parquet</Key><Size>0</Size></Contents>)"
     R"(<IsTruncated>true</IsTruncated>)"
     R"(<NextContinuationToken>token/with+chars=</NextContinuationToken>)"
@@ -155,8 +156,10 @@ TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "
   REQUIRE(page.entries.size() == 2);
   CHECK(page.entries[0].key == "lake/a&b.parquet");
   CHECK(page.entries[0].size == 12);
+  CHECK(page.entries[0].etag == "\"9b2cf535f27731c974343645a3985328\"");
   CHECK(page.entries[1].key == "lake/year=2024/file.parquet");
   CHECK(page.entries[1].size == 0);
+  CHECK(page.entries[1].etag.empty());
   CHECK(page.is_truncated);
   CHECK(page.next_continuation_token == "token/with+chars=");
 }
@@ -412,16 +415,17 @@ TEST_CASE("sigv4_presigned_authorizer signs sorted ListObjectsV2 query params", 
 TEST_CASE("sigv4_header_authorizer signs ListObjectsV2 canonical queries", "[s3][sigv4]")
 {
   sigv4_header_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.example.test:9000");
 
   auto request =
     provider.authorize_list("bucket",
                             "continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&prefix=p%2F",
                             k_presign_timeout);
 
-  CHECK(request.url ==
-        "http://minio.local:9000/bucket?continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&"
-        "prefix=p%2F");
+  CHECK(
+    request.url ==
+    "http://s3.example.test:9000/bucket?continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&"
+    "prefix=p%2F");
   CHECK_FALSE(contains(request.url, "X-Amz-Signature"));
   CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
   CHECK_FALSE(header_value(request.headers, "x-amz-date").empty());
@@ -460,14 +464,14 @@ TEST_CASE("sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][sigv4]")
 TEST_CASE("sigv4_presigned_authorizer preserves HTTP endpoint ports", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.example.test:9000");
 
   auto request =
     provider.authorize({"bucket", "object.parquet"}, request_method::GET, k_presign_timeout);
   CHECK(request.headers.empty());
   auto const& url = request.url;
 
-  CHECK(starts_with(url, "http://minio.local:9000/bucket/object.parquet?"));
+  CHECK(starts_with(url, "http://s3.example.test:9000/bucket/object.parquet?"));
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }
 
@@ -532,12 +536,12 @@ TEST_CASE("sigv4_header_authorizer signs with headers and plain path-style URLs"
 TEST_CASE("sigv4_header_authorizer omits session-token header for long-lived keys", "[s3][sigv4]")
 {
   sigv4_header_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.example.test:9000");
 
   auto request = provider.authorize(
     {"bucket", "nested/object.parquet"}, request_method::GET, std::chrono::seconds{10});
 
-  CHECK(request.url == "http://minio.local:9000/bucket/nested/object.parquet");
+  CHECK(request.url == "http://s3.example.test:9000/bucket/nested/object.parquet");
   CHECK_FALSE(contains(request.url, "X-Amz-"));
   CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
   CHECK(header_value(request.headers, "x-amz-security-token").empty());

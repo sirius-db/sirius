@@ -74,23 +74,26 @@ namespace {
 // conditions vector is consumed at the call boundary).
 join_condition wrap_one(duckdb::JoinCondition& c)
 {
+  if (!c.IsComparison()) {
+    throw duckdb::NotImplementedException("Non-comparison join condition is not supported on GPU");
+  }
   // Both join-condition expressions must be translatable before the hash join stores them.
-  auto left  = sirius::ast::from_duckdb(*c.left);
-  auto right = sirius::ast::from_duckdb(*c.right);
+  auto left  = sirius::ast::from_duckdb(c.GetLHS());
+  auto right = sirius::ast::from_duckdb(c.GetRHS());
   if (left == nullptr) {
     throw duckdb::NotImplementedException(
       "Unsupported expression on the left side of a join condition (falling back to CPU): " +
-      c.left->ToString());
+      c.GetLHS().ToString());
   }
   if (right == nullptr) {
     throw duckdb::NotImplementedException(
       "Unsupported expression on the right side of a join condition (falling back to CPU): " +
-      c.right->ToString());
+      c.GetRHS().ToString());
   }
   return join_condition{
     std::move(left),
     std::move(right),
-    from_duckdb(c.comparison),
+    from_duckdb(c.GetComparisonType()),
   };
 }
 

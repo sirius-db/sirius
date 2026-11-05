@@ -23,6 +23,7 @@
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -47,10 +48,6 @@ namespace duckdb {
 class SingleFileBlockManager;
 }
 
-namespace sirius::op {
-class sirius_dynamic_filter_set;
-}  // namespace sirius::op
-
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -64,18 +61,10 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   duckdb::vector<sirius::logical_type> returned_types;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
+  std::size_t projected_output_count = 0;
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
-  /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
-  /// wired. The ingestible installs the consumer column remap on the channel; the downstream
-  /// dynamic-filter operator applies the filters post-decode (the native scan has no read-time
-  /// dynamic path).
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-
-  /// Skip the constructor's metadata walk: a pin-served scan takes its splits from the pinned
-  /// entry. ensure_metadata_prepared() runs the walk if the scan falls to disk after all.
-  bool defer_metadata_walk = false;
 
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
@@ -150,6 +139,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// stats-backed only): the split stages no file reads and may carry a null
   /// datasource.
   bool host_backed_only = false;
+  bool is_insert_delta  = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
@@ -193,8 +183,16 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   [[nodiscard]] bool metadata_walk_pending() const noexcept
   {
-    return _walk_deferred && !_walk_ready.load(std::memory_order_acquire);
+    return !_walk_ready.load(std::memory_order_acquire);
   }
+
+  [[nodiscard]] duckdb::AttachedDatabase& attached_database() const noexcept
+  {
+    return _info->storage->GetAttached();
+  }
+
+  /// Valid only after ensure_metadata_prepared() completed under the caller's checkpoint key.
+  [[nodiscard]] std::uint64_t checkpoint_iteration() const;
 
   /// Call only when !metadata_walk_pending().
   [[nodiscard]] duckdb_native_walk_plan const& walk_plan_for_testing() const noexcept
@@ -211,7 +209,8 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     ::cucascade::memory::memory_space const& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    expression_query_policy policy = {}) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
@@ -220,7 +219,8 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,
-    std::span<std::size_t const> elided) override;
+    std::span<std::size_t const> elided,
+    expression_query_policy policy = {}) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
@@ -231,7 +231,10 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   /// virtual output columns — rowid decodes as a regular leading data column.
   /// If native scans ever synthesize output columns, replace this constant with
   /// a derivation like parquet's.
-  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override { return true; }
+  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override
+  {
+    return _column_layout.output_is_identity;
+  }
 
   [[nodiscard]] bool has_row_filter() const noexcept override
   {
@@ -242,14 +245,16 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   void run_metadata_walk();
 
   std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;
+  scan_column_layout _column_layout;
   duckdb_native_walk_plan _plan;
   std::shared_ptr<duckdb::Expression> _filter_expression;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 
   //===----------Deferred metadata walk----------===//
-  bool _walk_deferred = false;
   std::atomic<bool> _walk_ready{false};
   std::once_flag _walk_once;  ///< Serializes the deferred walk; re-arms after a throw.
+  std::uint64_t _checkpoint_iteration = 0;
+  bool _inject_decode_failure         = false;
 
   //===----------RG Range Slicing----------===//
   std::size_t _chunk_row_groups =

@@ -15,18 +15,21 @@
  */
 
 #pragma once
+#include "expression_evaluator/query_policy.hpp"
 
 // sirius
-#include <config.hpp>
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 
 // cudf
-#include <cudf/ast/expressions.hpp>
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+
+#include <variant>
 
 // rmm
 #include <rmm/resource_ref.hpp>
@@ -43,19 +46,9 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <variant>
 #include <vector>
 
 namespace sirius {
-
-/**
- * @brief Returns the current default expression_evaluator_strategy configured via
- * `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
- */
-inline expression_evaluator_strategy strategy_from_config()
-{
-  return duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
-}
 
 /**
  * @brief The expression_evaluator is responsible for evaluating Sirius AST expressions on the GPU
@@ -64,8 +57,9 @@ inline expression_evaluator_strategy strategy_from_config()
  * It builds a tree of AST trees whose edges are 'AST breakers', i.e., expression
  * operations that don't have cuDF AST equivalents (e.g., LIKE, SUBSTRING, CASE, etc.). Each AST
  * tree is then interpreted or JIT-compiled with cuDF to produce the final result. If the
- * expression_evaluator_strategy is MATERIALIZE, the AST trees are single operators and revert to
- * direct unary/binary operators. To control how many nodes should be in an AST tree before we
+ * expression_evaluator_strategy is MATERIALIZE, expression nodes use direct unary/binary kernels;
+ * floating comparisons use a small interpreted AST to preserve NaN semantics, never AST JIT.
+ * To control how many nodes should be in an AST tree before we
  * evaluate in AST mode (rather than MATERIALIZE mode), toggle the `min_ast_size` parameter in the
  * constructor.
  */
@@ -234,8 +228,8 @@ class expression_evaluator {
    * @param expressions The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
    * @param stream The ::cuda::stream_ref in which to evaluate any cuDF operations.
-   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
+   * @param policy Expression strategy and regex JIT policy, copied from the query snapshot.
+   * Standalone callers use fixed defaults; SQL execution passes its policy explicitly.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
@@ -249,7 +243,7 @@ class expression_evaluator {
     duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -260,8 +254,8 @@ class expression_evaluator {
    * @param expression The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
    * @param stream The ::cuda::stream_ref in which to evaluate any cuDF operations.
-   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
+   * @param policy Expression strategy and regex JIT policy, copied from the query snapshot.
+   * Standalone callers use fixed defaults; SQL execution passes its policy explicitly.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
@@ -275,7 +269,7 @@ class expression_evaluator {
     sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -294,7 +288,7 @@ class expression_evaluator {
     sirius::ast::node const* expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -316,7 +310,7 @@ class expression_evaluator {
     std::vector<sirius::ast::node const*> expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -403,6 +397,12 @@ class expression_evaluator {
     return _narrow_domain_comparison_count;
   }
 
+  /// Number of AST JIT evaluations over the evaluator lifetime, for backend-selection tests.
+  [[nodiscard]] std::size_t ast_jit_evaluation_count_for_testing() const noexcept
+  {
+    return _ast_jit_evaluation_count;
+  }
+
   /// Number of shared LIKE-cache lookups over the evaluator lifetime.
   [[nodiscard]] std::size_t like_shared_cache_lookup_count_for_testing() const noexcept
   {
@@ -414,7 +414,7 @@ class expression_evaluator {
     std::map<std::string, like_multiliteral_cache::entry_ptr, std::less<>>;
 
   std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
-  expression_evaluator_strategy _strategy;  ///< The strategy to use for expression evaluation
+  const expression_query_policy _policy;  ///< Immutable policy retained for every evaluation
   rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
   ::cuda::stream_ref _stream{
     cudaStream_t{}};          ///< The stream in which to evaluate any cuDF operations
@@ -424,6 +424,7 @@ class expression_evaluator {
   std::shared_ptr<like_multiliteral_cache const> _like_cache;
   like_classification_memo _like_classifications;
   std::size_t _like_shared_cache_lookup_count{0};
+  std::size_t _ast_jit_evaluation_count{0};
   cudf::table_view _input_table;  ///< The input table for expression evaluation
   std::vector<std::unique_ptr<cudf::column>>
     _output_columns;  ///< The output columns generated by expression evaluation (one per
@@ -451,8 +452,23 @@ class expression_evaluator {
   std::size_t _restored_reference_cast_count{0};   ///< For observability/testing
   std::size_t _narrow_domain_comparison_count{0};  ///< For observability/testing
 
+  /// Measured magnitude bounds of HUGEINT input columns, shared by every expression of one
+  /// top-level evaluation; nullopt where the bound could not be established.
+  std::vector<std::pair<std::uint32_t, std::optional<unsigned __int128>>> _hugeint_reference_bounds;
+
   [[nodiscard]] like_multiliteral_cache::entry_ptr const& get_or_classify_like(
     std::string_view pattern);
+
+  /// An upper bound on |v| over every value @p node can produce, from constants, the types of
+  /// integer casts and measured HUGEINT input columns; nullopt when unknown or not below 2^127.
+  [[nodiscard]] std::optional<unsigned __int128> hugeint_magnitude_bound(
+    sirius::ast::node const& node);
+
+  /// Throws not_implemented_exception, falling back to DuckDB, when the HUGEINT ADD, SUB or MUL
+  /// @p call could pass 2^127. cuDF wraps where DuckDB raises an overflow error.
+  void require_hugeint_arithmetic_in_range(sirius::ast::function_call const& call,
+                                           evaluate_result const& left,
+                                           evaluate_result const& right);
 
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
@@ -471,6 +487,16 @@ class expression_evaluator {
    * column_reference pointing to the temp column's index in the combined table.
    */
   evaluate_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
+
+  /**
+   * @brief Evaluates @p expr in MATERIALIZE mode and broadcasts a scalar result to a column with
+   * one row per input row.
+   *
+   * Use it for operands that a handler reads as a column. DuckDB can leave a constant operand
+   * unfolded: statistics propagation reduces `coalesce(<non-null constant>, x)` to the constant
+   * after constant folding has run, leaving e.g. `month(DATE '2020-02-01')`.
+   */
+  evaluate_result evaluate_as_column(sirius::ast::node const& expr);
 
   // Return a cached strict numeric restoration for one input reference. MATERIALIZE mode receives
   // a non-owning view; AST mode receives a reference to the cache-owned _temp_columns entry.
@@ -550,6 +576,8 @@ class expression_evaluator {
   evaluate_result evaluate(sirius::ast::comparison const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::conjunction const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::function_call const& expr, evaluation_mode mode);
+  // Runs the function's libcudf kernel, whose result may be narrower than the declared type.
+  evaluate_result evaluate_function_kernel(sirius::ast::function_call const& expr);
   evaluate_result evaluate(sirius::ast::unary_op const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::coalesce const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::in_list const& expr, evaluation_mode mode);

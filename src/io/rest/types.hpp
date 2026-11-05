@@ -55,15 +55,18 @@ struct buf_sink {
 
 /// Response headers the reactor inspects on completion.  @c content_range
 /// validates that a 206 honored the requested byte range; @c retry_after drives
-/// the retry delay when the server asks the client to back off.
+/// the retry delay when the server asks the client to back off; @c etag is the
+/// response's validator.
 struct header_capture {
   std::string content_range;
   std::string retry_after;
+  std::string etag;
 
   void reset() noexcept
   {
     content_range.clear();
     retry_after.clear();
+    etag.clear();
   }
 };
 
@@ -72,6 +75,7 @@ struct header_capture {
 /// so its iovecs remain stable across retries and until a CUDA event drains.
 struct rest_io_op_request {
   object_ref object;
+  std::string validation_tag;
   std::unique_ptr<io_op_request> op;
   std::size_t attempt{0};
   std::size_t auth_attempt{0};

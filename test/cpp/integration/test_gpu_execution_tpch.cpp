@@ -14,15 +14,11 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_partition.hpp"
 #include "util/env_guard.hpp"
-
-#include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/config.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -267,15 +263,16 @@ class GPUExecutionFixtureBase {
     return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
   }
 
-  /// Collect all rows from a MaterializedQueryResult as sorted vectors of stringified values.
-  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  /// Collect all rows from a retained QueryResult as sorted vectors of stringified values.
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result)
   {
     std::vector<std::vector<std::string>> rows;
-    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+    auto result_rows = result.Collection().GetRows();
+    for (duckdb::idx_t r = 0; r < result_rows.size(); r++) {
       std::vector<std::string> row;
       row.reserve(result.ColumnCount());
       for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-        row.push_back(result.GetValue(c, r).ToString());
+        row.push_back(result_rows.GetValue(c, r).ToString());
       }
       rows.push_back(std::move(row));
     }
@@ -328,13 +325,13 @@ class GPUExecutionFixtureBase {
     // Build a per-column flag for which columns are floating-point.
     std::vector<bool> col_is_float(gpu_result->ColumnCount());
     for (duckdb::idx_t c = 0; c < gpu_result->ColumnCount(); c++) {
-      col_is_float[c] = is_floating_point(gpu_result->types[c].id());
+      col_is_float[c] = is_floating_point(gpu_result->GetTypes()[c].id());
     }
 
     // Collect and sort rows from already-materialized results for deterministic comparison.
     // This avoids re-running the query (which could fail for wrapped subqueries).
-    auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
-    auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto& gpu_mat = *gpu_result;
+    auto& cpu_mat = *cpu_result;
     auto gpu_rows = collect_rows(gpu_mat);
     auto cpu_rows = collect_rows(cpu_mat);
 
@@ -802,6 +799,24 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "[integration][gpu_execution][limit][limit_multi_batch]")
 {
   compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem limit 50 offset 200;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped aggregate over a limit that passes no rows",
+                 "[integration][gpu_execution][limit]")
+{
+  // The aggregate must still return its single row.
+  SECTION("empty input")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from "
+      "(select * from nation where n_regionkey > 10 limit 1);");
+  }
+  SECTION("offset past the end")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from (select * from nation limit 1 offset 100);");
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -3666,10 +3681,10 @@ watchdog_query_result run_query_with_watchdog(duckdb::Connection& con,
         out.column_names.reserve(result->ColumnCount());
         out.column_types.reserve(result->ColumnCount());
         for (duckdb::idx_t c = 0; c < result->ColumnCount(); ++c) {
-          out.column_names.push_back(result->ColumnName(c));
-          out.column_types.push_back(result->types[c].ToString());
+          out.column_names.push_back(result->ColumnName(c).GetIdentifierName());
+          out.column_types.push_back(result->GetTypes()[c].ToString());
         }
-        auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+        auto& materialized = *result;
         out.rows           = GPUExecutionFixtureBase::collect_rows(materialized);
       }
     } catch (std::exception const& e) {
@@ -3736,10 +3751,10 @@ watchdog_query_result compare_gpu_vs_cpu_with_watchdog(duckdb::Connection& con,
   cpu_column_names.reserve(cpu_result->ColumnCount());
   cpu_column_types.reserve(cpu_result->ColumnCount());
   for (duckdb::idx_t c = 0; c < cpu_result->ColumnCount(); ++c) {
-    cpu_column_names.push_back(cpu_result->ColumnName(c));
-    cpu_column_types.push_back(cpu_result->types[c].ToString());
+    cpu_column_names.push_back(cpu_result->ColumnName(c).GetIdentifierName());
+    cpu_column_types.push_back(cpu_result->GetTypes()[c].ToString());
   }
-  auto& cpu_materialized = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+  auto& cpu_materialized = *cpu_result;
   auto cpu_rows          = GPUExecutionFixtureBase::collect_rows(cpu_materialized);
 
   REQUIRE(gpu_result.column_count == cpu_result->ColumnCount());
@@ -4416,6 +4431,32 @@ TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
                 "[integration][gpu_execution][parquet][TPC-H][Q22]",
                 sirius::test::kTpchQ22)
 
+TPCH_TEST_CASES(
+  compare_gpu_vs_cpu_for,
+  GPUExecutionDuckDBFixture,
+  "gpu_execution - ROLLUP over lineitem",
+  "[integration][gpu_execution][grouping_sets]",
+  "select l_returnflag, l_linestatus, l_shipmode, grouping(l_returnflag, l_shipmode) g, "
+  "count(*) n, sum(l_quantity) q, avg(l_extendedprice) p, min(l_shipdate) d "
+  "from lineitem group by rollup(l_returnflag, l_linestatus, l_shipmode);",
+  1e-9f)
+
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - CUBE with COUNT(DISTINCT) over lineitem",
+                "[integration][gpu_execution][grouping_sets]",
+                "select l_returnflag, l_linestatus, count(distinct l_suppkey) s, count(*) n "
+                "from lineitem group by cube(l_returnflag, l_linestatus);")
+
+// Cross products of two tables and of single-row aggregates, the shape of TPC-DS Q88 and Q90.
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H tables cross product",
+                "[integration][gpu_execution][TPC-H][cross_product]",
+                "SELECT n_name, r_name, c, m FROM nation, region, "
+                "(SELECT count(*) c FROM lineitem WHERE l_quantity < 10), "
+                "(SELECT max(o_totalprice) m FROM orders);")
+
 //===----------------------------------------------------------------------===//
 // TPC-H SF10 smoke variants (TEST-04)
 //
@@ -4718,7 +4759,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     UNSCOPED_INFO("oversized VALUES fallback error: " << result->GetError());
   }
   REQUIRE_FALSE(result->HasError());
-  REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 256);
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 256);
 
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before,
@@ -4744,8 +4785,8 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   }
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 2);
-  REQUIRE(result->GetValue(0, 0).ToString() == "-9223372036854775809");
-  REQUIRE(result->GetValue(0, 1).ToString() == "9223372036854775808");
+  REQUIRE(result->Collection().GetValue(0, 0).ToString() == "-9223372036854775809");
+  REQUIRE(result->Collection().GetValue(0, 1).ToString() == "9223372036854775808");
 
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before,
@@ -4992,13 +5033,13 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   REQUIRE(check);
   if (check->HasError()) { UNSCOPED_INFO("intercepted query error: " << check->GetError()); }
   REQUIRE_FALSE(check->HasError());
-  REQUIRE(check->GetValue(0, 0).GetValue<int64_t>() == 5000);
-  REQUIRE(check->GetValue(1, 0).GetValue<int64_t>() == 1000);
+  REQUIRE(check->Collection().GetValue(0, 0).GetValue<int64_t>() == 5000);
+  REQUIRE(check->Collection().GetValue(1, 0).GetValue<int64_t>() == 1000);
 
   auto intact = con->Query("SELECT s = repeat('x', 5000) FROM ovf.main.bigstr WHERE id = 7;");
   REQUIRE(intact);
   REQUIRE_FALSE(intact->HasError());
-  REQUIRE(intact->GetValue(0, 0).GetValue<bool>());
+  REQUIRE(intact->Collection().GetValue(0, 0).GetValue<bool>());
 
   auto stats_after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(stats_before,

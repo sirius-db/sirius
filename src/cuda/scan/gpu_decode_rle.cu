@@ -42,8 +42,15 @@
 #include <rmm/detail/error.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <cub/cub.cuh>
+#include <cub/block/block_load.cuh>
+#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
+#include <cub/block/block_store.cuh>
+#include <cub/thread/thread_load.cuh>
+#include <cub/thread/thread_store.cuh>
+#include <cub/util_ptx.cuh>
 #include <cuda/cmath>
+#include <cuda/functional>
 #include <cuda/std/algorithm>
 #include <cuda/std/functional>
 #include <cuda/std/limits>

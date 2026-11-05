@@ -1,5 +1,14 @@
 @PACKAGE_INIT@
 
-include("${CMAKE_CURRENT_LIST_DIR}/sirius-targets.cmake")
-
+include("${CMAKE_CURRENT_LIST_DIR}/sirius-targets.cmake" OPTIONAL)
+if("static" IN_LIST sirius_FIND_COMPONENTS OR NOT TARGET sirius::sirius)
+  if(NOT TARGET sirius::sirius_static AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/sirius-static-targets.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/sirius-static-dependencies.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/sirius-static-targetsCorrosion.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/sirius-static-targets.cmake")
+  endif()
+  if(TARGET sirius::sirius_static)
+    set(sirius_static_FOUND TRUE)
+  endif()
+endif()
 check_required_components(sirius)

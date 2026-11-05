@@ -16,22 +16,18 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
 
-#include <fcntl.h>
 #include <log/logging.hpp>
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -67,6 +63,7 @@ sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
                                      std::shared_ptr<io_object> io_obj)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
 {
+  if (_io_ctx && _io_object) _io_ctx->metadata_store().open_observed(*_io_object);
 }
 
 sirius_datasource::~sirius_datasource() {}
@@ -74,8 +71,7 @@ sirius_datasource::~sirius_datasource() {}
 std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
 {
   if (!_io_ctx || !_io_object) { return nullptr; }
-  auto& cache = _io_ctx->metadata_store();
-  return cache.get_metadata(*_io_object);
+  return _io_ctx->metadata_store().get_metadata(*_io_object);
 }
 
 [[nodiscard]] bool sirius_datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata)
@@ -144,9 +140,8 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
-  size_t offset, size_t size, cudf_datasource_stream_t stream_arg)
+  size_t offset, size_t size, ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   rmm::device_buffer buf(size, stream);
   auto n = device_read(offset, size, reinterpret_cast<uint8_t*>(buf.data()), stream);
   n      = std::min(n, size);
@@ -157,9 +152,8 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
 size_t sirius_datasource::device_read(size_t offset,
                                       size_t size,
                                       uint8_t* dst,
-                                      cudf_datasource_stream_t stream_arg)
+                                      ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();
   stream.sync();
@@ -169,9 +163,8 @@ size_t sirius_datasource::device_read(size_t offset,
 std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
-                                                         cudf_datasource_stream_t stream_arg)
+                                                         ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   return bridge_semi_to_std([&] {
     if (uses_prefetching_cache()) {
       auto* cache = _io_ctx->cache();
@@ -259,28 +252,29 @@ prepare_result sirius_datasource::prepare_prefetch(bool wait_for_eviction)
   return prepare_result::nothing_to_prepare;
 }
 
-prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
+prefetch_refusal sirius_datasource::prefetch_async(
+  exec::invocable<void(cache::prefetch_result) noexcept> on_done)
 {
   if (!_cache_handle || !uses_prefetching_cache()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::no_cache;
   }
 
   if (_cache_handle.has_started_reading()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::consumer_ahead;
   }
 
   auto const producer = _cache_handle.producer_state();
   if (producer == cache::producer_stage::abandoned) {
-    on_done(false);
+    on_done({});
     // Allocation pressure no longer abandons a request: prepare() leaves it
     // queued so readahead can evict and retry.  An abandoned request therefore
     // lost the race with its consumer (or was cancelled), not its buffers.
     return prefetch_refusal::other;
   }
   if (producer < cache::producer_stage::prepared) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::other;
   }
   if (_io_ctx->cache()->prefetch(_cache_handle, std::move(on_done))) {
@@ -289,6 +283,11 @@ prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) no
 
   return _cache_handle.has_started_reading() ? prefetch_refusal::consumer_ahead
                                              : prefetch_refusal::other;
+}
+
+std::exception_ptr sirius_datasource::prefetch_failure() const noexcept
+{
+  return _cache_handle ? _cache_handle.failure() : nullptr;
 }
 
 bool sirius_datasource::uses_prefetching_cache() const noexcept

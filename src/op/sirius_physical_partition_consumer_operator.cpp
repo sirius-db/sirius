@@ -17,33 +17,11 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
 #include "sirius/exception.hpp"
-#include "telemetry/batch_telemetry.hpp"
 
 namespace sirius {
 namespace op {
 
 sirius_physical_partition_consumer_operator::~sirius_physical_partition_consumer_operator() {}
-
-void sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
-  std::string_view port_id,
-  std::shared_ptr<::cucascade::data_batch> batch,
-  std::size_t partition_idx)
-{
-  auto* p = get_port(port_id);
-  if (p && p->repo) {
-    telemetry::batch_telemetry_registry::instance().on_published(
-      batch, p->repo, telemetry::batch_origin::partition_output);
-    p->repo->add_data_batch(batch, partition_idx);
-  }
-}
-
-partition_strategy sirius_physical_partition_consumer_operator::get_partition_strategy(
-  const partition_sizing_input& /*in*/)
-{
-  throw std::runtime_error(
-    "get_partition_strategy called on a non-sizing partition consumer operator " + get_name() +
-    " (id " + std::to_string(get_operator_id()) + ")");
-}
 
 void sirius_physical_partition_consumer_operator::set_placement(
   std::shared_ptr<const partition_placement> placement)

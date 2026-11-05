@@ -4,7 +4,7 @@ A quick path from nothing installed to a GPU-accelerated query. Full details, re
 [docs/README.md](https://github.com/{{REPO}}/blob/main/docs/README.md).
 
 **Requirements**: Linux (amd64 or arm64), NVIDIA GPU Turing or newer (compute capability 7.5+), and either CUDA 12.x
-(driver >=525.60.13) or CUDA 13.x (driver >=580.65.06) matching the file you download below.
+(driver >=570.26) or CUDA 13.x (driver >=580.65.06) matching the file you download below.
 
 ### 1. Install DuckDB {{DUCKDB_VERSION}}
 
@@ -18,7 +18,15 @@ curl https://install.duckdb.org | DUCKDB_VERSION={{DUCKDB_VERSION_BARE}} sh
 
 {{DOWNLOAD_LINKS}}
 
-### 3. Allow unsigned extensions
+### 3. Decompress it
+
+Downloads are gzip-compressed to fit under GitHub's release-asset size limit:
+
+```bash
+gunzip <downloaded-file>.duckdb_extension.gz
+```
+
+### 4. Allow unsigned extensions
 
 Sirius isn't published through DuckDB's official signed extension repository yet, so you need to explicitly allow
 unsigned extensions before loading it:
@@ -32,7 +40,7 @@ For client APIs, pass the same config at connect time instead, e.g. Python:
 
 **Warning**: unsigned extensions execute native code with the host process's privileges.
 
-### 4. Load the extension and try it
+### 5. Load the extension and try it
 
 ```sql
 LOAD './{{FIRST_FILE}}';

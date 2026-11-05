@@ -6,13 +6,12 @@
  */
 
 #include "catch.hpp"
+#include "sirius_context.hpp"
 #include "sirius_extension.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
-
-#include <duckdb.hpp>
 
 #include <algorithm>
 #include <array>
@@ -23,7 +22,6 @@
 #include <fstream>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -53,7 +51,7 @@ struct s3_tpch_env {
 
 std::optional<s3_tpch_env> load_s3_tpch_env()
 {
-  if (!sirius::test::ensure_s3_container_env()) return std::nullopt;
+  if (!sirius::test::ensure_s3_test_env()) return std::nullopt;
 
   auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -83,7 +81,7 @@ bool should_skip_s3_tpch_env(std::optional<s3_tpch_env> const& env)
 
 class s3_tpch_config_guard {
  public:
-  s3_tpch_config_guard(s3_tpch_env const& env, bool sf1)
+  s3_tpch_config_guard(s3_tpch_env const& /*env*/, bool sf1)
   {
     if (auto const* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       original_config_ = current;
@@ -131,22 +129,6 @@ class s3_tpch_config_guard {
         << "\n"
            "  executor:\n"
            "    scan_manager:\n"
-           "      object_store:\n"
-           "        endpoint: "
-        << sql_quote(env.endpoint)
-        << "\n"
-           "        region: "
-        << sql_quote(env.region)
-        << "\n"
-           "        access_key: "
-        << sql_quote(env.access_key)
-        << "\n"
-           "        secret_key: "
-        << sql_quote(env.secret_key) << "\n";
-    if (!env.session_token.empty()) {
-      out << "        session_token: " << sql_quote(env.session_token) << "\n";
-    }
-    out << "        tls_verify: false\n"
            "      rest:\n"
            "        request_timeout_s: 30\n";
     out.close();
@@ -200,7 +182,7 @@ void tpch_load_sirius_extension(duckdb::DuckDB& db)
   }
 }
 
-std::vector<std::vector<std::string>> tpch_collect_rows(duckdb::MaterializedQueryResult& result)
+std::vector<std::vector<std::string>> tpch_collect_rows(duckdb::QueryResult& result)
 {
   std::vector<std::vector<std::string>> rows;
   rows.reserve(result.RowCount());
@@ -208,7 +190,7 @@ std::vector<std::vector<std::string>> tpch_collect_rows(duckdb::MaterializedQuer
     std::vector<std::string> row;
     row.reserve(result.ColumnCount());
     for (duckdb::idx_t column_index = 0; column_index < result.ColumnCount(); ++column_index) {
-      row.push_back(result.GetValue(column_index, row_index).ToString());
+      row.push_back(result.Collection().GetValue(column_index, row_index).ToString());
     }
     rows.push_back(std::move(row));
   }
@@ -295,12 +277,24 @@ class s3_tpch_suite {
     gpu_db_ = std::make_unique<duckdb::DuckDB>(nullptr);
     tpch_load_sirius_extension(*gpu_db_);
     gpu_connection_ = std::make_unique<duckdb::Connection>(*gpu_db_);
+    auto context =
+      gpu_connection_->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    sirius::io::object_store_config object_store;
+    object_store.endpoint      = env_.endpoint;
+    object_store.region        = env_.region;
+    object_store.access_key    = env_.access_key;
+    object_store.secret_key    = env_.secret_key;
+    object_store.session_token = env_.session_token;
+    object_store.tls_verify    = false;
+    context->get_config().set_object_store_config(object_store);
+    context->get_scan_manager().install_s3_config("s3://" + env_.bucket, object_store);
     auto const root = "s3://" + env_.bucket + "/" + object_prefix_;
     create_views(*gpu_connection_, root, true);
     tpch_require_query_ok(*gpu_connection_, "SET gpu_execution = true;");
   }
 
-  std::unique_ptr<duckdb::MaterializedQueryResult> run_gpu_query(std::string const& sql)
+  std::unique_ptr<duckdb::QueryResult> run_gpu_query(std::string const& sql)
   {
     auto result = gpu_connection_->Query(sql);
     if (!result) throw std::runtime_error("GPU query returned no result");
@@ -324,11 +318,11 @@ class s3_tpch_suite {
 
     std::vector<bool> floating_columns(gpu_result->ColumnCount());
     for (duckdb::idx_t column = 0; column < gpu_result->ColumnCount(); ++column) {
-      floating_columns[column] = tpch_is_floating_point(gpu_result->types[column].id());
+      floating_columns[column] = tpch_is_floating_point(gpu_result->GetTypes()[column].id());
     }
 
     auto gpu_rows = tpch_collect_rows(*gpu_result);
-    auto cpu_rows = tpch_collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+    auto cpu_rows = tpch_collect_rows(*cpu_result);
     REQUIRE(gpu_rows.size() == cpu_rows.size());
     for (std::size_t row = 0; row < gpu_rows.size(); ++row) {
       REQUIRE(gpu_rows[row].size() == cpu_rows[row].size());

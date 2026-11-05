@@ -50,6 +50,7 @@ struct unary_op {
     op_not,
     op_is_null,
     op_is_not_null,
+    // Reserved for future GPU evaluation; DuckDB-to-Sirius translation currently rejects TRY.
     op_try,
   };
 

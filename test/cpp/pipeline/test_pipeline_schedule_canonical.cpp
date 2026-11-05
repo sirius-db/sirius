@@ -14,13 +14,11 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_concat.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -56,6 +54,20 @@ std::string operator_chain(const sirius_pipeline& pipeline)
   static const std::regex kIdToken{" \\(id=\\d+\\)"};
   return std::regex_replace(
     sirius::pipeline::sirius_plan_printer::build_operator_chain(pipeline), kIdToken, "");
+}
+
+std::string normalize_contract_runtime_ids(std::string dump)
+{
+  // Contract handles are process-wide monotonic and finalize generations advance per planning
+  // attempt. Both are required in the diagnostic dump, but neither is schedule structure.
+  static const std::regex kHandle{"(handle=)\\d+"};
+  static const std::regex kFinalizeGeneration{"(finalize_generation=)\\d+"};
+  dump = std::regex_replace(dump, kHandle, "$1<volatile>");
+  dump = std::regex_replace(dump, kFinalizeGeneration, "$1<volatile>");
+  // Measured certification durations vary between attempts; keep byte counts,
+  // verdicts, required checks and the entire schedule in the comparison.
+  static const std::regex kDurations{"((?:added_time_us|delete_preparation_time_us)=)\\d+"};
+  return std::regex_replace(dump, kDurations, "$1<volatile>");
 }
 
 //! Every pipeline must appear after all of its `dependencies` (producers).
@@ -99,8 +111,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
     }
 
     // Join dependencies are build-side-first: dependencies[0] is the build CONCAT
-    // (finalize_pipeline_structure front-inserts it; link_join_partition_siblings and
-    // dynamic-filter scheduling read the slots positionally).
+    // (finalize_pipeline_structure front-inserts it for dynamic-filter scheduling).
     for (const auto& pipeline : scheduled) {
       auto source = pipeline->get_source();
       if (!source || (source->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
@@ -112,7 +123,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
       auto build_sink = pipeline->dependencies[0]->get_sink();
       REQUIRE(build_sink);
       REQUIRE(build_sink->type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
-      CHECK(build_sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat());
+      CHECK(source->input_port_for(*build_sink) == "build");
     }
 
     // Reordering an already-canonical schedule is a no-op.
@@ -131,7 +142,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
   // Convert-twice raw-schedule determinism (see the battery doc above).
   auto first_raw  = sirius::test::convert_query_to_raw_schedule(con, query);
   auto second_raw = sirius::test::convert_query_to_raw_schedule(con, query);
-  REQUIRE(first_raw == second_raw);
+  REQUIRE(normalize_contract_runtime_ids(first_raw) == normalize_contract_runtime_ids(second_raw));
 }
 
 //! The 8 TPC-H tables as views over the committed parquet fixtures.

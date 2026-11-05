@@ -22,8 +22,10 @@ detail::batched_codec_ops const& deflate_ops()
 
     detail::batched_codec_ops o;
     o.chunk_size             = kDeflateChunkSize;
-    o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedGdeflateCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+    o.compress_get_temp_size = [copts](
+                                 size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+      return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+        nvcompBatchedGdeflateCompressGetTempSize, stream, nc, mc, copts, tb, mt);
     };
     o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
       return nvcompBatchedGdeflateCompressGetMaxOutputChunkSize(mc, copts, mo);
@@ -40,9 +42,11 @@ detail::batched_codec_ops const& deflate_ops()
                                cudaStream_t s) {
       return nvcompBatchedGdeflateCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
     };
-    o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedGdeflateDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
-    };
+    o.decompress_get_temp_size =
+      [dopts](size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+        return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+          nvcompBatchedGdeflateDecompressGetTempSize, stream, nc, mc, dopts, tb, mt);
+      };
     o.decompress_async = [dopts](void const* const* cp,
                                  size_t const* cb,
                                  size_t const* ubuf,
@@ -64,10 +68,10 @@ detail::batched_codec_ops const& deflate_ops()
 }  // namespace
 
 std::unique_ptr<cudf::column> deflate_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
   return detail::nvcomp_decompress_impl(
-    deflate_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+    deflate_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> deflate_compressor::compress(
