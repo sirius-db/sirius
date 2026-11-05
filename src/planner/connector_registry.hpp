@@ -121,8 +121,10 @@ std::span<connector const> registered_connectors();
 #ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
 namespace testing {
 // Test builds only. Replaces the policy and hook fields of existing trusted registry entries for
-// one database instance while lookup keeps verifying the original entry's trusted references,
-// bind data, catalog registration and verify_binding. A matching override is authoritative: its
+// one database instance. Lookup uses the override's bind-data matcher to decide whether the
+// binding is accepted, and its optional verify_binding check. Lookup still checks the registered
+// function's trusted references and catalog registration.
+// A matching override is authoritative: its
 // decline never falls through to the original entry. Install the scope before any binding,
 // policy or capture lookup and keep it alive until every prepared statement, callback and
 // execution that may observe it has drained. The database must outlive the scope.
