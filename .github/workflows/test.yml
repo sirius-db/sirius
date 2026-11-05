@@ -253,6 +253,7 @@ jobs:
       - name: Run C++ unit tests
         env:
           SIRIUS_EXTENSION_PATH: ${{ github.workspace }}/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+          SIRIUS_TEST_GPU: "1"
           SIRIUS_TEST_REQUIRE_DUCKLAKE: "1"
         run: |
           nvidia-smi
