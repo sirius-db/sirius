@@ -148,7 +148,8 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan,
   std::uint64_t validated_plan_pin_epoch,
   std::optional<uint64_t> captured_transaction_id,
-  std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs)
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs,
+  std::uint64_t validated_distributed_query)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
@@ -162,7 +163,8 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     source_policy_(std::move(source_policy)),
     captured_transaction_id_(captured_transaction_id),
     validated_sirius_plan_(std::move(validated_sirius_plan)),
-    validated_plan_pin_epoch_(validated_plan_pin_epoch)
+    validated_plan_pin_epoch_(validated_plan_pin_epoch),
+    validated_distributed_query_(validated_distributed_query)
 {
 }
 
@@ -279,6 +281,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         if (current_epoch == planned_epoch && read_view_injection_stage != "execute" &&
             read_view_injection_stage != "execute_copy_fails") {
           sirius_plan = std::move(validated_sirius_plan_);
+          if (state.sirius_context) {
+            state.sirius_context->adopt_distributed_query(context.client,
+                                                          validated_distributed_query_);
+          }
         } else {
           validated_sirius_plan_.reset();
           SIRIUS_LOG_INFO(
