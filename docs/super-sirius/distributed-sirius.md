@@ -211,7 +211,9 @@ A hash join's build side is broadcast when its estimated size is at most 1 GiB a
 probe side's divided by ranks − 1, and when its join type emits build rows only with a probe match.
 A hashed `MARK` join (`IN`, `NOT IN`, `ANY`) sends build rows with a NULL key to every rank: one
 NULL build key makes an unmatched probe row's mark NULL rather than false, on whichever rank that
-row is.
+row is. Each rank also sends one row of its build input to every rank, so a rank's share is empty
+only when the whole build is: a NULL probe key's mark is NULL against any non-empty build. That
+row matches nothing off its home rank, since every probe row with its key hashes there.
 A nested-loop join refuses the types that emit unmatched build rows (`RIGHT`, `OUTER`,
 `RIGHT_SEMI`, `RIGHT_ANTI`), since every rank holds the whole build.
 
