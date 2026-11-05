@@ -30,6 +30,7 @@
 #include <chrono>
 #include <exception>
 #include <format>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <stdexcept>
@@ -446,10 +447,21 @@ void downgrade_executor::processing_loop()
                   cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
                 if (result) {
                   std::move(rollback).Cancel();
-                  req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  // A task may move only some of its source-space batches (the target filled up,
+                  // a batch was locked); credit what left the source space, not the task total.
+                  auto const moved_bytes =
+                    std::accumulate(result->begin(), result->end(), std::size_t{0});
+                  if (moved_bytes >= candidate_bytes) {
+                    planned_bytes.fetch_add(moved_bytes - candidate_bytes,
+                                            std::memory_order_relaxed);
+                  } else {
+                    planned_bytes.fetch_sub(candidate_bytes - moved_bytes,
+                                            std::memory_order_relaxed);
+                  }
+                  req_ptr->bytes_freed.fetch_add(moved_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                  pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  pipeline_queue_stats.bytes.fetch_add(moved_bytes, std::memory_order_relaxed);
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
                     if (i < host_end_idx) {
