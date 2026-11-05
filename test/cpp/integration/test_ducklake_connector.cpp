@@ -5715,13 +5715,17 @@ TEST_CASE("DuckLake remote deletes publish earlier files under bounded preparati
   auto refused         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
   refused->return_null = true;
   counters->preparation_provider_for_testing = refused;
-  auto rejected_before                       = runtime->get_transparent_execution_stats();
-  auto rejected                              = con.Query(sql);
+  bool admission_refused                     = false;
+  counters->iceberg_statement_route_for_testing =
+    [&](std::string_view route, sirius::scan_manager::admission_decision const& decision) {
+      admission_refused = route == "provider_admission_refused" && !decision.deferred;
+    };
+  auto rejected_before = runtime->get_transparent_execution_stats();
+  auto rejected        = con.Query(sql);
   REQUIRE(rejected);
   REQUIRE(rejected->HasError());
   INFO(rejected->GetError());
-  CHECK(rejected->GetError().find("DuckLake statement preparation was not admitted") !=
-        std::string::npos);
+  CHECK(admission_refused);
   CHECK(refused->seen->requests == 1);
   CHECK(refused->seen->allocations == 0);
   CHECK(refused->outstanding() == 0);
