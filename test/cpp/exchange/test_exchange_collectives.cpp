@@ -268,10 +268,12 @@ struct whole_build_join {
     std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   dynamic_filter_publish_plan plan;
 
-  explicit whole_build_join(std::shared_ptr<exchange_service> service)
-    : plan(filter_plan(channel, 64 * KiB))
+  explicit whole_build_join(std::shared_ptr<exchange_service> service,
+                            std::size_t bloom_keys = 4096,
+                            std::uint64_t cap      = 64 * KiB)
+    : plan(filter_plan(channel, cap))
   {
-    plan.set_distributed(merge_over(std::move(service), 4096));
+    plan.set_distributed(merge_over(std::move(service), bloom_keys));
   }
 
   sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
@@ -321,12 +323,13 @@ std::vector<std::int64_t> sequence(std::int64_t first, std::int64_t step, int co
 TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
           "[exchange][collectives][dynamic_filter]")
 {
-  // Planned for 2^30 keys; the 64 KiB cap cuts every rank's Bloom to the same 32Ki keys.
+  // Planned for 2^30 keys. The cap holds the key's Bloom, the copy sent and the other rank's, so
+  // 3 x 64 KiB cuts every rank's Bloom to the same 64 KiB.
   ranks c(2);
   std::vector<std::unique_ptr<accumulating_join>> joins;
   for (rank_t r = 0; r < 2; ++r) {
     joins.push_back(
-      std::make_unique<accumulating_join>(c.all[r].service, std::size_t{1} << 30, 64 * KiB));
+      std::make_unique<accumulating_join>(c.all[r].service, std::size_t{1} << 30, 3 * 64 * KiB));
   }
   // Rank 0 holds the even keys, rank 1 the odd ones.
   on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000)); });
@@ -338,6 +341,27 @@ TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
     CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
     // Keys no rank holds are mostly absent.
     CHECK(members(*bloom, sequence(1'000'000, 1, 4000)) < 100);
+  }
+}
+
+TEST_CASE("a rank that accumulates and one that publishes a whole build size their Blooms alike",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  auto const planned = std::size_t{1} << 30;
+  accumulating_join accumulated(c.all[0].service, planned, 3 * 64 * KiB);
+  whole_build_join whole(c.all[1].service, planned, 3 * 64 * KiB);
+  on_every_rank(2, [&](rank_t r) {
+    if (r == 0) {
+      accumulated.build(keys_batch(0, 2, 2000));
+    } else {
+      static_cast<void>(whole.publish(keys_table(1, 2, 2000)->view()));
+    }
+  });
+  for (auto const* bloom : {accumulated.bloom(), published_bloom(*whole.channel)}) {
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == 64 * KiB);
+    CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
   }
 }
 
