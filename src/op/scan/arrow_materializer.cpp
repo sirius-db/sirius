@@ -95,8 +95,7 @@ owned_arrow_batch::~owned_arrow_batch()
 namespace {
 [[noreturn]] void invalid()
 {
-  throw std::invalid_argument(
-    "arrow_layout_unsupported: unsupported or invalid arrow_host_flat_v1 input");
+  throw std::invalid_argument("unsupported or invalid arrow_host_flat_v1 input");
 }
 cudf::data_type type_for(std::string_view f)
 {

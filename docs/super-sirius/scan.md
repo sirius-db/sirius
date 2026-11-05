@@ -927,10 +927,11 @@ storage, rounded pinned staging/normalization and private destination storage.
 Unique retained parent bytes are reported separately from per-root reservations.
 These input credits do not bound downstream output retention.
 
-Schema/layout/extent errors are `physical_input`. Valid row/byte excess is
-`resource / arrow_batch_too_large`; unavailable or overflowing envelopes are
-`resource / arrow_envelope_unavailable`. Required source devices are checked before
-scan input publication, and the scheduler refuses devices without an executor.
+Schema/layout/extent errors are `physical_input`. Bound-schema drift reports
+`arrow_schema_drift`. On the qualified path, valid row/byte excess reports
+`resource / arrow_batch_too_large`, and unavailable or overflowing envelopes
+report `resource / arrow_envelope_unavailable`. Required source devices are checked
+before scan input publication, and the scheduler refuses devices without an executor.
 
 Inputs stay immutable and keep their leases through source readiness, asynchronous
 reads and retries. Cancellation, failure and abandoned offers also wait for source

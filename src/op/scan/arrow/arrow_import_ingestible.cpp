@@ -237,6 +237,9 @@ struct arrow_import_ingestible::impl {
     }
     auto input = std::get<produced_arrow_input>(std::move(result));
     try {
+      if (!binding.program.arrow_schema &&
+          (!input.batch || input.batch->row_count() > limits.max_rows))
+        throw std::invalid_argument("Arrow producer exceeded its declared row bound");
       if (!input.batch)
         throw std::invalid_argument("arrow_layout_unsupported: Arrow producer returned no batch");
       input.batch->validate_for(binding.program);

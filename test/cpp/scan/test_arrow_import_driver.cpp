@@ -31,9 +31,9 @@
 #include "scan_manager/preparation_slot.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "sirius_context.hpp"
-#include "transparent/replay_admission.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/read_view_registry.hpp"
+#include "transparent/replay_admission.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/strings/strings_column_view.hpp>
@@ -161,6 +161,7 @@ class pull_producer final : public arrow_batch_producer {
   std::function<void()> before_next;
   std::function<void()> before_stop_check;
   std::function<void(ArrowSchema&, ArrowArray&)> observe_tree;
+  std::shared_ptr<owned_arrow_batch> next_batch;
   sm::unit_envelope envelope{{8192}, 0};
   int64_t max_rows                = 3;
   uint64_t temporary_probe_before = 0, temporary_probe_after = 0;
@@ -193,6 +194,7 @@ class pull_producer final : public arrow_batch_producer {
     if (cancelled) throw duckdb::InterruptException();
     if (before_next) before_next();
     if (fail_read) throw std::runtime_error("pull failed");
+    if (next_batch) return produced_arrow_input{std::exchange(next_batch, {}), {}};
     if (cursor == rows.size()) return arrow_end_of_stream{};
     // Probes retire before next() returns: post-return accounting cannot catch them.
     if (temporary_probe_before) {
@@ -223,12 +225,12 @@ struct harness {
   std::shared_ptr<arrow_import_ingestible> driver;
   std::shared_ptr<arrow_input_gate> gate = std::make_shared<arrow_input_gate>();
   harness(std::shared_ptr<arrow_batch_producer> producer,
-          materialization_program program                   = integer_program(),
-          bool empty_source                                 = true,
-          sm::reservation_provider* external                = nullptr,
-          std::shared_ptr<arrow_batch_producer> other       = {},
-          uint64_t quantum                                  = 1,
-          std::shared_ptr<physical_check_counters> counters = {},
+          materialization_program program                      = integer_program(),
+          bool empty_source                                    = true,
+          sm::reservation_provider* external                   = nullptr,
+          std::shared_ptr<arrow_batch_producer> other          = {},
+          uint64_t quantum                                     = 1,
+          std::shared_ptr<physical_check_counters> counters    = {},
           std::function<void(arrow_import_binding&)> configure = {})
   {
     auto unique     = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
@@ -540,23 +542,38 @@ TEST_CASE("Arrow accepted roots release outside the queue lock on failure and ca
 TEST_CASE("Arrow qualified admission rejects valid oversize and first schema drift without waiting",
           "[arrow_driver][arrow_admission]")
 {
-  auto drift   = GENERATE(false, true);
-  int failures = 0;
-  auto q       = std::make_shared<arrow_push_queue>(
-    qualified_integer_program(), drift ? 8192 : 64, [&](std::exception_ptr failure) {
+  auto mode     = GENERATE(0, 1, 2, 3);
+  bool drift    = mode >= 2;
+  auto counters = make_counters();
+  int failures  = 0;
+  std::exception_ptr reported;
+  auto q = std::make_shared<arrow_push_queue>(
+    qualified_integer_program(),
+    arrow_push_limits{mode == 0 ? 2 : 3, mode == 1 || mode == 3 ? 64U : 8192U, 8192, 8192},
+    [&](std::exception_ptr failure) {
       ++failures;
-      try {
-        std::rethrow_exception(failure);
-      } catch (sirius::transparent::classified_execution_error const& error) {
-        CHECK(error.cause == (drift ? sirius::transparent::late_failure_cause::physical_input
-                                          : sirius::transparent::late_failure_cause::resource));
-      }
-    });
+      reported = failure;
+      CHECK(counters->arrow_schema_drift_refusals == (drift ? 1 : 0));
+    },
+    counters);
   auto slot = q->acquire_offered_slot();
   auto tree = std::make_shared<qualified_integer>();
   if (drift) tree->field.name = "wrong";
   slot.set_input(tree->schema, tree->array, tree, tree->profile(tree));
-  CHECK_THROWS_AS(q->offer(slot), sirius::transparent::classified_execution_error);
+  auto error = capture_rejection([&] { q->offer(slot); });
+  CHECK(reported == error);
+  if (drift) {
+    check_physical_failure(error, "Arrow storage, name or nullability changed", true);
+  } else {
+    try {
+      std::rethrow_exception(error);
+    } catch (sirius::transparent::classified_execution_error const& e) {
+      CHECK(e.cause == sirius::transparent::late_failure_cause::resource);
+      CHECK(std::string(e.what()).find("arrow_batch_too_large") != std::string::npos);
+    }
+  }
+  CHECK(capture_rejection([&] { q->check_status(); }) == error);
+  CHECK(counters->arrow_schema_drift_refusals == (drift ? 1 : 0));
   CHECK(failures == 1);
   CHECK(q->observe().accepted == 0);
   CHECK(slot.held());
@@ -1140,39 +1157,6 @@ TEST_CASE("Arrow copy and normalization bounds are checked before accepting an o
   CHECK(owner.use_count() == 2);
 }
 
-TEST_CASE("Arrow push distinguishes valid admission refusals from malformed roots",
-          "[arrow_driver][arrow_profile]")
-{
-  auto mode    = GENERATE(0, 1, 2, 3, 4);
-  int failures = 0;
-  auto q       = std::make_shared<arrow_push_queue>(
-    integer_program(),
-    arrow_push_limits{mode == 0 ? 2 : 3,
-                      mode == 1 || mode == 4 ? 1U : 8192U,
-                      mode == 2 ? 16U : 8192U,
-                      mode == 3 ? 1U : 8192U},
-    [&](std::exception_ptr failure) {
-      ++failures;
-      try {
-        std::rethrow_exception(failure);
-      } catch (sirius::transparent::classified_execution_error const& error) {
-        auto expected = mode == 4 ? sirius::transparent::late_failure_cause::physical_input
-                                        : sirius::transparent::late_failure_cause::resource;
-        CHECK(error.cause == expected);
-        CHECK(std::string(error.what())
-                .find(mode == 4 ? "arrow_schema_drift" : "arrow_batch_too_large") !=
-              std::string::npos);
-      }
-    });
-  auto owner = std::make_shared<integer_tree>();
-  if (mode == 4) owner->field.format = "f";
-  CHECK_THROWS_AS(q->offer(owner->offer(owner)), sirius::transparent::classified_execution_error);
-  CHECK(failures == 1);
-  CHECK(owner.use_count() == 1);
-  CHECK(owner->schema.release);
-  CHECK(owner->array.release);
-}
-
 TEST_CASE("Arrow push rejects unavailable envelopes at construction",
           "[arrow_driver][arrow_profile]")
 {
@@ -1193,14 +1177,22 @@ TEST_CASE("Arrow push rejects unavailable envelopes at construction",
   }
 }
 
-TEST_CASE("Arrow pull classifies valid row-limit refusals after validating the schema",
+TEST_CASE("Qualified Arrow pull classifies valid row-limit refusals after validating the schema",
           "[arrow_driver][arrow_profile]")
 {
-  auto malformed         = GENERATE(false, true);
-  auto producer          = std::make_shared<pull_producer>();
-  producer->max_rows     = 2;
-  producer->wrong_schema = malformed;
-  harness h(producer);
+  auto malformed     = GENERATE(false, true);
+  auto producer      = std::make_shared<pull_producer>();
+  producer->max_rows = 2;
+  auto tree          = std::make_shared<qualified_integer>();
+  if (malformed) tree->field.name = "wrong";
+  auto profile         = std::make_shared<arrow_source_profile const>(tree->profile(tree));
+  producer->next_batch = std::make_shared<owned_arrow_batch>(tree->schema,
+                                                             tree->array,
+                                                             tree,
+                                                             *std::pmr::null_memory_resource(),
+                                                             arrow_metadata_lengths{},
+                                                             std::move(profile));
+  harness h(producer, qualified_integer_program());
   try {
     (void)h.next();
     FAIL("invalid input was accepted");
@@ -1209,7 +1201,9 @@ TEST_CASE("Arrow pull classifies valid row-limit refusals after validating the s
                                     : sirius::transparent::late_failure_cause::resource));
     if (!malformed)
       CHECK(std::string(error.what()).find("arrow_batch_too_large") != std::string::npos);
+    CHECK(error.reason == (malformed ? sirius::transparent::kArrowSchemaDrift : ""));
   }
+  CHECK(h.profiles->counters->arrow_schema_drift_refusals == (malformed ? 1 : 0));
   CHECK(producer->calls == 1);
   CHECK_FALSE(h.gate->active);
   CHECK(h.ledger->permits_in_flight() == 0);
@@ -1238,8 +1232,9 @@ TEST_CASE("Arrow push preserves timestamp units and signed values through sliced
   owner->array.offset = owner->column.offset = 1;
   owner->column.length                       = 4;
   owner->column.null_count                   = -1;
-  auto q                                     = queue(program);
-  harness h(q, program);
+  auto counters                              = make_counters();
+  auto q                                     = queue(counters, program);
+  harness h(counters, q, program);
   auto submitting = std::async(std::launch::async, [&] { return q->offer(owner->offer(owner)); });
   queue_guard guard{q};
   await_ready(*q);
@@ -1803,13 +1798,15 @@ struct arrow_engine_fixture {
     // Duplicate projection makes skipped post-processing observable; filter removes 11.
     program.output_types.push_back(program.output_types[0]);
     program.predicates = 1;
+    auto counters      = make_counters();
     queue              = std::make_shared<arrow_push_queue>(
       // Leave room for the real scan's 8x cold estimate and the executor's 2x retry floor.
       program,
       8ULL << 20,
-      [done = completion](auto error) { done->report_error(error); });
+      [done = completion](auto error) { done->report_error(error); },
+      counters);
     input = std::make_unique<harness>(
-      queue, program, true, &backing, nullptr, 1, [&](arrow_import_binding& binding) {
+      queue, program, true, &backing, nullptr, 1, counters, [&](arrow_import_binding& binding) {
         binding.read_identity  = view.identity;
         binding.output_columns = {0, 0};
         auto integer           = sirius::logical_type::make(sirius::type_id::INTEGER);
@@ -2471,12 +2468,12 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   auto read_fails = GENERATE(false, true);
   sirius::test::preparation::hold reading;
   std::atomic<int> failures{0};
-  auto pull    = std::make_shared<pull_producer>();
-  pull->rows   = {3, 3};
-  pull->domain = sm::preparation_execution_domain::native_reader;
-  auto program = kind == 2 ? qualified_integer_program() : integer_program();
+  auto pull     = std::make_shared<pull_producer>();
+  pull->rows    = {3, 3};
+  pull->domain  = sm::preparation_execution_domain::native_reader;
+  auto program  = kind == 2 ? qualified_integer_program() : integer_program();
   auto counters = make_counters();
-  auto q = queue(counters, program, [&](auto) { ++failures; });
+  auto q        = queue(counters, program, [&](auto) { ++failures; });
   std::shared_ptr<arrow_batch_producer> producer =
     push ? std::static_pointer_cast<arrow_batch_producer>(q)
          : std::static_pointer_cast<arrow_batch_producer>(pull);
