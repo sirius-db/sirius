@@ -758,13 +758,12 @@ and projection remain independent. Pruning and dynamic filters do not complete
 static predicates. Answers retain their slots until projection, and
 `residual_filter::against_progress()` rejects unknown IDs or unavailable inputs.
 
-Unmapped `read_parquet` results, including Iceberg and qualified Hive inline
-assembly, use validated producer records to execute only pending work. Bulk/hybrid,
-mapped, metadata-only, cached and compressed producers retain translated legacy
-authority. Their shadow records report discrepancies without changing decisions;
-unqualified Hive still evaluates the full residual unless the whole predicate
-was completed. Invalid authoritative records fail before publication. Required
-and applied delete-set identities are compared so completed deletions are skipped.
+Parquet reader, bulk/hybrid, mapped, metadata-only and Hive inline results use
+validated producer records to execute only pending work. Resident/stolen results
+use the same decisions after translating their observed decode facts; malformed
+legacy answer reports retain the old fallback and report a shadow mismatch.
+Invalid authoritative records fail before publication. Required and applied
+delete-set identities are compared so completed deletions are skipped.
 
 Source lineage is either original-file runs, explicit original positions, or
 unavailable. Runs retain offsets across pruned row groups. Visibility requires
@@ -840,6 +839,32 @@ A direct GPU reader can supply an owning batch to the same validator and finish
 without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
 source adapter or relax the existing Iceberg equality-delete, snapshot or
 remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
+
+## Shared GPU decoder boundary
+
+Default Parquet decoding enters `materialize_impl` through the core's private
+`default_reader::materialize` adapter; replacement GPU decoders enter through
+`materialize_shared`. Both reuse the production normalization, visibility,
+residual-predicate and output-assembly functions. The default reader retains its
+existing completion protocol. Replacement decoders supply owned prepared input,
+a program-bound mapping certificate and an owned result; the shared boundary
+validates the result and retains borrowed storage until checked stream completion.
+See [shared_materializer.hpp](../../src/op/scan/shared_materializer.hpp) for the adapter contract.
+
+Canonical `row_lineage` is used only when a consumer requests it. It retains an
+immutable input domain and an identity, interval or device-ordinal selection.
+Composition preserves that domain; concatenation offsets by input length, including
+rows removed by earlier filters. `none` and `lost` do not imply identity. External
+lineage is validated and imported into private storage before reuse; reader
+positions are converted on demand. Ordinary Parquet/Iceberg scans retain their
+existing position and deletion representations, and native MVCC retains its separate
+visibility contract. See [row_lineage.hpp](../../src/op/scan/row_lineage.hpp).
+
+The shared [field mapper](../../src/op/scan/table_scan/field_mapper.hpp) applies the
+existing name, Iceberg field-ID and flat compatibility rules. Immutable mapping
+results preserve physical-check evidence and diagnostics, and distinguish field
+correspondence from the reader projection, including cardinality carriers and
+natural-read fallback. Preparation still reads and certifies each footer once.
 
 ## Key Files
 

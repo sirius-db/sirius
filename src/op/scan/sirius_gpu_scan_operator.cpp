@@ -406,10 +406,15 @@ std::unique_ptr<cudf::table> transfer_converted_table(sirius_gpu_scan_operator c
 /// an origin and keep every row of that chunk.
 filtered_table materialize_source(sirius_gpu_scan_operator const& scan,
                                   scan_operator_input const& input,
+                                  split_validation const* validation,
                                   ::cuda::stream_ref stream)
 {
-  auto source = scan.get_ingestible().materialize_table(
-    input, stream, scan.like_swar_fastpath_enabled(), scan.like_cache(), scan.expression_policy());
+  auto source = scan.get_ingestible().materialize_table(input,
+                                                        stream,
+                                                        scan.like_swar_fastpath_enabled(),
+                                                        scan.like_cache(),
+                                                        scan.expression_policy(),
+                                                        validation);
   if (scan.deferred_output().empty()) { return source; }
   // Installed only where a served batch is one pinned chunk's whole row span, so a batch arriving
   // here without an origin means the install-time conditions and the serve-time stamping have
@@ -526,13 +531,14 @@ row_selection run_cached_checkpoint(sirius_gpu_scan_operator const& scan,
 /// residual filter and projection.
 row_selection select_rows(sirius_gpu_scan_operator const& scan,
                           scan_operator_input const& input,
+                          split_validation const* validation,
                           batch_receipt const& receipt,
                           scan_assembly_state& assembly,
                           ::cuda::stream_ref stream)
 {
   bool const checkpoint = input.cached_checkpoint_possible();
   bool const borrowed   = input.borrows_resident_batch();
-  auto source           = materialize_source(scan, input, stream);
+  auto source           = materialize_source(scan, input, validation, stream);
   row_selection selection;
   if (checkpoint) {
     selection = run_cached_checkpoint(scan, input, receipt, source, assembly, stream);
@@ -732,10 +738,10 @@ bool sirius_gpu_scan_operator::cached_view_possible() const noexcept
 //===----------------------------------------------------------------------===//
 gpu_ingestible& sirius_gpu_scan_operator::get_ingestible() const { return *_ingestible; }
 
-void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input,
-                                              bool admit_resident) const
+std::optional<split_validation> sirius_gpu_scan_operator::validate_input(
+  scan_operator_input const& input, bool admit_resident) const
 {
-  if (!_contract_id) return;  // standalone unbound operator fixtures
+  if (!_contract_id) return std::nullopt;  // standalone unbound operator fixtures
   try {
     if (input.has_scan_metadata()) {
       if (!_read_views) {
@@ -753,6 +759,7 @@ void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input,
                              *validator,
                              entry.window_id.value_or(entry.finalize_generation),
                              _read_views->profiles);
+      return split_validation{input.get_scan_info(), _contract_id, entry.eligibility.later_checks};
     } else if (input.is_resident()) {
       if (input.resident_contract_id != _contract_id)
         throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
@@ -781,6 +788,7 @@ void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input,
       _compressed_materialization_observer->record_transparent_certificate_mismatch();
     throw;
   }
+  return std::nullopt;
 }
 
 bound_table_scan const& sirius_gpu_scan_operator::scan_contract() const
@@ -808,7 +816,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       "[sirius_gpu_scan_operator::execute] expected input of type scan_operator_input; got " +
       std::string(typeid(input_data).name()));
   }
-  validate_input(*scan_input, false);
+  auto validation = validate_input(*scan_input, false);
 
   auto receipt        = decode_receipt(*this, *scan_input);
   auto assembly       = std::make_unique<scan_assembly_state>();
@@ -822,7 +830,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       selection.placement.cached_bypassed_transfer = 1;
     } else {
       bool const stolen = scan_input->stolen_table != nullptr;
-      selection         = select_rows(*this, *scan_input, receipt, *assembly, stream);
+      selection         = select_rows(
+        *this, *scan_input, validation ? &*validation : nullptr, receipt, *assembly, stream);
       selection.placement.cached_bypassed_transfer = stolen ? 1 : 0;
       finish_assembly(*this, *scan_input, *assembly, stream);
     }

@@ -157,6 +157,7 @@ void attach_membership_probes(Representation& rep,
  */
 class scan_operator_input : public op::operator_data {
  public:
+  scan_execution_context execution;
   enum class prefetch_start { immediate, deferred };
   /// Hint the IO layer about every range this split will read, then publish it
   /// to @p readahead -- in that order, which is why both belong here.
