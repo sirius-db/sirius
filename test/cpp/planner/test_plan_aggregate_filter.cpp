@@ -420,7 +420,7 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
       // AVG's expanded SUM and COUNT_VALID slots read the same value mask.
       CHECK(grouped_agg.cudf_aggregate_idx == std::vector<int>{1, 1, 1, 1, 1, 1, 2});
       REQUIRE(grouped_agg.aggregate_slots.size() == 6);
-      CHECK(grouped_agg.aggregate_slots[3].is_avg);
+      CHECK(std::holds_alternative<sirius::op::avg_slot>(grouped_agg.aggregate_slots[3]));
     } else {
       auto const& ungrouped = aggregate->Cast<sirius::op::sirius_physical_ungrouped_aggregate>();
       REQUIRE(ungrouped.aggregates.size() == 6);

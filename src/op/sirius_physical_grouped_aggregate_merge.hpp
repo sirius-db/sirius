@@ -34,6 +34,7 @@
 
 #include <memory>
 #include <numeric>
+#include <variant>
 
 namespace sirius {
 namespace planner {
@@ -57,7 +58,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     std::vector<cudf::aggregation::Kind> cudf_aggregates,
     std::vector<int> cudf_aggregate_idx,
     std::vector<std::vector<int>> cudf_aggregate_struct_col_indices,
-    std::vector<AggregateSlot> aggregate_slots,
+    std::vector<aggregate_slot> aggregate_slots,
     bool has_avg,
     bool has_count_distinct,
     std::size_t estimated_cardinality);
@@ -89,13 +90,13 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
 
-  // AVG and COUNT DISTINCT decomposition metadata
-  std::vector<AggregateSlot> aggregate_slots;
+  // AVG, COUNT DISTINCT and FIRST slot metadata
+  std::vector<aggregate_slot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
 
-  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
-  /// (AggregateSlot::is_wide_integer_sum). Derived from aggregate_slots (wide_integer_sum_mask).
+  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG.
+  /// Derived from aggregate_slots (wide_integer_sum_mask).
   std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
   /// Number of group columns after the `group_idx` keys: the set id and GROUPING() columns of
@@ -117,6 +118,19 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     std::vector<int> indices(num_output_group_columns());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;
+  }
+
+  //! Whether the partial batch already has the final output's slot order and types.
+  [[nodiscard]] bool partials_are_output() const noexcept
+  {
+    return partial_layout().matches_output(aggregate_slots);
+  }
+
+  [[nodiscard]] bool has_first() const { return has_slot<first_slot>(aggregate_slots); }
+
+  [[nodiscard]] grouped_aggregate_layout partial_layout() const
+  {
+    return {num_output_group_columns(), cudf_aggregates.size(), aggregate_slots};
   }
 
   // Source interface

@@ -174,6 +174,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   // Sort and TOP_N payloads must retain their physical type until host export.
   inspect("SELECT c FROM lineage_leaf ORDER BY b", {{1, 2}});
   inspect("SELECT c FROM lineage_leaf ORDER BY b LIMIT 1", {{1, 2}});
+  // So must a FIRST's input, which the aggregate gathers and concatenates unchanged.
+  inspect("SELECT a, first(c) FROM lineage_leaf GROUP BY a", {{0, 2}});
+  inspect("SELECT DISTINCT ON (a) a, c FROM lineage_leaf", {{0, 2}});
   inspect("SELECT l.c,r.a FROM lineage_leaf l JOIN lineage_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
   inspect("SELECT l.c,r.a+1 FROM lineage_leaf l JOIN lineage_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
   inspect(

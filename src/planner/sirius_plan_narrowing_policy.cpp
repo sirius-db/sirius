@@ -18,6 +18,7 @@
 #include "expression/ast/constant_range.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
@@ -461,9 +462,7 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       if (op.children.size() != 1) { break; }
       auto const& aggregate = op.Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.has_grouping_sets()) { break; }
-      if (aggregate.has_avg || aggregate.has_count_distinct || aggregate.has_stddev_samp()) {
-        break;
-      }
+      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots)) { break; }
       if (op.types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
         break;
       }
