@@ -69,10 +69,11 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       input.get_data_batches(), std::vector<std::size_t>(input.get_data_batches().size(), 0));
   }
 
-  auto start           = std::chrono::high_resolution_clock::now();
-  size_t num_parts     = _sample_op->get_num_partitions();
-  auto& boundaries     = _sample_op->get_partition_boundaries();
-  auto boundaries_view = boundaries.view();
+  auto start          = std::chrono::high_resolution_clock::now();
+  size_t num_parts    = _sample_op->get_num_partitions();
+  auto const& sampled = dynamic_cast<const sort_sample_output&>(input_data);
+  if (!sampled.boundaries) { throw internal_exception("Sort boundaries are missing"); }
+  auto boundaries_view = get_cudf_table_view(*sampled.boundaries);
 
   auto const& order_key_idx   = comparison->key_columns;
   auto const& column_order    = comparison->directions;
@@ -113,8 +114,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
                                   num_splits * sizeof(int32_t),
                                   cudaMemcpyDeviceToHost,
                                   stream.get()));
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-
+    stream.sync();
     // Build slice indices: [0, split[0], split[0], split[1], ..., split[P-2], num_rows]
     std::vector<cudf::size_type> slice_indices;
     slice_indices.reserve(num_parts * 2);
