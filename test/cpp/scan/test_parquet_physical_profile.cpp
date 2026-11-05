@@ -16,7 +16,6 @@
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
 
 #include <catch.hpp>
 #include <io/parquet_helpers.hpp>

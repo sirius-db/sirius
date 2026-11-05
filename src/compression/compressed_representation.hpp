@@ -183,7 +183,7 @@ class compressed_host_representation : public simpatico_compressed_representatio
   {
     return _column_names;
   }
-  [[nodiscard]] std::int64_t num_rows() const noexcept { return _num_rows; }
+  [[nodiscard]] std::int64_t num_rows() const noexcept override { return _num_rows; }
 
   /// Column indices to project during decompression (nullopt = all columns).
   [[nodiscard]] const std::optional<std::vector<std::size_t>>& selected_indices() const noexcept
@@ -302,7 +302,7 @@ class compressed_device_representation : public simpatico_compressed_representat
   {
     return _column_names;
   }
-  [[nodiscard]] std::int64_t num_rows() const noexcept { return _num_rows; }
+  [[nodiscard]] std::int64_t num_rows() const noexcept override { return _num_rows; }
 
   [[nodiscard]] const std::optional<std::vector<std::size_t>>& selected_indices() const noexcept
   {

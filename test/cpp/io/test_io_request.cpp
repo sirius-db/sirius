@@ -23,7 +23,6 @@
 // The tests below exercise those ordering and ownership requirements directly.
 
 #include <atomic>
-#include <cstddef>
 #include <exception>
 #include <memory>
 #include <stdexcept>

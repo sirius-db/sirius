@@ -27,8 +27,9 @@
 #include <duckdb/planner/joinside.hpp>
 
 // cudf
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/ast/ast_operator.hpp>
-#include <cudf/ast/expressions.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/types.hpp>
 

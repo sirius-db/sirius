@@ -155,7 +155,7 @@ target_include_directories(
                     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
-# Standalone / pixi builds use the toolkit's shared NVRTC target.
+# Other builds use the toolkit's shared NVRTC target.
 if(VCPKG_BUILD AND NOT TARGET nvrtc::nvrtc_static)
   # A standalone vcpkg configure has no parent to discover this target.
   find_package(nvrtc REQUIRED CONFIG)

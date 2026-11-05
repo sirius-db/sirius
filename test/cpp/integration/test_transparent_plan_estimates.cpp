@@ -19,7 +19,6 @@
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 

@@ -46,6 +46,37 @@ endif()
 target_sources(sirius_unittest
                PRIVATE $<TARGET_OBJECTS:sirius_context_config_test>)
 
+# Test variant of the connector registry: the same translation unit compiled
+# with the test-connector override seam. Linking the object ahead of sirius_core
+# keeps the archive's production object out of the test executable; production
+# libraries never see the seam.
+add_library(sirius_connector_registry_test OBJECT
+            src/planner/connector_registry.cpp)
+target_compile_definitions(
+  sirius_connector_registry_test
+  PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES
+          CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+set_target_properties(
+  sirius_connector_registry_test
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON)
+target_include_directories(
+  sirius_connector_registry_test BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(sirius_connector_registry_test PRIVATE sirius_core
+                                                             duckdb_static)
+if(VCPKG_BUILD)
+  set_target_properties(sirius_connector_registry_test
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_connector_registry_test BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+target_sources(sirius_unittest
+               PRIVATE $<TARGET_OBJECTS:sirius_connector_registry_test>)
+target_compile_definitions(sirius_unittest
+                           PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES)
+
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
   target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
@@ -114,7 +145,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(
     sirius_cuda_fault_test
     test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
+    test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
+    test/cpp/memory/test_device_transfer_fault.cpp
     test/cpp/scan_manager/test_memory_prefetcher_health.cpp
+    test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
     test/cpp/utils/cuda_status_fault.cpp
     src/sirius_extension_entry.cpp
     test/cpp/utils/sirius_extension_loader.cpp)
@@ -129,14 +163,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     PRIVATE sirius_core duckdb_static ZLIB::ZLIB Catch2::Catch2WithMain
             ${SIRIUS_CURL_TARGET} ${CMAKE_DL_LIBS})
   sirius_link_duckdb_extensions(sirius_cuda_fault_test PRIVATE)
+  # Wrap device_copy_batch::enqueue at the Sirius boundary: cuDF dispatches its
+  # CUDA batch call from its shared library.
   target_link_options(
     sirius_cuda_fault_test
     PRIVATE
     "LINKER:--allow-multiple-definition"
     "LINKER:--wrap=cudaStreamWaitEvent"
     "LINKER:--wrap=cudaDeviceSynchronize"
+    "LINKER:--wrap=cudaMemPoolGetAccess"
+    "LINKER:--wrap=cudaMemcpyAsync"
+    "LINKER:--wrap=cudaMemcpyBatchAsync"
+    "LINKER:--wrap=cudaStreamSynchronize"
     "LINKER:--wrap=_ZN9cucascade6memory21exclusive_stream_pool14acquire_streamENS1_21stream_acquire_policyE"
-  )
+    "LINKER:--wrap=cudaMemcpyPeerAsync"
+    "LINKER:--wrap=_ZNK6sirius4cuda17device_copy_batch7enqueueEN4cuda3__410stream_refE"
+    "LINKER:--wrap=cudaEventRecord"
+    "LINKER:--wrap=cudaEventCreateWithFlags")
   set_target_properties(
     sirius_cuda_fault_test
     PROPERTIES ENABLE_EXPORTS ON

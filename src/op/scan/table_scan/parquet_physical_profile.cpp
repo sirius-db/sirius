@@ -19,7 +19,6 @@
 #include "io/parquet_helpers.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/parquet_metadata.hpp"
-#include "op/scan/parquet_schema_mapping.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_io_utils.hpp>

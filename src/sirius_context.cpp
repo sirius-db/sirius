@@ -16,12 +16,11 @@
 
 #include "sirius_context.hpp"
 
+#include "compression/spill_compression.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
-#include "cuda/device_health.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
-#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -38,7 +37,6 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/connection_provenance.hpp"
@@ -55,7 +53,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -69,9 +66,6 @@
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
-#include <io/types.hpp>
-#include <io/uring/uring_ioctx.hpp>
-#include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 
 #include <algorithm>
@@ -86,9 +80,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
-#include <variant>
 
 namespace duckdb {
 
@@ -616,7 +608,12 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
     SIRIUS_LOG_INFO("QueryEnd");
   } catch (...) {
   }
+  // Keep completion through resource release. A close failure may arrive during retirement
+  // after the query future already delivered an unrelated error.
+  auto completion = window_completion(query_id);
   retire_query_work(query_id, query_retirement_mode::cancelled);
+  // Finish physical retirement, then retain checkpoint keys if a reader failed to close.
+  if (completion) completion->throw_if_preparation_cleanup_failed();
   auto const keys_released = release_query_state(query_id, inject_failure);
   try {
     log_pool_stats(end_tag);
@@ -950,6 +947,9 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
   }
   config_ = config.resolve(discovery.get_topology());
+  // The spill converters run on downgrade threads with no client context, so they
+  // read process-wide settings rather than this configuration.
+  sirius::compression::apply_spill_compression_config(config_.get_compression_config());
   admission_.configure(config_.max_concurrent_queries());
   if (config_.max_concurrent_queries() > 1) {
     for (auto const& space : config_.get_memory_space_configs()) {
@@ -1033,76 +1033,6 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // index by shared_ptr copy instead of rebuilding its own device<->NUMA map.
   topology_index_ = std::make_shared<const sirius::memory::topology_index>(
     config_.get_hw_topology(), *memory_manager_);
-
-  // Enable P2P peer access for every configured GPU pair.
-  // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
-  // conversion. For that call to bypass host staging, peer access must be
-  // enabled ONCE at init for every (src, dst) pair the host supports.
-  // Non-fatal failure mode: SIRIUS_LOG_ERROR and continue — host-staged fallback
-  // in cucascade's converter is a correct alternate path.
-  {
-    if (active_gpu_ids.size() >= 2) {
-      // cucascade's first peer-DMA query probes every visible GPU pair and caches the results. Run
-      // it here, before any pair is enabled below and even when no pair supports peer access, so
-      // later queries (dynamic-filter accumulation admission runs under a task-creation lock) only
-      // read the cache.
-      (void)cucascade::memory::probe_peer_dma_works(active_gpu_ids[0], active_gpu_ids[1]);
-      peer_access_enabled_pairs_.reserve(active_gpu_ids.size() * (active_gpu_ids.size() - 1));
-      for (int source_device : active_gpu_ids) {
-        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{source_device}};
-        for (int target_device : active_gpu_ids) {
-          if (source_device == target_device) continue;
-          int can_access = 0;
-          cudaError_t probe_err =
-            cudaDeviceCanAccessPeer(&can_access, source_device, target_device);
-          if (probe_err != cudaSuccess) {
-            SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
-                             source_device,
-                             target_device,
-                             cudaGetErrorString(probe_err));
-            continue;
-          }
-          if (can_access == 0) {
-            SIRIUS_LOG_INFO("SiriusContext: no P2P access {} -> {} -- falling back to host staging",
-                            source_device,
-                            target_device);
-            continue;
-          }
-          // cucascade probes whether peer copies actually move data and disables peer access
-          // for the pairs where they do not. Enabling it again would let peer copies outside
-          // cucascade's converters silently skip the transfer.
-          if (!cucascade::memory::probe_peer_dma_works(source_device, target_device)) {
-            SIRIUS_LOG_INFO(
-              "SiriusContext: peer DMA {} -> {} does not work on this host -- falling back to "
-              "host staging",
-              source_device,
-              target_device);
-            continue;
-          }
-          cudaError_t enable_err = cudaDeviceEnablePeerAccess(target_device, 0);
-          // Always consume sticky error state — cudaErrorPeerAccessAlreadyEnabled
-          // (and any other non-fatal condition) persists in the runtime until
-          // cudaGetLastError() is called, which would make the NEXT CUDA API
-          // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
-          (void)cudaGetLastError();
-          if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-            peer_access_enabled_pairs_.emplace(source_device, target_device);
-            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", source_device, target_device);
-          } else {
-            SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
-                             target_device,
-                             source_device,
-                             cudaGetErrorString(enable_err));
-          }
-        }
-      }
-    } else {
-      SIRIUS_LOG_INFO(
-        "SiriusContext: skipping peer-access enable loop (num_gpus={}); "
-        "configured GPU set has no pairs to enable",
-        active_gpu_ids.size());
-    }
-  }
 
   // cucascade topology exposes hw-decompression availability as a runtime attribute populated
   // only when discovery is asked to touch the CUDA driver. Context initialization requests
@@ -1283,8 +1213,6 @@ void SiriusContext::terminate()
   downgrade_executors_.clear();
   task_scheduler_.reset();
   telemetry_context_.reset();
-
-  peer_access_enabled_pairs_.clear();
 
   if (memory_manager_) {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
@@ -1594,6 +1522,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
   snapshot.split_flushed_for_schema =
     physical_counters_->split_flushed_for_schema.load(std::memory_order_relaxed);
+  snapshot.arrow_schema_drift_refusals =
+    physical_counters_->arrow_schema_drift_refusals.load(std::memory_order_relaxed);
   snapshot.parquet_type_mismatch_observed =
     physical_counters_->type_mismatches.load(std::memory_order_relaxed);
   snapshot.parquet_type_refusals =

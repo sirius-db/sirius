@@ -16,22 +16,18 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/prefetching_cache.hpp"
 
 #include <rmm/device_buffer.hpp>
 
-#include <fcntl.h>
 #include <log/logging.hpp>
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -144,9 +140,8 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::ho
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
-  size_t offset, size_t size, cudf_datasource_stream_t stream_arg)
+  size_t offset, size_t size, ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   rmm::device_buffer buf(size, stream);
   auto n = device_read(offset, size, reinterpret_cast<uint8_t*>(buf.data()), stream);
   n      = std::min(n, size);
@@ -157,9 +152,8 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
 size_t sirius_datasource::device_read(size_t offset,
                                       size_t size,
                                       uint8_t* dst,
-                                      cudf_datasource_stream_t stream_arg)
+                                      ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   auto f = device_read_async(offset, size, dst, stream);
   auto n = f.get();
   stream.sync();
@@ -169,9 +163,8 @@ size_t sirius_datasource::device_read(size_t offset,
 std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
-                                                         cudf_datasource_stream_t stream_arg)
+                                                         ::cuda::stream_ref stream)
 {
-  ::cuda::stream_ref stream{stream_arg};
   return bridge_semi_to_std([&] {
     if (uses_prefetching_cache()) {
       auto* cache = _io_ctx->cache();

@@ -25,6 +25,7 @@
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "exec/queue_priority.hpp"
+#include "memory/numa_affinity.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -424,9 +425,9 @@ class task_creator {
   ///  - gpu_ids() is the active executor set that partition affinity indexes,
   ///    so the pin resolves to a real executor when num_gpus < physical count.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
-  /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
-  std::atomic<uint64_t> _numa_affinity_rr{0};
-  /// Separate from _numa_affinity_rr. A task can take a NUMA pick and then be clamped, so
+  /// Rotate independently within each NUMA node, including interleaved host-pin inputs.
+  sirius::memory::numa_affinity _numa_affinity;
+  /// Separate from NUMA affinity. A task can take a NUMA pick and then be clamped, so
   /// sharing one counter advances it twice per task: against an even subset size the stride
   /// never changes parity and every clamped task lands on the same GPU.
   std::atomic<uint64_t> _admission_rr{0};

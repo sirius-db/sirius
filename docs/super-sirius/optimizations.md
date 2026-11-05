@@ -100,8 +100,8 @@ look-ahead is not a user-selectable YAML setting.
 
 **Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
 - `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
-- per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
-- the join is neither RIGHT-family nor `MIXED_JOIN`
+- two independent per-GPU bounds hold: the estimated cuco hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission including MARK) stay under `max_build_hash_table_bytes`, and the folded build payload that stays GPU-resident for the whole probe stream stays under `max_build_probe_resident_bytes`; the build must fold to a single batch per partition
+- the join is neither RIGHT-family, `MIXED_JOIN`, nor full `OUTER`
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
@@ -109,7 +109,7 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing by the join's partition placement
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB)
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) and `max_build_probe_resident_bytes` (folded resident build payload; default: 8× the derived batch size)
 
 ### COUNT DISTINCT Optimization (PR #414)
 
@@ -151,6 +151,57 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Sorted-Key Grouped Aggregation
+
+**Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
+
+**Mechanism:** For a batch with a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate, `grouped_aggregate_table()` verifies with `keys_ascending()` (`src/cuda/sorted_keys.cu`) that the key is ascending and, if so, builds the group-by with `cudf::sorted::YES`, so cuDF reduces runs of equal keys instead of hashing. Unsorted batches keep the hash path, so correctness never depends on the data layout. For integer, boolean, timestamp, duration and fixed-point keys the check is one `thrust::is_sorted` pass that stops at the first descent; `cudf::is_sorted`'s generic row comparator is about 2.4 times slower on a sorted INT64 column (SF1000 q18: 0.620 s with it, 0.597 s with the typed pass). Other keys use `cudf::is_sorted`. Verified-sorted keys also let the stable STDDEV_SAMP path skip its own sort.
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`
+
+**Config:** Always on. TPC-H SF1000 on a GB300, together with natural-order pinning: q18 1.148 s → 0.830 s.
+
+### Order-Preserving Partition and Sorted Merge
+
+**Motivation:** After a sorted-key partial aggregation each partial is sorted, and with a table pinned in key order the partials cover consecutive key ranges. `cudf::hash_partition` does not keep row order, so the merge had to hash and re-aggregate everything (q18: 352 ms of merge kernels at SF1000).
+
+**Mechanism:** Both parts decide from the data, so there is no setting:
+1. **Partition:** `hash_partition()` checks whether a single fixed-width, non-floating-point partition key is ascending. If so it uses a stable partition (`cudf::stable_sorted_order` of the partition ids, then a gather) that keeps the input order within each partition; otherwise it calls `cudf::hash_partition` as before. Both assign a row by its MurmurHash3 row hash modulo the partition count, so batches of one input may take either path and a key still lands in one partition.
+2. **Merge:** for a single fixed-width, non-floating-point group key, `merge_grouped_aggregate()` orders the incoming partials by their first key (gathered into one column, sorted on the device and read back with one synchronization), concatenates them, verifies the result with `keys_ascending()`, and uses the sorted-keys group-by if it passes. Any other input keeps the hash merge.
+
+**Code path:** `src/op/partition/gpu_partition_impl.cpp` — `hash_partition()`; `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`
+
+**Config:** None. TPC-H SF1000 on a GB300, on top of the sorted-key aggregation: q18 0.830 s → 0.639 s; no other query moved by more than run-to-run noise.
+
+### Natural-Order Parquet Pinning
+
+**Motivation:** `pin_table` lists local parquet files in directory order, and each pinned chunk packs several files, so a table stored sorted across numbered files (`part.0`, `part.1`, …) pinned into chunks whose rows are out of order: at TPC-H SF1000 only 3 of q18's 39 lineitem batches were in `l_orderkey` order.
+
+**Mechanism:** `pin_table` sorts the file list with glibc `strverscmp` (digit runs compared numerically, so `part.2` precedes `part.10`) before materializing, so chunks hold consecutive files. Nothing relies on the order for correctness: the consumers verify sortedness themselves, and matching a scan's files to a pinned entry ignores order.
+
+**Code path:** `src/sirius_extension.cpp` — pin file list
+
+**Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply.
+
+### Low-Cardinality Grouped Aggregation (experimental)
+
+**Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
+
+**Mechanism:** A custom CUDA kernel path, tried first by `grouped_aggregate_table()`:
+1. `find_groups_kernel` builds a 16-bit code from up to two one-character string keys, verifies every key length, and records the codes present and one representative row per code.
+2. The host maps the codes to at most 64 dense groups.
+3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
+4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
+
+It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+
+**Code path:**
+- `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
+- `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
+
+**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
@@ -164,6 +215,25 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_columns()`, `src/op/sirius_physical_hash_join.cpp` — distinct hash table construction
 
+Parquet scans declare no PRIMARY KEY; for them, [Pin-Proven Unique Join Keys](#pin-proven-unique-join-keys) supplies the proof from pin-time facts.
+
+### Pin-Proven Unique Join Keys
+
+**Motivation:** The distinct hash join needs a proof that the build keys are unique, and for a base table the only proof was a declared PRIMARY KEY. Parquet tables declare none, so every join over pinned parquet took the two-pass `cudf::hash_join` (a count pass, then a retrieve pass), even for keys such as `o_orderkey` or `s_suppkey`. The runtime distinctness check is off by default (issue #1600).
+
+**Mechanism:** Two parts:
+1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports an output column whose pinned column was proven distinct at pin time. Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
+2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column automatically, in addition to the columns late materialization names. An automatic column must be an integer, and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`.
+
+Composite keys are not covered, because the proof is per column.
+
+**Code path:**
+- `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_from_pin()`, `prove_unique_columns()`
+- `src/late_mat/pin_uniqueness.cpp` — `pin_unique_automatic_selection()`, `unique_probe`, `exact_uniqueness_byte_cap()`
+- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — selection and attaching the facts
+
+**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the automatic probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `n_name`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
+
 ### Scan Scheduling Tuning (PR #507)
 
 **Motivation:** Eagerly depleting all scan sources at query startup wastes GPU memory on multi-scan plans (e.g., joins with two scanned tables).
@@ -174,7 +244,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) — independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
 ### Zero-Copy Projection Passthrough (PR #991)
 
@@ -344,6 +414,20 @@ result materialization restore native carriers.
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
 
+### Decode to Restore Type
+
+**Motivation:** With compressed materialization, a pinned column stored in a narrow carrier is cast back to its native type by the scan whenever a type-sensitive consumer needs it. TPC-H q1 restores four DECIMAL32 columns to DECIMAL64 in every batch: a separate read and write of each column, about 25 ms of cast kernels at SF1000.
+
+**Mechanism:** When the scan's output assembly is a leading identity, it passes its restore targets down to the Simpatico decode (`pushdown_request::output_types` → `scan_filter_request::output_types` → `decode_selection::output_type`). For a compacted (filter-pushdown) decode whose root is a bitpack node, the JIT renderer declares the kernel's output in the wider element type (entry symbol suffix `_to_<type>`), so the kernel widens in its store, and the decode allocates the output column in the target type. The scan's restore cast then finds the column already restored. Supported widenings: signed integer to a wider signed integer, same-scale DECIMAL widening, and a raw signed integer to DECIMAL or `TIMESTAMP_DAYS`. Other decodes keep the restore cast. The JIT decoder only has signed element types (`int8_t` through `__int128`), so unsigned storage is not widened in place, and only a compacted decode with a bitpack root writes in the restore type.
+
+**Code path:**
+- `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/op/scan/sirius_gpu_scan_operator_data.cpp` — restore targets
+- `src/compression/compressed_scan.cpp` — `pushdown_request::output_types`, `decompression_pushdown_scan::with_output_types()`
+- `src/compression/simpatico_codegen/src/plan/decompress.cpp` — `widened_element_dtype()`, `decode_fused_subtree_impl()`
+- `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
+
+**Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
+
 ### Late Materialization (unreleased, experimental)
 
 **Motivation:** A query that selects wide columns carries them from the scan to whatever finally
@@ -373,7 +457,7 @@ distinctness proof.
 
 **Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
 `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
-which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+which no group-by-rowid ride is admissible. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
 floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.

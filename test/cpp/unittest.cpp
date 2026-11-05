@@ -16,7 +16,6 @@
 
 #include "catch.hpp"
 #include "config.hpp"
-#include "log/logging.hpp"
 #include "log/spdlog_owning_sink.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "utils/s3_backend.hpp"
@@ -26,7 +25,6 @@
 
 #include <unistd.h>
 
-#include <algorithm>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>

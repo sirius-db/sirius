@@ -100,7 +100,9 @@ failure_cause classify_failure(std::exception_ptr error, late_failure_cause fall
   try {
     std::rethrow_exception(error);
   } catch (classified_execution_error const& e) {
-    return {e.cause, e.what()};
+    return {e.cause, e.what(), e.reason};
+  } catch (arrow_schema_drift_error const& e) {
+    return {late_failure_cause::physical_input, e.what(), kArrowSchemaDrift};
   } catch (op::scan::unsupported_physical_input const& e) {
     return {late_failure_cause::physical_input, e.what()};
   } catch (op::scan::certificate_incomplete const& e) {

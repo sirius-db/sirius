@@ -21,6 +21,7 @@
 
 #include <catch.hpp>
 
+#include <array>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -105,6 +106,50 @@ TEST_CASE("Replan-origin read views admit only a single corresponding scan",
   CHECK(single.equal);
   CHECK(single.correspondence == "single");
   CHECK(single.reason.empty());
+}
+
+TEST_CASE("Skipped CTE definition scans count toward correspondence", "[transparent][read_view]")
+{
+  auto a = view("a.parquet");
+  auto b = view("b.parquet");
+  std::vector<original_binding> logical{{10, a}, {20, b}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(b)};
+  std::vector<candidate_binding> planned{{20, b}};
+
+  auto missing = compare_read_views(candidate_origin::copy, logical, physical, planned);
+  CHECK_FALSE(missing.equal);
+  CHECK(missing.reason == "fingerprint_mismatch");
+
+  std::vector<candidate_binding> skipped{{10, a}};
+  auto copy = compare_read_views(candidate_origin::copy, logical, physical, planned, skipped);
+  CHECK(copy.equal);
+  CHECK(copy.correspondence == "table_index");
+
+  std::vector<candidate_binding> wrong_index{{11, a}};
+  auto rebound =
+    compare_read_views(candidate_origin::copy, logical, physical, planned, wrong_index);
+  CHECK_FALSE(rebound.equal);
+  CHECK(rebound.reason == "binding_mismatch");
+
+  std::vector<candidate_binding> wrong_view{{10, view("c.parquet")}};
+  auto changed = compare_read_views(candidate_origin::copy, logical, physical, planned, wrong_view);
+  CHECK_FALSE(changed.equal);
+  CHECK(changed.reason == "fingerprint_mismatch");
+
+  // Replan names the single planned scan; the skipped one still joins the multiset check.
+  std::vector<candidate_binding> replanned{{31, b}};
+  std::vector<candidate_binding> replan_skipped{{30, a}};
+  auto replan =
+    compare_read_views(candidate_origin::replan, {}, physical, replanned, replan_skipped);
+  CHECK(replan.equal);
+  CHECK(replan.correspondence == "single");
+
+  std::vector<candidate_binding> none;
+  std::vector<read_view_fingerprint> physical_one{fingerprint(a)};
+  auto only_skipped =
+    compare_read_views(candidate_origin::replan, {}, physical_one, none, replan_skipped);
+  CHECK(only_skipped.equal);
+  CHECK(only_skipped.correspondence == "none");
 }
 
 TEST_CASE("Read-view mismatch summaries are bounded", "[transparent][read_view]")
@@ -258,8 +303,7 @@ TEST_CASE("Correspondence preserves a recorded scan refusal", "[transparent][rea
   CHECK(certificate.evidence_scope == certificate_evidence_scope::binding_correspondence);
 }
 
-TEST_CASE("Pre-declined scan receives a contract without a candidate view",
-          "[transparent][read_view]")
+TEST_CASE("Pre-declined scan preserves an available candidate view", "[transparent][read_view]")
 {
   auto registry = std::make_shared<read_view_registry>();
   duckdb::TableFunction function("iceberg_scan", {}, nullptr, nullptr);
@@ -285,12 +329,38 @@ TEST_CASE("Pre-declined scan receives a contract without a candidate view",
   connector.kind             = source_kind::parquet_local;
   connector.registry_profile = "iceberg.v1";
 
+  SECTION("no safe pre-capture") {}
+  SECTION("connector semantic capture") { scan.bound_view = view("refused.parquet"); }
+
   auto id            = registry->allocate_declined_scan(scan, connector);
   auto const& record = registry->entry(id);
-  CHECK(record.contract.view == nullptr);
+  CHECK(record.contract.view == scan.bound_view);
+  CHECK(registry->candidate_bindings().front().view == scan.bound_view);
   CHECK(record.contract.scan_node_id == 77);
   CHECK(record.contract.table_index == 12);
   CHECK(record.finalize_generation == 9);
   CHECK(record.eligibility.materializer.kind == materializer_kind::iceberg);
   CHECK_THROWS_AS(registry->allocate_declined_scan(scan, connector), std::runtime_error);
+}
+
+TEST_CASE("Provider read identities preserve semantics without enumerating files",
+          "[transparent][read_view]")
+{
+  bound_read_identity identity;
+  identity.source      = {"provider", source_kind::parquet_local, "provider.v1"};
+  identity.data_view   = provider_read_identity{"table-uuid/snapshot=12/schema=3"};
+  identity.bound_types = {duckdb::LogicalType::BIGINT};
+  identity.bound_names = {"id"};
+  auto first           = make_bound_read_identity(identity, {});
+  CHECK(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  identity.data_view = provider_read_identity{"table-uuid/snapshot=13/schema=3"};
+  CHECK_FALSE(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  identity.data_view = provider_read_identity{"other-uuid/snapshot=12/schema=3"};
+  CHECK_FALSE(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  identity.data_view = provider_read_identity{"table-uuid/snapshot=12/schema=4"};
+  CHECK_FALSE(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  std::array<std::string, 1> files{"must-not-be-invented.parquet"};
+  CHECK_THROWS_AS(make_bound_read_identity(identity, files), std::invalid_argument);
+  identity.data_view = provider_read_identity{};
+  CHECK_THROWS_AS(make_bound_read_identity(identity, {}), std::invalid_argument);
 }

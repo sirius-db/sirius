@@ -24,8 +24,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <log/logging.hpp>
-
 #include <algorithm>
 #include <cstdint>
 #include <limits>

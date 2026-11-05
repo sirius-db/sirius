@@ -29,7 +29,6 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -37,7 +36,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -157,6 +155,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
   state->completion_handler = handler;
 
   auto pipeline_priorities = compute_pipeline_priorities(query);
+  auto const host_spaces   = _mem_res_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  auto const* host_staging_space = host_spaces.empty() ? nullptr : host_spaces.front();
 
   // Filled once, here, and never mutated afterwards: task-creation workers read it without a
   // lock, holding only their shared_ptr to this state. Note the map is NOT cleared — other
@@ -170,8 +170,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
       continue;
     }
     size_t operator_id = source_operator->get_operator_id();
-    auto gs =
-      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    auto gs            = std::make_shared<pipeline::gpu_pipeline_task_global_state>(
+      pipeline, telemetry_context, host_staging_space);
     gs->set_completion_handler(handler);
     if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
       gs->set_priority(it->second);
@@ -770,11 +770,8 @@ void task_creator::manager_loop()
                                                        return a.second < b.second;
                                                      })
                                       ->first;
-                    auto gpus = _topology_index->gpus_of(top_host);
-                    if (!gpus.empty()) {
-                      auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                      preferred_device_id = gpus[idx];
-                    }
+                    preferred_device_id =
+                      _numa_affinity.next_gpu(top_host, _topology_index->gpus_of(top_host));
                   }
                   SIRIUS_LOG_DEBUG(
                     "Task Creator: locality score gpu_sources={} host_sources={} "
@@ -809,11 +806,9 @@ void task_creator::manager_loop()
                           // pick a GPU on the same NUMA. The host space's device id
                           // is the NUMA key verbatim (-1 = "unknown"), matching the
                           // pipelineable locality block above.
-                          auto gpus = _topology_index->gpus_of(space->get_device_id());
-                          if (!gpus.empty()) {
-                            auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                            preferred_device_id = gpus[idx];
-                          }
+                          auto const host = space->get_device_id();
+                          preferred_device_id =
+                            _numa_affinity.next_gpu(host, _topology_index->gpus_of(host));
                         }
                         SIRIUS_LOG_DEBUG(
                           "Task Creator: cached-scan locality tier={} device_id={} "

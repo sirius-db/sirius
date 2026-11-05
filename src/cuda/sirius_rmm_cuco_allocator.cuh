@@ -36,12 +36,12 @@ class rmm_cuco_allocator {
   {
   }
 
-  value_type* allocate(std::size_t n, cuda::stream_ref stream)
+  value_type* allocate(std::size_t n, ::cuda::stream_ref stream)
   {
     return static_cast<value_type*>(_mr.allocate(
       ::cuda::stream_ref{stream.get()}, n * sizeof(value_type), rmm::CUDA_ALLOCATION_ALIGNMENT));
   }
-  void deallocate(value_type* p, std::size_t n, cuda::stream_ref stream) noexcept
+  void deallocate(value_type* p, std::size_t n, ::cuda::stream_ref stream) noexcept
   {
     _mr.deallocate(
       ::cuda::stream_ref{stream.get()}, p, n * sizeof(value_type), rmm::CUDA_ALLOCATION_ALIGNMENT);

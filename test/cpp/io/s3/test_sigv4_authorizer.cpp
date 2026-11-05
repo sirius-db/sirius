@@ -146,7 +146,8 @@ TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "
     R"(<?xml version="1.0" encoding="UTF-8"?>)"
     R"(<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">)"
     R"(<Name>bucket</Name><Prefix>lake/</Prefix>)"
-    R"(<Contents><Key>lake/a&amp;b.parquet</Key><Size>12</Size></Contents>)"
+    R"(<Contents><Key>lake/a&amp;b.parquet</Key><Size>12</Size>)"
+    R"(<ETag>&quot;9b2cf535f27731c974343645a3985328&quot;</ETag></Contents>)"
     R"(<Contents><Key>lake/year=2024/file.parquet</Key><Size>0</Size></Contents>)"
     R"(<IsTruncated>true</IsTruncated>)"
     R"(<NextContinuationToken>token/with+chars=</NextContinuationToken>)"
@@ -155,8 +156,10 @@ TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "
   REQUIRE(page.entries.size() == 2);
   CHECK(page.entries[0].key == "lake/a&b.parquet");
   CHECK(page.entries[0].size == 12);
+  CHECK(page.entries[0].etag == "\"9b2cf535f27731c974343645a3985328\"");
   CHECK(page.entries[1].key == "lake/year=2024/file.parquet");
   CHECK(page.entries[1].size == 0);
+  CHECK(page.entries[1].etag.empty());
   CHECK(page.is_truncated);
   CHECK(page.next_continuation_token == "token/with+chars=");
 }

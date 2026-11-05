@@ -79,6 +79,31 @@ class completion_handler {
     finish_error(std::move(error), fallback, nullptr);
   }
 
+  // Read the committed winner without inferring its type from diagnostic text.
+  std::exception_ptr terminal_error() const
+  {
+    std::lock_guard lock(terminal_mutex_);
+    return terminal_error_;
+  }
+
+  // A failed close is a retirement failure even when an earlier query error already won.
+  // Preserve the terminal error; common window cleanup checks this independent latch after
+  // physical retirement, before any frontend can enter CPU replay.
+  void report_preparation_cleanup_error(std::exception_ptr error) noexcept
+  {
+    finish_error(std::move(error), transparent::late_failure_cause::other, nullptr, true);
+  }
+  void throw_if_preparation_cleanup_failed() const
+  {
+    std::exception_ptr error;
+    {
+      std::lock_guard lock(terminal_mutex_);
+      if (preparation_cleanup_error_)
+        error = terminal_error_ ? terminal_error_ : preparation_cleanup_error_;
+    }
+    if (error) std::rethrow_exception(error);
+  }
+
   void report_error(scan_manager::preparation_failure const& error) noexcept
   {
     try {
@@ -242,10 +267,13 @@ class completion_handler {
   // terminal -> failure -> publication. Never hold these locks while draining workers.
   void finish_error(std::exception_ptr error,
                     transparent::late_failure_cause fallback,
-                    scan_manager::preparation_failure const* preparation) noexcept
+                    scan_manager::preparation_failure const* preparation,
+                    bool cleanup_failed = false) noexcept
   {
     std::unique_lock terminal_lock(terminal_mutex_);
+    if (cleanup_failed && !preparation_cleanup_error_) preparation_cleanup_error_ = error;
     if (_completed.load()) return;
+    terminal_error_ = error;
     {
       std::lock_guard lock(failure_mutex_);
       // Save only the terminal winner, before waking the query thread. Allocation failure
@@ -296,7 +324,8 @@ class completion_handler {
     }
   }
   std::shared_ptr<std::function<void(bool)> const> preparation_stop_;
-  std::mutex terminal_mutex_;
+  mutable std::mutex terminal_mutex_;
+  std::exception_ptr terminal_error_, preparation_cleanup_error_;
   bool gpu_done_              = false;
   bool preparation_active_    = false;
   bool inputs_closed_         = false;

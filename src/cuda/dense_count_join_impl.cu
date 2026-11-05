@@ -416,8 +416,6 @@ void accumulate_impl(cudf::column_view const& keys,
                                                 bins);
   };
   dispatch_key_type(keys.type().id(), "key column", launch);
-  // Deliberately not CUDF_CHECK_CUDA: that macro synchronizes the stream in non-NDEBUG builds, and
-  // this path runs once per input batch.
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

@@ -35,7 +35,6 @@
 #include <catch.hpp>
 #include <late_mat/prepared_selection.hpp>
 
-#include <algorithm>
 #include <cstdint>
 #include <set>
 #include <vector>

@@ -17,12 +17,11 @@
 
 #include "memory/numa_small_pinned_mr.hpp"
 
-#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
-#include <catch2/catch_all.hpp>
+#include <catch.hpp>
 
 #include <algorithm>
 #include <atomic>

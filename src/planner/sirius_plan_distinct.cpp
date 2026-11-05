@@ -20,7 +20,6 @@
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
-#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"

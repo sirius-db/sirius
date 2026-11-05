@@ -16,16 +16,18 @@
 
 #pragma once
 
-#include <vector>
+#include <cudf/scalar/scalar.hpp>
+
+#include <cuda/stream>
+
+#include <duckdb/common/types/value.hpp>
 
 namespace sirius {
-namespace parallel {
 
-struct task_executor_config {
-  int num_threads{0};
-  bool retry_on_error{false};
-  std::vector<int> cpu_affinity_list;
-};
+// Convert integer, date, timestamp, and string scalars using the supplied stream.
+// Returns a NULL Value for unsupported types. The caller must validate the scalar
+// and enforce its own type allowlist before calling; conversion support does not
+// imply that a type is eligible for boundary publication or statistics capture.
+duckdb::Value cudf_scalar_to_value(cudf::scalar const& scalar, ::cuda::stream_ref stream);
 
-}  // namespace parallel
 }  // namespace sirius

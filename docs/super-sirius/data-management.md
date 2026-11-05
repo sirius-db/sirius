@@ -131,6 +131,10 @@ Operators access their ports by string name:
 
 Minimal empty base class. Provides a generic extension point for any type of operator data — signaling objects, metadata-only data, or non-batch representations can derive from `operator_data` without being forced into the batch model.
 
+### `input_free_operator_data`
+
+Used by GPU_VALUES and zero-input ungrouped aggregate finalization. It owns no batches and captures the reserved GPU memory space during `prepare_for_processing()`. Its estimated byte basis accounts for output allocation. An empty relation may finish with zero batches; operators that must produce an empty-input result schedule work explicitly. There is no universal requirement for an operator to emit a batch.
+
 ### `pipelineable_operator_data`
 
 Extends `operator_data` with batch-based data flow. Holds two optional internal stores that are
@@ -156,6 +160,7 @@ Extends `pipelineable_operator_data` with a partition index (`get_partition_idx(
 
 ```
 operator_data                       (empty generic base)
+  ├── input_free_operator_data       (reservation space, no batches)
   └── pipelineable_operator_data    (batch vector + data flow methods)
        └── partitioned_operator_data (adds partition_idx)
 ```

@@ -184,7 +184,7 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
 
   // cuDF casts can wrap where DuckDB CAST throws or TRY_CAST returns NULL. Reject
   // unsigned integer casts unless the target carrier fits the full source domain.
-  // HUGEINT/UHUGEINT currently use INT64/UINT64 on the GPU.
+  // HUGEINT is DECIMAL128 on the GPU (127 value bits); UHUGEINT still uses UINT64.
   // TODO: Implement checked GPU integer casts: return NULL on overflow for TRY_CAST
   // and raise an error for CAST, allowing these conversions without CPU fallback.
   if (source_type.IsUnsigned()) {
@@ -193,8 +193,8 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
       case duckdb::LogicalTypeId::TINYINT: target_value_bits = 7; break;
       case duckdb::LogicalTypeId::SMALLINT: target_value_bits = 15; break;
       case duckdb::LogicalTypeId::INTEGER: target_value_bits = 31; break;
-      case duckdb::LogicalTypeId::BIGINT:
-      case duckdb::LogicalTypeId::HUGEINT: target_value_bits = 63; break;
+      case duckdb::LogicalTypeId::BIGINT: target_value_bits = 63; break;
+      case duckdb::LogicalTypeId::HUGEINT: target_value_bits = 127; break;
       case duckdb::LogicalTypeId::UTINYINT: target_value_bits = 8; break;
       case duckdb::LogicalTypeId::USMALLINT: target_value_bits = 16; break;
       case duckdb::LogicalTypeId::UINTEGER: target_value_bits = 32; break;
@@ -258,7 +258,7 @@ bool gpu_supports_abs(duckdb::BoundFunctionExpression const& expr)
          type.id() != duckdb::LogicalTypeId::UHUGEINT;
 }
 
-// Unsigned (DuckDB rejects nonzero), HUGEINT (INT64 carrier) and INTERVAL negation stay on the CPU.
+// Unsigned (DuckDB rejects nonzero), HUGEINT and INTERVAL negation stay on the CPU.
 // cuDF's negation keeps its input type, so the result type must match it.
 bool gpu_supports_negate(duckdb::BoundFunctionExpression const& expr)
 {
@@ -399,6 +399,8 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
 
 std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const& aggr)
 {
+  // FILTERed aggregates have already been consumed and translated
+  if (aggr.GetFilter()) { return nullptr; }
   auto agg_id_opt =
     sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
   if (!agg_id_opt.has_value()) { return nullptr; }

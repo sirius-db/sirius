@@ -14,22 +14,11 @@
  * limitations under the License.
  */
 
-#include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
+#pragma once
 
-#include <cucascade/memory/common.hpp>
-
-namespace sirius::op {
-
-std::optional<std::pair<int, int>> find_pair_without_peer_dma(std::span<int const> device_ids)
-{
-  for (auto const source : device_ids) {
-    for (auto const destination : device_ids) {
-      if (source != destination && !cucascade::memory::probe_peer_dma_works(source, destination)) {
-        return std::pair{source, destination};
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-}  // namespace sirius::op
+// TODO: Remove with the cudf port patch and CMake workaround after cudf#24173 ships.
+// cuDF 26.10 needs <variant> before its AST header.
+// clang-format off
+#include <variant>  // IWYU pragma: keep
+#include <cudf/ast/expressions.hpp>  // IWYU pragma: export
+// clang-format on

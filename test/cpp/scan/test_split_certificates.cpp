@@ -30,16 +30,12 @@
 #include "transparent/replay_admission.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
-#include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <io/kvikio/kvikio_context.hpp>
@@ -646,7 +642,7 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
   CHECK(pruned->flush().empty());
 }
 TEST_CASE("Parquet coalescing rejects malformed files without changing pending work",
-          "[scan][certificate][parquet_certificate]")
+          "[scan][certificate][parquet_certificate][fw_s4]")
 {
   auto const defect  = std::string{GENERATE("missing", "extra", "foreign", "uncertified_foreign")};
   auto const pending = std::string{GENERATE("empty", "rows", "pruned")};
@@ -683,7 +679,17 @@ TEST_CASE("Parquet coalescing rejects malformed files without changing pending w
       certificate.contract_id = id;
   }
   malformed->set_contract_payload(id, std::move(certificates), std::move(dependencies));
-  REQUIRE_THROWS_AS(coalescer->push(std::move(malformed)), std::invalid_argument);
+  try {
+    coalescer->push(std::move(malformed));
+    FAIL("expected certificate refusal");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::certificate);
+    CHECK(error.reason.empty());
+    auto expected = (defect == "foreign" || defect == "uncertified_foreign")
+                      ? "parquet file contract does not match coalescer contract"
+                      : "parquet file requires one certificate and dependency";
+    CHECK(std::string(error.what()) == expected);
+  }
 
   auto preserved = coalescer->flush();
   REQUIRE(preserved.size() == (pending == "empty" ? 0 : 1));
@@ -1412,8 +1418,8 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
 }
 
-TEST_CASE("Production scan preparation runs and publishes on the execute owner",
-          "[integration][scan][certificate][scan_preparation][query_thread]")
+TEST_CASE("Metadata-only production scans publish on the query owner",
+          "[integration][scan][certificate][scan_preparation][coordinator_thread]")
 {
   sirius::test::GpuExecutionFixture fixture;
   auto& con = *fixture.con;
@@ -1452,7 +1458,7 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
         CHECK(observation.execute_owner != std::thread::id{});
         CHECK(observation.preparation_owner == observation.execute_owner);
         CHECK(observation.preparation_runner == observation.execute_owner);
-        CHECK(observation.preparation_publisher == observation.execute_owner);
+        CHECK(observation.preparation_publisher == observation.preparation_runner);
       }
     }
   }

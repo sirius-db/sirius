@@ -35,6 +35,7 @@ class LogicalGet;
 class LogicalOperator;
 class PhysicalOperator;
 class PhysicalTableScan;
+struct ParquetOptions;
 }  // namespace duckdb
 namespace sirius::op {
 class sirius_physical_table_scan;
@@ -110,10 +111,16 @@ struct read_view_capture_metrics {
   std::size_t sort_index_capacity = 0;
 };
 
+/// Bound provider semantics independent of lazy file discovery. The key is an
+/// immutable, length-delimited descriptor supplied by a verified connector.
+struct provider_read_identity {
+  std::string key;
+};
 /// Stable read identity shared after an equal comparison; evidence remains capture-specific.
 struct bound_read_identity {
   verified_source_identity source;
-  std::variant<native_table_identity, file_inventory, stream_identity> data_view;
+  std::variant<native_table_identity, file_inventory, stream_identity, provider_read_identity>
+    data_view;
   duckdb::vector<duckdb::LogicalType> bound_types;
   duckdb::vector<std::string> bound_names;
   /// Canonical bound reader options participating in stable identity.
@@ -151,6 +158,10 @@ struct logical_bound_read_view_capture {
   uint64_t planning_generation = 0;
   std::vector<logical_bound_read_view> views;
 };
+
+// Canonical text of the Parquet reader options that change what a file reads as, including
+// the encryption configuration. Equal text means equal options.
+std::string parquet_options_identity(duckdb::ParquetOptions const& options);
 
 // Maps original file order to evidence order without retaining another path inventory.
 // An empty result means the paths are already sorted; use the original file position.

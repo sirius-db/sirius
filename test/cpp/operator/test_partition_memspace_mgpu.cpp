@@ -32,7 +32,6 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <unistd.h>
 
 #include <cstdint>

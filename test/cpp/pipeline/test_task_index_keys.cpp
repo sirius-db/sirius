@@ -28,7 +28,6 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "pipeline/sirius_pipeline_task_states.hpp"
 #include "query_id.hpp"
 #include "utils/telemetry_utils.hpp"
 
