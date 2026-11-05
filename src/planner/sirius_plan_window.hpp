@@ -20,6 +20,7 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/window/ranking.hpp"
 #include "op/window/whole_partition.hpp"
 #include "sirius_config.hpp"
 
@@ -45,28 +46,39 @@ struct whole_partition_expression {
   duckdb::idx_t output_slot;
 };
 
+struct ranking_window_expression {
+  op::ranking_function function;
+  duckdb::LogicalType result_type;
+  duckdb::idx_t output_slot;
+};
+
 // Planning IR only: not an executable operator. All slots index the prepared input
 // (original columns followed by hidden expressions), except output_slot, which
 // indexes the visible output (original columns followed by window results).
-struct whole_partition_window_plan {
+// A window holds either `expressions` (aggregates over the whole partition) or `rankings`
+// (ranking functions over `ranking_order`), never both.
+struct window_plan {
   duckdb::idx_t input_width;
   duckdb::vector<duckdb::LogicalType> prepared_types;
   duckdb::vector<duckdb::LogicalType> output_types;
   std::vector<duckdb::idx_t> partition_slots;
   std::vector<std::unique_ptr<ast::node>> hidden_expressions;
   std::vector<whole_partition_expression> expressions;
+  std::vector<ranking_window_expression> rankings;
+  // Order key slots, direction and NULL placement shared by all `rankings`.
+  op::ranking_order ranking_order;
 };
 
 // Admit at most one window operator in a plan. Throws NotImplementedException otherwise.
-void validate_whole_partition_window_stages(duckdb::LogicalOperator const& plan);
+void validate_window_stages(duckdb::LogicalOperator const& plan);
 
 // Requires resolved column references. Throws NotImplementedException for unsupported
 // combinations, even on empty input. Hidden columns must survive through reduction/expansion and be
 // removed when the visible output is published.
-whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window);
+window_plan plan_window(duckdb::LogicalWindow const& window);
 
 /**
- * @brief Build the input side of a whole-partition window: prepare, PARTITION, then CONCAT.
+ * @brief Build the input side of a window: prepare, PARTITION, then CONCAT.
  *
  * Adds a projection on @p child that passes its columns through and appends the plan's hidden
  * expressions. Each `PARTITION BY` key or aggregate argument that is not a plain column reference
@@ -77,22 +89,22 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
  * buckets after pipeline wrapper insertion.
  *
  * @param child Producer of the window's input columns.
- * @param plan Plan from `plan_whole_partition_window`.
+ * @param plan Plan from `plan_window`.
  * @param estimated_cardinality Estimated number of input rows.
  * @param hash_partition_bytes Target size of a bucket in bytes. Must be positive.
  * @return The root of the prepared input.
  * @throws duckdb::InternalException if the child's schema differs from the plan's input schema.
  * @throws std::invalid_argument if @p hash_partition_bytes is zero.
  */
-duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_input(
+duckdb::unique_ptr<op::sirius_physical_operator> build_window_input(
   duckdb::unique_ptr<op::sirius_physical_operator> child,
-  whole_partition_window_plan const& plan,
+  window_plan const& plan,
   std::size_t estimated_cardinality,
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
 
 // Insert only the exchange/assembly around an already prepared child. SQL lowering calls this
 // after compressed-schema propagation, alongside the other pipeline wrapper insertions.
-duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_exchange(
+duckdb::unique_ptr<op::sirius_physical_operator> build_window_exchange(
   duckdb::unique_ptr<op::sirius_physical_operator> child,
   std::vector<duckdb::idx_t> const& partition_slots,
   std::size_t estimated_cardinality,

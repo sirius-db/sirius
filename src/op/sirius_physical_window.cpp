@@ -25,10 +25,12 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
+#include <numeric>
 #include <stdexcept>
 
 namespace sirius::op {
 
+// A window of aggregates over the whole partition.
 sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> output_types,
                                                duckdb::vector<logical_type> prepared_types,
                                                std::size_t input_width,
@@ -56,6 +58,38 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
   }
 }
 
+// A window of ranking functions over the window ORDER BY.
+sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> output_types,
+                                               duckdb::vector<logical_type> prepared_types,
+                                               std::size_t input_width,
+                                               std::vector<cudf::size_type> partition_columns,
+                                               ranking_order order,
+                                               std::vector<ranking_function> ranking_functions,
+                                               std::size_t estimated_cardinality)
+  : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
+    _prepared_types(std::move(prepared_types)),
+    _input_width(input_width),
+    _partition_columns(std::move(partition_columns)),
+    _ranking_order(std::move(order)),
+    _ranking_functions(std::move(ranking_functions))
+{
+  auto const valid_slot = [&](cudf::size_type slot) {
+    return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
+  };
+  if (_ranking_functions.empty() || _partition_columns.empty() || _ranking_order.columns.empty() ||
+      _ranking_order.directions.size() != _ranking_order.columns.size() ||
+      _ranking_order.nulls.size() != _ranking_order.columns.size() ||
+      !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
+      !std::all_of(_ranking_order.columns.begin(), _ranking_order.columns.end(), valid_slot)) {
+    throw std::invalid_argument("Window key or order key is outside its prepared schema");
+  }
+  if (_input_width > _prepared_types.size() ||
+      types.size() != _input_width + _ranking_functions.size()) {
+    throw std::invalid_argument("Window output schema does not match its prepared input");
+  }
+}
+
+// The next complete bucket from CONCAT, or nullptr when none is ready.
 std::unique_ptr<operator_data> sirius_physical_window::get_next_task_input_data()
 {
   std::lock_guard<std::mutex> guard(lock);
@@ -82,8 +116,13 @@ std::size_t sirius_physical_window::workspace_bytes(std::size_t rows, std::size_
   // groupby and distinct-join hash tables, the row-to-group map, restored/widened arguments,
   // checked SUM structs, counts/AVG temporaries, and expanded output columns. Worst case: one
   // group per row. History refines this after execution, and native OOM follows ordinary retries.
+  // A ranking window needs about 24 bytes per row for each function: the INT32 scan result, the
+  // scattered result and the INT64 cast. The sort order is shared by all functions.
   auto per_row = memory::saturating_add(128, memory::saturating_mul(_aggregates.size(), 128));
+  per_row = memory::saturating_add(per_row, memory::saturating_mul(_ranking_functions.size(), 24));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_partition_columns.size(), 32));
+  per_row =
+    memory::saturating_add(per_row, memory::saturating_mul(_ranking_order.columns.size(), 32));
   return memory::saturating_add(memory::saturating_mul(input_bytes, 2),
                                 memory::saturating_mul(rows, per_row));
 }
@@ -95,6 +134,7 @@ std::size_t sirius_physical_window::no_history_peak_memory_estimate(input_stats 
   return workspace_bytes(rows, stats.bytes);
 }
 
+// Evaluates each input bucket and publishes its columns followed by the window results.
 std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data const& input,
                                                                ::cuda::stream_ref stream)
 {
@@ -124,8 +164,7 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
       input_bytes,
       memory::saturating_mul(static_cast<std::size_t>(table.num_rows()), result_width));
     if (required > space.get_max_memory()) {
-      throw std::runtime_error(
-        "Whole-partition window input and results exceed GPU memory capacity");
+      throw std::runtime_error("Window input and results exceed GPU memory capacity");
     }
 
     auto columns = std::vector<cudf::column_view>(table.begin(), table.end());
@@ -139,23 +178,32 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
         restored.push_back(std::move(column));
       }
     };
-    for (auto slot : _partition_columns) {
-      restore(slot);
+    // Ranking only reads the equality and the order of its keys, which an exact narrower carrier
+    // keeps, so its keys are used as they are.
+    if (_ranking_functions.empty()) {
+      for (auto slot : _partition_columns) {
+        restore(slot);
+      }
+      for (auto const& aggregate : _aggregates) {
+        restore(aggregate.argument_column);
+      }
     }
-    for (auto const& aggregate : _aggregates) {
-      restore(aggregate.argument_column);
-    }
-    std::shared_ptr<cudf::table> results = evaluate_whole_partition_window(
-      cudf::table_view(columns), _partition_columns, _aggregates, stream, mr);
+    std::shared_ptr<cudf::table> results =
+      _ranking_functions.empty()
+        ? evaluate_whole_partition_window(
+            cudf::table_view(columns), _partition_columns, _aggregates, stream, mr)
+        : evaluate_ranking_window(cudf::table_view(columns),
+                                  _partition_columns,
+                                  _ranking_order,
+                                  _ranking_functions,
+                                  stream,
+                                  mr);
 
-    // Forward payload in its original carrier and row order, followed by the window results.
-    std::vector<cudf::column_view> visible;
-    for (std::size_t i = 0; i < _input_width; ++i) {
-      visible.push_back(table.column(i));
-    }
-    for (auto column : results->view()) {
-      visible.push_back(column);
-    }
+    // Forward payload in its original carrier and row order, followed by the window results. The
+    // hidden columns after the payload are not published.
+    std::vector<cudf::size_type> payload(_input_width);
+    std::iota(payload.begin(), payload.end(), 0);
+    cudf::table_view const visible{{table.select(payload), results->view()}};
     struct window_owner {
       std::shared_ptr<cudf::table> results;
       cucascade::read_only_data_batch input;
@@ -163,7 +211,7 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
     auto bytes = memory::saturating_add(input_bytes, results->alloc_size());
     window_owner owner{std::move(results), std::move(batch)};
     output.push_back(make_data_batch_from_view(
-      cudf::table_view(visible), std::move(owner), bytes, space, stream, batch_telemetry()));
+      visible, std::move(owner), bytes, space, stream, batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(std::move(output));
 }
