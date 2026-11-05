@@ -2,7 +2,7 @@
 #include "op/scan/table_scan/field_mapper.hpp"
 
 #include "io/parquet_helpers.hpp"
-#include "io/uri_parser.hpp"
+#include "io/path_utils.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 
 #include <algorithm>

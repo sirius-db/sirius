@@ -2453,15 +2453,6 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   scan_execution_context execution)
 {
   auto const& physical = dynamic_cast<parquet_split_info const&>(info);
-  // Reuse the production certificate check before either decoder is dispatched.
-  // It consumes retained evidence and performs no footer or object metadata I/O.
-  auto required_checks =
-    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
-  if (_info->physical_schema || physical.field_mapping)
-    required_checks |= check_bit(later_check::schema_per_file);
-  if (!execution.validation ||
-      !execution.validation->consume(info, _info->contract_id, required_checks))
-    validate_split_for_gpu(_info->contract_id, required_checks, std::nullopt, info);
   if (physical.field_mapping) {
     auto const& mapping = *physical.field_mapping;
     if (mapping.program().contract != _info->contract_id)
@@ -2474,6 +2465,15 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
           transparent::late_failure_cause::certificate,
           "mapped split does not match its approved file");
   }
+  // Preserve mapped-split diagnostics before the generic certificate check.
+  // Both checks consume retained evidence before either decoder is dispatched.
+  auto required_checks =
+    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
+  if (_info->physical_schema || physical.field_mapping)
+    required_checks |= check_bit(later_check::schema_per_file);
+  if (!execution.validation ||
+      !execution.validation->consume(info, _info->contract_id, required_checks))
+    validate_split_for_gpu(_info->contract_id, required_checks, std::nullopt, info);
   std::call_once(_materializer_once, [&] {
     auto program                    = std::make_shared<materialization_program>();
     program->contract               = execution_contract();

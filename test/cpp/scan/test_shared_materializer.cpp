@@ -1,6 +1,5 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "helper/type_conversions.hpp"
-#include "io/kvikio/kvikio_context.hpp"
 #include "op/scan/detail/read_retirement.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -24,6 +23,7 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
@@ -298,7 +298,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto reader                  = std::make_shared<relay_ingestible>(std::move(info));
   auto ioctx                   = std::make_shared<sirius::test::tracking_kvikio_context>();
   auto task                    = reader->next_split_provider(
-    [ioctx](auto) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](auto) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
   auto coalescer = reader->create_batch_coalescer();
   auto splits    = coalescer->push(task({}));
@@ -823,8 +823,10 @@ TEST_CASE_METHOD(
                                     duckdb::Value::INTEGER(100)));
   parquet_scan_core core(std::move(info));
   auto ioctx    = std::make_shared<sirius::test::tracking_kvikio_context>();
-  auto resolver = [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; };
-  auto prepare  = core.next_split_provider(resolver);
+  auto resolver = [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+    return ioctx;
+  };
+  auto prepare = core.next_split_provider(resolver);
   REQUIRE(prepare);
   auto coalescer = core.create_batch_coalescer();
   auto splits    = coalescer->push(prepare({}));
@@ -1786,7 +1788,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   info->column_ids             = {duckdb::ColumnIndex(0)};
   info->projected_output_count = 1;
   parquet_scan_core core(std::move(info));
-  auto ioctx     = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx     = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare   = core.next_split_provider([ioctx](std::string_view) { return ioctx; });
   auto coalescer = core.create_batch_coalescer();
   auto splits    = coalescer->push(prepare({}));
@@ -1925,10 +1927,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
          " file_path, pos FROM (VALUES (-1::BIGINT), (11::BIGINT)" +
          (duplicates ? ",(11::BIGINT)" : "") + ") t(pos)) TO " +
          dir.file_literal("deletes.parquet") + " (FORMAT PARQUET)");
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files = {dir.file("deletes.parquet")};
-  auto payload = load_delete_payload(*con->context, "lineage-eager", ioctx.get(), {}, discovery);
+  auto payload = load_delete_payload(*con->context, "lineage-eager", ioctx, discovery);
   REQUIRE(payload);
   REQUIRE(payload->positional_deletes.at(path) ==
           (duplicates ? std::vector<int64_t>{-1, 11, 11} : std::vector<int64_t>{-1, 11}));
