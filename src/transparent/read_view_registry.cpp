@@ -175,8 +175,20 @@ read_view_comparison compare_read_views_impl(
   candidate_origin origin,
   std::span<original_binding_ref const> logical_original,
   std::span<op::scan::read_view_fingerprint const* const> physical_original,
-  std::span<candidate_binding const> candidate)
+  std::span<candidate_binding const> planned,
+  std::span<candidate_binding const> skipped)
 {
+  // Skipped definitions get the same identity checks; only replan's single correspondence,
+  // which names the scan the GPU reads, considers planned scans alone.
+  std::vector<candidate_binding> all;
+  auto candidate = planned;
+  if (!skipped.empty()) {
+    all.reserve(planned.size() + skipped.size());
+    all.assign(planned.begin(), planned.end());
+    all.insert(all.end(), skipped.begin(), skipped.end());
+    candidate = all;
+  }
+
   read_view_comparison result;
   result.original_count  = physical_original.size();
   result.candidate_count = candidate.size();
@@ -187,8 +199,8 @@ read_view_comparison compare_read_views_impl(
     result.candidate_hash = candidate.front().view->identity->fingerprint.hash;
   }
   if (origin == candidate_origin::replan) {
-    result.correspondence = candidate.empty() ? "none" : "single";
-    if (candidate.size() > 1) {
+    result.correspondence = planned.empty() ? "none" : "single";
+    if (planned.size() > 1) {
       result.correspondence = "none";
       result.reason         = "no_correspondence";
       return result;
@@ -199,16 +211,16 @@ read_view_comparison compare_read_views_impl(
   if (!compare_multiset(physical_original, candidate, result)) return result;
 
   if (origin == candidate_origin::replan) {
-    if (candidate.empty()) {
+    if (planned.empty()) {
       result.equal = true;
       return result;
     }
     op::scan::bound_read_view const* selector_original = nullptr;
     if (logical_original.size() == 1 &&
-        same_identity(logical_original.front().view, candidate.front().view)) {
+        same_identity(logical_original.front().view, planned.front().view)) {
       selector_original = logical_original.front().view;
     }
-    if (!selector_proven(*candidate.front().view, selector_original)) {
+    if (!selector_proven(*planned.front().view, selector_original)) {
       result.reason = "selector_unproven";
       return result;
     }
@@ -249,7 +261,8 @@ read_view_comparison compare_read_views(
   candidate_origin origin,
   std::span<original_binding const> logical_original,
   std::span<op::scan::read_view_fingerprint const> physical_original,
-  std::span<candidate_binding const> candidate)
+  std::span<candidate_binding const> candidate,
+  std::span<candidate_binding const> skipped)
 {
   std::vector<original_binding_ref> logical;
   logical.reserve(logical_original.size());
@@ -259,7 +272,7 @@ read_view_comparison compare_read_views(
   physical.reserve(physical_original.size());
   for (auto const& fingerprint : physical_original)
     physical.push_back(&fingerprint);
-  return compare_read_views_impl(origin, logical, physical, candidate);
+  return compare_read_views_impl(origin, logical, physical, candidate, skipped);
 }
 
 read_view_comparison compare_read_views(
@@ -286,7 +299,8 @@ read_view_comparison compare_read_views(
     physical.push_back(&view.identity->fingerprint);
   }
   auto bindings = candidate.candidate_bindings();
-  auto result   = compare_read_views_impl(origin, logical, physical, bindings);
+  auto result =
+    compare_read_views_impl(origin, logical, physical, bindings, candidate.skipped_bindings());
   if (!physical_original.empty()) result.original_depth = physical_original.front().depth;
   if (!bindings.empty() && bindings.front().view) {
     result.candidate_depth = bindings.front().view->depth;
@@ -298,8 +312,10 @@ void share_equal_read_view_identities(op::scan::logical_bound_read_view_capture*
                                       std::span<op::scan::bound_read_view> physical_original,
                                       read_view_registry const& candidate)
 {
-  auto const bindings = candidate.candidate_bindings();
-  auto share          = [&](op::scan::bound_read_view& original, bool required) {
+  auto bindings       = candidate.candidate_bindings();
+  auto const& skipped = candidate.skipped_bindings();
+  bindings.insert(bindings.end(), skipped.begin(), skipped.end());
+  auto share = [&](op::scan::bound_read_view& original, bool required) {
     if (!original.identity) {
       throw std::logic_error("cannot share a missing original read-view identity");
     }
@@ -407,6 +423,15 @@ std::vector<candidate_binding> read_view_registry::candidate_bindings() const
     result.push_back({entry.contract.table_index, entry.contract.view});
   }
   return result;
+}
+
+void read_view_registry::record_skipped_scans(std::vector<op::scan::logical_bound_read_view> views)
+{
+  skipped_.reserve(skipped_.size() + views.size());
+  for (auto& view : views) {
+    skipped_.push_back(
+      {view.table_index, std::make_shared<op::scan::bound_read_view const>(std::move(view.view))});
+  }
 }
 
 void read_view_registry::record_delete_preparation(op::scan::scan_contract_id id,
