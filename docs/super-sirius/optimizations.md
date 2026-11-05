@@ -151,7 +151,7 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
-### Correlated EXISTS MIN/MAX Rewrite (unreleased, experimental)
+### Correlated EXISTS MIN/MAX Rewrite
 
 **Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
 
@@ -185,7 +185,7 @@ Because the merged plan reads one view fewer times than the original, `compare_r
 
 **Code path:** `src/planner/sirius_plan_exists_rewrite.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`
 
-**Config:** `enable_exists_minmax_rewrite` (default `false`, see [Configuration](configuration.md)).
+**Config:** `enable_exists_minmax_rewrite` (default `true`, see [Configuration](configuration.md)).
 
 ### Sorted-Key Grouped Aggregation
 

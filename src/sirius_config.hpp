@@ -118,10 +118,9 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-/// Rewrite correlated `[NOT] EXISTS` with one `=` and one `<>` correlation into a per-key MIN/MAX
-/// aggregate, merging sibling subqueries over the same table into one scan. Off by default while
-/// the rewrite is experimental.
-constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = false;
+/// Merge sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same
+/// table into one scan and a per-key MIN/MAX aggregate.
+constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 
 /// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
