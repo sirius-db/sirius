@@ -113,11 +113,12 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
     case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
+      if (policy == origin_policy::row_wise) { return std::nullopt; }
       return mapped_origin(0, {}, ordinal, child_width);
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
       auto const& aggregate = op.Cast<duckdb::LogicalAggregate>();
       // Several grouping sets repeat rows; the keys a set omits are padded with NULL.
-      if (policy == origin_policy::row_subset && aggregate.grouping_sets.size() > 1) {
+      if (policy != origin_policy::value_preserving && aggregate.grouping_sets.size() > 1) {
         return std::nullopt;
       }
       if (ordinal >= aggregate.groups.size()) { return std::nullopt; }
@@ -131,7 +132,7 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
     case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_ASOF_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
-      if (policy == origin_policy::row_subset) { return std::nullopt; }
+      if (policy != origin_policy::value_preserving) { return std::nullopt; }
       return join_origin(op.Cast<duckdb::LogicalJoin>(), ordinal, policy);
     case duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
       if (policy == origin_policy::row_subset || op.children.size() != 2) { return std::nullopt; }
