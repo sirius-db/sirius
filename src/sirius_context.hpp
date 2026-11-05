@@ -827,6 +827,10 @@ class SiriusContext : public ClientContextState {
   /// \brief The distributed query execution window @p window runs, or 0.
   [[nodiscard]] uint64_t distributed_query_of(sirius::query_id_t window);
 
+  /// \brief Test hook: @p service becomes this process's exchange, as if connected; null drops it.
+  void set_exchange_service_for_testing(
+    std::shared_ptr<sirius::exchange::exchange_service> service);
+
   /// \brief @p context's open execution window runs distributed query @p query, which an earlier
   /// statement planned (a prepared statement's validated plan). No-op for 0 or without a window.
   void adopt_distributed_query(ClientContext& context, uint64_t query);

@@ -1322,6 +1322,13 @@ void SiriusContext::release_distributed_connection(ClientContext& context)
   if (distributed_connection_ == context.GetConnectionId()) { distributed_connection_.reset(); }
 }
 
+void SiriusContext::set_exchange_service_for_testing(
+  std::shared_ptr<sirius::exchange::exchange_service> service)
+{
+  std::lock_guard lock{exchange_mutex_};
+  exchange_service_ = std::move(service);
+}
+
 void SiriusContext::adopt_distributed_query(ClientContext& context, uint64_t query)
 {
   auto state = get_sirius_connection_state(context);
