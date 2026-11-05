@@ -642,7 +642,7 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
   CHECK(pruned->flush().empty());
 }
 TEST_CASE("Parquet coalescing rejects malformed files without changing pending work",
-          "[scan][certificate][parquet_certificate]")
+          "[scan][certificate][parquet_certificate][fw_s4]")
 {
   auto const defect  = std::string{GENERATE("missing", "extra", "foreign", "uncertified_foreign")};
   auto const pending = std::string{GENERATE("empty", "rows", "pruned")};
@@ -679,7 +679,17 @@ TEST_CASE("Parquet coalescing rejects malformed files without changing pending w
       certificate.contract_id = id;
   }
   malformed->set_contract_payload(id, std::move(certificates), std::move(dependencies));
-  REQUIRE_THROWS_AS(coalescer->push(std::move(malformed)), std::invalid_argument);
+  try {
+    coalescer->push(std::move(malformed));
+    FAIL("expected certificate refusal");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::certificate);
+    CHECK(error.reason.empty());
+    auto expected = (defect == "foreign" || defect == "uncertified_foreign")
+                      ? "parquet file contract does not match coalescer contract"
+                      : "parquet file requires one certificate and dependency";
+    CHECK(std::string(error.what()) == expected);
+  }
 
   auto preserved = coalescer->flush();
   REQUIRE(preserved.size() == (pending == "empty" ? 0 : 1));

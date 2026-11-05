@@ -450,6 +450,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       try {
         require_s3_cpu_replay(source_policy_, query_sql_, gpu_msg);
+      } catch (duckdb::Exception const&) {
+        // Preserve typed discovery failures, including their transaction semantics.
+        throw;
       } catch (std::runtime_error const& error) {
         throw duckdb::ExecutorException(error.what());
       }
@@ -467,6 +470,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       try {
         require_non_s3_cpu_replay(source_policy_, gpu_msg);
+      } catch (duckdb::Exception const&) {
+        // Preserve typed discovery failures, including their transaction semantics.
+        throw;
       } catch (std::runtime_error const& error) {
         throw duckdb::ExecutorException(error.what());
       }

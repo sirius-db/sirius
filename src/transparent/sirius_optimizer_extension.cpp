@@ -20,6 +20,7 @@
 #include "planner/connector_registry.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -49,6 +50,13 @@ bool gpu_execution_enabled(const duckdb::ClientContext& context)
 {
   duckdb::Value setting;
   auto lookup_result = context.TryGetCurrentSetting("gpu_execution", setting);
+  return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
+}
+
+bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
+{
+  duckdb::Value setting;
+  auto lookup_result = context.TryGetCurrentSetting("parquet_footer_statistics", setting);
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
 }
 
@@ -180,6 +188,10 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
   // Decide before optimization can remove scans, including when GPU execution is off.
   (void)should_use_duckdb(context, plan.get(), &input.optimizer.binder.GetStatementProperties());
+  if (parquet_footer_statistics_enabled(context)) {
+    auto const scans = add_parquet_footer_statistics(context, *plan);
+    if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
+  }
   // DuckDB v2 derives the single-table restrictions implied by an OR-ed join condition itself
   // (JoinDependentFilterRule now also runs on INNER and SEMI join conditions, which is where the
   // TPC-H q19 and q7 disjunctions end up). This hook used to derive them too, for DuckDB 1.5, which

@@ -160,7 +160,10 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+# mold localizes GNU_UNIQUE symbols under --exclude-libs (rmm#826).
+if(CMAKE_LINKER_TYPE STREQUAL "MOLD")
+  set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+endif()
 
 # Keep the embedded DuckDB private when the host exposes another DuckDB
 # globally.
@@ -173,9 +176,9 @@ endforeach()
 target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections"
                     "LINKER:--allow-multiple-definition")
 
-# sirius-ffi is built by Cargo, independently of the telemetry bridge above. Its
-# build.rs compiles against include/ and links the library in build/<preset>.
-# See rust/crates/sirius-ffi.
+# Cargo builds the Rust API crates separately from the telemetry bridge above.
+# sirius-sys links libsirius from build/<preset>; sirius-ffi additionally
+# compiles its C++ bridge against include/. See rust/README.md.
 
 # NVML's static stub cannot be embedded safely; the real library is supplied by
 # the NVIDIA driver. Keep this requirement in the exported support target.

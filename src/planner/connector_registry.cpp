@@ -51,8 +51,11 @@
 #include <parquet_extension.hpp>
 #include <parquet_multi_file_info.hpp>
 
+#include <algorithm>
 #include <array>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_set>
 
@@ -667,6 +670,32 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
     if (name == "iceberg") initialize_iceberg_callbacks(db);
   }
 };
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+struct connector_override_scope {
+  duckdb::DatabaseInstance const* db;
+  std::shared_ptr<std::vector<connector> const> overrides;
+};
+std::mutex override_scopes_mutex;
+std::vector<connector_override_scope> override_scopes;
+
+// Retain the immutable override set under the lock, then release the lock before
+// verification or callbacks.
+std::shared_ptr<std::vector<connector> const> overrides_for(duckdb::DatabaseInstance const& db)
+{
+  std::lock_guard lock(override_scopes_mutex);
+  for (auto const& scope : override_scopes)
+    if (scope.db == &db) return scope.overrides;
+  return nullptr;
+}
+
+connector const* override_for(std::vector<connector> const* overrides, std::string const& name)
+{
+  if (!overrides) return nullptr;
+  for (auto const& candidate : *overrides)
+    if (candidate.function_name == name) return &candidate;
+  return nullptr;
+}
+#endif
 }  // namespace
 
 std::span<connector const> registered_connectors() { return entries; }
@@ -733,10 +762,21 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
                                                 duckdb::ClientContext& context)
 {
   bool function_known = false;
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+  auto const scoped_overrides = overrides_for(duckdb::DatabaseInstance::GetDatabase(context));
+#endif
   for (size_t i = 0; i < entries.size(); ++i) {
-    auto const& entry = entries[i];
-    if (entry.function_name != function.GetName()) continue;
+    auto const& registered = entries[i];
+    if (registered.function_name != function.GetName()) continue;
     function_known = true;
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+    // An installed override supplies the policy and hooks; trust verification below still
+    // uses the registered entry's reference cache.
+    auto const* overriding = override_for(scoped_overrides.get(), registered.function_name);
+    auto const& entry      = overriding ? *overriding : registered;
+#else
+    auto const& entry = registered;
+#endif
 
     if (!entry.bind_data_matches(bind)) continue;
     // The catalog's destructor identifies its host without a loader lookup per scan.
@@ -816,4 +856,42 @@ connector const* lookup_connector(duckdb::PhysicalTableScan const& get,
 {
   return lookup_connector(get.function, get.bind_data.get(), context);
 }
+
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+namespace testing {
+scoped_connector_overrides::scoped_connector_overrides(duckdb::DatabaseInstance const& db,
+                                                       std::vector<connector> overrides)
+  : db_(&db)
+{
+  for (auto const& candidate : overrides) {
+    auto const known = std::ranges::any_of(
+      entries, [&](auto const& entry) { return entry.function_name == candidate.function_name; });
+    if (!known)
+      throw std::invalid_argument("connector override names an unregistered function: " +
+                                  candidate.function_name);
+    if (!candidate.bind_data_matches)
+      throw std::invalid_argument("connector override requires a bind-data matcher: " +
+                                  candidate.function_name);
+    auto const duplicates = std::ranges::count_if(
+      overrides, [&](auto const& other) { return other.function_name == candidate.function_name; });
+    if (duplicates != 1)
+      throw std::invalid_argument("connector override repeats function: " +
+                                  candidate.function_name);
+  }
+  std::lock_guard lock(override_scopes_mutex);
+  if (std::ranges::any_of(override_scopes, [&](auto const& scope) { return scope.db == db_; }))
+    throw std::logic_error("a connector override scope is already installed for this database");
+  override_scopes.push_back(
+    {db_, std::make_shared<std::vector<connector> const>(std::move(overrides))});
+}
+
+scoped_connector_overrides::~scoped_connector_overrides()
+{
+  std::lock_guard lock(override_scopes_mutex);
+  std::erase_if(override_scopes, [&](auto const& scope) { return scope.db == db_; });
+}
+
+bool connector_overrides_linked() { return true; }
+}  // namespace testing
+#endif
 }  // namespace sirius::planner

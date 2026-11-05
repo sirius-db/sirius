@@ -523,8 +523,11 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     }
   }
   if (!view.replay_policy.permits_cpu_replay) {
-    view.replay_policy.reason =
-      view.replay_policy.source == transparent::byte_source_class::stream ? "stream" : "s3";
+    switch (view.replay_policy.source) {
+      case transparent::byte_source_class::stream: view.replay_policy.reason = "stream"; break;
+      case transparent::byte_source_class::sirius_owned_s3: view.replay_policy.reason = "s3"; break;
+      default: view.replay_policy.reason = "connector policy"; break;
+    }
   }
   view.metrics.file_count              = paths.size();
   view.metrics.transient_path_capacity = owned_paths.capacity() * sizeof(std::string) +
@@ -548,6 +551,11 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   return view;
 }
 }  // namespace
+
+std::string parquet_options_identity(duckdb::ParquetOptions const& options)
+{
+  return parquet_options_text(options);
+}
 
 // Map each file's input position to its position in the sorted evidence arrays.
 std::vector<std::size_t> make_read_view_evidence_index(std::span<std::string const> paths)

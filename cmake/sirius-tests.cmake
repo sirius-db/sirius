@@ -46,6 +46,37 @@ endif()
 target_sources(sirius_unittest
                PRIVATE $<TARGET_OBJECTS:sirius_context_config_test>)
 
+# Test variant of the connector registry: the same translation unit compiled
+# with the test-connector override seam. Linking the object ahead of sirius_core
+# keeps the archive's production object out of the test executable; production
+# libraries never see the seam.
+add_library(sirius_connector_registry_test OBJECT
+            src/planner/connector_registry.cpp)
+target_compile_definitions(
+  sirius_connector_registry_test
+  PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES
+          CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+set_target_properties(
+  sirius_connector_registry_test
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON)
+target_include_directories(
+  sirius_connector_registry_test BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(sirius_connector_registry_test PRIVATE sirius_core
+                                                             duckdb_static)
+if(VCPKG_BUILD)
+  set_target_properties(sirius_connector_registry_test
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_connector_registry_test BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+target_sources(sirius_unittest
+               PRIVATE $<TARGET_OBJECTS:sirius_connector_registry_test>)
+target_compile_definitions(sirius_unittest
+                           PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES)
+
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
   target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})

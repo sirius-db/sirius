@@ -26,6 +26,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/error_data.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -96,9 +97,11 @@ insert_delta_workset prepare_insert_delta_tasks(
     try {
       request.plan =
         op::scan::prepare_insert_delta_capture(*request.storage, *request.context, request.n_cache);
+    } catch (duckdb::InterruptException const&) {
+      throw;
     } catch (std::exception const& e) {
-      throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + request.entry_name +
-                               "': " + e.what());
+      duckdb::ErrorData(e).Throw("[prepare_insert_delta_tasks] pinned entry '" +
+                                 request.entry_name + "': ");
     }
     request.bundles.clear();
   }
@@ -139,9 +142,11 @@ insert_delta_workset prepare_insert_delta_tasks(
             req->entry_name + "|" + e.input_identity,
             e.reason,
             "[prepare_insert_delta_tasks] pinned entry '" + req->entry_name + "': " + e.what());
+        } catch (duckdb::InterruptException const&) {
+          throw;
         } catch (std::exception const& e) {
-          throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + req->entry_name +
-                                   "': " + e.what());
+          duckdb::ErrorData(e).Throw("[prepare_insert_delta_tasks] pinned entry '" +
+                                     req->entry_name + "': ");
         }
       });
     }
