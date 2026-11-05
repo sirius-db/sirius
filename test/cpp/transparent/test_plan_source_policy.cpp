@@ -17,6 +17,8 @@
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/sink.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
+#include "planner/connector_registry.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"  // IWYU pragma: keep
 #include "sirius_sql_rewrite.hpp"
@@ -25,6 +27,7 @@
 #include "transparent/read_view_registry.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -43,12 +46,79 @@
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <parquet_extension.hpp>
 
 #include <cstdint>
 #include <numeric>
+#include <stdexcept>
 
 namespace {
 using namespace sirius::transparent;
+using sirius::planner::testing::scoped_connector_overrides;
+
+sirius::planner::connector parquet_policy_override(byte_source_class source, bool permitted)
+{
+  for (auto const& entry : sirius::planner::registered_connectors()) {
+    if (entry.function_name != "parquet_scan") continue;
+    auto replacement               = entry;
+    replacement.byte_source        = source;
+    replacement.permits_cpu_replay = permitted;
+    replacement.registry_profile   = "test.replay.policy";
+    return replacement;
+  }
+  throw std::logic_error("parquet_scan registry entry is missing");
+}
+
+duckdb::LogicalGet* find_policy_get(duckdb::LogicalOperator& node)
+{
+  if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET)
+    return &node.Cast<duckdb::LogicalGet>();
+  for (auto& child : node.children) {
+    if (auto* get = find_policy_get(*child)) return get;
+  }
+  return nullptr;
+}
+
+struct replay_parquet_fixture {
+  sirius::test::scoped_sirius_disable disable;
+  sirius::test::scratch_dir files{"replay_policy"};
+  duckdb::DuckDB db{nullptr};
+  duckdb::Connection con{db};
+
+  replay_parquet_fixture()
+  {
+    db.LoadStaticExtension<duckdb::SiriusExtension>();
+    db.LoadStaticExtension<duckdb::ParquetExtension>();
+    REQUIRE(db.ExtensionIsLoaded("sirius"));
+    REQUIRE(db.ExtensionIsLoaded("parquet"));
+    auto written = con.Query("COPY (SELECT 42 AS id) TO " + files.file_literal("data.parquet") +
+                             " (FORMAT PARQUET)");
+    REQUIRE(written);
+    if (written->HasError()) UNSCOPED_INFO(written->GetError());
+    REQUIRE_FALSE(written->HasError());
+    con.BeginTransaction();
+  }
+
+  duckdb::unique_ptr<duckdb::LogicalOperator> bind()
+  {
+    auto plan =
+      con.ExtractPlan("SELECT id FROM parquet_scan(" + files.file_literal("data.parquet") + ")");
+    REQUIRE(plan);
+    return plan;
+  }
+
+  duckdb::LogicalGet& scan(duckdb::LogicalOperator& plan)
+  {
+    auto* get = find_policy_get(plan);
+    REQUIRE(get);
+    REQUIRE(get->function.GetName() == "parquet_scan");
+    REQUIRE(get->bind_data);
+    auto const* entry = sirius::planner::lookup_connector(*get, *con.context);
+    REQUIRE(entry);
+    REQUIRE(entry->registry_profile == "test.replay.policy");
+    return *get;
+  }
+};
 
 duckdb::unique_ptr<duckdb::LogicalGet> file_scan(std::string name, std::string path)
 {
@@ -108,6 +178,117 @@ struct external_child_operator final : duckdb::PhysicalOperator {
   }
 };
 }  // namespace
+
+TEST_CASE("Registered replay veto survives local MultiFile classification and capture",
+          "[transparent][planner][policy][connector_replay]")
+{
+  auto const declared_source = GENERATE(byte_source_class::unclassified,
+                                        byte_source_class::local_file,
+                                        byte_source_class::duckdb_native);
+  replay_parquet_fixture fixture;
+  scoped_connector_overrides scope(*fixture.db.instance,
+                                   {parquet_policy_override(declared_source, false)});
+  auto plan = fixture.bind();
+  auto& get = fixture.scan(*plan);
+  SECTION("local inventory") {}
+  SECTION("empty inventory")
+  {
+    get.bind_data->Cast<duckdb::MultiFileBindData>().file_list =
+      duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{});
+  }
+  auto const policy = derive_plan_source_policy(*plan, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source == declared_source);
+  CHECK_FALSE(policy.cpu_replay_permitted());
+  CHECK(policy.scans.front().reason == "connector policy forbids CPU replay");
+  CHECK_THROWS_WITH(
+    require_cpu_replay(policy, "", "forced GPU failure"),
+    "CPU fallback is not supported: parquet_scan: connector policy forbids CPU replay. "
+    "Underlying GPU error: forced GPU failure");
+
+  auto const view = sirius::op::scan::capture_bound_read_view(get, *fixture.con.context);
+  CHECK(view.replay_policy.source == declared_source);
+  CHECK_FALSE(view.replay_policy.permits_cpu_replay);
+  CHECK(view.replay_policy.reason == "connector policy");
+}
+
+TEST_CASE("Registered unclassified permission keeps its source classification",
+          "[transparent][planner][policy][connector_replay]")
+{
+  replay_parquet_fixture fixture;
+  scoped_connector_overrides scope(
+    *fixture.db.instance, {parquet_policy_override(byte_source_class::unclassified, true)});
+  auto plan         = fixture.bind();
+  auto& get         = fixture.scan(*plan);
+  auto const policy = derive_plan_source_policy(*plan, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source == byte_source_class::unclassified);
+  CHECK(policy.cpu_replay_permitted());
+  CHECK(policy.scans.front().reason.empty());
+  CHECK(policy.reason().empty());
+  CHECK_NOTHROW(require_cpu_replay(policy, "", "forced GPU failure"));
+
+  auto const view = sirius::op::scan::capture_bound_read_view(get, *fixture.con.context);
+  CHECK(view.replay_policy.source == byte_source_class::unclassified);
+  CHECK(view.replay_policy.permits_cpu_replay);
+  CHECK(view.replay_policy.reason.empty());
+}
+
+TEST_CASE("S3 inventory restricts registered MultiFile replay policies",
+          "[transparent][planner][policy][connector_replay]")
+{
+  auto const declared_source =
+    GENERATE(byte_source_class::local_file, byte_source_class::unclassified);
+  auto const permitted = GENERATE(false, true);
+  replay_parquet_fixture fixture;
+  scoped_connector_overrides scope(*fixture.db.instance,
+                                   {parquet_policy_override(declared_source, permitted)});
+  auto plan = fixture.bind();
+  auto& get = fixture.scan(*plan);
+  // Substitute inventory after local binding so no S3 I/O is needed to exercise the veto.
+  get.bind_data->Cast<duckdb::MultiFileBindData>().file_list =
+    duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{
+      duckdb::OpenFileInfo(fixture.files.file("data.parquet")),
+      duckdb::OpenFileInfo("s3://bucket/replay-policy.parquet")});
+  auto const policy = derive_plan_source_policy(*plan, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source == byte_source_class::sirius_owned_s3);
+  CHECK_FALSE(policy.cpu_replay_permitted());
+  CHECK(policy.reads_sirius_owned_s3());
+  CHECK(policy.scans.front().reason == "S3 CPU fallback is not supported");
+  CHECK_THROWS_AS(require_cpu_replay(policy, "", "forced GPU failure"), std::runtime_error);
+
+  auto const view = sirius::op::scan::capture_bound_read_view(get, *fixture.con.context);
+  CHECK(view.replay_policy.source == byte_source_class::sirius_owned_s3);
+  CHECK_FALSE(view.replay_policy.permits_cpu_replay);
+  CHECK(view.replay_policy.reason == "s3");
+}
+
+TEST_CASE("Missing connector entries keep the local and S3 replay heuristics",
+          "[transparent][planner][policy][connector_replay]")
+{
+  auto const remote = GENERATE(false, true);
+  replay_parquet_fixture fixture;
+  auto node = file_scan("unregistered_policy_probe",
+                        remote ? "s3://bucket/replay-policy.parquet" : "local.parquet");
+  REQUIRE(sirius::planner::lookup_connector(*node, *fixture.con.context) == nullptr);
+  auto const policy = derive_plan_source_policy(*node, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source ==
+        (remote ? byte_source_class::sirius_owned_s3 : byte_source_class::local_file));
+  CHECK(policy.cpu_replay_permitted() == !remote);
+  if (remote) {
+    CHECK(policy.scans.front().reason == "S3 CPU fallback is not supported");
+    CHECK_THROWS_AS(require_cpu_replay(policy, "", "forced GPU failure"), std::runtime_error);
+  } else {
+    CHECK(policy.scans.front().reason.empty());
+    CHECK_NOTHROW(require_cpu_replay(policy, "", "forced GPU failure"));
+  }
+}
 
 TEST_CASE("Source policy permits complete empty local and native plans",
           "[transparent][policy][shared_context]")

@@ -1,6 +1,8 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "op/scan/arrow_materializer.hpp"
 
+#include "transparent/replay_admission.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/utilities/error.hpp>
@@ -385,7 +387,7 @@ void owned_arrow_batch::validate_for(materialization_program const& program) con
     throw std::invalid_argument("Arrow import requires admitted input and program");
   auto types = validate_arrow_host_flat(schema, array, metadata_lengths);
   if (!program.input_types || types != *program.input_types)
-    throw std::invalid_argument("Arrow schema does not match its bound program");
+    throw transparent::arrow_schema_drift_error("Arrow schema does not match its bound program");
   for (std::size_t i = 0; i < types.size(); ++i) {
     if (types[i].id() != cudf::type_id::DECIMAL128) continue;
     int precision = 0;
@@ -393,7 +395,8 @@ void owned_arrow_batch::validate_for(materialization_program const& program) con
     (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
     if (program.decimal_precisions.size() != types.size() ||
         program.decimal_precisions[i] != precision)
-      throw std::invalid_argument("Arrow decimal precision does not match its bound program");
+      throw transparent::arrow_schema_drift_error(
+        "Arrow decimal precision does not match its bound program");
   }
 }
 

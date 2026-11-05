@@ -717,7 +717,7 @@ TEST_CASE("Physical scan lowering records its finalize generation",
 }
 
 TEST_CASE("Physical stream lowering records its window without file checks",
-          "[scan][contracts][shared_context]")
+          "[scan][contracts][shared_context][fw_s4]")
 {
   REQUIRE(sirius::test::g_shared_env);
   auto con = sirius::test::g_shared_env->make_connection();
@@ -760,6 +760,7 @@ TEST_CASE("Physical stream lowering records its window without file checks",
   CHECK(contract_entry.eligibility.later_checks.none());
   CHECK_FALSE(contract_entry.contract.view->replay_policy.permits_cpu_replay);
   CHECK(contract_entry.contract.view->replay_policy.reason == "stream");
+  REQUIRE(contract_entry.contract.predicates.static_filter_fingerprint.empty());
   sirius::pipeline::pipeline_build_context build_context(nullptr);
   auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_context);
   sirius::pipeline::sirius_pipeline_build_state state;
@@ -767,7 +768,8 @@ TEST_CASE("Physical stream lowering records its window without file checks",
   sirius::pipeline::pipeline_conversion_result result{{pipeline}, {}, 1};
   for (auto const& dump : {sirius::pipeline::dump_pipeline_conversion_result(result),
                            sirius::pipeline::dump_pipeline_schedule_raw(result)}) {
-    CHECK(dump.find("pushdown_mode=none scan_cpu_replay=forbidden scan_replay_veto=stream") !=
+    CHECK(dump.find(
+            "pushdown_mode=none fingerprint=- scan_cpu_replay=forbidden scan_replay_veto=stream") !=
           std::string::npos);
     CHECK(dump.find("plan_cpu_replay=forbidden veto=stream") != std::string::npos);
   }
@@ -1297,16 +1299,34 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
 }
 
 TEST_CASE("Scan diagnostics distinguish pushdown from replay permission",
-          "[scan][contracts][shared_context]")
+          "[scan][contracts][shared_context][fw_s4]")
 {
+  auto filtered = GENERATE(false, true);
+  CAPTURE(filtered);
   REQUIRE(sirius::test::g_shared_env);
   auto con = sirius::test::g_shared_env->make_connection();
   auto path =
     std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/lineitem.parquet";
   auto dump = sirius::test::convert_query_to_raw_schedule(
-    con, "SELECT sum(l_orderkey) FROM read_parquet('" + path + "')");
+    con,
+    "SELECT sum(l_orderkey) FROM read_parquet('" + path + "')" +
+      (filtered ? " WHERE l_orderkey > 7" : ""));
   INFO(dump);
   CHECK(dump.find(" pushdown_mode=") != std::string::npos);
+  auto fingerprint = dump.find(" fingerprint=");
+  REQUIRE(fingerprint != std::string::npos);
+  auto begin = fingerprint + std::string(" fingerprint=").size();
+  auto end   = dump.find(' ', begin);
+  REQUIRE(end != std::string::npos);
+  auto label = dump.substr(begin, end - begin);
+  if (filtered) {
+    CHECK(label.size() == 8);
+    CHECK(std::all_of(label.begin(), label.end(), [](char c) {
+      return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    }));
+  } else {
+    CHECK(label == "-");
+  }
   CHECK(dump.find(" scan_cpu_replay=permitted") != std::string::npos);
   CHECK(dump.find("plan_cpu_replay=permitted veto=none") != std::string::npos);
   CHECK(dump.find(" policy=") == std::string::npos);

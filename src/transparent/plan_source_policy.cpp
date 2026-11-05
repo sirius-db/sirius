@@ -61,14 +61,21 @@ scan_source_policy classify(duckdb::BoundTableFunction const& function,
   if (entry) {
     result.source             = entry->byte_source;
     result.permits_cpu_replay = entry->permits_cpu_replay;
-    if (result.source == byte_source_class::stream) result.reason = "stream source has no CPU body";
-    if (result.source == byte_source_class::sirius_owned_s3)
+    if (result.source == byte_source_class::stream)
+      result.reason = "stream source has no CPU body";
+    else if (result.source == byte_source_class::sirius_owned_s3)
       result.reason = "S3 CPU fallback is not supported";
+    else if (!result.permits_cpu_replay)
+      result.reason = "connector policy forbids CPU replay";
   }
   if (auto const* files = dynamic_cast<duckdb::MultiFileBindData const*>(bind)) {
     if (!files->file_list) throw std::runtime_error("Missing bound file list");
-    result.source             = byte_source_class::local_file;
-    result.permits_cpu_replay = true;
+    // A registered entry keeps its declared policy; the bound file list can only restrict it.
+    // Without an entry the file list is the only classification available.
+    if (!entry) {
+      result.source             = byte_source_class::local_file;
+      result.permits_cpu_replay = true;
+    }
     for (auto const& file : files->file_list->Files()) {
       auto const& path = file.path;
       if (path.size() > 5 && (path[0] == 's' || path[0] == 'S') && path[1] == '3' &&
