@@ -430,6 +430,41 @@ TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter 
   CHECK(rank1_channel->snapshot().terminal());
 }
 
+TEST_CASE("a rank missing from one key's merge costs the others one timeout, not one per key",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  cudf::data_type const int64{cudf::type_id::INT64};
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  dynamic_filter_publish_plan plan{
+    {{.planner_condition_index = 0, .build_key_ordinal = 0, .storage_type = int64},
+     {.planner_condition_index = 1, .build_key_ordinal = 1, .storage_type = int64}},
+    {{channel,
+      sirius::op::dynamic_filter_route_class::scan,
+      false,
+      {{0, 0, int64}, {1, 1, int64}}}},
+    {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
+    {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 64 * KiB}};
+  auto merge    = merge_over(c.all[0].service, 4096);
+  merge.timeout = std::chrono::seconds{1};
+  plan.set_distributed(std::move(merge));
+  std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
+  producers.push_back(channel->register_producer({0, 1}));
+  channel->freeze_registration();
+
+  // Rank 1 never takes part: rank 0 waits out key 0's gather, then leaves key 1's.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(numeric_column(int64, sequence(0, 2, 2000)));
+  columns.push_back(numeric_column(int64, sequence(1, 2, 2000)));
+  cudf::table const build{std::move(columns)};
+  auto const stream = utils::default_stream();
+  auto const start  = std::chrono::steady_clock::now();
+  static_cast<void>(sirius::op::publish_dynamic_filters(plan, build.view(), stream, producers));
+  stream.sync();
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds{1800});
+  CHECK(published_bloom(*channel) == nullptr);
+}
+
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
 {
   ranks c(2);
