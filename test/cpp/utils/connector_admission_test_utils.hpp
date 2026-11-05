@@ -35,6 +35,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -52,7 +53,16 @@ namespace fs = std::filesystem;
 
 inline constexpr char probe_key[]     = "connector_admission_probe";
 inline constexpr char remote_puffin[] = "s3://connector-admission.invalid/sidecar.puffin";
-enum class fault { none, prepare, bind, malformed };
+enum class fault {
+  none,
+  prepare,
+  bind,
+  malformed,
+  prepare_unrelated,
+  bind_unrelated,
+  prepare_bad_alloc,
+  bind_bad_alloc
+};
 
 struct request_observation {
   unsigned prepares = 0, binds = 0, rollbacks = 0, lowerings = 0;
@@ -132,6 +142,9 @@ inline std::optional<preparation_request> collect_request(
     observation->arena = ledger.allocator(permit).allocate_retained(8);
     if (probe->injected == fault::prepare)
       throw preparation_resource_error("injected connector prepare fault", false);
+    if (probe->injected == fault::prepare_unrelated)
+      throw std::runtime_error("provider schema unavailable");
+    if (probe->injected == fault::prepare_bad_alloc) throw std::bad_alloc{};
   };
   request.bind = [probe, observation](std::shared_ptr<preparation_admission> admission) {
     ++observation->binds;
@@ -139,6 +152,9 @@ inline std::optional<preparation_request> collect_request(
     observation->admission  = std::move(admission);
     if (probe->injected == fault::bind)
       throw preparation_resource_error("injected connector bind fault", false);
+    if (probe->injected == fault::bind_unrelated)
+      throw std::runtime_error("provider schema unavailable");
+    if (probe->injected == fault::bind_bad_alloc) throw std::bad_alloc{};
   };
   if (probe->injected != fault::malformed) {
     request.rollback = [probe, observation]() noexcept {

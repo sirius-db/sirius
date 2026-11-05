@@ -18,6 +18,8 @@
 
 #include <catch.hpp>
 
+#include <typeinfo>
+
 using namespace sirius::test::connector_admission;
 
 TEST_CASE("Required connector preparation is bound before lowering",
@@ -59,12 +61,14 @@ TEST_CASE("Required HOST refusals cover every originating connector once",
 TEST_CASE("Prepare and bind resource faults do not repeat helper rollback",
           "[planner][scan_preparation][connector_admission][isolated_context]")
 {
-  auto injected = GENERATE(fault::prepare, fault::bind);
+  auto injected =
+    GENERATE(fault::prepare, fault::bind, fault::prepare_bad_alloc, fault::bind_bad_alloc);
   admission_fixture fixture;
   fixture.probe->injected = injected;
   auto before             = fixture.stats();
   auto error              = expect_refusal(fixture, "SELECT id FROM " + fixture.parquet());
-  check_refusal(fixture, error, "arena allocation failed", 1, injected == fault::bind ? 1 : 0);
+  auto bind_failure       = injected == fault::bind || injected == fault::bind_bad_alloc;
+  check_refusal(fixture, error, "arena allocation failed", 1, bind_failure ? 1 : 0);
   CHECK(fixture.provider->backing.seen->allocations.load() == 1);
   CHECK(fixture.stats().semantic_declines[refused_index] ==
         before.semantic_declines[refused_index] + 1);
@@ -83,6 +87,42 @@ TEST_CASE("A resource fault before the helper try still rolls back required requ
   CHECK(fixture.provider->backing.seen->allocations.load() == 0);
   CHECK(fixture.stats().semantic_declines[refused_index] ==
         before.semantic_declines[refused_index] + 1);
+}
+
+TEST_CASE("Unrelated connector faults propagate unchanged and release reserved memory",
+          "[planner][scan_preparation][connector_admission][isolated_context]")
+{
+  auto injected = GENERATE(fault::prepare_unrelated, fault::bind_unrelated);
+  admission_fixture fixture;
+  fixture.probe->injected = injected;
+  auto before             = fixture.stats();
+  try {
+    fixture.attempt(fixture.two_connectors());
+    FAIL("expected the original provider schema error");
+  } catch (std::runtime_error const& error) {
+    CHECK(typeid(error) == typeid(std::runtime_error));
+    CHECK(std::string(error.what()) == "provider schema unavailable");
+  }
+  REQUIRE(fixture.probe->requests.size() == 2);
+  unsigned prepares = 0, binds = 0;
+  for (auto const& [id, observation] : fixture.probe->requests) {
+    CHECK(observation.rollbacks == 1);
+    CHECK(observation.lowerings == 0);
+    CHECK_FALSE(observation.arena);
+    CHECK_FALSE(observation.admission);
+    prepares += observation.prepares;
+    binds += observation.binds;
+  }
+  CHECK(prepares == (injected == fault::prepare_unrelated ? 1 : 2));
+  CHECK(binds == (injected == fault::bind_unrelated ? 1 : 0));
+  CHECK(fixture.provider->backing.seen->requests.load() == 1);
+  CHECK(fixture.provider->backing.seen->allocations.load() == prepares);
+  CHECK(fixture.provider->backing.outstanding() == 0);
+  CHECK(fixture.provider->backing.seen->allocated_bytes.load() == 0);
+  CHECK_FALSE(fixture.plan);
+  CHECK(fixture.stats().scan_lowerings.empty());
+  CHECK(fixture.stats().semantic_declines[refused_index] ==
+        before.semantic_declines[refused_index]);
 }
 
 TEST_CASE("Malformed required requests fail at collection",
