@@ -85,8 +85,10 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   };
   void set_distributed(distributed_sampling sampling) { _distributed = std::move(sampling); }
 
-  //! Rows of each rank's sample summary shared in distributed mode.
+  //! Rows of each rank's sample summary shared in distributed mode, at least.
   static constexpr std::size_t distributed_summary_rows = 1024;
+  //! Sample rows each of a rank's partitions gets from the global sample.
+  static constexpr std::size_t summary_rows_per_partition = 32;
 
  public:
   bool is_source() const override { return true; }
@@ -132,6 +134,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Distributed mode: shares @p sample_keys (sorted, possibly empty), then sets both sets of
   //! boundaries from the global sample; this rank keeps up to @p num_parts partitions.
   void compute_distributed_boundaries(cudf::table_view sample_keys,
+                                      std::size_t sample_bytes,
                                       std::size_t num_parts,
                                       std::vector<cudf::order> const& column_order,
                                       std::vector<cudf::null_order> const& null_precedence,
