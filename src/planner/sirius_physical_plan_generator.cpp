@@ -220,9 +220,8 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-//! Distributed: every rank binds every file of a table and scans its share of them. Local files
-//! are split by byte range (`byte_ranges_for_rank`); remote ones, which take no byte ranges,
-//! whole, files rank, rank + world, ...
+}  // namespace
+
 void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
                           std::vector<std::string> files,
                           const sirius::operator_params& op_params)
@@ -275,6 +274,8 @@ void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
     info.resolved_file_ranges.push_back({{r.start, r.length}});
   }
 }
+
+namespace {
 
 //! Attach the plan-carried byte ranges to the scan's files, claiming each file's ranges from the
 //! per-plan registry. A file keeps ONE entry holding all its ranges: the bound read view requires
