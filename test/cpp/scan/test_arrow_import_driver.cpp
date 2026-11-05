@@ -215,12 +215,12 @@ struct harness {
   std::unique_ptr<arrow_import_ingestible> driver;
   std::shared_ptr<arrow_input_gate> gate;
   harness(std::shared_ptr<arrow_batch_producer> producer,
-          materialization_program program              = integer_program(),
-          bool empty_source                            = true,
-          sm::reservation_provider* external           = nullptr,
-          std::shared_ptr<arrow_batch_producer> other  = {},
-          uint64_t quantum                             = 1,
-          std::shared_ptr<arrow_input_gate> input_gate = std::make_shared<arrow_input_gate>(),
+          materialization_program program                   = integer_program(),
+          bool empty_source                                 = true,
+          sm::reservation_provider* external                = nullptr,
+          std::shared_ptr<arrow_batch_producer> other       = {},
+          uint64_t quantum                                  = 1,
+          std::shared_ptr<arrow_input_gate> input_gate      = std::make_shared<arrow_input_gate>(),
           std::shared_ptr<physical_check_counters> counters = {})
     : gate(std::move(input_gate))
   {
@@ -258,7 +258,14 @@ struct harness {
   harness(std::shared_ptr<physical_check_counters> counters,
           std::shared_ptr<arrow_batch_producer> producer,
           materialization_program program = integer_program())
-    : harness(std::move(producer), std::move(program), true, nullptr, {}, 1, std::make_shared<arrow_input_gate>(), std::move(counters))
+    : harness(std::move(producer),
+              std::move(program),
+              true,
+              nullptr,
+              {},
+              1,
+              std::make_shared<arrow_input_gate>(),
+              std::move(counters))
   {
   }
   auto make_preparation_source()

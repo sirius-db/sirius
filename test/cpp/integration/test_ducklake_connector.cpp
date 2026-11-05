@@ -1225,7 +1225,8 @@ TEST_CASE("DuckLake joins refuse an insufficient preparation permit ceiling befo
   counters->track_units = true;
   bool refused          = false;
   counters->iceberg_statement_route_for_testing =
-    [&](std::string_view, sirius::scan_manager::admission_decision const& decision) {
+    [&](std::string_view route, sirius::scan_manager::admission_decision const& decision) {
+      CHECK(route == "provider_admission_refused");
       refused =
         !decision.deferred && decision.reason == sirius::scan_manager::admission_reason::capacity;
     };
