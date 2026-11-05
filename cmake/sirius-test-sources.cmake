@@ -285,6 +285,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_connector_overrides.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
+    test/cpp/planner/test_distributed_scan_refusals.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
