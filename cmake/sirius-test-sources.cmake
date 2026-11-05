@@ -56,6 +56,7 @@ set(TEST_SOURCES
     test/cpp/exchange/test_exchange_batch_io.cpp
     test/cpp/exchange/test_exchange_byte_ranges.cpp
     test/cpp/exchange/test_exchange_collectives.cpp
+    test/cpp/exchange/test_exchange_distribute_plan.cpp
     test/cpp/exchange/test_exchange_operators.cpp
     test/cpp/exchange/test_exchange_plan_reuse.cpp
     test/cpp/exchange/test_exchange_query_windows.cpp
