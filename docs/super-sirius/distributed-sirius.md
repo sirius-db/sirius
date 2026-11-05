@@ -271,15 +271,12 @@ correctness.
 
 ## Settings and build
 
-| Setting | Default | Description |
-|---|---|---|
-| `sirius_exchange_peers` | `''` | `host:port` of every rank's listener, comma-separated in rank order. Empty runs in one process. |
-| `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
-| `sirius_exchange_host_staging` | `auto` | `always` or `never` overrides the host-staging choice; set it before `sirius_exchange_rank`. |
-
-The exchange connects on the connection's first distributed query; the settings cannot change
-after that. Set `enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU
-alone would return a wrong answer.
+The settings are in [Distributed Execution](configuration.md#distributed-execution). The exchange
+belongs to the process: with `sirius_exchange_peers` already set, `SET sirius_exchange_rank`
+connects it and waits for every peer; set the other way round, the first distributed query
+connects it. Once it is connected, none of the settings can change, on any connection. Set
+`enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU alone would
+return a wrong answer.
 
 NIXL is an optional build dependency, linked from an out-of-tree install:
 
