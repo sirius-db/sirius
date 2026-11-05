@@ -2697,7 +2697,9 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
   auto const list = StringValue::Get(parameter);
   for (std::size_t at = 0; at < list.size();) {
     auto const comma = std::min(list.find(',', at), list.size());
-    if (comma > at) { peers.push_back(list.substr(at, comma - at)); }
+    auto peer        = list.substr(at, comma - at);
+    StringUtil::Trim(peer);
+    if (!peer.empty()) { peers.push_back(std::move(peer)); }
     at = comma + 1;
   }
   get_operator_params(context, scope)->exchange_peers = std::move(peers);
