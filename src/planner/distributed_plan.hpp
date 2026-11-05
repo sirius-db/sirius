@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace cucascade::memory {
@@ -34,6 +35,14 @@ class exchange_service;
 
 namespace sirius::exec {
 class query_lifecycle_registry;
+}
+
+namespace sirius::op::scan {
+class parquet_ingestible_table_info;
+}
+
+namespace sirius {
+struct operator_params;
 }
 
 namespace sirius::planner {
@@ -81,5 +90,20 @@ struct file_byte_range {
  */
 [[nodiscard]] std::vector<file_byte_range> byte_ranges_for_rank(
   std::span<std::uint64_t const> file_bytes, std::size_t rank, std::size_t world);
+
+/**
+ * @brief Sets @p info's files to this rank's share of @p files, or to all of them when
+ * @p op_params is not distributed.
+ *
+ * Every rank binds every file of a table. Local files are split by byte range
+ * (`byte_ranges_for_rank`), so a rank may get no range at all; remote ones, which take no byte
+ * ranges, are dealt whole: files rank, rank + world, ...
+ *
+ * @throws sirius::not_implemented_exception for a remote table of fewer files than ranks, or a
+ *         scan that reads `filename` or `file_index`, which each rank would number from 0.
+ */
+void assign_files_to_rank(op::scan::parquet_ingestible_table_info& info,
+                          std::vector<std::string> files,
+                          operator_params const& op_params);
 
 }  // namespace sirius::planner
