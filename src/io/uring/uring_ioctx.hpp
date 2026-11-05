@@ -31,6 +31,8 @@ namespace sirius::io::uring {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
+  using templated_ioctx<uring_reactor>::templated_ioctx;
+
   /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context
   /// per pool: it carries the per-reactor @c config and the pinned bounce-staging
   /// resource, which must outlive this ioctx).  The ioctx config is sourced from

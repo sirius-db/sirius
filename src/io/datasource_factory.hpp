@@ -34,8 +34,11 @@
 #include <vector>
 
 namespace sirius {
-struct sirius_config;
+namespace memory {
+class topology_index;
 }
+struct sirius_config;
+}  // namespace sirius
 
 namespace cucascade::memory {
 class memory_reservation_manager;
@@ -105,8 +108,10 @@ class io_context_registry {
   ///                            resource for the uring / rest reactors).  Must
   ///                            outlive the registry — the factory closures hold
   ///                            it by reference.
+  /// @param topology Shared GPU-to-NUMA index; absent topology preserves first-pool staging.
   io_context_registry(config_type config,
-                      cucascade::memory::memory_reservation_manager& reservation_manager);
+                      cucascade::memory::memory_reservation_manager& reservation_manager,
+                      std::shared_ptr<const memory::topology_index> topology = nullptr);
   ~io_context_registry() = default;
 
   io_context_registry(io_context_registry const&)            = delete;
@@ -180,15 +185,18 @@ io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
 /// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
-/// HOST-tier resource block size; physical grouping is chosen by the worker.
+/// NUMA-local HOST-tier resource block size; physical grouping is chosen by the worker.
+/// Pass the shared topology index to route device reads to local staging pools.
 io_context_registry::factory_type make_uring_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager);
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const memory::topology_index> topology = nullptr);
 
 /// RESTful object-store (s3://) backend.  Builds a SigV4 authorizer from
 /// @c config.object_store and a @c rest_reactor::reactor_context from
 /// @c config.rest.  Returns a null ioctx when the object store is not
 /// configured (empty endpoint / credentials / region).
 io_context_registry::factory_type make_rest_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager);
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const memory::topology_index> topology = nullptr);
 
 }  // namespace sirius::io
