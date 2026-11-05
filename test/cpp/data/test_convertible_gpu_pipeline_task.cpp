@@ -16,13 +16,18 @@
 
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <exec/multi_index_priority_queue.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
@@ -115,6 +120,13 @@ inline size_t get_batch_size(cucascade::data_batch& batch)
 {
   auto ro = batch.to_read_only();
   return ro.get_data()->get_size_in_bytes();
+}
+
+inline bool batch_in_space(cucascade::data_batch& batch,
+                           const cucascade::memory::memory_space* space)
+{
+  auto ro = batch.to_read_only();
+  return ro.get_memory_space() == space;
 }
 
 }  // anonymous namespace
@@ -425,4 +437,69 @@ TEST_CASE("non-blocking convert and bytes_in_space skip a batch held by another 
   REQUIRE((*result)[0] == free_size);
   REQUIRE(get_batch_tier(*free_batch) == cucascade::memory::Tier::HOST);
   REQUIRE(get_batch_tier(*held_batch) == cucascade::memory::Tier::GPU);
+}
+
+// A GPU 0 executor's stream cannot touch GPU 1 memory (a build batch shared with a task on
+// another GPU, say). Bound to GPU 0, the wrapper moves only the task's GPU 0 batch and leaves the
+// GPU 1 batch where it is, instead of throwing part-way through the task.
+TEST_CASE("task conversion bound to one GPU leaves the task's other-GPU batches alone",
+          "[convertible_gpu_pipeline_task][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+
+  auto mgr   = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* gpu0 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* gpu1 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  auto* host = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(gpu0 != nullptr);
+  REQUIRE(gpu1 != nullptr);
+  REQUIRE(host != nullptr);
+
+  auto gpu0_batch = sirius::test::operator_utils::make_numeric_batch(
+    *gpu0, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto gpu1_batch = sirius::test::operator_utils::make_numeric_batch(
+    *gpu0, std::vector<int32_t>{4, 5, 6, 7, 8}, cudf::type_id::INT32);
+  auto const gpu0_size = get_batch_size(*gpu0_batch);
+  auto const gpu1_size = get_batch_size(*gpu1_batch);
+
+  // Place the second batch on GPU 1 (spilled, then upgraded there).
+  rmm::cuda_stream stream0;
+  auto& registry = sirius::converter_registry::get();
+  {
+    auto mut = gpu1_batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host, stream0);
+  }
+  stream0.synchronize();
+  {
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{1}};
+    rmm::cuda_stream stream1;
+    {
+      auto mut = gpu1_batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream1);
+    }
+    stream1.synchronize();
+  }
+  REQUIRE(batch_in_space(*gpu1_batch, gpu1));
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto task = make_test_gpu_task(1, {gpu0_batch, gpu1_batch});
+  REQUIRE(queue.push(std::move(task)));
+
+  // GPU 0's executor picks the task.
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(gpu0, false);
+  REQUIRE(cd != nullptr);
+  REQUIRE(cd->bytes_in_space(gpu0) == gpu0_size);
+  REQUIRE(cd->bytes_in_space(gpu1) == gpu1_size);
+
+  std::optional<std::vector<std::size_t>> result;
+  REQUIRE_NOTHROW(result = cd->convert({host}, stream0, *mgr, /*blocking=*/true));
+  REQUIRE(result.has_value());
+  REQUIRE(result->size() == 1);
+  CHECK((*result)[0] == gpu0_size);
+  CHECK(batch_in_space(*gpu0_batch, host));
+  CHECK(batch_in_space(*gpu1_batch, gpu1));
+  CHECK(gpu1_batch->get_state() == cucascade::batch_state::idle);
 }
