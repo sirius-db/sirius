@@ -153,6 +153,24 @@ entities:
           gpu_id: { option: { ref: GpuDevice } }
           label: string
 
+  BatchClone:
+    events:
+      started:
+        multi: true
+        attributes:
+          clone_id: u64
+          source_tier: { ref: MemorySpace }
+          destination_tier: { ref: MemorySpace }
+          # channel: { ref: Channel }
+          source_data_batch: { scope-ref: DataBatch }
+          destination_data_batch_id: u64
+          bytes: u64
+      completed:
+        multi: true
+        attributes:
+          clone_id: u64
+          success: bool
+
 fsms:
   Query:
     doc: A query progressing through planning and execution.

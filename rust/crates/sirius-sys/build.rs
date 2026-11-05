@@ -60,7 +60,7 @@ fn main() {
 fn resolve_lib_dir(build_dir: &Path, static_link: bool) -> PathBuf {
     let candidates = [build_dir.to_path_buf(), build_dir.join("extension/sirius")];
     let file = if static_link {
-        "libsirius.a"
+        "libsirius_core.a"
     } else {
         "libsirius.so"
     };

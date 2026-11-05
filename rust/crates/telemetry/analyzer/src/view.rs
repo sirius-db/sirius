@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     boilerplate::{
-        DataBatch, DataBatchExt, Engine, Operator, Plan, Port, Query, QueryGroup, Task, TaskExt,
-        Worker,
+        BatchClone, DataBatch, DataBatchExt, Engine, Operator, Plan, Port, Query, QueryGroup, Task,
+        TaskExt, Worker,
     },
     model::SiriusModel,
 };
@@ -41,6 +41,7 @@ pub(crate) struct SiriusModelQueryView<'a> {
     ref_tree_entities: HashMap<Uuid, &'a dyn RefTreeEntity>,
     tasks: HashMap<Uuid, &'a Task>,
     data_batches: HashMap<Uuid, &'a DataBatch>,
+    batch_clones: HashMap<Uuid, &'a BatchClone>,
 }
 
 impl<'a> SiriusModelQueryView<'a> {
@@ -105,6 +106,15 @@ impl<'a> SiriusModelQueryView<'a> {
             .filter(|data_batch| data_batch.belongs_to(&pipeline_ids))
             .map(|data_batch| (data_batch.id(), data_batch))
             .collect::<HashMap<_, _>>();
+        let batch_clones = model
+            .batch_clones
+            .values()
+            .filter(|copy| {
+                copy.source_batch_id()
+                    .is_some_and(|id| data_batches.contains_key(&id))
+            })
+            .map(|copy| (copy.id(), copy))
+            .collect::<HashMap<_, _>>();
         let scoped_entity_ids = query_engine_entity_ids
             .iter()
             .copied()
@@ -124,9 +134,18 @@ impl<'a> SiriusModelQueryView<'a> {
                     })
                     .map(|batch| batch.id()),
             );
-        let ref_tree_entities = scoped_entity_ids
+        let mut ref_tree_entities = scoped_entity_ids
             .map(|id| model.ref_tree_entity(id).map(|entity| (id, entity)))
             .collect::<AnalyzerResult<HashMap<_, _>>>()?;
+        // Include copies only when their source batch is in the reference tree.
+        for copy in batch_clones.values() {
+            if copy
+                .parent_id()
+                .is_some_and(|id| ref_tree_entities.contains_key(&id))
+            {
+                ref_tree_entities.insert(copy.id(), model.ref_tree_entity(copy.id())?);
+            }
+        }
 
         Ok(Self {
             model,
@@ -152,6 +171,7 @@ impl<'a> SiriusModelQueryView<'a> {
             ref_tree_entities,
             tasks,
             data_batches,
+            batch_clones,
         })
     }
 
@@ -207,6 +227,10 @@ impl<'a> SiriusModelQueryView<'a> {
 
     pub(crate) fn data_batches(&self) -> impl Iterator<Item = &'a DataBatch> + '_ {
         self.data_batches.values().copied()
+    }
+
+    pub(crate) fn batch_clones(&self) -> impl Iterator<Item = &'a BatchClone> + '_ {
+        self.batch_clones.values().copied()
     }
 
     pub(crate) fn sirius_resources(&self) -> impl Iterator<Item = &'a dyn Resource> + '_ {
@@ -351,6 +375,14 @@ impl Model for SiriusModelQueryView<'_> {
                         .get(&entity_id)
                         .map(|data_batch| EntityRef::Application {
                             type_name: data_batch.type_name().to_owned(),
+                            id: entity_id,
+                        })
+                })
+                .or_else(|| {
+                    self.batch_clones
+                        .get(&entity_id)
+                        .map(|copy| EntityRef::Application {
+                            type_name: copy.type_name().to_owned(),
                             id: entity_id,
                         })
                 })
