@@ -17,7 +17,6 @@
 #include "catch.hpp"
 #include "memory/pool_peer_access.hpp"
 #include "memory/pool_peer_access_detail.hpp"
-#include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_transfer.hpp"
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
 #include "operator/operator_test_utils.hpp"
@@ -32,6 +31,7 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/error.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <array>
@@ -217,8 +217,9 @@ TEST_CASE("managed pools grant actual allocations without changing a control poo
   }
 }
 
-TEST_CASE("unknown pools stage replicas and decline accumulation before allocating",
-          "[pool_peer_access][dynamic_filter][multi_gpu]")
+TEST_CASE(
+  "unknown pools stage replicas and publish accumulated filters through bounded HOST staging",
+  "[pool_peer_access][dynamic_filter][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto manager = sirius::test::operator_utils::initialize_memory_manager(
@@ -227,13 +228,12 @@ TEST_CASE("unknown pools stage replicas and decline accumulation before allocati
       return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
         rmm::mr::cuda_memory_resource{}};
     }});
-  auto& first      = *manager->get_memory_space(Tier::GPU, 0);
-  auto& second     = *manager->get_memory_space(Tier::GPU, 1);
-  auto const& host = *manager->get_memory_spaces_for_tier(Tier::HOST).front();
-  std::array replicas{sirius::op::dynamic_filter_replica_space{first, host},
-                      sirius::op::dynamic_filter_replica_space{second, host}};
+  auto& first            = *manager->get_memory_space(Tier::GPU, 0);
+  auto& second           = *manager->get_memory_space(Tier::GPU, 1);
+  auto const& host       = *manager->get_memory_spaces_for_tier(Tier::HOST).front();
   auto const before      = first.get_memory_resource_of<Tier::GPU>()->get_total_allocated_bytes();
-  auto const unavailable = sirius::op::find_pair_without_pool_access(replicas);
+  auto const unavailable = sirius::memory::find_pair_without_pool_access(
+    std::array<cucascade::memory::memory_space const*, 2>{&first, &second});
   REQUIRE(unavailable);
   REQUIRE((*unavailable == std::pair<int, int>{0, 1}));
   REQUIRE(first.get_memory_resource_of<Tier::GPU>()->get_total_allocated_bytes() == before);
@@ -248,8 +248,25 @@ TEST_CASE("unknown pools stage replicas and decline accumulation before allocati
      }}};
   std::vector batches{fixture.make_batch(0, 0, 8), fixture.make_batch(1, 8, 8)};
   auto const before_admission = fixture.allocated_bytes();
-  REQUIRE_FALSE(fixture.begin(batches));
-  REQUIRE(fixture.allocated_bytes() == before_admission);
+  auto const* staging =
+    fixture.spaces[1].get_host_staging_space().get_memory_resource_of<Tier::HOST>();
+  REQUIRE(staging);
+  auto const host_before = staging->get_total_allocated_bytes();
+  REQUIRE(fixture.begin(batches));
+  for (auto const& batch : batches) {
+    fixture.contribute(batch);
+  }
+  fixture.publish(1, batches.back()->get_batch_id());
+  fixture.require_members(batches);
+  auto const counts = fixture.stats.snapshot();
+  REQUIRE(counts.accumulations_started == 1);
+  REQUIRE(counts.accumulation_publications_finished == 1);
+  REQUIRE(counts.accumulation_publications_host_staged == 1);
+  REQUIRE(counts.accumulations_skipped_admission == 0);
+  REQUIRE(counts.filters_pushed == 2);
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(staging->get_total_allocated_bytes() == host_before);
+  fixture.require_storage_returned(before_admission);
 }
 
 TEST_CASE("pool grants validate an invalid native request", "[.pool_peer_access_invalid]")

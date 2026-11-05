@@ -24,6 +24,8 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <cuda_runtime_api.h>
+
 // standard library
 #include <cmath>
 #include <cstdint>
@@ -79,7 +81,7 @@ void launch_round(cudf::column_view const& input,
     round_floating_point_kernel<T, false><<<num_blocks, threads_per_block, 0, stream.get()>>>(
       input.data<T>(), output.data<T>(), input.size(), modifier);
   }
-  CUDF_CHECK_CUDA(stream.get());
+  CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 }  // namespace

@@ -94,19 +94,19 @@ The core-extension layout has three artifacts:
 - `sirius_cuda13`: the backend built with CUDA 13.
 
 `INSTALL sirius; LOAD sirius;` opens `libcuda.so.1` and queries `cuDriverGetVersion`.
-Versions 12000–12999 select `sirius_cuda12`; 13000 and newer select `sirius_cuda13`.
+Versions 12080–12999 select `sirius_cuda12`; 13000 and newer select `sirius_cuda13`.
 When `autoinstall_known_extensions` is enabled and the selected backend is not
 installed yet, `LOAD sirius` downloads it from DuckDB's community repository (or
 the configured auto-install repository); without a usable driver it does no
 network I/O. The loader does not retry with the other CUDA version.
 
-If the driver is missing, supports a CUDA version below 12, or cannot report its
+If the driver is missing, supports a CUDA version below 12.8, or cannot report its
 version, or the selected backend is not installed, cannot be installed, or its
 file cannot be loaded, `LOAD sirius` still succeeds and the loader leaves
 DuckDB's CPU execution untouched: it registers no optimizer hook and
 `gpu_execution` defaults to `false`. Explicit requests for the GPU, `SET gpu_execution = true` or the
 `gpu_execution(...)` table function, then fail with the recorded reason, such as
-`Sirius requires an NVIDIA driver supporting CUDA 12 or newer: cannot open
+`Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: cannot open
 libcuda.so.1 (...)`. The fallback is logged once at `INFO` level to
 `duckdb_logs`, and the loader prints nothing. The result is cached per database:
 loading the backend after a fallback needs a new database instance.
@@ -184,11 +184,13 @@ is prepared separately on
 The build job supplies GPU architectures. CUDA 12 builds include Blackwell's
 `100-real` and `120-real` targets and require a toolkit of at least 12.8.
 Core CI must supply those targets too; selecting a backend by driver version
-does not check GPU architecture. The 12000/13000 thresholds select a CUDA major
-version, not a tested minimum driver for every backend feature. Before core
-publication, test the CUDA 12.9 backend on the oldest supported CUDA 12 driver,
-including cuDF NVRTC/nvJitLink paths, then record the tested minimum or raise the
-loader threshold. Simpatico compiles cubins rather than relying on
+does not check GPU architecture. The 12080 threshold is the first driver with
+`cuMemcpyBatchAsync`, which the CUDA 12 backend calls unconditionally on its scan,
+spill, and transfer paths; 13000 selects a CUDA major version. Neither is a tested
+minimum driver for every backend feature. Before core publication, test the CUDA
+12.9 backend on the oldest supported CUDA 12 driver, including cuDF
+NVRTC/nvJitLink paths, then record the tested minimum or raise the loader
+threshold. Simpatico compiles cubins rather than relying on
 the driver's PTX compiler; other dependency paths need separate qualification.
 
 The conflict checks reject sequential loads of different backends in one

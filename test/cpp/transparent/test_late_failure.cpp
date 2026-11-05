@@ -446,6 +446,46 @@ TEST_CASE("late failure classification uses exception types rather than message 
         late_failure_cause::gpu_error);
 }
 
+TEST_CASE("Arrow schema drift reason survives terminal and preparation classification",
+          "[transparent][late_failure][fw_s4]")
+{
+  auto raw         = GENERATE(false, true);
+  auto same_cause  = GENERATE(false, true);
+  std::string text = "Arrow schema does not match its bound program";
+  CAPTURE(raw, same_cause);
+  auto original = raw ? std::make_exception_ptr(arrow_schema_drift_error(text))
+                      : std::make_exception_ptr(classified_execution_error(
+                          late_failure_cause::physical_input, text, kArrowSchemaDrift));
+  auto direct   = classify_failure(original, late_failure_cause::resource);
+  CHECK(direct.cause == late_failure_cause::physical_input);
+  CHECK(direct.detail == text);
+  CHECK(direct.reason == kArrowSchemaDrift);
+
+  sirius::pipeline::completion_handler terminal;
+  terminal.report_error(original);
+  CHECK(terminal.terminal_error() == original);
+  CHECK(terminal.failure().cause == direct.cause);
+  CHECK(terminal.failure().detail == direct.detail);
+  CHECK(terminal.failure().reason == direct.reason);
+
+  auto cause = same_cause ? late_failure_cause::physical_input : late_failure_cause::resource;
+  sirius::scan_manager::preparation_failure prepared{
+    cause, std::nullopt, "prepared input rejected", original};
+  auto result = sirius::scan_manager::classify_failure(prepared);
+  CHECK(result.cause == cause);
+  CHECK(result.detail == prepared.detail);
+  CHECK(result.reason == (same_cause ? kArrowSchemaDrift : ""));
+  sirius::pipeline::completion_handler completion;
+  completion.report_error(prepared);
+  CHECK(completion.terminal_error() == original);
+  CHECK(completion.failure().cause == result.cause);
+  CHECK(completion.failure().detail == result.detail);
+  CHECK(completion.failure().reason == result.reason);
+  CHECK_FALSE(completion.failure_reason());
+  prepared.original = {};
+  CHECK(sirius::scan_manager::classify_failure(prepared).reason.empty());
+}
+
 namespace {
 struct empty_cleanup_coalescer final : sirius::op::scan::batch_coalescer {
   size_t target_batch_bytes() const noexcept override { return 1; }

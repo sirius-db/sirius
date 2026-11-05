@@ -504,6 +504,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   };
   std::vector<candidate> scans;
   std::vector<preparation_request> requests;
+  // Connector requests are required: the statement cannot proceed without their admission.
+  std::vector<preparation_request> required_requests;
+  std::vector<std::pair<scan_contract_id, std::string>> required_origins;
   std::function<void(sirius::op::sirius_physical_operator&)> visit = [&](auto& node) {
     using type = sirius::op::SiriusPhysicalOperatorType;
     for (auto& child : node.children)
@@ -517,8 +520,12 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     auto& scan = node.template Cast<sirius::op::sirius_physical_table_scan>();
     if (auto const* connector = lookup_connector(scan.function, scan.bind_data.get(), context);
         connector && connector->prepare) {
-      if (auto request = connector->prepare(scan, params, context))
-        requests.push_back(std::move(*request));
+      if (auto request = connector->prepare(scan, params, context)) {
+        if (!request->prepare || !request->bind || !request->rollback)
+          throw std::invalid_argument("incomplete preparation resource request");
+        required_requests.push_back(std::move(*request));
+        required_origins.emplace_back(scan.contract_id, scan.function.GetName());
+      }
     }
     if (scan.function.GetName() != "iceberg_scan") return;
     candidate c{&scan, {}};
@@ -526,7 +533,7 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     scans.push_back(std::move(c));
   };
   visit(root);
-  if (scans.empty() && requests.empty()) return;
+  if (scans.empty() && required_requests.empty()) return;
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) throw duckdb::InternalException("scan preparation requires a SiriusContext");
   struct remote_puffin {
@@ -619,34 +626,66 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   auto* selected = counters->track_units && counters->preparation_provider_for_testing
                      ? counters->preparation_provider_for_testing.get()
                      : &provider;
-  if (counters->track_units && counters->preparation_envelope_for_testing)
+  if (counters->track_units && counters->preparation_envelope_for_testing) {
+    for (auto& request : required_requests)
+      counters->preparation_envelope_for_testing(request.envelope);
     for (auto& request : requests)
       counters->preparation_envelope_for_testing(request.envelope);
+  }
   admission_decision decision;
   bool arena_failed = false;
   bool route_allowed =
     counters->track_units && counters->statement_dv_limit_for_testing
       ? statement_dv_route_allowed(counts, *counters->statement_dv_limit_for_testing)
       : statement_dv_route_allowed(counts);
-  if (qualified && route_allowed && !requests.empty()) {
+  // DV qualification only selects optional DV participation; required connector requests
+  // always take part in the single shared admission attempt.
+  bool const dv_eligible = qualified && route_allowed && !requests.empty();
+  bool const required    = !required_requests.empty();
+  std::vector<preparation_request> participants;
+  bool helper_rolled_back        = false;
+  std::string_view refusal_cause = {};
+  if (dv_eligible || required) {
     auto spaces =
       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (!spaces.empty()) {
+    if (spaces.empty()) {
+      if (required) refusal_cause = "no HOST memory space";
+    } else {
       auto const& config = sirius_ctx->get_config().get_scan_manager_config();
       auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
       auto permits       = static_cast<size_t>(config.thread_pool.num_threads);
       if (limits.max_inflight_dv_jobs) permits = std::min(permits, limits.max_inflight_dv_jobs);
+      participants.reserve(required_requests.size() + (dv_eligible ? requests.size() : 0));
+      for (auto& request : required_requests)
+        participants.push_back(std::move(request));
+      if (dv_eligible)
+        for (auto& request : requests)
+          participants.push_back(std::move(request));
       try {
-        decision = prepare_statement_resources(
-          *selected, requests, spaces.front()->get_id(), static_cast<uint32_t>(permits));
+        decision = prepare_statement_resources(*selected,
+                                               participants,
+                                               spaces.front()->get_id(),
+                                               static_cast<uint32_t>(permits),
+                                               &helper_rolled_back);
       } catch (preparation_resource_error const&) {
         arena_failed = true;
       } catch (std::bad_alloc const&) {
         arena_failed = true;
       }
+      if (required && !decision.deferred)
+        refusal_cause = arena_failed ? "arena allocation failed" : "HOST admission refused";
     }
   }
-  std::string_view route_reason = !qualified           ? "unqualified_envelope"
+  bool const refused = !refusal_cause.empty();
+  if (refused && !helper_rolled_back) {
+    // The helper reports whether it ran rollback; otherwise the unprepared requests
+    // still need their refusal cleanup.
+    auto& pending = participants.empty() ? required_requests : participants;
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it)
+      it->rollback();
+  }
+  std::string_view route_reason = refused              ? "provider_admission_refused"
+                                  : !qualified         ? "unqualified_envelope"
                                   : !route_allowed     ? "statement_dv_limit"
                                   : requests.empty()   ? "no_deferred_dv_work"
                                   : arena_failed       ? "arena_allocation"
@@ -663,10 +702,26 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     });
     if (eager_remote != remote_puffins.end()) {
       sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_remote_eager);
+      if (refused && counters->track_units && counters->iceberg_statement_route_for_testing)
+        counters->iceberg_statement_route_for_testing(route_reason, decision);
       throw scan_verdict_declined(
         "iceberg_scan declines the GPU path: remote Puffin requires deferred preparation",
         {{eager_remote->contract, verdict_reason::iceberg_puffin_remote_eager}});
     }
+  }
+  if (refused) {
+    sirius_ctx->record_semantic_decline(verdict_reason::provider_admission_refused);
+    if (counters->track_units && counters->iceberg_statement_route_for_testing)
+      counters->iceberg_statement_route_for_testing(route_reason, decision);
+    std::vector<std::pair<scan_contract_id, verdict_reason>> declined;
+    std::string functions;
+    for (auto const& [contract, function] : required_origins) {
+      declined.emplace_back(contract, verdict_reason::provider_admission_refused);
+      functions += functions.empty() ? function : ", " + function;
+    }
+    throw scan_verdict_declined("connector preparation declines the GPU path: " +
+                                  std::string(refusal_cause) + " for " + functions,
+                                std::move(declined));
   }
   if (counters->track_units && counters->iceberg_statement_route_for_testing)
     counters->iceberg_statement_route_for_testing(route_reason, decision);

@@ -523,8 +523,11 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     }
   }
   if (!view.replay_policy.permits_cpu_replay) {
-    view.replay_policy.reason =
-      view.replay_policy.source == transparent::byte_source_class::stream ? "stream" : "s3";
+    switch (view.replay_policy.source) {
+      case transparent::byte_source_class::stream: view.replay_policy.reason = "stream"; break;
+      case transparent::byte_source_class::sirius_owned_s3: view.replay_policy.reason = "s3"; break;
+      default: view.replay_policy.reason = "connector policy"; break;
+    }
   }
   view.metrics.file_count              = paths.size();
   view.metrics.transient_path_capacity = owned_paths.capacity() * sizeof(std::string) +

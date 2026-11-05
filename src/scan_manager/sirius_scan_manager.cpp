@@ -59,6 +59,7 @@
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/error_data.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -4026,11 +4027,13 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
                       pinned_name,
                       op->get_operator_id());
       return cached_assignment{op, entry_ptr, std::move(cols), pinned_name, std::move(plan)};
+    } catch (duckdb::InterruptException const&) {
+      throw;
     } catch (std::exception const& e) {
       if (mvcc_strict) {
-        throw std::runtime_error("[sirius_scan_manager] mvcc-pinned entry '" + pinned_name +
-                                 "' matched operator '" + std::to_string(op->get_operator_id()) +
-                                 "' but cannot serve from the cache: " + e.what());
+        duckdb::ErrorData(e).Throw("[sirius_scan_manager] mvcc-pinned entry '" + pinned_name +
+                                   "' matched operator '" + std::to_string(op->get_operator_id()) +
+                                   "' but cannot serve from the cache: ");
       }
       SIRIUS_LOG_ERROR(
         "[sirius_scan_manager] error while trying to assign cached entries to "

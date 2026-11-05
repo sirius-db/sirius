@@ -17,6 +17,8 @@
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/sink.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
+#include "planner/connector_registry.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"  // IWYU pragma: keep
 #include "sirius_sql_rewrite.hpp"
@@ -25,6 +27,7 @@
 #include "transparent/read_view_registry.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -43,12 +46,79 @@
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <parquet_extension.hpp>
 
 #include <cstdint>
 #include <numeric>
+#include <stdexcept>
 
 namespace {
 using namespace sirius::transparent;
+using sirius::planner::testing::scoped_connector_overrides;
+
+sirius::planner::connector parquet_policy_override(byte_source_class source, bool permitted)
+{
+  for (auto const& entry : sirius::planner::registered_connectors()) {
+    if (entry.function_name != "parquet_scan") continue;
+    auto replacement               = entry;
+    replacement.byte_source        = source;
+    replacement.permits_cpu_replay = permitted;
+    replacement.registry_profile   = "test.replay.policy";
+    return replacement;
+  }
+  throw std::logic_error("parquet_scan registry entry is missing");
+}
+
+duckdb::LogicalGet* find_policy_get(duckdb::LogicalOperator& node)
+{
+  if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET)
+    return &node.Cast<duckdb::LogicalGet>();
+  for (auto& child : node.children) {
+    if (auto* get = find_policy_get(*child)) return get;
+  }
+  return nullptr;
+}
+
+struct replay_parquet_fixture {
+  sirius::test::scoped_sirius_disable disable;
+  sirius::test::scratch_dir files{"replay_policy"};
+  duckdb::DuckDB db{nullptr};
+  duckdb::Connection con{db};
+
+  replay_parquet_fixture()
+  {
+    db.LoadStaticExtension<duckdb::SiriusExtension>();
+    db.LoadStaticExtension<duckdb::ParquetExtension>();
+    REQUIRE(db.ExtensionIsLoaded("sirius"));
+    REQUIRE(db.ExtensionIsLoaded("parquet"));
+    auto written = con.Query("COPY (SELECT 42 AS id) TO " + files.file_literal("data.parquet") +
+                             " (FORMAT PARQUET)");
+    REQUIRE(written);
+    if (written->HasError()) UNSCOPED_INFO(written->GetError());
+    REQUIRE_FALSE(written->HasError());
+    con.BeginTransaction();
+  }
+
+  duckdb::unique_ptr<duckdb::LogicalOperator> bind()
+  {
+    auto plan =
+      con.ExtractPlan("SELECT id FROM parquet_scan(" + files.file_literal("data.parquet") + ")");
+    REQUIRE(plan);
+    return plan;
+  }
+
+  duckdb::LogicalGet& scan(duckdb::LogicalOperator& plan)
+  {
+    auto* get = find_policy_get(plan);
+    REQUIRE(get);
+    REQUIRE(get->function.GetName() == "parquet_scan");
+    REQUIRE(get->bind_data);
+    auto const* entry = sirius::planner::lookup_connector(*get, *con.context);
+    REQUIRE(entry);
+    REQUIRE(entry->registry_profile == "test.replay.policy");
+    return *get;
+  }
+};
 
 duckdb::unique_ptr<duckdb::LogicalGet> file_scan(std::string name, std::string path)
 {
@@ -63,24 +133,30 @@ duckdb::unique_ptr<duckdb::LogicalGet> file_scan(std::string name, std::string p
                                                duckdb::vector<duckdb::Identifier>{});
 }
 
+struct non_standard_discovery_error {};
+
 struct throwing_list final : duckdb::SimpleMultiFileList {
-  throwing_list() : SimpleMultiFileList({}) {}
-  duckdb::vector<duckdb::OpenFileInfo> GetAllFiles() const override
+  explicit throwing_list(bool non_standard = false)
+    : SimpleMultiFileList({}), non_standard(non_standard)
   {
+  }
+  explicit throwing_list(std::exception_ptr error)
+    : SimpleMultiFileList({}), error(std::move(error))
+  {
+  }
+  [[noreturn]] void fail() const
+  {
+    if (error) std::rethrow_exception(error);
+    if (non_standard) throw non_standard_discovery_error{};
     throw std::runtime_error("inventory extraction failed");
   }
-  duckdb::FileExpandResult GetExpandResult() const override
-  {
-    throw std::runtime_error("inventory extraction failed");
-  }
-  duckdb::idx_t GetTotalFileCount() const override
-  {
-    throw std::runtime_error("inventory extraction failed");
-  }
-  duckdb::OpenFileInfo GetFile(duckdb::idx_t) const override
-  {
-    throw std::runtime_error("inventory extraction failed");
-  }
+  duckdb::vector<duckdb::OpenFileInfo> GetAllFiles() const override { fail(); }
+  duckdb::FileExpandResult GetExpandResult() const override { fail(); }
+  duckdb::idx_t GetTotalFileCount() const override { fail(); }
+  duckdb::OpenFileInfo GetFile(duckdb::idx_t) const override { fail(); }
+
+  bool non_standard = false;
+  std::exception_ptr error;
 };
 
 struct external_child_operator final : duckdb::PhysicalOperator {
@@ -102,6 +178,117 @@ struct external_child_operator final : duckdb::PhysicalOperator {
   }
 };
 }  // namespace
+
+TEST_CASE("Registered replay veto survives local MultiFile classification and capture",
+          "[transparent][planner][policy][connector_replay]")
+{
+  auto const declared_source = GENERATE(byte_source_class::unclassified,
+                                        byte_source_class::local_file,
+                                        byte_source_class::duckdb_native);
+  replay_parquet_fixture fixture;
+  scoped_connector_overrides scope(*fixture.db.instance,
+                                   {parquet_policy_override(declared_source, false)});
+  auto plan = fixture.bind();
+  auto& get = fixture.scan(*plan);
+  SECTION("local inventory") {}
+  SECTION("empty inventory")
+  {
+    get.bind_data->Cast<duckdb::MultiFileBindData>().file_list =
+      duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{});
+  }
+  auto const policy = derive_plan_source_policy(*plan, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source == declared_source);
+  CHECK_FALSE(policy.cpu_replay_permitted());
+  CHECK(policy.scans.front().reason == "connector policy forbids CPU replay");
+  CHECK_THROWS_WITH(
+    require_cpu_replay(policy, "", "forced GPU failure"),
+    "CPU fallback is not supported: parquet_scan: connector policy forbids CPU replay. "
+    "Underlying GPU error: forced GPU failure");
+
+  auto const view = sirius::op::scan::capture_bound_read_view(get, *fixture.con.context);
+  CHECK(view.replay_policy.source == declared_source);
+  CHECK_FALSE(view.replay_policy.permits_cpu_replay);
+  CHECK(view.replay_policy.reason == "connector policy");
+}
+
+TEST_CASE("Registered unclassified permission keeps its source classification",
+          "[transparent][planner][policy][connector_replay]")
+{
+  replay_parquet_fixture fixture;
+  scoped_connector_overrides scope(
+    *fixture.db.instance, {parquet_policy_override(byte_source_class::unclassified, true)});
+  auto plan         = fixture.bind();
+  auto& get         = fixture.scan(*plan);
+  auto const policy = derive_plan_source_policy(*plan, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source == byte_source_class::unclassified);
+  CHECK(policy.cpu_replay_permitted());
+  CHECK(policy.scans.front().reason.empty());
+  CHECK(policy.reason().empty());
+  CHECK_NOTHROW(require_cpu_replay(policy, "", "forced GPU failure"));
+
+  auto const view = sirius::op::scan::capture_bound_read_view(get, *fixture.con.context);
+  CHECK(view.replay_policy.source == byte_source_class::unclassified);
+  CHECK(view.replay_policy.permits_cpu_replay);
+  CHECK(view.replay_policy.reason.empty());
+}
+
+TEST_CASE("S3 inventory restricts registered MultiFile replay policies",
+          "[transparent][planner][policy][connector_replay]")
+{
+  auto const declared_source =
+    GENERATE(byte_source_class::local_file, byte_source_class::unclassified);
+  auto const permitted = GENERATE(false, true);
+  replay_parquet_fixture fixture;
+  scoped_connector_overrides scope(*fixture.db.instance,
+                                   {parquet_policy_override(declared_source, permitted)});
+  auto plan = fixture.bind();
+  auto& get = fixture.scan(*plan);
+  // Substitute inventory after local binding so no S3 I/O is needed to exercise the veto.
+  get.bind_data->Cast<duckdb::MultiFileBindData>().file_list =
+    duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{
+      duckdb::OpenFileInfo(fixture.files.file("data.parquet")),
+      duckdb::OpenFileInfo("s3://bucket/replay-policy.parquet")});
+  auto const policy = derive_plan_source_policy(*plan, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source == byte_source_class::sirius_owned_s3);
+  CHECK_FALSE(policy.cpu_replay_permitted());
+  CHECK(policy.reads_sirius_owned_s3());
+  CHECK(policy.scans.front().reason == "S3 CPU fallback is not supported");
+  CHECK_THROWS_AS(require_cpu_replay(policy, "", "forced GPU failure"), std::runtime_error);
+
+  auto const view = sirius::op::scan::capture_bound_read_view(get, *fixture.con.context);
+  CHECK(view.replay_policy.source == byte_source_class::sirius_owned_s3);
+  CHECK_FALSE(view.replay_policy.permits_cpu_replay);
+  CHECK(view.replay_policy.reason == "s3");
+}
+
+TEST_CASE("Missing connector entries keep the local and S3 replay heuristics",
+          "[transparent][planner][policy][connector_replay]")
+{
+  auto const remote = GENERATE(false, true);
+  replay_parquet_fixture fixture;
+  auto node = file_scan("unregistered_policy_probe",
+                        remote ? "s3://bucket/replay-policy.parquet" : "local.parquet");
+  REQUIRE(sirius::planner::lookup_connector(*node, *fixture.con.context) == nullptr);
+  auto const policy = derive_plan_source_policy(*node, *fixture.con.context);
+  REQUIRE(policy.discovery_complete);
+  REQUIRE(policy.scans.size() == 1);
+  CHECK(policy.scans.front().source ==
+        (remote ? byte_source_class::sirius_owned_s3 : byte_source_class::local_file));
+  CHECK(policy.cpu_replay_permitted() == !remote);
+  if (remote) {
+    CHECK(policy.scans.front().reason == "S3 CPU fallback is not supported");
+    CHECK_THROWS_AS(require_cpu_replay(policy, "", "forced GPU failure"), std::runtime_error);
+  } else {
+    CHECK(policy.scans.front().reason.empty());
+    CHECK_NOTHROW(require_cpu_replay(policy, "", "forced GPU failure"));
+  }
+}
 
 TEST_CASE("Source policy permits complete empty local and native plans",
           "[transparent][policy][shared_context]")
@@ -168,15 +355,71 @@ TEST_CASE("Source policy treats failed node extraction as incomplete",
           "[transparent][policy][shared_context]")
 {
   REQUIRE(sirius::test::g_shared_env);
-  auto con   = sirius::test::g_shared_env->make_connection();
-  auto node  = file_scan("broken", "local.parquet");
-  auto& bind = node->bind_data->Cast<duckdb::MultiFileBindData>();
+  auto con          = sirius::test::g_shared_env->make_connection();
+  auto node         = file_scan("broken", "local.parquet");
+  auto& bind        = node->bind_data->Cast<duckdb::MultiFileBindData>();
+  bool non_standard = false;
   SECTION("missing list") { bind.file_list.reset(); }
   SECTION("throwing list") { bind.file_list = duckdb::make_shared_ptr<throwing_list>(); }
+  SECTION("non-standard exception")
+  {
+    non_standard   = true;
+    bind.file_list = duckdb::make_shared_ptr<throwing_list>(true);
+  }
   auto policy = derive_plan_source_policy(*node, *con.context);
   REQUIRE_FALSE(policy.discovery_complete);
   REQUIRE_FALSE(policy.cpu_replay_permitted());
   REQUIRE(policy.reason().find("incomplete") != std::string::npos);
+  REQUIRE(policy.discovery_error);
+  std::string discovery_message = !bind.file_list ? "Missing bound file list"
+                                  : non_standard  ? "non-standard exception"
+                                                  : "inventory extraction failed";
+  REQUIRE_THROWS_AS(require_cpu_replay(policy, "", "GPU scan unsupported"), std::runtime_error);
+  REQUIRE_THROWS_WITH(require_cpu_replay(policy, "", "GPU scan unsupported"),
+                      "CPU fallback is not supported: source discovery failed: " +
+                        discovery_message + ". Underlying GPU error: GPU scan unsupported");
+}
+
+TEST_CASE("Source policy does not wrap retained interrupts", "[transparent][policy]")
+{
+  plan_source_policy policy;
+  policy.discovery_complete = false;
+  policy.discovery_error    = std::make_exception_ptr(duckdb::InterruptException());
+  REQUIRE_THROWS_AS(require_cpu_replay(policy, "", "GPU scan unsupported"),
+                    duckdb::InterruptException);
+}
+
+TEST_CASE("Source policy preserves DuckDB error types and metadata", "[transparent][policy]")
+{
+  for (auto type : {duckdb::ExceptionType::CATALOG,
+                    duckdb::ExceptionType::BINDER,
+                    duckdb::ExceptionType::INVALID_INPUT,
+                    duckdb::ExceptionType::INVALID,
+                    duckdb::ExceptionType::OUT_OF_MEMORY,
+                    duckdb::ExceptionType::INTERNAL,
+                    duckdb::ExceptionType::FATAL}) {
+    CAPTURE(type);
+    plan_source_policy policy;
+    policy.discovery_complete = false;
+    policy.discovery_error    = std::make_exception_ptr(
+      duckdb::Exception({{"position", "7"}}, type, "typed discovery failure"));
+    duckdb::ErrorData error;
+    try {
+      require_cpu_replay(policy, "", "GPU scan unsupported");
+    } catch (std::exception const& ex) {
+      error = duckdb::ErrorData(ex);
+    }
+    REQUIRE(error.HasError());
+    if (type == duckdb::ExceptionType::INTERNAL || type == duckdb::ExceptionType::FATAL) {
+      CHECK(error.Type() == duckdb::ExceptionType::EXECUTOR);
+    } else {
+      CHECK(error.Type() == type);
+      CHECK(error.ExtraInfo().at("position") == "7");
+    }
+    CHECK(error.RawMessage() ==
+          "CPU fallback is not supported: source discovery failed: "
+          "typed discovery failure. Underlying GPU error: GPU scan unsupported");
+  }
 }
 
 TEST_CASE("Source policy visits physical GetChildren and forbids a failed walk",
@@ -282,7 +525,15 @@ TEST_CASE("Source policy retains known S3 evidence after a sibling extraction fa
   auto con = sirius::test::g_shared_env->make_connection();
   duckdb::LogicalDummyScan root(duckdb::TableIndex(0));
   auto broken = file_scan("broken", "local.parquet");
-  broken->bind_data->Cast<duckdb::MultiFileBindData>().file_list.reset();
+  SECTION("missing list")
+  {
+    broken->bind_data->Cast<duckdb::MultiFileBindData>().file_list.reset();
+  }
+  SECTION("non-standard exception")
+  {
+    broken->bind_data->Cast<duckdb::MultiFileBindData>().file_list =
+      duckdb::make_shared_ptr<throwing_list>(true);
+  }
   root.children.push_back(std::move(broken));
   root.children.push_back(file_scan("remote_after_failure", "s3://bucket/data.parquet"));
   auto policy = derive_plan_source_policy(root, *con.context);
@@ -290,6 +541,12 @@ TEST_CASE("Source policy retains known S3 evidence after a sibling extraction fa
   REQUIRE_FALSE(policy.cpu_replay_permitted());
   REQUIRE(policy.reads_sirius_owned_s3());
   REQUIRE(policy.reason().find("remote_after_failure") != std::string::npos);
+  REQUIRE(policy.discovery_error);
+  REQUIRE_THROWS_WITH(require_cpu_replay(policy, "", "boom"),
+                      Catch::Matchers::ContainsSubstring("S3 CPU fallback is not supported"));
+  policy.scans = {{"stream", byte_source_class::stream, false, "stream source has no CPU body"}};
+  REQUIRE_THROWS_WITH(require_cpu_replay(policy, "", "boom"),
+                      Catch::Matchers::ContainsSubstring("stream source has no CPU body"));
 }
 
 // These cases exercise the explicit entry point. Its window-entry failure happens
@@ -343,8 +600,7 @@ TEST_CASE("Explicit replay rejects bind-time source discovery failure before win
   REQUIRE(result);
   REQUIRE(result->HasError());
   INFO((result->HasError() ? result->GetError() : ""));
-  CHECK(result->GetError().find("source discovery incomplete") != std::string::npos);
-  CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
+  CHECK(result->GetError().find("inventory extraction failed") != std::string::npos);
   CHECK(result->GetError().find("unexpected CPU source execution") == std::string::npos);
   CHECK(replays == 0);
   CHECK(context->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE);
@@ -559,15 +815,16 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
       CHECK(result->GetError().find("direct CPU replay exception") != std::string::npos);
     } else if (fallback && std::string_view(source) == "error") {
       CHECK(result->GetError().find("CPU replay source failed") != std::string::npos);
-    } else {
+    } else if (!(fallback && std::string_view(source) == "incomplete")) {
       CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
     }
     if (fallback && std::string_view(source) != "error" && std::string_view(source) != "throw") {
       CHECK(result->GetError().find(std::string_view(source) == "s3"
                                       ? "S3 CPU fallback is not supported"
-                                      : "source discovery incomplete") != std::string::npos);
+                                      : "inventory extraction failed") != std::string::npos);
     } else if (!fallback) {
       CHECK(result->GetError().find("SiriusExecuteQuery error:") != std::string::npos);
+      CHECK(result->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
     }
   }
   auto after = context->get_transparent_execution_stats();
@@ -589,6 +846,7 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
 namespace {
 int precedence_bind_count = 0;
 std::string precedence_replan_error;
+bool precedence_non_standard = false;
 
 duckdb::unique_ptr<duckdb::FunctionData> bind_precedence_source(
   duckdb::ClientContext&,
@@ -608,7 +866,7 @@ duckdb::unique_ptr<duckdb::FunctionData> bind_precedence_source(
   auto bind       = duckdb::make_uniq<duckdb::MultiFileBindData>();
   bind->types     = types;
   bind->names     = names;
-  bind->file_list = duckdb::make_shared_ptr<throwing_list>();
+  bind->file_list = duckdb::make_shared_ptr<throwing_list>(precedence_non_standard);
   return std::move(bind);
 }
 }  // namespace
@@ -616,11 +874,15 @@ duckdb::unique_ptr<duckdb::FunctionData> bind_precedence_source(
 TEST_CASE("Transparent finalize preserves GPU errors before incomplete-source veto",
           "[integration][policy][transparent_precedence]")
 {
+  precedence_non_standard = GENERATE(false, true);
+  CAPTURE(precedence_non_standard);
+  auto const* source_name =
+    precedence_non_standard ? "precedence_non_standard_source" : "precedence_source";
   sirius::test::GpuExecutionFixture fixture;
   auto& con = *fixture.con;
   duckdb::ExtensionLoader loader(*con.context->db, "precedence_test");
   loader.RegisterFunction(duckdb::TableFunction(
-    "precedence_source",
+    source_name,
     {},
     [](duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) {
       FAIL("CPU source must not execute");
@@ -636,14 +898,23 @@ TEST_CASE("Transparent finalize preserves GPU errors before incomplete-source ve
       precedence_bind_count   = 0;
       precedence_replan_error = replan_error;
       auto before             = context->get_transparent_execution_stats();
-      auto result             = con.Query("SELECT * FROM precedence_source()");
+      duckdb::unique_ptr<duckdb::QueryResult> result;
+      REQUIRE_NOTHROW(result = con.Query("SELECT * FROM " + std::string(source_name) + "()"));
       REQUIRE(result);
       REQUIRE(result->HasError());
       INFO(result->GetError());
       CHECK(precedence_bind_count >= 2);
       if (fallback) {
-        CHECK(result->GetError().find(
-                "CPU fallback is not supported: source discovery incomplete") != std::string::npos);
+        CHECK(result->GetError().find(precedence_non_standard
+                                        ? "non-standard exception"
+                                        : "inventory extraction failed") != std::string::npos);
+        CHECK(result->GetError().find("Underlying GPU error:") != std::string::npos);
+        if (replan_error == "unsupported")
+          CHECK(result->GetError().find("source replan refused") != std::string::npos);
+        if (replan_error == "unavailable")
+          CHECK(result->GetError().find("source runtime unavailable") != std::string::npos);
+        if (replan_error == "generic")
+          CHECK(result->GetError().find("source replan failed") != std::string::npos);
       } else {
         CHECK(result->GetError().find("CPU fallback is not supported") == std::string::npos);
         if (replan_error == "unavailable") {
@@ -665,7 +936,96 @@ TEST_CASE("Transparent finalize preserves GPU errors before incomplete-source ve
       auto after = context->get_transparent_execution_stats();
       CHECK(after.fallbacks == before.fallbacks);
       CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      fixture.run_ok("SELECT 1");
     }
+  }
+}
+
+TEST_CASE("Discovery errors respect transaction and database validity at the query boundary",
+          "[integration][policy][discovery_transaction]")
+{
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con             = *fixture.con;
+  auto const name       = "typed_discovery_" + fixture.attach_alias;
+  precedence_bind_count = 0;
+  duckdb::ExtensionLoader loader(*con.context->db, "typed_discovery_test");
+  loader.RegisterFunction(duckdb::TableFunction(
+    duckdb::Identifier(name),
+    {duckdb::LogicalType::VARCHAR},
+    [](duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) {
+      FAIL("CPU source must not execute");
+    },
+    [](duckdb::ClientContext&,
+       duckdb::TableFunctionBindInput& input,
+       duckdb::vector<duckdb::LogicalType>& types,
+       duckdb::vector<duckdb::Identifier>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
+      if (++precedence_bind_count > 1)
+        throw duckdb::NotImplementedException("source GPU replan refused");
+      types       = {duckdb::LogicalType::INTEGER};
+      names       = {"id"};
+      auto bind   = duckdb::make_uniq<duckdb::MultiFileBindData>();
+      bind->types = types;
+      bind->names = names;
+      auto kind   = input.inputs[0].GetValue<std::string>();
+      std::exception_ptr error;
+      if (kind == "internal") {
+        error = std::make_exception_ptr(duckdb::InternalException("internal discovery failure"));
+      } else if (kind == "fatal") {
+        error = std::make_exception_ptr(duckdb::FatalException("fatal discovery failure"));
+      } else {
+        error =
+          std::make_exception_ptr(duckdb::CatalogException("inventory catalog entry missing"));
+      }
+      bind->file_list = duckdb::make_shared_ptr<throwing_list>(error);
+      return std::move(bind);
+    }));
+  fixture.run_ok("SET gpu_execution = false");
+  fixture.run_ok("SET enable_duckdb_fallback = true");
+  fixture.run_ok("CREATE TEMP TABLE discovery_transaction_rows(id INTEGER)");
+  for (auto const* policy :
+       {"SYNTACTIC_ERRORS_DO_NOT_INVALIDATE", "ALL_ERRORS_INVALIDATE_TRANSACTION"}) {
+    CAPTURE(policy);
+    fixture.run_ok(std::string("SET default_transaction_invalidation_policy = '") + policy + "'");
+    fixture.run_ok("BEGIN");
+    fixture.run_ok("INSERT INTO discovery_transaction_rows VALUES (42)");
+    fixture.run_ok("SET gpu_execution = true");
+    precedence_bind_count = 0;
+    duckdb::unique_ptr<duckdb::QueryResult> result;
+    REQUIRE_NOTHROW(result = con.Query("SELECT * FROM " + name + "('catalog')"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(precedence_bind_count >= 2);
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::CATALOG);
+    CHECK(result->GetError().find("inventory catalog entry missing") != std::string::npos);
+    CHECK(result->GetError().find("source GPU replan refused") != std::string::npos);
+    auto next = con.Query("SELECT count(*) FROM discovery_transaction_rows");
+    REQUIRE(next);
+    if (std::string_view(policy) == "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE") {
+      REQUIRE_FALSE(next->HasError());
+      CHECK(next->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
+      fixture.run_ok("COMMIT");
+    } else {
+      CHECK(next->HasError());
+      CHECK(next->GetErrorType() == duckdb::ExceptionType::TRANSACTION);
+      fixture.run_ok("ROLLBACK");
+    }
+    fixture.run_ok("SET gpu_execution = false");
+    auto persisted = con.Query("SELECT count(*) FROM discovery_transaction_rows");
+    REQUIRE_FALSE(persisted->HasError());
+    CHECK(persisted->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
+  }
+  fixture.run_ok("SET gpu_execution = true");
+  for (std::string kind : {"internal", "fatal"}) {
+    CAPTURE(kind);
+    precedence_bind_count = 0;
+    auto result           = con.Query("SELECT * FROM " + name + "('" + kind + "')");
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
+    CHECK(result->GetError().find(kind + " discovery failure") != std::string::npos);
+    CHECK(result->GetError().find("source GPU replan refused") != std::string::npos);
+    fixture.run_ok("SELECT 1");
   }
 }
 
@@ -795,7 +1155,7 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
     unavailable = true;
     context->mark_runtime_unavailable();
   }
-  for (auto const source : {"stream", "incomplete", "s3", "s3_text"}) {
+  for (auto const source : {"stream", "incomplete", "catalog", "s3", "s3_text"}) {
     for (bool fallback : {false, true}) {
       CAPTURE(source, fallback, unavailable);
       fixture.run_ok(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"));
@@ -809,6 +1169,10 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
                                 "stream source has no CPU body"});
       } else if (std::string_view(source) == "incomplete") {
         policy.discovery_complete = false;
+      } else if (std::string_view(source) == "catalog") {
+        policy.discovery_complete = false;
+        policy.discovery_error    = std::make_exception_ptr(
+          duckdb::CatalogException("runtime inventory catalog entry missing"));
       } else if (std::string_view(source) == "s3") {
         policy.scans.push_back({"read_parquet", byte_source_class::sirius_owned_s3, false, "S3"});
       } else {
@@ -859,6 +1223,11 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
         CHECK(error.RawMessage().find(unavailable ? "Sirius GPU runtime is unavailable"
                                                   : "missing the logical plan template") !=
               std::string::npos);
+      } else if (std::string_view(source) == "catalog") {
+        CHECK(error.Type() == duckdb::ExceptionType::CATALOG);
+        CHECK(error.RawMessage().find("runtime inventory catalog entry missing") !=
+              std::string::npos);
+        CHECK(error.RawMessage().find("Underlying GPU error:") != std::string::npos);
       } else {
         CHECK(error.RawMessage().find("CPU fallback is not supported:") != std::string::npos);
         CHECK(error.RawMessage().find(std::string_view(source) == "stream"
