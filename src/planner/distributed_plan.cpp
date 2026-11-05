@@ -432,12 +432,17 @@ void require_same_shape(rewriter& r)
     column->mutable_view().data<std::int64_t>(), &hash, sizeof(hash), cudaMemcpyHostToDevice));
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(column));
-  auto mine      = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+  auto mine = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                       *r.gpu,
                                       cudf::get_default_stream(),
                                       telemetry::batch_telemetry_info{});
+  // The query's last stream id: the rewrite numbers its exchanges up from 1.
   auto const all = exchange::all_gather(
-    *r.service, (r.query << 20) | 0xfffff, mine, *r.gpu, cudf::get_default_stream());
+    *r.service,
+    exchange::make_stream_id(r.query, (std::uint64_t{1} << exchange::query_stream_bits) - 1),
+    mine,
+    *r.gpu,
+    cudf::get_default_stream());
   for (exchange::rank_t rank = 0; rank < all.size(); ++rank) {
     std::int64_t theirs = 0;
     auto ro             = all[rank]->to_read_only();
