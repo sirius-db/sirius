@@ -252,6 +252,7 @@ void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
   auto const remote = std::any_of(
     files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
   if (remote) {
+    // TODO(#2377): split remote files by byte range too, as local ones are.
     if (files.size() < world) {
       throw sirius::not_implemented_exception(
         "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
