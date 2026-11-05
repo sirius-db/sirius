@@ -2149,6 +2149,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   // The FFI refuses remote LocalFiles inputs before binding, so its registered ranges are local.
   if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
         sirius::planner::scan_byte_ranges_state::kStateKey)) {
+    // attach_byte_ranges would replace this rank's share with the plan's ranges.
+    if (op_params.distributed()) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: a plan that carries its own byte ranges");
+    }
     attach_byte_ranges(*table_info, *byte_ranges);
   }
   return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
