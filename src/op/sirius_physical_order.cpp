@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_order.hpp"
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -26,6 +24,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_order::sirius_physical_order(duckdb::vector<sirius::logical_type> types,
+                                             std::size_t input_width,
                                              duckdb::vector<duckdb::BoundOrderByNode> orders,
                                              duckdb::vector<std::size_t> projections_p,
                                              std::size_t estimated_cardinality,
@@ -33,6 +32,7 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<sirius::logical_type
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
+    comparison(std::make_shared<const sort_comparison_config>(this->orders, input_width)),
     projections(std::move(projections_p)),
     is_index_sort(is_index_sort_p)
 {
@@ -45,23 +45,9 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
-  // Build cudf order vectors from BoundOrderByNode
-  std::vector<int> order_key_idx;
-  std::vector<cudf::order> column_order;
-  std::vector<cudf::null_order> null_precedence;
-  order_key_idx.reserve(orders.size());
-  column_order.reserve(orders.size());
-  null_precedence.reserve(orders.size());
-
-  for (auto const& ord : orders) {
-    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-      throw not_implemented_exception("Order by only supports bound reference expressions");
-    }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
-    order_key_idx.push_back(idx);
-    column_order.push_back(to_cudf_order(ord.type));
-    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
-  }
+  auto const& order_key_idx   = comparison->key_columns;
+  auto const& column_order    = comparison->directions;
+  auto const& null_precedence = comparison->null_precedence;
 
   std::vector<int> proj_idx(projections.begin(), projections.end());
 

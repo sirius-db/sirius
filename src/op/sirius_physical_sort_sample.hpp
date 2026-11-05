@@ -18,6 +18,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sort_comparison_config.hpp"
 #include "sirius_config.hpp"
 
 #include <cudf/table/table.hpp>
@@ -50,10 +51,12 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     std::size_t estimated_cardinality,
     uint64_t sort_sample_bytes           = config::DEFAULT_SORT_SAMPLE_BYTES,
     uint64_t max_partition_bytes         = 0,
-    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
+    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION,
+    std::shared_ptr<const sort_comparison_config> comparison_p = nullptr);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
+  std::shared_ptr<const sort_comparison_config> comparison;
 
  public:
   bool is_source() const override { return true; }

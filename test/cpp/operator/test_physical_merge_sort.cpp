@@ -16,12 +16,16 @@
 
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
+#include <duckdb.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_merge_sort.hpp>
 #include <op/sirius_physical_order.hpp>
 #include <op/sirius_physical_sort_partition.hpp>
+#include <op/sirius_physical_sort_sample.hpp>
 
 using namespace sirius::op;
 using sirius::op::operator_data;
@@ -94,6 +98,7 @@ std::shared_ptr<data_batch> sort_batch(const std::shared_ptr<data_batch>& batch,
 {
   sirius_physical_order order_op(
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
+    types.size(),
     copy_orders(orders),
     duckdb::vector<duckdb::idx_t>(projections),
     0);
@@ -451,6 +456,7 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
 
   sirius_physical_order order_op(
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
+    types.size(),
     copy_orders(orders),
     duckdb::vector<duckdb::idx_t>(projections),
     0);
@@ -520,4 +526,104 @@ TEST_CASE("sort range publication retains holes and merge claims destination pos
   REQUIRE(output_repo.pop_data_batch_by_position(1) == earlier_data.get_data_batches().front());
   REQUIRE(output_repo.pop_data_batch_by_position(3) ==
           dynamic_cast<pipelineable_operator_data&>(*later).get_data_batches().front());
+}
+
+TEST_CASE("sort lowering shares executable comparison arguments", "[sort_comparison][cpu]")
+{
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(1,
+                              duckdb::LogicalType::BIGINT,
+                              duckdb::OrderType::DESCENDING,
+                              duckdb::OrderByNullType::NULLS_LAST));
+  orders.push_back(make_order(0,
+                              duckdb::LogicalType::BIGINT,
+                              duckdb::OrderType::ASCENDING,
+                              duckdb::OrderByNullType::NULLS_FIRST));
+  sirius_physical_order local({sirius::logical_type::make(sirius::type_id::BIGINT),
+                               sirius::logical_type::make(sirius::type_id::BIGINT)},
+                              2,
+                              std::move(orders),
+                              {0, 1},
+                              0);
+  sirius_physical_sort_sample sample(&local);
+  sirius_physical_sort_partition partition(&local);
+  sirius_physical_merge_sort merge(&local);
+  REQUIRE(sample.comparison == local.comparison);
+  REQUIRE(partition.comparison == local.comparison);
+  REQUIRE(merge.comparison == local.comparison);
+  CHECK(local.comparison->key_columns == std::vector<int>{1, 0});
+  CHECK(local.comparison->directions ==
+        std::vector<cudf::order>{cudf::order::DESCENDING, cudf::order::ASCENDING});
+  CHECK(local.comparison->null_precedence ==
+        std::vector<cudf::null_order>{cudf::null_order::BEFORE, cudf::null_order::BEFORE});
+}
+
+TEST_CASE("ORDER BY expansion retains hidden keys through the shared sort chain",
+          "[sort_comparison][cpu]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection connection(db);
+  auto bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(1,
+                              duckdb::LogicalType::BIGINT,
+                              duckdb::OrderType::DESCENDING,
+                              duckdb::OrderByNullType::NULLS_FIRST));
+  duckdb::unique_ptr<sirius_physical_operator> plan =
+    duckdb::make_uniq<sirius_physical_order>(duckdb::vector<sirius::logical_type>{bigint},
+                                             2,
+                                             std::move(orders),
+                                             duckdb::vector<std::size_t>{0},
+                                             10);
+  plan->children.push_back(duckdb::make_uniq<test_physical_operator>(
+    SiriusPhysicalOperatorType::INVALID, duckdb::vector<sirius::logical_type>{bigint, bigint}, 10));
+  sirius::planner::sirius_physical_plan_generator generator(*connection.context);
+  generator.insert_gpu_pipeline_operators(plan);
+  REQUIRE(plan->type == SiriusPhysicalOperatorType::MERGE_SORT);
+  auto& merge = plan->Cast<sirius_physical_merge_sort>();
+  REQUIRE(merge.children.size() == 1);
+  auto& partition = merge.children[0]->Cast<sirius_physical_sort_partition>();
+  auto& sample    = partition.children[0]->Cast<sirius_physical_sort_sample>();
+  auto& local     = sample.children[0]->Cast<sirius_physical_order>();
+  CHECK(merge.types.size() == 1);
+  CHECK(partition.types.size() == 2);
+  CHECK(sample.types.size() == 2);
+  CHECK(local.types.size() == 2);
+  CHECK(local.projections == duckdb::vector<std::size_t>{0, 1});
+  CHECK(local.comparison == sample.comparison);
+  CHECK(local.comparison == partition.comparison);
+  CHECK(local.comparison == merge.comparison);
+  CHECK(local.comparison->key_columns == std::vector<int>{1});
+}
+
+TEST_CASE("sort stages reject out-of-schema keys during construction", "[sort_comparison][cpu]")
+{
+  auto bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(1, duckdb::LogicalType::BIGINT));
+  CHECK_THROWS_AS(sort_comparison_config(orders, 1), sirius::invalid_input_exception);
+  CHECK_NOTHROW(sort_comparison_config(orders, 2));
+  CHECK_THROWS_AS(sirius_physical_order({bigint}, 1, copy_orders(orders), {0}, 0),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sirius_physical_merge_sort({bigint}, copy_orders(orders), {0}, 0),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sirius_physical_sort_partition({bigint}, copy_orders(orders), {0}, 0),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sirius_physical_sort_sample({bigint}, copy_orders(orders), 0),
+                  sirius::invalid_input_exception);
+}
+
+TEST_CASE("sort comparison lowers absolute SQL null precedence for both directions",
+          "[sort_comparison][cpu]")
+{
+  auto direction = GENERATE(duckdb::OrderType::ASCENDING, duckdb::OrderType::DESCENDING);
+  auto nulls = GENERATE(duckdb::OrderByNullType::NULLS_FIRST, duckdb::OrderByNullType::NULLS_LAST);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::BIGINT, direction, nulls));
+  sort_comparison_config config(orders, 1);
+  bool before =
+    (nulls == duckdb::OrderByNullType::NULLS_FIRST) != (direction == duckdb::OrderType::DESCENDING);
+  CHECK(config.null_precedence.front() ==
+        (before ? cudf::null_order::BEFORE : cudf::null_order::AFTER));
+  CHECK_THROWS_AS(sort_comparison_config(orders, 0), sirius::invalid_input_exception);
 }

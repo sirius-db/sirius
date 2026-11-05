@@ -43,6 +43,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
     }
     auto order =
       duckdb::make_uniq<sirius::op::sirius_physical_order>(sirius::from_duckdb_vec(op.types),
+                                                           plan->types.size(),
                                                            std::move(op.orders),
                                                            std::move(projection_map),
                                                            op.estimated_cardinality);

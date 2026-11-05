@@ -18,9 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"  // IWYU pragma: keep
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
-#include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -34,7 +32,8 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(sirius_physical_o
   : sirius_physical_sort_partition(order_by->types,
                                    copy_orders(order_by->orders),
                                    order_by->projections,
-                                   order_by->estimated_cardinality)
+                                   order_by->estimated_cardinality,
+                                   order_by->comparison)
 {
 }
 
@@ -42,10 +41,14 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
   duckdb::vector<std::size_t> projections_p,
-  std::size_t estimated_cardinality)
+  std::size_t estimated_cardinality,
+  std::shared_ptr<const sort_comparison_config> comparison_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_PARTITION, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
+    comparison(comparison_p ? std::move(comparison_p)
+                            : std::make_shared<const sort_comparison_config>(this->orders,
+                                                                             this->types.size())),
     projections(std::move(projections_p))
 {
 }
@@ -71,23 +74,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   auto& boundaries     = _sample_op->get_partition_boundaries();
   auto boundaries_view = boundaries.view();
 
-  // Build cudf order vectors from BoundOrderByNode
-  std::vector<int> order_key_idx;
-  std::vector<cudf::order> column_order;
-  std::vector<cudf::null_order> null_precedence;
-  order_key_idx.reserve(orders.size());
-  column_order.reserve(orders.size());
-  null_precedence.reserve(orders.size());
-
-  for (auto const& ord : orders) {
-    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-      throw not_implemented_exception("Sort partition only supports bound reference expressions");
-    }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
-    order_key_idx.push_back(idx);
-    column_order.push_back(to_cudf_order(ord.type));
-    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
-  }
+  auto const& order_key_idx   = comparison->key_columns;
+  auto const& column_order    = comparison->directions;
+  auto const& null_precedence = comparison->null_precedence;
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   std::vector<std::size_t> output_partitions;

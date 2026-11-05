@@ -17,9 +17,7 @@
 #include "op/sirius_physical_sort_sample.hpp"
 
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
-#include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
@@ -72,7 +70,8 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* 
                                 order_by->estimated_cardinality,
                                 sort_sample_bytes,
                                 max_partition_bytes,
-                                max_partition_memory_fraction)
+                                max_partition_memory_fraction,
+                                order_by->comparison)
 {
 }
 
@@ -82,10 +81,14 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
   std::size_t estimated_cardinality,
   uint64_t sort_sample_bytes,
   uint64_t max_partition_bytes,
-  double max_partition_memory_fraction)
+  double max_partition_memory_fraction,
+  std::shared_ptr<const sort_comparison_config> comparison_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_SAMPLE, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
+    comparison(comparison_p ? std::move(comparison_p)
+                            : std::make_shared<const sort_comparison_config>(this->orders,
+                                                                             this->types.size())),
     _sort_sample_bytes(sort_sample_bytes),
     _max_partition_bytes_override(max_partition_bytes),
     _max_partition_memory_fraction(max_partition_memory_fraction)
@@ -197,23 +200,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       total_sample_bytes += batch.get_data()->get_size_in_bytes();
     }
 
-    // 2. Build cudf order vectors from BoundOrderByNode
-    std::vector<int> order_key_idx;
-    std::vector<cudf::order> column_order;
-    std::vector<cudf::null_order> null_precedence;
-    order_key_idx.reserve(orders.size());
-    column_order.reserve(orders.size());
-    null_precedence.reserve(orders.size());
-
-    for (auto const& ord : orders) {
-      if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-        throw not_implemented_exception("Sort sample only supports bound reference expressions");
-      }
-      auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
-      order_key_idx.push_back(idx);
-      column_order.push_back(to_cudf_order(ord.type));
-      null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
-    }
+    auto const& order_key_idx   = comparison->key_columns;
+    auto const& column_order    = comparison->directions;
+    auto const& null_precedence = comparison->null_precedence;
 
     // 3. Merge pre-sorted sample batches (ORDER_BY sorts each batch locally).
     cudf::table_view merged_sample_view;

@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sort_comparison_config.hpp"
 
 namespace sirius {
 namespace op {
@@ -45,6 +46,7 @@ class sirius_physical_order : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
 
   sirius_physical_order(duckdb::vector<sirius::logical_type> types,
+                        std::size_t input_width,
                         duckdb::vector<duckdb::BoundOrderByNode> orders,
                         duckdb::vector<std::size_t> projections_p,
                         std::size_t estimated_cardinality,
@@ -52,6 +54,7 @@ class sirius_physical_order : public sirius_physical_operator {
 
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
+  std::shared_ptr<const sort_comparison_config> comparison;
   duckdb::vector<std::size_t> projections;
   bool is_index_sort;
 

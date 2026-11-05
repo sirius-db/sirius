@@ -19,6 +19,7 @@
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sort_comparison_config.hpp"
 
 #include <mutex>
 
@@ -41,10 +42,12 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
                              duckdb::vector<duckdb::BoundOrderByNode> orders,
                              duckdb::vector<std::size_t> projections_p,
                              std::size_t estimated_cardinality,
-                             bool is_index_sort_p = false);
+                             bool is_index_sort_p                                       = false,
+                             std::shared_ptr<const sort_comparison_config> comparison_p = nullptr);
 
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
+  std::shared_ptr<const sort_comparison_config> comparison;
   duckdb::vector<std::size_t> projections;
   bool is_index_sort;
 
