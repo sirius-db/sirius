@@ -469,3 +469,23 @@ dropping unfinished execution tasks. See [Query lifetime and retirement](query-l
 | `src/pipeline/task_request.hpp` | Executor↔pipeline request |
 | `src/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
 | `src/parallel/task_executor.hpp` | `itask_executor` base class for all executors |
+
+
+## Operator task lifecycle hooks
+
+`notify_task_attempt(input, task_attempt_context)` runs before preparation. The context
+contains granted reservation bytes and the selected memory space's attainable ceiling,
+independent of transient free memory or an operator's planner default.
+
+After an OOM preparation exception is synchronized, a source that is also its pipeline's
+sink may return a control input from `recover_preparation_failure`. The default returns
+null and retains ordinary retry behavior. The hook does not change shared progress,
+publish payload, retire sources or retain preparation locks. Failed prepared input is
+released before the control input runs through ordinary compute and publication.
+
+`on_task_output_published(output)` runs once after every sink destination and stream
+completion succeeds. The default does nothing. Retries and partial publication do not
+reach it; a callback exception fails the query without replay. An operator-owned
+`operator_data::is_control_only()` marker excludes replan results from successful memory
+history and payload-ratio totals, retaining failure observations instead. Ordinary child
+payload tasks train history normally. These hooks carry no sort phase or scheduling API.
