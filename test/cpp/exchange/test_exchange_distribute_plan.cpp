@@ -207,6 +207,8 @@ std::vector<std::string> distribute(std::vector<plan>& plans, ranks& c, fixture&
         sirius::planner::distribute_plan(plans[r], c.all[r].service, f.gpu(), 7, c.lifecycle);
       } catch (std::exception const& e) {
         errors[r] = e.what();
+        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
+        c.all[r].service->abort(7, e.what());
       }
     });
   }
