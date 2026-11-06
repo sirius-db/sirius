@@ -49,7 +49,9 @@ validated_file_identity validated_identity(duckdb::FileHandle&);
 // Native footer and row-group opens use this context; destruction restores ordinary opens.
 class scoped_native_read_context {
  public:
-  scoped_native_read_context(duckdb::ClientContext&, std::string path, std::shared_ptr<cucascade::io::ioctx>);
+  scoped_native_read_context(duckdb::ClientContext&,
+                             std::string path,
+                             std::shared_ptr<cucascade::io::ioctx>);
   ~scoped_native_read_context();
   scoped_native_read_context(scoped_native_read_context const&)            = delete;
   scoped_native_read_context& operator=(scoped_native_read_context const&) = delete;

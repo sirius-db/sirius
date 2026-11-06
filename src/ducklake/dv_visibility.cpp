@@ -16,10 +16,11 @@
 
 #include "ducklake/dv_visibility.hpp"
 
-#include <cucascade/io/io_errors.hpp>
 #include "io/path_utils.hpp"
-#include <cucascade/io/uri_parser.hpp>
 #include "op/scan/puffin_io.hpp"
+
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/uri_parser.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -37,7 +38,8 @@ char const* parquet_dependency_error(unit_descriptor const& unit, dependency_sco
   for (auto reason : gate.reasons) {
     switch (reason) {
       case unit_gate_reason::remote_data:
-        if (scope == dependency_scope::s3_deletes && cucascade::io::parse(unit.input.path).scheme == "s3")
+        if (scope == dependency_scope::s3_deletes &&
+            cucascade::io::parse(unit.input.path).scheme == "s3")
           break;
         return "DuckLake remote data is outside the local scan profile";
       case unit_gate_reason::remote_delete:

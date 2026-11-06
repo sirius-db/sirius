@@ -39,10 +39,11 @@ void install_duckdb_s3_config(duckdb::ClientContext&,
 
 // Capture independently for data and delete URIs on the owner thread, then
 // retain the returned context in the task rather than resolving shared state later.
-std::shared_ptr<cucascade::io::ioctx> capture_duckdb_s3_context(duckdb::ClientContext&,
-                                                 scan_manager::sirius_scan_manager&,
-                                                 std::string_view path,
-                                                 object_store_config const& defaults);
+std::shared_ptr<cucascade::io::ioctx> capture_duckdb_s3_context(
+  duckdb::ClientContext&,
+  scan_manager::sirius_scan_manager&,
+  std::string_view path,
+  object_store_config const& defaults);
 
 /// Register Sirius's own `SIRIUS_S3` config secret type. This does not require httpfs.
 void register_sirius_s3_secret(duckdb::SecretManager& manager);

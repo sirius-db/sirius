@@ -14,16 +14,16 @@
  * limitations under the License.
  */
 
-#include "io/path_utils.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 
-#include <cucascade/io/io_context.hpp>
-#include <cucascade/io/io_errors.hpp>
+#include "io/path_utils.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -84,8 +84,8 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
 };
 
 std::shared_ptr<cucascade::io::ioctx> read_access_context(duckdb::ClientContext& client,
-                                           duckdb::SiriusContext& runtime,
-                                           std::string const& path)
+                                                          duckdb::SiriusContext& runtime,
+                                                          std::string const& path)
 {
   auto pinned = client.registered_state->Get<native_read_context>(kNativeReadContext);
   if (pinned) {
@@ -247,9 +247,8 @@ bool match_glob_no_crawl(std::vector<std::string_view> const& keys,
 
 }  // namespace
 
-scoped_native_read_context::scoped_native_read_context(duckdb::ClientContext& context,
-                                                       std::string path,
-                                                       std::shared_ptr<cucascade::io::ioctx> captured)
+scoped_native_read_context::scoped_native_read_context(
+  duckdb::ClientContext& context, std::string path, std::shared_ptr<cucascade::io::ioctx> captured)
   : context_(context)
 {
   if (!captured || !is_s3_path(path))
@@ -270,8 +269,10 @@ validated_file_identity validated_identity(duckdb::FileHandle& handle)
 {
   auto* native = dynamic_cast<sirius_httpfs_file_handle*>(&handle);
   if (!native || native->datasource_->io_ctx()->type() != cucascade::io::io_context_type::restful ||
-      native->datasource_->get_io_object().identity().kind != cucascade::io::identity_kind::object_tag)
-    throw cucascade::io::descriptor_mismatch_error("Native remote reader requires a Sirius REST strong validator");
+      native->datasource_->get_io_object().identity().kind !=
+        cucascade::io::identity_kind::object_tag)
+    throw cucascade::io::descriptor_mismatch_error(
+      "Native remote reader requires a Sirius REST strong validator");
   return {native->datasource_->get_io_object().identity_cache_key(), native->datasource_->io_ctx()};
 }
 
@@ -314,7 +315,9 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   // the returned datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
   // DuckDB to surface at bind time.
-  auto datasource = context ? sirius::io::open_datasource(context, path, cucascade::io::open_hint::generic) : nullptr;
+  auto datasource =
+    context ? sirius::io::open_datasource(context, path, cucascade::io::open_hint::generic)
+            : nullptr;
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }
@@ -336,7 +339,8 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
     if (file.extended_info->TryGetOption("sirius_expected_size", expected_size) &&
         (handle->GetFileSize() < 0 ||
          static_cast<uint64_t>(handle->GetFileSize()) != expected_size))
-      throw cucascade::io::descriptor_mismatch_error("Native remote object size differs from binding");
+      throw cucascade::io::descriptor_mismatch_error(
+        "Native remote object size differs from binding");
     // Native caches lack the Sirius credential scope. Bypass both their byte
     // and footer caches; ioctx caches still reuse validated, scoped bytes.
     auto& native = as_httpfs_handle(*handle);
@@ -360,8 +364,9 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
   // A parquet_footer_probe open: one suffix-range GET resolves the size (== the
   // LIST size that rode the glob expansion) and stashes the footer, so the
   // binder's footer reads are served locally (no HEAD, no separate footer GETs).
-  auto datasource =
-    context ? sirius::io::open_datasource(context, file.path, cucascade::io::open_hint::parquet_footer_probe) : nullptr;
+  auto datasource = context ? sirius::io::open_datasource(
+                                context, file.path, cucascade::io::open_hint::parquet_footer_probe)
+                            : nullptr;
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }

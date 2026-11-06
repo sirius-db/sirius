@@ -21,7 +21,6 @@
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/preparation_gate.hpp"
 #include "helper/type_conversions.hpp"
-#include <cucascade/cudf/datasource.hpp>
 #include "op/scan/parquet_batch_layout.hpp"
 #include "op/scan/positional_visibility.hpp"
 #include "op/scan/table_scan/split_validation.hpp"
@@ -30,6 +29,7 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>

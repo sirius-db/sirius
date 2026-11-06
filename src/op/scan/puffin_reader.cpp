@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "io/path_utils.hpp"
 #include "op/scan/puffin_reader.hpp"
 
+#include "io/path_utils.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/puffin_io.hpp"
 

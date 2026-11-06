@@ -1330,7 +1330,9 @@ TEST_CASE("Shared Puffin open preserves resolver failures and rejects missing co
     throw cucascade::io::descriptor_mismatch_error("descriptor changed");
   };
   CHECK_THROWS_AS(open_puffin_source(path, resolve, {}), cucascade::io::descriptor_mismatch_error);
-  resolve = [&](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { throw std::bad_alloc{}; };
+  resolve = [&](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+    throw std::bad_alloc{};
+  };
   CHECK_THROWS_AS(open_puffin_source(path, resolve, {}), std::bad_alloc);
   std::stop_source cancel;
   resolve = [&](std::string_view) {

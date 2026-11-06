@@ -2353,10 +2353,11 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
 std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type_locked(
   cucascade::io::io_context_type type, std::string_view path)
 {
-  auto const snapshot =
-    (type == cucascade::io::io_context_type::restful || type == cucascade::io::io_context_type::kvikio) && !path.empty()
-      ? _s3_configs.resolve(path)
-      : std::optional<io::scoped_object_store_configs::snapshot>{};
+  auto const snapshot  = (type == cucascade::io::io_context_type::restful ||
+                         type == cucascade::io::io_context_type::kvikio) &&
+                            !path.empty()
+                           ? _s3_configs.resolve(path)
+                           : std::optional<io::scoped_object_store_configs::snapshot>{};
   auto const config_id = snapshot ? snapshot->id : 0;
   auto const cache_key = routed_ioctx_key{type, config_id};
   if (_io_ctx && _io_ctx->type() == type && !snapshot) return _io_ctx;
@@ -2387,8 +2388,7 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type_locked
   io_ctx->start();
   init_cache_for(*io_ctx);
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] =
-    _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
   return it->second;
 }
 
@@ -2492,7 +2492,8 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::capture_s3_context(
 {
   auto scope = normalize_path(std::string(path));
   auto type  = _ioctx_registry.lookup_path(scope);
-  if (!type || (*type != cucascade::io::io_context_type::restful && *type != cucascade::io::io_context_type::kvikio))
+  if (!type || (*type != cucascade::io::io_context_type::restful &&
+                *type != cucascade::io::io_context_type::kvikio))
     throw std::invalid_argument("S3 access scope requires an object-store backend");
   std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
   std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
