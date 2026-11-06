@@ -55,6 +55,7 @@ using sirius::op::HASH_JOIN_MODE;
 using sirius::op::partition_placement;
 using sirius::op::partition_strategy;
 using sirius::op::select_build_probe_action;
+using sirius::op::select_kept_build_action;
 
 namespace {
 
@@ -1325,4 +1326,168 @@ TEST_CASE("compute_hash_join_partition_strategy - SINGLE schedules like LEFT",
                          HASH_JOIN_MODE::STANDARD,
                          /*hash_partition_bytes=*/k100MB)
                   .build_probe);
+}
+
+//===----------------------------------------------------------------------===//
+// Kept-build streaming (RIGHT_SEMI / RIGHT_ANTI built on the kept side)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+partition_strategy kept_strategy(uint64_t total_bytes,
+                                 int num_gpus,
+                                 uint64_t hash_partition_bytes,
+                                 uint64_t max_build_hash_table_bytes = kMaxBuildBytes,
+                                 std::optional<uint64_t> total_rows  = std::nullopt,
+                                 bool build_foldable                 = true)
+{
+  auto result = compute_hash_join_partition_strategy(total_bytes,
+                                                     total_rows.value_or(total_bytes / 16),
+                                                     /*is_build_side=*/true,
+                                                     build_foldable,
+                                                     gpu_ids(num_gpus),
+                                                     /*single_partition_rotation=*/0,
+                                                     hash_partition_bytes,
+                                                     max_build_hash_table_bytes,
+                                                     max_build_hash_table_bytes,
+                                                     kMaxBroadcastBytes,
+                                                     duckdb::JoinType::RIGHT_SEMI,
+                                                     HASH_JOIN_MODE::STANDARD,
+                                                     /*estimated_probe_to_build_ratio=*/100.0,
+                                                     /*resident_bytes=*/std::nullopt,
+                                                     /*kept_build_streaming=*/true);
+  REQUIRE(result.placement.num_partitions() == static_cast<std::size_t>(result.num_partitions));
+  return result;
+}
+
+build_probe_slot_view kept_slot(BUILD_HASH_TABLE_STATE state,
+                                bool has_build,
+                                bool has_probe,
+                                bool in_flight = false)
+{
+  auto v            = slot(state, has_build, has_probe);
+  v.probe_in_flight = in_flight;
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("kept-build strategy is BUILD_PROBE and never broadcasts",
+          "[hash_join][build_probe][unit][semi_build_left]")
+{
+  // A tiny build would broadcast in the normal path; replicas would hold partial matched flags.
+  auto const one_gpu = kept_strategy(1024, /*num_gpus=*/1, kBigPartitionBytes);
+  REQUIRE(one_gpu.build_probe);
+  REQUIRE_FALSE(one_gpu.broadcast);
+  REQUIRE(one_gpu.num_partitions == 1);
+
+  auto const four_gpus = kept_strategy(4 * k100MB, /*num_gpus=*/4, k100MB);
+  REQUIRE(four_gpus.build_probe);
+  REQUIRE_FALSE(four_gpus.broadcast);
+  REQUIRE(four_gpus.num_partitions == 4);
+}
+
+TEST_CASE("kept-build strategy keeps more partitions than GPUs when over budget",
+          "[hash_join][build_probe][unit][semi_build_left]")
+{
+  // 8 natural partitions on one GPU; the folded build exceeds the hash-table budget, so the join
+  // keeps all eight slots resident instead of rejecting BUILD_PROBE.
+  auto const s = kept_strategy(8 * k100MB, /*num_gpus=*/1, k100MB, /*max_build=*/k100MB);
+  REQUIRE(s.build_probe);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.num_partitions == 8);
+
+  // Within budget it collapses to one slot per GPU.
+  auto const fits = kept_strategy(8 * k100MB, /*num_gpus=*/1, k100MB, /*max_build=*/100 * k100MB);
+  REQUIRE(fits.num_partitions == 1);
+}
+
+TEST_CASE("kept-build strategy splits builds beyond the cudf row limit",
+          "[hash_join][build_probe][unit][semi_build_left]")
+{
+  uint64_t const rows = 3ull * std::numeric_limits<int32_t>::max();
+  auto const s =
+    kept_strategy(k100MB, /*num_gpus=*/1, kBigPartitionBytes, kMaxBuildBytes * 1000, rows);
+  REQUIRE(s.build_probe);
+  REQUIRE(static_cast<uint64_t>(s.num_partitions) * (std::numeric_limits<int32_t>::max() / 2) >=
+          rows);
+}
+
+TEST_CASE("kept-build strategy requires a foldable build",
+          "[hash_join][build_probe][unit][semi_build_left]")
+{
+  REQUIRE_THROWS_AS(kept_strategy(k100MB,
+                                  1,
+                                  kBigPartitionBytes,
+                                  kMaxBuildBytes,
+                                  std::nullopt,
+                                  /*build_foldable=*/false),
+                    std::logic_error);
+}
+
+TEST_CASE("select_kept_build_action builds, probes, then emits after the probe drains",
+          "[hash_join][build_probe][unit][semi_build_left]")
+{
+  using S = BUILD_HASH_TABLE_STATE;
+  REQUIRE(select_kept_build_action({}, false).action == build_probe_action::none);
+
+  auto d = select_kept_build_action({kept_slot(S::NOT_BUILT, true, true)}, false);
+  REQUIRE(d.action == build_probe_action::schedule_build);
+  REQUIRE(d.partition == 0u);
+
+  d = select_kept_build_action({kept_slot(S::BUILT, false, true, true)}, false);
+  REQUIRE(d.action == build_probe_action::schedule_probe);
+
+  // The probe stream is still open: a drained slot must not emit yet.
+  d = select_kept_build_action({kept_slot(S::BUILT, false, false)}, false);
+  REQUIRE(d.action == build_probe_action::wait_for_probe);
+
+  // Probe finished but a probe task is still marking flags.
+  d = select_kept_build_action({kept_slot(S::BUILT, false, false, true)}, true);
+  REQUIRE(d.action == build_probe_action::wait_for_probe);
+
+  d = select_kept_build_action({kept_slot(S::BUILT, false, false)}, true);
+  REQUIRE(d.action == build_probe_action::schedule_emit);
+  REQUIRE(d.partition == 0u);
+
+  d = select_kept_build_action({kept_slot(S::EMIT_SCHEDULED, false, false)}, true);
+  REQUIRE(d.action == build_probe_action::wait_for_probe);
+
+  d = select_kept_build_action({kept_slot(S::DESTROYED, false, false)}, true);
+  REQUIRE(d.action == build_probe_action::none);
+}
+
+TEST_CASE("select_kept_build_action emits a never-probed build",
+          "[hash_join][build_probe][unit][semi_build_left]")
+{
+  using S = BUILD_HASH_TABLE_STATE;
+  // RIGHT_ANTI keeps every row of a partition the probe never reached.
+  auto d = select_kept_build_action({kept_slot(S::NOT_BUILT, true, false)}, false);
+  REQUIRE(d.action == build_probe_action::wait_for_probe);
+  d = select_kept_build_action({kept_slot(S::NOT_BUILT, true, false)}, true);
+  REQUIRE(d.action == build_probe_action::schedule_emit);
+
+  // A build without a batch still waits on the build producer.
+  d = select_kept_build_action({kept_slot(S::NOT_BUILT, false, true)}, true);
+  REQUIRE(d.action == build_probe_action::wait_for_build);
+}
+
+TEST_CASE("select_kept_build_action prefers runnable work across partitions",
+          "[hash_join][build_probe][unit][semi_build_left]")
+{
+  using S = BUILD_HASH_TABLE_STATE;
+  std::vector<build_probe_slot_view> slots{kept_slot(S::BUILT, false, false),
+                                           kept_slot(S::BUILT, false, true, true),
+                                           kept_slot(S::NOT_BUILT, true, true)};
+  auto d = select_kept_build_action(slots, true);
+  REQUIRE(d.action == build_probe_action::schedule_build);
+  REQUIRE(d.partition == 2u);
+  slots[2] = kept_slot(S::SCHEDULED, false, false, true);
+  d        = select_kept_build_action(slots, true);
+  REQUIRE(d.action == build_probe_action::schedule_probe);
+  REQUIRE(d.partition == 1u);
+  slots[1] = kept_slot(S::BUILT, false, false, true);
+  d        = select_kept_build_action(slots, true);
+  REQUIRE(d.action == build_probe_action::schedule_emit);
+  REQUIRE(d.partition == 0u);
 }
