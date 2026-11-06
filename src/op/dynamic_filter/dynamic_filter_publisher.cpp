@@ -676,14 +676,11 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    // A build too large for the cap gets a Bloom cut to it: more false positives, still a filter.
     // Distributed, every rank takes the plan's size, uncapped, so the ranks' filters merge.
     auto const* distributed = plan.distributed();
     auto const cap =
       distributed ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
-    auto const wanted = distributed ? distributed->bloom_keys : rows;
-    auto const sized_for =
-      distributed ? wanted : std::min(rows, bloom_keys_within_cap(cap, keys.size()));
+    auto const sized_for = distributed ? distributed->bloom_keys : rows;
     auto const geometry =
       detail::accumulated_bloom_geometry::try_create(sized_for, keys.size(), cap);
     if (!geometry) {
@@ -699,15 +696,6 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         plan.max_bloom_bytes_per_gpu());
       return false;
     }
-    if (sized_for < wanted) {
-      SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom cut to the per-GPU cap: sized for "
-        "{} keys instead of {}, cap={}",
-        sized_for,
-        wanted,
-        plan.max_bloom_bytes_per_gpu());
-    }
-
     auto const& replicas = plan.replica_spaces();
     if (replicas.empty()) {
       selection.accumulations_skipped_admission = 1;
