@@ -447,6 +447,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
              yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
+  r.optional("semi_join_kept_build_ratio",
+             opt.semi_join_kept_build_ratio,
+             yaml::between<double>{0.0, std::numeric_limits<double>::max()});
   if (r.has("enable_runtime_distinct_build_probe")) {
     throw std::runtime_error(
       "'sirius.operator_params.enable_runtime_distinct_build_probe': removed; runtime distinct "

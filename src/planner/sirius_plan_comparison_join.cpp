@@ -781,6 +781,19 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     hj.mark_join_build_switch_ratio   = op_params.mark_join_build_switch_ratio;
     hj.runtime_distinct_build_probe   = op_params.enable_runtime_distinct_build_probe;
     hj.max_build_probe_resident_bytes = op_params.max_build_probe_resident_bytes;
+    if ((op.join_type == duckdb::JoinType::RIGHT_SEMI ||
+         op.join_type == duckdb::JoinType::RIGHT_ANTI) &&
+        op_params.semi_join_kept_build_ratio > 0.0 &&
+        static_cast<double>(lhs_cardinality) >=
+          op_params.semi_join_kept_build_ratio * static_cast<double>(rhs_cardinality)) {
+      hj.set_kept_build_streaming(true);
+      SIRIUS_LOG_DEBUG(
+        "[sirius_plan_comparison_join] {} builds on its kept side and streams the probe (probe est "
+        "{} rows, build est {} rows).",
+        duckdb::JoinTypeToString(op.join_type),
+        lhs_cardinality,
+        rhs_cardinality);
+    }
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 

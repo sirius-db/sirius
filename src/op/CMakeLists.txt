@@ -97,6 +97,7 @@ target_sources(
           sirius_physical_union.cpp
           sirius_physical_window.cpp
           aggregate/wide_integer_sum.cu
+          join/kept_build_marks.cu
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu
           scan/equality_delete_mask.cu)
