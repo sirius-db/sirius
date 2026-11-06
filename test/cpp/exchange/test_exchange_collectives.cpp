@@ -828,12 +828,21 @@ TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted ra
         mine.insert(mine.end(), k.begin(), k.end());
       }
     }
-    CHECK(!mine.empty());
+    REQUIRE(!mine.empty());
     // Ranges follow rank order: all of rank r's keys are above rank r - 1's.
     auto const [lo, hi] = std::minmax_element(mine.begin(), mine.end());
     CHECK(*lo > previous_max);
     previous_max = *hi;
     all.insert(all.end(), mine.begin(), mine.end());
   }
-  CHECK(all.size() == 6 * 10'000);
+  std::vector<std::int64_t> expected;
+  for (rank_t r = 0; r < world; ++r) {
+    for (std::int64_t i = 0; i < 10'000; ++i) {
+      expected.push_back(r + 3 * i);
+      expected.push_back(30'000 + r + 5 * i);
+    }
+  }
+  std::sort(expected.begin(), expected.end());
+  std::sort(all.begin(), all.end());
+  CHECK(all == expected);
 }
