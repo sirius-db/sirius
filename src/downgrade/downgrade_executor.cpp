@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <thread>
@@ -229,11 +230,9 @@ void downgrade_executor::processing_loop()
       // Resolve the source memory space for filtering candidates
       source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-      // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK
-      // tier. NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on
-      // the post-#637 architecture): if preferred_numa_node is set, stable_partition the matching
-      // HOST space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space
-      // first.
+      // Build the target list: a GPU-source executor spills to the HOST spaces, then DISK; a
+      // HOST-source executor spills to DISK only. When preferred_numa_node is set, the matching
+      // HOST space(s) are moved to the front so cand->convert() tries the NUMA-local space first.
       if (_space_id.tier == cucascade::memory::Tier::GPU) {
         auto host_span =
           _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -296,12 +295,15 @@ void downgrade_executor::processing_loop()
 
           // Snapshot candidate sizes so target-carrying requests can right-size their final pick
           // (spill_policy.hpp) instead of taking the next whole batch in policy order. Requests
-          // without a target keep plain policy-order iteration.
+          // without a target keep plain policy-order iteration. A size of 0 means the batch was
+          // taken exclusively (or moved) since the snapshot; a non-blocking convert would skip
+          // it, so it is dropped here rather than spent as a dispatch.
           std::vector<std::size_t> candidate_sizes(candidates.size());
-          for (std::size_t i = 0; i < candidates.size(); ++i) {
-            candidate_sizes[i] = candidates[i]->bytes_in_space(source_space);
-          }
           std::vector<bool> already_dispatched(candidates.size(), false);
+          for (std::size_t i = 0; i < candidates.size(); ++i) {
+            candidate_sizes[i]    = candidates[i]->bytes_in_space(source_space);
+            already_dispatched[i] = candidate_sizes[i] == 0;
+          }
 
           for (std::size_t n = 0; n < candidates.size(); ++n) {
             if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
@@ -443,10 +445,21 @@ void downgrade_executor::processing_loop()
                   cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
                 if (result) {
                   std::move(rollback).Cancel();
-                  req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  // A task may move only some of its source-space batches (the target filled up,
+                  // a batch was locked); credit what left the source space, not the task total.
+                  auto const moved_bytes =
+                    std::accumulate(result->begin(), result->end(), std::size_t{0});
+                  if (moved_bytes >= candidate_bytes) {
+                    planned_bytes.fetch_add(moved_bytes - candidate_bytes,
+                                            std::memory_order_relaxed);
+                  } else {
+                    planned_bytes.fetch_sub(candidate_bytes - moved_bytes,
+                                            std::memory_order_relaxed);
+                  }
+                  req_ptr->bytes_freed.fetch_add(moved_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                  pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  pipeline_queue_stats.bytes.fetch_add(moved_bytes, std::memory_order_relaxed);
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
                     if (i < host_end_idx) {

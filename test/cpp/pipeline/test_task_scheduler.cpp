@@ -406,7 +406,9 @@ void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
 TEST_CASE("Tasks extracted and RAII-returned while executors are parked still run",
           "[task_scheduler][deadlock-1467]")
 {
-  auto manager = initialize_memory_manager(1);
+  auto manager    = initialize_memory_manager(1);
+  auto* gpu_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::query_lifecycle_registry lifecycle;
   lifecycle.open_query(sirius::make_query_id(0));
@@ -429,8 +431,8 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   std::vector<std::unique_ptr<sirius::convertible_gpu_pipeline_task>> extracted;
   while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
                                         /*front_to_back=*/false)) {
-    extracted.push_back(
-      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue, lifecycle));
+    extracted.push_back(std::make_unique<sirius::convertible_gpu_pipeline_task>(
+      std::move(*t), *queue, lifecycle, gpu_space));
   }
   REQUIRE(extracted.size() == num_tasks);
 
@@ -529,13 +531,17 @@ TEST_CASE("scheduler and spill return retain submission through rejected task de
   }
   SECTION("spill return enqueue")
   {
+    auto manager    = initialize_memory_manager(1);
+    auto* gpu_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+    REQUIRE(gpu_space != nullptr);
     sirius::exec::multi_index_priority_queue<itask> queue(&index_keys_for);
     queue.interrupt();
     {
       sirius::convertible_gpu_pipeline_task spilled(
         std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction),
         queue,
-        lifecycle);
+        lifecycle,
+        gpu_space);
     }
     REQUIRE(queue.empty());
   }
