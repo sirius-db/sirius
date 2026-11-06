@@ -687,7 +687,7 @@ duckdb::TableFunction rebound_policy_source(std::string name)
       ++replay_source_executions;
       if (replay_source_behavior == "empty") return;
       if (replay_source_behavior == "error") {
-        throw duckdb::InvalidInputException("CPU replay source failed");
+        throw duckdb::IOException("CPU replay source failed");
       }
       output.SetCardinality(1);
       output.SetValue(0, 0, duckdb::Value::INTEGER(42));
@@ -815,6 +815,9 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
       CHECK(result->GetError().find("direct CPU replay exception") != std::string::npos);
     } else if (fallback && std::string_view(source) == "error") {
       CHECK(result->GetError().find("CPU replay source failed") != std::string::npos);
+      // Fetching an already failed result must not rewrite its native IO type.
+      CHECK(result->GetErrorType() == duckdb::ExceptionType::IO);
+      CHECK(result->GetError().find("unsuccessful or closed query result") == std::string::npos);
     } else if (!(fallback && std::string_view(source) == "incomplete")) {
       CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
     }

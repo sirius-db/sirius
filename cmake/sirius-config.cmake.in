@@ -1,5 +1,12 @@
 @PACKAGE_INIT@
 
+if(@SIRIUS_BUILD_DUCKLAKE_BRIDGE@ AND NOT TARGET sirius::ducklake_provider)
+  add_library(sirius::ducklake_provider SHARED IMPORTED)
+  set_target_properties(sirius::ducklake_provider PROPERTIES
+    IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/sirius/ducklake.duckdb_extension"
+    INTERFACE_LINK_OPTIONS "LINKER:-rpath,$<TARGET_FILE_DIR:sirius::ducklake_provider>")
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/sirius-targets.cmake" OPTIONAL)
 if("static" IN_LIST sirius_FIND_COMPONENTS OR NOT TARGET sirius::sirius)
   if(NOT TARGET sirius::sirius_static AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/sirius-static-targets.cmake")

@@ -1,6 +1,7 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "op/scan/field_id_mapping.hpp"
 
+#include "helper/hugeint.hpp"
 #include "io/parquet_helpers.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -49,6 +50,16 @@ cudf::data_type flat_type(duckdb::LogicalType const& type)
     case D::UBIGINT: return cudf::data_type{C::UINT64};
     case D::FLOAT: return cudf::data_type{C::FLOAT32};
     case D::DOUBLE: return cudf::data_type{C::FLOAT64};
+    case D::DECIMAL: {
+      auto precision = duckdb::DecimalType::GetWidth(type);
+      auto scale     = duckdb::DecimalType::GetScale(type);
+      if (!precision || precision > 38 || scale > precision)
+        throw std::invalid_argument("unsupported decimal precision or scale");
+      return cudf::data_type{precision <= 9    ? C::DECIMAL32
+                             : precision <= 18 ? C::DECIMAL64
+                                               : C::DECIMAL128,
+                             -static_cast<int32_t>(scale)};
+    }
     case D::VARCHAR: return cudf::data_type{C::STRING};
     case D::DATE: return cudf::data_type{C::TIMESTAMP_DAYS};
     case D::TIMESTAMP: return cudf::data_type{C::TIMESTAMP_MICROSECONDS};
@@ -72,8 +83,9 @@ bool carrier_type(duckdb::LogicalType const& type, row_count_carrier_policy poli
     case D::FLOAT:
     case D::DOUBLE:
     case D::VARCHAR: return true;
+    case D::DECIMAL:
     case D::DATE:
-    case D::TIMESTAMP: return policy == row_count_carrier_policy::include_temporal;
+    case D::TIMESTAMP: return policy == row_count_carrier_policy::include_temporal_and_decimal;
     default: return false;
   }
 }
@@ -98,7 +110,16 @@ std::unique_ptr<cudf::scalar> default_scalar(duckdb::Value const& value,
                                              rmm::device_async_resource_ref mr)
 {
   if (value.IsNull()) {
-    auto result = cudf::make_default_constructed_scalar(type, stream, mr);
+    std::unique_ptr<cudf::scalar> result;
+    if (type.id() == cudf::type_id::DECIMAL32 || type.id() == cudf::type_id::DECIMAL64 ||
+        type.id() == cudf::type_id::DECIMAL128) {
+      auto zero = duckdb::Value::DECIMAL(int64_t{0},
+                                         duckdb::DecimalType::GetWidth(value.type()),
+                                         duckdb::DecimalType::GetScale(value.type()));
+      result    = default_scalar(zero, type, stream, mr);
+    } else {
+      result = cudf::make_default_constructed_scalar(type, stream, mr);
+    }
     result->set_valid_async(false, stream);
     return result;
   }
@@ -144,6 +165,27 @@ std::unique_ptr<cudf::scalar> default_scalar(duckdb::Value const& value,
         true,
         stream,
         mr);
+    case cudf::type_id::DECIMAL32:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+        static_cast<int32_t>(sirius::to_int128(duckdb::IntegralValue::Get(value))),
+        numeric::scale_type{type.scale()},
+        true,
+        stream,
+        mr);
+    case cudf::type_id::DECIMAL64:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+        static_cast<int64_t>(sirius::to_int128(duckdb::IntegralValue::Get(value))),
+        numeric::scale_type{type.scale()},
+        true,
+        stream,
+        mr);
+    case cudf::type_id::DECIMAL128:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+        sirius::to_int128(duckdb::IntegralValue::Get(value)),
+        numeric::scale_type{type.scale()},
+        true,
+        stream,
+        mr);
     case cudf::type_id::STRING:
       return std::make_unique<cudf::string_scalar>(
         duckdb::StringValue::Get(value), true, stream, mr);
@@ -169,7 +211,7 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
                                            row_count_carrier_policy carrier_policy)
 {
   if (carrier_policy != row_count_carrier_policy::legacy_scalars &&
-      carrier_policy != row_count_carrier_policy::include_temporal)
+      carrier_policy != row_count_carrier_policy::include_temporal_and_decimal)
     throw std::invalid_argument("unknown row-count carrier policy");
   if (!metadata || opened_identity.empty() || metadata->built_for_identity != opened_identity ||
       !program.contract || !program.generation)
@@ -212,8 +254,13 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
       auto root = root_ordinals.find(found->second);
       if (root == root_ordinals.end())
         throw std::invalid_argument("requested field ID is not a top-level scalar");
-      auto ordinal     = root->second;
-      op.physical_type = flat_type(schema.types.at(ordinal));
+      auto ordinal            = root->second;
+      auto const& source_type = schema.types.at(ordinal);
+      if ((source_type.id() == duckdb::LogicalTypeId::DECIMAL ||
+           op.field.type.id() == duckdb::LogicalTypeId::DECIMAL) &&
+          source_type != op.field.type)
+        throw std::invalid_argument("decimal field requires identical precision and scale");
+      op.physical_type = flat_type(source_type);
       if (op.physical_type != target &&
           !(op.field.allow_int32_to_int64 && op.physical_type.id() == cudf::type_id::INT32 &&
             target.id() == cudf::type_id::INT64) &&

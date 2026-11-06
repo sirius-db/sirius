@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <future>
 #include <stdexcept>
 #include <system_error>
 
@@ -1598,7 +1599,7 @@ TEST_CASE("Default field mapping preserves row-count carrier eligibility",
                                             program,
                                             fields,
                                             field_mapping_scope::flat_file,
-                                            row_count_carrier_policy::include_temporal);
+                                            row_count_carrier_policy::include_temporal_and_decimal);
   CHECK(opted_in.read_indices() == std::vector<cudf::size_type>{0});
   CHECK(opted_in.read_names() == std::vector<std::string>{"temporal"});
   CHECK(opted_in.read_types() == std::vector<duckdb::LogicalType>{timestamp
@@ -1707,4 +1708,93 @@ TEST_CASE("Planning binds validators before publishing correspondence",
   registry.publish_correspondence(
     certificate_evidence_scope::binding_correspondence, "test", originals);
   CHECK_THROWS_AS(registry.bind_split_validator(id, parquet_split_validator()), std::logic_error);
+}
+
+TEST_CASE("Arrow narrow decimal imports preserve signed values and reject overflow",
+          "[materialization][scan][decimal]")
+{
+  auto bits      = GENERATE(32, 64);
+  auto precision = bits == 32 ? 9 : 18;
+  auto format    = "d:" + std::to_string(precision) + ",2," + std::to_string(bits);
+  int released   = 0;
+  auto fixture   = std::make_shared<arrow_fixture>(released);
+  int32_t values32[]{-999999999, 0, 999999999};
+  int64_t values64[]{-999999999999999999LL, 0, 999999999999999999LL};
+  fixture->child_schema.format = format.c_str();
+  fixture->buffers[1] = bits == 32 ? static_cast<void*>(values32) : static_cast<void*>(values64);
+  auto types          = validate_arrow_host_flat(fixture->schema, fixture->array);
+  REQUIRE(types[0] ==
+          cudf::data_type(bits == 32 ? cudf::type_id::DECIMAL32 : cudf::type_id::DECIMAL64, -2));
+  rmm::cuda_stream stream;
+  sirius::exec::retire_lane lane(stream.value());
+  auto owner = owned_fixture(fixture);
+  materialization_program program{43, 1, types, 0, false};
+  program.input_types        = types;
+  program.decimal_precisions = {precision - 1};
+  CHECK_THROWS(owner->validate_for(program));
+  program.decimal_precisions = {precision};
+  auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  CHECK(batch.table.view().column(0).null_count() == 1);
+  if (bits == 32) {
+    int32_t result[3]{};
+    REQUIRE(cudaMemcpy(result,
+                       batch.table.view().column(0).head(),
+                       sizeof(result),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    CHECK(result[0] == values32[0]);
+    CHECK(result[2] == values32[2]);
+
+  } else {
+    int64_t result[3]{};
+    REQUIRE(cudaMemcpy(result,
+                       batch.table.view().column(0).head(),
+                       sizeof(result),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    CHECK(result[0] == values64[0]);
+    CHECK(result[2] == values64[2]);
+  }
+  int invalid_released         = 0;
+  auto invalid                 = std::make_shared<arrow_fixture>(invalid_released);
+  invalid->child_schema.format = format.c_str();
+  int32_t overflow32[]{-1000000000, 0, 0};
+  int64_t overflow64[]{-1000000000000000000LL, 0, 0};
+  invalid->buffers[1] =
+    bits == 32 ? static_cast<void*>(overflow32) : static_cast<void*>(overflow64);
+  CHECK_THROWS(owned_fixture(invalid)->validate_for(program));
+}
+
+TEST_CASE("Arrow decimal formats reject invalid storage widths", "[materialization][scan][decimal]")
+{
+  int released = 0;
+  arrow_fixture fixture(released);
+  for (auto format : {"d:10,2,32", "d:19,2,64", "d:38,2,256", "d:4,2,16", "d:9,10,32"}) {
+    CAPTURE(format);
+    fixture.child_schema.format = format;
+    CHECK_THROWS(validate_arrow_host_flat(fixture.schema, fixture.array));
+  }
+}
+
+TEST_CASE("Owned Arrow validation remains bound to each program under concurrent reuse",
+          "[materialization][scan]")
+{
+  int released = 0;
+  auto fixture = std::make_shared<arrow_fixture>(released);
+  auto owner   = owned_fixture(fixture);
+  materialization_program program{43, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+  program.input_types = program.output_types;
+  std::vector<std::future<size_t>> workers;
+  for (int i = 0; i < 8; ++i)
+    workers.push_back(std::async(std::launch::async, [owner, program] {
+      owner->validate_for(program);
+      return owner->estimated_device_bytes();
+    }));
+  for (auto& worker : workers)
+    CHECK(worker.get() == owner->estimated_device_bytes());
+  CHECK(owner->input_types() == *program.input_types);
+  program.input_types = std::vector{cudf::data_type{cudf::type_id::FLOAT64}};
+  CHECK_THROWS(owner->validate_for(program));
+  program.input_types = program.output_types;
+  program.generation  = 0;
+  CHECK_THROWS(owner->validate_for(program));
 }

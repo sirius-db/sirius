@@ -52,6 +52,7 @@ add_subdirectory(src)
 include(cmake/sirius-substrait.cmake)
 
 include(cmake/sirius-targets.cmake)
+include(cmake/sirius-ducklake-provider.cmake)
 
 include(cmake/sirius-install.cmake)
 

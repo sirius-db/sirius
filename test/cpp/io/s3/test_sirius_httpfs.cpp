@@ -708,8 +708,8 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
         if (!replace_during_batches) replace_object();
         return std::vector<uint64_t>{1};
       },
-      [&] {
-        return [&](duckdb::DataChunk& chunk) {
+      [&](bool) {
+        return [&](uint64_t, duckdb::DataChunk& chunk) {
           std::lock_guard lock(consume_mutex);
           for (duckdb::idx_t i = 0; i < chunk.size(); ++i)
             pending.push_back(chunk.GetValue(0, i).GetValue<int64_t>());
