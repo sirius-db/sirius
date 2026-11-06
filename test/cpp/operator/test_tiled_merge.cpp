@@ -74,9 +74,18 @@ class injected_merge : public sirius_physical_merge_sort {
       replaced_single |= batches.get_data_batches().size() == 1;
       replaced_multiple |= batches.get_data_batches().size() > 1;
       std::vector<std::shared_ptr<cucascade::data_batch>> replacements;
+      std::vector<cucascade::read_only_data_batch> reads;
       try {
         for (auto const& batch : batches.get_data_batches()) {
-          replacements.push_back(batch->clone(sirius::get_next_batch_id(), stream));
+          reads.push_back(batch->to_read_only());
+          auto const& read = reads.back();
+          auto* space      = read.get_memory_space();
+          replacements.push_back(sirius::make_data_batch(
+            std::make_unique<cudf::table>(
+              sirius::get_cudf_table_view(read), stream, space->get_default_allocator()),
+            *space,
+            stream,
+            batch_telemetry()));
           REQUIRE(replacements.back() != batch);
         }
         stream.sync();
