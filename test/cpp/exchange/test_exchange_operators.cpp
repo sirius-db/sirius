@@ -34,7 +34,6 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -165,8 +164,9 @@ std::vector<std::int64_t> flat(std::vector<std::vector<std::int64_t>> const& tas
   return out;
 }
 
-/// Every rank sinks @p batches batches through an EXCHANGE_SINK of @p spec, then ends; returns
-/// each rank's source, built first unless @p sources_late.
+/// Every rank sinks @p batches batches through an EXCHANGE_SINK of @p spec on @p stream, then
+/// ends; returns each rank's source, built first unless @p sources_late. With @p ordered, each
+/// source returns its senders' batches in rank order instead of arrival order.
 std::vector<std::unique_ptr<sirius_physical_exchange_source>> exchange_all(
   ranks& c, stream_id stream, exchange_spec spec, int batches, bool ordered, bool sources_late)
 {
@@ -231,21 +231,22 @@ struct stub_operator : sirius::op::sirius_physical_operator {
 TEST_CASE("hash exchange sends each row to the rank its hash names", "[exchange][operators]")
 {
   ranks c(3);
+  int const batches = 2;
   exchange_spec spec;
   spec.key_columns = {0};
-  auto sources     = exchange_all(c, 1, spec, 2, /*ordered=*/false, /*sources_late=*/false);
+  auto sources     = exchange_all(c, 1, spec, batches, /*ordered=*/false, /*sources_late=*/false);
 
   // The same rows hashed by the same kernel and seed, in one process: the expected split.
   for (rank_t r = 0; r < c.world(); ++r) {
     auto got = flat(drain(*sources[r]));
     std::vector<std::int64_t> want;
     for (rank_t from = 0; from < c.world(); ++from) {
-      for (int i = 0; i < 2; ++i) {
+      for (int i = 0; i < batches; ++i) {
         auto batch = key_value_batch(from, i);
         auto parts = sirius::op::gpu_partition_impl::hash_partition(batch->to_read_only(),
                                                                     {0},
                                                                     {},
-                                                                    3,
+                                                                    static_cast<int>(c.world()),
                                                                     utils::default_stream(),
                                                                     *env().gpu,
                                                                     {},
