@@ -293,6 +293,9 @@ Without it, a distributed query fails with "needs a Sirius built with -DSIRIUS_W
 - `NIXL_PLUGIN_DIR`.
 
 It leaves `UCX_TLS` alone, so UCX picks its transports (NVLink, InfiniBand, TCP) from the hardware.
+The single-host launchers below default `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: when UCX
+picks InfiniBand on a multi-rail host, ranks on the same host can fail to connect. Set `UCX_TLS`
+yourself to override.
 
 ## Running TPC-H Q12 on 4 GPUs
 
