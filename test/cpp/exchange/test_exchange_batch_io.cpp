@@ -87,7 +87,7 @@ TEST_CASE("a GPU batch lands on the GPU frame by frame", "[exchange][batch_io]")
   auto batch          = gpu_batch(sample_table(20'000));
   auto const expected = digest(batch);
   // A frame size that is not a multiple of the stream alignment cuts buffers anywhere.
-  for (std::size_t frame : {64 * KiB, 100'000ul, 1ul << 20}) {
+  for (std::size_t frame : {64 * KiB, 100'000ul, MiB}) {
     auto received = ship(batch, frame, Tier::GPU);
     CHECK(received->to_read_only().get_current_tier() == Tier::GPU);
     CHECK(digest(received) == expected);

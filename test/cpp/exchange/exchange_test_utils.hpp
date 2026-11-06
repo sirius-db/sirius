@@ -51,6 +51,7 @@ namespace utils = sirius::test::operator_utils;
 using cucascade::memory::Tier;
 
 constexpr std::size_t KiB = std::size_t{1} << 10;
+constexpr std::size_t MiB = KiB * KiB;
 
 struct io_env {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
