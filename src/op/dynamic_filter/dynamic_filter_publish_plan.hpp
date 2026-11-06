@@ -187,7 +187,10 @@ class dynamic_filter_publish_plan final {
     exchange::stream_id first_stream = 0;
     /// Where this rank's contribution and the gathered filters are allocated; required.
     cucascade::memory::memory_space* gpu = nullptr;
-    /// Every rank's Bloom is sized for this many keys.
+    /// Every rank's Bloom is sized for this many keys, on either publication path, so the Blooms
+    /// merge. max_bloom_bytes_per_gpu does not cut it: the merged Bloom holds every rank's keys,
+    /// and Q05 at SF3000 on 2 GPUs, cut to 256 MiB, got ~1.5 bits per key, filtered almost nothing
+    /// and ran 3.5x slower. The planner's clamp bounds it until the streaming OR (#2375).
     std::size_t bloom_keys = 0;
     /// Shorter than all_gather's default: a late rank should cost the filter, not stall the build.
     static constexpr std::chrono::milliseconds default_timeout{std::chrono::minutes{2}};

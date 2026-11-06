@@ -325,12 +325,11 @@ std::vector<std::int64_t> sequence(std::int64_t first, std::int64_t step, int co
 TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
           "[exchange][collectives][dynamic_filter]")
 {
-  // Planned for 2^30 keys; the 64 KiB cap cuts every rank's Bloom to the same 32Ki keys.
+  // Planned for 32Ki keys at 2 bytes each.
   ranks c(2);
   std::vector<std::unique_ptr<accumulating_join>> joins;
   for (rank_t r = 0; r < 2; ++r) {
-    joins.push_back(
-      std::make_unique<accumulating_join>(c.all[r].service, std::size_t{1} << 30, 64 * KiB));
+    joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, 32 * KiB, 64 * KiB));
   }
   // Rank 0 holds the even keys, rank 1 the odd ones.
   on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000)); });
@@ -348,8 +347,9 @@ TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
 TEST_CASE("a rank that accumulates and one that publishes a whole build size their Blooms alike",
           "[exchange][collectives][dynamic_filter]")
 {
+  // Planned for 64Ki keys, 128 KiB: the per-GPU cap of 64 KiB does not cut a distributed Bloom.
   ranks c(2);
-  auto const planned = std::size_t{1} << 30;
+  auto const planned = std::size_t{64} * KiB;
   accumulating_join accumulated(c.all[0].service, planned, 64 * KiB);
   whole_build_join whole(c.all[1].service, planned, 64 * KiB);
   on_every_rank(2, [&](rank_t r) {
@@ -361,7 +361,7 @@ TEST_CASE("a rank that accumulates and one that publishes a whole build size the
   });
   for (auto const* bloom : {accumulated.bloom(), published_bloom(*whole.channel)}) {
     REQUIRE(bloom != nullptr);
-    CHECK(bloom->storage_bytes() == 64 * KiB);
+    CHECK(bloom->storage_bytes() == 128 * KiB);
     CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
   }
 }
