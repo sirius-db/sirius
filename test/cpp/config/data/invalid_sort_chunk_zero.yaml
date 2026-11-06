@@ -1,0 +1,3 @@
+sirius:
+  operator_params:
+    sort_chunk_bytes: 0

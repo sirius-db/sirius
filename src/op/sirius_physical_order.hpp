@@ -19,6 +19,7 @@
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sort_comparison_config.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius {
 namespace op {
@@ -57,6 +58,9 @@ class sirius_physical_order : public sirius_physical_operator {
   std::shared_ptr<const sort_comparison_config> comparison;
   duckdb::vector<std::size_t> projections;
   bool is_index_sort;
+
+  // Positive decoded-byte target for independently owned local runs.
+  std::size_t chunk_bytes{config::DEFAULT_SORT_CHUNK_BYTES};
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }

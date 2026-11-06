@@ -2667,6 +2667,13 @@ static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
+static void SetSortChunkBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) { throw InvalidInputException("sort_chunk_bytes must be greater than zero"); }
+  get_operator_params(context, scope)->sort_chunk_bytes = bytes;
+}
+
 static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                     = get_operator_params(context, scope);
@@ -3394,6 +3401,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.scan_task_batch_size),
                     SetDefaultScanTaskBatchSize);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sort_chunk_bytes",
+                    "override the internally derived ORDER BY chunk target",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.sort_chunk_bytes),
+                    SetSortChunkBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "fuse_merge_pipelines",
