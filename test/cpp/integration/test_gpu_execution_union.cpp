@@ -20,10 +20,8 @@
 // GpuExecutionFixture runs each query on the GPU -- asserting one GPU execution and ZERO fallbacks
 // -- and again on DuckDB CPU, then compares. The zero-fallback assertion is what makes these tests
 // meaningful: a silent CPU fallback would still produce the right answer, so a plain result check
-// would pass whether or not the operator existed. The rest of the set-operation family is asserted
-// the other way round, with expect_plan_fallback_matches_cpu -- those shapes are refused during
-// plan generation, which moves `fallbacks` and leaves `executions` flat, so expect_gpu_fallback
-// (which requires the *runtime* counter to move) would never hold for them.
+// would pass whether or not the operator existed. Distinct EXCEPT and INTERSECT also use this
+// comparator to verify that their hash join and DISTINCT execute on the GPU.
 //
 // NOT covered here (needs a fixture with a small scan_task_batch_size; the shared integration
 // config uses 100 MB, so these fixtures are one batch per arm): multi-batch streaming,
@@ -248,16 +246,40 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
-                 "gpu_execution declines the rest of the set-operation family",
-                 "[integration][gpu_execution][union][union_all]")
+                 "gpu_execution distinct EXCEPT and INTERSECT match the CPU",
+                 "[integration][gpu_execution][set_operation]")
 {
-  // EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not error, and not
-  // silently return the union of both inputs. Both are refused during plan generation
-  // (`plan_except_intersect` refuses the distinct forms), so this asserts a plan-time fallback.
-  // The helper also compares against the CPU result, which is what pins "still the right answer"
-  // without a hand-rolled second check.
-  expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
-  expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
+  compare_gpu_vs_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
+  compare_gpu_vs_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
+  for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
+    compare_gpu_vs_cpu("SELECT k FROM ua " + keyword +
+                       " (WITH m AS MATERIALIZED (SELECT k, v FROM ub) "
+                       "SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+  }
+}
+
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution distinct set operations deduplicate surviving composite rows",
+                 "[integration][gpu_execution][set_operation][setop_distinct]")
+{
+  std::string keyword;
+  SECTION("EXCEPT") { keyword = "EXCEPT"; }
+  SECTION("INTERSECT") { keyword = "INTERSECT"; }
+
+  run_ok("CREATE TABLE setop_left (k INTEGER, v VARCHAR);");
+  run_ok("CREATE TABLE setop_right (k INTEGER, v VARCHAR);");
+  run_ok(
+    "INSERT INTO setop_left VALUES "
+    "(1, 'a'), (1, 'a'), (2, 'b'), (2, 'b'), (NULL, 'n'), (NULL, 'n'), "
+    "(NULL, NULL), (NULL, NULL), (3, NULL), (3, NULL);");
+  run_ok(
+    "INSERT INTO setop_right VALUES "
+    "(1, 'a'), (1, 'a'), (NULL, 'n'), (NULL, 'n'), (NULL, NULL), (3, 'other');");
+  run_ok("CHECKPOINT;");
+
+  compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM setop_right");
+  compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM uempty");
+  compare_gpu_vs_cpu("SELECT k, v FROM uempty " + keyword + " SELECT k, v FROM setop_right");
 }
 
 TEST_CASE_METHOD(UnionFixture,
@@ -550,4 +572,56 @@ TEST_CASE_METHOD(UnionFloatFixture,
     compare_gpu_vs_cpu_canonical("SELECT f FROM fa UNION SELECT f FROM fb");
     compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT f FROM fa UNION SELECT f FROM fb) t");
   }
+}
+
+namespace {
+
+class DistinctSetOperationFloatFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  DistinctSetOperationFloatFixture()
+  {
+    run_ok("CREATE TABLE set_float_l (d DOUBLE, f REAL);");
+    run_ok("CREATE TABLE set_float_r (d DOUBLE, f REAL);");
+    run_ok("CREATE TABLE set_float_no_nan (d DOUBLE, f REAL);");
+    run_ok(
+      "INSERT INTO set_float_l VALUES "
+      "(-(0.0::DOUBLE), -(0.0::REAL)), (0.0, 0.0), "
+      "('NaN'::DOUBLE, 'NaN'::REAL), ('NaN'::DOUBLE, 'NaN'::REAL), "
+      "('Infinity'::DOUBLE, 'Infinity'::REAL), ('Infinity'::DOUBLE, 'Infinity'::REAL), "
+      "('-Infinity'::DOUBLE, '-Infinity'::REAL), (NULL, NULL), (NULL, NULL), "
+      "(1.5, 1.5), (2.5, 2.5), (2.5, 2.5);");
+    run_ok(
+      "INSERT INTO set_float_r VALUES "
+      "(0.0::DOUBLE, 0.0::REAL), (0.0, 0.0), "
+      "(-('NaN'::DOUBLE), -('NaN'::REAL)), (-('NaN'::DOUBLE), -('NaN'::REAL)), "
+      "('Infinity'::DOUBLE, 'Infinity'::REAL), ('-Infinity'::DOUBLE, '-Infinity'::REAL), "
+      "(NULL, NULL), (NULL, NULL), (1.5, 1.5), (3.5, 3.5), (3.5, 3.5);");
+    run_ok(
+      "INSERT INTO set_float_no_nan VALUES "
+      "(0.0::DOUBLE, 0.0::REAL), ('Infinity'::DOUBLE, 'Infinity'::REAL), "
+      "('-Infinity'::DOUBLE, '-Infinity'::REAL), (NULL, NULL), (1.5, 1.5), (3.5, 3.5);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(DistinctSetOperationFloatFixture,
+                 "gpu_execution distinct set operations match floating key equality",
+                 "[integration][gpu_execution][set_operation][setop_float]")
+{
+  std::string const column  = GENERATE("d", "f");
+  std::string const keyword = GENERATE("EXCEPT", "INTERSECT");
+  INFO(column << " " << keyword);
+  auto compare = [&](std::string const& left, std::string const& right) {
+    auto const sql =
+      "SELECT " + column + " FROM " + left + " " + keyword + " SELECT " + column + " FROM " + right;
+    compare_gpu_vs_cpu_canonical(sql);
+    compare_gpu_vs_cpu("SELECT count(*) FROM (" + sql + ") q");
+  };
+  compare("set_float_l", "set_float_r");
+  compare("set_float_r", "set_float_l");
+  // EXCEPT must retain one NaN here; the matching-arm case alone removes every left NaN.
+  compare("set_float_l", "set_float_no_nan");
+  compare("set_float_l", "set_float_r WHERE false");
 }
