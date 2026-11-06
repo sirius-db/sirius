@@ -17,7 +17,7 @@
 #include "op/window/whole_partition.hpp"
 
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/aggregate/wide_integer_sum.hpp"
+#include "op/window/aggregate_types.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -39,25 +39,8 @@
 #include <unordered_set>
 
 namespace sirius::op {
-namespace {
 
-// The type a `sum` over `input` accumulates in.
-cudf::data_type accumulator_type(cudf::data_type input)
-{
-  using cudf::type_id;
-  switch (input.id()) {
-    case type_id::INT8:
-    case type_id::INT16:
-    case type_id::INT32:
-    case type_id::INT64: return wide_integer_sum_type();
-    case type_id::DECIMAL32:
-    case type_id::DECIMAL64:
-    case type_id::DECIMAL128: return cudf::data_type{type_id::DECIMAL128, input.scale()};
-    case type_id::FLOAT32:
-    case type_id::FLOAT64: return cudf::data_type{type_id::FLOAT64};
-    default: throw std::invalid_argument("Unsupported whole-partition window argument type");
-  }
-}
+namespace {
 
 // An 8 to 32 bit integer has a magnitude of at most 2^31 and a column holds fewer than 2^31 rows,
 // so the sum of a partition fits INT64.
@@ -132,20 +115,6 @@ std::unique_ptr<Base> simple_aggregation(aggregate_id function)
       return cudf::make_count_aggregation<Base>(cudf::null_policy::INCLUDE);
     case aggregate_id::min: return cudf::make_min_aggregation<Base>();
     case aggregate_id::max: return cudf::make_max_aggregation<Base>();
-    default: throw std::invalid_argument("Unsupported whole-partition window function");
-  }
-}
-
-// The type of the result column of `agg` over an argument of type `input`.
-cudf::data_type result_type(whole_partition_aggregate const& agg, cudf::data_type input)
-{
-  switch (agg.function) {
-    case aggregate_id::sum: return accumulator_type(input);
-    case aggregate_id::avg: return cudf::data_type{cudf::type_id::FLOAT64};
-    case aggregate_id::count:
-    case aggregate_id::count_star: return cudf::data_type{cudf::type_id::INT64};
-    case aggregate_id::min:
-    case aggregate_id::max: return input;
     default: throw std::invalid_argument("Unsupported whole-partition window function");
   }
 }
@@ -278,7 +247,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   std::vector<std::size_t> argument_indices;
   for (auto const& agg : aggregates) {
     check_index(agg.argument_column);
-    (void)result_type(agg, input.column(agg.argument_column).type());
+    (void)window_result_type(agg.function, input.column(agg.argument_column).type());
     if (!uses_sum(agg.function)) {
       argument_indices.push_back(0);  // Assigned after the shared SUM/AVG requests below.
       continue;
@@ -297,7 +266,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   if (input.num_rows() == 0) {
     std::vector<std::unique_ptr<cudf::column>> empty;
     for (auto const& agg : aggregates) {
-      auto type = result_type(agg, input.column(agg.argument_column).type());
+      auto type = window_result_type(agg.function, input.column(agg.argument_column).type());
       empty.push_back(cudf::make_empty_column(type));
     }
     return std::make_unique<cudf::table>(std::move(empty));
@@ -309,7 +278,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   auto const in_place = sums_in_place(input, arguments, stream, mr);
   for (auto& arg : arguments) {
     auto values = input.column(arg.column);
-    auto type   = accumulator_type(values.type());
+    auto type   = window_sum_type(values.type());
     if (is_narrow_integer(values.type())) {
       type = cudf::data_type{cudf::type_id::INT64};
     } else if (in_place.contains(arg.column)) {
@@ -389,7 +358,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
         result.results.push_back(
           reduce_to_column(request.values,
                            *simple_aggregation<cudf::reduce_aggregation>(agg.function),
-                           result_type(agg, request.values.type()),
+                           window_result_type(agg.function, request.values.type()),
                            stream,
                            mr));
         if (request.aggregations.size() > 1) {
@@ -413,7 +382,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     auto& arg = arguments[i];
     arg.widened.reset();
     arg.sum = checked_sum(std::move(results[i].results[0]), stream, mr);
-    if (auto const target = accumulator_type(input.column(arg.column).type());
+    if (auto const target = window_sum_type(input.column(arg.column).type());
         arg.sum->type() != target) {
       arg.sum = cudf::cast(arg.sum->view(), target, stream, mr);
     }
@@ -424,19 +393,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
       std::any_of(aggregates.begin(), aggregates.end(), [&](auto const& aggregate) {
         return aggregate.argument_column == arg.column && aggregate.function == aggregate_id::sum;
       });
-    if (decimal_sum) {
-      constexpr auto limit = int128_pow10(38);
-      auto bounds          = cudf::minmax(arg.sum->view(), stream, mr);
-      for (auto const* bound : {bounds.first.get(), bounds.second.get()}) {
-        if (bound->is_valid(stream)) {
-          auto const value =
-            static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(*bound).value(stream);
-          if (value <= -limit || value >= limit) {
-            throw std::overflow_error("Whole-partition window sum exceeds DECIMAL(38)");
-          }
-        }
-      }
-    }
+    if (decimal_sum) { check_decimal_sum_fits(arg.sum->view(), stream, mr); }
     if (arg.needs_avg) {
       auto sum   = cudf::cast(arg.sum->view(), f64, stream, mr);
       auto count = cudf::cast(results[i].results[1]->view(), f64, stream, mr);
@@ -480,8 +437,8 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
         nan->set_valid_async(true, stream);
         value = cudf::copy_if_else(*nan, value->view(), replace->view(), stream, mr);
       }
-      auto const type =
-        result_type(aggregates[i], input.column(aggregates[i].argument_column).type());
+      auto const type = window_result_type(aggregates[i].function,
+                                           input.column(aggregates[i].argument_column).type());
       if (value->type() != type) { value = cudf::cast(value->view(), type, stream, mr); }
       output.push_back(value->view());
       continue;
