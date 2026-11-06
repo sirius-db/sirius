@@ -590,9 +590,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::vector<per_partition_build_state> _partition_build_states;
 
   /// BUILD_PROBE probe of a partition built from several chunks. A probe row of a MARK/SEMI/ANTI
-  /// join matches when any chunk holds its key: the per-chunk matches are OR'ed into one mask, so
-  /// SEMI emits each row once and ANTI only rows no chunk matches. INNER emits one batch per
-  /// chunk's join; the chunks' build rows are disjoint.
+  /// join matches when any chunk holds its key: the chunks' matching rows are merged into one
+  /// scatter map, so SEMI emits each row once and ANTI only rows no chunk matches. INNER emits one
+  /// batch per chunk's join; the chunks' build rows are disjoint.
   std::unique_ptr<operator_data> probe_chunked_build(
     per_partition_build_state const& slot,
     ::cucascade::read_only_data_batch const& probe_batch,

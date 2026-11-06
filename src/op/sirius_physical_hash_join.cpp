@@ -17,7 +17,6 @@
 #include "op/sirius_physical_hash_join.hpp"
 
 #include "cudf/copying.hpp"
-#include "cudf/filling.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
@@ -29,7 +28,6 @@
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
-#include "cudf/unary.hpp"
 #include "cudf/utilities/error.hpp"
 #include "cudf/utilities/memory_resource.hpp"
 #include "data/data_batch_utils.hpp"
@@ -1947,46 +1945,32 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::probe_chunked_build(
                              " join cannot probe a chunked build");
   }
 
-  // OR each chunk's matches into one BOOL8 mask over the probe rows.
-  auto const num_rows = probe_keys.num_rows();
-  cudf::numeric_scalar<bool> false_scalar(false, true, stream);
-  cudf::numeric_scalar<bool> true_scalar(true, true, stream);
-  auto matched = cudf::make_column_from_scalar(false_scalar, num_rows, stream);
+  // Merge every chunk's matching probe rows into one scatter map. A row matched by several chunks
+  // appears once per chunk; each scatter writes the same value there, so duplicates are harmless.
+  std::vector<std::unique_ptr<rmm::device_uvector<cudf::size_type>>> chunk_matches;
+  std::size_t total_matches = 0;
   for (auto const& chunk : slot.chunks) {
-    auto const chunk_matches = chunk.filtered_table->semi_join(probe_keys, stream);
-    if (chunk_matches->size() == 0) { continue; }
-    cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
-                                  static_cast<cudf::size_type>(chunk_matches->size()),
-                                  chunk_matches->data(),
-                                  nullptr,
-                                  0,
-                                  0,
-                                  {});
-    auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(true_scalar))},
-                                   scatter_map,
-                                   cudf::table_view({matched->view()}),
-                                   stream);
-    matched        = std::move(scattered->release()[0]);
+    auto matches = chunk.filtered_table->semi_join(probe_keys, stream);
+    if (matches->is_empty()) { continue; }
+    total_matches += matches->size();
+    chunk_matches.push_back(std::move(matches));
   }
-  if (join_type == duckdb::JoinType::ANTI) {
-    matched = cudf::unary_operation(matched->view(), cudf::unary_operator::NOT, stream);
+  auto matches = std::make_unique<rmm::device_uvector<cudf::size_type>>(0, stream);
+  if (chunk_matches.size() == 1) {
+    matches = std::move(chunk_matches.front());
+  } else if (chunk_matches.size() > 1) {
+    matches->resize(total_matches, stream);
+    std::size_t offset = 0;
+    for (auto const& part : chunk_matches) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(matches->data() + offset,
+                                    part->data(),
+                                    part->size() * sizeof(cudf::size_type),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.get()));
+      offset += part->size();
+    }
   }
-
-  // The selected row ids, in probe order: matched rows for MARK/SEMI, unmatched rows for ANTI.
-  auto row_ids =
-    cudf::sequence(num_rows, cudf::numeric_scalar<cudf::size_type>(0, true, stream), stream);
-  auto selected =
-    cudf::apply_boolean_mask(cudf::table_view({row_ids->view()}), matched->view(), stream);
-  auto const selected_ids = selected->get_column(0).view();
-  auto indices =
-    std::make_unique<rmm::device_uvector<cudf::size_type>>(selected_ids.size(), stream);
-  if (!indices->is_empty()) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(indices->data(),
-                                  selected_ids.data<cudf::size_type>(),
-                                  indices->size() * sizeof(cudf::size_type),
-                                  cudaMemcpyDeviceToDevice,
-                                  stream.get()));
-  }
+  chunk_matches.clear();
 
   if (join_type == duckdb::JoinType::MARK) {
     bool const build_empty =
@@ -1995,7 +1979,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::probe_chunked_build(
       });
     auto const nulls =
       resolve_mark_null_state(_build_has_null.load(std::memory_order_acquire) > 0, build_empty);
-    return resolve_mark_join_result(*indices,
+    return resolve_mark_join_result(*matches,
                                     left_full,
                                     lhs_output_columns.col_idxs,
                                     probe_keys,
@@ -2005,16 +1989,27 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::probe_chunked_build(
                                     stream,
                                     batch_telemetry());
   }
-  return gather_join_output(join_type,
-                            left_full,
-                            cudf::table_view{},
-                            lhs_output_columns.col_idxs,
-                            rhs_output_columns.col_idxs,
-                            std::move(indices),
-                            nullptr,
-                            memory_space,
-                            stream,
-                            batch_telemetry());
+
+  // SEMI keeps the matched probe rows and ANTI the rest, in probe order.
+  bool const keep_matched = join_type == duckdb::JoinType::SEMI;
+  cudf::numeric_scalar<bool> keep_unmatched_scalar(!keep_matched, true, stream);
+  auto keep = cudf::make_column_from_scalar(keep_unmatched_scalar, probe_keys.num_rows(), stream);
+  if (!matches->is_empty()) {
+    cudf::numeric_scalar<bool> keep_matched_scalar(keep_matched, true, stream);
+    auto scattered =
+      cudf::scatter({std::ref(static_cast<cudf::scalar const&>(keep_matched_scalar))},
+                    as_gather_map(*matches),
+                    cudf::table_view({keep->view()}),
+                    stream);
+    keep = std::move(scattered->release()[0]);
+  }
+  matches.reset();
+  auto output =
+    cudf::apply_boolean_mask(left_full.select(lhs_output_columns.col_idxs), keep->view(), stream);
+  keep.reset();
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output), memory_space, stream, batch_telemetry())});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
