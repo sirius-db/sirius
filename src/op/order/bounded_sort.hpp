@@ -31,12 +31,12 @@ namespace sirius::op {
 // Cold start: merge output and owning copies coexist (2x); key search, merge
 // scratch, promoted string offsets and allocation rounding get another 4x.
 // This is a starting estimate, not a permanent floor over observed history.
-inline constexpr std::size_t bounded_merge_workspace_base  = 64 * 1024;
-inline constexpr std::size_t bounded_merge_workspace_scale = 6;
-inline std::size_t bounded_merge_workspace(std::size_t input_bytes)
+inline constexpr std::size_t merge_cold_estimate_base  = 64 * 1024;
+inline constexpr std::size_t merge_cold_estimate_scale = 6;
+inline std::size_t merge_cold_peak_estimate(std::size_t input_bytes)
 {
-  return memory::saturating_add(memory::saturating_mul(input_bytes, bounded_merge_workspace_scale),
-                                bounded_merge_workspace_base);
+  return memory::saturating_add(memory::saturating_mul(input_bytes, merge_cold_estimate_scale),
+                                merge_cold_estimate_base);
 }
 
 // Native row arithmetic is independent of device allocation. Logical row

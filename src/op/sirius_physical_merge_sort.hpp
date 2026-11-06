@@ -69,7 +69,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   // used by compute OOM. The returned empty task input commits through the
   // ordinary sink/completion path. nullptr permits reservation-growth retry.
   std::unique_ptr<operator_data> on_preparation_oom(const operator_data& input);
-  void note_task_reservation(operator_data& input, std::size_t bytes);
+  void note_task_reservation(operator_data& input, std::size_t bytes, std::size_t ceiling);
   bool declared_output_schema_is_runtime_schema() const noexcept override
   {
     // Intermediate bounded steps retain hidden keys until final publication.

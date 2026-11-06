@@ -712,7 +712,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   }
   if (source_op && source_op->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
     source_op->Cast<op::sirius_physical_merge_sort>().note_task_reservation(
-      *local_state._input_data, reservation_bytes);
+      *local_state._input_data, reservation_bytes, requested_memory_space->get_max_memory());
   }
 
   auto executor_thread_resource_id = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()};

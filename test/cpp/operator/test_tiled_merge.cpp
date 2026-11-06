@@ -251,7 +251,7 @@ TEST_CASE("preparation subdivision commits only through ordinary publication", "
   f.add({2, 4, 6});
   auto data = f.merge.get_next_task_input_data();
   REQUIRE(data);
-  f.merge.note_task_reservation(*data, f.merge.reservation_limit);
+  f.merge.note_task_reservation(*data, f.merge.reservation_limit, f.merge.reservation_limit);
   auto replacement = f.merge.on_preparation_oom(*data);
   REQUIRE(replacement);
   CHECK(f.input->total_size() == 2);
@@ -337,7 +337,8 @@ TEST_CASE("tiled final projection removes hidden keys after positioned merge", "
   CHECK(f.rows() == std::vector<int64_t>{10, 20, 30, 40, 50, 60});
 }
 
-TEST_CASE("oversized variable-width tiles subdivide under actual strict admission", "[tiled_merge]")
+TEST_CASE("variable-width tiled output conserves payloads under reservation admission",
+          "[tiled_merge]")
 {
   memory_manager_options options;
   options.gpu_bytes                = 512 * 1024;
@@ -373,7 +374,7 @@ TEST_CASE("oversized variable-width tiles subdivide under actual strict admissio
   for (auto const& log : logs.records()) {
     subdivisions += log.message.find("sort.tile_refine") != std::string::npos;
   }
-  CHECK(subdivisions > 0);
+  CHECK(subdivisions == 0);
   std::size_t payload_rows = 0, large_rows = 0;
   for (auto position : f.output.get_positions()) {
     pipelineable_operator_data restored({f.output.get_data_batch_by_position(position)});
@@ -602,4 +603,39 @@ TEST_CASE("tiled sample and extraction work restores backing across GPUs",
     CHECK(repo->all_empty());
   }
   CHECK(f.rows() == std::vector<int64_t>{1, 2, 4, 5, 7, 8});
+}
+
+TEST_CASE("cold estimates do not refuse fitting order or coalescing tasks", "[tiled_merge]")
+{
+  auto chunk = GENERATE(512, 1024);
+  memory_manager_options options;
+  options.gpu_bytes                = 512 * 1024;
+  options.gpu_reservation_fraction = 0.0625;  // 32 KiB: below even the cold estimate's base
+  tiled_fixture f(1, options);
+  f.merge.chunk_bytes = chunk;
+  // A planner default larger than the selected GPU must not prevent exhausted recovery.
+  f.merge.reservation_limit = std::numeric_limits<std::size_t>::max();
+  auto* tracker =
+    f.gpu->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  tracker->set_default_policy(std::make_unique<cucascade::memory::fail_reservation_limit_policy>());
+  std::vector<int64_t> left(64), right(64), expected(128);
+  for (int i = 0; i < 64; ++i) {
+    left[i]  = 2 * i;
+    right[i] = 2 * i + 1;
+  }
+  std::iota(expected.begin(), expected.end(), 0);
+  f.add(left);
+  f.add(right);
+  sirius::test::scoped_recording_log_sink logs("trace");
+  f.drain();
+  CHECK(f.rows() == expected);
+  std::size_t orders = 0, coalesces = 0, refinements = 0;
+  for (auto const& log : logs.records()) {
+    orders += log.message.find("sort.tile_work kind=order_samples") != std::string::npos;
+    coalesces += log.message.find("sort.tile_work kind=coalesce") != std::string::npos;
+    refinements += log.message.find("sort.tile_refine") != std::string::npos;
+  }
+  CHECK(orders == (chunk == 512 ? 1 : 0));
+  CHECK(coalesces == (chunk == 1024 ? 1 : 0));
+  CHECK(refinements == 0);
 }

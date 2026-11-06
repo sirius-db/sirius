@@ -130,7 +130,7 @@ struct sirius_physical_merge_sort::tiled_state {
     std::vector<record> records;
     std::vector<record> spans;
     uint64_t splitter_count{0};
-    std::size_t admitted_bytes{0};
+    std::size_t admitted_bytes{0}, attempt_ceiling{0};
     bool split{false};
     task_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
               std::shared_ptr<work> item,
@@ -144,9 +144,10 @@ struct sirius_physical_merge_sort::tiled_state {
       auto result     = std::make_unique<task_data>(std::move(batches), item, get_position());
       result->records = records;
       result->spans   = spans;
-      result->splitter_count = splitter_count;
-      result->admitted_bytes = admitted_bytes;
-      result->split          = split;
+      result->splitter_count  = splitter_count;
+      result->admitted_bytes  = admitted_bytes;
+      result->attempt_ceiling = attempt_ceiling;
+      result->split           = split;
       result->adopt_row_identity(*this);
       return result;
     }
@@ -264,14 +265,6 @@ struct sirius_physical_merge_sort::tiled_state {
       g->output = g->inputs.front();
       return;
     }
-    uint64_t bytes = 0;
-    for (auto const& input : g->inputs) {
-      bytes = sm::checked_add(bytes, input.bytes);
-    }
-    if (bounded_merge_workspace(bytes) > op.reservation_limit) {
-      split_group(op, r, g);
-      return;
-    }
     auto item         = add(r, kind::COALESCE, g->inputs);
     item->coalescing  = g;
     item->destination = allocate(op, INPUTS);
@@ -370,12 +363,7 @@ struct sirius_physical_merge_sort::tiled_state {
           return;
         }
         auto average = bytes ? 1 + (bytes - 1) / rows : uint64_t{1};
-        auto budget =
-          op.reservation_limit > bounded_merge_workspace_base
-            ? (op.reservation_limit - bounded_merge_workspace_base) / bounded_merge_workspace_scale
-            : uint64_t{1};
-        auto target  = std::max(uint64_t{1}, std::min<uint64_t>(op.chunk_bytes, budget));
-        r->row_limit = std::min(native_rows, std::max(uint64_t{1}, target / average));
+        r->row_limit = std::min(native_rows, std::max(uint64_t{1}, op.chunk_bytes / average));
         if (r->requested_row_limit) {
           r->row_limit = std::min(r->row_limit, r->requested_row_limit);
         }
@@ -407,15 +395,14 @@ struct sirius_physical_merge_sort::tiled_state {
       } else if (r->stage == phase::SAMPLE) {
         r->items.clear();
         std::vector<ref> samples;
-        uint64_t bytes = 0, rows = 0;
+        uint64_t rows = 0;
         for (auto const& input : r->samples) {
           if (!input) { continue; }
           samples.push_back(*input);
-          rows  = sm::checked_add(rows, input->rows);
-          bytes = sm::checked_add(bytes, input->bytes);
+          rows = sm::checked_add(rows, input->rows);
         }
-        if (rows > native_rows || bounded_merge_workspace(bytes) > op.reservation_limit) {
-          throw invalid_input_exception("Sort sample working set exceeds admitted envelope");
+        if (rows > native_rows) {
+          throw invalid_input_exception("Sort sample row count exceeds the native table limit");
         }
         auto item             = add(r, kind::ORDER, std::move(samples));
         item->destination     = allocate(op, SPLITTERS);
@@ -487,16 +474,8 @@ struct sirius_physical_merge_sort::tiled_state {
           auto& tile = r->tiles[t];
           if (!tile.rows) { continue; }
           std::vector<ref> sources;
-          uint64_t bytes = 0;
           for (auto const& piece : tile.pieces) {
             sources.push_back(piece.batch);
-            bytes = sm::checked_add(bytes, piece.batch.bytes);
-          }
-          // Observe actual owning piece backing before any multi-input restore.
-          // Single-piece ownership forwarding needs no n-ary merge workspace.
-          if (sources.size() > 1 && bounded_merge_workspace(bytes) > op.reservation_limit) {
-            refine(op, r, t);
-            continue;
           }
           auto item         = add(r, kind::MERGE, std::move(sources));
           item->tile_index  = t;
@@ -520,8 +499,8 @@ std::size_t sirius_physical_merge_sort::no_history_peak_memory_estimate(
   input_stats const& stats) const
 {
   return stats.num_batches == 1 ? memory::saturating_add(memory::saturating_mul(stats.bytes, 2),
-                                                         bounded_merge_workspace_base)
-                                : bounded_merge_workspace(stats.bytes);
+                                                         merge_cold_estimate_base)
+                                : merge_cold_peak_estimate(stats.bytes);
 }
 
 void sirius_physical_merge_sort::register_scratch(
@@ -783,7 +762,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     cudaStreamSynchronize(stream.get());
     // Let ordinary retries grow an underestimated reservation first. Once the
     // configured capacity is granted, only subdivision or a normal error remains.
-    if (input.admitted_bytes && input.admitted_bytes < reservation_limit) { throw; }
+    if (input.admitted_bytes && input.admitted_bytes < input.attempt_ceiling) { throw; }
     // No sink has been entered. Smaller disjoint work can be committed by the
     // ordinary success callback; partial sink publication can never reach here.
     if (item.type == state::kind::PUBLISH || item.type == state::kind::ORDER ||
@@ -832,7 +811,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::on_preparation_oom(
   operator_data const& input)
 {
   auto const& data = dynamic_cast<tiled_state::task_data const&>(input);
-  if (data.admitted_bytes && data.admitted_bytes < reservation_limit) { return nullptr; }
+  if (data.admitted_bytes && data.admitted_bytes < data.attempt_ceiling) { return nullptr; }
   auto const& item = *data.item;
   using kind       = tiled_state::kind;
   if (item.type == kind::SAMPLE || item.type == kind::ORDER || item.type == kind::PUBLISH ||
@@ -847,9 +826,13 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::on_preparation_oom(
   return output;
 }
 
-void sirius_physical_merge_sort::note_task_reservation(operator_data& input, std::size_t bytes)
+void sirius_physical_merge_sort::note_task_reservation(operator_data& input,
+                                                       std::size_t bytes,
+                                                       std::size_t ceiling)
 {
-  dynamic_cast<tiled_state::task_data&>(input).admitted_bytes = bytes;
+  auto& data           = dynamic_cast<tiled_state::task_data&>(input);
+  data.admitted_bytes  = bytes;
+  data.attempt_ceiling = ceiling;
 }
 
 void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::stream_ref stream)
