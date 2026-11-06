@@ -37,6 +37,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -1102,6 +1103,46 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     has_anti = has_anti || type == duckdb::JoinType::ANTI || type == duckdb::JoinType::RIGHT_ANTI;
   }
   CHECK(has_anti);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a join above a delim CTE publishes to scans in the CTE body",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][cte_body]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  // TPC-H Q20 shape: the outer `parts` join sits above the CTE node that holds the correlated
+  // subquery's outer rows.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pname = 'p1' AND p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p2') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  std::size_t joins_above_cte = 0;
+  std::size_t body_scan_routes = 0;
+  for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
+    auto& join = node->Cast<sirius::op::sirius_physical_hash_join>();
+    REQUIRE(join.children.size() == 2);
+    if (find_first(join.children[0].get(), SiriusPhysicalOperatorType::CTE) == nullptr) {
+      continue;
+    }
+    ++joins_above_cte;
+    for (auto const& target : join.dynamic_filter_plan().probe_targets()) {
+      if (target.route_class == sirius::op::dynamic_filter_route_class::scan) {
+        ++body_scan_routes;
+      }
+    }
+  }
+  REQUIRE(joins_above_cte > 0);
+  CHECK(body_scan_routes > 0);
   require_parent_links(plan.get(), /*expected_parent=*/nullptr);
 }
 
