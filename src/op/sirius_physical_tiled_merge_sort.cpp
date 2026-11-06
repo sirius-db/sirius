@@ -144,6 +144,7 @@ struct sirius_physical_merge_sort::tiled_state {
       : pipelineable_operator_data(std::move(batches), position), item(std::move(item))
     {
     }
+    bool is_control_only() const noexcept override { return action != recovery::NONE; }
     std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
       std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
     {
@@ -850,11 +851,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   return output;
 }
 
-std::unique_ptr<operator_data> sirius_physical_merge_sort::on_preparation_oom(
-  operator_data const& input)
+std::unique_ptr<operator_data> sirius_physical_merge_sort::recover_preparation_failure(
+  operator_data const& input, task_attempt_context attempt)
 {
   auto const& data = dynamic_cast<tiled_state::task_data const&>(input);
-  if (data.admitted_bytes && data.admitted_bytes < data.attempt_ceiling) { return nullptr; }
+  if (attempt.granted_bytes < attempt.effective_ceiling) { return nullptr; }
   auto const& item = *data.item;
   using kind       = tiled_state::kind;
   if (item.type != kind::COALESCE && item.type != kind::MERGE) {
@@ -868,13 +869,12 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::on_preparation_oom(
   return output;
 }
 
-void sirius_physical_merge_sort::note_task_reservation(operator_data& input,
-                                                       std::size_t bytes,
-                                                       std::size_t ceiling)
+void sirius_physical_merge_sort::notify_task_attempt(operator_data& input,
+                                                     task_attempt_context attempt)
 {
   auto& data           = dynamic_cast<tiled_state::task_data&>(input);
-  data.admitted_bytes  = bytes;
-  data.attempt_ceiling = ceiling;
+  data.admitted_bytes  = attempt.granted_bytes;
+  data.attempt_ceiling = attempt.effective_ceiling;
 }
 
 void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::stream_ref stream)
@@ -896,6 +896,7 @@ void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::strea
 
 void sirius_physical_merge_sort::on_task_output_published(operator_data const& output)
 {
+  SIRIUS_LOG_TRACE("sort.task_wait site=publication_completion, host_waits=1");
   using state      = tiled_state;
   auto const& data = dynamic_cast<state::task_data const&>(output);
   std::lock_guard lock(_drain_mutex);

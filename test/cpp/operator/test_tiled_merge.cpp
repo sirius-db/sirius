@@ -47,6 +47,25 @@ class injected_merge : public sirius_physical_merge_sort {
   using sirius_physical_merge_sort::sirius_physical_merge_sort;
   bool fail_compute{false};
   std::function<void()> before_compute;
+  std::size_t attempts{0}, publications{0}, preparation_recoveries{0};
+  bool reject_completion{false};
+  void notify_task_attempt(operator_data& data, task_attempt_context attempt) override
+  {
+    ++attempts;
+    sirius_physical_merge_sort::notify_task_attempt(data, attempt);
+  }
+  std::unique_ptr<operator_data> recover_preparation_failure(operator_data const& data,
+                                                             task_attempt_context attempt) override
+  {
+    ++preparation_recoveries;
+    return sirius_physical_merge_sort::recover_preparation_failure(data, attempt);
+  }
+  void on_task_output_published(operator_data const& output) override
+  {
+    ++publications;
+    if (reject_completion) { throw std::runtime_error("injected completion callback failure"); }
+    sirius_physical_merge_sort::on_task_output_published(output);
+  }
   std::unique_ptr<operator_data> execute(operator_data const& input,
                                          ::cuda::stream_ref stream) override
   {
@@ -237,6 +256,8 @@ TEST_CASE("independent tiled merges publish ordered ranges after all leaves fini
   std::vector<int64_t> expected(18);
   std::iota(expected.begin(), expected.end(), 1);
   CHECK(f.rows() == expected);
+  CHECK(f.merge.attempts == f.task_id);
+  CHECK(f.merge.publications == f.task_id);
 }
 
 TEST_CASE("tiled merge handles empty and single-contribution inputs", "[tiled_merge]")
@@ -258,8 +279,9 @@ TEST_CASE("preparation subdivision commits only through ordinary publication", "
   f.add({2, 4, 6});
   auto data = f.merge.get_next_task_input_data();
   REQUIRE(data);
-  f.merge.note_task_reservation(*data, f.merge.reservation_limit, f.merge.reservation_limit);
-  auto replacement = f.merge.on_preparation_oom(*data);
+  f.merge.notify_task_attempt(*data, {f.merge.reservation_limit, f.merge.reservation_limit});
+  auto replacement = f.merge.recover_preparation_failure(
+    *data, {f.merge.reservation_limit, f.merge.reservation_limit});
   REQUIRE(replacement);
   CHECK(f.input->total_size() == 2);
   data.reset();
@@ -852,7 +874,12 @@ TEST_CASE("preparation recovery reduces coalescing sources and refines merge per
     spill_tiled_inputs(f);
     auto task        = f.task(std::move(data), nullptr, true);
     fault->fail_when = [first = sources.front()] { return first->get_read_only_count() > 0; };
+    auto before      = f.global->get_memory_history().totals();
     task->execute(f.stream);
+    auto after = f.global->get_memory_history().totals();
+    CHECK(after.output_records == before.output_records);
+    CHECK(after.ratio_records == before.ratio_records);
+    CHECK(f.global->get_memory_history().size() > 0);
     fault->fail_when = {};
     task.reset();
     for (auto const& source : sources) {
@@ -891,7 +918,11 @@ TEST_CASE("compute failures split copied output while search failures stop expli
     CHECK_THROWS_WITH(task->execute(f.stream),
                       Catch::Matchers::ContainsSubstring("cut search failed"));
   } else {
+    auto before = f.global->get_memory_history().totals();
     task->execute(f.stream);
+    auto after = f.global->get_memory_history().totals();
+    CHECK(after.output_records == before.output_records);
+    CHECK(after.ratio_records == before.ratio_records);
   }
   fault->remaining       = -1;
   f.merge.before_compute = {};
@@ -961,4 +992,22 @@ TEST_CASE("extraction allocation sweep recovers owning spans and partial local c
   CHECK(search_errors > 0);
   CHECK(recovered_spans > 0);
   CHECK(partial_copies > 0);
+}
+
+TEST_CASE("publication callback failure is fatal after one sink publication", "[tiled_merge]")
+{
+  tiled_fixture f;
+  f.add({1, 2, 3});
+  auto data                 = reach_work(f, "publish");
+  auto before               = f.merge.publications;
+  auto task                 = f.task(std::move(data));
+  f.merge.reject_completion = true;
+  CHECK_THROWS_WITH(task->execute(f.stream),
+                    Catch::Matchers::ContainsSubstring("completion callback failure"));
+  task.reset();
+  CHECK(f.merge.publications == before + 1);
+  CHECK(f.output.total_size() == 1);
+  CHECK(f.repo("sort_tile_results")->total_size() == 1);
+  CHECK_FALSE(f.merge.get_next_task_input_data());
+  CHECK_FALSE(f.merge.all_ports_empty());
 }

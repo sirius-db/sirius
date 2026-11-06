@@ -64,12 +64,13 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   std::optional<task_creation_hint> get_next_task_hint() override;
   void sink(const operator_data& output, ::cuda::stream_ref stream) override;
   // gpu_pipeline_task calls this only after successful sink publication and stream completion.
-  void on_task_output_published(const operator_data& output);
+  void on_task_output_published(const operator_data& output) override;
   // Before publication, preparation can request the same finite subdivision
   // used by compute OOM. The returned empty task input commits through the
   // ordinary sink/completion path. nullptr permits reservation-growth retry.
-  std::unique_ptr<operator_data> on_preparation_oom(const operator_data& input);
-  void note_task_reservation(operator_data& input, std::size_t bytes, std::size_t ceiling);
+  std::unique_ptr<operator_data> recover_preparation_failure(const operator_data& input,
+                                                             task_attempt_context attempt) override;
+  void notify_task_attempt(operator_data& input, task_attempt_context attempt) override;
   bool declared_output_schema_is_runtime_schema() const noexcept override
   {
     // Intermediate bounded steps retain hidden keys until final publication.
