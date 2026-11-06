@@ -745,10 +745,19 @@ and batch arrays.
 
 
 
-The task creator claims operator-local work under a mutex from pending queues. Completion
-counts cover outstanding work, ranges and final publications; only actionable
-regions enter the ready queue. Completed descriptors leave the work queue when claimed;
-tasks retain them through retries. Scheduling order does not assign result positions.
+Each range holds one stage in a concrete variant: normalization, coalescing, sampling,
+splitter selection, extraction, merge or completion. Each active stage owns its pending
+queue, outstanding task count and partial results. Typed stage transitions transfer only
+the handles and parameters needed next; normalization's planned repeated splitting stays
+within normalization, and coalescing runs once.
+
+The task creator claims work under a mutex from the ready-range queue. A membership guard
+prevents duplicate entries, and completion wakes only its own range. A stage advances only
+when its pending queue is empty and its outstanding count is zero. Zero-work stages advance
+synchronously. Claimed requests remain task-owned through retries; completed requests are
+not retained to reconstruct progress. Tile ordinals determine result order regardless of
+completion order. Once every range completes, the coordinator assigns scalar positions in
+range/tile order and enters the existing final-publication barrier.
 
 Preparation/compute retries do not advance shared progress. Defaulted physical-operator
 lifecycle hooks receive each attempt's granted reservation and attainable device ceiling,

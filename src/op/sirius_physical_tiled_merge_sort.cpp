@@ -44,13 +44,8 @@ template <typename Work>
 struct tiled_merge_work_queue {
   std::deque<std::shared_ptr<Work>> pending;
   std::size_t outstanding{0};
-  std::size_t inspections{0};
 
-  void add(std::shared_ptr<Work> item)
-  {
-    pending.push_back(std::move(item));
-    ++outstanding;
-  }
+  void add(std::shared_ptr<Work> item) { pending.push_back(std::move(item)); }
   // Prepare task-owned metadata before committing the claim. Allocation failure
   // leaves both the pending item and its outstanding count intact.
   template <typename Prepare>
@@ -60,7 +55,7 @@ struct tiled_merge_work_queue {
     if (pending.empty()) { return result_type{}; }
     auto result = std::forward<Prepare>(prepare)(pending.front());
     pending.pop_front();
-    ++inspections;
+    ++outstanding;
     return result;
   }
   void complete()
@@ -68,7 +63,7 @@ struct tiled_merge_work_queue {
     if (!outstanding) { throw std::logic_error("Sort work count underflow"); }
     --outstanding;
   }
-  bool complete_stage() const { return outstanding == 0; }
+  bool complete_stage() const { return pending.empty() && outstanding == 0; }
 };
 }  // namespace
 
@@ -76,7 +71,6 @@ struct tiled_merge_work_queue {
 // registered repositories; these descriptors contain locations and host metadata.
 struct sirius_physical_merge_sort::tiled_state {
   enum storage { INPUTS, SAMPLES, SPLITTERS, PIECES, RESULTS, STORAGE_COUNT };
-  enum class phase { NORMALIZE, COALESCE, SAMPLE, ORDER, EXTRACT, TILES, MERGING, DONE };
   enum class kind { NORMALIZE, COALESCE, SAMPLE, ORDER, EXTRACT, MERGE, PUBLISH };
   enum class status { PENDING, CLAIMED, COMPLETE };
   static char const* name(kind type)
@@ -176,7 +170,7 @@ struct sirius_physical_merge_sort::tiled_state {
     std::size_t input;
     uint64_t begin, end;
   };
-  struct region;
+  struct range_state;
   struct tile {
     std::size_t partition;
     std::vector<piece> pieces;
@@ -186,23 +180,8 @@ struct sirius_physical_merge_sort::tiled_state {
   struct request;
   struct work {
     status state{status::PENDING};
-    std::weak_ptr<region> owner;
+    std::weak_ptr<range_state> owner;
     std::shared_ptr<const request> execution;
-  };
-  struct region {
-    phase stage{phase::NORMALIZE};
-    std::vector<ref> inputs;
-    tiled_merge_work_queue<work> work_items;
-    bool enqueued{false};
-    std::vector<std::vector<std::pair<uint64_t, ref>>> normalized;
-    std::vector<std::shared_ptr<group>> groups;
-    std::vector<std::optional<ref>> samples;
-    std::vector<ref> pages;
-    std::vector<tile> tiles;
-    std::size_t creator_visits{0};
-    sm::parameters sampling{};
-    uint64_t row_limit{0}, splitter_count{0}, coalescing_inputs{0};
-    std::size_t sample_partition{0};
   };
   // Immutable worker payloads, separate from coordinator bookkeeping.
   struct normalize_request {
@@ -300,6 +279,124 @@ struct sirius_physical_merge_sort::tiled_state {
                               merge_result,
                               publish_result>;
 
+  struct stage_work {
+    tiled_merge_work_queue<work> queue;
+  };
+  struct normalize_stage : stage_work {
+    std::vector<ref> inputs;
+    std::vector<std::vector<std::pair<uint64_t, ref>>> normalized;
+    void accept(normalize_result const& value, request const& task)
+    {
+      normalized.at(std::get<normalize_request>(task.op).input)
+        .push_back({value.begin, value.output.describe()});
+    }
+  };
+  struct coalesce_stage : stage_work {
+    std::vector<group> groups;
+    std::size_t input_count{0};
+    void accept(coalesce_result const& value, request const& task)
+    {
+      groups.at(std::get<coalesce_request>(task.op).group_index).output =
+        storage_access::commit_replacement(
+          task.sources, value.output.destination, *value.output.batch);
+    }
+  };
+  struct sample_stage : stage_work {
+    std::vector<ref> inputs;
+    uint64_t row_limit;
+    sm::parameters sampling;
+    std::vector<std::optional<ref>> samples;
+    void accept(sample_result const& value, request const& task)
+    {
+      samples.at(std::get<sample_request>(task.op).input) = value.output.describe();
+    }
+  };
+  struct order_stage : stage_work {
+    std::vector<ref> inputs, samples, pages;
+    uint64_t row_limit, splitter_count{0};
+    void accept(order_result const& value, request const&)
+    {
+      for (auto const& page : value.pages) {
+        pages.push_back(page.describe());
+      }
+      splitter_count = value.splitter_count;
+    }
+  };
+  struct extract_stage : stage_work {
+    std::vector<ref> inputs, pages;
+    std::vector<tile> tiles;
+    uint64_t row_limit;
+    void accept(extract_result const& value, request const& task)
+    {
+      for (auto const& piece : value.pieces) {
+        tiles.at(piece.tile_index)
+          .pieces.push_back({piece.output.describe(),
+                             std::get<extract_request>(task.op).input,
+                             piece.begin,
+                             piece.end});
+      }
+    }
+  };
+  struct merge_stage : stage_work {
+    std::vector<tile> tiles;
+    void accept(merge_result const& value, request const& task)
+    {
+      auto& tile  = tiles.at(std::get<merge_request>(task.op).tile_index);
+      tile.result = storage_access::commit_replacement(
+        task.sources, value.output.destination, *value.output.batch);
+      tile.pieces.clear();
+    }
+  };
+  struct done_stage {
+    std::vector<ref> results;
+    void accept(publish_result const&, request const&) {}
+  };
+  using active_stage = std::variant<normalize_stage,
+                                    coalesce_stage,
+                                    sample_stage,
+                                    order_stage,
+                                    extract_stage,
+                                    merge_stage,
+                                    done_stage>;
+  struct range_state {
+    active_stage stage{normalize_stage{}};
+    bool enqueued{false};
+    std::size_t creator_visits{0}, claims{0};
+    auto* queue()
+    {
+      return std::visit(
+        [](auto& value) -> tiled_merge_work_queue<work>* {
+          if constexpr (std::is_same_v<std::decay_t<decltype(value)>, done_stage>) {
+            return nullptr;
+          } else {
+            return &value.queue;
+          }
+        },
+        stage);
+    }
+    bool actionable()
+    {
+      auto* work = queue();
+      return work && (!work->pending.empty() || work->complete_stage());
+    }
+    void accept(result const& output, request const& task)
+    {
+      std::visit(
+        [&](auto& active) {
+          std::visit(
+            [&](auto const& value) {
+              if constexpr (requires { active.accept(value, task); }) {
+                active.accept(value, task);
+              } else {
+                throw internal_exception("Sort result does not match active stage");
+              }
+            },
+            output);
+        },
+        stage);
+    }
+  };
+
   // The adapter derives its runtime batch list from these paired results.
   template <typename Result, typename Visit>
   static void visit_batches(Result& result, Visit&& visit)
@@ -387,45 +484,37 @@ struct sirius_physical_merge_sort::tiled_state {
       configured);
   }
 
-  std::vector<std::shared_ptr<region>> roots;
-  std::deque<std::shared_ptr<region>> ready_regions;
+  std::vector<std::shared_ptr<range_state>> ranges;
+  std::deque<std::shared_ptr<range_state>> ready_ranges;
   tiled_merge_work_queue<work> finals;
-  std::size_t unfinished_roots{0};
+  std::size_t unfinished_ranges{0};
   bool publishing{false}, finished{false};
   storage_access scratch;
   explicit tiled_state(std::vector<cucascade::shared_data_repository*> repositories)
     : scratch(std::move(repositories))
   {
   }
-  static bool complete(region const& r) { return r.work_items.complete_stage(); }
-  static bool actionable(region const& r)
+  void enqueue(std::shared_ptr<range_state> const& r)
   {
-    return r.stage != phase::DONE && (!r.work_items.pending.empty() || complete(r));
-  }
-  void enqueue(std::shared_ptr<region> const& r)
-  {
-    if (!r->enqueued && actionable(*r)) {
-      ready_regions.push_back(r);
+    if (!r->enqueued && r->actionable()) {
+      ready_ranges.push_back(r);
       r->enqueued = true;
     }
   }
   bool ready() const
   {
-    return !finished && (!ready_regions.empty() || (!unfinished_roots && !publishing) ||
+    return !finished && (!ready_ranges.empty() || (!unfinished_ranges && !publishing) ||
                          !finals.pending.empty());
   }
-  void finish(std::shared_ptr<region> const& r)
+  void finish(std::shared_ptr<range_state> const& r, std::vector<ref> results)
   {
-    if (r->stage == phase::DONE) { throw internal_exception("Sort region completed twice"); }
-    SIRIUS_LOG_DEBUG("sort.tile_schedule claims={}, region_visits={}",
-                     r->work_items.inspections,
-                     r->creator_visits);
-    r->stage = phase::DONE;
-    if (!unfinished_roots) { throw internal_exception("Sort root count underflow"); }
-    --unfinished_roots;
+    SIRIUS_LOG_DEBUG("sort.tile_schedule claims={}, range_visits={}", r->claims, r->creator_visits);
+    r->stage = done_stage{std::move(results)};
+    if (!unfinished_ranges) { throw internal_exception("Sort range count underflow"); }
+    --unfinished_ranges;
   }
   static std::shared_ptr<work> make_work(sirius_physical_merge_sort const& op,
-                                         std::shared_ptr<region> const& r,
+                                         std::shared_ptr<range_state> const& r,
                                          std::vector<ref> sources,
                                          operation payload)
   {
@@ -435,219 +524,266 @@ struct sirius_physical_merge_sort::tiled_state {
       request{std::move(sources), op.comparison, std::move(payload)});
     return item;
   }
-  void flatten_results(sirius_physical_merge_sort const& op,
-                       std::shared_ptr<region> const& r,
-                       uint64_t& position)
+  void schedule_publication(sirius_physical_merge_sort const& op,
+                            std::shared_ptr<range_state> const& r,
+                            uint64_t& position)
   {
-    for (auto const& tile : r->tiles) {
-      if (!tile.result) { continue; }
+    for (auto const& result : std::get<done_stage>(r->stage).results) {
       finals.add(make_work(
         op,
         r,
-        {*tile.result},
+        {result},
         publish_request{{op._final_projections.begin(), op._final_projections.end()}, position}));
       position = sm::checked_add(position, 1);
     }
+    std::get<done_stage>(r->stage).results.clear();
   }
   void add(sirius_physical_merge_sort const& op,
-           std::shared_ptr<region> const& r,
+           std::shared_ptr<range_state> const& r,
            std::vector<ref> sources,
            operation payload)
   {
-    r->work_items.add(make_work(op, r, std::move(sources), std::move(payload)));
+    r->queue()->add(make_work(op, r, std::move(sources), std::move(payload)));
     enqueue(r);
   }
-  void coalesce(sirius_physical_merge_sort& op, std::shared_ptr<region> const& r, std::size_t index)
+  void start_merge(sirius_physical_merge_sort& op,
+                   std::shared_ptr<range_state> const& r,
+                   std::vector<tile> tiles)
   {
-    auto const& g = r->groups.at(index);
-    if (g->inputs.size() == 1) {
-      g->output = g->inputs.front();
+    merge_stage next;
+    next.tiles  = std::move(tiles);
+    r->stage    = std::move(next);
+    auto& stage = std::get<merge_stage>(r->stage);
+    for (std::size_t t = 0; t < stage.tiles.size(); ++t) {
+      auto const& tile = stage.tiles[t];
+      if (!tile.rows) { continue; }
+      std::vector<ref> sources;
+      for (auto const& piece : tile.pieces) {
+        sources.push_back(piece.batch);
+      }
+      add(op, r, std::move(sources), merge_request{scratch.allocate(RESULTS), t});
+    }
+  }
+
+  void finish_stage(normalize_stage& stage,
+                    sirius_physical_merge_sort& op,
+                    std::shared_ptr<range_state> const& r)
+  {
+    if (!stage.normalized.empty()) {
+      std::vector<ref> next;
+      for (std::size_t i = 0; i < stage.inputs.size(); ++i) {
+        auto& replacements = stage.normalized[i];
+        if (replacements.empty()) {
+          next.push_back(stage.inputs[i]);
+          continue;
+        }
+        std::sort(replacements.begin(), replacements.end(), [](auto const& a, auto const& b) {
+          return a.first < b.first;
+        });
+        for (auto const& replacement : replacements) {
+          next.push_back(replacement.second);
+        }
+        storage_access::retire(stage.inputs[i]);
+      }
+      stage.inputs = std::move(next);
+      stage.normalized.clear();
+    }
+    stage.normalized.resize(stage.inputs.size());
+    for (std::size_t i = 0; i < stage.inputs.size(); ++i) {
+      auto const& input = stage.inputs[i];
+      if (input.bytes <= op.chunk_bytes || input.rows <= 1) { continue; }
+      for (auto [begin, end] :
+           {std::pair{uint64_t{0}, input.rows / 2}, std::pair{input.rows / 2, input.rows}}) {
+        add(op, r, {input}, normalize_request{scratch.allocate(INPUTS), begin, end, i});
+      }
+    }
+    if (!stage.queue.complete_stage()) { return; }
+    coalesce_stage next;
+    next.input_count = stage.inputs.size();
+    std::vector<sm::contribution_size> sizes;
+    for (auto const& input : stage.inputs) {
+      sizes.push_back({input.rows, input.bytes});
+    }
+    for (auto planned : sm::plan_coalescing(sizes, op.chunk_bytes, native_rows)) {
+      group g;
+      g.inputs.assign(stage.inputs.begin() + planned.begin, stage.inputs.begin() + planned.end);
+      next.groups.push_back(std::move(g));
+    }
+    r->stage         = std::move(next);
+    auto& coalescing = std::get<coalesce_stage>(r->stage);
+    for (std::size_t i = 0; i < coalescing.groups.size(); ++i) {
+      auto& g = coalescing.groups[i];
+      if (g.inputs.size() == 1) {
+        g.output = g.inputs.front();
+      } else {
+        add(op, r, g.inputs, coalesce_request{scratch.allocate(INPUTS), i});
+      }
+    }
+  }
+
+  void finish_stage(coalesce_stage& stage,
+                    sirius_physical_merge_sort& op,
+                    std::shared_ptr<range_state> const& r)
+  {
+    std::vector<ref> inputs;
+    uint64_t rows = 0, bytes = 0;
+    for (auto const& g : stage.groups) {
+      inputs.push_back(g.output.value());
+      rows  = sm::checked_add(rows, inputs.back().rows);
+      bytes = sm::checked_add(bytes, inputs.back().bytes);
+    }
+    if (!rows) {
+      finish(r, {});
       return;
     }
-    add(op, r, g->inputs, coalesce_request{scratch.allocate(INPUTS), index});
+    auto average   = bytes ? 1 + (bytes - 1) / rows : uint64_t{1};
+    auto row_limit = std::min(native_rows, std::max(uint64_t{1}, op.chunk_bytes / average));
+    SIRIUS_LOG_DEBUG("sort.tiles pre_coalesce={}, inputs={}, rows={}, bytes={}, row_limit={}",
+                     stage.input_count,
+                     inputs.size(),
+                     rows,
+                     bytes,
+                     row_limit);
+    if (rows <= row_limit) {
+      tile single{scratch.allocate(PIECES).partition, {}, rows};
+      for (std::size_t i = 0; i < inputs.size(); ++i) {
+        single.pieces.push_back({inputs[i], i, 0, inputs[i].rows});
+      }
+      std::vector<tile> tiles;
+      tiles.push_back(std::move(single));
+      start_merge(op, r, std::move(tiles));
+      return;
+    }
+    sample_stage next;
+    next.row_limit = row_limit;
+    next.sampling  = sm::choose_parameters(inputs.size(), row_limit);
+    next.samples.resize(inputs.size());
+    next.inputs    = std::move(inputs);
+    r->stage       = std::move(next);
+    auto& sampling = std::get<sample_stage>(r->stage);
+    auto partition = scratch.allocate(SAMPLES).partition;
+    for (std::size_t i = 0; i < sampling.inputs.size(); ++i) {
+      if (!sm::sample_count(sampling.inputs[i].rows, sampling.sampling.stride)) { continue; }
+      add(
+        op,
+        r,
+        {sampling.inputs[i]},
+        sample_request{{scratch.repositories[SAMPLES], partition, i}, i, sampling.sampling.stride});
+    }
   }
-  void advance(sirius_physical_merge_sort& op, std::shared_ptr<region> const& r)
+
+  void finish_stage(sample_stage& stage,
+                    sirius_physical_merge_sort& op,
+                    std::shared_ptr<range_state> const& r)
   {
-    while (complete(*r)) {
-      if (r->stage == phase::DONE) { return; }
-      if (r->stage == phase::NORMALIZE) {
-        if (!r->normalized.empty()) {
-          std::vector<ref> next;
-          for (std::size_t i = 0; i < r->inputs.size(); ++i) {
-            auto& replacements = r->normalized[i];
-            if (replacements.empty()) {
-              next.push_back(r->inputs[i]);
-              continue;
-            }
-            std::sort(replacements.begin(), replacements.end(), [](auto const& a, auto const& b) {
-              return a.first < b.first;
-            });
-            for (auto const& replacement : replacements) {
-              next.push_back(replacement.second);
-            }
-            storage_access::retire(r->inputs[i]);
-          }
-          r->inputs = std::move(next);
-          r->normalized.clear();
-        }
-        r->normalized.resize(r->inputs.size());
-        for (std::size_t i = 0; i < r->inputs.size(); ++i) {
-          auto const& input = r->inputs[i];
-          if (input.bytes <= op.chunk_bytes || input.rows <= 1) { continue; }
-          for (auto [begin, end] :
-               {std::pair{uint64_t{0}, input.rows / 2}, std::pair{input.rows / 2, input.rows}}) {
-            add(op, r, {input}, normalize_request{scratch.allocate(INPUTS), begin, end, i});
-          }
-        }
-        if (!r->work_items.pending.empty()) { return; }
-        r->normalized.clear();
-        r->stage             = phase::COALESCE;
-        r->coalescing_inputs = r->inputs.size();
-        std::vector<sm::contribution_size> sizes;
-        for (auto const& input : r->inputs) {
-          sizes.push_back({input.rows, input.bytes});
-        }
-        for (auto planned : sm::plan_coalescing(sizes, op.chunk_bytes, native_rows)) {
-          auto g = std::make_shared<group>();
-          g->inputs.assign(r->inputs.begin() + planned.begin, r->inputs.begin() + planned.end);
-          r->groups.push_back(g);
-          coalesce(op, r, r->groups.size() - 1);
-        }
-      } else if (r->stage == phase::COALESCE) {
-        r->inputs.clear();
-        for (auto const& g : r->groups) {
-          r->inputs.push_back(g->output.value());
-        }
-        r->groups.clear();
-        uint64_t rows = 0, bytes = 0;
-        for (auto const& input : r->inputs) {
-          rows  = sm::checked_add(rows, input.rows);
-          bytes = sm::checked_add(bytes, input.bytes);
-        }
-        if (!rows) {
-          finish(r);
-          return;
-        }
-        auto average = bytes ? 1 + (bytes - 1) / rows : uint64_t{1};
-        r->row_limit = std::min(native_rows, std::max(uint64_t{1}, op.chunk_bytes / average));
-        SIRIUS_LOG_DEBUG("sort.tiles pre_coalesce={}, inputs={}, rows={}, bytes={}, row_limit={}",
-                         r->coalescing_inputs,
-                         r->inputs.size(),
-                         rows,
-                         bytes,
-                         r->row_limit);
-        if (rows <= r->row_limit) {
-          auto location = scratch.allocate(PIECES);
-          r->tiles.push_back({location.partition, {}, rows});
-          for (std::size_t i = 0; i < r->inputs.size(); ++i) {
-            r->tiles.back().pieces.push_back({r->inputs[i], i, 0, r->inputs[i].rows});
-          }
-          r->inputs.clear();  // ownership responsibility moved to the tile, without retirement
-          r->stage = phase::TILES;
-          return;
-        }
-        r->sampling         = sm::choose_parameters(r->inputs.size(), r->row_limit);
-        r->sample_partition = scratch.allocate(SAMPLES).partition;
-        r->samples.resize(r->inputs.size());
-        r->stage = phase::SAMPLE;
-        for (std::size_t i = 0; i < r->inputs.size(); ++i) {
-          if (!sm::sample_count(r->inputs[i].rows, r->sampling.stride)) { continue; }
-          add(op,
-              r,
-              {r->inputs[i]},
-              sample_request{
-                {scratch.repositories[SAMPLES], r->sample_partition, i}, i, r->sampling.stride});
-        }
-      } else if (r->stage == phase::SAMPLE) {
-        std::vector<ref> samples;
-        uint64_t rows = 0;
-        for (auto const& input : r->samples) {
-          if (!input) { continue; }
-          samples.push_back(*input);
-          rows = sm::checked_add(rows, input->rows);
-        }
-        if (rows > native_rows) {
-          throw invalid_input_exception("Sort sample row count exceeds the native table limit");
+    order_stage next;
+    uint64_t rows = 0;
+    for (auto const& sample : stage.samples) {
+      if (!sample) { continue; }
+      next.samples.push_back(*sample);
+      rows = sm::checked_add(rows, sample->rows);
+    }
+    if (rows > native_rows) {
+      throw invalid_input_exception("Sort sample row count exceeds the native table limit");
+    }
+    auto sample_step = stage.sampling.sample_step;
+    next.inputs      = std::move(stage.inputs);
+    next.row_limit   = stage.row_limit;
+    r->stage         = std::move(next);
+    add(op,
+        r,
+        std::get<order_stage>(r->stage).samples,
+        order_request{scratch.allocate(SPLITTERS), sample_step});
+  }
+
+  void finish_stage(order_stage& stage,
+                    sirius_physical_merge_sort& op,
+                    std::shared_ptr<range_state> const& r)
+  {
+    extract_stage next;
+    auto splitter_count = stage.splitter_count;
+    next.row_limit      = stage.row_limit;
+    next.inputs         = std::move(stage.inputs);
+    next.pages          = std::move(stage.pages);
+    for (uint64_t t = 0; t <= splitter_count; ++t) {
+      next.tiles.push_back({scratch.allocate(PIECES).partition, {}, 0});
+    }
+    storage_access::retire_all(stage.samples);
+    r->stage         = std::move(next);
+    auto& extracting = std::get<extract_stage>(r->stage);
+    for (std::size_t i = 0; i < extracting.inputs.size(); ++i) {
+      for (std::size_t page = 0; page < extracting.pages.size(); ++page) {
+        auto begin = page * window_tiles;
+        auto end   = std::min(begin + window_tiles, splitter_count + 1);
+        std::vector<slot> destinations;
+        for (auto t = begin; t < end; ++t) {
+          destinations.push_back({scratch.repositories[PIECES], extracting.tiles[t].partition, i});
         }
         add(op,
             r,
-            std::move(samples),
-            order_request{scratch.allocate(SPLITTERS), r->sampling.sample_step});
-        r->stage = phase::ORDER;
-      } else if (r->stage == phase::ORDER) {
-        for (uint64_t t = 0; t <= r->splitter_count; ++t) {
-          auto location = scratch.allocate(PIECES);
-          r->tiles.push_back({location.partition, {}, 0});
-        }
-        for (std::size_t i = 0; i < r->inputs.size(); ++i) {
-          for (std::size_t page = 0; page < r->pages.size(); ++page) {
-            auto begin = page * window_tiles;
-            auto end   = std::min(begin + window_tiles, r->splitter_count + 1);
-            std::vector<slot> destinations;
-            for (auto t = begin; t < end; ++t) {
-              destinations.push_back({scratch.repositories[PIECES], r->tiles[t].partition, i});
-            }
-            add(
-              op,
-              r,
-              {r->inputs[i], r->pages[page]},
-              extract_request{
-                i, begin, end, begin ? begin - 1 : 0, r->splitter_count, std::move(destinations)});
-          }
-        }
-        for (auto const& sample : r->samples) {
-          if (sample) { storage_access::retire(*sample); }
-        }
-        r->samples.clear();
-        r->stage = phase::EXTRACT;
-      } else if (r->stage == phase::EXTRACT) {
-        std::vector<std::vector<std::pair<std::size_t, piece>>> coverage(r->inputs.size());
-        for (std::size_t t = 0; t < r->tiles.size(); ++t) {
-          auto& tile = r->tiles[t];
-          std::sort(tile.pieces.begin(), tile.pieces.end(), [](piece const& a, piece const& b) {
-            return std::tie(a.input, a.begin) < std::tie(b.input, b.begin);
-          });
-          for (auto const& piece : tile.pieces) {
-            tile.rows = sm::checked_add(tile.rows, piece.batch.rows);
-            coverage[piece.input].push_back({t, piece});
-          }
-          if (tile.rows > r->row_limit) {
-            throw internal_exception("Sampled sort tile exceeds row bound");
-          }
-        }
-        for (std::size_t i = 0; i < coverage.size(); ++i) {
-          uint64_t cursor = 0;
-          for (auto const& [t, piece] : coverage[i]) {
-            if (piece.begin != cursor || piece.batch.rows != piece.end - piece.begin) {
-              throw internal_exception("Sort extraction lost or duplicated input rows");
-            }
-            cursor = piece.end;
-          }
-          if (cursor != r->inputs[i].rows) {
-            throw internal_exception("Incomplete sort extraction");
-          }
-        }
-        storage_access::retire_all(r->inputs);
-        storage_access::retire_all(r->pages);
-        r->pages.clear();
-        r->inputs.clear();
-        r->stage = phase::TILES;
-        return;
-      } else if (r->stage == phase::TILES) {
-        for (std::size_t t = 0; t < r->tiles.size(); ++t) {
-          auto& tile = r->tiles[t];
-          if (!tile.rows) { continue; }
-          std::vector<ref> sources;
-          for (auto const& piece : tile.pieces) {
-            sources.push_back(piece.batch);
-          }
-          add(op, r, std::move(sources), merge_request{scratch.allocate(RESULTS), t});
-        }
-        r->stage = phase::MERGING;
-      } else if (r->stage == phase::MERGING) {
-        finish(r);
-        return;
+            {extracting.inputs[i], extracting.pages[page]},
+            extract_request{
+              i, begin, end, begin ? begin - 1 : 0, splitter_count, std::move(destinations)});
       }
+    }
+  }
+
+  void finish_stage(extract_stage& stage,
+                    sirius_physical_merge_sort& op,
+                    std::shared_ptr<range_state> const& r)
+  {
+    std::vector<std::vector<std::pair<std::size_t, piece>>> coverage(stage.inputs.size());
+    for (std::size_t t = 0; t < stage.tiles.size(); ++t) {
+      auto& tile = stage.tiles[t];
+      std::sort(tile.pieces.begin(), tile.pieces.end(), [](piece const& a, piece const& b) {
+        return std::tie(a.input, a.begin) < std::tie(b.input, b.begin);
+      });
+      for (auto const& piece : tile.pieces) {
+        tile.rows = sm::checked_add(tile.rows, piece.batch.rows);
+        coverage[piece.input].push_back({t, piece});
+      }
+      if (tile.rows > stage.row_limit) {
+        throw internal_exception("Sampled sort tile exceeds row bound");
+      }
+    }
+    for (std::size_t i = 0; i < coverage.size(); ++i) {
+      uint64_t cursor = 0;
+      for (auto const& [t, piece] : coverage[i]) {
+        if (piece.begin != cursor || piece.batch.rows != piece.end - piece.begin) {
+          throw internal_exception("Sort extraction lost or duplicated input rows");
+        }
+        cursor = piece.end;
+      }
+      if (cursor != stage.inputs[i].rows) {
+        throw internal_exception("Incomplete sort extraction");
+      }
+    }
+    storage_access::retire_all(stage.inputs);
+    storage_access::retire_all(stage.pages);
+    start_merge(op, r, std::move(stage.tiles));
+  }
+
+  void finish_stage(merge_stage& stage,
+                    sirius_physical_merge_sort&,
+                    std::shared_ptr<range_state> const& r)
+  {
+    std::vector<ref> results;
+    for (auto const& tile : stage.tiles) {
+      if (tile.rows) { results.push_back(tile.result.value()); }
+    }
+    finish(r, std::move(results));
+  }
+  void finish_stage(done_stage&, sirius_physical_merge_sort&, std::shared_ptr<range_state> const&)
+  {
+  }
+
+  void advance(sirius_physical_merge_sort& op, std::shared_ptr<range_state> const& r)
+  {
+    // Empty stages advance synchronously; only pending or in-flight work suspends
+    // the range. A transition never scans or wakes unrelated ranges.
+    while (auto* queue = r->queue()) {
+      if (!queue->complete_stage()) { return; }
+      std::visit([&](auto& stage) { finish_stage(stage, op, r); }, r->stage);
     }
   }
 };
@@ -705,35 +841,37 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     _tiled_state = std::make_shared<tiled_state>(_tile_storage);
     auto* repo   = get_port("default")->repo;
     for (std::size_t p = 0; p < repo->num_partitions(); ++p) {
-      auto r   = std::make_shared<tiled_state::region>();
+      auto r   = std::make_shared<tiled_state::range_state>();
       auto ids = repo->get_batch_ids(p);
       std::sort(ids.begin(), ids.end());
       for (auto id : ids) {
         auto batch = repo->get_data_batch_by_id(id, p);
         auto input = tiled_state::storage_access::describe({repo, p, 0}, *batch);
         if (input.rows) {
-          r->inputs.push_back(input);
+          std::get<tiled_state::normalize_stage>(r->stage).inputs.push_back(input);
         } else {
           tiled_state::storage_access::retire(input);
         }
       }
-      _tiled_state->roots.push_back(r);
-      ++_tiled_state->unfinished_roots;
+      _tiled_state->ranges.push_back(r);
+      ++_tiled_state->unfinished_ranges;
       _tiled_state->enqueue(r);
     }
-    SIRIUS_LOG_DEBUG("sort.tile_ranges ranges={}, nonempty_ranges={}",
-                     _tiled_state->roots.size(),
-                     std::count_if(_tiled_state->roots.begin(),
-                                   _tiled_state->roots.end(),
-                                   [](auto const& r) { return !r->inputs.empty(); }));
+    SIRIUS_LOG_DEBUG(
+      "sort.tile_ranges ranges={}, nonempty_ranges={}",
+      _tiled_state->ranges.size(),
+      std::count_if(_tiled_state->ranges.begin(), _tiled_state->ranges.end(), [](auto const& r) {
+        return !std::get<tiled_state::normalize_stage>(r->stage).inputs.empty();
+      }));
   }
-  while (!_tiled_state->ready_regions.empty()) {
-    auto r = std::move(_tiled_state->ready_regions.front());
-    _tiled_state->ready_regions.pop_front();
+  while (!_tiled_state->ready_ranges.empty()) {
+    auto r = std::move(_tiled_state->ready_ranges.front());
+    _tiled_state->ready_ranges.pop_front();
     r->enqueued = false;
     ++r->creator_visits;
     _tiled_state->advance(*this, r);
-    auto data = r->work_items.claim([](auto const& item) {
+    if (!r->queue()) { continue; }
+    auto data = r->queue()->claim([](auto const& item) {
       std::vector<std::shared_ptr<cucascade::data_batch>> batches;
       batches.reserve(item->execution->sources.size());
       for (auto const& input : item->execution->sources) {
@@ -743,16 +881,17 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     });
     if (data) {
       data->item->state = tiled_state::status::CLAIMED;
+      ++r->claims;
       _tiled_state->enqueue(r);
       return data;
     }
     _tiled_state->enqueue(r);
   }
-  if (!_tiled_state->unfinished_roots) {
+  if (!_tiled_state->unfinished_ranges) {
     if (!_tiled_state->publishing) {
       uint64_t position = 0;
-      for (auto const& root : _tiled_state->roots) {
-        _tiled_state->flatten_results(*this, root, position);
+      for (auto const& root : _tiled_state->ranges) {
+        _tiled_state->schedule_publication(*this, root, position);
       }
       _tiled_state->publishing = true;
       if (_tiled_state->finals.complete_stage()) { _tiled_state->finished = true; }
@@ -1003,44 +1142,11 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
     throw internal_exception("Sort work completed twice");
   }
   auto r = item.owner.lock();
-  if (!r) { throw internal_exception("Missing sort region at completion"); }
-  std::visit(
-    [&](auto const& value) {
-      using T = std::decay_t<decltype(value)>;
-      if constexpr (std::is_same_v<T, state::normalize_result>) {
-        r->normalized.at(std::get<state::normalize_request>(item.execution->op).input)
-          .push_back({value.begin, value.output.describe()});
-      } else if constexpr (std::is_same_v<T, state::coalesce_result>) {
-        r->groups.at(std::get<state::coalesce_request>(item.execution->op).group_index)->output =
-          state::storage_access::commit_replacement(
-            item.execution->sources, value.output.destination, *value.output.batch);
-      } else if constexpr (std::is_same_v<T, state::sample_result>) {
-        r->samples.at(std::get<state::sample_request>(item.execution->op).input) =
-          value.output.describe();
-      } else if constexpr (std::is_same_v<T, state::order_result>) {
-        for (auto const& page : value.pages) {
-          r->pages.push_back(page.describe());
-        }
-        r->splitter_count = value.splitter_count;
-      } else if constexpr (std::is_same_v<T, state::merge_result>) {
-        r->tiles.at(std::get<state::merge_request>(item.execution->op).tile_index).result =
-          state::storage_access::commit_replacement(
-            item.execution->sources, value.output.destination, *value.output.batch);
-        r->tiles.at(std::get<state::merge_request>(item.execution->op).tile_index).pieces.clear();
-      } else if constexpr (std::is_same_v<T, state::extract_result>) {
-        for (auto const& piece : value.pieces) {
-          r->tiles.at(piece.tile_index)
-            .pieces.push_back({piece.output.describe(),
-                               std::get<state::extract_request>(item.execution->op).input,
-                               piece.begin,
-                               piece.end});
-        }
-      }
-    },
-    data.completed.value());
+  if (!r) { throw internal_exception("Missing sort range at completion"); }
+  r->accept(data.completed.value(), *item.execution);
   item.state = state::status::COMPLETE;
   if (item.execution->type() != state::kind::PUBLISH) {
-    r->work_items.complete();
+    r->queue()->complete();
     _tiled_state->enqueue(r);
   }
   if (item.execution->type() == state::kind::PUBLISH) {
