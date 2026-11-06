@@ -23,13 +23,10 @@
 
 #pragma once
 
-#include <rmm/aligned.hpp>
-
 #include <cuda/cmath>
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdint>
 
 namespace sirius::op {
 
@@ -47,21 +44,6 @@ static_assert(bloom_bits_per_block % bloom_target_bits_per_key == 0,
 {
   return ::cuda::ceil_div(std::max<std::size_t>(num_keys, 1),
                           bloom_bits_per_block / bloom_target_bits_per_key);
-}
-
-/**
- * @brief The most keys each of @p key_count Blooms can be sized for when together they must fit in
- * @p cap: the cap split evenly per key, rounded down to the allocation alignment, as whole blocks
- * of bloom_bytes_per_block, each holding bloom_bits_per_block / bloom_target_bits_per_key keys.
- *
- * The inverse of detail::accumulated_bloom_geometry::try_create's footprint; change both together.
- */
-[[nodiscard]] constexpr std::size_t bloom_keys_within_cap(std::uint64_t cap,
-                                                          std::size_t key_count) noexcept
-{
-  auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  auto const blocks        = cap / key_count / alignment * alignment / bloom_bytes_per_block;
-  return blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
 }
 
 }  // namespace sirius::op
