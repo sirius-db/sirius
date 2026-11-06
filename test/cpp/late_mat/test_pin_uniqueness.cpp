@@ -56,7 +56,6 @@
 #include <string>
 #include <vector>
 
-using sirius::late_mat::pin_unique_probe_selection;
 using sirius::late_mat::unique_probe;
 using sirius::scan_manager::pinned_entry;
 using sirius::scan_manager::scan_manager_config;
@@ -97,61 +96,7 @@ bool proves_single_column(std::vector<std::vector<std::int64_t>> const& chunks,
   return proven[0];
 }
 
-/// RAII around one environment variable, so a case can set the gate and leave
-/// the process as it found it (Catch runs every case in one process).
-struct scoped_env {
-  std::string name;
-  bool had_previous;
-  std::string previous;
-
-  scoped_env(std::string var, char const* value) : name(std::move(var))
-  {
-    char const* old = std::getenv(name.c_str());
-    had_previous    = old != nullptr;
-    if (had_previous) { previous = old; }
-    if (value == nullptr) {
-      unsetenv(name.c_str());
-    } else {
-      setenv(name.c_str(), value, 1);
-    }
-  }
-  ~scoped_env()
-  {
-    if (had_previous) {
-      setenv(name.c_str(), previous.c_str(), 1);
-    } else {
-      unsetenv(name.c_str());
-    }
-  }
-};
-
-std::vector<std::string> const kNames{"c_custkey", "c_name", "c_nationkey"};
-
 }  // namespace
-
-TEST_CASE("the probe selection reads the gate", "[late_mat][pin_uniqueness]")
-{
-  {
-    scoped_env off{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
-    auto const selected = pin_unique_probe_selection(kNames);
-    REQUIRE(selected == std::vector<bool>{false, false, false});
-  }
-  {
-    scoped_env none{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "none"};
-    REQUIRE(pin_unique_probe_selection(kNames) == std::vector<bool>{false, false, false});
-  }
-  {
-    scoped_env all{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "all"};
-    REQUIRE(pin_unique_probe_selection(kNames) == std::vector<bool>{true, true, true});
-  }
-  {
-    // A name list is the usual setting; spelling and spacing are forgiving, and
-    // a name that matches nothing in THIS table is not an error, since one
-    // setting covers a suite of pins over different tables.
-    scoped_env named{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", " C_CustKey , o_orderkey,c_nationkey"};
-    REQUIRE(pin_unique_probe_selection(kNames) == std::vector<bool>{true, false, true});
-  }
-}
 
 TEST_CASE("a key split across chunks in the wrong order is still proven",
           "[late_mat][pin_uniqueness]")
@@ -165,7 +110,7 @@ TEST_CASE("a key split across chunks in the wrong order is still proven",
   // it counts distinct values off sortedness rather than off a hash set,
   // because a hash set over a gigabyte-sized pinned chunk overruns cuco's
   // representable extent and fails the pin. An unsorted chunk is therefore
-  // UNDECIDED — the exact stage still settles it.
+  // sorted on the spot, and chunks whose ranges do not overlap still prove the column.
   unique_probe probe{std::vector<bool>{true}};
   auto const unsorted_a = int64_column({7, 5, 6}, stream);
   auto const unsorted_b = int64_column({1, 3, 2}, stream);
@@ -173,8 +118,8 @@ TEST_CASE("a key split across chunks in the wrong order is still proven",
     std::vector<cudf::column_view> cols{(*column)->view()};
     probe.observe(cudf::table_view{cols}, stream);
   }
-  REQUIRE(probe.verdicts() == std::vector<sirius::late_mat::unique_verdict>{
-                                sirius::late_mat::unique_verdict::undecided});
+  REQUIRE(probe.verdicts() ==
+          std::vector<sirius::late_mat::unique_verdict>{sirius::late_mat::unique_verdict::proven});
   std::vector<cudf::column_view> both{unsorted_a->view(), unsorted_b->view()};
   REQUIRE(sirius::late_mat::exact_distinct_over_chunks(both, stream) == std::optional<bool>{true});
 }
@@ -210,8 +155,7 @@ TEST_CASE("an empty chunk carries no evidence either way", "[late_mat][pin_uniqu
   REQUIRE(proves_single_column({{3, 4}, {}, {1, 2}}, stream));
 }
 
-TEST_CASE("nulls are refused; a type the cheap stage cannot judge is only undecided",
-          "[late_mat][pin_uniqueness]")
+TEST_CASE("nulls are refused", "[late_mat][pin_uniqueness]")
 {
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
@@ -226,18 +170,6 @@ TEST_CASE("nulls are refused; a type the cheap stage cannot judge is only undeci
     std::vector<cudf::column_view> cols{col->view()};
     probe.observe(cudf::table_view{cols}, stream);
     REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused});
-  }
-  {
-    // The cheap stage is integer-only, but a non-integer column is UNDECIDED,
-    // not refused — the exact check sorts whatever cuDF can sort, and a
-    // dimension's name column is exactly what a rider's proof rests on.
-    unique_probe probe{std::vector<bool>{true}};
-    auto col = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::FLOAT64}, 4, cudf::mask_state::UNALLOCATED, stream);
-    std::vector<cudf::column_view> cols{col->view()};
-    probe.observe(cudf::table_view{cols}, stream);
-    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
-    REQUIRE(probe.proven() == std::vector<bool>{false});
   }
 }
 
@@ -308,70 +240,77 @@ TEST_CASE("the exact check decides what the range test could not", "[late_mat][p
   REQUIRE_FALSE(exact_distinct_over_chunks(with_nulls, stream).has_value());
 }
 
-TEST_CASE("the join-key gate observes every other column automatically",
-          "[late_mat][pin_uniqueness]")
-{
-  using sirius::late_mat::pin_unique_automatic_selection;
-  std::vector<bool> const explicit_columns{true, false, false};
-  REQUIRE(pin_unique_automatic_selection(explicit_columns, /*prove_unique_keys=*/false) ==
-          std::vector<bool>{false, false, false});
-  REQUIRE(pin_unique_automatic_selection(explicit_columns, /*prove_unique_keys=*/true) ==
-          std::vector<bool>{false, true, true});
-}
-
-TEST_CASE("an automatic column is settled where an explicit one is only undecided",
-          "[late_mat][pin_uniqueness]")
+TEST_CASE("a column is settled by its first chunk where it can be", "[late_mat][pin_uniqueness]")
 {
   // Observing every column of a fact table must not hand each of them to the exact stage's sort,
-  // so an automatic column must be an integer, and an unsorted chunk is sorted on the spot to find
-  // a repeat.
+  // so an unsorted chunk is sorted on the spot to find a repeat, and a non-integer column goes no
+  // further than a small table (below).
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
 
-  // Columns: explicit unsorted, automatic unsorted with a repeat, automatic float, automatic
-  // sorted, automatic unsorted but distinct.
-  unique_probe probe{std::vector<bool>{true, true, true, true, true},
-                     std::vector<bool>{false, true, true, true, true}};
-  auto explicit_unsorted  = int64_column({7, 5, 6}, stream);
-  auto automatic_unsorted = int64_column({7, 5, 7}, stream);
-  auto automatic_float    = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::FLOAT64}, 3, cudf::mask_state::UNALLOCATED, stream);
-  auto automatic_sorted   = int64_column({10, 11, 12}, stream);
-  auto automatic_distinct = int64_column({12, 10, 11}, stream);
-  std::vector<cudf::column_view> cols{explicit_unsorted->view(),
-                                      automatic_unsorted->view(),
-                                      automatic_float->view(),
-                                      automatic_sorted->view(),
-                                      automatic_distinct->view()};
+  // Columns: unsorted with a repeat, sorted, unsorted but distinct.
+  unique_probe probe{std::vector<bool>{true, true, true}};
+  auto unsorted_repeat   = int64_column({7, 5, 7}, stream);
+  auto sorted            = int64_column({10, 11, 12}, stream);
+  auto unsorted_distinct = int64_column({12, 10, 11}, stream);
+  std::vector<cudf::column_view> cols{
+    unsorted_repeat->view(), sorted->view(), unsorted_distinct->view()};
   probe.observe(cudf::table_view{cols}, stream);
 
-  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided,
-                                                          unique_verdict::refused,
-                                                          unique_verdict::refused,
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused,
                                                           unique_verdict::proven,
                                                           unique_verdict::proven});
-  REQUIRE_FALSE(probe.candidate(1));
-  REQUIRE_FALSE(probe.candidate(2));
-  REQUIRE(probe.candidate(3));
-  REQUIRE(probe.candidate(4));
+  REQUIRE_FALSE(probe.candidate(0));
+  REQUIRE(probe.candidate(1));
+  REQUIRE(probe.candidate(2));
 }
 
-TEST_CASE("an automatic column is dropped, not the pin, when its sort cannot be reserved",
+TEST_CASE("a non-integer column stays in the running only for a small table",
+          "[late_mat][pin_uniqueness]")
+{
+  // A dimension's name column (nation.n_name) can prove a group-by-rowid ride, so a non-integer
+  // column is left to the exact stage while its table is small, whatever its type. Past the row cap
+  // it is refused at the chunk that crosses it.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+  auto const mr = cudf::get_current_device_resource_ref();
+
+  unique_probe probe{std::vector<bool>{true, true}};
+  auto names =
+    sirius::test::operator_utils::make_string_column({"ALGERIA", "BRAZIL", "CHINA"}, stream, mr);
+  auto floats = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT64}, 3, cudf::mask_state::UNALLOCATED, stream);
+  std::vector<cudf::column_view> cols{names->view(), floats->view()};
+  probe.observe(cudf::table_view{cols}, stream);
+
+  // The cheap stage cannot judge them: undecided, still candidates for the exact stage.
+  REQUIRE(probe.verdicts() ==
+          std::vector<unique_verdict>{unique_verdict::undecided, unique_verdict::undecided});
+  REQUIRE(probe.candidate(0));
+  REQUIRE(probe.candidate(1));
+
+  // At exactly the cap the column is still in the running; the next chunk pushes it over.
+  std::vector<std::string> big(sirius::late_mat::small_table_max_rows, "x");
+  auto big_names = sirius::test::operator_utils::make_string_column(big, stream, mr);
+  unique_probe big_probe{std::vector<bool>{true}};
+  std::vector<cudf::column_view> big_cols{big_names->view()};
+  big_probe.observe(cudf::table_view{big_cols}, stream);
+  REQUIRE(big_probe.candidate(0));
+  big_probe.observe(cudf::table_view{big_cols}, stream);
+  REQUIRE(big_probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused});
+}
+
+TEST_CASE("a column is dropped, not the pin, when its sort cannot be reserved",
           "[late_mat][pin_uniqueness]")
 {
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
 
-  // An unsorted automatic column that is distinct, a sorted automatic one (needs no sort) and an
-  // unsorted explicit one (never sorted).
-  auto const make_probe = [] {
-    return unique_probe{std::vector<bool>{true, true, true}, std::vector<bool>{true, true, false}};
-  };
+  // An unsorted column that is distinct, and a sorted one (needs no sort).
+  auto const make_probe  = [] { return unique_probe{std::vector<bool>{true, true}}; };
   auto unsorted_distinct = int64_column({12, 10, 11}, stream);
   auto sorted            = int64_column({10, 11, 12}, stream);
-  auto explicit_unsorted = int64_column({7, 5, 6}, stream);
-  std::vector<cudf::column_view> cols{
-    unsorted_distinct->view(), sorted->view(), explicit_unsorted->view()};
+  std::vector<cudf::column_view> cols{unsorted_distinct->view(), sorted->view()};
 
   SECTION("a granted reservation sorts the chunk and proves the column")
   {
@@ -383,18 +322,16 @@ TEST_CASE("an automatic column is dropped, not the pin, when its sort cannot be 
     });
     REQUIRE(asked == std::vector<std::size_t>{3 * sizeof(std::int64_t) *
                                               sirius::late_mat::sort_scratch_factor});
-    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::proven,
-                                                            unique_verdict::proven,
-                                                            unique_verdict::undecided});
+    REQUIRE(probe.verdicts() ==
+            std::vector<unique_verdict>{unique_verdict::proven, unique_verdict::proven});
   }
 
   SECTION("a declined reservation drops only the column that needed the sort")
   {
     auto probe = make_probe();
     probe.observe(cudf::table_view{cols}, stream, [](std::size_t) { return false; });
-    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused,
-                                                            unique_verdict::proven,
-                                                            unique_verdict::undecided});
+    REQUIRE(probe.verdicts() ==
+            std::vector<unique_verdict>{unique_verdict::refused, unique_verdict::proven});
     REQUIRE_FALSE(probe.candidate(0));
     REQUIRE(probe.candidate(1));
   }
@@ -405,15 +342,13 @@ TEST_CASE("an automatic column is dropped, not the pin, when its sort cannot be 
     REQUIRE_NOTHROW(probe.observe(cudf::table_view{cols}, stream, [](std::size_t) -> bool {
       throw std::runtime_error("out of memory");
     }));
-    REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::refused,
-                                                            unique_verdict::proven,
-                                                            unique_verdict::undecided});
+    REQUIRE(probe.verdicts() ==
+            std::vector<unique_verdict>{unique_verdict::refused, unique_verdict::proven});
   }
 }
 
-TEST_CASE(
-  "an automatic column the exact stage cannot settle is not sorted again once chunks overlap",
-  "[late_mat][pin_uniqueness]")
+TEST_CASE("a column the exact stage cannot settle is not sorted again once chunks overlap",
+          "[late_mat][pin_uniqueness]")
 {
   // Unsorted, distinct chunks: each one costs a sort. Once the exact stage is out of reach only
   // chunks that never overlap in range can prove the column, so an overlapping chunk is dropped
@@ -423,7 +358,7 @@ TEST_CASE(
 
   auto const observe_two =
     [&](bool exact_available, std::vector<std::int64_t> const& second, std::size_t& sorts) {
-      unique_probe probe{std::vector<bool>{true}, std::vector<bool>{true}};
+      unique_probe probe{std::vector<bool>{true}};
       auto const count_sorts = [&](std::size_t) {
         ++sorts;
         return true;
@@ -466,24 +401,6 @@ TEST_CASE(
     REQUIRE(sorts == 2);
     REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::proven});
   }
-}
-
-TEST_CASE("an explicit column keeps its chances when the exact stage becomes unavailable",
-          "[late_mat][pin_uniqueness]")
-{
-  ::cuda::stream_ref const stream{cudaStream_t{}};
-  using sirius::late_mat::unique_verdict;
-  unique_probe probe{std::vector<bool>{true}};
-  auto first  = int64_column({1, 5, 9}, stream);
-  auto second = int64_column({2, 6, 8}, stream);
-  probe.exact_unavailable(0);
-  for (auto const* column : {&first, &second}) {
-    std::vector<cudf::column_view> cols{(*column)->view()};
-    probe.observe(cudf::table_view{cols}, stream);
-  }
-  // Overlapping ranges: not provable by chunks alone, but not refused either.
-  REQUIRE(probe.candidate(0));
-  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
 }
 
 TEST_CASE("an optional retained copy yields to the batches the pin still has to store",
@@ -595,13 +512,13 @@ TEST_CASE("required work is retried once after the optional copies are given bac
   }
 }
 
-TEST_CASE("an automatic column with sorted, overlapping chunks is left to the exact stage",
+TEST_CASE("a column with sorted, overlapping chunks is left to the exact stage",
           "[late_mat][pin_uniqueness]")
 {
   // SF1000 `orders`: every chunk is sorted by o_orderkey, but the chunks overlap in range.
   ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
-  unique_probe probe{std::vector<bool>{true}, std::vector<bool>{true}};
+  unique_probe probe{std::vector<bool>{true}};
   auto first  = int64_column({1, 5, 9}, stream);
   auto second = int64_column({2, 6, 8}, stream);
   for (auto const* column : {&first, &second}) {

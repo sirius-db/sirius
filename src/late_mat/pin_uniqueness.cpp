@@ -29,8 +29,6 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <algorithm>
-#include <cctype>
-#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -41,15 +39,6 @@
 namespace sirius::late_mat {
 
 namespace {
-
-std::string lowered(std::string_view s)
-{
-  std::string out{s};
-  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return out;
-}
 
 /// Host value of an integer scalar, widened into the probe's common domain.
 /// Returns nullopt for anything the probe must not interpret — an invalid
@@ -87,55 +76,6 @@ std::optional<__int128_t> integer_scalar_value(cudf::scalar const& s, ::cuda::st
 }
 
 }  // namespace
-
-std::vector<bool> pin_unique_probe_selection(std::span<std::string const> column_names)
-{
-  std::vector<bool> selected(column_names.size(), false);
-
-  char const* raw = std::getenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
-  if (raw == nullptr || raw[0] == '\0') { return selected; }
-  std::string const spec = lowered(raw);
-  if (spec == "0" || spec == "none" || spec == "off") { return selected; }
-
-  if (spec == "all") {
-    selected.assign(column_names.size(), true);
-    return selected;
-  }
-
-  // Comma-separated names. An entry that matches nothing is not an error — a
-  // single setting is meant to cover a suite of pins over different tables.
-  std::size_t pos = 0;
-  while (pos <= spec.size()) {
-    auto const comma = spec.find(',', pos);
-    auto const end   = comma == std::string::npos ? spec.size() : comma;
-    std::string_view wanted{spec.data() + pos, end - pos};
-    while (!wanted.empty() && std::isspace(static_cast<unsigned char>(wanted.front()))) {
-      wanted.remove_prefix(1);
-    }
-    while (!wanted.empty() && std::isspace(static_cast<unsigned char>(wanted.back()))) {
-      wanted.remove_suffix(1);
-    }
-    if (!wanted.empty()) {
-      for (std::size_t i = 0; i < column_names.size(); ++i) {
-        if (lowered(column_names[i]) == wanted) { selected[i] = true; }
-      }
-    }
-    if (comma == std::string::npos) { break; }
-    pos = comma + 1;
-  }
-  return selected;
-}
-
-std::vector<bool> pin_unique_automatic_selection(std::vector<bool> const& explicitly_selected,
-                                                 bool prove_unique_keys)
-{
-  std::vector<bool> automatic(explicitly_selected.size(), false);
-  if (!prove_unique_keys) { return automatic; }
-  for (std::size_t i = 0; i < explicitly_selected.size(); ++i) {
-    automatic[i] = !explicitly_selected[i];
-  }
-  return automatic;
-}
 
 std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
                                       std::uint64_t gpu_capacity_bytes)
@@ -179,13 +119,12 @@ std::optional<bool> exact_distinct_over_chunks(std::span<cudf::column_view const
   return static_cast<std::int64_t>(distinct) == total_rows;
 }
 
-unique_probe::unique_probe(std::vector<bool> selected, std::vector<bool> const& automatic)
+unique_probe::unique_probe(std::vector<bool> selected)
 {
   _columns.resize(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
     _columns[i].observed  = selected[i];
     _columns[i].candidate = selected[i];
-    _columns[i].automatic = selected[i] && i < automatic.size() && automatic[i];
     if (selected[i]) { ++_live_candidates; }
   }
 }
@@ -253,10 +192,15 @@ void unique_probe::observe(cudf::table_view const& chunk,
       continue;
     }
     if (!cudf::is_integral_not_bool(col.type())) {
-      // Out of the cheap stage's reach, not out of the running: the exact check
-      // sorts whatever cuDF can sort. An automatic column is not worth that sort.
-      if (_columns[i].automatic) {
-        drop(i, "observed automatically and not an integer");
+      // Out of the cheap stage's reach. Every column of a pin is observed, and the exact stage's
+      // sort is not worth paying on a big table's non-integer columns, so such a column stays in
+      // the running only while its table is small: a dimension's name column, say, which can prove
+      // a group-by-rowid ride (q5, q9 and q10 group by nation.n_name). The cap is on rows seen so
+      // far, so a big table's first chunk ends the column's chances with no sort and no retained
+      // values. A nested column is never worth it: the exact stage cannot judge one.
+      _columns[i].observed_rows += static_cast<std::size_t>(col.size());
+      if (cudf::is_nested(col.type()) || _columns[i].observed_rows > small_table_max_rows) {
+        drop(i, "not an integer, and nested or past the small-table row cap");
         continue;
       }
       _columns[i].cheap_undecidable = true;
@@ -274,10 +218,10 @@ void unique_probe::observe(cudf::table_view const& chunk,
     cudf::size_type distinct     = 0;
     std::optional<range> early_range;
     try {
-      // With the exact stage out of reach, an automatic column can only be proven by chunks whose
-      // ranges never overlap, so a chunk that overlaps an earlier one ends its chances and is not
-      // worth sorting.
-      if (_columns[i].automatic && !_columns[i].exact_available) {
+      // With the exact stage out of reach, a column can only be proven by chunks whose ranges
+      // never overlap, so a chunk that overlaps an earlier one ends its chances and is not worth
+      // sorting.
+      if (!_columns[i].exact_available) {
         early_range = chunk_range(col);
         if (!early_range) {
           drop(i, "its range cannot be read and the exact stage cannot settle it");
@@ -293,15 +237,8 @@ void unique_probe::observe(cudf::table_view const& chunk,
         }
       }
       if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
-        // Unsorted says nothing either way — leave it to the exact stage, unless
-        // the column was observed automatically. Most columns of a fact table are
-        // unsorted and repeat values, so an automatic column sorts this one chunk
-        // instead: a repeat refuses it here, before the exact stage retains any of
-        // its values.
-        if (!_columns[i].automatic) {
-          _columns[i].cheap_undecidable = true;
-          continue;
-        }
+        // Most columns of a fact table are unsorted and repeat values, so sort this one chunk:
+        // a repeat refuses the column here, before the exact stage retains any of its values.
         // The sort is optional. A pin that cannot spare the memory for it loses this proof,
         // never the pin itself.
         if (try_reserve_sort_memory &&

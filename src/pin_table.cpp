@@ -257,7 +257,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   // Whole-table distinctness proof, accumulated chunk by chunk. Inactive (and
   // free) unless the caller selected columns to observe.
-  late_mat::unique_probe unique_probe{options.probe_unique_columns, options.probe_unique_automatic};
+  late_mat::unique_probe unique_probe{options.probe_unique_columns};
 
   // The cheap per-chunk pass usually leaves a key UNDECIDED: chunk ranges
   // overlap, because the coalescer interleaves row groups rather than

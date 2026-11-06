@@ -53,33 +53,6 @@ namespace {
 constexpr std::int64_t dim_rows  = 20'000;
 constexpr std::int64_t fact_rows = 200'000;
 
-/// Sets one environment variable for the scope of a case, and restores it afterwards.
-struct scoped_env {
-  std::string name;
-  bool had_previous{false};
-  std::string previous;
-
-  scoped_env(std::string var, char const* value) : name(std::move(var))
-  {
-    char const* old = std::getenv(name.c_str());
-    had_previous    = old != nullptr;
-    if (had_previous) { previous = old; }
-    if (value == nullptr) {
-      ::unsetenv(name.c_str());
-    } else {
-      ::setenv(name.c_str(), value, 1);
-    }
-  }
-  ~scoped_env()
-  {
-    if (had_previous) {
-      ::setenv(name.c_str(), previous.c_str(), 1);
-    } else {
-      ::unsetenv(name.c_str());
-    }
-  }
-};
-
 void run_generator(duckdb::Connection& gen, std::string const& sql)
 {
   auto result = gen.Query(sql);
@@ -344,8 +317,6 @@ TEST_CASE("a pinned distinct parquet column proves a join's build keys unique",
   REQUIRE(fallback);
   REQUIRE_FALSE(fallback->HasError());
 
-  // Automatic selection only: no explicit column list.
-  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
   pin(con, unique_dim, "pin_unique_join_unique_dim");
   pin(con, dup_dim, "pin_unique_join_dup_dim");
 
@@ -409,7 +380,6 @@ TEST_CASE("the exact-stage byte cap declines a column over the cap",
   sirius::test::shared_test_env local_env(yaml_path);
   auto con = local_env.make_connection();
   set_option(con, "SET enable_duckdb_fallback = false;");
-  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
   auto const sql = join_query(fact, dim_glob);
 
   SECTION("under the default cap the exact stage proves the key")
@@ -465,7 +435,6 @@ TEST_CASE("the exact-stage byte cap is shared by every column the pin retains",
   sirius::test::shared_test_env local_env(yaml_path);
   auto con = local_env.make_connection();
   set_option(con, "SET enable_duckdb_fallback = false;");
-  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
   auto const on_k  = join_query_on(fact, dim_glob, "k");
   auto const on_k2 = join_query_on(fact, dim_glob, "k2");
 
@@ -525,7 +494,6 @@ TEST_CASE("a Hive partition column is not proven unique by a same-named file col
   sirius::test::shared_test_env local_env(yaml_path);
   auto con = local_env.make_connection();
   set_option(con, "SET enable_duckdb_fallback = false;");
-  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
   pin(con, hive_glob, "pin_unique_join_hive_dim");
 
   auto const query = [&](std::string const& hive_option) {
@@ -578,7 +546,6 @@ TEST_CASE("a scan that does not return the files' own columns is not proven from
   sirius::test::shared_test_env local_env(yaml_path);
   auto con = local_env.make_connection();
   set_option(con, "SET enable_duckdb_fallback = false;");
-  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
   pin(con, unique_dim, "pin_unique_join_raw_columns_dim");
 
   auto const query = [&](std::string const& options) {
