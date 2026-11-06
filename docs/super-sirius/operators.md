@@ -451,7 +451,7 @@ sizing partitions have run.
 ### Ranking window evaluator
 **File:** `src/op/window/ranking.hpp`, `src/op/window/ranking.cpp`
 
-`evaluate_ranking_window()` computes `rank`, `dense_rank` and `row_number` over the window `ORDER BY` of one table. It sorts the partition columns and order keys with `cudf::stable_sorted_order()`, gathers only those key columns, runs a sorted `cudf::groupby` scan with the rank (`MIN` or `DENSE`) or count aggregation, and scatters the `INT64` results back to the input row order. The payload columns are neither sorted nor copied. Each order key has its own direction and NULL placement. With `row_number` only, the order keys are sorted on but not gathered. A window without `PARTITION BY` is one partition: a constant column stands in for the partition key, and the whole input is one bucket on one GPU.
+`evaluate_ranking_window()` computes `rank`, `dense_rank` and `row_number` over the window `ORDER BY` of one table. It sorts the partition columns and order keys with `cudf::stable_sorted_order()`, gathers only those key columns, runs a sorted `cudf::groupby` scan with the rank (`MIN` or `DENSE`) or count aggregation, and scatters the `INT64` results back to the input row order. The payload columns are neither sorted nor copied. Each order key has its own direction and NULL placement. With `row_number` only, the order keys are sorted on but not gathered. A window without `PARTITION BY` is one partition: a constant column stands in for the partition key, and the whole input is one bucket on one GPU. The input, the results and the scratch memory must then fit on that GPU, and the input must have fewer than 2^31 rows.
 
 ## Pipeline Breakers (Sirius-Specific)
 

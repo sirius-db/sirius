@@ -139,23 +139,16 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
   }
   cudf::table_view const keys(key_views);
   // Equal partition values only need to be next to each other, so any column order, direction and
-  // NULL placement will do for them. There is one entry for each partition key, and the constant
-  // key of a window without PARTITION BY counts as one.
-  std::size_t const key_count = std::max<std::size_t>(partition_count, 1);
-  std::vector<cudf::order> const partition_directions(key_count, cudf::order::ASCENDING);
-  std::vector<cudf::null_order> const partition_nulls(key_count, cudf::null_order::BEFORE);
-  std::vector<cudf::order> directions(partition_directions.begin(),
-                                      partition_directions.begin() + partition_count);
-  std::vector<cudf::null_order> nulls(partition_nulls.begin(),
-                                      partition_nulls.begin() + partition_count);
+  // NULL placement will do for them.
+  std::vector<cudf::order> directions(partition_count, cudf::order::ASCENDING);
+  std::vector<cudf::null_order> nulls(partition_count, cudf::null_order::BEFORE);
   directions.insert(directions.end(), order.directions.begin(), order.directions.end());
   nulls.insert(nulls.end(), order.nulls.begin(), order.nulls.end());
   auto row_order = cudf::stable_sorted_order(keys, directions, nulls, stream, mr);
 
   // Only rank and dense_rank read the order keys. row_number needs the partition columns alone.
-  bool const needs_order = std::any_of(functions.begin(), functions.end(), [](auto function) {
-    return function != ranking_function::row_number;
-  });
+  bool const needs_order = std::ranges::any_of(
+    functions, [](auto function) { return function != ranking_function::row_number; });
   std::size_t const gathered_count = needs_order ? key_views.size() : partition_count;
   std::unique_ptr<cudf::table> sorted;
   if (gathered_count > 0) {
@@ -174,6 +167,10 @@ std::unique_ptr<cudf::table> evaluate_ranking_window(
     std::iota(sorted_partition_indices.begin(), sorted_partition_indices.end(), 0);
     partition_view = sorted->view().select(sorted_partition_indices);
   }
+  // One entry for each group key. The constant key of a window without PARTITION BY counts as one.
+  std::size_t const group_key_count = std::max<std::size_t>(partition_count, 1);
+  std::vector<cudf::order> const partition_directions(group_key_count, cudf::order::ASCENDING);
+  std::vector<cudf::null_order> const partition_nulls(group_key_count, cudf::null_order::BEFORE);
   cudf::groupby::groupby groups(partition_view,
                                 cudf::null_policy::INCLUDE,
                                 cudf::sorted::YES,
