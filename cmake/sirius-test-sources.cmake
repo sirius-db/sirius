@@ -219,6 +219,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
+    test/cpp/operator/test_build_probe_chunked.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_build_probe_reclaim.cpp
     test/cpp/operator/test_ungrouped_aggregate_empty_input.cpp

@@ -57,14 +57,6 @@ struct single_join_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
-void number_operator_tree(sirius::op::sirius_physical_operator& op, size_t& next_id)
-{
-  op.operator_id = next_id++;
-  for (auto& child : op.children) {
-    if (child) { number_operator_tree(*child, next_id); }
-  }
-}
-
 /// Output: left key, left payload, right key, right payload (empty projection maps keep every
 /// column of both sides).
 single_join_fixture create_single_join(
