@@ -1142,7 +1142,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     return std::nullopt;
   }
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // Each partition owns one hash table and runs its own build-then-probe sequence; those
+    // Each partition owns its hash tables and runs its own build-then-probe sequence; those
     // sequences interleave (a built partition probes on its GPU while another still builds on a
     // different GPU). Pick the next action from a per-partition snapshot.
 
@@ -2051,8 +2051,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // Each partition owns one hash table. The incoming batch carries its partition index
-    // (get_next_task_input_data_for_build_probe), which selects the per-partition slot; the
+    // Each partition owns one hash table per build chunk. The incoming batch carries its partition
+    // index (get_next_task_input_data_for_build_probe), which selects the per-partition slot; the
     // scheduler has already pinned this task to that partition's GPU.
     auto const* partitioned = dynamic_cast<const partitioned_operator_data*>(&input_data);
     if (!partitioned) {

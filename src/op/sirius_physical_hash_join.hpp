@@ -560,14 +560,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
            _mark_build_partitioned.load(std::memory_order_acquire);
   }
 
-  // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
-  // that lives entirely on one GPU . A partition is built once — its
-  // single SCHEDULED build task release-stores BUILT — and then probed by many streamed probe tasks
-  // that only read the table. `build_state` is atomic so get_next_task_hint can observe a slot's
-  // progress without holding op_state_mutex while execute() flips it.
   // A partition's build side normally arrives as one batch, built into one chunk. A build above
   // operator_params::build_chunk_max_rows rows arrives as several batches, one chunk each; probes
-  // combine the chunks' results (see execute).
+  // combine the chunks' results (see probe_chunked_build).
   struct build_chunk {
     std::unique_ptr<cudf::hash_join> hash_table;  // general path (INNER/LEFT/OUTER)
     std::unique_ptr<cudf::distinct_hash_join>
@@ -579,6 +574,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     std::vector<std::unique_ptr<cudf::column>>
       built_table_cast_columns;  // scope holder for columns cast for the build table's lifetime
   };
+  // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one hash table per
+  // build chunk, all on one GPU. A partition is built once — its single SCHEDULED build task
+  // release-stores BUILT — and then probed by many streamed probe tasks that only read the tables.
+  // `build_state` is atomic so get_next_task_hint can observe a slot's progress without holding
+  // op_state_mutex while execute() flips it.
   struct per_partition_build_state {
     std::atomic<BUILD_HASH_TABLE_STATE> build_state{BUILD_HASH_TABLE_STATE::NOT_BUILT};
     std::vector<build_chunk> chunks;
