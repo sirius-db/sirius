@@ -16,18 +16,25 @@
 
 #include "catch.hpp"
 #include "op/order/gpu_sampled_merge.hpp"
+#include "op/order/sampled_merge.hpp"
 #include "operator_test_utils.hpp"
-#include "utils/sampled_merge_reference.hpp"
 
+#include <cudf/concatenate.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/merge.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/unary.hpp>
 
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <numeric>
 #include <random>
+#include <type_traits>
 
 using namespace sirius::op;
 using namespace sirius::test::operator_utils;
@@ -121,27 +128,31 @@ std::vector<std::shared_ptr<cucascade::data_batch>> coalesce_probe(
 
 // Deliberately complete SAMPLE items in reverse input order. Frozen input IDs
 // must determine cuts regardless of assembly order or SQL peer merge order.
-template <typename T, typename Less = std::less<T>>
 void verify_gpu_cuts(std::vector<std::shared_ptr<cucascade::data_batch>> const& batches,
-                     std::vector<std::vector<T>> const& host_keys,
                      sort_comparison_config const& comparison,
-                     uint64_t limit,
-                     Less less = {})
+                     uint64_t limit)
 {
-  auto* space   = get_default_gpu_space();
-  auto stream   = default_stream();
-  auto mr       = get_resource_ref(*space);
-  auto expected = sirius::test::reference_sampled_cuts(host_keys, limit, less);
-  uint64_t k    = 0;
-  for (auto const& keys : host_keys) {
-    k += !keys.empty();
+  auto* space = get_default_gpu_space();
+  auto stream = default_stream();
+  auto mr     = get_resource_ref(*space);
+  uint64_t k  = 0;
+  for (auto const& batch : batches) {
+    k += sirius::get_cudf_table_view(*batch).num_rows() != 0;
   }
   auto p = sm::choose_parameters(k, limit);
-  std::vector<std::unique_ptr<cudf::table>> inputs, samples;
+  std::vector<std::unique_ptr<cudf::table>> originals, inputs, samples, outputs;
+  int64_t total_rows = 0;
   std::vector<cudf::table_view> sample_views;
   for (auto const& batch : batches) {
-    auto ro    = batch->to_read_only();
-    auto table = sirius::get_cudf_table_view(ro);
+    auto ro      = batch->to_read_only();
+    auto table   = sirius::get_cudf_table_view(ro);
+    auto columns = std::make_unique<cudf::table>(table, stream, mr)->release();
+    cudf::numeric_scalar<int64_t> start(total_rows, true, stream, mr);
+    cudf::numeric_scalar<int64_t> step(1, true, stream, mr);
+    columns.push_back(cudf::sequence(table.num_rows(), start, step, stream, mr));
+    total_rows += table.num_rows();
+    originals.push_back(std::make_unique<cudf::table>(std::move(columns)));
+    table      = originals.back()->view();
     auto order = cudf::sorted_order(table.select(comparison.key_columns),
                                     comparison.directions,
                                     comparison.null_precedence,
@@ -156,25 +167,19 @@ void verify_gpu_cuts(std::vector<std::shared_ptr<cucascade::data_batch>> const& 
     sample_views.push_back(samples.back()->view());
   }
   auto splitters = sm::order_sample_splitters(sample_views, p.sample_step, comparison, stream, mr);
-  auto keys      = comparison.directions.size();
-  auto ids       = copy_column_to_host<uint64_t>(splitters->view().column(keys), stream);
-  auto rows      = copy_column_to_host<uint64_t>(splitters->view().column(keys + 1), stream);
-  REQUIRE(ids.size() == expected.splitters.size());
-  for (std::size_t t = 0; t < ids.size(); ++t) {
-    CHECK(ids[t] == expected.splitters[t].input);
-    CHECK(rows[t] == expected.splitters[t].row);
-  }
   std::vector<std::vector<cudf::size_type>> cuts(inputs.size());
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     auto device =
       sm::discover_cuts(inputs[i]->view(), i, splitters->view(), comparison, stream, mr);
     auto host = copy_column_to_host<cudf::size_type>(device->view(), stream);
-    REQUIRE(host.size() + 2 == expected.cuts[i].size());
-    cuts[i].push_back(0);
-    for (std::size_t t = 0; t < host.size(); ++t) {
-      CHECK(host[t] == expected.cuts[i][t + 1]);
-      cuts[i].push_back(host[t]);
+    REQUIRE(host.size() == static_cast<std::size_t>(splitters->num_rows()));
+    REQUIRE(std::is_sorted(host.begin(), host.end()));
+    for (auto offset : host) {
+      REQUIRE(offset >= 0);
+      REQUIRE(offset <= inputs[i]->num_rows());
     }
+    cuts[i].push_back(0);
+    cuts[i].insert(cuts[i].end(), host.begin(), host.end());
     cuts[i].push_back(inputs[i]->num_rows());
     // Windowed searches preserve the same original row coordinates. Each
     // window has one bulk offset readback, never one key readback per splitter.
@@ -188,7 +193,7 @@ void verify_gpu_cuts(std::vector<std::shared_ptr<cucascade::data_batch>> const& 
   }
   // Exercise the n-ary library seam and owning piece extraction, without
   // claiming that this direct helper test qualifies task/storage integration.
-  for (std::size_t t = 0; t <= ids.size(); ++t) {
+  for (std::size_t t = 0; t <= static_cast<std::size_t>(splitters->num_rows()); ++t) {
     std::vector<std::unique_ptr<cudf::table>> pieces;
     std::vector<cudf::table_view> views;
     uint64_t row_count = 0;
@@ -208,12 +213,67 @@ void verify_gpu_cuts(std::vector<std::shared_ptr<cucascade::data_batch>> const& 
                           comparison.directions,
                           comparison.null_precedence,
                           stream));
+    outputs.push_back(std::move(merged));
     stream.sync();
+  }
+  std::vector<cudf::table_view> output_views, original_views;
+  for (auto const& output : outputs) {
+    output_views.push_back(output->view());
+  }
+  for (auto const& original : originals) {
+    original_views.push_back(original->view());
+  }
+  REQUIRE(!output_views.empty());
+  auto actual   = cudf::concatenate(output_views, stream, mr);
+  auto expected = cudf::concatenate(original_views, stream, mr);
+  REQUIRE(actual->num_rows() == total_rows);
+  // Check ordering across tile boundaries, not just inside each merge.
+  CHECK(cudf::is_sorted(actual->view().select(comparison.key_columns),
+                        comparison.directions,
+                        comparison.null_precedence,
+                        stream));
+  auto id_column = actual->num_columns() - 1;
+  auto order     = cudf::sorted_order(actual->view().select({id_column}), {}, {}, stream, mr);
+  auto by_id =
+    cudf::gather(actual->view(), order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  auto ids = copy_column_to_host<int64_t>(by_id->view().column(id_column), stream);
+  for (int64_t row = 0; row < total_rows; ++row) {
+    REQUIRE(ids[row] == row);
+  }
+  // Unique row IDs establish exact conservation. Compare every original column
+  // in ID order to catch detached payloads without imposing an order on SQL peers.
+  for (cudf::size_type col = 0; col < id_column; ++col) {
+    auto a = by_id->view().column(col), e = expected->view().column(col);
+    auto a_null = cudf::is_null(a, stream, mr);
+    auto e_null = cudf::is_null(e, stream, mr);
+    auto nulls  = copy_column_to_host<bool>(a_null->view(), stream);
+    REQUIRE(nulls == copy_column_to_host<bool>(e_null->view(), stream));
+    auto compare = [&]<typename T>() {
+      stream.sync();
+      auto av = copy_column_to_host<T>(a), ev = copy_column_to_host<T>(e);
+      for (std::size_t row = 0; row < av.size(); ++row) {
+        if (nulls[row]) { continue; }
+        if constexpr (std::is_floating_point_v<T>) {
+          CHECK((av[row] == ev[row] || (std::isnan(av[row]) && std::isnan(ev[row]))));
+          if (av[row] == 0 && ev[row] == 0) {
+            CHECK(std::signbit(av[row]) == std::signbit(ev[row]));
+          }
+        } else {
+          CHECK(av[row] == ev[row]);
+        }
+      }
+    };
+    switch (a.type().id()) {
+      case cudf::type_id::INT64: compare.template operator()<int64_t>(); break;
+      case cudf::type_id::FLOAT64: compare.template operator()<double>(); break;
+      case cudf::type_id::STRING: compare.template operator()<std::string>(); break;
+      default: FAIL("Add a payload comparison for this test type");
+    }
   }
 }
 }  // namespace
 
-TEST_CASE("GPU sampled cuts match the reference for unequal peer-heavy inputs",
+TEST_CASE("GPU merge tiles preserve global order and rows for unequal peer-heavy inputs",
           "[gpu_sampled_merge]")
 {
   auto* space     = get_default_gpu_space();
@@ -231,7 +291,7 @@ TEST_CASE("GPU sampled cuts match the reference for unequal peer-heavy inputs",
       std::sort(input.begin(), input.end());
     }
     // N > R, even for one input; s=1 and incomplete blocks both occur.
-    verify_gpu_cuts(batches, keys, comparison, 1 + trial % 16);
+    verify_gpu_cuts(batches, comparison, 1 + trial % 16);
   }
 }
 
@@ -244,12 +304,6 @@ TEST_CASE("GPU cut ties preserve null NaN and signed-zero SQL equivalence", "[gp
                                                        {nan, std::nullopt, 0.0, -1.0, 2.0},
                                                        {std::nullopt, nan, 0.0},
                                                        {}};
-  auto less = [](auto a, auto b) {
-    if (a.has_value() != b.has_value()) { return a.has_value(); }
-    if (!a) { return false; }
-    if (std::isnan(*a) != std::isnan(*b)) { return !std::isnan(*a); }
-    return *a < *b;
-  };
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   for (auto& input : keys) {
     std::vector<double> values;
@@ -260,9 +314,8 @@ TEST_CASE("GPU cut ties preserve null NaN and signed-zero SQL equivalence", "[gp
     }
     batches.push_back(
       make_numeric_batch_with_nulls<double>(*space, values, valid, cudf::type_id::FLOAT64));
-    std::sort(input.begin(), input.end(), less);
   }
-  verify_gpu_cuts(batches, keys, comparison, 3, less);
+  verify_gpu_cuts(batches, comparison, 3);
 }
 
 TEST_CASE("GPU samples select hidden string keys and use mixed key directions",
@@ -277,26 +330,11 @@ TEST_CASE("GPU samples select hidden string keys and use mixed key directions",
     batches.push_back(make_two_column_batch<int64_t, std::string>(
       *space, numbers[i], strings[i], cudf::type_id::STRING));
   }
-  auto hidden         = make_comparison({1}, {duckdb::OrderType::DESCENDING}, 2);
-  auto sorted_strings = strings;
-  for (auto& input : sorted_strings) {
-    std::sort(input.begin(), input.end(), std::greater<std::string>{});
-  }
-  verify_gpu_cuts(batches, sorted_strings, hidden, 3, std::greater<std::string>{});
+  auto hidden = make_comparison({1}, {duckdb::OrderType::DESCENDING}, 2);
+  verify_gpu_cuts(batches, hidden, 3);
   auto mixed =
     make_comparison({0, 1}, {duckdb::OrderType::ASCENDING, duckdb::OrderType::DESCENDING}, 2);
-  using key = std::pair<int64_t, std::string>;
-  std::vector<std::vector<key>> keys(numbers.size());
-  auto less = [](key const& a, key const& b) {
-    return a.first < b.first || (a.first == b.first && a.second > b.second);
-  };
-  for (std::size_t i = 0; i < numbers.size(); ++i) {
-    for (std::size_t j = 0; j < numbers[i].size(); ++j) {
-      keys[i].emplace_back(numbers[i][j], strings[i][j]);
-    }
-    std::sort(keys[i].begin(), keys[i].end(), less);
-  }
-  verify_gpu_cuts(batches, keys, mixed, 3, less);
+  verify_gpu_cuts(batches, mixed, 3);
 }
 
 TEST_CASE("GPU samples retain 64-bit input IDs and omit incomplete blocks", "[gpu_sampled_merge]")
@@ -353,8 +391,7 @@ TEST_CASE("one-pass coalescing preserves sorted rows and forwards large singleto
         std::vector<int64_t>{1, 4, 7, 8});
   CHECK(copy_column_to_host<int64_t>(sirius::get_cudf_table_view(*output[1]).column(0)) ==
         std::vector<int64_t>{0, 2, 6, 9});
-  verify_gpu_cuts<int64_t>(
-    output, {{1, 4, 7, 8}, {0, 2, 6, 9}, std::vector<int64_t>(100, 10)}, comparison, 16);
+  verify_gpu_cuts(output, comparison, 16);
 }
 
 TEST_CASE("coalescing qualifies tiny caps and ordinary row sizing with wide keys",
@@ -543,14 +580,25 @@ TEST_CASE("full-row samples fit the original reservation without a sorted-key co
     stream.sync();
   }
   tracker->reset_peak_allocated_bytes(stream);
-  auto splitters   = sm::order_sample_splitters(views, p.sample_step, comparison, stream, mr);
-  auto ids         = copy_column_to_host<uint64_t>(splitters->view().column(1), stream);
-  auto sample_rows = copy_column_to_host<uint64_t>(splitters->view().column(2), stream);
-  REQUIRE(ids.size() == k * rows / p.sample_step);
-  for (std::size_t t = 0; t < ids.size(); ++t) {
-    CHECK(ids[t] == t / (rows / p.sample_step));
-    CHECK(sample_rows[t] == (t % (rows / p.sample_step) + 1) * p.sample_step - 1);
+  auto splitters = sm::order_sample_splitters(views, p.sample_step, comparison, stream, mr);
+  std::vector<uint64_t> tile_rows(splitters->num_rows() + 1, 0);
+  for (uint64_t i = 0; i < k; ++i) {
+    auto batch = make_string_batch(*space, std::vector<std::string>(rows, std::string(width, 'x')));
+    auto ro    = batch->to_read_only();
+    auto cuts  = sm::discover_cuts(
+      sirius::get_cudf_table_view(ro), i, splitters->view(), comparison, stream, mr);
+    auto offsets = copy_column_to_host<cudf::size_type>(cuts->view(), stream);
+    offsets.insert(offsets.begin(), 0);
+    offsets.push_back(rows);
+    REQUIRE(std::is_sorted(offsets.begin(), offsets.end()));
+    REQUIRE(offsets.front() == 0);
+    REQUIRE(offsets.back() == rows);
+    for (std::size_t t = 0; t < tile_rows.size(); ++t) {
+      tile_rows[t] += offsets[t + 1] - offsets[t];
+    }
   }
+  CHECK(std::accumulate(tile_rows.begin(), tile_rows.end(), uint64_t{0}) == k * rows);
+  CHECK(*std::max_element(tile_rows.begin(), tile_rows.end()) <= row_limit);
   stream.sync();
   std::cout << "sampled_merge_capacity_limit stride=" << p.stride << " fan_in=" << k
             << " source_rows=" << rows << " sample_rows=" << k * rows
