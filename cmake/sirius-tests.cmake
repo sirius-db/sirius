@@ -1,5 +1,19 @@
 find_package(Catch2 3 REQUIRED CONFIG)
 
+# The sampled-cut proof has no GPU dependency. Keep it runnable on build hosts
+# without a CUDA driver as well as in the ordinary unit-test executable.
+add_executable(sirius_sampled_merge_reference_test
+               test/cpp/operator/test_sampled_merge.cpp)
+target_compile_features(sirius_sampled_merge_reference_test PRIVATE cxx_std_20)
+set_target_properties(
+  sirius_sampled_merge_reference_test
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF RUNTIME_OUTPUT_DIRECTORY
+                                      "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+target_include_directories(sirius_sampled_merge_reference_test PRIVATE src
+                                                                       test/cpp)
+target_link_libraries(sirius_sampled_merge_reference_test
+                      PRIVATE Catch2::Catch2WithMain)
+
 add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                test/cpp/utils/sirius_extension_loader.cpp)
 # Export DuckDB's host API for third-party extensions such as Iceberg.
