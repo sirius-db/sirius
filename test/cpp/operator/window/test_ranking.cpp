@@ -425,7 +425,6 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
       return evaluate_ranking_window(input->view(), partitions, order, functions, stream, mr);
     };
     CHECK_THROWS_AS(call({0}, spec, {}), std::invalid_argument);
-    CHECK_THROWS_AS(call({}, spec, {ranking_function::rank}), std::invalid_argument);
     CHECK_THROWS_AS(call({7}, spec, {ranking_function::rank}), std::invalid_argument);
     CHECK_THROWS_AS(call({0}, ranking_order{}, {ranking_function::rank}), std::invalid_argument);
     spec.columns = {-1};
@@ -436,6 +435,54 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
     spec.columns = {1};
     spec.directions.clear();
     CHECK_THROWS_AS(call({0}, spec, {ranking_function::rank}), std::invalid_argument);
+  }
+}
+
+TEST_CASE("ranking evaluator ranks a window without partition columns",
+          "[window_evaluator][window_ranking][gpu]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  REQUIRE_FALSE(con.Query(create_table)->HasError());
+  rmm::cuda_stream owning_stream;
+  auto stream      = owning_stream.view();
+  auto mr          = cudf::get_current_device_resource_ref();
+  auto input       = make_input(stream, mr);
+  auto const order = GENERATE(
+    direction{
+      "ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST},
+    direction{"ASC NULLS LAST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST},
+    direction{
+      "DESC NULLS FIRST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_FIRST},
+    direction{
+      "DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST});
+  INFO(order.sql);
+
+  SECTION("rank and dense_rank over one order key")
+  {
+    auto result = evaluate_ranking_window(input->view(),
+                                          {},
+                                          make_order({1}, {order}),
+                                          {ranking_function::rank, ranking_function::dense_rank},
+                                          stream,
+                                          mr);
+    check_against_duckdb(
+      con, std::string("ORDER BY v ") + order.sql, result->view(), {"rank", "dense_rank"}, stream);
+  }
+  SECTION("row_number with the id column breaking every tie")
+  {
+    auto result = evaluate_ranking_window(input->view(),
+                                          {},
+                                          make_order({1, 3}, {order, order}),
+                                          {ranking_function::row_number},
+                                          stream,
+                                          mr);
+    check_against_duckdb(con,
+                         std::string("ORDER BY v ") + order.sql + ", id " + order.sql,
+                         result->view(),
+                         {"row_number"},
+                         stream);
   }
 }
 

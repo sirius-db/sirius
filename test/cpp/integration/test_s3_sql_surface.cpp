@@ -2755,8 +2755,9 @@ TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
 
   s3_sql_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
-  auto const s3_query = "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn FROM " +
-                        s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  auto const s3_query =
+    "SELECT n_nationkey, PERCENT_RANK() OVER (ORDER BY n_nationkey) AS pr FROM " +
+    s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
   auto result = fixture.con.Query(s3_query);
   REQUIRE(result);
   REQUIRE(result->HasError());
@@ -2806,7 +2807,7 @@ TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU"
                   ->HasError());
 
   auto result = fixture.con.Query(
-    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
+    "SELECT n_nationkey, PERCENT_RANK() OVER (ORDER BY n_nationkey) AS pr "
     "FROM v_s3_nation ORDER BY n_nationkey");
   REQUIRE(result);
   REQUIRE(result->HasError());
@@ -3510,7 +3511,7 @@ TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
   } reset{*context};
 
   auto const query =
-    "SELECT n_nationkey, row_number() OVER (ORDER BY n_nationkey) "
+    "SELECT n_nationkey, percent_rank() OVER (ORDER BY n_nationkey) "
     "FROM explicit_remote_view";
   SECTION("plan generation fails") {}
   SECTION("window entry fails")

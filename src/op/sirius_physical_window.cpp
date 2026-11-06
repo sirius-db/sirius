@@ -76,7 +76,7 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
   auto const valid_slot = [&](cudf::size_type slot) {
     return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
   };
-  if (_ranking_functions.empty() || _partition_columns.empty() || _ranking_order.columns.empty() ||
+  if (_ranking_functions.empty() || _ranking_order.columns.empty() ||
       _ranking_order.directions.size() != _ranking_order.columns.size() ||
       _ranking_order.nulls.size() != _ranking_order.columns.size() ||
       !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
