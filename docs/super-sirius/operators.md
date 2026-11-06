@@ -646,13 +646,13 @@ After the FULL producer barrier, the operator snapshots each range's contributio
 Oversized contributions are normalized into owning pieces by row subdivision. Small
 contributions are grouped in fixed order toward `sort_chunk_bytes` and merged with
 `cudf::merge`; singleton groups pass through. This is one coalescing pass, not repeated
-merging toward a single run. Exhausted restoration/allocation failures can split
-groups further; cold admission estimates do not split them. Contribution ordinals
+merging toward a single run. Neither exhausted attempts nor cold admission estimates
+change the planned groups. Contribution ordinals
 are assigned after coalescing completes, independently of task completion order.
 
 The operator chooses `R = max(1, min(native_rows, chunk_bytes / ceil_average_row_bytes))`
-from decoded-size metadata. Child regions additionally cap `R` at half their parent's
-rows. This target is independent of the cold admission multiplier. For `k` nonempty contributions,
+from decoded-size metadata. This target is independent of the cold admission multiplier.
+For `k` nonempty contributions,
 regular sampling uses:
 
 ```text
@@ -696,7 +696,7 @@ without gaps.
 
 Extraction copies nonempty input slices into independently owned tile pieces. A borrowed
 suffix would retain the entire source allocation, defeating bounded restoration. The
-initial implementation waits for all extraction work in a region before merging its
+coordinator waits for all extraction work in a range before merging its
 tiles; it verifies coverage and row limits before retiring sources and splitter pages.
 
 Each tile runs one n-ary `cudf::merge`, or forwards a single owning piece.
@@ -769,7 +769,7 @@ it must not replay an already partially published task. Cancellation uses normal
 gates, task draining and repository retirement.
 
 Capacity is not guaranteed for arbitrary input distributions. Sample ordering still
-assembles all samples for a region; when `s=1`, every key is sampled. Coalescing reduces
+assembles all samples for a range; when `s=1`, every key is sampled. Coalescing reduces
 fragmentation-driven fan-in, but extreme skew can still exceed sample memory or native
 limits. The implementation reports an error rather than selecting another merge engine.
 `merge_cold_peak_estimate()` supplies the ordinary estimator only; it is not a feasibility

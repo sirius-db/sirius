@@ -46,18 +46,12 @@ class injected_merge : public sirius_physical_merge_sort {
   using sirius_physical_merge_sort::sirius_physical_merge_sort;
   bool fail_compute{false};
   std::function<void()> before_compute;
-  std::size_t attempts{0}, publications{0}, preparation_recoveries{0};
+  std::size_t attempts{0}, publications{0};
   bool reject_completion{false};
   void notify_task_attempt(operator_data& data, task_attempt_context attempt) override
   {
     ++attempts;
     sirius_physical_merge_sort::notify_task_attempt(data, attempt);
-  }
-  std::unique_ptr<operator_data> recover_preparation_failure(operator_data const& data,
-                                                             task_attempt_context attempt) override
-  {
-    ++preparation_recoveries;
-    return sirius_physical_merge_sort::recover_preparation_failure(data, attempt);
   }
   void on_task_output_published(operator_data const& output) override
   {
@@ -239,8 +233,7 @@ struct tiled_fixture {
 };
 }  // namespace
 
-TEST_CASE("independent tiled merges publish ordered ranges after all leaves finish",
-          "[tiled_merge]")
+TEST_CASE("independent tiled merges publish ordered ranges after all tiles finish", "[tiled_merge]")
 {
   tiled_fixture f;
   f.input->set_num_partitions(5);
@@ -621,7 +614,7 @@ TEST_CASE("cold estimates do not refuse fitting order or coalescing tasks", "[ti
   options.gpu_reservation_fraction = 0.0625;  // 32 KiB: below even the cold estimate's base
   tiled_fixture f(1, options);
   f.merge.chunk_bytes = chunk;
-  // A planner default larger than the selected GPU must not prevent exhausted recovery.
+  // A large planner allowance must not replace the selected GPU's attainable ceiling.
   f.merge.reservation_limit = std::numeric_limits<std::size_t>::max();
   auto* tracker =
     f.gpu->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
@@ -662,17 +655,14 @@ namespace {
 struct allocation_fault {
   int remaining{-1};
   std::function<bool()> fail_when;
-  std::size_t failures{0}, successes{0};
+  std::size_t failures{0};
   void before()
   {
     if (remaining == 0 || (fail_when && fail_when())) {
       ++failures;
       throw rmm::out_of_memory("injected tiled allocation");
     }
-    if (remaining > 0) {
-      --remaining;
-      ++successes;
-    }
+    if (remaining > 0) { --remaining; }
   }
 };
 // Interpose below the ordinary reservation tracker; task/runtime code is unchanged.
@@ -754,8 +744,6 @@ std::unique_ptr<operator_data> reach_work(tiled_fixture& f, std::string const& w
       kind = "extract";
     } else if (in_repo(f, "sort_tile_pieces", id)) {
       kind = "merge";
-    } else if (batches.size() == 1 && !f.repo("sort_tile_splitters")->all_empty()) {
-      kind = "copy_fragment";
     } else if (batches.size() > 1) {
       kind = "coalesce";
     } else if (sirius::get_batch_rows_and_bytes(*batches.front()).bytes > f.merge.chunk_bytes) {
@@ -775,6 +763,8 @@ TEST_CASE("exhausted preparation failures terminate source restoration without i
           "[tiled_merge]")
 {
   auto kind  = GENERATE(std::string("normalize"),
+                       std::string("coalesce"),
+                       std::string("merge"),
                        std::string("sample"),
                        std::string("order_samples"),
                        std::string("extract"),
@@ -786,6 +776,7 @@ TEST_CASE("exhausted preparation failures terminate source restoration without i
   f.add({1, 3});
   f.add({2, 4});
   if (kind == "normalize") { f.merge.chunk_bytes = 8; }
+  if (kind == "coalesce") { f.merge.chunk_bytes = 32; }
   auto data    = reach_work(f, kind);
   auto sources = dynamic_cast<pipelineable_operator_data const&>(*data).get_data_batches();
   spill_tiled_inputs(f);
@@ -850,8 +841,7 @@ TEST_CASE("an exhausted one-row copy reports its actual allocation boundary", "[
   CHECK_FALSE(f.merge.all_ports_empty());
 }
 
-TEST_CASE("single-piece preparation failure terminates without recursive refinement",
-          "[tiled_merge]")
+TEST_CASE("single-piece preparation failure terminates at the attempt ceiling", "[tiled_merge]")
 {
   auto fault = std::make_shared<allocation_fault>();
   tiled_fixture f(1, fault_options(fault));
