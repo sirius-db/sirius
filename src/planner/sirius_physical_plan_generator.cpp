@@ -78,6 +78,7 @@
 #include "op/sirius_physical_union.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/mark_join_conversion.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
@@ -2393,6 +2394,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
+
+  // Before binding resolution: a MARK join under FILTER(mark) / FILTER(NOT mark) becomes SEMI /
+  // ANTI so it can publish dynamic filters (DuckDB's own conversion is off in delim CTE plans).
+  sirius::planner::convert_mark_joins(context, op);
 
   {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();

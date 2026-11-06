@@ -9,6 +9,7 @@ target_sources(
           dynamic_filter/dynamic_filter_target_discovery.cpp
           gpu_admission.cpp
           join_key_nullability.cpp
+          mark_join_conversion.cpp
           query.cpp
           query_index.cpp
           scan_column_origin.cpp

@@ -124,7 +124,11 @@ class scoped_temp_db_path {
 /// rolling back and restoring the optimizer settings) so a planner regression fails the
 /// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
-  Connection& con, const std::string& query, const std::vector<OptimizerType>& also_disabled = {})
+  Connection& con,
+  const std::string& query,
+  const std::vector<OptimizerType>& also_disabled = {},
+  bool pre_resolve                                = true,
+  std::string* logical_plan_text                  = nullptr)
 {
   auto& context = *con.context;
 
@@ -158,13 +162,17 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    plan->ResolveOperatorTypes();
+    // Production hands the generator an unresolved plan; the MARK-join conversion needs that.
+    if (pre_resolve) {
+      plan->ResolveOperatorTypes();
 
-    ColumnBindingResolver resolver;
-    duckdb::ColumnBindingResolver verifier(true);
-    verifier.VisitOperator(*plan);
-    resolver.VisitOperator(*plan);
+      ColumnBindingResolver resolver;
+      duckdb::ColumnBindingResolver verifier(true);
+      verifier.VisitOperator(*plan);
+      resolver.VisitOperator(*plan);
+    }
 
+    if (logical_plan_text) { *logical_plan_text = plan->ToString(); }
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));
   } catch (...) {
@@ -1037,6 +1045,56 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
   REQUIRE(dedup_builds > 0);
   require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - an IN subquery under a delim CTE plans as a SEMI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // TPC-H Q20 shape: an IN predicate inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  for (auto* node : joins) {
+    CHECK(node->Cast<sirius::op::sirius_physical_hash_join>().join_type != duckdb::JoinType::MARK);
+  }
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - MARK joins DuckDB keeps are not converted under a delim CTE",
+                 "[plan_tree_shape][isolated_context][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // Each query holds a delim CTE (so the conversion pass is active) and a MARK join whose mark
+  // is not a bare filter: it is projected, or negated over keys that are not null-safe.
+  auto const sql = GENERATE(
+    std::string("SELECT p.pk, p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
+                "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk)) FROM parts p"),
+    std::string("SELECT p.pk FROM parts p WHERE p.pk NOT IN (SELECT i.fk FROM items i "
+                "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"));
+  INFO(sql);
+  auto plan = generate_sirius_plan(*con, sql, /*also_disabled=*/{}, /*pre_resolve=*/false);
+  INFO(tree_to_string(plan.get()));
+
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  CHECK(std::any_of(joins.begin(), joins.end(), [](auto* node) {
+    return node->template Cast<sirius::op::sirius_physical_hash_join>().join_type ==
+           duckdb::JoinType::MARK;
+  }));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
