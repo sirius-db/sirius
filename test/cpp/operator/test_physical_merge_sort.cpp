@@ -21,6 +21,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_merge_sort.hpp>
 #include <op/sirius_physical_order.hpp>
+#include <op/sirius_physical_sort_partition.hpp>
 
 using namespace sirius::op;
 using sirius::op::operator_data;
@@ -463,4 +464,60 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
     *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
+}
+
+TEST_CASE("sort range publication retains holes and merge claims destination positions",
+          "[physical_merge_sort][ordering]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::BIGINT, duckdb::OrderType::ASCENDING));
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
+  sirius_physical_merge_sort merge(types, std::move(orders), {0}, 8);
+  sirius_physical_sort_partition partition(types, {}, {0}, 8);
+  cucascade::data_repository repo;
+  merge.add_port("default",
+                 std::make_unique<sirius_physical_operator::port>(
+                   MemoryBarrierType::FULL, &repo, nullptr, nullptr));
+  partition.add_next_port_after_sink({&merge, "default"});
+  // Empty ranges 0 and 2 must not shift the nonempty range indices.
+  auto a = make_1col_batch(*space, {1, 3});
+  auto b = make_1col_batch(*space, {2, 4});
+  auto c = make_1col_batch(*space, {9, 10});
+  partition.sink(sort_partition_output({c, a}, {3, 1}), cudf::get_default_stream());
+  partition.sink(sort_partition_output({b}, {1}), cudf::get_default_stream());
+  REQUIRE(repo.size(0) == 0);
+  REQUIRE(repo.size(1) == 2);
+  REQUIRE(repo.size(2) == 0);
+  REQUIRE(repo.size(3) == 1);
+  auto first  = merge.get_next_task_input_data();
+  auto second = merge.get_next_task_input_data();
+  REQUIRE(first);
+  REQUIRE(second);
+  REQUIRE_FALSE(merge.get_next_task_input_data());
+  REQUIRE(dynamic_cast<pipelineable_operator_data&>(*first).get_position() == 1);
+  REQUIRE(dynamic_cast<pipelineable_operator_data&>(*second).get_position() == 3);
+  auto later   = merge.execute(*second, cudf::get_default_stream());
+  auto earlier = merge.execute(*first, cudf::get_default_stream());
+  REQUIRE(dynamic_cast<pipelineable_operator_data&>(*later).get_position() == 3);
+  auto& earlier_data = dynamic_cast<pipelineable_operator_data&>(*earlier);
+  REQUIRE(earlier_data.get_position() == 1);
+  auto table = sirius::get_cudf_table_view(*earlier_data.get_data_batches().front());
+  REQUIRE(copy_column_to_host<int64_t>(table.column(0)) == std::vector<int64_t>{1, 2, 3, 4});
+  // Completion order must not become logical order when the merge sink publishes.
+  cucascade::data_repository output_repo;
+  sirius_physical_merge_sort destination(types, {}, {0}, 8);
+  destination.add_port("default",
+                       std::make_unique<sirius_physical_operator::port>(
+                         MemoryBarrierType::FULL, &output_repo, nullptr, nullptr));
+  merge.add_next_port_after_sink({&destination, "default"});
+  merge.sink(*later, cudf::get_default_stream());
+  merge.sink(*earlier, cudf::get_default_stream());
+  REQUIRE(output_repo.get_ordering() == cucascade::data_repository_ordering::ORDERED);
+  REQUIRE(output_repo.get_positions() == std::vector<std::size_t>{1, 3});
+  REQUIRE(output_repo.pop_data_batch_by_position(1) == earlier_data.get_data_batches().front());
+  REQUIRE(output_repo.pop_data_batch_by_position(3) ==
+          dynamic_cast<pipelineable_operator_data&>(*later).get_data_batches().front());
 }

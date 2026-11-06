@@ -34,6 +34,11 @@ namespace op {
 //! `sirius_physical_partition_consumer_operator`.
 class sirius_physical_passthrough_sink : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::PASSTHROUGH_SINK;
 

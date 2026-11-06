@@ -257,6 +257,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_gpu_values.cpp
+    test/cpp/operator/test_output_order.cpp
     test/cpp/operator/test_physical_limit.cpp
     test/cpp/operator/test_physical_mark_join.cpp
     test/cpp/operator/test_physical_single_join.cpp

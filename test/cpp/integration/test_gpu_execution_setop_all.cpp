@@ -227,6 +227,9 @@ TEST_CASE_METHOD(SetOpAllFixture,
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM (SELECT k, v FROM shot INTERSECT ALL "
     "SELECT k, v FROM shot WHERE k = 7 OR k < 10) t");
+  compare_gpu_vs_cpu(
+    "SELECT k + 1 FROM (SELECT k FROM shot WHERE k = 7 EXCEPT ALL SELECT k FROM sb) t "
+    "LIMIT 13 OFFSET 7");
 }
 
 TEST_CASE_METHOD(

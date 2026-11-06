@@ -17,6 +17,7 @@
 #include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -102,12 +103,12 @@ mark_join_fixture create_mark_join(
   f.logical_join->types = {
     duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
 
-  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
                                                                 duckdb::LogicalType::INTEGER}),
     0);
-  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
@@ -169,12 +170,12 @@ nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
     f.logical_join->types = {duckdb::LogicalType::INTEGER};
   }
 
-  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
       duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER}),
     0);
-  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
@@ -211,12 +212,12 @@ nlj_projection_fixture create_projected_nlj_two_cond(duckdb::ExpressionType comp
   f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
   f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
 
-  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
       duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER}),
     0);
-  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
                                                                 duckdb::LogicalType::INTEGER}),
@@ -398,7 +399,7 @@ TEST_CASE("MARK join drains probe batches when its build pipeline emits no batch
   auto f          = create_mark_join();
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -488,7 +489,7 @@ TEST_CASE("MARK join runs an orphan task issued before the empty-build latch",
   auto f          = create_mark_join();
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -731,12 +732,12 @@ TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupporte
   logical_join->types = {
     duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
 
-  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
                                                                 duckdb::LogicalType::INTEGER}),
     0);
-  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
@@ -1267,7 +1268,7 @@ TEST_CASE(
   auto f          = create_mark_join();
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -1383,7 +1384,7 @@ TEST_CASE(
   auto f          = create_mark_join();
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -1758,7 +1759,7 @@ TEST_CASE("Nested-loop floating comparisons follow DuckDB NaN and NULL semantics
   };
   auto const type = single_precision ? LogicalType::FLOAT : LogicalType::DOUBLE;
   auto child      = [&] {
-    return duckdb::make_uniq<sirius_physical_operator>(
+    return duckdb::make_uniq<test_physical_operator>(
       SiriusPhysicalOperatorType::PROJECTION,
       sirius::from_duckdb_vec(duckdb::vector<LogicalType>{type, LogicalType::INTEGER}),
       domain.size());

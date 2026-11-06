@@ -12,6 +12,7 @@
   ],
   "license": "LGPL-2.1-only",
   "name": "numactl",
+  "port-version": 1,
   "supports": "linux",
   "version": "2.0.19"
 }

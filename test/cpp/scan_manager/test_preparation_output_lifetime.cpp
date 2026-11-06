@@ -457,6 +457,11 @@ struct gpu_reader_input : sirius::op::operator_data {
 };
 
 struct delayed_copy_operator : sirius::op::sirius_physical_operator {
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   gpu_read_hold& hold;
   void* device;
   size_t offset;
@@ -667,7 +672,7 @@ void check_gpu_backing_retirement(std::array<int, 2> devices)
         rmm::cuda_set_device_raii device{rmm::cuda_device_id{devices[i]}};
         delayed_copy_operator op(gpu.holds[i], gpu.buffers[i], i * 16, fail, gpu.events[i]);
         auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
-          sirius::pipeline::pipeline_build_context{nullptr, true});
+          sirius::pipeline::pipeline_build_context{nullptr});
         pipeline->set_pipeline_id(i + 1);
         sirius::pipeline::sirius_pipeline_build_state build;
         build.set_pipeline_source(*pipeline, op);
