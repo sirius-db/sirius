@@ -40,6 +40,7 @@
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -322,6 +323,64 @@ TEST_CASE("distribute_plan broadcasts a small build and hashes a large one", "[e
       REQUIRE(sink_below(*side));
       CHECK(sink_below(*side)->spec().routing == exchange_spec::mode::hash);
     }
+  }
+}
+
+TEST_CASE("distribute_plan has a merged join's build CONCAT close its publication",
+          "[exchange][planner]")
+{
+  fixture f;
+  // Filtered builds: a build that covers its whole key domain publishes no filter. Both sides
+  // alike, so on 3 ranks the build is too large to broadcast.
+  auto const hashed =
+    std::string{"SELECT b.v, c.v FROM big b JOIN big2 c ON b.k = c.k WHERE b.v < 5 AND c.v < 5"};
+  auto const broadcast =
+    std::string{"SELECT b.v FROM big b JOIN small s ON b.k = s.k WHERE s.v < 5"};
+  /// Freezes @p join's targets, as execution does, finalizes its build CONCAT, and returns whether
+  /// every target then expects no more filters.
+  auto const closed_by_build_finalize = [](sirius_physical_operator& node) {
+    auto& join          = node.Cast<sirius::op::sirius_physical_hash_join>();
+    auto const& targets = join.dynamic_filter_plan().probe_targets();
+    REQUIRE_FALSE(targets.empty());
+    for (auto const& target : targets) {
+      target.filter_set->freeze_registration();
+      REQUIRE_FALSE(target.filter_set->snapshot().terminal());
+    }
+    join.children.at(1)->finalize_operator();
+    return std::ranges::all_of(
+      targets, [](auto const& target) { return target.filter_set->snapshot().terminal(); });
+  };
+
+  SECTION("a hashed join that merges its filters closes at its build's finalize")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, hashed, 3);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
+    for (auto& p : plans) {
+      auto* join = find(*p, T::HASH_JOIN);
+      REQUIRE(join);
+      REQUIRE(
+        join->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().distributed());
+      CHECK(closed_by_build_finalize(*join));
+    }
+  }
+
+  SECTION("a broadcast join, and a plan for one process, wait for the join's own finalize")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, broadcast, 2);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(2));
+    auto* broadcast_join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(broadcast_join);
+    auto [probe, build] = join_sides(*broadcast_join);
+    REQUIRE(sink_below(*build));
+    REQUIRE(sink_below(*build)->spec().routing == exchange_spec::mode::broadcast);
+    CHECK_FALSE(closed_by_build_finalize(*broadcast_join));
+
+    auto local = f.lowered(hashed);
+    auto* join = find(*local, T::HASH_JOIN);
+    REQUIRE(join);
+    CHECK_FALSE(closed_by_build_finalize(*join));
   }
 }
 

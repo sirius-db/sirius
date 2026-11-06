@@ -18,7 +18,6 @@
 
 #include "data/data_batch_utils.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "telemetry/nvtx.hpp"
 
@@ -251,16 +250,6 @@ std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
 {
   if (stats.num_batches <= 1) { return 0; }
   return stats.bytes;
-}
-
-void sirius_physical_concat::on_finalize_operator()
-{
-  auto* join = get_parent_op();
-  if (join == nullptr || join->type != SiriusPhysicalOperatorType::HASH_JOIN ||
-      join->input_port_for(*this) != "build") {
-    return;
-  }
-  join->Cast<sirius_physical_hash_join>().on_build_input_finished();
 }
 
 }  // namespace op

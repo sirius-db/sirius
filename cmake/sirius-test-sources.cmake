@@ -320,6 +320,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_window_plan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
+    test/cpp/pipeline/test_finalize_listeners.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_in_task_publication.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp

@@ -260,7 +260,7 @@ BUILD_FILTER stage in distributed mode (`distribute_plan()` removes it), so they
 A rank with an empty build still merges, contributing an empty Bloom. A rank
 that never saw a whole build joins each key's all-gather without a filter, so the others drop
 that key at once instead of waiting out the timeout. It does so as soon as its build side ends
-(the build `CONCAT` closes the join's publication), before its probe side runs, and without
+(a finalize listener on the build `CONCAT` closes the join's publication), before its probe side runs, and without
 waiting (`leave_all_gather`): a rank holding build rows holds its probe side until the merge
 completes, and that probe side may be what the other rank's probe waits on.
 
