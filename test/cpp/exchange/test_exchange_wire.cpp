@@ -83,7 +83,9 @@ column_metadata string_column(std::size_t chars_offset, std::size_t chars, std::
 batch_header columns_batch()
 {
   batch_header b;
-  b.rows         = rows;
+  b.rows = rows;
+  // At 256-byte alignment: the 128-byte null mask at 0, 8000 data bytes at 256, 5000 chars at
+  // 8448 (256 + 8000 rounded up), then the 1001 offsets at 13568 (8448 + 5000 rounded up).
   b.columns      = {int64_column(256, true, 0), string_column(8448, 5000, 13568)};
   b.stream_bytes = 13568 + (rows + 1) * 4;
   return b;
@@ -393,16 +395,21 @@ TEST_CASE("plan_stream lays a table out aligned, in walk order", "[exchange][wir
   REQUIRE(meta.size() == 3);
   CHECK(meta[0].has_null_mask);
   CHECK(meta[0].null_mask_offset == 0);
-  CHECK(meta[0].data_offset == 256);
+  CHECK(meta[0].data_offset == stream_alignment);
   CHECK(meta[0].data_size == 40);
   CHECK(meta[1].data_size == 11);
   CHECK(meta[1].children.size() == 1);
   CHECK(meta[1].children[0].num_rows == 11);
   CHECK(meta[2].scale == -2);
   CHECK_FALSE(meta[2].has_null_mask);
-  for (auto const& b : stream_map(meta)) {
+  auto const walk = stream_map(meta);
+  for (auto const& b : walk) {
     CHECK(b.offset % stream_alignment == 0);
     CHECK(b.offset + b.size <= bytes);
+  }
+  // Disjoint, in walk order.
+  for (std::size_t i = 1; i < walk.size(); ++i) {
+    CHECK(walk[i].offset >= walk[i - 1].offset + walk[i - 1].size);
   }
   CHECK(stream_sources(table.view(), meta).size() == stream_map(meta).size());
 
