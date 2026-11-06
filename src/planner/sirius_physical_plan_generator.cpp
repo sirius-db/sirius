@@ -96,11 +96,9 @@
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -221,63 +219,6 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-}  // namespace
-
-void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
-                          std::vector<std::string> files,
-                          const sirius::operator_params& op_params)
-{
-  if (!op_params.distributed()) {
-    info.resolved_file_paths = std::move(files);
-    return;
-  }
-  // A rank numbers the files of its own share from 0, so their index and a filter on their name
-  // would mean different files on different ranks.
-  using kind              = sirius::op::scan::scan_plan::parquet_virtual_column_kind;
-  auto const names_a_file = [&](auto const& column) {
-    return column.HasPrimaryIndex() &&
-           std::any_of(
-             info.virtual_columns.begin(), info.virtual_columns.end(), [&](auto const& v) {
-               return v.column_id == column.GetPrimaryIndex() &&
-                      (v.kind == kind::FILENAME || v.kind == kind::FILE_INDEX);
-             });
-  };
-  if (std::any_of(info.column_ids.begin(), info.column_ids.end(), names_a_file)) {
-    throw sirius::not_implemented_exception(
-      "distributed execution: filename or file_index of a table split across ranks");
-  }
-  auto const world  = op_params.exchange_peers.size();
-  auto const rank   = op_params.exchange_rank;
-  auto const remote = std::any_of(
-    files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
-  if (remote) {
-    // TODO(#2377): split remote files by byte range too, as local ones are.
-    if (files.size() < world) {
-      throw sirius::not_implemented_exception(
-        "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
-        "Split it into at least {} files, or read it from local files, which split by byte range",
-        files.size(),
-        world,
-        world);
-    }
-    for (std::size_t i = rank; i < files.size(); i += world) {
-      info.resolved_file_paths.push_back(std::move(files[i]));
-    }
-    return;
-  }
-  std::vector<std::uint64_t> bytes;
-  bytes.reserve(files.size());
-  for (auto const& f : files) {
-    bytes.push_back(std::filesystem::file_size(f));
-  }
-  for (auto const& r : sirius::planner::byte_ranges_for_rank(bytes, rank, world)) {
-    info.resolved_file_paths.push_back(std::move(files[r.file]));
-    info.resolved_file_ranges.push_back({{r.start, r.length}});
-  }
-}
-
-namespace {
-
 //! Attach the plan-carried byte ranges to the scan's files, claiming each file's ranges from the
 //! per-plan registry. A file keeps ONE entry holding all its ranges: the bound read view requires
 //! one entry per bound file. If the bind kept repeated occurrences of a ranged path, the first
@@ -393,11 +334,6 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
         "has no URI parameter");
-    }
-    // One URI, expanded only when read: nothing splits it, so every rank would read all of it.
-    if (op_params.distributed()) {
-      throw sirius::not_implemented_exception(
-        "distributed execution: read_parquet of one remote URI; every rank would read all of it");
     }
     info->resolved_file_paths = std::move(resolved_file_paths);
   } else {
@@ -1416,6 +1352,7 @@ void lower_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& 
                  ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                  : nullptr;
   if (state) state->record_scan_lowering(scan.contract_id);
+  if (params.distributed()) { check_distributed_scan(scan, *entry, context); }
   slot = entry->lower(scan, params, context, entry->filter_mode);
 }
 
@@ -2099,11 +2036,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
   duckdb::ClientContext& context,
   sirius::op::scan::dynamic_filter_apply_mode mode)
 {
-  // Nothing splits a DuckDB table by rank: every rank would scan all of it.
-  if (op_params.distributed()) {
-    throw sirius::not_implemented_exception(
-      "distributed execution: a DuckDB table; read the table from Parquet files instead");
-  }
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
@@ -2133,11 +2065,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   // The FFI refuses remote LocalFiles inputs before binding, so its registered ranges are local.
   if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
         sirius::planner::scan_byte_ranges_state::kStateKey)) {
-    // attach_byte_ranges would replace this rank's share with the plan's ranges.
-    if (op_params.distributed()) {
-      throw sirius::not_implemented_exception(
-        "distributed execution: a plan that carries its own byte ranges");
-    }
     attach_byte_ranges(*table_info, *byte_ranges);
   }
   return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
