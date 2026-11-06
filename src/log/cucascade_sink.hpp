@@ -20,12 +20,15 @@
 
 namespace sirius::log {
 
-/// Installs, once, a cuCascade log sink that forwards every cuCascade record to
-/// whichever Sirius sink get_sink() returns at the time of the record.
+/// Installs a cuCascade log sink that forwards every cuCascade record, prefixed
+/// `[cucascade] `, to whichever Sirius sink get_sink() returns at the time of
+/// the record.
 ///
-/// Idempotent and thread-safe; set_sink calls it on every swap, so cuCascade's
-/// records always follow the active Sirius sink. It leaves cuCascade's level
-/// threshold untouched; set_cucascade_log_level mirrors the Sirius level into it.
+/// Idempotent and thread-safe: a single bridge is created on first use and
+/// re-installed only if something else took cuCascade's slot since. set_sink
+/// calls it on every swap, so cuCascade's records follow the active Sirius sink.
+/// It leaves cuCascade's level threshold untouched; set_cucascade_log_level
+/// mirrors a Sirius level into it.
 void attach_cucascade_logging();
 
 /// Sets cuCascade's level threshold to `lvl`, so cuCascade skips formatting any

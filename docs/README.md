@@ -223,7 +223,7 @@ If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinne
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
-Messages from the embedded cuCascade library (memory tiers, spilling, I/O) flow through the same sink and are gated by the same log level.
+Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA error reports, and its I/O layer where enabled) flow through the same sink, prefixed `[cucascade]`, and are filtered by the same log level.
 
 Log directory and level can be initialized via environment variables before loading the extension:
 ```bash

@@ -2169,11 +2169,12 @@ void install_configured_log_sink(DatabaseInstance* db)
       SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
     }
   } else if (backend == "noop") {
-    // Mute cuCascade too, so it does not format records the noop sink drops.
-    sirius::log::set_sink(sirius::log::make_noop_sink(), sirius::log::level::off);
+    // The noop sink accepts nothing, so the mirror mutes cuCascade's gate as well.
+    sirius::log::set_sink(sirius::log::make_noop_sink());
   } else if (backend == "duckdb") {
     // Needs a DatabaseInstance; with none, defer and leave the current sink.
-    // cuCascade records are gated by sirius_log_level before DuckDB applies its own level.
+    // DuckDB applies its own level to Sirius and cuCascade records alike; see
+    // duckdb_sink::min_accepted_level.
     if (db) { sirius::log::set_sink(sirius::log::make_duckdb_sink(*db), lvl); }
   } else if (db) {
     // Only report a bad backend on the db path; the db-less call is best-effort

@@ -21,10 +21,14 @@
 #include <cucascade/log/logging.hpp>
 
 #include <memory>
+#include <string>
+#include <string_view>
 
 namespace sirius::log {
 
 namespace {
+
+constexpr std::string_view prefix = "[cucascade] ";
 
 level to_sirius_level(cucascade::log::level lvl)
 {
@@ -67,7 +71,14 @@ class cucascade_forwarding_sink final : public cucascade::log::sink {
     // sink mid-write.
     auto s   = get_sink();
     auto lvl = to_sirius_level(rec.lvl);
-    if (s->should_log(lvl)) { s->log(lvl, rec.location, rec.message); }
+    if (!s->should_log(lvl)) { return; }
+    // Tagged: cuCascade carries files with the same basenames and messages as Sirius's own io
+    // layer, and the spdlog pattern prints only the basename.
+    std::string line;
+    line.reserve(prefix.size() + rec.message.size());
+    line += prefix;
+    line += rec.message;
+    s->log(lvl, rec.location, line);
   }
 };
 

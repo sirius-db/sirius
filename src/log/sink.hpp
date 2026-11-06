@@ -19,6 +19,7 @@
 #include "log/level.hpp"
 
 #include <memory>
+#include <optional>
 #include <source_location>
 #include <string_view>
 
@@ -54,6 +55,14 @@ class sink {
   /// Whether this blocks the current thread until the flush is completed is
   /// implementation-defined.
   virtual bool flush() = 0;
+
+  /// The lowest level this sink currently accepts, or `off` if it accepts nothing; `nullopt` when
+  /// acceptance is decided per record by something the sink does not control (DuckDB's logger).
+  ///
+  /// Mirrored onto the embedded cuCascade library's own gate whenever a sink or level is set, so
+  /// cuCascade never formats a record this sink would drop. The default probes `should_log` from
+  /// trace upward.
+  [[nodiscard]] virtual std::optional<level> min_accepted_level() const;
 };
 
 /// Installs `sink` as the process-wide sink, flushing and releasing the
@@ -62,29 +71,30 @@ class sink {
 /// If `sink` holds a nullptr, this installs a new instance of the no-op sink
 /// instead, such that get_sink() never returns a nullptr.
 ///
-/// cuCascade's log records are forwarded to whichever sink is installed, at
-/// cuCascade's own level threshold; use the overload taking a level to keep the
-/// two in step.
+/// The embedded cuCascade library's log records are forwarded to whichever sink
+/// is installed, and cuCascade's own gate is set from the new sink's
+/// min_accepted_level(), so cuCascade formats only what the sink would keep.
+///
+/// Thread safe; serialized against set_level and the other overload.
 void set_sink(std::shared_ptr<sink> sink);
 
-/// Sets `sink`'s level to `lvl`, installs it as by set_sink(sink), and mirrors
-/// `lvl` into cuCascade's level threshold, so cuCascade formats only the
-/// records `sink` would keep.
+/// Sets `sink`'s level to `lvl` before installing it as by set_sink(sink).
 void set_sink(std::shared_ptr<sink> sink, level lvl);
 
-/// Sets the installed sink's level to `lvl` and mirrors it into cuCascade's
-/// level threshold.
+/// Sets the installed sink's level to `lvl` and re-mirrors its
+/// min_accepted_level() onto cuCascade's gate.
 ///
-/// Thread safe.
+/// Thread safe; serialized against set_sink.
 void set_level(level lvl);
 
 /// Returns the currently installed sink.
 ///
 /// If set_sink is not used before this is called, this returns the no-op sink.
 ///
-/// This function never returns a nullptr, but calling it from a static/global
-/// object's destructor at program exit is undefined behavior because the
-/// backing singleton may be destroyed.
+/// This function never returns a nullptr. The backing state is never destroyed,
+/// so it is safe to call from a static object's destructor at program exit (the
+/// embedded cuCascade library may log from there); the sink returned then is
+/// whatever was last installed.
 std::shared_ptr<sink> get_sink();
 
 }  // namespace sirius::log
