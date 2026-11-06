@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "cudf/compute_column_compat.hpp"
+
 #include <cudf/cudf_utils.hpp>
 
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
@@ -233,7 +235,8 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_e
   cudf::table_view combined_table_view(combined_column_views);
   if (_policy.strategy == expression_evaluator_strategy::AST_JIT) {
     ++_ast_jit_evaluation_count;
-    return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
+    return sirius::cudf_compat::compute_column_jit(
+      combined_table_view, root_expr.get(), _stream, _mr);
   }
   // MATERIALIZE uses a small interpreted AST for floating comparison semantics.
   // Building that AST must not opt a query into the JIT backend.
