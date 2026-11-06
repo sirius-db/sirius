@@ -22,6 +22,8 @@
 #include "operator_test_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
+#include <cudf/concatenate.hpp>
+
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -161,6 +163,8 @@ std::shared_ptr<cucascade::data_batch> probe_batch(std::shared_ptr<cucascade::da
 
 struct probe_result {
   std::unique_ptr<operator_data> output;
+  std::size_t num_batches = 0;
+  std::unique_ptr<cudf::table> merged;  // the output batches' rows, when there are several
   cudf::table_view view;
 };
 
@@ -191,11 +195,23 @@ probe_result run_chunked(chunked_join& f,
   REQUIRE(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches().size() ==
           chunks.size() + 1);
   CHECK(f.build_repo.total_size() == 0);
-  auto output         = f.join->execute(*input, cudf::get_default_stream());
-  auto const& batches = dynamic_cast<pipelineable_operator_data const&>(*output).get_data_batches();
-  REQUIRE(batches.size() == 1);
-  auto view = sirius::get_cudf_table_view(*batches[0]);
-  return {std::move(output), view};
+  probe_result result;
+  result.output = f.join->execute(*input, cudf::get_default_stream());
+  auto const& batches =
+    dynamic_cast<pipelineable_operator_data const&>(*result.output).get_data_batches();
+  REQUIRE_FALSE(batches.empty());
+  result.num_batches = batches.size();
+  if (batches.size() == 1) {
+    result.view = sirius::get_cudf_table_view(*batches[0]);
+    return result;
+  }
+  std::vector<cudf::table_view> views;
+  for (auto const& batch : batches) {
+    views.push_back(sirius::get_cudf_table_view(*batch));
+  }
+  result.merged = cudf::concatenate(views);
+  result.view   = result.merged->view();
+  return result;
 }
 
 std::vector<int32_t> sorted(std::vector<int32_t> values)
@@ -278,6 +294,8 @@ TEST_CASE("chunked BUILD_PROBE INNER join joins every chunk's build rows", "[bui
   auto f      = make_chunked_join(duckdb::JoinType::INNER);
   auto result = run_chunked(
     *f, {int_batch({2, 4}), int_batch({4, 6})}, probe_batch(int_batch({2, 4, 7}), {20, 40, 70}));
+  // One batch per chunk's join, not one concatenated batch.
+  CHECK(result.num_batches == 2);
   // Build key 4 appears once in each chunk, so probe row 4 joins twice, as with one table.
   REQUIRE(result.view.num_columns() == 3);
   CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(0))) ==

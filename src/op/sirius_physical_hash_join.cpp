@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
-#include "cudf/concatenate.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/filling.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
@@ -1922,29 +1921,25 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::probe_chunked_build(
 {
   auto& memory_space = *probe_batch.get_memory_space();
   if (join_type == duckdb::JoinType::INNER) {
-    std::vector<std::unique_ptr<cudf::table>> parts;
-    parts.reserve(slot.chunks.size());
+    // One batch per chunk: concatenating would hold every part twice, and their total can pass
+    // cuDF's row limit even when each part fits. An all-empty result still emits one batch.
+    std::vector<std::shared_ptr<::cucascade::data_batch>> parts;
     for (auto const& chunk : slot.chunks) {
       auto result = chunk.distinct_hash_table
                       ? chunk.distinct_hash_table->inner_join(probe_keys, stream)
                       : chunk.hash_table->inner_join(probe_keys, {}, stream);
-      parts.push_back(gather_join_table(join_type,
-                                        left_full,
-                                        get_cudf_table_view(chunk.build_table.value()),
-                                        lhs_output_columns.col_idxs,
-                                        rhs_output_columns.col_idxs,
-                                        std::move(result.first),
-                                        std::move(result.second),
-                                        stream));
+      auto part   = gather_join_table(join_type,
+                                    left_full,
+                                    get_cudf_table_view(chunk.build_table.value()),
+                                    lhs_output_columns.col_idxs,
+                                    rhs_output_columns.col_idxs,
+                                    std::move(result.first),
+                                    std::move(result.second),
+                                    stream);
+      if (part->num_rows() == 0 && (!parts.empty() || &chunk != &slot.chunks.back())) { continue; }
+      parts.push_back(make_data_batch(std::move(part), memory_space, stream, batch_telemetry()));
     }
-    std::vector<cudf::table_view> views;
-    views.reserve(parts.size());
-    for (auto const& part : parts) {
-      views.push_back(part->view());
-    }
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
-        cudf::concatenate(views, stream), memory_space, stream, batch_telemetry())});
+    return std::make_unique<pipelineable_operator_data>(std::move(parts));
   }
   if (join_type != duckdb::JoinType::MARK && join_type != duckdb::JoinType::SEMI &&
       join_type != duckdb::JoinType::ANTI) {
