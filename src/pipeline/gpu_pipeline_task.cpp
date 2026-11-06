@@ -25,6 +25,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/sirius_physical_merge_sort.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
@@ -339,6 +340,9 @@ std::unique_ptr<op::operator_data> run_one_operator(
   if (stream_status != cudaSuccess)
     throw std::runtime_error(std::string("CUDA stream completion failed: ") +
                              cudaGetErrorName(stream_status));
+  if (op.type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+    SIRIUS_LOG_TRACE("sort.task_wait site=operator_completion, host_waits=1");
+  }
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
@@ -706,6 +710,10 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
+  if (source_op && source_op->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+    source_op->Cast<op::sirius_physical_merge_sort>().note_task_reservation(
+      *local_state._input_data, reservation_bytes);
+  }
 
   auto executor_thread_resource_id = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()};
   if (auto const& h = telemetry::executor_thread_telemetry_state.handle) {
@@ -736,33 +744,52 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
     // is accurate.
     stream.sync();
-  } catch (const rmm::out_of_memory& oom) {
-    auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
-    std::optional<std::size_t> retry_requested_bytes;
-    if (auto const* cc_oom =
-          dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
-      retry_requested_bytes = cc_oom->requested_bytes;
+    if (sink_op && sink_op->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+      SIRIUS_LOG_TRACE("sort.task_wait site=preparation, host_waits=1");
     }
-    auto const live_allocated_bytes = allocator->get_allocated_bytes(stream);
-    local_state.update_retry_reservation_floor_after_oom(
-      reservation_bytes, live_allocated_bytes, retry_requested_bytes);
-    const auto& res_info      = local_state.get_reservation_size_info();
-    auto bytes_to_materialize = res_info->bytes_to_materialize_input;
-    auto input_basis          = res_info->input_basis;
-    // Keep the recorded peak clean of materialization overhead (host/disk upgrades and
-    // cross-GPU clones — prepare's allocations are almost entirely those), consistent with
-    // the success and compute-OOM record paths; the estimator re-adds
-    // bytes_to_materialize_input on top of the history-based estimate.
-    peak_bytes   = peak_bytes > bytes_to_materialize ? peak_bytes - bytes_to_materialize : 0;
-    auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-    global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+  } catch (const rmm::out_of_memory& oom) {
+    // Tiled merge owns a finite subdivision path even when restoring the work
+    // inputs fails before execute(). Keep this strictly before the sink and
+    // commit the subdivision via normal compute/publication/completion below.
+    bool replanned = false;
+    if (source_op && sink_op && source_op.get() == sink_op.get() &&
+        source_op->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+      synchronize_after_exception(stream, pipeline);
+      auto replacement = source_op->Cast<op::sirius_physical_merge_sort>().on_preparation_oom(
+        *local_state._input_data);
+      if (replacement) {
+        local_state._input_data = std::move(replacement);
+        replanned               = true;
+      }
+    }
+    if (!replanned) {
+      auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+      std::optional<std::size_t> retry_requested_bytes;
+      if (auto const* cc_oom =
+            dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+        retry_requested_bytes = cc_oom->requested_bytes;
+      }
+      auto const live_allocated_bytes = allocator->get_allocated_bytes(stream);
+      local_state.update_retry_reservation_floor_after_oom(
+        reservation_bytes, live_allocated_bytes, retry_requested_bytes);
+      const auto& res_info      = local_state.get_reservation_size_info();
+      auto bytes_to_materialize = res_info->bytes_to_materialize_input;
+      auto input_basis          = res_info->input_basis;
+      // Keep the recorded peak clean of materialization overhead (host/disk upgrades and
+      // cross-GPU clones — prepare's allocations are almost entirely those), consistent with
+      // the success and compute-OOM record paths; the estimator re-adds
+      // bytes_to_materialize_input on top of the history-based estimate.
+      peak_bytes   = peak_bytes > bytes_to_materialize ? peak_bytes - bytes_to_materialize : 0;
+      auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+      global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
-    SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
-                     pipeline->get_pipeline_id());
-    throw oom_reschedule_exception(
-      std::move(local_state._input_data),
-      local_state._start_operator_index,
-      std::string("OOM while preparing batches for processing: ") + oom.what());
+      SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
+                       pipeline->get_pipeline_id());
+      throw oom_reschedule_exception(
+        std::move(local_state._input_data),
+        local_state._start_operator_index,
+        std::string("OOM while preparing batches for processing: ") + oom.what());
+    }
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
                      pipeline->get_pipeline_id(),
@@ -878,6 +905,15 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     }
 
     stream.sync();
+    if (sink_op && sink_op->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+      SIRIUS_LOG_TRACE("sort.task_wait site=publication_completion, host_waits=1");
+    }
+    // Commit sort dependencies only after ordinary publication and device
+    // completion. Failed or retried work never reaches this callback.
+    if (output_data && sink_op && sink_op->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+      sink_op->Cast<op::sirius_physical_merge_sort>().on_task_output_published(
+        materialized ? *materialized : *output_data);
+    }
   } catch (...) {
     // output_data and materialized were declared outside this try, so they remain alive until
     // every sink/finalization enqueue on the task stream has quiesced.
@@ -975,6 +1011,15 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
     info.peak_memory_estimate =
       (max_estimate > 0) ? max_estimate : memory::saturating_mul(input_basis, 2);
+  }
+
+  // Explicit input working sets can impose an admission floor. The default
+  // pipelineable input reports only its byte basis and leaves history-based sizing intact.
+  if (input_type == op::operator_data_type::PIPELINEABLE && ls._input_data) {
+    auto floor = ls._input_data->get_estimated_working_set_size_in_bytes();
+    if (floor > input_basis) {
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, floor);
+    }
   }
 
   auto const normal_reservation =

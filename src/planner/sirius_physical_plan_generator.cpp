@@ -41,6 +41,7 @@
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "log/logging.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
@@ -1521,6 +1522,21 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
+std::size_t sort_reservation_limit(duckdb::ClientContext& context)
+{
+  auto limit = std::numeric_limits<std::size_t>::max();
+  auto state = context.registered_state
+                 ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                 : nullptr;
+  if (state && state->is_initialized()) {
+    for (auto* space :
+         state->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      limit = std::min(limit, space->get_max_memory());
+    }
+  }
+  return limit;
+}
+
 //! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
 //! original_input`. Destructive: ORDER_BY's
 //! `projections`/`types` are overwritten with the identity over the input's types so every
@@ -1528,7 +1544,8 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
 //! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                   const sirius::operator_params& op_params)
+                   const sirius::operator_params& op_params,
+                   duckdb::ClientContext& context)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> order_op) {
     auto* order_ptr = &order_op->Cast<sirius::op::sirius_physical_order>();
@@ -1547,6 +1564,17 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     }
     order_ptr->projections = std::move(identity_proj);
     order_ptr->types       = child_types;
+    auto reservation_limit = sort_reservation_limit(context);
+    order_ptr->chunk_bytes = op_params.sort_chunk_bytes;
+    if (!order_ptr->chunk_bytes) {
+      throw sirius::invalid_input_exception("sort_chunk_bytes must be greater than zero");
+    }
+    for (auto const& type : child_types) {
+      if (type.id() == sirius::type_id::STRUCT || type.id() == sirius::type_id::LIST ||
+          type.id() == sirius::type_id::ARRAY) {
+        throw sirius::not_implemented_exception("GPU ORDER BY supports scalar payloads only");
+      }
+    }
 
     auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
       order_ptr,
@@ -1560,7 +1588,8 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     partition->set_sample_op(sample_ptr);
     partition->children.push_back(std::move(sample));
 
-    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
+    auto merge               = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
+    merge->reservation_limit = reservation_limit;
 
     bool is_identity = (original_projections.size() == order_ptr->types.size());
     if (is_identity) {
@@ -1962,7 +1991,9 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
       wrap_ungrouped_aggregate(slot);
       break;
-    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY: wrap_order_by(slot, op_params); break;
+    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY:
+      wrap_order_by(slot, op_params, context);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:

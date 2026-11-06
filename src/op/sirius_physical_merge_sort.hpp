@@ -21,6 +21,9 @@
 #include "op/sirius_physical_order.hpp"
 #include "op/sort_comparison_config.hpp"
 
+#include <cucascade/data/data_repository_manager.hpp>
+
+#include <limits>
 #include <mutex>
 
 namespace sirius {
@@ -51,7 +54,29 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   duckdb::vector<std::size_t> projections;
   bool is_index_sort;
 
-  sirius_physical_operator* child_op;
+  // Positive sizing target for the common merge implementation.
+  std::size_t chunk_bytes{config::DEFAULT_SORT_CHUNK_BYTES};
+  std::size_t reservation_limit{std::numeric_limits<std::size_t>::max()};
+  std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override;
+  // Runtime wiring registers idle intermediates before any creator or downgrade readers run.
+  void register_scratch(cucascade::shared_data_repository_manager& manager);
+  bool all_ports_empty() override;
+  std::optional<task_creation_hint> get_next_task_hint() override;
+  void sink(const operator_data& output, ::cuda::stream_ref stream) override;
+  // gpu_pipeline_task calls this only after successful sink publication and stream completion.
+  void on_task_output_published(const operator_data& output);
+  // Before publication, preparation can request the same finite subdivision
+  // used by compute OOM. The returned empty task input commits through the
+  // ordinary sink/completion path. nullptr permits reservation-growth retry.
+  std::unique_ptr<operator_data> on_preparation_oom(const operator_data& input);
+  void note_task_reservation(operator_data& input, std::size_t bytes);
+  bool declared_output_schema_is_runtime_schema() const noexcept override
+  {
+    // Intermediate bounded steps retain hidden keys until final publication.
+    return false;
+  }
+
+  sirius_physical_operator* child_op{nullptr};
   sirius_physical_operator* get_child_op() const { return child_op; }
 
  public:
@@ -81,8 +106,10 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   duckdb::vector<std::size_t> _final_projections;
   //! Guards concurrent calls to get_next_task_input_data().
   std::mutex _drain_mutex;
-  //! Tracks which partition to drain next (one task per partition).
-  size_t _current_partition_index{0};
+
+  struct tiled_state;
+  std::shared_ptr<tiled_state> _tiled_state;
+  std::vector<cucascade::shared_data_repository*> _tile_storage;
 };
 
 }  // namespace op
