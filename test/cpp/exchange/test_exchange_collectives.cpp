@@ -641,7 +641,8 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   auto const eb = keys_of(*boundaries[0]);
   REQUIRE(eb.size() == world - 1);
   CHECK(eb[0] < eb[1]);
-  // Each rank keeps partitions inside its own range, rank 2 included.
+  // Each rank that splits keeps its partitions inside its own range; rank 2, with no input, keeps
+  // one partition.
   for (rank_t r = 0; r < world; ++r) {
     if (samples[r]->get_num_partitions() <= 1) { continue; }
     for (auto const k : keys_of(samples[r]->get_partition_boundaries())) {
@@ -650,6 +651,8 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
     }
   }
   CHECK(samples[0]->get_num_partitions() > 1);
+  CHECK(samples[1]->get_num_partitions() > 1);
+  CHECK(samples[2]->get_num_partitions() == 1);
 }
 
 TEST_CASE("an OOM after the boundary all-gather retries without gathering again",
