@@ -531,13 +531,17 @@ TEST_CASE("scheduler and spill return retain submission through rejected task de
   }
   SECTION("spill return enqueue")
   {
+    auto manager    = initialize_memory_manager(1);
+    auto* gpu_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+    REQUIRE(gpu_space != nullptr);
     sirius::exec::multi_index_priority_queue<itask> queue(&index_keys_for);
     queue.interrupt();
     {
       sirius::convertible_gpu_pipeline_task spilled(
         std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction),
         queue,
-        lifecycle);
+        lifecycle,
+        gpu_space);
     }
     REQUIRE(queue.empty());
   }
