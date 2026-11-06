@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <numeric>
 
 namespace sirius::op {
@@ -38,6 +39,7 @@ struct sirius_physical_merge_sort::tiled_state {
   enum class phase { NORMALIZE, COALESCE, SAMPLE, ORDER, EXTRACT, TILES, MERGING, DONE };
   enum class kind { NORMALIZE, COALESCE, SAMPLE, ORDER, EXTRACT, COPY_FRAGMENT, MERGE, PUBLISH };
   enum class status { PENDING, CLAIMED, COMPLETE };
+  enum class recovery { NONE, SPLIT_GROUP, REFINE_TILE, SPLIT_COPY, COPY_SPANS };
   static char const* name(kind type)
   {
     switch (type) {
@@ -135,7 +137,7 @@ struct sirius_physical_merge_sort::tiled_state {
     std::vector<record> spans;
     uint64_t splitter_count{0};
     std::size_t admitted_bytes{0}, attempt_ceiling{0};
-    bool split{false};
+    recovery action{recovery::NONE};
     task_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
               std::shared_ptr<work> item,
               std::optional<std::size_t> position = std::nullopt)
@@ -151,11 +153,34 @@ struct sirius_physical_merge_sort::tiled_state {
       result->splitter_count  = splitter_count;
       result->admitted_bytes  = admitted_bytes;
       result->attempt_ceiling = attempt_ceiling;
-      result->split           = split;
+      result->action          = action;
       result->adopt_row_identity(*this);
       return result;
     }
   };
+
+  static std::string failure(task_data const& data,
+                             char const* site,
+                             std::size_t configured,
+                             char const* reason)
+  {
+    uint64_t bytes = 0;
+    for (auto const& source : data.item->sources) {
+      bytes = sm::checked_add(bytes, source.bytes);
+    }
+    auto page = data.item->type == kind::EXTRACT ? data.item->sources.back().bytes : 0;
+    return std::format(
+      "Tiled sort {} {}: {}; owning_backing={}, page_bytes={}, granted={}, "
+      "effective_ceiling={}, configured_ceiling={}",
+      name(data.item->type),
+      site,
+      reason,
+      bytes,
+      page,
+      data.admitted_bytes,
+      data.attempt_ceiling,
+      configured);
+  }
 
   std::vector<std::shared_ptr<region>> roots;
   std::deque<std::shared_ptr<region>> ready_regions;
@@ -616,10 +641,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   auto started      = std::chrono::steady_clock::now();
   using state       = tiled_state;
   auto const& input = dynamic_cast<state::task_data const&>(input_data);
-  if (input.split) {
+  if (input.action != state::recovery::NONE) {
     auto output = std::make_unique<state::task_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{}, input.item);
-    output->split = true;
+    output->action = input.action;
     return output;
   }
   auto const& item = *input.item;
@@ -760,18 +785,41 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     if (input.admitted_bytes && input.admitted_bytes < input.attempt_ceiling) { throw; }
     // No sink has been entered. Smaller disjoint work can be committed by the
     // ordinary success callback; partial sink publication can never reach here.
-    if (item.type == state::kind::PUBLISH || item.type == state::kind::ORDER ||
-        item.type == state::kind::SAMPLE ||
-        ((item.type == state::kind::NORMALIZE || item.type == state::kind::COPY_FRAGMENT) &&
-         item.end - item.begin <= 1) ||
-        (item.type == state::kind::EXTRACT && result->spans.empty() &&
-         item.end - item.begin <= 1)) {
-      throw invalid_input_exception(
-        "Tiled sort work cannot fit the configured sample/source envelope");
+    switch (item.type) {
+      case state::kind::COALESCE: result->action = state::recovery::SPLIT_GROUP; break;
+      case state::kind::MERGE: result->action = state::recovery::REFINE_TILE; break;
+      case state::kind::NORMALIZE:
+      case state::kind::COPY_FRAGMENT:
+        if (item.end - item.begin <= 1) {
+          throw invalid_input_exception(
+            state::failure(input, "compute", reservation_limit, "one-row owning copy cannot fit"));
+        }
+        result->action = state::recovery::SPLIT_COPY;
+        break;
+      case state::kind::EXTRACT:
+        if (result->spans.empty()) {
+          throw invalid_input_exception(
+            state::failure(input,
+                           "compute",
+                           reservation_limit,
+                           "cut search failed before independently copyable spans exist"));
+        }
+        result->action = state::recovery::COPY_SPANS;
+        break;
+      default:
+        throw invalid_input_exception(
+          state::failure(input,
+                         "compute",
+                         reservation_limit,
+                         "sample or final output capacity envelope exceeded"));
     }
+    SIRIUS_LOG_DEBUG("sort.tile_recovery kind={}, completed_copies={}, spans={}, action={}",
+                     state::name(item.type),
+                     batches.size(),
+                     result->spans.size(),
+                     static_cast<int>(result->action));
     batches.clear();
     result->records.clear();
-    result->split = true;
   } catch (...) {
     cudaStreamSynchronize(stream.get());
     throw;
@@ -781,7 +829,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   output->records        = std::move(result->records);
   output->spans          = std::move(result->spans);
   output->splitter_count = result->splitter_count;
-  output->split          = result->split;
+  output->action         = result->action;
   uint64_t output_bytes = 0, output_rows = 0;
   for (auto const& batch : output->get_data_batches()) {
     auto metadata = get_batch_rows_and_bytes(*batch);
@@ -797,7 +845,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     output_rows,
     output_bytes,
     output->splitter_count,
-    output->split,
+    static_cast<int>(output->action),
     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
   return output;
 }
@@ -809,15 +857,14 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::on_preparation_oom(
   if (data.admitted_bytes && data.admitted_bytes < data.attempt_ceiling) { return nullptr; }
   auto const& item = *data.item;
   using kind       = tiled_state::kind;
-  if (item.type == kind::SAMPLE || item.type == kind::ORDER || item.type == kind::PUBLISH ||
-      ((item.type == kind::NORMALIZE || item.type == kind::COPY_FRAGMENT ||
-        item.type == kind::EXTRACT) &&
-       item.end - item.begin <= 1)) {
-    throw invalid_input_exception("Sort input restoration exceeds the supported capacity envelope");
+  if (item.type != kind::COALESCE && item.type != kind::MERGE) {
+    throw invalid_input_exception(tiled_state::failure(
+      data, "preparation", reservation_limit, "source/page restoration envelope exceeded"));
   }
   auto output = std::make_unique<tiled_state::task_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{}, data.item);
-  output->split = true;
+  output->action = item.type == kind::COALESCE ? tiled_state::recovery::SPLIT_GROUP
+                                               : tiled_state::recovery::REFINE_TILE;
   return output;
 }
 
@@ -858,12 +905,12 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
   }
   auto r = item.owner.lock();
   if (!r) { throw internal_exception("Missing sort region at completion"); }
-  if (data.split) {
-    if (item.type == state::kind::MERGE) {
+  if (data.action != state::recovery::NONE) {
+    if (data.action == state::recovery::REFINE_TILE) {
       _tiled_state->refine(*this, r, item.tile_index);
-    } else if (item.type == state::kind::COALESCE) {
+    } else if (data.action == state::recovery::SPLIT_GROUP) {
       _tiled_state->split_group(*this, r, item.coalescing);
-    } else if (item.type == state::kind::EXTRACT && !data.spans.empty()) {
+    } else if (data.action == state::recovery::COPY_SPANS) {
       for (auto const& span : data.spans) {
         auto middle       = span.begin + (span.end - span.begin) / 2;
         auto add_fragment = [&](uint64_t begin, uint64_t end) {
@@ -882,7 +929,7 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
         add_fragment(span.begin, middle);
         add_fragment(middle, span.end);
       }
-    } else {
+    } else if (data.action == state::recovery::SPLIT_COPY) {
       auto middle = item.begin + (item.end - item.begin) / 2;
       for (auto [begin, end] : {std::pair{item.begin, middle}, std::pair{middle, item.end}}) {
         auto child            = _tiled_state->add(r, item.type, item.sources);

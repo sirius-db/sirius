@@ -46,9 +46,11 @@ class injected_merge : public sirius_physical_merge_sort {
  public:
   using sirius_physical_merge_sort::sirius_physical_merge_sort;
   bool fail_compute{false};
+  std::function<void()> before_compute;
   std::unique_ptr<operator_data> execute(operator_data const& input,
                                          ::cuda::stream_ref stream) override
   {
+    if (before_compute) { before_compute(); }
     auto output = sirius_physical_merge_sort::execute(input, stream);
     if (std::exchange(fail_compute, false)) {
       throw rmm::out_of_memory("injected before publication");
@@ -108,7 +110,9 @@ struct tiled_fixture {
     input->add_data_batch(make_numeric_batch<int64_t>(*gpu, values, cudf::type_id::INT64), range);
   }
   std::unique_ptr<sirius::pipeline::gpu_pipeline_task> task(
-    std::unique_ptr<operator_data> data, cucascade::memory::memory_space* target = nullptr)
+    std::unique_ptr<operator_data> data,
+    cucascade::memory::memory_space* target = nullptr,
+    bool at_ceiling                         = false)
   {
     if (!target) { target = gpu; }
     auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
@@ -116,8 +120,9 @@ struct tiled_fixture {
       repositories.get_repositories(),
       std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(data)),
       global);
-    auto info             = task->get_estimated_reservation_size_info(target);
-    info.reservation_size = std::max(info.reservation_size, retry_floor);
+    auto info = task->get_estimated_reservation_size_info(target);
+    info.reservation_size =
+      at_ceiling ? target->get_max_memory() : std::max(info.reservation_size, retry_floor);
     auto reservation =
       target->make_reservation_or_null(std::min(info.reservation_size, target->get_max_memory()));
     if (!reservation) {
@@ -130,9 +135,10 @@ struct tiled_fixture {
         sirius::convertible_data_batch_provider provider(repository);
         for (auto& candidate : provider.get_all_convertible(target, true, false)) {
           REQUIRE(candidate->convert({host}, stream, *manager, true).has_value());
-          info                  = task->get_estimated_reservation_size_info(target);
-          info.reservation_size = std::max(info.reservation_size, retry_floor);
-          reservation           = target->make_reservation_or_null(
+          info = task->get_estimated_reservation_size_info(target);
+          info.reservation_size =
+            at_ceiling ? target->get_max_memory() : std::max(info.reservation_size, retry_floor);
+          reservation = target->make_reservation_or_null(
             std::min(info.reservation_size, target->get_max_memory()));
           if (reservation) { break; }
         }
@@ -673,4 +679,286 @@ TEST_CASE("tiled stage work selection inspects each work item once", "[tiled_mer
     CHECK(stage.inspections == ids.size());
     CHECK(ids.size() == count + (count + 16) / 17);
   }
+}
+
+namespace {
+struct allocation_fault {
+  int remaining{-1};
+  std::function<bool()> fail_when;
+  std::size_t failures{0}, successes{0};
+  void before()
+  {
+    if (remaining == 0 || (fail_when && fail_when())) {
+      ++failures;
+      throw rmm::out_of_memory("injected tiled allocation");
+    }
+    if (remaining > 0) {
+      --remaining;
+      ++successes;
+    }
+  }
+};
+// Interpose below the ordinary reservation tracker; task/runtime code is unchanged.
+class fault_resource {
+ public:
+  fault_resource(int device, std::size_t capacity, std::shared_ptr<allocation_fault> fault)
+    : upstream(cucascade::memory::make_default_gpu_memory_resource(device, capacity)), fault(fault)
+  {
+  }
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    fault->before();
+    return upstream.allocate_sync(bytes, alignment);
+  }
+  void deallocate_sync(void* p, std::size_t bytes, std::size_t alignment) noexcept
+  {
+    upstream.deallocate_sync(p, bytes, alignment);
+  }
+  void* allocate(::cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
+  {
+    fault->before();
+    return upstream.allocate(stream, bytes, alignment);
+  }
+  void deallocate(::cuda::stream_ref stream,
+                  void* p,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    upstream.deallocate(stream, p, bytes, alignment);
+  }
+  friend void get_property(fault_resource const&, ::cuda::mr::device_accessible) noexcept {}
+  bool operator==(fault_resource const& other) const noexcept { return fault == other.fault; }
+
+ private:
+  ::cuda::mr::any_resource<::cuda::mr::device_accessible> upstream;
+  std::shared_ptr<allocation_fault> fault;
+};
+memory_manager_options fault_options(std::shared_ptr<allocation_fault> fault)
+{
+  memory_manager_options options;
+  options.gpu_resource_factory = [fault](int device, std::size_t capacity) {
+    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+      fault_resource{device, capacity, fault}};
+  };
+  return options;
+}
+void spill_tiled_inputs(tiled_fixture& f)
+{
+  auto* host = f.manager->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  for (auto* repo : f.repositories.get_repositories()) {
+    sirius::convertible_data_batch_provider provider(repo);
+    for (auto& candidate : provider.get_all_convertible(f.gpu, true, false)) {
+      REQUIRE(candidate->convert({host}, f.stream, *f.manager, true).has_value());
+    }
+  }
+}
+bool in_repo(tiled_fixture& f, char const* name, uint64_t id)
+{
+  auto* repo = f.repo(name);
+  for (std::size_t p = 0; p < repo->num_partitions(); ++p) {
+    if (repo->get_data_batch_by_id(id, p)) { return true; }
+  }
+  return false;
+}
+std::unique_ptr<operator_data> reach_work(tiled_fixture& f, std::string const& wanted)
+{
+  for (int guard = 0; guard < 100; ++guard) {
+    auto data = f.merge.get_next_task_input_data();
+    REQUIRE(data);
+    auto const& typed   = dynamic_cast<pipelineable_operator_data const&>(*data);
+    auto const& batches = typed.get_data_batches();
+    auto id             = batches.back()->get_batch_id();
+    std::string kind;
+    if (typed.get_position()) {
+      kind = "publish";
+    } else if (in_repo(f, "sort_tile_samples", id)) {
+      kind = "order_samples";
+    } else if (in_repo(f, "sort_tile_splitters", id)) {
+      kind = "extract";
+    } else if (in_repo(f, "sort_tile_pieces", id)) {
+      kind = "merge";
+    } else if (batches.size() == 1 && !f.repo("sort_tile_splitters")->all_empty()) {
+      kind = "copy_fragment";
+    } else if (batches.size() > 1) {
+      kind = "coalesce";
+    } else if (sirius::get_batch_rows_and_bytes(*batches.front()).bytes > f.merge.chunk_bytes) {
+      kind = "normalize";
+    } else {
+      kind = "sample";
+    }
+    if (kind == wanted) { return data; }
+    f.task(std::move(data))->execute(f.stream);
+  }
+  FAIL("did not reach " << wanted);
+  return nullptr;
+}
+}  // namespace
+
+TEST_CASE("exhausted preparation failures terminate source restoration without interval retries",
+          "[tiled_merge]")
+{
+  auto kind  = GENERATE(std::string("normalize"),
+                       std::string("sample"),
+                       std::string("order_samples"),
+                       std::string("extract"),
+                       std::string("publish"));
+  auto after = GENERATE(0, 1);
+  auto fault = std::make_shared<allocation_fault>();
+  tiled_fixture f(1, fault_options(fault));
+  f.merge.chunk_bytes = 16;
+  f.add({1, 3});
+  f.add({2, 4});
+  if (kind == "normalize") { f.merge.chunk_bytes = 8; }
+  auto data    = reach_work(f, kind);
+  auto sources = dynamic_cast<pipelineable_operator_data const&>(*data).get_data_batches();
+  spill_tiled_inputs(f);
+  auto task = f.task(std::move(data), nullptr, true);
+  // Two-source work can fail after the first source has actually restored. Single
+  // source work fails at its first allocation instead.
+  fault->remaining = 0;
+  if (sources.size() > 1 && after) {
+    fault->remaining = -1;
+    fault->fail_when = [first = sources.front()] { return first->get_read_only_count() > 0; };
+  }
+  CHECK_THROWS_WITH(task->execute(f.stream),
+                    Catch::Matchers::ContainsSubstring(kind + " preparation"));
+  fault->remaining = -1;
+  fault->fail_when = {};
+  task.reset();
+  for (auto const& source : sources) {
+    CHECK(source->get_read_only_count() == 0);
+  }
+  CHECK_FALSE(f.merge.all_ports_empty());
+  CHECK(f.output.all_empty());
+  CHECK(fault->failures > 0);
+  if (sources.size() > 1 && after) {
+    CHECK(sources.front()->to_read_only().get_current_tier() == cucascade::memory::Tier::GPU);
+  }
+  (void)f.repositories.clear_all_repositories();
+}
+
+TEST_CASE("preparation recovery reduces coalescing sources and refines merge per piece",
+          "[tiled_merge]")
+{
+  auto fault = std::make_shared<allocation_fault>();
+  tiled_fixture f(1, fault_options(fault));
+  f.merge.chunk_bytes = 128;
+  f.add({1, 3, 5});
+  f.add({2, 4, 6});
+  for (auto const& kind : {"coalesce", "merge"}) {
+    auto data    = reach_work(f, kind);
+    auto sources = dynamic_cast<pipelineable_operator_data const&>(*data).get_data_batches();
+    REQUIRE(sources.size() == 2);
+    spill_tiled_inputs(f);
+    auto task        = f.task(std::move(data), nullptr, true);
+    fault->fail_when = [first = sources.front()] { return first->get_read_only_count() > 0; };
+    task->execute(f.stream);
+    fault->fail_when = {};
+    task.reset();
+    for (auto const& source : sources) {
+      CHECK(source->get_read_only_count() == 0);
+    }
+    if (std::string(kind) == "coalesce") {
+      CHECK(f.input->total_size() == 2);
+      f.merge.chunk_bytes = 16;
+    } else {
+      CHECK_FALSE(f.repo("sort_tile_pieces")->all_empty());
+    }
+    CHECK(f.output.all_empty());
+  }
+  f.drain(true);
+  CHECK(f.rows() == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
+}
+
+TEST_CASE("compute failures split copied output while search failures stop explicitly",
+          "[tiled_merge]")
+{
+  auto point = GENERATE(std::string("normalize"), std::string("search"));
+  auto fault = std::make_shared<allocation_fault>();
+  tiled_fixture f(1, fault_options(fault));
+  f.merge.chunk_bytes = point == "normalize" ? 16 : 24;
+  if (point == "normalize") {
+    f.add({1, 3, 5, 7, 9, 11});
+    f.add({2, 4, 6, 8, 10, 12});
+  } else {
+    f.add({1, 4, 7});
+    f.add({2, 5, 8});
+  }
+  auto data              = reach_work(f, point == "normalize" ? "normalize" : "extract");
+  auto task              = f.task(std::move(data), nullptr, true);
+  f.merge.before_compute = [fault] { fault->remaining = 0; };
+  if (point == "search") {
+    CHECK_THROWS_WITH(task->execute(f.stream),
+                      Catch::Matchers::ContainsSubstring("cut search failed"));
+  } else {
+    task->execute(f.stream);
+  }
+  fault->remaining       = -1;
+  f.merge.before_compute = {};
+  task.reset();
+  if (point != "search") {
+    f.drain(true);
+    CHECK(f.rows() == std::vector<int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+  }
+}
+
+TEST_CASE("extraction allocation sweep recovers owning spans and partial local copies",
+          "[tiled_merge]")
+{
+  bool const reject_fragment_restore = GENERATE(false, true);
+  std::size_t search_errors = 0, recovered_spans = 0, partial_copies = 0;
+  // Sweep failure positions until both search and partial-copy boundaries are
+  // observed. This deliberately does not assume a cuDF allocation count/layout.
+  for (int skip = 0; skip < 64 && !partial_copies; ++skip) {
+    auto fault = std::make_shared<allocation_fault>();
+    tiled_fixture f(1, fault_options(fault));
+    f.add({1, 4, 7});
+    f.add({2, 5, 8});
+    auto data = reach_work(f, "extract");
+    auto task = f.task(std::move(data), nullptr, true);
+    sirius::test::scoped_recording_log_sink logs("debug");
+    f.merge.before_compute = [fault, skip] { fault->remaining = skip; };
+    bool search_failed     = false;
+    try {
+      task->execute(f.stream);
+    } catch (sirius::invalid_input_exception const& error) {
+      CHECK(std::string(error.what()).find("cut search failed") != std::string::npos);
+      search_failed = true;
+      ++search_errors;
+    }
+    fault->remaining       = -1;
+    f.merge.before_compute = {};
+    task.reset();
+    if (search_failed) { continue; }
+    bool partial = false;
+    for (auto const& log : logs.records()) {
+      if (log.message.find("sort.tile_recovery kind=extract") == std::string::npos) { continue; }
+      ++recovered_spans;
+      auto at = log.message.find("completed_copies=");
+      REQUIRE(at != std::string::npos);
+      partial = std::stoul(log.message.substr(at + std::string("completed_copies=").size())) > 0;
+      partial_copies += partial;
+    }
+    if (reject_fragment_restore && partial) {
+      auto fragment = reach_work(f, "copy_fragment");
+      auto sources  = dynamic_cast<pipelineable_operator_data const&>(*fragment).get_data_batches();
+      spill_tiled_inputs(f);
+      auto copy        = f.task(std::move(fragment), nullptr, true);
+      fault->remaining = 0;
+      CHECK_THROWS_WITH(copy->execute(f.stream),
+                        Catch::Matchers::ContainsSubstring("copy_fragment preparation"));
+      fault->remaining = -1;
+      copy.reset();
+      for (auto const& source : sources) {
+        CHECK(source->get_read_only_count() == 0);
+      }
+      CHECK_FALSE(f.merge.all_ports_empty());
+    } else {
+      f.drain(true);
+      CHECK(f.rows() == std::vector<int64_t>{1, 2, 4, 5, 7, 8});
+    }
+  }
+  CHECK(search_errors > 0);
+  CHECK(recovered_spans > 0);
+  CHECK(partial_copies > 0);
 }
