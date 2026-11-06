@@ -196,10 +196,11 @@ class convertible_gpu_pipeline_task : public convertible_data {
    *
    * Sums the task's input batches that reside in the given memory space. Never waits on a
    * batch lock: a batch another thread holds exclusively is skipped, since a non-blocking
-   * convert() could not move it either.
+   * convert() could not move it either. The sum is therefore a lower bound while a batch is
+   * held, and 0 does not by itself mean the task has no data in the space.
    *
    * @param space The memory space to query.
-   * @return Total size in bytes, or 0 if no data resides in that space.
+   * @return Total size in bytes of the batches that could be inspected, 0 if none reside there.
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
@@ -256,8 +257,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
   /// Non-owning; the runtime or test fixture must outlive this wrapper.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
-  /// Non-owning; null converts the task's batches from any space.
-  cucascade::memory::memory_space const* _source_space{nullptr};
+  /// Non-owning and never null: the reservation manager that owns the space must outlive the
+  /// wrapper, as it does for the executor that created it.
+  cucascade::memory::memory_space const* _source_space;
 };
 
 /**

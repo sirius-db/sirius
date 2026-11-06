@@ -173,7 +173,7 @@ Candidates are fetched lazily via `convertible_data_provider` implementations:
 1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
 2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. A queued task can hold inputs in several spaces (inputs that were only partly spilled, a build batch shared from another GPU); only the batches still in the source space are converted, and the request is credited with the bytes that actually moved. Tasks are returned to the queue via RAII on all code paths.
 
-Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
+Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically per batch. A task is not a unit of rollback: its batches convert one at a time, and if a later batch throws, the ones already moved stay at the target but the request is credited nothing for the task, since the exception discards the running totals. Credited bytes are the batches' sizes in the source space, not what they occupy at the target (a batch spilled compressed is credited at its uncompressed GPU size).
 
 ## Memory Consumption History
 
