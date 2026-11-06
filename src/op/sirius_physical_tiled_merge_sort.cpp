@@ -18,7 +18,6 @@
 #include "op/order/bounded_sort.hpp"
 #include "op/order/gpu_sampled_merge.hpp"
 #include "op/order/sampled_merge.hpp"
-#include "op/order/tiled_merge_work_queue.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -26,12 +25,52 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <format>
+#include <memory>
 #include <numeric>
+#include <stdexcept>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
 
 namespace sirius::op {
 namespace sm = sampled_merge;
+
+namespace {
+// Only the tiled operator's finite stage/final-publication lists use this queue.
+// Claimed work stays owned by its task, not by a repeatedly scanned stage list.
+template <typename Work>
+struct tiled_merge_work_queue {
+  std::deque<std::shared_ptr<Work>> pending;
+  std::size_t outstanding{0};
+  std::size_t inspections{0};
+
+  void add(std::shared_ptr<Work> item)
+  {
+    pending.push_back(std::move(item));
+    ++outstanding;
+  }
+  // Prepare task-owned metadata before committing the claim. Allocation failure
+  // leaves both the pending item and its outstanding count intact.
+  template <typename Prepare>
+  auto claim(Prepare&& prepare)
+  {
+    using result_type = std::invoke_result_t<Prepare, std::shared_ptr<Work> const&>;
+    if (pending.empty()) { return result_type{}; }
+    auto result = std::forward<Prepare>(prepare)(pending.front());
+    pending.pop_front();
+    ++inspections;
+    return result;
+  }
+  void complete()
+  {
+    if (!outstanding) { throw std::logic_error("Sort work count underflow"); }
+    --outstanding;
+  }
+  bool complete_stage() const { return outstanding == 0; }
+};
+}  // namespace
 
 // Finite operator-local work and dependencies. All idle device owners live in
 // registered repositories; these descriptors contain locations and host metadata.

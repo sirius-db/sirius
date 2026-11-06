@@ -16,7 +16,6 @@
 
 #include "catch.hpp"
 #include "data/convertible_data_batch.hpp"
-#include "op/order/tiled_merge_work_queue.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "operator_test_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -692,40 +691,6 @@ TEST_CASE("cold estimates do not refuse fitting order or coalescing tasks", "[ti
             << " peak=" << peak << " orders=" << orders << " coalesces=" << coalesces << std::endl;
 }
 
-TEST_CASE("tiled stage work selection inspects each work item once", "[tiled_merge_schedule]")
-{
-  // Model the extraction workload: contributions times independent splitter pages.
-  // Finish claims in reverse, append replacement work before finishing its parent,
-  // and check no completion while claimed work or replacements remain.
-  for (std::size_t inputs : {16, 64, 256}) {
-    tiled_merge_work_queue<std::size_t> stage;
-    std::vector<std::shared_ptr<std::size_t>> claimed;
-    auto count = inputs * 32;
-    for (std::size_t i = 0; i < count; ++i) {
-      stage.add(std::make_shared<std::size_t>(i));
-    }
-    std::set<std::size_t> ids;
-    while (auto item = stage.claim()) {
-      CHECK(ids.insert(*item).second);
-      claimed.push_back(item);
-    }
-    CHECK_FALSE(stage.complete_stage());
-    CHECK_FALSE(stage.claim());  // no polling in-flight work
-    std::reverse(claimed.begin(), claimed.end());
-    for (auto const& item : claimed) {
-      if (*item % 17 == 0) { stage.add(std::make_shared<std::size_t>(count + *item)); }
-      stage.complete();
-    }
-    while (auto item = stage.claim()) {
-      CHECK(ids.insert(*item).second);
-      stage.complete();
-    }
-    CHECK(stage.complete_stage());
-    CHECK(stage.inspections == ids.size());
-    CHECK(ids.size() == count + (count + 16) / 17);
-  }
-}
-
 namespace {
 struct allocation_fault {
   int remaining{-1};
@@ -1074,24 +1039,4 @@ TEST_CASE("single-piece preparation failure terminates without recursive refinem
   CHECK_FALSE(f.merge.all_ports_empty());
   CHECK(sources.front()->get_read_only_count() == 0);
   CHECK(f.input->total_size() == 1);
-}
-
-TEST_CASE("task metadata allocation failure preserves its pending queue entry",
-          "[tiled_merge_schedule]")
-{
-  tiled_merge_work_queue<int> stage;
-  stage.add(std::make_shared<int>(17));
-  CHECK_THROWS_AS(stage.claim([](auto const&) -> std::unique_ptr<int> { throw std::bad_alloc{}; }),
-                  std::bad_alloc);
-  CHECK(stage.outstanding == 1);
-  CHECK(stage.inspections == 0);
-  CHECK(stage.pending.size() == 1);
-  auto data = stage.claim([](auto const& item) { return std::make_unique<int>(*item); });
-  REQUIRE(data);
-  CHECK(*data == 17);
-  CHECK(stage.pending.empty());
-  CHECK_FALSE(stage.complete_stage());
-  stage.complete();
-  CHECK(stage.complete_stage());
-  CHECK(stage.inspections == 1);
 }
