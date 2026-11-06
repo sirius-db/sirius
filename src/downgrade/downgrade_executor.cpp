@@ -298,12 +298,15 @@ void downgrade_executor::processing_loop()
 
           // Snapshot candidate sizes so target-carrying requests can right-size their final pick
           // (spill_policy.hpp) instead of taking the next whole batch in policy order. Requests
-          // without a target keep plain policy-order iteration.
+          // without a target keep plain policy-order iteration. A size of 0 means the batch was
+          // taken exclusively (or moved) since the snapshot; a non-blocking convert would skip
+          // it, so it is dropped here rather than spent as a dispatch.
           std::vector<std::size_t> candidate_sizes(candidates.size());
-          for (std::size_t i = 0; i < candidates.size(); ++i) {
-            candidate_sizes[i] = candidates[i]->bytes_in_space(source_space);
-          }
           std::vector<bool> already_dispatched(candidates.size(), false);
+          for (std::size_t i = 0; i < candidates.size(); ++i) {
+            candidate_sizes[i]    = candidates[i]->bytes_in_space(source_space);
+            already_dispatched[i] = candidate_sizes[i] == 0;
+          }
 
           for (std::size_t n = 0; n < candidates.size(); ++n) {
             if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
