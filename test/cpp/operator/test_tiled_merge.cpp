@@ -46,6 +46,7 @@ class injected_merge : public sirius_physical_merge_sort {
   using sirius_physical_merge_sort::sirius_physical_merge_sort;
   bool fail_compute{false};
   bool replace_output{false};
+  bool replaced_single{false}, replaced_multiple{false};
   std::function<void()> before_compute;
   std::size_t attempts{0}, publications{0};
   bool reject_completion{false};
@@ -70,7 +71,25 @@ class injected_merge : public sirius_physical_merge_sort {
     }
     if (replace_output) {
       auto const& batches = dynamic_cast<pipelineable_operator_data const&>(*output);
-      return batches.with_batches_preserving_rows(batches.get_data_batches());
+      replaced_single |= batches.get_data_batches().size() == 1;
+      replaced_multiple |= batches.get_data_batches().size() > 1;
+      std::vector<std::shared_ptr<cucascade::data_batch>> replacements;
+      try {
+        for (auto const& batch : batches.get_data_batches()) {
+          replacements.push_back(batch->clone(sirius::get_next_batch_id(), stream));
+          REQUIRE(replacements.back() != batch);
+        }
+        stream.sync();
+        if (!replacements.empty()) {
+          auto wrong_count = replacements;
+          wrong_count.pop_back();
+          CHECK_THROWS(batches.with_batches_preserving_rows(std::move(wrong_count)));
+        }
+        return batches.with_batches_preserving_rows(std::move(replacements));
+      } catch (...) {
+        cudaStreamSynchronize(stream.get());
+        throw;
+      }
     }
     return output;
   }
@@ -446,6 +465,8 @@ TEST_CASE("tiled preprocessing normalizes coalesces and preserves ranges", "[til
   }
   std::sort(expected.begin(), expected.end());
   CHECK(f.rows() == expected);
+  CHECK(f.merge.replaced_single);
+  CHECK(f.merge.replaced_multiple);
   CHECK(f.repo("sort_tile_inputs")->all_empty());
   CHECK(f.input->all_empty());
 }

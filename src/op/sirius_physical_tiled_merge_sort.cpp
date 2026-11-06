@@ -251,35 +251,15 @@ struct sirius_physical_merge_sort::tiled_state {
       return std::visit([](auto const& value) { return value.type; }, op);
     }
   };
-  struct produced_batch {
-    slot destination;
-    std::shared_ptr<cucascade::data_batch> batch;
-    ref describe() const { return storage_access::describe(destination, *batch); }
-  };
-  struct normalize_result {
-    produced_batch output;
-    uint64_t begin;
-  };
-  struct sample_result {
-    produced_batch output;
-  };
-  struct order_result {
-    std::vector<produced_batch> pages;
-    uint64_t splitter_count{0};
-  };
-  struct extracted_piece {
-    produced_batch output;
+  struct coverage {
     std::size_t tile_index;
     uint64_t begin, end;
   };
-  struct extract_result {
-    std::vector<extracted_piece> pieces;
+  struct output_metadata {
+    std::vector<slot> destinations;
+    std::vector<coverage> pieces;
+    uint64_t splitter_count{0};
   };
-  struct publish_result {
-    std::shared_ptr<cucascade::data_batch> batch;
-  };
-  using result =
-    std::variant<normalize_result, sample_result, order_result, extract_result, publish_result>;
 
   struct stage_work {
     tiled_merge_work_queue<work> queue;
@@ -287,11 +267,6 @@ struct sirius_physical_merge_sort::tiled_state {
   struct normalize_stage : stage_work {
     std::vector<ref> inputs;
     std::vector<std::vector<std::pair<uint64_t, ref>>> normalized;
-    void accept(normalize_result const& value, request const& task)
-    {
-      normalized.at(std::get<normalize_request>(task.op).input)
-        .push_back({value.begin, value.output.describe()});
-    }
   };
   struct coalesce_stage : stage_work {
     std::vector<group> groups;
@@ -302,43 +277,21 @@ struct sirius_physical_merge_sort::tiled_state {
     uint64_t row_limit;
     sm::parameters sampling;
     std::vector<std::optional<ref>> samples;
-    void accept(sample_result const& value, request const& task)
-    {
-      samples.at(std::get<sample_request>(task.op).input) = value.output.describe();
-    }
   };
   struct order_stage : stage_work {
     std::vector<ref> inputs, samples, pages;
     uint64_t row_limit, splitter_count{0};
-    void accept(order_result const& value, request const&)
-    {
-      for (auto const& page : value.pages) {
-        pages.push_back(page.describe());
-      }
-      splitter_count = value.splitter_count;
-    }
   };
   struct extract_stage : stage_work {
     std::vector<ref> inputs, pages;
     std::vector<tile> tiles;
     uint64_t row_limit;
-    void accept(extract_result const& value, request const& task)
-    {
-      for (auto const& piece : value.pieces) {
-        tiles.at(piece.tile_index)
-          .pieces.push_back({piece.output.describe(),
-                             std::get<extract_request>(task.op).input,
-                             piece.begin,
-                             piece.end});
-      }
-    }
   };
   struct merge_stage : stage_work {
     std::vector<tile> tiles;
   };
   struct done_stage {
     std::vector<ref> results;
-    void accept(publish_result const&, request const&) {}
   };
   using active_stage = std::variant<normalize_stage,
                                     coalesce_stage,
@@ -368,57 +321,12 @@ struct sirius_physical_merge_sort::tiled_state {
       auto* work = queue();
       return work && (!work->pending.empty() || work->complete_stage());
     }
-    void accept(result const& output, request const& task)
-    {
-      std::visit(
-        [&](auto& active) {
-          std::visit(
-            [&](auto const& value) {
-              if constexpr (requires { active.accept(value, task); }) {
-                active.accept(value, task);
-              } else {
-                throw internal_exception("Sort result does not match active stage");
-              }
-            },
-            output);
-        },
-        stage);
-    }
   };
 
-  // The adapter derives its runtime batch list from these paired results.
-  template <typename Result, typename Visit>
-  static void visit_batches(Result& result, Visit&& visit)
-  {
-    std::visit(
-      [&](auto& value) {
-        using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, order_result>) {
-          for (auto& page : value.pages) {
-            visit(page.batch);
-          }
-        } else if constexpr (std::is_same_v<T, extract_result>) {
-          for (auto& piece : value.pieces) {
-            visit(piece.output.batch);
-          }
-        } else if constexpr (std::is_same_v<T, publish_result>) {
-          visit(value.batch);
-        } else {
-          visit(value.output.batch);
-        }
-      },
-      result);
-  }
-  static std::vector<std::shared_ptr<cucascade::data_batch>> batches(result const& value)
-  {
-    std::vector<std::shared_ptr<cucascade::data_batch>> out;
-    visit_batches(value, [&](auto const& batch) { out.push_back(batch); });
-    return out;
-  }
   struct task_data : pipelineable_operator_data {
     std::shared_ptr<work> item;
     std::shared_ptr<const request> execution;
-    std::optional<result> completed;
+    std::optional<output_metadata> completed;
     std::size_t admitted_bytes{0}, attempt_ceiling{0};
     task_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
               std::shared_ptr<work> item,
@@ -432,17 +340,12 @@ struct sirius_physical_merge_sort::tiled_state {
     std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
       std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
     {
+      if (completed && batches.size() != get_data_batches().size()) {
+        throw internal_exception("Sort output replacement changed batch count");
+      }
       auto result =
         std::make_unique<task_data>(std::move(batches), item, execution, get_position());
-      result->completed = completed;
-      if (result->completed) {
-        std::size_t index = 0;
-        visit_batches(*result->completed,
-                      [&](auto& batch) { batch = result->get_data_batches().at(index++); });
-        if (index != result->get_data_batches().size()) {
-          throw internal_exception("Sort result replacement changed batch count");
-        }
-      }
+      result->completed       = completed;
       result->admitted_bytes  = admitted_bytes;
       result->attempt_ceiling = attempt_ceiling;
       result->adopt_row_identity(*this);
@@ -927,11 +830,14 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   auto* space = reads.front().get_memory_space();
   auto mr     = space->get_default_allocator();
   // Keep partial outputs alive until the exception fence has completed.
-  state::result completed;
-  std::vector<std::shared_ptr<cucascade::data_batch>> merged;
+  state::output_metadata metadata;
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  auto emit_batch = [&](std::shared_ptr<cucascade::data_batch> batch, state::slot destination) {
+    batches.push_back(std::move(batch));
+    metadata.destinations.push_back(destination);
+  };
   auto emit = [&](std::unique_ptr<cudf::table> table, state::slot destination) {
-    return state::produced_batch{
-      destination, make_data_batch(std::move(table), *space, stream, batch_telemetry())};
+    emit_batch(make_data_batch(std::move(table), *space, stream, batch_telemetry()), destination);
   };
   std::vector<cudf::table_view> views;
   for (auto const& read : reads) {
@@ -943,60 +849,58 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
       [&](auto const& item) {
         if constexpr (std::is_same_v<std::decay_t<decltype(item)>, state::merge_operation>) {
           // Output index zero is the sole owner used by sink and completion.
-          merged.push_back(item.execute(input, views, *comparison, stream, mr, [&](auto table) {
-            return make_data_batch(std::move(table), *space, stream, batch_telemetry());
-          }));
+          emit_batch(item.execute(input,
+                                  views,
+                                  *comparison,
+                                  stream,
+                                  mr,
+                                  [&](auto table) {
+                                    return make_data_batch(
+                                      std::move(table), *space, stream, batch_telemetry());
+                                  }),
+                     item.destination);
         } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::PUBLISH) {
-          auto& value = completed.emplace<state::publish_result>();
           if (item.projection.empty()) {
-            value.batch = input.get_data_batches().front();
+            batches.push_back(input.get_data_batches().front());
           } else {
-            value.batch = make_data_batch(
+            batches.push_back(make_data_batch(
               std::make_unique<cudf::table>(views.front().select(item.projection), stream, mr),
               *space,
               stream,
-              batch_telemetry());
+              batch_telemetry()));
           }
         } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::NORMALIZE) {
-          auto& value = completed.emplace<state::normalize_result>();
-          value.begin = item.begin;
-          auto view   = cudf::slice(
+          auto view = cudf::slice(
             views.front(),
             {static_cast<cudf::size_type>(item.begin), static_cast<cudf::size_type>(item.end)},
             stream)[0];
-          value.output = emit(std::make_unique<cudf::table>(view, stream, mr), item.destination);
+          emit(std::make_unique<cudf::table>(view, stream, mr), item.destination);
         } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::SAMPLE) {
-          auto& value  = completed.emplace<state::sample_result>();
-          value.output = emit(
-            sm::gather_samples(views.front(), item.input, item.stride, *comparison, stream, mr),
-            item.destination);
+          emit(sm::gather_samples(views.front(), item.input, item.stride, *comparison, stream, mr),
+               item.destination);
         } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::ORDER) {
-          auto& value = completed.emplace<state::order_result>();
           auto splitters =
             sm::order_sample_splitters(views, item.sample_step, *comparison, stream, mr);
-          value.splitter_count = splitters->num_rows();
-          auto count           = value.splitter_count + 1;
-          value.pages.reserve(1 + (count - 1) / state::window_tiles);
+          metadata.splitter_count = splitters->num_rows();
+          auto count              = metadata.splitter_count + 1;
           for (uint64_t begin = 0, page = 0; begin < count; begin += state::window_tiles, ++page) {
             auto end             = std::min(begin + state::window_tiles, count);
             auto first           = begin ? begin - 1 : 0;
-            auto last            = std::min(end, value.splitter_count);
+            auto last            = std::min(end, metadata.splitter_count);
             auto destination     = item.destination;
             destination.position = page;
             if (!page && end == count) {
-              value.pages.push_back(emit(std::move(splitters), destination));
+              emit(std::move(splitters), destination);
             } else {
               auto view = cudf::slice(
                 splitters->view(),
                 {static_cast<cudf::size_type>(first), static_cast<cudf::size_type>(last)},
                 stream)[0];
-              value.pages.push_back(
-                emit(std::make_unique<cudf::table>(view, stream, mr), destination));
+              emit(std::make_unique<cudf::table>(view, stream, mr), destination);
             }
           }
         } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::EXTRACT) {
-          auto& value = completed.emplace<state::extract_result>();
-          value.pieces.reserve(item.end - item.begin);
+          metadata.pieces.reserve(item.end - item.begin);
           auto cuts = sm::discover_cuts(views[0], item.input, views[1], *comparison, stream, mr);
           std::vector<cudf::size_type> host(cuts->size());
           // One bulk integer readback, including adjacent page boundaries. Keep the
@@ -1021,18 +925,18 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
             }
             if (begin == end) { continue; }
             auto view = cudf::slice(views[0], {begin, end}, stream)[0];
-            value.pieces.push_back({emit(std::make_unique<cudf::table>(view, stream, mr),
-                                         item.destinations.at(t - item.begin)),
-                                    static_cast<std::size_t>(t),
-                                    static_cast<uint64_t>(begin),
-                                    static_cast<uint64_t>(end)});
+            emit(std::make_unique<cudf::table>(view, stream, mr),
+                 item.destinations.at(t - item.begin));
+            metadata.pieces.push_back({static_cast<std::size_t>(t),
+                                       static_cast<uint64_t>(begin),
+                                       static_cast<uint64_t>(end)});
           }
           SIRIUS_LOG_TRACE(
             "sort.extract input={}, tile_begin={}, tile_end={}, readbacks=1, waits=1, pieces={}",
             item.input,
             item.begin,
             item.end,
-            value.pieces.size());
+            metadata.pieces.size());
         }
       },
       request.op);
@@ -1046,13 +950,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     throw;
   }
   auto output = std::make_unique<state::task_data>(
-    merged.empty() ? state::batches(completed) : std::move(merged),
-    input.item,
-    input.execution,
-    input.get_position());
-  if (!std::holds_alternative<state::merge_operation>(request.op)) {
-    output->completed = std::move(completed);
-  }
+    std::move(batches), input.item, input.execution, input.get_position());
+  output->completed     = std::move(metadata);
   uint64_t output_bytes = 0, output_rows = 0;
   for (auto const& batch : output->get_data_batches()) {
     auto metadata = get_batch_rows_and_bytes(*batch);
@@ -1067,9 +966,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     output->get_data_batches().size(),
     output_rows,
     output_bytes,
-    output->completed && std::holds_alternative<state::order_result>(*output->completed)
-      ? std::get<state::order_result>(*output->completed).splitter_count
-      : 0,
+    output->completed->splitter_count,
     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
   return output;
 }
@@ -1099,29 +996,14 @@ void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::strea
     sirius_physical_operator::sink(output, stream);
     return;
   }
-  if (auto* merge = std::get_if<tiled_state::merge_operation>(&data.execution->op)) {
-    tiled_state::storage_access::publish(merge->destination, data.get_data_batches().at(0));
-    return;
+  auto const& destinations = data.completed.value().destinations;
+  auto const& batches      = data.get_data_batches();
+  if (destinations.size() != batches.size()) {
+    throw internal_exception("Sort scratch output count mismatch");
   }
-  auto publish = [](tiled_state::produced_batch const& output) {
-    tiled_state::storage_access::publish(output.destination, output.batch);
-  };
-  std::visit(
-    [&](auto const& value) {
-      using T = std::decay_t<decltype(value)>;
-      if constexpr (std::is_same_v<T, tiled_state::order_result>) {
-        for (auto const& page : value.pages) {
-          publish(page);
-        }
-      } else if constexpr (std::is_same_v<T, tiled_state::extract_result>) {
-        for (auto const& piece : value.pieces) {
-          publish(piece.output);
-        }
-      } else if constexpr (!std::is_same_v<T, tiled_state::publish_result>) {
-        publish(value.output);
-      }
-    },
-    data.completed.value());
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    tiled_state::storage_access::publish(destinations[i], batches[i]);
+  }
 }
 
 void sirius_physical_merge_sort::on_task_output_published(operator_data const& output)
@@ -1136,11 +1018,43 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
   }
   auto r = item.owner.lock();
   if (!r) { throw internal_exception("Missing sort range at completion"); }
-  if (auto* merge = std::get_if<state::merge_operation>(&item.execution->op)) {
-    merge->complete(*r, *item.execution, *data.get_data_batches().at(0));
-  } else {
-    r->accept(data.completed.value(), *item.execution);
-  }
+  auto const& metadata = data.completed.value();
+  auto describe        = [&](std::size_t i) {
+    return state::storage_access::describe(metadata.destinations.at(i),
+                                           *data.get_data_batches().at(i));
+  };
+  std::visit(
+    [&](auto const& operation) {
+      using T = std::decay_t<decltype(operation)>;
+      if constexpr (std::is_same_v<T, state::merge_operation>) {
+        operation.complete(*r, *item.execution, *data.get_data_batches().at(0));
+      } else if constexpr (T::type == state::kind::NORMALIZE) {
+        std::get<state::normalize_stage>(r->stage)
+          .normalized.at(operation.input)
+          .push_back({operation.begin, describe(0)});
+      } else if constexpr (T::type == state::kind::SAMPLE) {
+        std::get<state::sample_stage>(r->stage).samples.at(operation.input) = describe(0);
+      } else if constexpr (T::type == state::kind::ORDER) {
+        auto& stage = std::get<state::order_stage>(r->stage);
+        for (std::size_t i = 0; i < metadata.destinations.size(); ++i) {
+          stage.pages.push_back(describe(i));
+        }
+        stage.splitter_count = metadata.splitter_count;
+      } else if constexpr (T::type == state::kind::EXTRACT) {
+        auto& stage = std::get<state::extract_stage>(r->stage);
+        if (metadata.pieces.size() != data.get_data_batches().size()) {
+          throw internal_exception("Sort extraction coverage count mismatch");
+        }
+        for (std::size_t i = 0; i < metadata.pieces.size(); ++i) {
+          auto const& piece = metadata.pieces[i];
+          stage.tiles.at(piece.tile_index)
+            .pieces.push_back({describe(i), operation.input, piece.begin, piece.end});
+        }
+      } else {
+        (void)std::get<state::done_stage>(r->stage);
+      }
+    },
+    item.execution->op);
   item.state = state::status::COMPLETE;
   if (item.execution->type() != state::kind::PUBLISH) {
     r->queue()->complete();

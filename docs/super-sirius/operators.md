@@ -759,6 +759,14 @@ not retained to reconstruct progress. Tile ordinals determine result order regar
 completion order. Once every range completes, the coordinator assigns scalar positions in
 range/tile order and enters the existing final-publication barrier.
 
+Task outputs own batches only through the runtime batch vector. Scratch destinations
+align by output index; completion metadata contains splitter counts and extraction
+coordinates, never batch pointers. Output replacement preserves this metadata and
+checks batch counts. Scratch sink validates destination counts before publishing;
+completion reads the current runtime batches, including materialized replacements.
+Final publication retains its positioned downstream sink, and empty extraction
+outputs complete normally.
+
 Preparation/compute retries do not advance shared progress. Defaulted physical-operator
 lifecycle hooks receive each attempt's granted reservation and attainable device ceiling,
 request preparation recovery only for a source that is also the sink, and notify successful
