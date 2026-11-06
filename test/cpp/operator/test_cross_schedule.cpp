@@ -26,7 +26,7 @@
 // istically. End-to-end multi-batch streaming is covered by the [mgpu] tests,
 // which also exercise refresh_cross_schedule's non-INNER whole-side guard.
 
-#include "op/sirius_physical_hash_join.hpp"
+#include "op/join_cross_schedule.hpp"
 
 #include <catch.hpp>
 
