@@ -285,12 +285,15 @@ TEST_CASE("range exchange sends each row to the rank whose range holds it", "[ex
   CHECK(all == all_keys(3, 2));
 }
 
-TEST_CASE("broadcast exchange sends every row to every rank", "[exchange][operators]")
+TEST_CASE("broadcast exchange sends every row to every rank, sources attached before or after",
+          "[exchange][operators]")
 {
+  // Attached after: what arrived before a source existed is kept for it.
+  bool const sources_late = GENERATE(false, true);
   ranks c(3);
   exchange_spec spec;
   spec.routing = mode::broadcast;
-  auto sources = exchange_all(c, 3, spec, 2, false, false);
+  auto sources = exchange_all(c, 3, spec, 2, false, sources_late);
   auto want    = all_keys(3, 2);
   for (rank_t r = 0; r < c.world(); ++r) {
     auto got = flat(drain(*sources[r]));
@@ -361,19 +364,6 @@ TEST_CASE("an unordered gather delivers every row to its target", "[exchange][op
   std::sort(got.begin(), got.end());
   CHECK(got == all_keys(2, 3));
   CHECK(drain(*sources[0]).empty());
-}
-
-TEST_CASE("batches that arrive before their source exists are kept for it", "[exchange][operators]")
-{
-  ranks c(3);
-  exchange_spec spec;
-  spec.routing = mode::broadcast;
-  auto sources = exchange_all(c, 6, spec, 2, false, /*sources_late=*/true);
-  for (rank_t r = 0; r < c.world(); ++r) {
-    auto got = flat(drain(*sources[r]));
-    std::sort(got.begin(), got.end());
-    CHECK(got == all_keys(3, 2));
-  }
 }
 
 TEST_CASE("an exchange source hints READY with data, waits while open, ends when done",
@@ -526,6 +516,15 @@ TEST_CASE("an aborted query fails its streams on every rank, and only its stream
   REQUIRE(untouched.has_value());
   CHECK(untouched->hint == sirius::op::TaskCreationHint::WAITING_FOR_INPUT_DATA);
 
+  // The peer stops sending for the query, and still closes its streams.
+  auto& service = *c.all[1].service;
+  CHECK_THROWS_WITH(service.send(aborted, 0, key_value_batch(1, 0)),
+                    Catch::Matchers::ContainsSubstring("failed on rank 0: injected failure"));
+  CHECK_THROWS_WITH(service.send(aborted + 1, 1, key_value_batch(1, 1)),
+                    Catch::Matchers::ContainsSubstring("failed on rank 0: injected failure"));
+  CHECK_NOTHROW(service.close(aborted, 0));
+  CHECK_NOTHROW(service.close(aborted, 1));
+
   // A stream of the query attached after the abort fails at once.
   sirius_physical_exchange_source late(
     key_value_types(), 0, c.all[1].service, aborted + 1, {0, 1}, false);
@@ -564,24 +563,8 @@ TEST_CASE("a receiver that throws aborts its query on every rank, and the next q
   CHECK(flat(drain(source)).size() == rows_per_batch);
 }
 
-TEST_CASE("a failed exchange fails the next task of its sources", "[exchange][operators]")
-{
-  ranks c(2, {.fail_after_writes = 0});
-  exchange_spec spec;
-  spec.routing = mode::broadcast;
-  sirius_physical_exchange_source source(key_value_types(), 0, c.all[1].service, 8, {0, 1}, false);
-  sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[0].service, 8, spec);
-  sink_batch(sink, key_value_batch(0, 0));
-  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-  while (source.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY) {
-    REQUIRE(std::chrono::steady_clock::now() < deadline);
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  CHECK_THROWS(source.get_next_task_input_data());
-  CHECK_FALSE(source.all_ports_empty());
-}
-
-TEST_CASE("a failed exchange tells a later query to restart every rank", "[exchange][operators]")
+TEST_CASE("a failed exchange fails its sources' next task and tells a later query to restart",
+          "[exchange][operators]")
 {
   ranks c(2, {.fail_after_writes = 0});
   exchange_spec spec;
@@ -594,6 +577,9 @@ TEST_CASE("a failed exchange tells a later query to restart every rank", "[excha
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
+  CHECK_THROWS(failed.get_next_task_input_data());
+  CHECK_FALSE(failed.all_ports_empty());
+
   // Streams 8 and the failed one are query 0; fail-stop must also refuse another query.
   stream_id const next_query = sirius::exchange::make_stream_id(1, 1);
   sirius_physical_exchange_source later(
@@ -677,28 +663,6 @@ TEST_CASE("a stream takes a second receiver only once its first has detached",
     CHECK(flat(drain(first)).size() == rows_per_batch);
   }
   CHECK_NOTHROW(service.attach(stream, std::make_shared<ignoring>()));
-}
-
-TEST_CASE("a rank stops sending for a query a peer aborted, and still closes its streams",
-          "[exchange][operators]")
-{
-  ranks c(2);
-  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
-  sirius_physical_exchange_source there(
-    key_value_types(), 0, c.all[1].service, stream, {0, 1}, false);
-  c.all[0].service->abort(sirius::exchange::query_of(stream), "injected failure");
-  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-  while (there.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY) {
-    REQUIRE(std::chrono::steady_clock::now() < deadline);
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  auto& service = *c.all[1].service;
-  CHECK_THROWS_WITH(service.send(stream, 0, key_value_batch(1, 0)),
-                    Catch::Matchers::ContainsSubstring("failed on rank 0: injected failure"));
-  CHECK_THROWS_WITH(service.send(stream + 1, 1, key_value_batch(1, 1)),
-                    Catch::Matchers::ContainsSubstring("failed on rank 0: injected failure"));
-  CHECK_NOTHROW(service.close(stream, 0));
-  CHECK_NOTHROW(service.close(stream, 1));
 }
 
 TEST_CASE("queries retiring out of order are each forgotten", "[exchange][operators]")
