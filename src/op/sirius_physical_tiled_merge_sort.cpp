@@ -33,6 +33,7 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 namespace sirius::op {
 namespace sm = sampled_merge;
@@ -178,24 +179,113 @@ struct sirius_physical_merge_sort::tiled_state {
     std::size_t tile_index{0};
     uint64_t begin{0}, end{0};
   };
+  // Immutable worker payloads, separate from coordinator bookkeeping.
+  struct normalize_request {
+    static constexpr kind type = kind::NORMALIZE;
+    slot destination;
+    uint64_t begin, end;
+  };
+  struct coalesce_request {
+    static constexpr kind type = kind::COALESCE;
+    slot destination;
+  };
+  struct sample_request {
+    static constexpr kind type = kind::SAMPLE;
+    slot destination;
+    std::size_t input;
+    uint64_t stride;
+  };
+  struct order_request {
+    static constexpr kind type = kind::ORDER;
+    slot destination;
+    uint64_t sample_step;
+  };
+  struct extract_request {
+    static constexpr kind type = kind::EXTRACT;
+    std::size_t input;
+    uint64_t begin, end, first_splitter, splitter_count;
+    std::vector<slot> destinations;
+  };
+  struct merge_request {
+    static constexpr kind type = kind::MERGE;
+    slot destination;
+  };
+  struct publish_request {
+    static constexpr kind type = kind::PUBLISH;
+    std::vector<cudf::size_type> projection;
+  };
+  using operation = std::variant<normalize_request,
+                                 coalesce_request,
+                                 sample_request,
+                                 order_request,
+                                 extract_request,
+                                 merge_request,
+                                 publish_request>;
+  struct request {
+    std::vector<ref> sources;
+    std::shared_ptr<const sort_comparison_config> comparison;
+    operation op;
+    kind type() const
+    {
+      return std::visit([](auto const& value) { return value.type; }, op);
+    }
+  };
+  static std::shared_ptr<const request> capture(sirius_physical_merge_sort const& op,
+                                                work const& item)
+  {
+    auto r = item.owner.lock();
+    if (!r) { throw internal_exception("Missing sort region at claim"); }
+    operation payload = [&]() -> operation {
+      switch (item.type) {
+        case kind::NORMALIZE: return normalize_request{item.destination, item.begin, item.end};
+        case kind::COALESCE: return coalesce_request{item.destination};
+        case kind::SAMPLE: return sample_request{item.destination, item.input, r->sampling.stride};
+        case kind::ORDER: return order_request{item.destination, r->sampling.sample_step};
+        case kind::EXTRACT: {
+          std::vector<slot> destinations;
+          for (auto t = item.begin; t < item.end; ++t) {
+            destinations.push_back(
+              {op._tile_storage[PIECES], r->tiles.at(t).partition, item.input});
+          }
+          return extract_request{item.input,
+                                 item.begin,
+                                 item.end,
+                                 item.first_splitter,
+                                 r->splitter_count,
+                                 std::move(destinations)};
+        }
+        case kind::MERGE: return merge_request{item.destination};
+        case kind::PUBLISH:
+          return publish_request{{op._final_projections.begin(), op._final_projections.end()}};
+      }
+      throw internal_exception("Unknown tiled sort request");
+    }();
+    return std::make_shared<const request>(
+      request{item.sources, op.comparison, std::move(payload)});
+  }
   struct task_data : pipelineable_operator_data {
     std::shared_ptr<work> item;
+    std::shared_ptr<const request> execution;
     std::vector<record> records;
     std::vector<record> spans;
     uint64_t splitter_count{0};
     std::size_t admitted_bytes{0}, attempt_ceiling{0};
     task_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
               std::shared_ptr<work> item,
+              std::shared_ptr<const request> execution,
               std::optional<std::size_t> position = std::nullopt)
-      : pipelineable_operator_data(std::move(batches), position), item(std::move(item))
+      : pipelineable_operator_data(std::move(batches), position),
+        item(std::move(item)),
+        execution(std::move(execution))
     {
     }
     std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
       std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
     {
-      auto result     = std::make_unique<task_data>(std::move(batches), item, get_position());
-      result->records = records;
-      result->spans   = spans;
+      auto result =
+        std::make_unique<task_data>(std::move(batches), item, execution, get_position());
+      result->records         = records;
+      result->spans           = spans;
       result->splitter_count  = splitter_count;
       result->admitted_bytes  = admitted_bytes;
       result->attempt_ceiling = attempt_ceiling;
@@ -210,14 +300,14 @@ struct sirius_physical_merge_sort::tiled_state {
                              char const* reason)
   {
     uint64_t bytes = 0;
-    for (auto const& source : data.item->sources) {
+    for (auto const& source : data.execution->sources) {
       bytes = sm::checked_add(bytes, source.bytes);
     }
-    auto page = data.item->type == kind::EXTRACT ? data.item->sources.back().bytes : 0;
+    auto page = data.execution->type() == kind::EXTRACT ? data.execution->sources.back().bytes : 0;
     return std::format(
       "Tiled sort {} {}: {}; owning_backing={}, page_bytes={}, granted={}, "
       "effective_ceiling={}, configured_ceiling={}",
-      name(data.item->type),
+      name(data.execution->type()),
       site,
       reason,
       bytes,
@@ -570,13 +660,14 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     r->enqueued = false;
     ++r->creator_visits;
     _tiled_state->advance(*this, r);
-    auto data = r->work_items.claim([](auto const& item) {
+    auto data = r->work_items.claim([this](auto const& item) {
       std::vector<std::shared_ptr<cucascade::data_batch>> batches;
       batches.reserve(item->sources.size());
       for (auto const& input : item->sources) {
         batches.push_back(input.get());
       }
-      return std::make_unique<tiled_state::task_data>(std::move(batches), item);
+      return std::make_unique<tiled_state::task_data>(
+        std::move(batches), item, tiled_state::capture(*this, *item));
     });
     if (data) {
       data->item->state = tiled_state::status::CLAIMED;
@@ -594,10 +685,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
       _tiled_state->publishing = true;
       if (_tiled_state->finals.complete_stage()) { _tiled_state->finished = true; }
     }
-    auto task = _tiled_state->finals.claim([](auto const& item) {
+    auto task = _tiled_state->finals.claim([this](auto const& item) {
       return std::make_unique<tiled_state::task_data>(
         std::vector<std::shared_ptr<cucascade::data_batch>>{item->sources.front().get()},
         item,
+        tiled_state::capture(*this, *item),
         item->destination.position);
     });
     if (task) {
@@ -611,20 +703,19 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data const& input_data,
                                                                    ::cuda::stream_ref stream)
 {
-  auto started      = std::chrono::steady_clock::now();
-  using state       = tiled_state;
-  auto const& input = dynamic_cast<state::task_data const&>(input_data);
-  auto const& item  = *input.item;
-  auto owner        = item.owner.lock();
-  if (!owner) { throw internal_exception("Sort work outlived its region"); }
-  auto reads = input.get_read_only_batches();
+  auto started           = std::chrono::steady_clock::now();
+  using state            = tiled_state;
+  auto const& input      = dynamic_cast<state::task_data const&>(input_data);
+  auto const& request    = *input.execution;
+  auto const& comparison = request.comparison;
+  auto reads             = input.get_read_only_batches();
   if (reads.empty()) { throw internal_exception("Tiled sort task has no inputs"); }
   // INVARIANT: gpu_pipeline_task -> prepare_for_processing -> lock_or_prepare_batch
   // restores exactly this item's inputs onto the task's reservation device.
   auto* space = reads.front().get_memory_space();
   auto mr     = space->get_default_allocator();
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
-  auto result = std::make_unique<state::task_data>(std::move(outputs), input.item);
+  auto result = std::make_unique<state::task_data>(std::move(outputs), input.item, input.execution);
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   auto emit = [&](std::unique_ptr<cudf::table> table, state::record record) {
     batches.push_back(make_data_batch(std::move(table), *space, stream, batch_telemetry()));
@@ -636,115 +727,115 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   }
   nvtx_scoped_range nvtx{"sort.tile_work"};
   try {
-    if (item.type == state::kind::PUBLISH) {
-      if (_final_projections.empty()) {
-        batches = input.get_data_batches();
-      } else {
-        std::vector<cudf::size_type> projection(_final_projections.begin(),
-                                                _final_projections.end());
-        batches.push_back(make_data_batch(
-          std::make_unique<cudf::table>(views.front().select(projection), stream, mr),
-          *space,
-          stream,
-          batch_telemetry()));
-      }
-    } else if (item.type == state::kind::MERGE) {
-      if (views.size() == 1) {
-        batches = input.get_data_batches();
-        result->records.push_back({item.destination});
-      } else {
-        emit(cudf::merge(views,
-                         comparison->key_columns,
-                         comparison->directions,
-                         comparison->null_precedence,
-                         stream,
-                         mr),
-             {item.destination});
-      }
-    } else if (item.type == state::kind::NORMALIZE) {
-      auto view = cudf::slice(
-        views.front(),
-        {static_cast<cudf::size_type>(item.begin), static_cast<cudf::size_type>(item.end)},
-        stream)[0];
-      emit(std::make_unique<cudf::table>(view, stream, mr),
-           {item.destination, item.tile_index, item.begin, item.end});
-    } else if (item.type == state::kind::COALESCE) {
-      emit(cudf::merge(views,
-                       comparison->key_columns,
-                       comparison->directions,
-                       comparison->null_precedence,
-                       stream,
-                       mr),
-           {item.destination});
-    } else if (item.type == state::kind::SAMPLE) {
-      emit(sm::gather_samples(
-             views.front(), item.input, owner->sampling.stride, *comparison, stream, mr),
-           {item.destination});
-    } else if (item.type == state::kind::ORDER) {
-      auto splitters =
-        sm::order_sample_splitters(views, owner->sampling.sample_step, *comparison, stream, mr);
-      result->splitter_count = splitters->num_rows();
-      auto count             = result->splitter_count + 1;
-      for (uint64_t begin = 0, page = 0; begin < count; begin += state::window_tiles, ++page) {
-        auto end             = std::min(begin + state::window_tiles, count);
-        auto first           = begin ? begin - 1 : 0;
-        auto last            = std::min(end, result->splitter_count);
-        auto destination     = item.destination;
-        destination.position = page;
-        if (!page && end == count) {
-          emit(std::move(splitters), {destination});
-        } else {
-          auto view =
-            cudf::slice(splitters->view(),
-                        {static_cast<cudf::size_type>(first), static_cast<cudf::size_type>(last)},
-                        stream)[0];
-          emit(std::make_unique<cudf::table>(view, stream, mr), {destination});
+    std::visit(
+      [&](auto const& item) {
+        if constexpr (std::decay_t<decltype(item)>::type == state::kind::PUBLISH) {
+          if (item.projection.empty()) {
+            batches = input.get_data_batches();
+          } else {
+            batches.push_back(make_data_batch(
+              std::make_unique<cudf::table>(views.front().select(item.projection), stream, mr),
+              *space,
+              stream,
+              batch_telemetry()));
+          }
+        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::MERGE) {
+          if (views.size() == 1) {
+            batches = input.get_data_batches();
+            result->records.push_back({item.destination});
+          } else {
+            emit(cudf::merge(views,
+                             comparison->key_columns,
+                             comparison->directions,
+                             comparison->null_precedence,
+                             stream,
+                             mr),
+                 {item.destination});
+          }
+        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::NORMALIZE) {
+          auto view = cudf::slice(
+            views.front(),
+            {static_cast<cudf::size_type>(item.begin), static_cast<cudf::size_type>(item.end)},
+            stream)[0];
+          emit(std::make_unique<cudf::table>(view, stream, mr),
+               {item.destination, 0, item.begin, item.end});
+        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::COALESCE) {
+          emit(cudf::merge(views,
+                           comparison->key_columns,
+                           comparison->directions,
+                           comparison->null_precedence,
+                           stream,
+                           mr),
+               {item.destination});
+        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::SAMPLE) {
+          emit(sm::gather_samples(views.front(), item.input, item.stride, *comparison, stream, mr),
+               {item.destination});
+        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::ORDER) {
+          auto splitters =
+            sm::order_sample_splitters(views, item.sample_step, *comparison, stream, mr);
+          result->splitter_count = splitters->num_rows();
+          auto count             = result->splitter_count + 1;
+          for (uint64_t begin = 0, page = 0; begin < count; begin += state::window_tiles, ++page) {
+            auto end             = std::min(begin + state::window_tiles, count);
+            auto first           = begin ? begin - 1 : 0;
+            auto last            = std::min(end, result->splitter_count);
+            auto destination     = item.destination;
+            destination.position = page;
+            if (!page && end == count) {
+              emit(std::move(splitters), {destination});
+            } else {
+              auto view = cudf::slice(
+                splitters->view(),
+                {static_cast<cudf::size_type>(first), static_cast<cudf::size_type>(last)},
+                stream)[0];
+              emit(std::make_unique<cudf::table>(view, stream, mr), {destination});
+            }
+          }
+        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::EXTRACT) {
+          auto cuts = sm::discover_cuts(views[0], item.input, views[1], *comparison, stream, mr);
+          std::vector<cudf::size_type> host(cuts->size());
+          // One bulk integer readback, including adjacent page boundaries. Keep the
+          // host destination alive through the exception fence as well.
+          try {
+            CUDF_CUDA_TRY(cudaMemcpyAsync(host.data(),
+                                          cuts->view().template data<cudf::size_type>(),
+                                          host.size() * sizeof(cudf::size_type),
+                                          cudaMemcpyDeviceToHost,
+                                          stream.get()));
+            stream.sync();
+          } catch (...) {
+            cudaStreamSynchronize(stream.get());
+            throw;
+          }
+          for (auto t = item.begin; t < item.end; ++t) {
+            auto begin = t ? host.at(t - 1 - item.first_splitter) : 0;
+            auto end =
+              t == item.splitter_count ? views[0].num_rows() : host.at(t - item.first_splitter);
+            if (begin > end || begin < 0 || end > views[0].num_rows()) {
+              throw internal_exception("Nonmonotone tiled sort cuts");
+            }
+            if (begin == end) { continue; }
+            result->spans.push_back({item.destinations.at(t - item.begin),
+                                     static_cast<std::size_t>(t),
+                                     static_cast<uint64_t>(begin),
+                                     static_cast<uint64_t>(end)});
+          }
+          for (auto const& span : result->spans) {
+            auto view = cudf::slice(
+              views[0],
+              {static_cast<cudf::size_type>(span.begin), static_cast<cudf::size_type>(span.end)},
+              stream)[0];
+            emit(std::make_unique<cudf::table>(view, stream, mr), span);
+          }
+          SIRIUS_LOG_TRACE(
+            "sort.extract input={}, tile_begin={}, tile_end={}, readbacks=1, waits=1, pieces={}",
+            item.input,
+            item.begin,
+            item.end,
+            batches.size());
         }
-      }
-    } else if (item.type == state::kind::EXTRACT) {
-      auto cuts = sm::discover_cuts(views[0], item.input, views[1], *comparison, stream, mr);
-      std::vector<cudf::size_type> host(cuts->size());
-      // One bulk integer readback, including adjacent page boundaries. Keep the
-      // host destination alive through the exception fence as well.
-      try {
-        CUDF_CUDA_TRY(cudaMemcpyAsync(host.data(),
-                                      cuts->view().data<cudf::size_type>(),
-                                      host.size() * sizeof(cudf::size_type),
-                                      cudaMemcpyDeviceToHost,
-                                      stream.get()));
-        stream.sync();
-      } catch (...) {
-        cudaStreamSynchronize(stream.get());
-        throw;
-      }
-      for (auto t = item.begin; t < item.end; ++t) {
-        auto begin = t ? host.at(t - 1 - item.first_splitter) : 0;
-        auto end =
-          t == owner->splitter_count ? views[0].num_rows() : host.at(t - item.first_splitter);
-        if (begin > end || begin < 0 || end > views[0].num_rows()) {
-          throw internal_exception("Nonmonotone tiled sort cuts");
-        }
-        if (begin == end) { continue; }
-        auto const& tile = owner->tiles.at(t);
-        result->spans.push_back({{_tile_storage[state::PIECES], tile.partition, item.input},
-                                 static_cast<std::size_t>(t),
-                                 static_cast<uint64_t>(begin),
-                                 static_cast<uint64_t>(end)});
-      }
-      for (auto const& span : result->spans) {
-        auto view = cudf::slice(
-          views[0],
-          {static_cast<cudf::size_type>(span.begin), static_cast<cudf::size_type>(span.end)},
-          stream)[0];
-        emit(std::make_unique<cudf::table>(view, stream, mr), span);
-      }
-      SIRIUS_LOG_TRACE(
-        "sort.extract input={}, tile_begin={}, tile_end={}, readbacks=1, waits=1, pieces={}",
-        item.input,
-        item.begin,
-        item.end,
-        batches.size());
-    }
+      },
+      request.op);
   } catch (rmm::out_of_memory const&) {
     cudaStreamSynchronize(stream.get());
     if (input.admitted_bytes < input.attempt_ceiling) { throw; }
@@ -754,8 +845,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     cudaStreamSynchronize(stream.get());
     throw;
   }
-  auto output =
-    std::make_unique<state::task_data>(std::move(batches), input.item, input.get_position());
+  auto output = std::make_unique<state::task_data>(
+    std::move(batches), input.item, input.execution, input.get_position());
   output->records        = std::move(result->records);
   output->spans          = std::move(result->spans);
   output->splitter_count = result->splitter_count;
@@ -768,8 +859,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   SIRIUS_LOG_TRACE(
     "sort.tile_work kind={}, inputs={}, outputs={}, output_rows={}, output_bytes={}, splitters={}, "
     "enqueue_ms={}",
-    state::name(item.type),
-    item.sources.size(),
+    state::name(request.type()),
+    request.sources.size(),
     output->get_data_batches().size(),
     output_rows,
     output_bytes,
@@ -799,7 +890,7 @@ void sirius_physical_merge_sort::notify_task_attempt(operator_data& input,
 void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::stream_ref stream)
 {
   auto const& data = dynamic_cast<tiled_state::task_data const&>(output);
-  if (data.item->type == tiled_state::kind::PUBLISH) {
+  if (data.execution->type() == tiled_state::kind::PUBLISH) {
     sirius_physical_operator::sink(output, stream);
     return;
   }

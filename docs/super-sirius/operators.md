@@ -718,6 +718,14 @@ descriptors contain repository locations and host metadata; ordinary task prepar
 acquires read handles and restores only the selected work's inputs on its assigned GPU.
 Full backing allocations count even when an operation reads a slice.
 
+At claim time, the coordinator captures an immutable operation-specific request containing
+source handles, comparison settings and the operation's parameters. Extraction requests
+include splitter bounds and destination slots; publication requests include the final
+projection. GPU execution reads this request and prepared batches without dereferencing
+range state. Runtime batch replacement preserves the same request through reservation
+retries. Scheduling identity and reservation-attempt metadata remain in the task adapter.
+
+
 The task creator claims operator-local work under a mutex from pending queues. Completion
 counts cover outstanding work, ranges and final publications; only actionable
 regions enter the ready queue. Completed descriptors leave the work queue when claimed;
