@@ -33,8 +33,10 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <planner/sirius_physical_plan_generator.hpp>
 
 #include <algorithm>
 #include <numeric>
@@ -80,7 +82,10 @@ struct chunked_join {
   sirius::pipeline::sirius_pipeline_build_state build_state;
 };
 
-std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type)
+/// @param build_concat  Feed the build port from a CONCAT child, as the planner does, instead of a
+///                      placeholder.
+std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type,
+                                                bool build_concat = false)
 {
   using duckdb::LogicalType;
   auto f                 = std::make_unique<chunked_join>();
@@ -97,10 +102,15 @@ std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type)
                                               sirius::from_duckdb_vec(duckdb::vector<LogicalType>{
                                                 LogicalType::INTEGER, LogicalType::INTEGER}),
                                               0);
-  auto build_child = duckdb::make_uniq<test_physical_operator>(
-    SiriusPhysicalOperatorType::PROJECTION,
-    sirius::from_duckdb_vec(duckdb::vector<LogicalType>{LogicalType::INTEGER}),
-    0);
+  auto const build_types =
+    sirius::from_duckdb_vec(duckdb::vector<LogicalType>{LogicalType::INTEGER});
+  duckdb::unique_ptr<sirius_physical_operator> build_child;
+  if (build_concat) {
+    build_child = duckdb::make_uniq<sirius_physical_concat>(build_types, 0, /*concat_all=*/true);
+  } else {
+    build_child = duckdb::make_uniq<test_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION, build_types, 0);
+  }
   duckdb::vector<duckdb::JoinCondition> conditions;
   conditions.emplace_back(
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(LogicalType::INTEGER, 0),
@@ -118,6 +128,7 @@ std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type)
     1000);
   size_t next_id = 0;
   number_operator_tree(*f->join, next_id);
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*f->join, nullptr);
 
   sirius::pipeline::pipeline_build_context ctx{nullptr, true};
   f->build_pipeline = std::make_shared<finishable_pipeline>(ctx);
@@ -438,4 +449,50 @@ TEST_CASE("a chunked BUILD_PROBE probe that fails keeps the built chunks for the
   auto const payload = copy_column_to_host<int32_t>(result.view.column(1));
   CHECK(copy_column_to_host<int32_t>(result.view.column(0)) == std::vector<int32_t>{2, 4, 6});
   CHECK(payload == std::vector<int32_t>{20, 40, 60});
+}
+
+TEST_CASE("a split build CONCAT tells its BUILD_PROBE join the build is chunked", "[build_probe]")
+{
+  auto f       = make_chunked_join(duckdb::JoinType::SEMI, /*build_concat=*/true);
+  auto& concat = f->join->children[1]->Cast<sirius_physical_concat>();
+  concat.set_build_split_allowed(true);
+  concat.add_next_port_after_sink({f->join.get(), "build"});
+  concat.sink(partitioned_operator_data(
+                {int_batch({2, 4}), int_batch({4, 6})}, 0, partition_placement::unpinned(1)),
+              cudf::get_default_stream());
+  REQUIRE(f->build_repo.size(0) == 2);
+  f->probe_repo.add_data_batch(probe_batch(int_batch({1, 2, 4, 6, 7}), {10, 20, 40, 60, 70}), 0);
+
+  // Told by the CONCAT, the join waits for every chunk instead of building from two batches it
+  // takes for one.
+  auto hint = f->join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  f->build_pipeline->finished = true;
+  hint                        = f->join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  auto input = f->join->get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  REQUIRE(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches().size() == 3);
+  auto result = collect(f->join->execute(*input, cudf::get_default_stream()));
+  CHECK(copy_column_to_host<int32_t>(result.view.column(0)) == std::vector<int32_t>{2, 4, 6});
+}
+
+TEST_CASE("a CONCAT that does not feed a hash join build refuses to split a build", "[build_probe]")
+{
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  auto parent =
+    duckdb::make_uniq<test_physical_operator>(SiriusPhysicalOperatorType::PROJECTION, types, 0);
+  parent->children.push_back(
+    duckdb::make_uniq<sirius_physical_concat>(types, 0, /*concat_all=*/true));
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*parent, nullptr);
+  auto& concat = parent->children[0]->Cast<sirius_physical_concat>();
+  concat.set_build_split_allowed(true);
+  CHECK_THROWS_AS(
+    concat.sink(partitioned_operator_data(
+                  {int_batch({2}), int_batch({4})}, 0, partition_placement::unpinned(1)),
+                cudf::get_default_stream()),
+    std::logic_error);
 }
