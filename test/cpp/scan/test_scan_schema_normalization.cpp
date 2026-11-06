@@ -55,7 +55,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
-#include <io/io_context.hpp>
+#include <io/ioctx_resolver.hpp>
 #include <late_mat/column_origin.hpp>
 #include <late_mat/defer_directive.hpp>
 #include <late_mat/port_materialize.hpp>

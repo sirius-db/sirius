@@ -21,6 +21,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 
 #include <algorithm>

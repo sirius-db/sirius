@@ -15,9 +15,9 @@
  */
 
 // sirius
-#include "io/cache/types.hpp"
 #include "op/scan/table_scan/split_validation.hpp"
 
+#include <cucascade/io/cache/types.hpp>
 #include <data/data_batch_utils.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
@@ -716,7 +716,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     if (_ingestible->output_assembly_is_leading_identity()) {
       scan_input->decode_restore_types = normalization_targets();
     }
-    scan_input->update(io::cache::scan_stage::queued);
+    scan_input->update(cucascade::io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }

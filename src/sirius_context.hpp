@@ -62,6 +62,7 @@
 
 namespace cucascade::memory {
 class small_pinned_host_memory_resource;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::vss {
@@ -70,7 +71,7 @@ class cuvs_index_cache;
 
 namespace sirius::memory {
 class numa_small_pinned_mr;
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius {

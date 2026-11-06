@@ -29,6 +29,8 @@
 #include "yyjson.hpp"
 
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -36,7 +38,6 @@
 #include <duckdb/common/string_util.hpp>
 #include <duckdb/common/types/blob.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
@@ -3460,8 +3461,8 @@ TEST_CASE_METHOD(
   REQUIRE_FALSE(sibling.Query("SELECT 1")->HasError());
   auto discovery = sirius::op::scan::discover_from_manifests(
     *con->context, v2_path, std::move(*inventory.inventory));
-  sirius::io::kvikio_context ioctx;
-  auto data = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto data  = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
   REQUIRE(data);
   REQUIRE(data->positional_deletes.size() == 1);
   CHECK(data->positional_deletes.begin()->second == std::vector<int64_t>{1, 3});
@@ -3470,8 +3471,8 @@ TEST_CASE_METHOD(
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 1);
   REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
   auto cached =
-    sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
-  auto hit = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+    sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
+  auto hit = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
   CHECK(cached != hit);
   CHECK(cached->positional_deletes == data->positional_deletes);
   CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
