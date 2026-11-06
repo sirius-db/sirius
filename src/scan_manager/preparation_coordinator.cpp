@@ -61,7 +61,7 @@ std::unique_ptr<op::scan::scan_info> preparation_job::run(preparation_stop_token
   }
 }
 
-struct preparation_coordinator::state {
+struct preparation_coordinator::state : std::enable_shared_from_this<state> {
   static thread_local state const* native_caller;
   struct native_call_guard {
     state const* previous;
@@ -166,10 +166,75 @@ struct preparation_coordinator::state {
     std::function<void()> close;
     size_t remaining;
   };
+  // One asynchronous coalescer call. The worker owns mutable access until it
+  // publishes done under gate->mutex; the control driver then consumes the result.
+  struct coalescing_operation {
+    enum class kind { advance, partial, flush } type;
+    // For advance: originating result slot and resumable position within its input.
+    size_t index = 0, cursor = 0;
+    // Input moves out of the slot while running; batch is the optional emitted output.
+    std::unique_ptr<op::scan::scan_info> input, batch;
+    // finished exhausts the advance input; done publishes completion of this call.
+    // size_triggered records why a partial batch was requested for publication.
+    bool finished = false, done = false, size_triggered = false;
+    // Post-call snapshots avoid reading a coalescer concurrently with its worker.
+    size_t retained_bytes = 0;
+    // first is the post-call retention time; deadline_retained preserves the
+    // pre-call timestamp used to account for a deadline-triggered emission.
+    std::optional<op::scan::batch_coalescer::clock::time_point> first, deadline_retained;
+    // Worker failure, rethrown by the control driver after observing done.
+    std::exception_ptr error;
+  };
+  // Captured by the dispatched callback. Detects accepted work discarded without
+  // completion so the attempt cannot remain parked waiting for a missing result.
+  struct coalescing_ticket {
+    // Keep attempt state and operation alive through callback/capture disposal.
+    std::shared_ptr<state> owner;
+    std::shared_ptr<coalescing_operation> operation;
+    ~coalescing_ticket()
+    {
+      {
+        std::lock_guard lock(owner->gate->mutex);
+        if (operation->done || owner->gate->closed) return;
+      }
+      // Preserve an enqueue exception reported by the control driver. A silent
+      // dispatcher discard otherwise needs its own failure and retirement signal.
+      if (!std::uncaught_exceptions()) {
+        try {
+          throw std::runtime_error("accepted coalescing operation was discarded");
+        } catch (...) {
+          owner->completion->report_error(std::current_exception());
+        }
+      }
+      owner->stop();
+    }
+  };
   struct source_state {
+    // Adapter hooks and coalescer for this registered source.
     source hooks;
+    // Shared destination/close accounting for sources that feed the same output.
     std::shared_ptr<output_group> output;
+    // Whether this source has already contributed to the output group's completion.
     bool output_done = false;
+    // Opt-in to worker execution of coalescer calls instead of inline control work.
+    bool asynchronous = false;
+    // Stable pool domain shared by this source's metadata and coalescing jobs;
+    // -1 means unrouted. This is not an OS NUMA node ID.
+    int domain = -1;
+    // Last completed worker snapshots, used for budgets/deadlines while another
+    // call may be running. Inline coalescers are queried directly by the accessors.
+    size_t retained_bytes = 0;
+    std::optional<op::scan::batch_coalescer::clock::time_point> retained_since;
+    // At most one outstanding coalescer call per source; cleared on consumption.
+    std::shared_ptr<coalescing_operation> coalescing;
+    auto first_retained() const
+    {
+      return asynchronous ? retained_since : hooks.coalescer->first_retained_time();
+    }
+    size_t retained() const
+    {
+      return asynchronous ? retained_bytes : hooks.coalescer->retained_bytes();
+    }
     enum class phase {
       enumerating,
       enumeration_done,
@@ -179,7 +244,9 @@ struct preparation_coordinator::state {
     size_t outstanding = 0, pending_batches = 0;
     // Completed work remains charged through coalescing and publication until downstream pop.
     size_t work_bytes = 0, output_bytes = 0, window_bytes = 0;
+    // Result slot currently being drained; retained across incremental advances.
     std::optional<size_t> active_result;
+    // Reader handoff/lifetime state for adapters requiring their owning thread.
     provider_execution provider;
     native_execution native;
     bool on_native_reader() const { return hooks.execution == execution_domain::native_reader; }
@@ -206,6 +273,9 @@ struct preparation_coordinator::state {
   std::optional<size_t> free_slot;
   std::deque<size_t> ready_results;
   std::vector<source_state> sources;
+  // Pool domain indices eligible for this query's active GPUs; source assignments
+  // rotate across this subset, keeping metadata and coalescing colocated.
+  std::vector<int> metadata_domains;
   std::map<unit_key, std::shared_ptr<preparation_unit>> units;
   std::deque<pending_batch> batches;
   lifecycle phase = lifecycle::constructed;
@@ -241,7 +311,7 @@ struct preparation_coordinator::state {
   bool can_emit(size_t source_id) const
   {
     auto const& source = sources[source_id];
-    return source.output_bytes < source.window_bytes;
+    return !source.coalescing && source.output_bytes < source.window_bytes;
   }
 
   struct job_ticket {
@@ -372,15 +442,22 @@ struct preparation_coordinator::state {
     auto const& source = sources[id];
     if (!options.partial_batch || source.pending_batches || !can_emit(id)) return {};
     auto const& coalescer = *source.hooks.coalescer;
-    auto first            = coalescer.first_retained_time();
+    auto first            = source.first_retained();
     if (!first) return {};
     auto cap     = coalescer.target_batch_bytes();
     auto percent = options.partial_batch->min_fill_percent;
     // Round up without overflowing when the target is near SIZE_MAX.
     auto threshold = (cap / 100) * percent + ((cap % 100) * percent + 99) / 100;
-    if (coalescer.retained_bytes() < threshold) return {};
+    if (source.retained() < threshold) return {};
     return *first + options.partial_batch->min_residence;
   }
+  bool complete_coalescing(lock_type&);
+  bool submit_coalescing(lock_type&,
+                         size_t,
+                         coalescing_operation::kind,
+                         size_t                                                      = 0,
+                         std::optional<op::scan::batch_coalescer::clock::time_point> = {},
+                         bool                                                        = false);
   bool emit_partial_batch(lock_type&, bool size_triggered = false);
   bool publish_batch(lock_type&);
   bool advance_result(lock_type&);
@@ -566,9 +643,14 @@ preparation_coordinator::preparation_coordinator(pipeline::completion_handler& c
                                                  exec::scoped_dispatcher& dispatcher,
                                                  preparation_options options,
                                                  native_reader_executor* native,
-                                                 coordinator_pool* pool)
+                                                 coordinator_pool* pool,
+                                                 std::vector<int> metadata_domains)
   : state_(std::make_shared<state>(options, completion, dispatcher, native)), pool_(pool)
 {
+  for (int domain : metadata_domains)
+    if (domain < 0 || domain >= static_cast<int>(dispatcher.num_domains()))
+      throw std::invalid_argument("invalid preparation metadata domain");
+  state_->metadata_domains = std::move(metadata_domains);
   if (options.partial_batch) options.partial_batch->validate();
   if (!options.lookahead_batches || !options.max_control_work || !options.drain_quantum ||
       options.interrupt_check_interval.count() <= 0)
@@ -644,7 +726,14 @@ void preparation_coordinator::add_sources(std::vector<source> sources,
   for (auto& s : sources) {
     auto cap = s.coalescer->target_batch_bytes();
     state_->sources.push_back({std::move(s), output});
-    state_->sources.back().window_bytes = cap * state_->options.lookahead_batches;
+    auto& registered        = state_->sources.back();
+    registered.window_bytes = cap * state_->options.lookahead_batches;
+    registered.asynchronous = registered.hooks.coalescer->asynchronous_preparation();
+    if (!state_->metadata_domains.empty())
+      registered.domain =
+        state_->metadata_domains[(state_->sources.size() - 1) % state_->metadata_domains.size()];
+    else if (state_->dispatcher->num_domains())
+      registered.domain = (state_->sources.size() - 1) % state_->dispatcher->num_domains();
   }
   lock.unlock();
   for (size_t id = first; id < state_->sources.size(); ++id) {
@@ -698,7 +787,7 @@ void preparation_coordinator::arm()
       throw std::logic_error("provider preparation must arm on its registering owner");
     state_->stats.owner        = std::this_thread::get_id();
     state_->independent_driver = std::ranges::any_of(state_->sources, [](auto const& source) {
-      return source.hooks.execution != execution_domain::metadata_worker;
+      return source.asynchronous || source.hooks.execution != execution_domain::metadata_worker;
     });
   }
   try {
@@ -1002,6 +1091,128 @@ void preparation_coordinator::state::queue_batch(
   stats.output_peak = std::max(stats.output_peak, output);
 }
 
+// The coordinator owns source state; workers exclusively own the coalescer until
+// completion. No slot reference crosses the async boundary, and retirement waits
+// for the existing dispatcher to drain before releasing any source or input.
+bool preparation_coordinator::state::submit_coalescing(
+  lock_type& lock,
+  size_t id,
+  coalescing_operation::kind type,
+  size_t index,
+  std::optional<op::scan::batch_coalescer::clock::time_point> first,
+  bool size_triggered)
+{
+  auto& source                 = sources[id];
+  auto operation               = std::make_shared<coalescing_operation>();
+  operation->type              = type;
+  operation->index             = index;
+  operation->deadline_retained = first;
+  operation->size_triggered    = size_triggered;
+  if (type == coalescing_operation::kind::advance) {
+    operation->input  = std::move(slots[index].input);
+    operation->cursor = slots[index].cursor;
+  }
+  source.coalescing = operation;
+  auto coalescer    = source.hooks.coalescer;
+  auto self         = shared_from_this();
+  auto queued       = std::chrono::steady_clock::now();
+  ++stats.coalescing_submitted;
+  lock.unlock();
+  auto ticket       = std::make_shared<coalescing_ticket>();
+  ticket->owner     = self;
+  ticket->operation = operation;
+  dispatcher->enqueue(
+    [self, operation, coalescer, id, queued, ticket = std::move(ticket)] {
+      auto started = std::chrono::steady_clock::now();
+      try {
+        if (!self->reader_stop.stop_requested()) {
+          switch (operation->type) {
+            case coalescing_operation::kind::advance: {
+              auto step           = operation->input
+                                      ? coalescer->advance(
+                                *operation->input, operation->cursor, self->options.drain_quantum)
+                                      : op::scan::batch_coalescer::cursor_step{nullptr, true};
+              operation->batch    = std::move(step.batch);
+              operation->finished = step.finished;
+              break;
+            }
+            case coalescing_operation::kind::partial:
+              operation->batch = coalescer->partial_emit();
+              break;
+            case coalescing_operation::kind::flush: {
+              auto final = coalescer->flush();
+              if (final.size() > 1)
+                throw std::logic_error("final flush exceeded its reserved output slot");
+              if (!final.empty()) operation->batch = std::move(final.front());
+              break;
+            }
+          }
+          operation->first          = coalescer->first_retained_time();
+          operation->retained_bytes = coalescer->retained_bytes();
+        }
+      } catch (...) {
+        operation->error = std::current_exception();
+      }
+      SIRIUS_LOG_TRACE(
+        "scan coalescing attempt={} source={} domain={} cpu={} queue_us={} execution_us={}",
+        static_cast<void*>(self.get()),
+        id,
+        self->sources[id].domain,
+        sched_getcpu(),
+        std::chrono::duration_cast<std::chrono::microseconds>(started - queued).count(),
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                              started)
+          .count());
+      std::lock_guard done(self->gate->mutex);
+      operation->done = true;
+      self->gate->notify_under_lock();
+    },
+    source.domain,
+    true);
+  lock.lock();
+  return true;
+}
+
+bool preparation_coordinator::state::complete_coalescing(lock_type& lock)
+{
+  for (size_t id = 0; id < sources.size(); ++id) {
+    auto& source = sources[id];
+    if (!source.coalescing || !source.coalescing->done) continue;
+    auto operation = std::move(source.coalescing);
+    // Destruction of a rejected result can reenter the gate. Always release it unlocked.
+    lock.unlock();
+    if (operation->error) std::rethrow_exception(operation->error);
+    lock.lock();
+    source.retained_since = operation->first;
+    source.retained_bytes = operation->retained_bytes;
+    queue_batch(lock,
+                id,
+                std::move(operation->batch),
+                operation->deadline_retained,
+                operation->size_triggered);
+    if (operation->type == coalescing_operation::kind::advance) {
+      auto index          = operation->index;
+      slots[index].input  = std::move(operation->input);
+      slots[index].cursor = operation->cursor;
+      if (operation->finished) {
+        auto retired = release_slot(index);
+        lock.unlock();
+        retired = {};
+        lock.lock();
+      } else {
+        ready_results.push_back(index);
+      }
+    } else if (operation->type == coalescing_operation::kind::flush) {
+      source.status = source_state::phase::tail_flushed;
+    }
+    lock.unlock();
+    operation.reset();
+    lock.lock();
+    return true;
+  }
+  return false;
+}
+
 bool preparation_coordinator::state::emit_partial_batch(lock_type& lock, bool size_triggered)
 {
   if (!options.partial_batch) return false;
@@ -1009,11 +1220,16 @@ bool preparation_coordinator::state::emit_partial_batch(lock_type& lock, bool si
   for (size_t n = 0; n < sources.size(); ++n) {
     auto id         = (next_deadline_source + n) % sources.size();
     auto& coalescer = *sources[id].hooks.coalescer;
-    auto first      = coalescer.first_retained_time();
+    auto first      = sources[id].first_retained();
     if (!can_emit(id) || !first) continue;
     auto deadline =
       size_triggered ? size_deadline(id) : *first + options.partial_batch->max_residence;
     if (!deadline || time < *deadline) continue;
+    if (sources[id].asynchronous) {
+      next_deadline_source = id + 1;
+      return submit_coalescing(
+        lock, id, coalescing_operation::kind::partial, 0, first, size_triggered);
+    }
     lock.unlock();
     auto batch = coalescer.partial_emit();
     lock.lock();
@@ -1110,6 +1326,8 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
     }
     ready_results.pop_back();
     source.active_result = index;
+    if (source.asynchronous)
+      return submit_coalescing(lock, slot.source_id, coalescing_operation::kind::advance, index);
     lock.unlock();
     auto step = slot.input
                   ? source.hooks.coalescer->advance(*slot.input, slot.cursor, options.drain_quantum)
@@ -1256,9 +1474,11 @@ void preparation_coordinator::state::dispatch_job(
       std::lock_guard check(gate->mutex);
       gate->check_interrupted();
     }
-    dispatcher->enqueue([submitted = std::move(submitted)]() mutable {
-      submitted.ticket->st->execute_job(submitted.work, submitted.ticket);
-    });
+    dispatcher->enqueue(
+      [submitted = std::move(submitted)]() mutable {
+        submitted.ticket->st->execute_job(submitted.work, submitted.ticket);
+      },
+      source.domain);
     lock.lock();
   }
 }
@@ -1325,8 +1545,10 @@ bool preparation_coordinator::state::emit_full_window(lock_type& lock)
   for (size_t id = 0; id < sources.size(); ++id) {
     auto& source = sources[id];
     if (source.outstanding || source.work_bytes < source.window_bytes || !can_emit(id) ||
-        !source.hooks.coalescer->first_retained_time())
+        !source.first_retained())
       continue;
+    if (source.asynchronous)
+      return submit_coalescing(lock, id, coalescing_operation::kind::partial);
     lock.unlock();
     auto batch = source.hooks.coalescer->partial_emit();
     lock.lock();
@@ -1343,11 +1565,13 @@ bool preparation_coordinator::state::close_finished_source(lock_type& lock)
   if (!batches.empty()) return false;
   for (size_t id = 0; id < sources.size(); ++id) {
     auto& source = sources[id];
-    if (source.status == source_state::phase::closed ||
+    if (source.coalescing || source.status == source_state::phase::closed ||
         source.status == source_state::phase::enumerating || source.outstanding ||
         (source.status == source_state::phase::enumeration_done && !can_emit(id)))
       continue;
     if (source.status == source_state::phase::enumeration_done) {
+      if (source.asynchronous)
+        return submit_coalescing(lock, id, coalescing_operation::kind::flush);
       lock.unlock();
       auto final = source.hooks.coalescer->flush();
       lock.lock();
@@ -1396,7 +1620,7 @@ preparation_coordinator::state::nearest_deadline() const
   auto limit = options.partial_batch->max_residence;
   for (size_t id = 0; id < sources.size(); ++id) {
     if (!can_emit(id)) continue;
-    auto first = sources[id].hooks.coalescer->first_retained_time();
+    auto first = sources[id].first_retained();
     if (!first) continue;
     auto next = size_deadline(id);
     if (!next || *first + limit < *next) next = *first + limit;
@@ -1465,6 +1689,7 @@ bool preparation_coordinator::state::finish_step()
     if (cleanup_source < sources.size()) {
       auto id      = cleanup_source++;
       auto& source = sources[id];
+      source.coalescing.reset();
       if (source.status != source_state::phase::closed) {
         if (!source.on_query_owner() && !source.on_native_reader())
           close_source(id);
@@ -1510,8 +1735,9 @@ preparation_coordinator::state::control_step_result preparation_coordinator::sta
   if (gate->closed) return {next::retire};
   gate->check_interrupted();
   auto const observed_wake = gate->wake_generation;
-  size_t actions           = emit_partial_batch(lock) ? 1 : 0;
-  auto available           = [&] {
+  size_t actions           = complete_coalescing(lock) ? 1 : 0;
+  if (!gate->closed && emit_partial_batch(lock)) ++actions;
+  auto available = [&] {
     if (gate->closed || actions >= options.max_control_work) return false;
     gate->check_interrupted();
     return true;

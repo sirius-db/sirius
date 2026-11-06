@@ -346,7 +346,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
+| `num_threads` | int (**> 0**) | max(4, logical CPUs − 10, eligible NUMA domains) | Shared metadata and Parquet-coalescing worker count. Explicit values must cover all eligible domains. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
@@ -521,7 +521,7 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
 | `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
-| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Metadata-only attempts still run coordination on the query owner. |
+| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Parquet/Iceberg attempts also use independent coordination; synchronous-only metadata attempts retain query-owner coordination. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -1100,3 +1100,30 @@ prefetcher `min_free_fraction` below 0.4, prefetcher threads above 3,
 pipeline threads above 8. The H2D interconnect sustains ~350-380 GB/s
 regardless of stream count; past these settings the link, not scheduling,
 is the bound.
+
+### Metadata worker NUMA placement and asynchronous Parquet preparation
+
+The existing `scan_manager.num_threads` budget is divided across eligible NUMA domains
+associated with configured GPUs. When `num_threads` is omitted, its initial default is
+`max(4, hardware_concurrency() - 10)`; after discovering eligible domains, initialization
+raises that default if necessary to provide at least one worker per domain. An explicitly
+supplied value is never raised: initialization rejects it when it cannot cover all eligible
+domains. Each worker binds once, before accepting work; there is no per-operation affinity
+guard or extra coalescing pool. CPU sets intersect GPU topology, the cgroup v2 effective
+CPU allowance, and an explicit `scan_manager.cpu_affinity` when supplied. A caller's
+incidental DuckDB thread affinity does not define this allowance. To restrict scan workers,
+use the explicit affinity configuration or a deployment cpuset; `taskset` on the caller alone
+is not a worker placement policy. Without readable cgroup v2 allowance the caller's affinity
+is the fallback, with a warning. Missing eligible GPU-local topology uses the allowed CPUs
+and reports that fallback rather than claiming locality. An empty CPU intersection fails
+initialization.
+
+Each preparation source selects a stable worker domain from the query's eligible GPU
+domains. Its metadata jobs and Parquet coalescer operations share that domain. Workers do
+not steal domain-routed jobs from other domains. Final GPU batch placement is unchanged;
+CPU placement does not imply page migration or pin all batches to one GPU.
+
+The query dispatcher alternates pending metadata and coalescing work when both are ready.
+Running metadata I/O is not preempted: a domain whose workers are all blocked on reads can
+still delay coalescing. No worker waits for another job in the pool. Trace logs report
+coalescing queue and execution duration; storage/concurrency qualification must check both.
