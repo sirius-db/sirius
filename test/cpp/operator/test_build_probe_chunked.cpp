@@ -24,14 +24,20 @@
 
 #include <cudf/concatenate.hpp>
 
+#include <rmm/cuda_stream.hpp>
+
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
 #include <algorithm>
+#include <numeric>
 #include <vector>
 
 using namespace sirius::op;
@@ -169,10 +175,11 @@ struct probe_result {
 };
 
 /// Delivers @p chunks as a split build and @p probe as the first probe batch, checks that the
-/// join waits for the build producer to finish before building, then runs the build+probe task.
-probe_result run_chunked(chunked_join& f,
-                         std::vector<std::shared_ptr<cucascade::data_batch>> const& chunks,
-                         std::shared_ptr<cucascade::data_batch> probe)
+/// join waits for the build producer to finish before building, then returns the build+probe task.
+std::unique_ptr<operator_data> deliver_chunked(
+  chunked_join& f,
+  std::vector<std::shared_ptr<cucascade::data_batch>> const& chunks,
+  std::shared_ptr<cucascade::data_batch> probe)
 {
   f.join->note_build_chunked();
   for (auto const& chunk : chunks) {
@@ -195,8 +202,13 @@ probe_result run_chunked(chunked_join& f,
   REQUIRE(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches().size() ==
           chunks.size() + 1);
   CHECK(f.build_repo.total_size() == 0);
+  return input;
+}
+
+probe_result collect(std::unique_ptr<operator_data> output)
+{
   probe_result result;
-  result.output = f.join->execute(*input, cudf::get_default_stream());
+  result.output = std::move(output);
   auto const& batches =
     dynamic_cast<pipelineable_operator_data const&>(*result.output).get_data_batches();
   REQUIRE_FALSE(batches.empty());
@@ -212,6 +224,78 @@ probe_result run_chunked(chunked_join& f,
   result.merged = cudf::concatenate(views);
   result.view   = result.merged->view();
   return result;
+}
+
+probe_result run_chunked(chunked_join& f,
+                         std::vector<std::shared_ptr<cucascade::data_batch>> const& chunks,
+                         std::shared_ptr<cucascade::data_batch> probe)
+{
+  auto input = deliver_chunked(f, chunks, std::move(probe));
+  return collect(f.join->execute(*input, cudf::get_default_stream()));
+}
+
+/// A memory manager whose allocator is the current device resource, which the join allocates
+/// from, while the caller holds it. Each manager installs its allocator over the previous one, and
+/// the shared fixture space and other suites keep theirs: create the shared one first.
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_current_manager()
+{
+  gpu_space();
+  return sirius::test::operator_utils::initialize_memory_manager();
+}
+
+/// Counts @p stream's allocations against a reservation of @p bytes on @p manager's GPU, past
+/// which an allocation throws rmm::out_of_memory, as under a task's fail policy.
+struct reserved_stream {
+  rmm::cuda_stream_view stream;
+  cucascade::memory::reservation_aware_resource_adaptor* allocator = nullptr;
+
+  reserved_stream(sirius::memory::sirius_memory_reservation_manager& manager,
+                  rmm::cuda_stream_view stream,
+                  std::size_t bytes)
+    : stream(stream)
+  {
+    auto* space = manager.get_memory_space(cucascade::memory::Tier::GPU, 0);
+    REQUIRE(space);
+    auto reservation = space->make_reservation_or_null(bytes);
+    REQUIRE(reservation);
+    allocator =
+      reservation->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(allocator);
+    REQUIRE(allocator->attach_reservation_to_tracker(
+      stream,
+      std::move(reservation),
+      std::make_unique<cucascade::memory::fail_reservation_limit_policy>(),
+      nullptr));
+  }
+  ~reserved_stream() { release(); }
+
+  [[nodiscard]] std::size_t allocated_bytes() const
+  {
+    return allocator->get_allocated_bytes(stream);
+  }
+
+  /// Drop the reservation, as a retry that was granted more memory would run without this cap.
+  void release()
+  {
+    if (allocator == nullptr) { return; }
+    allocator->reset_stream_reservation(stream);
+    allocator = nullptr;
+  }
+};
+
+std::vector<int32_t> iota_keys(int32_t n)
+{
+  std::vector<int32_t> keys(n);
+  std::iota(keys.begin(), keys.end(), 0);
+  return keys;
+}
+
+std::vector<int32_t> times_ten(std::vector<int32_t> values)
+{
+  for (auto& value : values) {
+    value *= 10;
+  }
+  return values;
 }
 
 std::vector<int32_t> sorted(std::vector<int32_t> values)
@@ -304,4 +388,54 @@ TEST_CASE("chunked BUILD_PROBE INNER join joins every chunk's build rows", "[bui
         std::vector<int32_t>{20, 40, 40});
   CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(2))) ==
         std::vector<int32_t>{2, 4, 4});
+}
+
+TEST_CASE("a chunked BUILD_PROBE build that fails on a later chunk frees the chunks it built",
+          "[build_probe]")
+{
+  // Chunk 2's table needs far more than the reservation; chunk 1's fits in it.
+  constexpr int32_t big_chunk_rows = 1 << 20;
+  auto manager                     = make_current_manager();
+  rmm::cuda_stream stream;  // outlives every table built on it
+  auto f     = make_chunked_join(duckdb::JoinType::SEMI);
+  auto input = deliver_chunked(*f,
+                               {int_batch({2, 4}), int_batch(iota_keys(big_chunk_rows))},
+                               probe_batch(int_batch({1, 2, 4, 7}), {10, 20, 40, 70}));
+  reserved_stream capped(*manager, stream, 1 << 20);
+  REQUIRE_THROWS_AS(f->join->execute(*input, stream.view()), std::bad_alloc);
+  // An OOM retry reserves its memory before it runs again: chunk 1's table must not still count.
+  CHECK(capped.allocated_bytes() == 0);
+  CHECK(f->join->snapshot_build_probe_slots()[0].state == BUILD_HASH_TABLE_STATE::SCHEDULED);
+
+  capped.release();
+  auto output = f->join->execute(*input, stream.view());
+  stream.synchronize();  // the checks below copy on the default stream
+  auto result = collect(std::move(output));
+  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(0))) ==
+        std::vector<int32_t>{1, 2, 4, 7});
+}
+
+TEST_CASE("a chunked BUILD_PROBE probe that fails keeps the built chunks for the retry",
+          "[build_probe]")
+{
+  // The build fits in the reservation; probing this many rows does not.
+  constexpr int32_t probe_rows = 1 << 20;
+  auto manager                 = make_current_manager();
+  rmm::cuda_stream stream;  // outlives every table built on it
+  auto keys  = iota_keys(probe_rows);
+  auto f     = make_chunked_join(duckdb::JoinType::SEMI);
+  auto input = deliver_chunked(
+    *f, {int_batch({2, 4}), int_batch({4, 6})}, probe_batch(int_batch(keys), times_ten(keys)));
+  reserved_stream capped(*manager, stream, 1 << 20);
+  REQUIRE_THROWS_AS(f->join->execute(*input, stream.view()), std::bad_alloc);
+  CHECK(f->join->snapshot_build_probe_slots()[0].state == BUILD_HASH_TABLE_STATE::BUILT);
+  CHECK(capped.allocated_bytes() > 0);
+
+  capped.release();
+  auto output = f->join->execute(*input, stream.view());
+  stream.synchronize();  // the checks below copy on the default stream
+  auto result        = collect(std::move(output));
+  auto const payload = copy_column_to_host<int32_t>(result.view.column(1));
+  CHECK(copy_column_to_host<int32_t>(result.view.column(0)) == std::vector<int32_t>{2, 4, 6});
+  CHECK(payload == std::vector<int32_t>{20, 40, 60});
 }

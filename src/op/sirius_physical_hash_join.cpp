@@ -2108,47 +2108,60 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       // partitions build concurrently on their own GPUs. Each build batch (one, or the chunks of a
       // split build) becomes one chunk with its own table.
       bool build_has_null = false;
-      slot.chunks.clear();
       slot.chunks.reserve(input_batches.size() - 1);
-      for (std::size_t b = 1; b < input_batches.size(); ++b) {
-        auto const& build_batch_ro = input_batches[b];
-        auto build_keys_result =
-          prepare_join_keys(build_batch_ro, right_key_col_indices, _hash_key_types, stream);
-        cudf::table_view build_keys = build_keys_result.keys;
-        if (auto const* ms = build_batch_ro.get_memory_space(); ms) {
-          slot.device_id = ms->get_device_id();
-        }
-        auto& chunk                    = slot.chunks.emplace_back();
-        chunk.built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        chunk.build_table              = build_batch_ro;
-        if (join_type == duckdb::JoinType::MARK || join_type == duckdb::JoinType::SEMI ||
-            join_type == duckdb::JoinType::ANTI) {
-          // MARK/SEMI/ANTI: build a reusable filtered_join on the right (filter) keys; each probe
-          // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8 mark
-          // for MARK, gathered as the output rows for SEMI/ANTI).
-          chunk.filtered_table = make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
-          // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
-          // time, but the build keys are not retained beyond this scope.
-          if (join_type == duckdb::JoinType::MARK) {
-            build_has_null = build_has_null || table_has_any_null(build_keys);
+      try {
+        for (std::size_t b = 1; b < input_batches.size(); ++b) {
+          auto const& build_batch_ro = input_batches[b];
+          auto build_keys_result =
+            prepare_join_keys(build_batch_ro, right_key_col_indices, _hash_key_types, stream);
+          cudf::table_view build_keys = build_keys_result.keys;
+          if (auto const* ms = build_batch_ro.get_memory_space(); ms) {
+            slot.device_id = ms->get_device_id();
           }
-          SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
-                           this->get_operator_id(),
-                           duckdb::JoinTypeToString(join_type));
-        } else if ((join_type == duckdb::JoinType::INNER || is_left_like(join_type)) &&
-                   (unique_build_keys ||
-                    (runtime_distinct_build_probe &&
-                     compare_nulls() == cudf::null_equality::UNEQUAL &&
-                     build_keys_are_distinct(build_keys, compare_nulls(), stream)))) {
-          chunk.distinct_hash_table =
-            std::make_unique<cudf::distinct_hash_join>(build_keys, compare_nulls(), 0.5, stream);
-          SIRIUS_LOG_DEBUG(
-            "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE, {})",
-            this->get_operator_id(),
-            unique_build_keys ? "proven unique" : "runtime-distinct");
-        } else {
-          chunk.hash_table = std::make_unique<cudf::hash_join>(build_keys, compare_nulls(), stream);
+          auto& chunk                    = slot.chunks.emplace_back();
+          chunk.built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
+          chunk.build_table              = build_batch_ro;
+          if (join_type == duckdb::JoinType::MARK || join_type == duckdb::JoinType::SEMI ||
+              join_type == duckdb::JoinType::ANTI) {
+            // MARK/SEMI/ANTI: build a reusable filtered_join on the right (filter) keys; each probe
+            // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8
+            // mark for MARK, gathered as the output rows for SEMI/ANTI).
+            chunk.filtered_table =
+              make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
+            // Record whether the build keys contain a NULL; MARK three-valued logic needs it at
+            // probe time, but the build keys are not retained beyond this scope.
+            if (join_type == duckdb::JoinType::MARK) {
+              build_has_null = build_has_null || table_has_any_null(build_keys);
+            }
+            SIRIUS_LOG_DEBUG(
+              "sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
+              this->get_operator_id(),
+              duckdb::JoinTypeToString(join_type));
+          } else if ((join_type == duckdb::JoinType::INNER || is_left_like(join_type)) &&
+                     (unique_build_keys ||
+                      (runtime_distinct_build_probe &&
+                       compare_nulls() == cudf::null_equality::UNEQUAL &&
+                       build_keys_are_distinct(build_keys, compare_nulls(), stream)))) {
+            chunk.distinct_hash_table =
+              std::make_unique<cudf::distinct_hash_join>(build_keys, compare_nulls(), 0.5, stream);
+            SIRIUS_LOG_DEBUG(
+              "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE, {})",
+              this->get_operator_id(),
+              unique_build_keys ? "proven unique" : "runtime-distinct");
+          } else {
+            chunk.hash_table =
+              std::make_unique<cudf::hash_join>(build_keys, compare_nulls(), stream);
+          }
         }
+        stream.sync();  // Ensure the hash tables are fully built before we allow any probe
+                        // batches to proceed.
+      } catch (...) {
+        // Free the chunks this attempt built: an OOM retry reserves its memory before it runs
+        // again, and they would still count against the limit. Its queued work may still read
+        // them; a sync error here is the failure already in flight.
+        cudaStreamSynchronize(stream.get());
+        slot.chunks.clear();
+        throw;
       }
       // A hash-partitioned build uses the join-wide observation instead (slots differ).
       if (join_type == duckdb::JoinType::MARK && !mark_is_null_safe() &&
@@ -2161,8 +2174,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                         partition,
                         slot.chunks.size());
       }
-      stream.sync();  // Ensure the hash tables are fully built before we allow any probe
-                      // batches to proceed.
       slot.build_state.store(BUILD_HASH_TABLE_STATE::BUILT, std::memory_order_release);
     }
     if (slot.build_state.load(std::memory_order_acquire) == BUILD_HASH_TABLE_STATE::BUILT) {
