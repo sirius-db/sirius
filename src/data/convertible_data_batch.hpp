@@ -206,17 +206,18 @@ class convertible_data_batch : public convertible_data {
   /**
    * @brief Get the size in bytes of this batch in the specified memory space.
    *
-   * Acquires a shared (read-only) lock to access the memory space pointer, then
-   * compares with the provided space. Returns the batch size in bytes if the batch
-   * resides in the given space, 0 otherwise.
+   * Never waits on the batch lock: a batch another thread holds exclusively counts as 0, since
+   * a non-blocking convert() could not move it either and the caller sizing candidates must not
+   * stall behind the holder.
    *
    * @param space The memory space to query.
    * @return The batch size in bytes if the batch resides in the given space, 0 otherwise.
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    auto ro = _batch->to_read_only();
-    if (ro.get_memory_space() == space) { return ro.get_data()->get_size_in_bytes(); }
+    auto ro = _batch->try_to_read_only();
+    if (!ro) { return 0; }
+    if (ro->get_memory_space() == space) { return ro->get_data()->get_size_in_bytes(); }
     return 0;
   }
 
