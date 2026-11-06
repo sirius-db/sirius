@@ -958,6 +958,11 @@ TEST_CASE("an exchange sink rejects a spec that does not fit", "[exchange][opera
                   sirius::invalid_input_exception);
   CHECK_THROWS_AS(sink.set_range_boundaries(boundaries({1}, 2)), sirius::invalid_input_exception);
   CHECK_NOTHROW(sink.set_range_boundaries(boundaries({1}, 1)));
+
+  // Without its boundaries, a range sink would send every row to one rank.
+  sirius_physical_exchange_sink unbounded(key_value_types(), 0, c.all[0].service, 13, range);
+  CHECK_THROWS_WITH(sink_batch(unbounded, key_value_batch(0, 0)),
+                    Catch::Matchers::ContainsSubstring("before its boundaries are set"));
 }
 
 TEST_CASE("a waiting exchange source walks on to this rank's unfinished producer",
