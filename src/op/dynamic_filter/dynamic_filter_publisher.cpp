@@ -356,7 +356,7 @@ struct dynamic_filter_publication_session::state {
         settled = accumulation_result;
         record(outcome);
         complete(*settled, true);
-        leave_merge = plan.distributed() != nullptr && !std::exchange(merged, true);
+        leave_merge = plan.distributed() != nullptr && !std::exchange(merge_started, true);
       }
     }
     // The other ranks wait on this rank's share of each key's merge, which it ended without.
@@ -438,7 +438,7 @@ struct dynamic_filter_publication_session::state {
       if (auto const* distributed = plan.distributed()) {
         {
           std::scoped_lock lock(mutex);
-          merged = true;
+          merge_started = true;
         }
         merge_across_ranks(*distributed, per_key, stream);
       }
@@ -516,8 +516,8 @@ struct dynamic_filter_publication_session::state {
   // owed and has not run.
   std::optional<std::uint64_t> pending_publication;
   phase current = phase::OPEN;
-  /// Distributed: this rank has taken its part in every key's merge, with filters or without.
-  bool merged         = false;
+  /// Distributed: this rank has started its part in every key's merge, with filters or without.
+  bool merge_started  = false;
   bool sealed         = false;
   bool input_closed   = false;
   bool cancelled      = false;
@@ -1109,8 +1109,15 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
         membership.reset();
         continue;
       }
-      for (auto const* words : others) {
-        bloom->merge_from(words, bloom->storage_bytes(), stream);
+      try {
+        for (auto const* words : others) {
+          bloom->merge_from(words, bloom->storage_bytes(), stream);
+        }
+      } catch (...) {
+        // `all` and this Bloom must outlive every OR already queued on `stream`.
+        auto error = std::current_exception();
+        stream.sync();
+        std::rethrow_exception(error);
       }
       // The gathered filters are freed with `all`, after the merges have read them.
       stream.sync();

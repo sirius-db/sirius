@@ -513,7 +513,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * @param words Device storage of a filter of this size and domain, as storage() gives it.
    * @param bytes The size of @p words; must equal storage_bytes().
    * @param stream The stream the OR runs on, after whatever wrote @p words.
-   * @throw std::invalid_argument when @p bytes is not this filter's storage_bytes()
+   * @throw std::invalid_argument when @p bytes is not this filter's storage_bytes(), or @p words
+   * is on another GPU
    * @throw std::logic_error when this filter is on more than one GPU
    */
   void merge_from(void const* words, std::size_t bytes, ::cuda::stream_ref stream);
