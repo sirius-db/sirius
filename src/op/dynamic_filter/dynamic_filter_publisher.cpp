@@ -214,20 +214,6 @@ void leave_merges(dynamic_filter_publish_plan::distributed_merge const& d,
                   std::size_t count) noexcept;
 void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
 
-/**
- * @brief Distributed: the keys every rank sizes each admitted key's Bloom for, alike on every rank
- * and on either publication path, so the Blooms merge. The cap is shared among the admitted keys'
- * Blooms only. A merge also holds the copy it sends and the world - 1 gathered ones for a moment;
- * counting those too cut a 73M-row SF1000 build to ~10 bits per key and cost Q03 7% on 2 GPUs, so
- * they wait for the streaming OR (#2375). 0: no Bloom fits.
- */
-std::size_t distributed_bloom_keys(dynamic_filter_publish_plan const& plan)
-{
-  return std::min(
-    plan.distributed()->bloom_keys,
-    bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), plan.admitted_keys().size()));
-}
-
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -691,14 +677,15 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     }
     if (keys.empty()) { return false; }
     // A build too large for the cap gets a Bloom cut to it: more false positives, still a filter.
-    // Distributed, every rank sizes it alike from the plan, so the ranks' filters merge.
-    auto const wanted = plan.distributed() ? plan.distributed()->bloom_keys : rows;
+    // Distributed, every rank takes the plan's size, uncapped, so the ranks' filters merge.
+    auto const* distributed = plan.distributed();
+    auto const cap =
+      distributed ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
+    auto const wanted = distributed ? distributed->bloom_keys : rows;
     auto const sized_for =
-      plan.distributed() != nullptr
-        ? distributed_bloom_keys(plan)
-        : std::min(rows, bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(), keys.size()));
-    auto const geometry = detail::accumulated_bloom_geometry::try_create(
-      sized_for, keys.size(), plan.max_bloom_bytes_per_gpu());
+      distributed ? wanted : std::min(rows, bloom_keys_within_cap(cap, keys.size()));
+    auto const geometry =
+      detail::accumulated_bloom_geometry::try_create(sized_for, keys.size(), cap);
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
       auto const required                    = detail::accumulated_bloom_geometry::try_create(
@@ -1221,7 +1208,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
-  auto const bloom_keys    = plan.distributed() ? distributed_bloom_keys(plan) : std::size_t{0};
+  auto const bloom_keys    = plan.distributed() ? plan.distributed()->bloom_keys : std::size_t{0};
 
   std::vector<key_filters> per_key(admitted_keys.size());
   // Build columns restored from a narrowed carrier; filters copy from them asynchronously on
@@ -1358,7 +1345,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       }
 
       // Distributed: a Bloom of the size every rank builds, so the ranks' filters can be merged.
-      auto const distributed_bloom = plan.distributed() != nullptr && bloom_keys > 0 && fits_rep &&
+      auto const distributed_bloom = plan.distributed() != nullptr && fits_rep &&
                                      sirius::op::sirius_dynamic_bloom_filter::supports(col.type());
       auto const chosen =
         plan.distributed() != nullptr
