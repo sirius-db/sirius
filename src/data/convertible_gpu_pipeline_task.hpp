@@ -38,10 +38,10 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
-#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius {
@@ -60,9 +60,9 @@ namespace sirius {
  * destructor to restore idle state on all exit paths (success, failure, exception).
  *
  * A queued task can hold inputs in several memory spaces: a GPU task whose inputs were only
- * partly spilled, or a probe task sharing a build batch that lives on another GPU. When bound
- * to a source space, convert() moves only the batches still in that space; the others are left
- * to the executor of their own space.
+ * partly spilled, or a probe task sharing a build batch that lives on another GPU. The wrapper
+ * is always bound to a source space: convert() moves only the batches still in that space; the
+ * others are left to the executor of their own space.
  */
 class convertible_gpu_pipeline_task : public convertible_data {
  public:
@@ -71,19 +71,22 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @param task The task to wrap (exclusive ownership taken).
    * @param queue The originating task queue (task is returned here on destruction).
    * @param query_lifecycle Gate for the RAII re-push (refused once the query tears down).
-   * @param source_space When non-null, convert() only moves batches still in this space -- the
-   *                     space the task was picked to relieve. Null converts from any space.
+   * @param source_space The space the task was picked to relieve; convert() only moves batches
+   *                     still in it. Must not be null.
    */
   convertible_gpu_pipeline_task(
     std::unique_ptr<sirius::parallel::itask> task,
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
     sirius::exec::query_lifecycle_registry& query_lifecycle,
-    cucascade::memory::memory_space const* source_space = nullptr)
+    cucascade::memory::memory_space const* source_space)
     : _task(std::move(task)),
       _queue(queue),
       _query_lifecycle(query_lifecycle),
       _source_space(source_space)
   {
+    if (_source_space == nullptr) {
+      throw std::invalid_argument("convertible_gpu_pipeline_task requires a source space");
+    }
   }
 
   // Non-copyable, move-constructible only (reference member prevents move assignment)
@@ -126,7 +129,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Convert this task's data batches to reside in one of the target memory spaces.
    *
    * Iterates the data_batches from the task's pipelineable_operator_data input.
-   * For each batch in the source space (when bound) and not already at a target space,
+   * For each batch still in the source space and not already at a target space,
    * delegates to convertible_data_batch which acquires a mutable_data_batch (blocking or
    * non-blocking), attempts the conversion, and releases automatically via RAII.
    *
@@ -156,8 +159,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
     for (const auto& batch : batches) {
       if (!batch) { continue; }
 
-      // Cheap pre-check under a shared lock: skip batches outside the source space or already at
-      // a target. A non-blocking request must not wait here on a batch another thread holds
+      // Cheap pre-check under a shared lock, so an ineligible batch never takes the exclusive
+      // one. A non-blocking request must not wait here on a batch another thread holds
       // exclusively (it could not convert it either), so it skips the batch instead.
       {
         std::optional<cucascade::read_only_data_batch> ro;
@@ -167,15 +170,13 @@ class convertible_gpu_pipeline_task : public convertible_data {
           ro = batch->try_to_read_only();
           if (!ro) { continue; }
         }
-        const auto* batch_space = ro->get_memory_space();
-        if (_source_space != nullptr && batch_space != _source_space) { continue; }
-        if (std::find(target_spaces.begin(), target_spaces.end(), batch_space) !=
-            target_spaces.end()) {
+        if (!sirius::convertible_data_batch::should_convert(
+              ro->get_memory_space(), _source_space, target_spaces)) {
           continue;
         }
       }
 
-      // convertible_data_batch repeats the source-space check under the exclusive lock.
+      // convert() re-applies the rule under the exclusive lock, since the batch may have moved.
       sirius::convertible_data_batch batch_converter(batch, _source_space);
       auto result = batch_converter.convert(target_spaces, stream, res_mgr, blocking);
       if (result) {
