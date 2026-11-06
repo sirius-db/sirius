@@ -1821,7 +1821,7 @@ TEST_CASE("split CONCAT packs a complete partition into row-bounded chunks", "[p
       sirius::get_cudf_table_view(batch->to_read_only()).column(0));
   };
   if (!split_allowed) {
-    // Without the consumer's permission, the row bound does not apply: one batch, as before.
+    // Without the consumer's permission, the row bound does not apply: one batch.
     REQUIRE(out.size() == 1);
     CHECK(values(out[0]) == std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8, 9});
     return;
