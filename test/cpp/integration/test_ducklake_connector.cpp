@@ -20,7 +20,6 @@
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "ducklake/scan_ingestible.hpp"
 #include "exec/streaming_fragment.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "planner/connector_registry.hpp"
@@ -35,6 +34,7 @@
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/main/attached_database.hpp>
@@ -3485,7 +3485,7 @@ TEST_CASE_METHOD(
     std::string path;
     uintmax_t size;
     std::filesystem::file_time_type modified;
-    std::weak_ptr<sirius::io::io_object_metadata> metadata;
+    std::weak_ptr<cucascade::io::io_object_metadata> metadata;
   };
   std::vector<file_identity> identities;
   for (duckdb::idx_t i = 0; i < files->RowCount(); ++i) {
