@@ -50,12 +50,13 @@ std::uint32_t frames_for(std::uint64_t stream_bytes, std::size_t frame_bytes)
   return static_cast<std::uint32_t>(utils::ceil_div<std::uint64_t>(stream_bytes, frame_bytes));
 }
 
-/// cudaEvent_t, created once and reused.
+/// cudaEvent_t, created once and reused. Destroys every event it created, checked out or not, so
+/// its owner must first synchronize the streams they were recorded on.
 class event_pool {
  public:
   ~event_pool()
   {
-    for (auto e : _free) {
+    for (auto e : _all) {
       static_cast<void>(cudaEventDestroy(e));
     }
   }
@@ -63,7 +64,9 @@ class event_pool {
   {
     cudaEvent_t e{};
     if (_free.empty()) {
+      _all.reserve(_all.size() + 1);  // so the push below cannot throw and orphan the event
       RMM_CUDA_TRY(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+      _all.push_back(e);
     } else {
       e = _free.back();
       _free.pop_back();
@@ -83,6 +86,7 @@ class event_pool {
 
  private:
   std::vector<cudaEvent_t> _free;
+  std::vector<cudaEvent_t> _all;
 };
 
 }  // namespace
@@ -532,17 +536,17 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   RMM_CUDA_TRY(cudaStreamWaitEvent(e.send_stream.value(), planned, 0));
   RMM_CUDA_TRY(cudaEventDestroy(planned));
   auto const bytes = out->stream_bytes();
+  auto owned       = std::make_unique<outgoing_batch>(std::move(*out));
   // Counted before the deleter can run, on any path that drops the batch.
   auto const query = query_of(stream);
   {
     std::lock_guard lock{_mutex};
     ++_held[query];
   }
-  std::shared_ptr<outgoing_batch> held(new outgoing_batch(std::move(*out)),
-                                       [this, query](outgoing_batch* b) {
-                                         delete b;
-                                         released(query);
-                                       });
+  std::shared_ptr<outgoing_batch> held(owned.release(), [this, query](outgoing_batch* b) {
+    delete b;
+    released(query);
+  });
   std::unique_lock lock{_mutex};
   _room.wait(lock, [&] {
     // A batch larger than the cap goes alone, else it would never fit.
@@ -550,8 +554,12 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
            e.queued_bytes + bytes <= e.opts.max_queued_bytes;
   });
   if (_error) { std::rethrow_exception(_error); }
+  // A copy, not a move: if the push throws, `held` stays the last owner and is dropped after `lock`
+  // is released, since its deleter takes _mutex.
+  auto& next = e.sent[to][stream];
+  e.queues[to].push_back({stream, next, held});
+  ++next;
   e.queued_bytes += bytes;
-  e.queues[to].push_back({stream, e.sent[to][stream]++, std::move(held)});
 }
 
 void transport::released(distributed_query_id query)
@@ -682,9 +690,6 @@ void transport::run()
     queued.clear();
     for (auto& p : e.out) {
       p.current.reset();
-    }
-    for (auto const& f : e.staged) {
-      static_cast<void>(cudaEventDestroy(f.copied));
     }
     e.staged.clear();
     _room.notify_all();
