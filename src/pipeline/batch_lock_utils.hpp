@@ -143,7 +143,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         // read_accessor to the original batch dropped.
       }
 
-      // HOST/DISK -> GPU upgrade/readback: convert in place (move), freeing the spilled copy
+      // HOST/DISK/REMOTE -> GPU readback: convert in place, freeing the spilled copy.
       {
         std::ignore =
           cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
