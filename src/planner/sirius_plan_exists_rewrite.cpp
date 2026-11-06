@@ -17,7 +17,9 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
@@ -36,10 +38,14 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb_table_identity.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/utilities/traits.hpp>
 
@@ -670,6 +676,31 @@ duckdb::idx_t widen(duckdb::LogicalGet& get, duckdb::idx_t base)
   return slot;
 }
 
+/// Whether @p get is served from a table pinned in GPU memory.
+bool served_from_gpu_pin(duckdb::ClientContext& context, duckdb::LogicalGet const& get)
+{
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!runtime) { return false; }
+  auto& scan_manager = runtime->get_scan_manager();
+  std::shared_ptr<sirius::scan_manager::pinned_entry const> entry;
+  if (get.function.GetName() == "seq_scan") {
+    auto const* bind = dynamic_cast<duckdb::TableScanBindData const*>(get.bind_data.get());
+    if (bind == nullptr || !bind->table.IsDuckTable()) { return false; }
+    auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
+    entry       = scan_manager.find_pinned_entry_for_duckdb_table(
+      table.ParentCatalog().GetName().GetIdentifierName(),
+      table.ParentSchema().name.GetIdentifierName(),
+      table.name.GetIdentifierName(),
+      sirius::duckdb_table_identity{table.oid, table.GetStorage().GetRowGroupCollection()});
+  } else {
+    auto const files = resolve_parquet_scan_file_paths(
+      get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
+    if (files.empty()) { return false; }
+    entry = scan_manager.find_pinned_entry_for_parquet_files(files);
+  }
+  return entry && entry->tier == cucascade::memory::Tier::GPU;
+}
+
 /// Whether every column @p expression reads is a plain base column of @p get.
 bool reads_only(Expression const& expression, duckdb::LogicalGet const& get)
 {
@@ -698,8 +729,8 @@ unique_ptr<Expression> move_onto(unique_ptr<Expression> expression,
 
 /// Rewrite a chain of two or more matched joins (innermost first) over the same scan, one level
 /// nested in the next through its outer rows. Returns null, consuming nothing, when the subqueries
-/// cannot share one scan, or when they are plain joins estimated to fit in @p gpu_memory_budget
-/// bytes (0: unknown).
+/// cannot share one scan, or when they are plain joins over a table pinned in GPU memory that are
+/// estimated to fit in @p gpu_memory_budget bytes (0: unknown).
 unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
                                            duckdb::Binder& binder,
                                            std::vector<exists_match>& chain,
@@ -746,26 +777,30 @@ unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
   if (!output) { return nullptr; }
   if (gpu_memory_budget > 0 &&
       std::ranges::all_of(chain, [](auto const& match) { return match.plain; })) {
-    // The plain joins hash each subquery's rows on the GPU, which is cheaper than the aggregate
-    // until those rows no longer fit and spill. The base-table row count is used because
-    // estimates of the subqueries' filters can be far too low.
+    // Plain joins each scan their subquery's table and hash its rows. That beats the merged
+    // aggregate only when those scans are cheap, from a pin in GPU memory, and the rows fit
+    // without spilling. The base-table row count is used because estimates of the subqueries'
+    // filters can be far too low.
+    bool pinned              = true;
     std::uint64_t join_bytes = 0;
     for (std::size_t i = 0; i < chain.size(); ++i) {
       auto const& get = *scans[i].get;
+      pinned          = pinned && served_from_gpu_pin(context, get);
       if (!get.has_estimated_cardinality) { continue; }
       auto const row_bytes = duckdb::GetTypeIdSize(chain[i].key_type.InternalType()) +
                              duckdb::GetTypeIdSize(chain[i].value_type.InternalType());
       join_bytes = std::max<std::uint64_t>(join_bytes, get.estimated_cardinality * row_bytes);
     }
-    bool const spills = join_bytes == 0 || join_bytes > gpu_memory_budget;
+    bool const merge = !pinned || join_bytes == 0 || join_bytes > gpu_memory_budget;
     SIRIUS_LOG_INFO(
-      "[sirius_plan_exists_rewrite] {} {} sibling EXISTS/NOT EXISTS: their joins would hold an "
-      "estimated {} bytes against a GPU budget of {} bytes",
-      spills ? "Merging" : "Not merging",
+      "[sirius_plan_exists_rewrite] {} {} sibling EXISTS/NOT EXISTS: subquery table {} in GPU "
+      "memory, their joins would hold an estimated {} bytes against a GPU budget of {} bytes",
+      merge ? "Merging" : "Not merging",
       chain.size(),
+      pinned ? "pinned" : "not pinned",
       join_bytes,
       gpu_memory_budget);
-    if (!spills) { return nullptr; }
+    if (!merge) { return nullptr; }
   }
 
   // ---- Nothing below declines: consume the original nodes. ----

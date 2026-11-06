@@ -78,9 +78,9 @@ namespace sirius::planner {
 /// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: a LEFT
 /// DELIM_JOIN against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery plus a filter. The replacement
 /// emits the same column bindings as the nodes it replaces. Subqueries DuckDB left as plain SEMI
-/// or ANTI joins (`delim_join_as_cte`) are merged only when those joins are estimated to exceed
-/// @p gpu_memory_budget bytes; 0 merges them regardless. Returns the number of subqueries
-/// rewritten.
+/// or ANTI joins (`delim_join_as_cte`) over a table pinned in GPU memory are merged only when those
+/// joins are estimated to exceed @p gpu_memory_budget bytes; 0 merges them regardless. Returns the
+/// number of subqueries rewritten.
 std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
                                                  duckdb::Binder& binder,
                                                  duckdb::unique_ptr<duckdb::LogicalOperator>& plan,

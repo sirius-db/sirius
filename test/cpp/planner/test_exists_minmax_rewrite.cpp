@@ -260,15 +260,22 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
 }
 
 TEST_CASE_METHOD(exists_rewrite_fixture,
-                 "exists rewrite merges plain joins only when they would not fit on the GPU",
+                 "exists rewrite leaves plain joins over a GPU pin that fits unmerged",
                  "[exists_rewrite][plan]")
 {
-  // `fact` has 5000 rows of a BIGINT key and an INTEGER value: 60,000 bytes per join.
+  // 5000 rows of a BIGINT key and an INTEGER value: 60,000 bytes per join.
+  std::uint64_t const fits = 1 << 20, spills = 1 << 10;
   {
     sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
-    CHECK(rewrites(q21_shape_query, 1 << 20) == 0);
-    CHECK(rewrites(q21_shape_query, 1 << 10) == 2);
+    CHECK(rewrites(q21_shape_query, fits) == 2);
+    REQUIRE_FALSE(con->Query("CHECKPOINT")->HasError());
+    auto const pin = con->Query("CALL pin_table(format='duckdb', name='fact', tier='gpu')");
+    INFO(pin->GetError());
+    REQUIRE_FALSE(pin->HasError());
+    CHECK(rewrites(q21_shape_query, fits) == 0);
+    CHECK(rewrites(q21_shape_query, spills) == 2);
   }
-  // Delim joins are merged whatever the budget.
-  CHECK(rewrites(q21_shape_query, 1 << 20) == 2);
+  // Delim joins are merged regardless.
+  CHECK(rewrites(q21_shape_query, fits) == 2);
+  REQUIRE_FALSE(con->Query("CALL unpin_table('fact')")->HasError());
 }
