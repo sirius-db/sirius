@@ -202,31 +202,24 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
-  src_pipeline->set_finished(true);
-  attach_port(sample_op, *repo, src_pipeline);
-
-  // Upstream finished but produced no batches — must not block waiting for sample bytes.
-  auto hint = sample_op.get_next_task_hint();
-  REQUIRE(hint.has_value());
-  REQUIRE(hint->hint == TaskCreationHint::READY);
-  REQUIRE(hint->producer == &sample_op);
-
-  // No batches to pull; execute() should still be able to mark boundaries done.
-  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
-}
-
-TEST_CASE("distributed sirius_physical_sort_sample schedules a boundary task with no input",
-          "[physical_sort_sample]")
-{
-  auto sample_op = make_sort_sample(100000);
-  auto repo      = std::make_unique<cucascade::shared_data_repository>();
-
-  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(false);
   attach_port(sample_op, *repo, src_pipeline);
 
-  SECTION("distributed")
+  SECTION("not distributed")
+  {
+    src_pipeline->set_finished(true);
+    // Upstream finished but produced no batches — must not block waiting for sample bytes.
+    auto hint = sample_op.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    REQUIRE(hint->hint == TaskCreationHint::READY);
+    REQUIRE(hint->producer == &sample_op);
+
+    // No batches to pull; execute() should still be able to mark boundaries done.
+    REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+    CHECK_FALSE(sample_op.runs_without_input());
+  }
+
+  SECTION("distributed: a boundary task with no input")
   {
     sample_op.set_distributed({nullptr, 0, nullptr, {}});
 
@@ -244,13 +237,6 @@ TEST_CASE("distributed sirius_physical_sort_sample schedules a boundary task wit
     CHECK(batch_count(*input) == 0);
     CHECK(sample_op.runs_without_input());
     CHECK(sample_op.get_next_task_input_data() == nullptr);
-  }
-
-  SECTION("not distributed")
-  {
-    src_pipeline->set_finished(true);
-    CHECK(sample_op.get_next_task_input_data() == nullptr);
-    CHECK_FALSE(sample_op.runs_without_input());
   }
 }
 
