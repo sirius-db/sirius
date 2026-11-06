@@ -294,7 +294,10 @@ bool sirius_pipeline::is_query_terminal() const
          s->type == op::SiriusPhysicalOperatorType::STREAMING_SINK;
 }
 
-void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
+void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc)
+{
+  _task_creator.store(tc, std::memory_order_release);
+}
 
 void sirius_pipeline::set_completion_handler(std::weak_ptr<completion_handler> handler)
 {
@@ -311,18 +314,19 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // whose FULL-barrier ports are now unblocked will get tasks created.
   // If this is the original pipeline, we dont want to schedule tasks for its consumers, that will
   // be done later.
-  if (_task_creator && !original_pipeline) {
+  auto* const creator = get_task_creator();
+  if (creator && !original_pipeline) {
     try {
       for (auto* consumer : get_output_consumers()) {
         // If is possible to have a race condition here where one task finished and here it does to
         // schedule a task right when the last task finished and marks the operator as finalized.
         // That is ok. This check here is to minimize unnecessary scheduling of task creation.
-        if (!consumer->finalized.load()) { _task_creator->schedule(consumer); }
+        if (!consumer->finalized.load()) { creator->schedule(consumer); }
       }
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR(
         "Pipeline {}: failed to schedule downstream consumers: {}", pipeline_id, e.what());
-      _task_creator->report_fatal_error(get_query_id(), std::current_exception());
+      creator->report_fatal_error(get_query_id(), std::current_exception());
     }
   }
 
@@ -420,7 +424,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
      // to avoid holding the child pipeline mutex while acquiring a parent's
 
   // Outside _status_mutex: an observer must not run under the pipeline lock.
-  if (just_closed && _task_creator != nullptr) {
+  if (auto* const creator = get_task_creator(); just_closed && creator != nullptr) {
     // Observation only, so an unnumbered source is reported as the sentinel
     // rather than throwing out of pipeline teardown: plans that never ran
     // assign_operator_ids still close their pipelines. 0 would not do — it is a
@@ -428,7 +432,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
     auto const source_id = source != nullptr && source->has_operator_id()
                              ? source->get_operator_id()
                              : op::sirius_physical_operator::invalid_operator_id;
-    _task_creator->publish_pipeline_closure(get_query_id(), get_pipeline_id(), source_id);
+    creator->publish_pipeline_closure(get_query_id(), get_pipeline_id(), source_id);
   }
 
   if (should_notify) { notify_downstream_pipelines(original_pipeline); }
