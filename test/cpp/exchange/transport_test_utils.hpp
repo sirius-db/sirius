@@ -31,8 +31,8 @@
 #include <vector>
 
 /// What exchange tests send through a transport, and the checks on what arrived. Batches are
-/// derived from (sender, receiver, index), so a rank can check what it received from a peer in
-/// another process.
+/// derived from (sender, receiver, stream, index), so a rank can check what it received from a
+/// peer in another process.
 namespace sirius::test::exchange_utils {
 
 using sirius::exchange::rank_t;
@@ -85,13 +85,16 @@ inline transport::callbacks recording(received& got)
           }};
 }
 
-/// Batch @p i from @p from to @p to.
-inline std::shared_ptr<cucascade::data_batch> exchange_batch(rank_t from,
-                                                             rank_t to,
-                                                             int i,
-                                                             std::size_t rows)
+/// Batch @p i from @p from to @p to on @p stream. Its first key encodes all four, so a batch on
+/// the wrong stream, or from or to the wrong rank, matches nothing expected there.
+inline std::shared_ptr<cucascade::data_batch> exchange_batch(
+  rank_t from, rank_t to, stream_id stream, int i, std::size_t rows)
 {
-  return gpu_batch(sample_table(rows + 97 * (from + to + static_cast<rank_t>(i))));
+  REQUIRE(stream < (stream_id{1} << 32));
+  REQUIRE((from < 1024 && to < 1024 && i >= 0 && i < 1024));
+  auto const tag = ((stream * 1024 + from) * 1024 + to) * 1024 + static_cast<stream_id>(i);
+  return gpu_batch(
+    sample_table(rows + 97 * (from + to + static_cast<rank_t>(i)), static_cast<std::int64_t>(tag)));
 }
 
 /// Sends @p per_stream batches of about @p rows rows on each stream from @p t to every rank,
@@ -104,7 +107,7 @@ inline void send_all(transport& t,
   for (rank_t to = 0; to < t.world_size(); ++to) {
     for (auto const stream : streams) {
       for (int i = 0; i < per_stream; ++i) {
-        t.send(stream, to, exchange_batch(t.rank(), to, i, rows));
+        t.send(stream, to, exchange_batch(t.rank(), to, stream, i, rows));
       }
     }
   }
@@ -115,7 +118,8 @@ inline void send_all(transport& t,
   }
 }
 
-/// Waits until rank @p to has every end, then checks it received exactly what send_all() sent it.
+/// Waits until rank @p to has every end, then checks it received exactly what send_all() sent it,
+/// on the stream and from the sender it was sent on and from.
 inline void check_all(received& got,
                       rank_t to,
                       rank_t world,
@@ -138,16 +142,23 @@ inline void check_all(received& got,
     return a.row_hashes < b.row_hashes;
   };
   for (rank_t from = 0; from < world; ++from) {
-    std::vector<table_digest> want;
-    for (int i = 0; i < per_stream; ++i) {
-      want.push_back(digest(exchange_batch(from, to, i, rows)));
-    }
-    std::sort(want.begin(), want.end(), by_hashes);
     for (auto const stream : streams) {
+      std::vector<table_digest> want;
+      for (int i = 0; i < per_stream; ++i) {
+        want.push_back(digest(exchange_batch(from, to, stream, i, rows)));
+      }
+      std::sort(want.begin(), want.end(), by_hashes);
       auto have = got.batches[{from, stream}];
       std::sort(have.begin(), have.end(), by_hashes);
       CHECK(have == want);
     }
+  }
+  // A batch under any other (sender, stream) arrived misrouted. Ends are not checked this way: a
+  // peer's next stream (a barrier) may already have ended here.
+  for (auto const& entry : got.batches) {
+    auto const [from, stream] = entry.first;
+    CHECK(from < world);
+    CHECK(std::find(streams.begin(), streams.end(), stream) != streams.end());
   }
 }
 
