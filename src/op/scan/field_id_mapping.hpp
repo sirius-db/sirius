@@ -29,7 +29,7 @@ enum class field_mapping_scope { flat_file, top_level_scalars };
 
 // Carrier eligibility is independent of schema scope and available mapping codecs.
 // Existing routes keep their original physical read layout unless they explicitly opt in.
-enum class row_count_carrier_policy { legacy_scalars, include_temporal };
+enum class row_count_carrier_policy { legacy_scalars, include_temporal_and_decimal };
 
 // Immutable, scan-local approval. Only compile() can mint its operations; callers cannot
 // attach a cast to an unrelated footer or change its target after physical validation.

@@ -10,6 +10,7 @@
 #include <functional>
 #include <limits>
 #include <memory_resource>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -19,8 +20,10 @@ namespace sirius::op::scan {
 using arrow_metadata_lengths = std::unordered_map<char const*, std::size_t>;
 
 // Ownership of the entire schema/array tree is transferred here. The producer must
-// detach any statement-affine release callbacks before publication. Capacity retains
-// the producer's input/staging reservation until the last asynchronous input read.
+// detach any statement-affine release callbacks before publication. The entire tree
+// and its backing must remain immutable until release; payload validation is cached.
+// Capacity retains the producer's input/staging reservation until the last
+// asynchronous input read.
 class owned_arrow_batch {
  public:
   // Every non-null metadata pointer requires its own trusted byte length.
@@ -44,6 +47,9 @@ class owned_arrow_batch {
                                               materialization_program const&,
                                               exec::retire_lane&,
                                               rmm::device_async_resource_ref);
+  std::vector<cudf::data_type> const& validated_types() const;
+  mutable std::once_flag validation_once;
+  mutable std::vector<cudf::data_type> types;
   ArrowSchema schema{};
   ArrowArray array{};
   std::shared_ptr<void> capacity;
@@ -55,6 +61,10 @@ class owned_arrow_batch {
 
 std::vector<cudf::data_type> validate_arrow_host_flat(
   ArrowSchema const&, ArrowArray const&, arrow_metadata_lengths const& metadata_lengths = {});
+// Compare a validated flat schema with a bound program, including decimal precision.
+void validate_arrow_bound_schema(ArrowSchema const&,
+                                 std::span<cudf::data_type const>,
+                                 materialization_program const&);
 // Conservative PMR storage for a validated flat input, including allocation alignment.
 std::size_t arrow_import_staging_bytes(ArrowArray const&, std::span<cudf::data_type const>);
 // The caller owns/drains the completion lane and its stream for the entire attempt.

@@ -205,7 +205,7 @@ Currently declined:
 - **Equality deletes.** The filter, the GPU anti-join mask and the group build all exist, but key projection is not wired, and two pieces do not implement the spec: the applicability test compares the *manifest's* sequence number rather than the entry's inherited data sequence number, and keys are taken from every column of the delete file rather than the entry's declared `equality_ids`. `read_iceberg_delete_data` refuses live equality entries behind `kEqualityDeleteRouteImplementedToSpec`, which is the single switch that turns the route on; the components are covered directly by `test/cpp/scan/test_iceberg_equality_delete.cpp`, because no SQL test can reach them.
 - **`snapshot_from_timestamp` and `version`.** The delete path resolves only by `snapshot_from_id`, so these would read one snapshot's data against another's deletes.
 - **`allow_moved_paths = true`.** It rewrites every data-file path to `<table_path>/data/<name>`, while delete discovery calls `iceberg_metadata()` without the flag and keeps the manifests' original paths; the two would not match and the deletes would be dropped.
-- **Schema changes outside `iceberg_flat_v1`**, including nested transformations, date/timestamp or decimal evolution, files lacking complete field IDs, and missing columns whose partition-constant semantics cannot be proved. Existing matching-schema support for these types is unchanged.
+- **Schema changes outside `iceberg_flat_v1`**, including nested transformations, date/timestamp evolution or decimal precision/scale changes, files lacking complete field IDs, and missing columns whose partition-constant semantics cannot be proved. Existing matching-schema support for these types is unchanged.
 - **A deletion vector whose Puffin footer descriptor contradicts its manifest entry**, or whose decoded position count contradicts the entry's `record_count`.
 
 Any code opening its own `Connection` on this path must bracket it with `SiriusContext::InternalQueryGuard` on **that connection's** context — the bracket is per-connection, so a caller's guard does not cover a connection it opens.
@@ -214,7 +214,14 @@ Any code opening its own `Connection` on this path must bracket it with `SiriusC
 
 Missing-column defaults require proof that partition metadata cannot override them. During lowering, one `LIMIT 0` Avro schema query per distinct data manifest checks for an empty partition record; nonempty or unavailable schemas do not grant this proof. No data-file footer sweep is added. Files with present fields can still map without this proof. This deliberately leaves identity-partition reconstruction outside the profile.
 
-Mapped files disable reader/statistics/null-count pruning and apply residual predicates after normalization. They use per-file reader options, so coalescing ends at their file boundary; row groups within a file still batch normally. Conversion/default buffers are included in the working-set estimate. If every requested field is absent, one physical column carries row count. Unsupported mappings fail before decoding and follow the existing late-failure policy. These choices preserve correctness but add manifest-header work and may reduce pruning/coalescing efficiency; performance acceptance is separate.
+Mapped scans disable reader row filtering, apply residual predicates after normalization and keep original row-group ordinals through pruning. Per-file reader options limit coalescing to one file. Conversion and default buffers count toward the working-set estimate.
+
+| Mapping or statistics | Behavior |
+|---|---|
+| Unchanged scalar field with usable statistics | Prune whole row groups using its physical name. |
+| Cast, default, ambiguous name or missing statistics | Keep affected groups and evaluate residual predicates. |
+| Every requested field is absent | Use a qualified physical row-count carrier and supply defaults; reject if none is available. |
+| Unsupported mapping | Fail before decode and follow the existing recovery policy. |
 
 ## owning_table_view
 
@@ -819,72 +826,38 @@ zero-column batch. A zero-row batch does not mean end-of-stream.
 
 Two reusable entry points additionally exercise this finish contract:
 
-- `materialize_mapped_parquet()` takes an immutable `field_id_mapping`, the opened
-  datasource, retained footer, physical contract, and exact row groups. The mapper
-  binds physical names by field ID, reorders fields, fills explicitly typed defaults,
-  and permits INT32-to-INT64 or FLOAT32-to-FLOAT64 conversion only when approved at compilation. It checks
-  the decoded dtype before conversion and preserves original file row positions.
-  The current core profile accepts flat boolean, integer, float, and string fields.
-  `materialize_mapped_parquet_runs()` coalesces compatible admitted units and flushes
-  at mapping/default/original-schema boundaries. Different object identities can
-  coalesce; repeated files retain repeated rows and separate lineage. The caller
-  reserves decoded memory plus `additional_bytes()` for each admitted run, including
-  all results retained in the returned vector. The production Iceberg adapter uses
-  the same mapper under its qualified `iceberg_flat_v1` rules.
-- `import_arrow_host()` accepts an owned Arrow C Data tree, its bound input schema,
-  task memory resource, and retirement lane. The flat host profile accepts booleans,
-  signed/unsigned integers, FLOAT32/64, UTF8, DATE32, microsecond timestamps without
-  timezone, and DECIMAL128 (precision 1–38, nonnegative scale no larger than precision).
-  It refuses nested, dictionary, extension, binary, large-string, and device arrays.
-  Decimal imports normalize to the approved DECIMAL128 carrier. Input buffers and
-  metadata must be readable producer-owned C Data memory. For every non-null metadata
-  buffer on the root or a child schema, the producer supplies a trusted readable byte
-  length in `arrow_metadata_lengths` and keeps that memory alive through import.
-  Arrow C Data carries no allocation extents: a raw pointer, lengths encoded inside
-  metadata, or `strnlen` cannot establish its readable range, and copying from an
-  unknown range cannot establish one either. The consumer rejects non-null metadata
-  without a trusted length and parses it only within that buffer's supplied bound.
-  The consumer owns extension/profile and bound-schema checks, admission, publication,
-  cancellation, and ownership/retirement. The producer must detach statement-affine
-  callbacks before ownership transfer. Input/staging capacity remains owned through
-  retirement, even if import throws. The caller reserves output/temporary memory and
-  drains the lane.
-  The conversion leaf incorporates the checked host normalization from
-  [#2216](https://github.com/sirius-db/sirius/pull/2216), whose original helper was
-  extracted from [#1965](https://github.com/sirius-db/sirius/pull/1965). It checks the
-  entire selected batch before GPU work, then builds owning cuDF columns with the
-  supplied device resource and lane stream, without intermediate cuDF Arrow import
-  or decimal casts. Decimal payloads must fit their declared precision; the output
-  remains DECIMAL128, and zero-column batches retain their separate row count.
-  `owned_arrow_batch` requires an explicit staging PMR. Boolean bytes, rebased UTF8
-  offsets and selected validity bits use that resource; roots, capacity and staging
-  stay retained on the lane until completion, including post-enqueue failures. The
-  capacity owner must keep the PMR alive until those staging buffers are destroyed.
-  An absent bitmap with unknown null count is treated as all-valid; positive null
-  counts without a bitmap are refused. No decimal rescaling or large-string support
-  is added. Metadata semantics and the other consumer responsibilities above remain
-  unchanged. Normal import does not synchronize the stream on the host; neither a
-  returned table nor an exception permits releasing pending inputs or replaying a
-  query before a successful attempt-level drain. A failed drain retains ownership,
-  not permission to release it. After output destruction/unwinding, the caller must
-  call `lane.quiesce()` even if `lane.idle()` or input retirement already completed:
-  commit-error recovery may precede subsequently queued output frees. The output
-  allocator and its backing reservation must outlive that final barrier.
-  No CPU/GPU overlap or throughput guarantee is made;
-  pageable producer or PMR buffers may cause CUDA-internal staging/synchronization.
-  `materialize_arrow_stream()` is the internal sequential verifier above this
-  single-batch importer. Its source returns independently owned batches with a
-  contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;
-  zero-row batches remain data. It validates the envelope against the imported
-  batch, sends each result directly to a sink without an unbounded queue, and
-  calls source cancellation on source, import, validation, or sink failure.
-  An adapter may translate an `ArrowArrayStream` one batch at a time, but no
-  public Fragment Arrow-input API or Paimon/DuckLake reader is introduced here.
+- `materialize_mapped_parquet()` takes an immutable `field_id_mapping`, the opened datasource, retained footer, physical contract, and exact row groups. The mapper binds physical names by field ID, reorders fields, fills explicitly typed defaults, and permits INT32-to-INT64 or FLOAT32-to-FLOAT64 conversion only when approved at compilation. It checks the decoded dtype before conversion and preserves original file row positions. The current core profile accepts flat boolean, integer, float, string and exact DECIMAL fields. Decimal precision and scale changes are refused. `materialize_mapped_parquet_runs()` coalesces compatible admitted units and flushes at mapping/default/original-schema boundaries. Different object identities can coalesce; repeated files retain repeated rows and separate lineage. The caller reserves decoded memory plus `additional_bytes()` for each admitted run, including all results retained in the returned vector. The production Iceberg adapter uses the same mapper under its qualified `iceberg_flat_v1` rules.
+- `import_arrow_host()` consumes an owned Arrow C Data tree, its bound input schema, the task memory resource and a retirement lane. It validates the selected batch before GPU work and creates independently owned cuDF columns on the lane's stream. The flat host profile accepts booleans, signed/unsigned integers, FLOAT32/64, UTF8, DATE32, timezone-free microsecond timestamps and DECIMAL32/64/128. Decimal precision is limited to 9/18/38 respectively; scale must be nonnegative and no larger than precision. Payloads must fit the declared precision. Import preserves storage width and scale without decimal casts. Nested, dictionary, extension, binary, large-string and device arrays are refused.
+
+  Producers supply readable C Data buffers and trusted lengths for every non-null schema metadata buffer through `arrow_metadata_lengths`. Metadata is parsed only within those bounds; raw pointers and encoded lengths do not prove allocation extents. Statement-affine callbacks must be detached before ownership transfer. The consumer handles bound-schema checks, admission, publication, cancellation and retirement.
+
+  `owned_arrow_batch` uses an explicit staging PMR for Boolean bytes, rebased UTF8 offsets and validity bits. Roots, capacity and staging remain retained until completion, including on failure. The capacity owner must keep the staging memory resource alive until all buffers allocated from it have been destroyed. Unknown null counts without a bitmap mean all-valid; positive null counts without a bitmap are refused. Zero-column batches retain a separate row count.
+
+  The caller reserves output and temporary memory and drains the lane. After output destruction or unwinding, call `lane.quiesce()` even if input retirement completed or the lane reports idle: error recovery can precede queued output frees. The output allocator and backing reservation must survive that barrier. Unconfirmed completion retains ownership and does not authorize CPU replay. Import itself does not synchronize the stream on the host, although pageable buffers may cause CUDA-internal staging or synchronization.
+
+  `materialize_arrow_stream()` verifies a sequential source of independently owned batches with contiguous sequence numbers and declared row/byte bounds. `nullopt` means EOS; zero-row batches remain data. Results pass directly to a sink without an unbounded queue. Source, import, validation or sink failures cancel the source.
+
 
 A direct GPU reader can supply an owning batch to the same validator and finish
 without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
 source adapter or relax the existing Iceberg equality-delete, snapshot or
 remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
+
+## DuckLake scans
+
+Enable `SIRIUS_BUILD_DUCKLAKE_BRIDGE` and load the matching provider to use DuckLake through ordinary SQL or `CALL gpu_execution(...)`. The build option is off by default. Local Parquet and inline data use the original statement binding and the shared scan and recovery paths.
+
+See [DuckLake support and limits](scan-contracts-design.md#ducklake-private-binding-boundary) for supported inputs, schema evolution, memory ownership and failure behavior.
+
+### Snapshot visibility
+
+Ordinary SQL and `CALL gpu_execution(...)` support snapshot-bearing Parquet and Puffin deletes and per-row snapshot-filtered data through the bound table scan. Snapshot visibility follows the original statement binding without an additional setting.
+
+For bound table scans, every referenced delete payload is validated before selecting positions visible at the bound snapshot. Transaction-local deletes bypass the committed-snapshot filter only when the bound read view includes local changes; explicit historical snapshots exclude those changes. Parquet deletes read positions and snapshots together, validate strict position ordering across batches, and check the original row domain even for future deletes. Validated rows and effective deletions have separate counts; inline deletes are combined after snapshot selection.
+
+Partial data requires the exact BIGINT field ID and physical name of `_ducklake_internal_snapshot_id`, without a missing-column default. This hidden column is retained for zero-user-column scans and excluded from output. Inclusive snapshot bounds use shared residual predicates. Reader row-filter pushdown is disabled so positional deletes operate on original file positions before residual filtering and projection; row-group pruning preserves that lineage.
+
+Before decoding data, the adapter compares the opened object's size and parsed footer length with the bound catalog descriptor. A physical-cache identity match does not establish agreement with the statement's descriptor.
 
 ## Key Files
 

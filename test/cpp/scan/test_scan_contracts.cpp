@@ -448,7 +448,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("ROLLBACK");
 }
 
-TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts][shared_context]")
+TEST_CASE("Scan registry verifies core catalog functions", "[scan][contracts][shared_context]")
 {
   REQUIRE(sirius::test::g_shared_env);
   auto con = sirius::test::g_shared_env->make_connection();
@@ -462,6 +462,13 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
 
   std::set<std::string> names;
   for (auto const& entry : sirius::planner::registered_connectors()) {
+    if (entry.function_name == "ducklake_scan") {
+      CHECK(entry.lower != nullptr);
+      CHECK(entry.verify_binding != nullptr);
+      CHECK(entry.capture != nullptr);
+      CHECK(entry.certify != nullptr);
+      continue;  // Its optional provider/qualification tests own the private ABI.
+    }
     names.insert(entry.function_name);
     if (entry.function_name == "sirius_stream_source") {
       CHECK(entry.certify == nullptr);
@@ -1228,6 +1235,7 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
   replacement_table = &first_get(*native).bind_data->Cast<duckdb::TableScanBindData>().table;
   duckdb::ExtensionLoader loader(*con.context->db, "registry_replacement_test");
   for (auto const& source : sirius::planner::registered_connectors()) {
+    if (source.function_name == "ducklake_scan") continue;
     INFO(source.function_name);
     auto& catalog = duckdb::Catalog::GetSystemCatalog(*con.context);
     auto original = *catalog
