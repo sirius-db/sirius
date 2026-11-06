@@ -1378,7 +1378,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     };
 
     // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
-    // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
+    // file_source factory, which binds to a single CUDA context.
     // That is mandatory on multi-GPU.
     if (data.args.tier == "host") {
       // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
@@ -1569,7 +1569,7 @@ void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
     // rebuilding a cache creates no per-query runtime state to clean up.
     duckdb::SiriusContext::SlotGuard slot(
       *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
-    sirius_ctx->get_scan_manager().reset_caches();
+    sirius_ctx->reset_caches();
   }
 
   output.data[0].Append(Value::BOOLEAN(true));
