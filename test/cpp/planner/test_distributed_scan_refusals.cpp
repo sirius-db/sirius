@@ -29,6 +29,7 @@
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <planner/substrait_scan_ranges.hpp>
 #include <sirius/exception.hpp>
+#include <sirius_context.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -211,6 +212,10 @@ TEST_CASE("a distributed plan refuses scans it cannot split", "[planner][distrib
             false)
             .empty());
     con.context->registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+    // Nothing distributed ran, so this process has no distributed session to pay for.
+    auto ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(ctx);
+    CHECK(ctx->distributed() == nullptr);
   }
 }
 

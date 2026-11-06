@@ -383,6 +383,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/exchange/transport.*`, `messages.*` | Credits, landing, end of stream, failure |
 | `src/exchange/fabric.*`, `nixl_fabric.*` | Rings; the NIXL fabric and its start-up |
 | `src/exchange/exchange_service.*`, `exchange_runtime.*`, `all_gather.*` | A process's exchange; collectives |
+| `src/exchange/distributed_session.*` | A process's distributed state: its exchange, query numbering, each window's query, abort and retire. `SiriusContext` creates it at the first distributed use; a process that runs none has none |
 | `src/op/sirius_physical_exchange_{sink,source}.*` | The operators |
 | `src/op/distributed/sirius_physical_distributed_sort_sample.*` | Distributed sampling |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check; each rank's share of a table's files, and the scans no rank can split |
