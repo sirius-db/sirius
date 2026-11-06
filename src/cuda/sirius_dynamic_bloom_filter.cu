@@ -488,6 +488,12 @@ void sirius_dynamic_bloom_filter::merge_from(void const* words,
   if (replica_count() > 1) {
     throw std::logic_error("[sirius_dynamic_bloom_filter] merge_from on a filter on several GPUs");
   }
+  cudaPointerAttributes attributes{};
+  CUDF_CUDA_TRY(cudaPointerGetAttributes(&attributes, words));
+  if (attributes.type == cudaMemoryTypeDevice && attributes.device != _impl->source_device) {
+    throw std::invalid_argument("[sirius_dynamic_bloom_filter] merging a filter on another GPU");
+  }
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_impl->source_device}};
   auto* into                 = static_cast<std::uint32_t*>(const_cast<void*>(storage()));
   auto const count           = bytes / sizeof(std::uint32_t);
   constexpr unsigned threads = 256;
