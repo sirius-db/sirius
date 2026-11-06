@@ -16,7 +16,7 @@
 
 #include "ducklake/unit_descriptor.hpp"
 
-#include "io/uri_parser.hpp"
+#include <cucascade/io/uri_parser.hpp>
 
 #include <stdexcept>
 
@@ -30,7 +30,7 @@ unit_gate assess_local_scope(unit_descriptor const& unit)
   };
   auto location = [&](std::string const& path, unit_gate_reason remote) {
     try {
-      auto uri = io::parse(path);
+      auto uri = cucascade::io::parse(path);
       if (uri.scheme != "file" || !uri.host.empty()) reject(remote);
     } catch (std::invalid_argument const&) {
       reject(unit_gate_reason::invalid_locator);

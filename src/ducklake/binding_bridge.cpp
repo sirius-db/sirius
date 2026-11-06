@@ -21,10 +21,11 @@
 #include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_reader.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
-#include "io/io_errors.hpp"
-#include "io/object_identity.hpp"
 #include "op/scan/parquet_delete_reader.hpp"
 #include "planner/connector_registry.hpp"
+
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/object_identity.hpp>
 
 #include <stdexcept>
 #include <thread>
@@ -475,7 +476,8 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   options.verify_unbound_trailer = true;
   options.check_stop             = check_stop;
   options.verify_remote          = [](CachingFileHandle&) {
-    throw io::descriptor_mismatch_error("DuckLake Parquet deletes require a local regular file");
+    throw cucascade::io::descriptor_mismatch_error(
+      "DuckLake Parquet deletes require a local regular file");
   };
   auto result = std::make_shared<dv_visibility>();
   std::span<int64_t> positions;
@@ -527,7 +529,7 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   }
   check_stop();
   result->delete_identity =
-    "duckdb.local.parquet.read:" + std::to_string(io::next_open_generation());
+    "duckdb.local.parquet.read:" + std::to_string(cucascade::io::next_open_generation());
   result->positions         = positions;
   result->parquet_validated = true;
   return result;

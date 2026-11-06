@@ -21,12 +21,12 @@
 #include "ducklake/scan_ingestible.hpp"
 #include "ducklake/unit_descriptor.hpp"
 #include "helper/hugeint.hpp"
-#include "io/io_errors.hpp"
 #include "planner/connector_registry.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "utils/puffin_test_utils.hpp"
 
 #include <catch.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <duckdb/common/multi_file/multi_file_function.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -644,7 +644,7 @@ TEST_CASE("DuckLake DV invalid later blobs cannot publish partial visibility",
                                  sm::preparation_stop_token(stop.get_token()));
   };
   if (mode == "size")
-    CHECK_THROWS_AS(prepare(), sirius::io::descriptor_mismatch_error);
+    CHECK_THROWS_AS(prepare(), cucascade::io::descriptor_mismatch_error);
   else if (mode == "io")
     CHECK_THROWS_AS(prepare(), sirius::transparent::classified_execution_error);
   else if (mode == "cancel")

@@ -21,7 +21,6 @@
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/preparation_gate.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/io_errors.hpp"
 #include "op/scan/parquet_batch_layout.hpp"
 #include "op/scan/positional_visibility.hpp"
 #include "op/scan/table_scan/split_validation.hpp"
@@ -30,6 +29,7 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
 
@@ -326,10 +326,10 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
           unit_, file.file_metadata->num_rows, data_identity, resolve, allocator, stop);
       } catch (transparent::classified_execution_error const&) {
         throw;
-      } catch (io::object_changed_error const& error) {
+      } catch (cucascade::io::object_changed_error const& error) {
         throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                       error.what());
-      } catch (io::descriptor_mismatch_error const& error) {
+      } catch (cucascade::io::descriptor_mismatch_error const& error) {
         throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                       error.what());
       } catch (std::system_error const& error) {
@@ -437,10 +437,10 @@ parquet_unit_ingestible::make_preparation_sources(io::ioctx_resolver resolve)
             throw;
           } catch (transparent::classified_execution_error const&) {
             throw;
-          } catch (io::object_changed_error const& e) {
+          } catch (cucascade::io::object_changed_error const& e) {
             throw transparent::classified_execution_error(
               transparent::late_failure_cause::reader_io, e.what());
-          } catch (io::descriptor_mismatch_error const& e) {
+          } catch (cucascade::io::descriptor_mismatch_error const& e) {
             throw transparent::classified_execution_error(
               transparent::late_failure_cause::reader_io, e.what());
           } catch (std::system_error const&) {

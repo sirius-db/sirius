@@ -348,8 +348,8 @@ void check_mixed_input_gate(std::shared_ptr<sirius::ducklake::binding_handle> co
   });
   parquet->preflight_for_query();
   arrow->preflight_for_query();
-  auto sources =
-    parquet->make_preparation_sources([](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
+  auto sources = parquet->make_preparation_sources(
+    [](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
       throw std::runtime_error("abandoned gate probe must not start Parquet I/O");
     });
   auto claim = arrow->try_claim_split({});
@@ -2511,7 +2511,7 @@ TEST_CASE_METHOD(ducklake_fixture,
     auto parquet   = binding->make_parquet_unit(0, 1, 1, admission, {0});
     parquet->attach_preparation_ledger(ledger);
     auto claim =
-      parquet->try_claim_split([](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
+      parquet->try_claim_split([](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
         throw std::logic_error("stopped job reached Parquet I/O");
       });
     auto job = std::get<sm::preparation_job>(std::move(claim));

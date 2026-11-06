@@ -16,7 +16,7 @@
 
 #pragma once
 #include "ducklake/unit_descriptor.hpp"
-#include "io/io_context.hpp"
+#include "io/ioctx_resolver.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_stop_token.hpp"
 

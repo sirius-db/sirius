@@ -16,9 +16,9 @@
 
 #include "ducklake/dv_visibility.hpp"
 
-#include "io/io_errors.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/uri_parser.hpp"
+#include "io/path_utils.hpp"
+
+#include <cucascade/io/io_errors.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -123,7 +123,7 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
     throw std::invalid_argument("DuckLake DV requires original data evidence");
   check_stop(stop);
   if (source.size() < 8 || static_cast<uint64_t>(source.size()) != unit.delete_file_size)
-    throw io::descriptor_mismatch_error("DuckLake DV object size differs from binding");
+    throw cucascade::io::descriptor_mismatch_error("DuckLake DV object size differs from binding");
   std::array<std::byte, 4> magic;
   read_exact(source, 0, magic, stop);
   bool container = std::memcmp(magic.data(), "PFA1", 4) == 0;
@@ -266,11 +266,11 @@ std::shared_ptr<dv_visibility const> read_dv_visibility(unit_descriptor const& u
                                                         sm::preparation_stop_token stop)
 {
   check_stop(stop);
-  std::unique_ptr<io::sirius_datasource> datasource;
+  std::unique_ptr<cucascade::io::datasource> datasource;
   try {
     auto context = resolve(unit.delete_path);
     if (!context) throw std::runtime_error("DuckLake DV has no I/O context");
-    datasource = context->open_datasource(unit.delete_path, io::open_hint::generic);
+    datasource = io::open_datasource(context, unit.delete_path, cucascade::io::open_hint::generic);
     if (!datasource) throw std::runtime_error("DuckLake DV has no datasource");
   } catch (transparent::classified_execution_error const&) {
     throw;
