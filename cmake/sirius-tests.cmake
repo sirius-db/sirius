@@ -2,6 +2,12 @@ find_package(Catch2 3 REQUIRED CONFIG)
 
 add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                test/cpp/utils/sirius_extension_loader.cpp)
+set_property(
+  SOURCE test/cpp/integration/test_ducklake_connector.cpp
+  APPEND
+  PROPERTY INCLUDE_DIRECTORIES
+           "${CMAKE_CURRENT_SOURCE_DIR}/cucascade/test/io/rest"
+           "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/httplib")
 # Export DuckDB's host API for third-party extensions such as Iceberg.
 set_target_properties(sirius_unittest PROPERTIES ENABLE_EXPORTS ON)
 # Load Sirius in a DuckDB-only host to avoid a second embedded engine copy.
