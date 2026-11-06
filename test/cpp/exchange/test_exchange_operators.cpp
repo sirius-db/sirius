@@ -807,6 +807,8 @@ TEST_CASE("a VALUES source keeps its rows on rank 0 alone", "[exchange][operator
         rows[r]             = sirius::get_cudf_table_view(batches.at(0)->to_read_only()).num_rows();
       } catch (std::exception const& e) {
         errors[r] = e.what();
+        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
+        c.all[r].service->abort(3, e.what());
       }
     });
   }
