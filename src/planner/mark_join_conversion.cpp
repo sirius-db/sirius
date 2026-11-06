@@ -107,8 +107,9 @@ void simplify_null_safe_semi_conditions(duckdb::ClientContext& context,
         !analyzer.IsNotNull(*join.children[1], cond.GetRHS())) {
       continue;
     }
-    cond = duckdb::JoinCondition(
-      cond.LeftReference()->Copy(), cond.RightReference()->Copy(), duckdb::ExpressionType::COMPARE_EQUAL);
+    cond = duckdb::JoinCondition(cond.LeftReference()->Copy(),
+                                 cond.RightReference()->Copy(),
+                                 duckdb::ExpressionType::COMPARE_EQUAL);
   }
 }
 
@@ -187,7 +188,8 @@ struct converter {
     if (to_anti && !all_comparisons_null_safe(join)) return;
 
     // The mark is the join's last output column. A filter whose projection map drops it keeps its
-    // own output unchanged; otherwise the output shrinks and every consumer must address by binding.
+    // own output unchanged; otherwise the output shrinks and every consumer must address by
+    // binding.
     auto const mark_position = join.GetColumnBindings().size() - 1;
     auto const has_map       = filter.HasProjectionMap();
     if (has_map) {

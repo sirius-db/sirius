@@ -372,9 +372,8 @@ void trace_probe_key_into(sirius::op::sirius_physical_operator& node,
     terminals.push_back(route_terminal{.node = &node, .ordinal = ordinal});
     if (node.type != sirius::op::SiriusPhysicalOperatorType::CTE_SCAN) { return; }
     auto const table_index = node.Cast<sirius::op::sirius_physical_column_data_scan>().cte_index;
-    auto const owner       = std::find_if(ctes.begin(), ctes.end(), [&](auto const* cte) {
-      return cte->table_index == table_index;
-    });
+    auto const owner       = std::find_if(
+      ctes.begin(), ctes.end(), [&](auto const* cte) { return cte->table_index == table_index; });
     if (owner == ctes.end() || !is_delim_outer_row_reader(**owner, node) ||
         ordinal >= (*owner)->children[0]->types.size()) {
       return;
@@ -383,12 +382,13 @@ void trace_probe_key_into(sirius::op::sirius_physical_operator& node,
     cte_stack body_ctes;
     std::vector<route_terminal> body;
     trace_probe_key_into(*(*owner)->children[0], ordinal, policy, body_ctes, body);
-    bool const all_scans = !body.empty() && std::all_of(body.begin(), body.end(), [](auto const& t) {
-      return t.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN;
-    });
+    bool const all_scans =
+      !body.empty() && std::all_of(body.begin(), body.end(), [](auto const& t) {
+        return t.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN;
+      });
     if (!all_scans) { return; }
     for (auto& terminal : body) {
-      terminal.in_cte_body    = true;
+      terminal.in_cte_body     = true;
       terminal.cte_table_index = table_index;
       terminals.push_back(terminal);
     }

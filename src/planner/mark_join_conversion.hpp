@@ -33,13 +33,14 @@ namespace sirius::planner {
 ///
 /// Why: with `delim_join_as_cte = true`, DuckDB wraps joins in identity projections that still
 /// reference the mark column when its filter pushdown runs, so its own MARK-to-SEMI/ANTI conversion
-/// is switched off (`convert_mark_to_semi = false`). Column pruning drops those references later, but
-/// nothing re-enables the conversion. A MARK join cannot publish a dynamic filter; a SEMI or ANTI
-/// join can.
+/// is switched off (`convert_mark_to_semi = false`). Column pruning drops those references later,
+/// but nothing re-enables the conversion. A MARK join cannot publish a dynamic filter; a SEMI or
+/// ANTI join can.
 ///
 /// The rules are DuckDB's own (`FilterPushdown::PushdownMarkJoin`):
 ///   - the filter is exactly the mark column, or exactly NOT(mark column);
-///   - NOT(mark) needs every comparison to be null-safe (IS NOT DISTINCT FROM), so the mark is never
+///   - NOT(mark) needs every comparison to be null-safe (IS NOT DISTINCT FROM), so the mark is
+///   never
 ///     NULL;
 ///   - nothing else in the plan reads the mark column;
 /// plus a positional-consumer guard: every operator between the filter and the next projection or

@@ -37,7 +37,6 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
-#include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -47,6 +46,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -1126,7 +1126,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   INFO(logical_plan);
   INFO(tree_to_string(plan.get()));
 
-  std::size_t joins_above_cte = 0;
+  std::size_t joins_above_cte  = 0;
   std::size_t body_scan_routes = 0;
   for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
     auto& join = node->Cast<sirius::op::sirius_physical_hash_join>();
@@ -1153,11 +1153,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   // Each query holds a delim CTE (so the conversion pass is active) and a MARK join whose mark
   // is not a bare filter: it is projected, or negated over keys that are not null-safe.
-  auto const sql = GENERATE(
-    std::string("SELECT p.pk, p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
-                "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk)) FROM parts p"),
-    std::string("SELECT p.pk FROM parts p WHERE p.pk NOT IN (SELECT i.fk FROM items i "
-                "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"));
+  auto const sql =
+    GENERATE(std::string("SELECT p.pk, p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
+                         "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk)) FROM parts p"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pk NOT IN (SELECT i.fk FROM items i "
+                         "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"));
   INFO(sql);
   auto plan = generate_sirius_plan(*con, sql, /*also_disabled=*/{}, /*pre_resolve=*/false);
   INFO(tree_to_string(plan.get()));
