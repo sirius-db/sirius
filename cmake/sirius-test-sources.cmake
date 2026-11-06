@@ -250,6 +250,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_mark_join.cpp
     test/cpp/operator/test_physical_single_join.cpp
     test/cpp/operator/test_physical_mixed_filter_join.cpp
+    test/cpp/integration/test_bounded_order_by.cpp
     test/cpp/operator/test_bounded_sort.cpp
     test/cpp/operator/test_sampled_merge.cpp
     test/cpp/operator/test_gpu_sampled_merge.cpp

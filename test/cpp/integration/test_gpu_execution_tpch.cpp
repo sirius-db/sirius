@@ -2989,7 +2989,6 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - order by multipartition",
                  "[integration][gpu_execution][order_by]")
 {
-  // Force small partition size (1 KB) so lineitem data is split into multiple partitions
   con->Query("SET max_sort_partition_bytes = 1024;");
 
   compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem order by l_orderkey;");
@@ -2999,7 +2998,6 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - order by multipartition parquet",
                  "[integration][gpu_execution][parquet][order_by]")
 {
-  // Force small partition size (1 KB) so lineitem data is split into multiple partitions
   con->Query("SET max_sort_partition_bytes = 1024;");
 
   compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem order by l_orderkey;");
