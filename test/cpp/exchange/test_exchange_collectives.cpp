@@ -229,6 +229,7 @@ sirius::op::sirius_dynamic_bloom_filter const* published_bloom(
 struct accumulating_join {
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel =
     std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  sirius::op::dynamic_filter_stats stats;
   std::unique_ptr<sirius::op::dynamic_filter_publication_session> session;
 
   accumulating_join(std::shared_ptr<exchange_service> service,
@@ -238,24 +239,31 @@ struct accumulating_join {
     auto plan = filter_plan(channel, cap);
     plan.set_distributed(merge_over(std::move(service), bloom_keys));
     session =
-      std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), nullptr);
+      std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), &stats);
   }
 
-  /// Accumulates @p batch as the build's only batch; publishes unless @p close_first ends the
-  /// input before the batch is added.
-  void build(std::shared_ptr<cucascade::data_batch> const& batch, bool close_first = false)
+  /// Accumulates @p batches as the whole build, publishing on the last; @p close_first ends the
+  /// input before any is added.
+  void build(std::vector<std::shared_ptr<cucascade::data_batch>> const& batches,
+             bool close_first = false)
   {
     sirius::op::build_arrival_ledger ledger;
-    ledger.record(*batch);
-    REQUIRE(session->try_begin_accumulation(ledger.certify({.repository_batches = 1})));
+    for (auto const& b : batches) {
+      ledger.record(*b);
+    }
+    REQUIRE(
+      session->try_begin_accumulation(ledger.certify({.repository_batches = batches.size()})));
     if (close_first) {
       session->finalize_input();
       return;
     }
     auto const stream = utils::default_stream();
-    session->contribute(batch->get_batch_id(), batch->to_read_only(), stream);
-    stream.sync();
-    session->publish_if_final(batch->get_batch_id(), *env().gpu, stream);
+    for (auto const& b : batches) {
+      session->contribute(b->get_batch_id(), b->to_read_only(), stream);
+      stream.sync();
+      session->publish_if_final(b->get_batch_id(), *env().gpu, stream);
+      if (&b != &batches.back()) { REQUIRE(channel->filter_count() == 0); }
+    }
   }
 
   [[nodiscard]] sirius::op::sirius_dynamic_bloom_filter const* bloom() const
@@ -332,7 +340,7 @@ TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
     joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, 32 * KiB, 64 * KiB));
   }
   // Rank 0 holds the even keys, rank 1 the odd ones.
-  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000)); });
+  on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 2000)}); });
 
   for (rank_t r = 0; r < 2; ++r) {
     auto const* bloom = joins[r]->bloom();
@@ -341,6 +349,34 @@ TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
     CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
     // Keys no rank holds are mostly absent.
     CHECK(members(*bloom, sequence(1'000'000, 1, 4000)) < 100);
+  }
+}
+
+TEST_CASE("ranks that each accumulate several batches publish once, after their last",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, 32 * KiB, 64 * KiB));
+  }
+  // Rank r's batch j holds the keys congruent to r + 2j mod 6: no key is in two batches, so each
+  // later batch adds keys only it has. build() requires no publication before the last batch.
+  on_every_rank(2, [&](rank_t r) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    for (std::int64_t j = 0; j < 3; ++j) {
+      batches.push_back(keys_batch(std::int64_t{r} + 2 * j, 6, 1000));
+    }
+    joins[r]->build(batches);
+  });
+
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(joins[r]->stats.snapshot().accumulation_publications_finished == 1);
+    CHECK(joins[r]->channel->filter_count() == 1);
+    CHECK(members(*bloom, sequence(0, 1, 6000)) == 6000);
+    CHECK(members(*bloom, sequence(1'000'000, 1, 6000)) < 100);
   }
 }
 
@@ -354,7 +390,7 @@ TEST_CASE("a rank that accumulates and one that publishes a whole build size the
   whole_build_join whole(c.all[1].service, planned, 64 * KiB);
   on_every_rank(2, [&](rank_t r) {
     if (r == 0) {
-      accumulated.build(keys_batch(0, 2, 2000));
+      accumulated.build({keys_batch(0, 2, 2000)});
     } else {
       static_cast<void>(whole.publish(keys_table(1, 2, 2000)->view()));
     }
@@ -377,7 +413,7 @@ TEST_CASE("a rank whose accumulation ends without a filter does not hold up the 
   auto const start = std::chrono::steady_clock::now();
   // Rank 1's input closes before its batch is added: it publishes nothing, and so does rank 0,
   // whose Bloom would miss rank 1's keys.
-  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000), r == 1); });
+  on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 2000)}, r == 1); });
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
   CHECK(joins[0]->bloom() == nullptr);
   CHECK(joins[1]->bloom() == nullptr);
@@ -392,7 +428,7 @@ TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
     joins.push_back(std::make_unique<accumulating_join>(
       c.all[r].service, std::size_t{4096} << r, std::uint64_t{64} << 20));
   }
-  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000)); });
+  on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 2000)}); });
   CHECK(joins[0]->bloom() == nullptr);
   CHECK(joins[1]->bloom() == nullptr);
 }
@@ -445,7 +481,7 @@ TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter 
       return;
     }
     auto const start = std::chrono::steady_clock::now();
-    rank0.build(keys_batch(0, 2, 2000));
+    rank0.build({keys_batch(0, 2, 2000)});
     rank0_merge = std::chrono::steady_clock::now() - start;
   });
 
