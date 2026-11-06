@@ -6,6 +6,7 @@ from decimal import Decimal
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ from tpch_pin_columns import emit_pin_all, union_columns_by_table
 def arguments(**overrides):
     defaults = dict(
         concurrency=2,
+        concurrency_mode="identical",
         stream_order=None,
         mode=None,
         profile=None,
@@ -56,6 +58,8 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
             dict(run_timeout=float("nan")),
             dict(query_timeout=-1),
             dict(concurrency=1, stream_order="same"),
+            dict(concurrency_mode="cooperative", stream_order="permuted"),
+            dict(concurrency_mode="cooperative", concurrency=1, profile="cold"),
             dict(pin="parquet"),
             dict(pin_compression=True),
             dict(validation_memory_limit_mb=0),
@@ -64,6 +68,152 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
                 cb.check_arguments(arguments(**values))
         cb.check_arguments(arguments(concurrency=1, mode="isolated", profile="cold"))
         cb.check_arguments(arguments(pin="host", profile="hot"))
+        cb.check_arguments(arguments(concurrency_mode="cooperative", concurrency=1))
+        cb.check_arguments(
+            arguments(concurrency_mode="cooperative", stream_order="same")
+        )
+
+    def test_cooperative_next_request_goes_to_first_available_stream(self):
+        initial_queries = threading.Barrier(3, timeout=3)
+        fourth_claimed = threading.Event()
+
+        class Connection:
+            def execute(self, sql):
+                self.query = int(sql)
+                self.fetched = False
+                if self.query <= 3:
+                    initial_queries.wait()
+                    if self.query != 2 and not fourth_claimed.wait(3):
+                        raise RuntimeError("stream 2 did not claim query 4")
+                elif self.query == 4:
+                    fourth_claimed.set()
+
+            def fetchmany(self, _):
+                if self.fetched:
+                    return []
+                self.fetched = True
+                return [(self.query,)]
+
+            def close(self):
+                pass
+
+        output = io.StringIO()
+        with patch.object(
+            perf,
+            "queries_for_scale_factor",
+            return_value={f"q{q}": str(q) for q in range(1, 11)},
+        ):
+            records, captures, errors = cb.run_phase(
+                SimpleNamespace(cursor=Connection),
+                arguments(
+                    concurrency=3,
+                    concurrency_mode="cooperative",
+                    iterations=1,
+                    query_timeout=0,
+                ),
+                "duckdb",
+                Path("."),
+                list(range(1, 11)),
+                False,
+                cb.CaptureBudget(0),
+                csv.DictWriter(output, fieldnames=cb.FIELDS),
+                output,
+            )
+        self.assertFalse(errors)
+        self.assertFalse(captures)
+        self.assertTrue(all(r["status"] == "success" for r in records))
+        self.assertEqual(len(records), 10)
+        by_query = {r["query"]: r for r in records}
+        self.assertEqual(set(by_query), {f"q{q}" for q in range(1, 11)})
+        for q in range(1, 4):
+            self.assertEqual(by_query[f"q{q}"]["stream_id"], q)
+        self.assertEqual(by_query["q4"]["stream_id"], 2)
+        self.assertLessEqual(by_query["q2"]["end_s"], by_query["q4"]["start_s"])
+
+    def test_cooperative_iterations_capture_each_query_once(self):
+        for concurrency in (1, 3, 8):
+            with self.subTest(concurrency=concurrency):
+                root = duckdb.connect()
+                output = io.StringIO()
+                try:
+                    with patch.object(
+                        perf,
+                        "queries_for_scale_factor",
+                        return_value={"q1": "select 42", "q6": "select 99"},
+                    ):
+                        records, captures, errors = cb.run_phase(
+                            root,
+                            arguments(
+                                concurrency=concurrency, concurrency_mode="cooperative"
+                            ),
+                            "duckdb",
+                            Path("."),
+                            [6, 1],
+                            True,
+                            cb.CaptureBudget(1 << 20),
+                            csv.DictWriter(output, fieldnames=cb.FIELDS),
+                            output,
+                        )
+                finally:
+                    root.close()
+                self.assertFalse(errors)
+                self.assertTrue(cb.summarize(records, 4, errors)["complete"])
+                self.assertEqual(len(captures), 4)
+                self.assertCountEqual(
+                    [(r["iteration"], r["query"]) for r in records],
+                    [(0, "q6"), (0, "q1"), (1, "q6"), (1, "q1")],
+                )
+                verdicts = cb.validate_captures(
+                    captures, {1: [(42,)], 6: [(99,)]}, [6, 1]
+                )
+                self.assertTrue(all(v["status"] == "success" for v in verdicts))
+                if concurrency == 1:
+                    self.assertEqual(
+                        [r["query"] for r in records], ["q6", "q1", "q6", "q1"]
+                    )
+
+    def test_cooperative_supervisor_metadata_and_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            database = directory / "input.duckdb"
+            duckdb.connect(str(database)).close()
+            (directory / "csv").mkdir()
+            (directory / "metadata.json").write_text("{}")
+            args = arguments(
+                concurrency=3,
+                concurrency_mode="cooperative",
+                input=str(database),
+                engine="cpu",
+            )
+
+            def child(command, **kwargs):
+                return SimpleNamespace(
+                    returncode=cb.run(json.loads(Path(command[-1]).read_text()))
+                )
+
+            with (
+                patch.object(cb, "configured_limit", return_value=(1, None)),
+                patch.object(cb.subprocess, "run", side_effect=child),
+                patch.object(perf, "drop_os_cache"),
+                patch.object(
+                    perf,
+                    "queries_for_scale_factor",
+                    return_value={"q1": "select 42", "q6": "select 99"},
+                ),
+            ):
+                self.assertEqual(
+                    cb.supervise(args, directory, None, True, None, None), 0
+                )
+            metadata = json.loads((directory / "metadata.json").read_text())
+            self.assertEqual(metadata["concurrency_mode"], "cooperative")
+            self.assertEqual(metadata["executions_per_engine"], 4)
+            self.assertEqual(metadata["shared_query_order"], [1, 6])
+            self.assertIsNone(metadata["stream_queries"])
+            summary = json.loads((directory / "concurrent_summary.json").read_text())
+            self.assertEqual(summary["status"], "success")
+            self.assertEqual(summary["engines"]["duckdb"]["expected"], 4)
+            self.assertEqual(summary["engines"]["duckdb"]["completed"], 4)
+            self.assertEqual(summary["validation"], {"checked": 4, "mismatches": 0})
 
     def test_stream_orders_and_selected_union(self):
         self.assertEqual(cb.orders_for([6, 1], 2, "same"), [[6, 1], [6, 1]])

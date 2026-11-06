@@ -229,6 +229,7 @@ def setup_benchmark_dir(
     data_source="parquet",
     duckdb_results_source=None,
     concurrency=1,
+    concurrency_mode="identical",
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -248,11 +249,15 @@ def setup_benchmark_dir(
     a run's other output rather than replacing the parameters that identify it.
     """
     ts = datetime.now().strftime(
-        "%Y%m%d_%H%M%S_%f" if concurrency > 1 else "%Y%m%d_%H%M%S"
+        "%Y%m%d_%H%M%S_%f"
+        if concurrency > 1 or concurrency_mode == "cooperative"
+        else "%Y%m%d_%H%M%S"
     )
     benchmark_name = f"tpch_{ts}_{profile_label}_{engine}_iter{iterations}"
-    if concurrency > 1:
+    if concurrency > 1 or concurrency_mode == "cooperative":
         benchmark_name += f"_c{concurrency}"
+    if concurrency_mode == "cooperative":
+        benchmark_name += "_cooperative"
     if name:
         benchmark_name = f"{benchmark_name}_{name}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
@@ -1761,10 +1766,16 @@ def parse_args():
         help="Concurrent read-only clients sharing one runtime (default: 1); independent of Sirius admission",
     )
     p.add_argument(
+        "--concurrency-mode",
+        choices=("identical", "cooperative"),
+        default="identical",
+        help="identical: each client repeats the selected queries (default); cooperative: clients share one query queue, executing each query once per iteration",
+    )
+    p.add_argument(
         "--stream-order",
         choices=("same", "permuted"),
         default=None,
-        help="Concurrent stream order: selected query order or deterministic TPC-H permutations (default: permuted); requires concurrency > 1",
+        help="Concurrent stream order: selected query order or deterministic TPC-H permutations (default: permuted in identical mode); cooperative mode uses selected query order and rejects permuted",
     )
     p.add_argument(
         "--run-timeout",
@@ -2038,7 +2049,7 @@ def main():
         return
 
     args = parse_args()
-    from concurrent_benchmark import check_arguments
+    from concurrent_benchmark import check_arguments, uses_concurrent_runner
 
     check_arguments(args)
     if args.scale_factor is None:
@@ -2152,7 +2163,7 @@ def main():
     # No --profile means change nothing: the profile is inert and the config
     # below is left exactly as the user wrote it.
     profile = PROFILES[args.profile] if args.profile is not None else DEFAULT_PROFILE
-    if args.concurrency > 1:
+    if uses_concurrent_runner(args):
         profile = {
             **profile,
             "summary": "shared cache, no resets; query order follows --stream-order; union pin only",
@@ -2210,9 +2221,10 @@ def main():
         data_source=args.data_source,
         duckdb_results_source=duckdb_results_dir,
         concurrency=args.concurrency,
+        concurrency_mode=args.concurrency_mode,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
-    if args.concurrency > 1:
+    if uses_concurrent_runner(args):
         runtime_csv = os.path.join(benchmark_dir, "csv", "concurrent_runtimes.csv")
 
     # Set before any connection opens: Sirius reads SIRIUS_CONFIG_FILE at LOAD.
@@ -2247,7 +2259,7 @@ def main():
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
-    if args.concurrency > 1:
+    if uses_concurrent_runner(args):
         from concurrent_benchmark import supervise
 
         raise SystemExit(
