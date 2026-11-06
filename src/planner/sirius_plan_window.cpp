@@ -34,7 +34,9 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
+#include <algorithm>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 
@@ -93,6 +95,27 @@ bool is_supported_partition_key(duckdb::LogicalType const& type)
 bool is_supported_count_min_max_argument(duckdb::LogicalType const& type)
 {
   return is_supported_numeric_argument(type) || is_supported_partition_key(type);
+}
+
+/// Whether a running MIN or MAX accepts an argument of @p type.
+bool is_cumulative_extremum_argument(duckdb::LogicalType const& type)
+{
+  using duckdb::LogicalTypeId;
+  switch (type.id()) {
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::BIGINT:
+    case LogicalTypeId::DATE:
+    case LogicalTypeId::TIMESTAMP:
+    case LogicalTypeId::TIMESTAMP_MS:
+    case LogicalTypeId::TIMESTAMP_NS:
+    case LogicalTypeId::TIMESTAMP_SEC: return true;
+    case LogicalTypeId::DECIMAL:
+      return duckdb::DecimalType::GetWidth(type) >
+             sirius::logical_type::decimal_max_precision_int16;
+    default: return false;
+  }
 }
 
 /// Decline the window modifiers that no window function here supports.
@@ -179,10 +202,14 @@ void plan_ranking_order(window_plan& plan,
 /**
  * @brief Return the aggregate to run for @p expression, or decline it.
  *
- * Valid is a `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` or `MAX` whose frame covers the whole
- * partition, without `DISTINCT`, `FILTER`, `EXCLUDE`, `IGNORE NULLS`, an argument `ORDER BY` or a
- * window `ORDER BY`. `SUM` and `AVG` take a numeric argument. `COUNT`, `MIN` and `MAX` also take
- * the types allowed as partition keys, and `MIN` and `MAX` keep the argument type.
+ * Valid is a `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` or `MAX` without `DISTINCT`, `FILTER`,
+ * `EXCLUDE`, `IGNORE NULLS` or an argument `ORDER BY`, in one of two forms:
+ * - Without a window `ORDER BY`, over a frame that covers the whole partition. `SUM` and `AVG`
+ *   take a numeric argument. `COUNT`, `MIN` and `MAX` also take the types allowed as partition
+ *   keys, and `MIN` and `MAX` keep the argument type.
+ * - With a window `ORDER BY`, over `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, for `SUM`,
+ *   `COUNT`, `COUNT(*)`, `MIN` and `MAX`. `MIN` and `MAX` take an integer, decimal, date or
+ *   timestamp argument.
  */
 aggregate_id validate(duckdb::BoundWindowExpression const& expression)
 {
@@ -192,12 +219,17 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
     decline("only SUM, AVG, COUNT, MIN and MAX aggregates are planned");
   }
   decline_unsupported_modifiers(expression);
-  if (!expression.OrderBy().empty()) { decline("window ORDER BY"); }
-  // Without ORDER BY all rows are peers. DuckDB retains CURRENT_ROW_RANGE for
-  // the default frame. CURRENT_ROW_ROWS still ends at the physical current row.
-  if (expression.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
-      (expression.WindowEnd() != WindowBoundary::UNBOUNDED_FOLLOWING &&
-       expression.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE)) {
+  bool const ordered = !expression.OrderBy().empty();
+  if (ordered) {
+    // DuckDB's default frame with an ORDER BY is a RANGE frame, where peers share a result.
+    if (expression.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
+        expression.WindowEnd() != WindowBoundary::CURRENT_ROW_ROWS) {
+      decline("window ORDER BY");
+    }
+  } else if (expression.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
+             (expression.WindowEnd() != WindowBoundary::UNBOUNDED_FOLLOWING &&
+              expression.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE)) {
+    // Without ORDER BY all rows are peers. DuckDB retains CURRENT_ROW_RANGE for the default frame.
     decline("frame does not cover the whole partition");
   }
   auto const id =
@@ -216,7 +248,9 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
         expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
       return aggregate_id::count;
     }
-    if (is_supported_count_min_max_argument(argument) && expression.GetReturnType() == argument) {
+    if (is_supported_count_min_max_argument(argument) &&
+        (!ordered || is_cumulative_extremum_argument(argument)) &&
+        expression.GetReturnType() == argument) {
       if (id == aggregate_id::min) { return aggregate_id::min; }
       if (id == aggregate_id::max) { return aggregate_id::max; }
     }
@@ -226,7 +260,8 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
     decline("aggregate argument type or arity");
   }
   auto const& argument = expression.GetChildren()[0]->GetReturnType();
-  if (id == aggregate_id::avg && expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
+  if (id == aggregate_id::avg && !ordered &&
+      expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
     return aggregate_id::avg;
   }
   // Statistics propagation replaces SUM with this internal implementation while retaining
@@ -244,37 +279,31 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
   decline("aggregate function or result type");
 }
 
-/// The number of LOGICAL_WINDOW operators in @p plan.
-std::size_t count_window_stages(duckdb::LogicalOperator const& plan)
+// Plans the expressions of `window` listed in `indices` as one stage over an input of
+// `input_types`. The input starts with the window child's columns, and a later stage of the same
+// window also holds the results of the stages below it. The output is the input followed by the
+// results of `indices`.
+window_plan plan_window_stage(duckdb::LogicalWindow const& window,
+                              std::vector<duckdb::idx_t> const& indices,
+                              duckdb::vector<duckdb::LogicalType> const& input_types)
 {
-  auto stages = static_cast<std::size_t>(plan.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW);
-  for (auto const& child : plan.children) {
-    stages += count_window_stages(*child);
-  }
-  return stages;
-}
-
-}  // namespace
-
-void validate_window_stages(duckdb::LogicalOperator const& plan)
-{
-  if (count_window_stages(plan) > 1) { decline("more than one window operator in a plan"); }
-}
-
-window_plan plan_window(duckdb::LogicalWindow const& window)
-{
-  if (window.children.size() != 1 || window.expressions.empty()) {
+  if (window.children.size() != 1 || indices.empty()) {
     decline("expected one child and at least one expression");
   }
+  auto const child_width = window.children[0]->types.size();
   window_plan plan;
-  plan.input_width    = window.children[0]->types.size();
-  plan.prepared_types = window.children[0]->types;
-  plan.output_types   = window.types;
-  if (window.types.size() != plan.input_width + window.expressions.size()) {
+  plan.input_width    = input_types.size();
+  plan.prepared_types = input_types;
+  plan.output_types   = input_types;
+  if (window.types.size() != child_width + window.expressions.size() ||
+      input_types.size() < child_width) {
     decline("output width");
   }
-  for (duckdb::idx_t i = 0; i < plan.input_width; ++i) {
-    if (window.types[i] != plan.prepared_types[i]) { decline("input column mapping"); }
+  for (duckdb::idx_t i = 0; i < child_width; ++i) {
+    if (window.types[i] != input_types[i]) { decline("input column mapping"); }
+  }
+  for (auto index : indices) {
+    plan.output_types.push_back(window.types[child_width + index]);
   }
 
   // Compare bound expressions before translation. Reuse references directly and
@@ -305,17 +334,21 @@ window_plan plan_window(duckdb::LogicalWindow const& window)
     return slot;
   };
 
-  duckdb::BoundWindowExpression const* organization         = nullptr;
-  duckdb::BoundWindowExpression const* ranking_organization = nullptr;
-  for (duckdb::idx_t i = 0; i < window.expressions.size(); ++i) {
-    auto const& bound = *window.expressions[i];
+  duckdb::BoundWindowExpression const* organization       = nullptr;
+  duckdb::BoundWindowExpression const* order_organization = nullptr;
+  for (duckdb::idx_t i = 0; i < indices.size(); ++i) {
+    auto const& bound = *window.expressions[indices[i]];
     if (bound.GetExpressionClass() != duckdb::ExpressionClass::BOUND_WINDOW) {
       decline("expected a bound window expression");
     }
     auto const& expression = bound.Cast<duckdb::BoundWindowExpression>();
     auto const ranking     = validate_ranking(expression);
+    bool const cumulative  = !ranking && !expression.OrderBy().empty();
     if (ranking && !plan.expressions.empty()) { decline("ranking mixed with aggregates"); }
     if (!ranking && !plan.rankings.empty()) { decline("ranking mixed with aggregates"); }
+    if (!plan.expressions.empty() && plan.cumulative != cumulative) {
+      decline("running aggregates mixed with whole partition aggregates");
+    }
     auto const function = ranking ? aggregate_id::count_star : validate(expression);
     if (organization && (!organization->PartitionsAreEquivalent(expression) ||
                          !expression.PartitionsAreEquivalent(*organization))) {
@@ -334,16 +367,19 @@ window_plan plan_window(duckdb::LogicalWindow const& window)
       }
     }
     auto const output_slot = plan.input_width + i;
-    if (window.types[output_slot] != expression.GetReturnType()) {
+    if (window.types[child_width + indices[i]] != expression.GetReturnType()) {
       decline("result column mapping");
     }
-    if (ranking) {
-      if (plan.rankings.empty()) {
+    if (ranking || cumulative) {
+      if (!order_organization) {
         plan_ranking_order(plan, expression, prepare);
-        ranking_organization = &expression;
-      } else if (!same_order(*ranking_organization, expression)) {
+        order_organization = &expression;
+      } else if (!same_order(*order_organization, expression)) {
         decline("incompatible ORDER BY specifications");
       }
+    }
+    plan.cumulative = cumulative;
+    if (ranking) {
       plan.rankings.push_back({*ranking, expression.GetReturnType(), output_slot});
       continue;
     }
@@ -360,6 +396,82 @@ window_plan plan_window(duckdb::LogicalWindow const& window)
                                 output_slot});
   }
   return plan;
+}
+
+/// The kinds of window expression. A stage holds one kind.
+enum class window_kind { whole_partition, ranking, cumulative };
+
+/// The kind of @p expression, by its function and whether it has a window `ORDER BY`. A running
+/// aggregate is any aggregate with an `ORDER BY`. `validate` refuses the forms it does not run.
+window_kind kind_of(duckdb::BoundWindowExpression const& expression)
+{
+  if (validate_ranking(expression)) { return window_kind::ranking; }
+  return expression.OrderBy().empty() ? window_kind::whole_partition : window_kind::cumulative;
+}
+
+/**
+ * @brief Split the expressions of a window into stages.
+ *
+ * Two expressions share a stage when all of these hold:
+ * - They are of one kind: ranking functions, aggregates over the whole partition, or running
+ *   aggregates (with a window `ORDER BY`).
+ * - Their `PARTITION BY` keys are equivalent.
+ * - For ranking functions and running aggregates, their `ORDER BY` is the same.
+ *
+ * Stages are listed in the order of their first expression, and the indices of a stage are in
+ * increasing order.
+ *
+ * @param window The window to split. Each of its expressions must be a bound window expression.
+ * @return One list of indices into `window.expressions` for each stage. Every expression is in
+ * exactly one stage.
+ * @throws duckdb::NotImplementedException if an expression is not a bound window expression, or is
+ * a ranking function in a form that `validate_ranking` refuses.
+ */
+std::vector<std::vector<duckdb::idx_t>> split_window_into_stages(
+  duckdb::LogicalWindow const& window)
+{
+  // One stage while it is built: its first expression, which later expressions are compared with,
+  // its kind, and the indices of its expressions.
+  struct stage {
+    duckdb::BoundWindowExpression const* first;
+    window_kind kind;
+    std::vector<duckdb::idx_t> indices;
+  };
+
+  std::vector<stage> stages;
+  for (duckdb::idx_t i = 0; i < window.expressions.size(); ++i) {
+    auto const& bound = *window.expressions[i];
+    if (bound.GetExpressionClass() != duckdb::ExpressionClass::BOUND_WINDOW) {
+      decline("expected a bound window expression");
+    }
+    auto const& expression = bound.Cast<duckdb::BoundWindowExpression>();
+    auto const kind        = kind_of(expression);
+    auto const match       = std::find_if(stages.begin(), stages.end(), [&](stage const& s) {
+      return s.kind == kind && s.first->PartitionsAreEquivalent(expression) &&
+             expression.PartitionsAreEquivalent(*s.first) &&
+             (kind == window_kind::whole_partition || same_order(*s.first, expression));
+    });
+    if (match == stages.end()) {
+      stages.push_back({&expression, kind, {i}});
+    } else {
+      match->indices.push_back(i);
+    }
+  }
+  std::vector<std::vector<duckdb::idx_t>> result;
+  result.reserve(stages.size());
+  for (auto& s : stages) {
+    result.push_back(std::move(s.indices));
+  }
+  return result;
+}
+
+}  // namespace
+
+window_plan plan_window(duckdb::LogicalWindow const& window)
+{
+  std::vector<duckdb::idx_t> indices(window.expressions.size());
+  std::iota(indices.begin(), indices.end(), duckdb::idx_t{0});
+  return plan_window_stage(window, indices, window.children[0]->types);
 }
 
 namespace {
@@ -459,13 +571,15 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_exchange(
   return assembly;
 }
 
-// Plans a LOGICAL_WINDOW as PARTITION, CONCAT and WINDOW over a projection of the hidden columns.
-duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(
-  duckdb::LogicalWindow& window)
+namespace {
+
+// Builds the WINDOW operator of one stage on top of its prepared input.
+duckdb::unique_ptr<op::sirius_physical_operator> build_window_stage(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  window_plan const& bound_plan,
+  std::size_t estimated_cardinality)
 {
-  auto bound_plan = plan_window(window);
-  auto child      = prepare_window_input(
-    create_plan(*window.children[0]), bound_plan, window.estimated_cardinality);
+  child         = prepare_window_input(std::move(child), bound_plan, estimated_cardinality);
   auto prepared = sirius::from_duckdb_vec(bound_plan.prepared_types);
   std::vector<cudf::size_type> keys(bound_plan.partition_slots.begin(),
                                     bound_plan.partition_slots.end());
@@ -481,9 +595,26 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator:
       std::move(keys),
       bound_plan.ranking_order,
       std::move(functions),
-      window.estimated_cardinality);
+      estimated_cardinality);
     ranked->children.push_back(std::move(child));
     return ranked;
+  }
+  if (bound_plan.cumulative) {
+    std::vector<op::cumulative_aggregate> running;
+    for (auto const& expression : bound_plan.expressions) {
+      running.push_back(
+        {expression.function, static_cast<cudf::size_type>(expression.argument_slot)});
+    }
+    auto result = duckdb::make_uniq<op::sirius_physical_window>(
+      sirius::from_duckdb_vec(bound_plan.output_types),
+      std::move(prepared),
+      bound_plan.input_width,
+      std::move(keys),
+      bound_plan.ranking_order,
+      std::move(running),
+      estimated_cardinality);
+    result->children.push_back(std::move(child));
+    return result;
   }
   std::vector<op::whole_partition_aggregate> aggregates;
   for (auto const& expression : bound_plan.expressions) {
@@ -496,9 +627,55 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator:
                                                   bound_plan.input_width,
                                                   std::move(keys),
                                                   std::move(aggregates),
-                                                  window.estimated_cardinality);
+                                                  estimated_cardinality);
   result->children.push_back(std::move(child));
   return result;
+}
+
+}  // namespace
+
+duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(
+  duckdb::LogicalWindow& window)
+{
+  if (window.children.size() != 1 || window.expressions.empty()) {
+    decline("expected one child and at least one expression");
+  }
+  // Plan every stage before the child. Planning the child can change the types of its logical
+  // operator.
+  auto const stages      = split_window_into_stages(window);
+  auto const child_width = window.children[0]->types.size();
+  auto types             = window.children[0]->types;
+  std::vector<window_plan> stage_plans;
+  for (auto const& indices : stages) {
+    stage_plans.push_back(plan_window_stage(window, indices, types));
+    types = stage_plans.back().output_types;
+  }
+  auto result = create_plan(*window.children[0]);
+  for (auto const& stage_plan : stage_plans) {
+    result = build_window_stage(std::move(result), stage_plan, window.estimated_cardinality);
+  }
+  // The stages append their results in stage order. Restore the order of the window's expressions.
+  std::vector<duckdb::idx_t> source(window.expressions.size());
+  duckdb::idx_t next = 0;
+  for (auto const& indices : stages) {
+    for (auto index : indices) {
+      source[index] = child_width + next++;
+    }
+  }
+  bool in_order = true;
+  for (duckdb::idx_t i = 0; i < source.size(); ++i) {
+    in_order &= source[i] == child_width + i;
+  }
+  if (in_order) { return result; }
+  auto const output_types = sirius::from_duckdb_vec(window.types);
+  duckdb::vector<std::unique_ptr<ast::node>> select;
+  for (duckdb::idx_t i = 0; i < output_types.size(); ++i) {
+    auto const slot = i < child_width ? i : source[i - child_width];
+    select.push_back(
+      std::make_unique<ast::node>(ast::reference{static_cast<uint32_t>(slot), output_types[i]}));
+  }
+  return push_projection(
+    std::move(result), output_types, std::move(select), window.estimated_cardinality);
 }
 
 }  // namespace sirius::planner
