@@ -270,28 +270,6 @@ TEST_CASE("tiled merge handles empty and single-contribution inputs", "[tiled_me
   CHECK(f.rows() == expected);
 }
 
-TEST_CASE("preparation subdivision commits only through ordinary publication", "[tiled_merge]")
-{
-  tiled_fixture f;
-  f.merge.chunk_bytes = 128;
-  f.add({1, 3, 5});
-  f.add({2, 4, 6});
-  auto data = f.merge.get_next_task_input_data();
-  REQUIRE(data);
-  f.merge.notify_task_attempt(*data, {f.merge.reservation_limit, f.merge.reservation_limit});
-  auto replacement = f.merge.recover_preparation_failure(
-    *data, {f.merge.reservation_limit, f.merge.reservation_limit});
-  REQUIRE(replacement);
-  CHECK(f.input->total_size() == 2);
-  data.reset();
-  auto task = f.task(std::move(replacement));
-  task->execute(f.stream);
-  task.reset();
-  CHECK(f.input->total_size() == 2);  // splitting itself retires no owning sources
-  f.drain();
-  CHECK(f.rows() == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
-}
-
 TEST_CASE("resident source forwarding is not refused by a planner byte allowance", "[tiled_merge]")
 {
   tiled_fixture f;
@@ -847,141 +825,6 @@ TEST_CASE("exhausted preparation failures terminate source restoration without i
   (void)f.repositories.clear_all_repositories();
 }
 
-TEST_CASE("preparation recovery reduces coalescing sources and refines merge per piece",
-          "[tiled_merge]")
-{
-  auto fault = std::make_shared<allocation_fault>();
-  tiled_fixture f(1, fault_options(fault));
-  f.merge.chunk_bytes = 128;
-  f.add({1, 3, 5});
-  f.add({2, 4, 6});
-  for (auto const& kind : {"coalesce", "merge"}) {
-    auto data    = reach_work(f, kind);
-    auto sources = dynamic_cast<pipelineable_operator_data const&>(*data).get_data_batches();
-    REQUIRE(sources.size() == 2);
-    spill_tiled_inputs(f);
-    auto task        = f.task(std::move(data), nullptr, true);
-    fault->fail_when = [first = sources.front()] { return first->get_read_only_count() > 0; };
-    auto before      = f.global->get_memory_history().totals();
-    task->execute(f.stream);
-    auto after = f.global->get_memory_history().totals();
-    CHECK(after.output_records == before.output_records);
-    CHECK(after.ratio_records == before.ratio_records);
-    CHECK(f.global->get_memory_history().size() > 0);
-    fault->fail_when = {};
-    task.reset();
-    for (auto const& source : sources) {
-      CHECK(source->get_read_only_count() == 0);
-    }
-    if (std::string(kind) == "coalesce") {
-      CHECK(f.input->total_size() == 2);
-      f.merge.chunk_bytes = 16;
-    } else {
-      CHECK_FALSE(f.repo("sort_tile_pieces")->all_empty());
-    }
-    CHECK(f.output.all_empty());
-  }
-  f.drain(true);
-  CHECK(f.rows() == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
-}
-
-TEST_CASE("compute failures split copied output while search failures stop explicitly",
-          "[tiled_merge]")
-{
-  auto point = GENERATE(std::string("normalize"), std::string("search"));
-  auto fault = std::make_shared<allocation_fault>();
-  tiled_fixture f(1, fault_options(fault));
-  f.merge.chunk_bytes = point == "normalize" ? 16 : 24;
-  if (point == "normalize") {
-    f.add({1, 3, 5, 7, 9, 11});
-    f.add({2, 4, 6, 8, 10, 12});
-  } else {
-    f.add({1, 4, 7});
-    f.add({2, 5, 8});
-  }
-  auto data              = reach_work(f, point == "normalize" ? "normalize" : "extract");
-  auto task              = f.task(std::move(data), nullptr, true);
-  f.merge.before_compute = [fault] { fault->remaining = 0; };
-  if (point == "search") {
-    CHECK_THROWS_WITH(task->execute(f.stream),
-                      Catch::Matchers::ContainsSubstring("cut search failed"));
-  } else {
-    auto before = f.global->get_memory_history().totals();
-    task->execute(f.stream);
-    auto after = f.global->get_memory_history().totals();
-    CHECK(after.output_records == before.output_records);
-    CHECK(after.ratio_records == before.ratio_records);
-  }
-  fault->remaining       = -1;
-  f.merge.before_compute = {};
-  task.reset();
-  if (point != "search") {
-    f.drain(true);
-    CHECK(f.rows() == std::vector<int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
-  }
-}
-
-TEST_CASE("extraction allocation sweep recovers owning spans and partial local copies",
-          "[tiled_merge]")
-{
-  bool const reject_fragment_restore = GENERATE(false, true);
-  std::size_t search_errors = 0, recovered_spans = 0, partial_copies = 0;
-  // Sweep failure positions until both search and partial-copy boundaries are
-  // observed. This deliberately does not assume a cuDF allocation count/layout.
-  for (int skip = 0; skip < 64 && !partial_copies; ++skip) {
-    auto fault = std::make_shared<allocation_fault>();
-    tiled_fixture f(1, fault_options(fault));
-    f.add({1, 4, 7});
-    f.add({2, 5, 8});
-    auto data = reach_work(f, "extract");
-    auto task = f.task(std::move(data), nullptr, true);
-    sirius::test::scoped_recording_log_sink logs("debug");
-    f.merge.before_compute = [fault, skip] { fault->remaining = skip; };
-    bool search_failed     = false;
-    try {
-      task->execute(f.stream);
-    } catch (sirius::invalid_input_exception const& error) {
-      CHECK(std::string(error.what()).find("cut search failed") != std::string::npos);
-      search_failed = true;
-      ++search_errors;
-    }
-    fault->remaining       = -1;
-    f.merge.before_compute = {};
-    task.reset();
-    if (search_failed) { continue; }
-    bool partial = false;
-    for (auto const& log : logs.records()) {
-      if (log.message.find("sort.tile_recovery kind=extract") == std::string::npos) { continue; }
-      ++recovered_spans;
-      auto at = log.message.find("completed_copies=");
-      REQUIRE(at != std::string::npos);
-      partial = std::stoul(log.message.substr(at + std::string("completed_copies=").size())) > 0;
-      partial_copies += partial;
-    }
-    if (reject_fragment_restore && partial) {
-      auto fragment = reach_work(f, "copy_fragment");
-      auto sources  = dynamic_cast<pipelineable_operator_data const&>(*fragment).get_data_batches();
-      spill_tiled_inputs(f);
-      auto copy        = f.task(std::move(fragment), nullptr, true);
-      fault->remaining = 0;
-      CHECK_THROWS_WITH(copy->execute(f.stream),
-                        Catch::Matchers::ContainsSubstring("copy_fragment preparation"));
-      fault->remaining = -1;
-      copy.reset();
-      for (auto const& source : sources) {
-        CHECK(source->get_read_only_count() == 0);
-      }
-      CHECK_FALSE(f.merge.all_ports_empty());
-    } else {
-      f.drain(true);
-      CHECK(f.rows() == std::vector<int64_t>{1, 2, 4, 5, 7, 8});
-    }
-  }
-  CHECK(search_errors > 0);
-  CHECK(recovered_spans > 0);
-  CHECK(partial_copies > 0);
-}
-
 TEST_CASE("publication callback failure is fatal after one sink publication", "[tiled_merge]")
 {
   tiled_fixture f;
@@ -1010,7 +853,7 @@ TEST_CASE("an exhausted one-row copy reports its actual allocation boundary", "[
   auto task              = f.task(std::move(data), nullptr, true);
   f.merge.before_compute = [fault] { fault->remaining = 0; };
   CHECK_THROWS_WITH(task->execute(f.stream),
-                    Catch::Matchers::ContainsSubstring("one-row owning copy cannot fit"));
+                    Catch::Matchers::ContainsSubstring("normalize compute"));
   fault->remaining       = -1;
   f.merge.before_compute = {};
   task.reset();
@@ -1031,7 +874,7 @@ TEST_CASE("single-piece preparation failure terminates without recursive refinem
   auto task        = f.task(std::move(data), nullptr, true);
   fault->remaining = 0;
   CHECK_THROWS_WITH(task->execute(f.stream),
-                    Catch::Matchers::ContainsSubstring("individual piece restoration"));
+                    Catch::Matchers::ContainsSubstring("merge preparation"));
   fault->remaining = -1;
   task.reset();
   CHECK_FALSE(f.merge.get_next_task_input_data());

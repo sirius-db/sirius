@@ -699,14 +699,12 @@ suffix would retain the entire source allocation, defeating bounded restoration.
 initial implementation waits for all extraction work in a region before merging its
 tiles; it verifies coverage and row limits before retiring sources and splitter pages.
 
-Each tile runs one n-ary `cudf::merge`, or forwards a single owning piece. For eligible
-oversized work, subdivision creates child regions using the same algorithm with a row
-cap at most half the parent's row count. Parent pieces remain registered until child
-extraction commits. Individual sources/rows and sample working sets still have to fit
-the supported admission envelope.
+Each tile runs one n-ary `cudf::merge`, or forwards a single owning piece.
+Failed tasks use reservation-growth retries only; exhausted attempts fail without
+subdividing tiles, coalescing groups or copy intervals.
 
-Final results remain in registered storage until all leaf merges complete. Traversal in
-range and tile/child order assigns scalar batch positions; ordinary positioned publication
+Final results remain in registered storage until all tile merges complete. Traversal in
+range and tile order assigns scalar batch positions; ordinary positioned publication
 then forwards each result and applies final projection. Empty ranges produce no batches.
 Completion order does not determine output order, and no stable ordering among SQL peers
 is promised. There is currently a full final-publication barrier, even though tile merges
@@ -721,7 +719,7 @@ acquires read handles and restores only the selected work's inputs on its assign
 Full backing allocations count even when an operation reads a slice.
 
 The task creator claims operator-local work under a mutex from pending queues. Completion
-counts cover outstanding work, child regions, roots and final publications; only actionable
+counts cover outstanding work, ranges and final publications; only actionable
 regions enter the ready queue. Completed descriptors leave the work queue when claimed;
 tasks retain them through retries. Scheduling order does not assign result positions.
 
@@ -730,8 +728,7 @@ lifecycle hooks receive each attempt's granted reservation and attainable device
 request preparation recovery only for a source that is also the sink, and notify successful
 publication. The runtime does not inspect sort phases or recovery actions. Progress,
 dependencies and retirement commit through `on_task_output_published()` only after successful
-sink publication and device completion. Control-only recovery records failed-attempt peaks,
-without training successful payload peaks or input/output ratios. Partial sink or final fan-out failure fails the query;
+sink publication and device completion. Partial sink or final fan-out failure fails the query;
 it must not replay an already partially published task. Cancellation uses normal query
 gates, task draining and repository retirement.
 
@@ -741,18 +738,17 @@ fragmentation-driven fan-in, but extreme skew can still exceed sample memory or 
 limits. The implementation reports an error rather than selecting another merge engine.
 `merge_cold_peak_estimate()` supplies the ordinary estimator only; it is not a feasibility
 gate or a permanent reservation floor. History can reduce requests. OOM retry floors grow
-for the same work, while new smaller work starts without its parent's floor. The executor
+for the same work, without changing the planned work. The executor
 clamps requests to the selected memory space's attainable ceiling; transient unavailability
 does not establish exhaustion.
 
-After ordinary growth retries exhaust that ceiling, preparation recovery splits COALESCE
-source groups or creates per-piece child work for MERGE. Restoration failures for extraction,
-copies, samples, ordering and final publication terminate with a site-specific envelope
-error. Narrowing an output interval would retain the same restoration backing. Compute
-failures can halve copy intervals or turn discovered extraction spans into independent
-copy tasks; search failure before spans exist terminates explicitly. A one-row copy that
-actually fails allocation reports that boundary. Diagnostics include the work kind, failure
-site, owning backing/page bytes, granted bytes, effective ceiling and configured ceiling.
+After ordinary growth retries exhaust that ceiling, preparation and compute failures
+terminate with a capacity error. Diagnostics include the work kind, failure site,
+owning backing/page bytes, granted bytes, effective ceiling and configured ceiling.
+Unpublished extraction copies are released after the device fence. Planned normalization
+of oversized contributions remains part of the algorithm; it is never failure recovery.
+The row target is a row bound, not a byte or workspace guarantee. Skewed inputs that
+previously succeeded through subdivision can now fail.
 
 Host work/cut metadata and piece counts grow with contribution and tile counts. Assess
 memory and throughput using sample bytes, pre/post-coalescing fan-in, owning piece counts,
