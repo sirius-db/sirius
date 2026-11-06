@@ -329,7 +329,9 @@ TEST_CASE("Bloom filters of the same capacity merge into one holding both key se
   CHECK(std::all_of(host.begin(), host.end(), [](std::uint8_t keep) { return keep == 1; }));
 
   // Unmerged, the odd keys are mostly absent: the merge is what added them.
-  auto const before   = other.compute_mask(make_int64(mine, stream)->view(), kDevice, stream, mr);
+  auto const before = sirius_dynamic_bloom_filter{mine_keys->view(), 4096, stream, mr}.compute_mask(
+    theirs_keys->view(), kDevice, stream, mr);
+  REQUIRE(before != nullptr);
   auto const absent   = mask_to_host(before->view(), stream);
   auto const positive = std::count(absent.begin(), absent.end(), std::uint8_t{1});
   CHECK(positive < 100);
