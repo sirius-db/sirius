@@ -24,6 +24,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -33,8 +34,9 @@
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/config.hpp>
-#include <cucascade/io/rest/curl_handle.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/resource.h>
@@ -128,7 +130,7 @@ std::string strip_file_scheme_for_registry(std::string const& path)
 
 bool is_local_backend(std::optional<io_context_type> type)
 {
-  return type.has_value() && (*type == io_context_type::uring || *type == io_context_type::kvikio);
+  return type.has_value() && *type == io_context_type::uring;
 }
 
 scan_manager_config make_s3_scan_config(std::string endpoint,
@@ -149,7 +151,7 @@ scan_manager_config make_s3_scan_config(std::string endpoint,
   cfg.rest.honor_retry_after       = false;
   cfg.rest.max_connections         = 1;
   cfg.thread_pool.num_threads      = 1;
-  cfg.uring_n_reactors             = 1;
+  cfg.uring_reactors_per_gpu       = 1;
   cfg.rest_n_reactors              = 1;
   cfg.cache.mode                   = cucascade::io::cache::cache_mode::none;
   return cfg;
@@ -290,6 +292,11 @@ class range_s3_server {
 
   /// Every request the server has served, of any method.
   [[nodiscard]] int request_count() const { return _request_count.load(std::memory_order_relaxed); }
+  /// Accepted TCP connections (warm-up exchanges each open a fresh one).
+  [[nodiscard]] int connection_count() const
+  {
+    return _connection_count.load(std::memory_order_relaxed);
+  }
 
   [[nodiscard]] std::size_t head_count() const { return _head_count.load(); }
   [[nodiscard]] std::size_t get_count() const { return _get_count.load(); }
@@ -311,6 +318,7 @@ class range_s3_server {
         if (_stop.load()) { return; }
         continue;
       }
+      _connection_count.fetch_add(1, std::memory_order_relaxed);
       handle_client(fd);
       ::close(fd);
     }
@@ -443,6 +451,7 @@ class range_s3_server {
   range_fault_policy _fault;
   std::atomic<bool> _stop{false};
   std::atomic<int> _request_count{0};
+  std::atomic<int> _connection_count{0};
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
   std::atomic<std::size_t> _suffix_get_count{0};
@@ -452,7 +461,7 @@ class range_s3_server {
 
 }  // namespace
 
-TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "[s3][routing]")
+TEST_CASE("io_context_registry routes full paths to their own backends", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::native);
@@ -467,11 +476,12 @@ TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "
   auto stripped = strip_file_scheme_for_registry(file_uri);
   CHECK(is_local_backend(registry.lookup_path(stripped)));
   CHECK(registry.lookup_path(stripped) != io_context_type::restful);
+  CHECK_FALSE(registry.lookup_path("http://localhost/key.parquet").has_value());
+  CHECK_FALSE(registry.lookup_path("https://localhost/key.parquet").has_value());
+  CHECK_FALSE(registry.lookup_path("unsupported://bucket/key.parquet").has_value());
 }
 
-TEST_CASE(
-  "io_context_registry routes local paths by backend and S3 reads to kvikio under backend=kvikio",
-  "[s3][routing]")
+TEST_CASE("io_context_registry routes local paths to uring under backend=native", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   auto const local_path = make_regular_file();
@@ -481,17 +491,6 @@ TEST_CASE(
       .to_io_config(),
     *fixture.memory};
   CHECK(native_registry.lookup_path(local_path.string()) == io_context_type::uring);
-
-  io_context_registry fallback_registry{
-    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::kvikio)
-      .to_io_config(),
-    *fixture.memory};
-  CHECK(fallback_registry.lookup_path(local_path.string()) == io_context_type::kvikio);
-  CHECK(fallback_registry.lookup_path(local_path.string()) != io_context_type::uring);
-  // backend=kvikio also takes s3:// READS off the REST backend — kvikIO's
-  // RemoteHandle serves them; LIST/glob still uses the REST ioctx, obtained by
-  // type rather than by path.
-  CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::kvikio);
 }
 
 TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3][routing]")
@@ -580,6 +579,36 @@ TEST_CASE("scan_manager planning backend lookup does not open remote objects", "
         io_context_type::restful);
 }
 
+TEST_CASE("scan_manager rejects raw HTTP and HTTPS URLs with S3 URI guidance", "[s3][routing]")
+{
+  auto const uri          = GENERATE("http://127.0.0.1:1/routing-bucket/data.parquet",
+                            "https://127.0.0.1:1/routing-bucket/data.parquet");
+  auto const footer_probe = GENERATE(false, true);
+  CAPTURE(uri, footer_probe);
+  scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle,
+    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::native),
+    *fixture.memory,
+    fixture.topology};
+
+  // Both public entry points reach ioctx_for_path. Even with an object store
+  // configured, raw web URLs must be rejected before any HEAD or footer read.
+  try {
+    if (footer_probe) {
+      (void)manager.describe_parquet(uri);
+    } else {
+      (void)manager.create_datasource(uri);
+    }
+    FAIL("raw HTTP(S) URL unexpectedly accepted");
+  } catch (std::invalid_argument const& error) {
+    CHECK_THAT(std::string{error.what()},
+               Catch::Matchers::ContainsSubstring("unsupported URL scheme") &&
+                 Catch::Matchers::ContainsSubstring("s3://"));
+  }
+}
+
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",
           "[s3][routing]")
 {
@@ -598,28 +627,6 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
   CHECK(datasource->io_ctx()->type() == io_context_type::uring);
-}
-
-TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio", "[s3][routing]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
-  scan_manager_fixture fixture;
-  sirius::exec::query_lifecycle_registry scan_lifecycle;
-  sirius_scan_manager manager{
-    scan_lifecycle,
-    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::kvikio),
-    *fixture.memory,
-    fixture.topology};
-
-  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
-
-  REQUIRE(datasource != nullptr);
-  REQUIRE(datasource->io_ctx() != nullptr);
-  CHECK(datasource->io_ctx()->type() == io_context_type::kvikio);
-  CHECK(datasource->size() == 4096);
-
-  std::vector<std::uint8_t> buffer(128, std::uint8_t{0xAB});
-  CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
 }
 
 TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing]")
@@ -705,12 +712,16 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
     return server.request_count();
   };
 
-  int const baseline          = server.request_count();
-  constexpr int expected_warm = 2;  // rest_n_reactors * max_connections
+  int const baseline             = server.request_count();
+  int const baseline_connections = server.connection_count();
+  constexpr int expected_warm    = 2;  // rest_n_reactors * max_connections
 
   // A bucket URL, with no object in it: warm-up traffic never names a data file.
+  // Each idle slot sends one zero-key LIST on a fresh connection, so TCP, TLS
+  // and HTTP are all exercised before the reads arrive.
   io_ctx->warmup("s3://warm-bucket");
   CHECK(wait_for_requests(baseline + expected_warm) >= baseline + expected_warm);
+  CHECK(server.connection_count() >= baseline_connections + expected_warm);
   int const after_warm = server.request_count();
 
   // Warming the same bucket again well inside conn_max_age is redundant — the
@@ -723,6 +734,102 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   io_ctx->warmup("s3://warm-bucket/some/deep/key.parquet");
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   CHECK(server.request_count() == after_warm);
+}
+
+TEST_CASE("rest_n_reactors 0 sizes the REST pool from the egress NIC", "[s3][routing]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{5}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
+  // Loopback has no queue IRQs to size or place the pool from, so the auto pool
+  // falls back to the default count (2), unpinned, whatever this host's real NIC
+  // looks like.  An explicit fan-out is only clamped to an auto-sized pool, so
+  // the clamped value exposes the pool size.
+  cfg.rest_n_reactors = 0;
+  cfg.rest.interface  = "lo";
+  cfg.rest.fan_out    = 64;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://auto-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  auto rest = std::dynamic_pointer_cast<cucascade::io::rest::rest_ioctx>(datasource->io_ctx());
+  REQUIRE(rest != nullptr);
+  CHECK(rest->dispatch_fanout() == 2);
+
+  CHECK(datasource->size() == 4096);
+  std::vector<std::uint8_t> buffer(256, std::uint8_t{0});
+  CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
+  CHECK(std::ranges::all_of(buffer, [](std::uint8_t b) { return b == 5; }));
+}
+
+TEST_CASE("scan manager forwards its topology to the io registries, scoped S3 included",
+          "[s3][routing][scan_manager]")
+{
+  // Two GPUs on one NUMA node. Reactor placement needs no CUDA device per GPU id, so this
+  // also runs with a single visible GPU; only the reactor counts per pool matter here.
+  cucascade::memory::system_topology_info info;
+  info.num_gpus = 2;
+  for (int id : {0, 1}) {
+    cucascade::memory::gpu_topology_info gpu;
+    gpu.id        = static_cast<unsigned>(id);
+    gpu.numa_node = 0;
+    info.gpus.push_back(std::move(gpu));
+  }
+  auto const topology =
+    std::make_shared<sirius::memory::topology_index>(info, std::vector<int>{0, 1});
+  constexpr std::size_t gpus = 2;
+
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
+  cfg.uring_reactors_per_gpu = 1;
+  // The REST count is a total for the process, never per GPU: 3 reactors, not 3 per GPU
+  // (a per-GPU pool would have 6).
+  cfg.rest_n_reactors = 3;
+  // One connection per reactor: warmup then opens exactly one per REST reactor.
+  cfg.rest.max_connections = 1;
+  cfg.rest.conn_max_age    = std::chrono::seconds{30};
+
+  auto const store  = cfg.object_store;
+  bool const scoped = GENERATE(false, true);
+  CAPTURE(scoped);
+  // The path-scoped case builds its REST context through the scan manager's throwaway
+  // registry; without a default object store an unscoped path could not reach REST at all.
+  if (scoped) { cfg.object_store = {}; }
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, topology};
+  if (scoped) { manager.install_s3_config("s3://placed-bucket", store); }
+
+  // The shared registry's uring pool has one reactor per GPU of the topology, not one in all.
+  auto* uring = dynamic_cast<cucascade::io::uring::uring_ioctx*>(manager.io_ctx());
+  REQUIRE(uring != nullptr);
+  CHECK(uring->reactor_gauges().size() == gpus * cfg.uring_reactors_per_gpu);
+
+  // Both registries build the REST pool from the same total, independent of the topology's
+  // GPU count. Its size shows in the warm-up: one exchange per idle slot, so exactly one per
+  // reactor at max_connections 1, each on a fresh connection.
+  auto datasource = manager.create_datasource("s3://placed-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  auto io_ctx = datasource->io_ctx();
+  REQUIRE(io_ctx != nullptr);
+  REQUIRE(io_ctx->type() == io_context_type::restful);
+  auto const* rest = dynamic_cast<cucascade::io::rest::rest_ioctx const*>(io_ctx.get());
+  REQUIRE(rest != nullptr);
+  auto const baseline_warmups = rest->stats().warmups;
+  int const baseline          = server.connection_count();
+  int const expected_warm     = static_cast<int>(cfg.rest_n_reactors * cfg.rest.max_connections);
+  auto const deadline         = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  io_ctx->warmup("s3://placed-bucket");
+  while ((server.connection_count() < baseline + expected_warm ||
+          rest->stats().warmups < baseline_warmups + expected_warm) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  CHECK(server.connection_count() >= baseline + expected_warm);
+  // Settle, then require the exact total: a per-GPU pool would warm gpus x as many slots.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  CHECK(rest->stats().warmups == baseline_warmups + expected_warm);
 }
 
 TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routing]")
@@ -980,29 +1087,37 @@ TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]"
   CHECK(weak_ctx.expired());
 }
 
-TEST_CASE("backend=kvikio without an object store rejects s3 paths with a clear error",
-          "[s3][routing]")
+TEST_CASE("backend=native without an object store declines s3 paths and says why", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
-  cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
+  cfg.backend                 = sirius::scan_manager::io_backend::native;
   cfg.thread_pool.num_threads = 1;
-  cfg.uring_n_reactors        = 1;
+  cfg.uring_reactors_per_gpu  = 1;
   cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   REQUIRE(cfg.object_store.endpoint.empty());
   REQUIRE(cfg.object_store.access_key.empty());
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
-  REQUIRE_THROWS_WITH(manager.create_datasource("s3://unconfigured-bucket/key.parquet"),
-                      Catch::Matchers::ContainsSubstring("object store not configured"));
+  // No backend can serve the path, so the datasource is null (callers map that
+  // to their own error); the cause is logged once, as a WARN.
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    CHECK(manager.create_datasource("s3://unconfigured-bucket/key.parquet") == nullptr);
+    auto const records = logs.records();
+    CHECK(std::ranges::any_of(records, [](auto const& record) {
+      return record.level == sirius::log::level::warn &&
+             record.message.find("object store not configured") != std::string::npos;
+    }));
+  }
 
-  // Local paths are still served by kvikIO on the same manager.
+  // Local paths are still served by uring on the same manager.
   auto const local_path = make_regular_file();
   auto local            = manager.create_datasource(local_path.string());
   REQUIRE(local != nullptr);
   REQUIRE(local->io_ctx() != nullptr);
-  CHECK(local->io_ctx()->type() == io_context_type::kvikio);
+  CHECK(local->io_ctx()->type() == io_context_type::uring);
 }
 
 namespace {
@@ -1048,10 +1163,7 @@ TEST_CASE("scan_manager retries a routed S3 ioctx after a transient construction
 
   // The REST reactor creates its wakeup eventfd in its constructor. With no
   // descriptor available that throws, cuCascade's factory reports a null
-  // context, and the manager has no backend for the path. curl's process-wide
-  // state is initialized outside the window so only the reactor sees the
-  // shortage.
-  cucascade::io::rest::global_curl_context::instance();
+  // context, and the manager has no backend for the path.
   {
     scoped_descriptor_exhaustion no_descriptors;
     CHECK(manager.create_datasource(uri) == nullptr);

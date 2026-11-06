@@ -49,9 +49,11 @@ set(TEST_SOURCES
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
+    test/cpp/downgrade/test_downgrade_remote.cpp
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/downgrade/test_fs_cache_reclaim.cpp
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
@@ -352,6 +354,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_byte_range.cpp
+    test/cpp/scan/test_cufile_scan.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp

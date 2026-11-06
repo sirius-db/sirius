@@ -17,8 +17,8 @@
 #include "catch.hpp"
 #include "io/path_utils.hpp"
 
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <unistd.h>
+#include <utils/local_ioctx.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -156,7 +156,7 @@ TEST_CASE("open_datasource keys a dotted file URI like the bare path", "[path_ut
 {
   remove_all_guard const scratch{open_datasource_root()};
   auto const file  = make_open_datasource_file(scratch.path());
-  auto const ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto const ioctx = sirius::test::make_test_local_ioctx();
   auto const dotted =
     "file://" + (file.parent_path() / ".." / "dir" / "." / file.filename()).string();
 
@@ -172,7 +172,7 @@ TEST_CASE("open_datasource normalizes the path it forwards with an open hint", "
 {
   remove_all_guard const scratch{open_datasource_root()};
   auto const file  = make_open_datasource_file(scratch.path());
-  auto const ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto const ioctx = sirius::test::make_test_local_ioctx();
   // The host-omitted `file:/abs` spelling, with an empty segment.
   auto const uri = "file:" + file.parent_path().string() + "//" + file.filename().string();
 

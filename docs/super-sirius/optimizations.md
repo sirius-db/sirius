@@ -568,7 +568,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** A per-request serial S3 backend staged each chunk as GET → H2D copy → `cudaStreamSynchronize`, serializing the GPU stream once per chunk and leaving request latency unhidden — costly when the reader issues many small ranged reads over high-RTT links.
 
-**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives its own libcurl multi handle), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
+**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives HTTP/1.1 connection pools on its own io_uring ring, with kTLS or user-space TLS for HTTPS endpoints), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
 
 **Code path:**
 - `cucascade/src/io/rest/rest_reactor.cpp`, `cucascade/src/io/rest/rest_ioctx.cpp` — REST reactor and context over the shared `templated_ioctx` base
@@ -624,7 +624,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/scan_manager/balancing_strategy.hpp`, `src/scan_manager/round_robin_strategy.cpp` — device-distribution interface and default
 - `src/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
 
-**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and the io reactor counts (`uring_n_reactors` / `rest_n_reactors`)
+**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and the io reactor counts (`uring_reactors_per_gpu` per GPU, `rest_n_reactors` in total)
 
 ### Zone-Map Pruning on Pinned Chunks (PR #1154)
 
