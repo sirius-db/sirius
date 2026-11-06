@@ -718,6 +718,18 @@ descriptors contain repository locations and host metadata; ordinary task prepar
 acquires read handles and restores only the selected work's inputs on its assigned GPU.
 Full backing allocations count even when an operation reads a slice.
 
+A sort-local storage helper owns destination allocation and centralizes repository lookup,
+publication and retirement. Batch handles contain repository identity and row/byte metadata,
+without a GPU view or retained read lock. The repository manager remains responsible for
+query cleanup after success, failure or cancellation.
+
+Stage handoffs retire samples after splitter selection commits, contributions and splitter
+pages after extraction commits and validates all coverage, tile pieces after their merge
+commits, and results after final publication commits. Single-piece forwarding publishes the
+replacement before retiring its old repository entry. The path that skips sampling transfers
+contribution handles directly to the tile without retiring them.
+
+
 When scheduling work, the coordinator constructs an immutable operation-specific request containing
 source handles, comparison settings and the operation's parameters. Extraction requests
 include splitter bounds and destination slots; publication requests include the final

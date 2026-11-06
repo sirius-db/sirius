@@ -102,18 +102,69 @@ struct sirius_physical_merge_sort::tiled_state {
   struct ref {
     slot location;
     uint64_t id, rows, bytes;
-    auto get() const
+  };
+  // Repository operations stay here; handles never own a GPU view or read lock.
+  // Repository retirement removes discoverability only after the owning stage's
+  // publication/device-completion barrier. Existing readers retain their owners.
+  struct storage_access {
+    std::vector<cucascade::shared_data_repository*> repositories;
+    std::vector<std::size_t> partitions = std::vector<std::size_t>(STORAGE_COUNT, 0);
+
+    explicit storage_access(std::vector<cucascade::shared_data_repository*> repos)
+      : repositories(std::move(repos))
     {
-      auto batch = location.repo->get_data_batch_by_id(id, location.partition);
-      if (!batch) { throw internal_exception("Missing tiled sort batch"); }
-      return batch;
     }
-    void retire() const { location.repo->pop_data_batch_by_id(id, location.partition); }
+    slot allocate(storage which)
+    {
+      auto& next = partitions.at(which);
+      auto index = next;
+      next       = sm::checked_add(next, 1);
+      auto* repo = repositories.at(which);
+      if (next > repo->num_partitions()) { repo->set_num_partitions(next); }
+      return {repo, index, 0};
+    }
     static ref describe(slot location, cucascade::data_batch const& batch)
     {
       auto info = get_batch_rows_and_bytes(batch);
       if (!info.rows) { throw invalid_input_exception("Sort input lacks row-count metadata"); }
       return {location, batch.get_batch_id(), *info.rows, info.bytes};
+    }
+    static auto resolve(ref const& input)
+    {
+      auto batch = input.location.repo->get_data_batch_by_id(input.id, input.location.partition);
+      if (!batch) { throw internal_exception("Missing tiled sort batch"); }
+      return batch;
+    }
+    static void publish(slot destination, std::shared_ptr<cucascade::data_batch> const& batch)
+    {
+      destination.repo->add_data_batch_at_position(
+        batch, destination.position, destination.partition);
+    }
+    static void retire(ref const& input)
+    {
+      input.location.repo->pop_data_batch_by_id(input.id, input.location.partition);
+    }
+    static void retire_all(std::vector<ref> const& inputs)
+    {
+      for (auto const& input : inputs) {
+        retire(input);
+      }
+    }
+    // Called only after the replacement has been published and the device work
+    // completed. Forwarded batches may retain their id in a new repository.
+    static ref commit_replacement(std::vector<ref> const& inputs,
+                                  slot destination,
+                                  cucascade::data_batch const& output)
+    {
+      auto replacement = describe(destination, output);
+      for (auto const& input : inputs) {
+        if (input.location.repo != replacement.location.repo ||
+            input.location.partition != replacement.location.partition ||
+            input.id != replacement.id) {
+          retire(input);
+        }
+      }
+      return replacement;
     }
   };
   struct group {
@@ -211,7 +262,7 @@ struct sirius_physical_merge_sort::tiled_state {
   struct produced_batch {
     slot destination;
     std::shared_ptr<cucascade::data_batch> batch;
-    ref describe() const { return ref::describe(destination, *batch); }
+    ref describe() const { return storage_access::describe(destination, *batch); }
   };
   struct normalize_result {
     produced_batch output;
@@ -341,16 +392,10 @@ struct sirius_physical_merge_sort::tiled_state {
   tiled_merge_work_queue<work> finals;
   std::size_t unfinished_roots{0};
   bool publishing{false}, finished{false};
-  std::vector<std::size_t> partitions = std::vector<std::size_t>(STORAGE_COUNT, 0);
-
-  slot allocate(sirius_physical_merge_sort& op, storage which)
+  storage_access scratch;
+  explicit tiled_state(std::vector<cucascade::shared_data_repository*> repositories)
+    : scratch(std::move(repositories))
   {
-    auto& next = partitions.at(which);
-    auto index = next;
-    next       = sm::checked_add(next, 1);
-    auto* repo = op._tile_storage.at(which);
-    if (next > repo->num_partitions()) { repo->set_num_partitions(next); }
-    return {repo, index, 0};
   }
   static bool complete(region const& r) { return r.work_items.complete_stage(); }
   static bool actionable(region const& r)
@@ -379,7 +424,6 @@ struct sirius_physical_merge_sort::tiled_state {
     if (!unfinished_roots) { throw internal_exception("Sort root count underflow"); }
     --unfinished_roots;
   }
-  static void retire(region const&, ref const& input) { input.retire(); }
   static std::shared_ptr<work> make_work(sirius_physical_merge_sort const& op,
                                          std::shared_ptr<region> const& r,
                                          std::vector<ref> sources,
@@ -420,7 +464,7 @@ struct sirius_physical_merge_sort::tiled_state {
       g->output = g->inputs.front();
       return;
     }
-    add(op, r, g->inputs, coalesce_request{allocate(op, INPUTS), index});
+    add(op, r, g->inputs, coalesce_request{scratch.allocate(INPUTS), index});
   }
   void advance(sirius_physical_merge_sort& op, std::shared_ptr<region> const& r)
   {
@@ -441,7 +485,7 @@ struct sirius_physical_merge_sort::tiled_state {
             for (auto const& replacement : replacements) {
               next.push_back(replacement.second);
             }
-            retire(*r, r->inputs[i]);
+            storage_access::retire(r->inputs[i]);
           }
           r->inputs = std::move(next);
           r->normalized.clear();
@@ -452,7 +496,7 @@ struct sirius_physical_merge_sort::tiled_state {
           if (input.bytes <= op.chunk_bytes || input.rows <= 1) { continue; }
           for (auto [begin, end] :
                {std::pair{uint64_t{0}, input.rows / 2}, std::pair{input.rows / 2, input.rows}}) {
-            add(op, r, {input}, normalize_request{allocate(op, INPUTS), begin, end, i});
+            add(op, r, {input}, normalize_request{scratch.allocate(INPUTS), begin, end, i});
           }
         }
         if (!r->work_items.pending.empty()) { return; }
@@ -493,16 +537,17 @@ struct sirius_physical_merge_sort::tiled_state {
                          bytes,
                          r->row_limit);
         if (rows <= r->row_limit) {
-          auto location = allocate(op, PIECES);
+          auto location = scratch.allocate(PIECES);
           r->tiles.push_back({location.partition, {}, rows});
           for (std::size_t i = 0; i < r->inputs.size(); ++i) {
             r->tiles.back().pieces.push_back({r->inputs[i], i, 0, r->inputs[i].rows});
           }
+          r->inputs.clear();  // ownership responsibility moved to the tile, without retirement
           r->stage = phase::TILES;
           return;
         }
         r->sampling         = sm::choose_parameters(r->inputs.size(), r->row_limit);
-        r->sample_partition = allocate(op, SAMPLES).partition;
+        r->sample_partition = scratch.allocate(SAMPLES).partition;
         r->samples.resize(r->inputs.size());
         r->stage = phase::SAMPLE;
         for (std::size_t i = 0; i < r->inputs.size(); ++i) {
@@ -511,7 +556,7 @@ struct sirius_physical_merge_sort::tiled_state {
               r,
               {r->inputs[i]},
               sample_request{
-                {op._tile_storage[SAMPLES], r->sample_partition, i}, i, r->sampling.stride});
+                {scratch.repositories[SAMPLES], r->sample_partition, i}, i, r->sampling.stride});
         }
       } else if (r->stage == phase::SAMPLE) {
         std::vector<ref> samples;
@@ -527,11 +572,11 @@ struct sirius_physical_merge_sort::tiled_state {
         add(op,
             r,
             std::move(samples),
-            order_request{allocate(op, SPLITTERS), r->sampling.sample_step});
+            order_request{scratch.allocate(SPLITTERS), r->sampling.sample_step});
         r->stage = phase::ORDER;
       } else if (r->stage == phase::ORDER) {
         for (uint64_t t = 0; t <= r->splitter_count; ++t) {
-          auto location = allocate(op, PIECES);
+          auto location = scratch.allocate(PIECES);
           r->tiles.push_back({location.partition, {}, 0});
         }
         for (std::size_t i = 0; i < r->inputs.size(); ++i) {
@@ -540,7 +585,7 @@ struct sirius_physical_merge_sort::tiled_state {
             auto end   = std::min(begin + window_tiles, r->splitter_count + 1);
             std::vector<slot> destinations;
             for (auto t = begin; t < end; ++t) {
-              destinations.push_back({op._tile_storage[PIECES], r->tiles[t].partition, i});
+              destinations.push_back({scratch.repositories[PIECES], r->tiles[t].partition, i});
             }
             add(
               op,
@@ -551,7 +596,7 @@ struct sirius_physical_merge_sort::tiled_state {
           }
         }
         for (auto const& sample : r->samples) {
-          if (sample) { sample->retire(); }
+          if (sample) { storage_access::retire(*sample); }
         }
         r->samples.clear();
         r->stage = phase::EXTRACT;
@@ -581,11 +626,9 @@ struct sirius_physical_merge_sort::tiled_state {
           if (cursor != r->inputs[i].rows) {
             throw internal_exception("Incomplete sort extraction");
           }
-          retire(*r, r->inputs[i]);
         }
-        for (auto const& page : r->pages) {
-          page.retire();
-        }
+        storage_access::retire_all(r->inputs);
+        storage_access::retire_all(r->pages);
         r->pages.clear();
         r->inputs.clear();
         r->stage = phase::TILES;
@@ -598,7 +641,7 @@ struct sirius_physical_merge_sort::tiled_state {
           for (auto const& piece : tile.pieces) {
             sources.push_back(piece.batch);
           }
-          add(op, r, std::move(sources), merge_request{allocate(op, RESULTS), t});
+          add(op, r, std::move(sources), merge_request{scratch.allocate(RESULTS), t});
         }
         r->stage = phase::MERGING;
       } else if (r->stage == phase::MERGING) {
@@ -659,7 +702,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     if (_tile_storage.size() != tiled_state::STORAGE_COUNT) {
       throw internal_exception("Tiled merge scratch is not registered");
     }
-    _tiled_state = std::make_shared<tiled_state>();
+    _tiled_state = std::make_shared<tiled_state>(_tile_storage);
     auto* repo   = get_port("default")->repo;
     for (std::size_t p = 0; p < repo->num_partitions(); ++p) {
       auto r   = std::make_shared<tiled_state::region>();
@@ -667,11 +710,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
       std::sort(ids.begin(), ids.end());
       for (auto id : ids) {
         auto batch = repo->get_data_batch_by_id(id, p);
-        auto input = tiled_state::ref::describe({repo, p, 0}, *batch);
+        auto input = tiled_state::storage_access::describe({repo, p, 0}, *batch);
         if (input.rows) {
           r->inputs.push_back(input);
         } else {
-          input.retire();
+          tiled_state::storage_access::retire(input);
         }
       }
       _tiled_state->roots.push_back(r);
@@ -690,11 +733,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     r->enqueued = false;
     ++r->creator_visits;
     _tiled_state->advance(*this, r);
-    auto data = r->work_items.claim([this](auto const& item) {
+    auto data = r->work_items.claim([](auto const& item) {
       std::vector<std::shared_ptr<cucascade::data_batch>> batches;
       batches.reserve(item->execution->sources.size());
       for (auto const& input : item->execution->sources) {
-        batches.push_back(input.get());
+        batches.push_back(tiled_state::storage_access::resolve(input));
       }
       return std::make_unique<tiled_state::task_data>(std::move(batches), item, item->execution);
     });
@@ -714,9 +757,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
       _tiled_state->publishing = true;
       if (_tiled_state->finals.complete_stage()) { _tiled_state->finished = true; }
     }
-    auto task = _tiled_state->finals.claim([this](auto const& item) {
+    auto task = _tiled_state->finals.claim([](auto const& item) {
       return std::make_unique<tiled_state::task_data>(
-        std::vector<std::shared_ptr<cucascade::data_batch>>{item->execution->sources.front().get()},
+        std::vector<std::shared_ptr<cucascade::data_batch>>{
+          tiled_state::storage_access::resolve(item->execution->sources.front())},
         item,
         item->execution,
         std::get<tiled_state::publish_request>(item->execution->op).position);
@@ -928,8 +972,7 @@ void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::strea
     return;
   }
   auto publish = [](tiled_state::produced_batch const& output) {
-    auto const& location = output.destination;
-    location.repo->add_data_batch_at_position(output.batch, location.position, location.partition);
+    tiled_state::storage_access::publish(output.destination, output.batch);
   };
   std::visit(
     [&](auto const& value) {
@@ -969,10 +1012,8 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
           .push_back({value.begin, value.output.describe()});
       } else if constexpr (std::is_same_v<T, state::coalesce_result>) {
         r->groups.at(std::get<state::coalesce_request>(item.execution->op).group_index)->output =
-          value.output.describe();
-        for (auto const& source : item.execution->sources) {
-          source.retire();
-        }
+          state::storage_access::commit_replacement(
+            item.execution->sources, value.output.destination, *value.output.batch);
       } else if constexpr (std::is_same_v<T, state::sample_result>) {
         r->samples.at(std::get<state::sample_request>(item.execution->op).input) =
           value.output.describe();
@@ -983,10 +1024,8 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
         r->splitter_count = value.splitter_count;
       } else if constexpr (std::is_same_v<T, state::merge_result>) {
         r->tiles.at(std::get<state::merge_request>(item.execution->op).tile_index).result =
-          value.output.describe();
-        for (auto const& source : item.execution->sources) {
-          source.retire();
-        }
+          state::storage_access::commit_replacement(
+            item.execution->sources, value.output.destination, *value.output.batch);
         r->tiles.at(std::get<state::merge_request>(item.execution->op).tile_index).pieces.clear();
       } else if constexpr (std::is_same_v<T, state::extract_result>) {
         for (auto const& piece : value.pieces) {
@@ -1005,7 +1044,7 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
     _tiled_state->enqueue(r);
   }
   if (item.execution->type() == state::kind::PUBLISH) {
-    item.execution->sources.front().retire();
+    state::storage_access::retire_all(item.execution->sources);
     _tiled_state->finals.complete();
     _tiled_state->finished = _tiled_state->finals.complete_stage();
   }
