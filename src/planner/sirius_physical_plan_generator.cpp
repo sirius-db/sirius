@@ -1637,14 +1637,11 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
 
       if (is_build && join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
         auto& join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-        // Distributed: BUILD_FILTER would publish this rank's build keys before the build is
-        // exchanged, and nothing merges an early publication across ranks, so its filter would
-        // drop probe rows that other ranks' builds match.
         if (!join.is_delim_join_inner() &&
             (join.join_type == duckdb::JoinType::RIGHT_SEMI ||
              join.join_type == duckdb::JoinType::RIGHT_ANTI) &&
             join.publishes_dynamic_filters() &&
-            join.dynamic_filter_plan().multi_partition_enabled() && !op_params.distributed()) {
+            join.dynamic_filter_plan().multi_partition_enabled()) {
           auto publish = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
             child_types, est_card, join.dynamic_filter_session());
           if (!child_physical.empty()) { publish->set_physical_types(child_physical); }
