@@ -150,7 +150,8 @@ class transport {
   {
   }
 
-  /// Stops the engine; work still in flight is dropped.
+  /// Sends the ends and aborts already asked for, then stops the engine; batches still in flight
+  /// are dropped.
   ~transport();
 
   transport(transport const&)            = delete;

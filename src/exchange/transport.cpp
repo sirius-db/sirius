@@ -606,7 +606,7 @@ void transport::run()
     while (true) {
       {
         std::lock_guard lock{_mutex};
-        if (_stop) { return; }
+        if (_stop) { break; }
       }
       bool progress = false;
       std::vector<abort_message> aborts;
@@ -690,6 +690,35 @@ void transport::run()
     _room.notify_all();
     _released.notify_all();
     e.cb.on_error(error);
+    return;
+  }
+  // Stopping. Ends and aborts already asked for need no credits, so they still go: a peer waits
+  // for an end, and the rank closing it may tear down at once, as a barrier's last rank does.
+  // Queued batches stay in the engine and are dropped with it.
+  std::vector<std::pair<rank_t, std::string>> notes_out;
+  {
+    std::lock_guard lock{_mutex};
+    for (auto const& a : _aborts) {
+      for (rank_t peer = 0; peer < e.fab.world_size(); ++peer) {
+        if (peer != e.fab.rank()) { notes_out.emplace_back(peer, encode(a)); }
+      }
+    }
+    _aborts.clear();
+    for (rank_t peer = 0; peer < e.queues.size(); ++peer) {
+      for (auto const& q : e.queues[peer]) {
+        if (!q.out) { notes_out.emplace_back(peer, encode(end_message{q.stream, q.batch})); }
+      }
+    }
+  }
+  for (auto& [peer, note] : notes_out) {
+    try {
+      e.fab.notify(peer, std::move(note));
+    } catch (std::exception const& ex) {
+      SIRIUS_LOG_WARN(
+        "exchange: could not send rank {} an end or abort at shutdown: {}", peer, ex.what());
+    } catch (...) {
+      SIRIUS_LOG_WARN("exchange: could not send rank {} an end or abort at shutdown", peer);
+    }
   }
 }
 
