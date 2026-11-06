@@ -8,5 +8,5 @@
   "license": "LicenseRef-Proprietary",
   "name": "cusolver",
   "supports": "linux & (x64 | arm64)",
-  "version": "12.2.2.18"
+  "version": "12.4.1.2"
 }
