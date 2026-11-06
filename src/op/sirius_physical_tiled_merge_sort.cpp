@@ -190,11 +190,6 @@ struct sirius_physical_merge_sort::tiled_state {
     uint64_t begin, end;
     std::size_t input;
   };
-  struct coalesce_request {
-    static constexpr kind type = kind::COALESCE;
-    slot destination;
-    std::size_t group_index;
-  };
   struct sample_request {
     static constexpr kind type = kind::SAMPLE;
     slot destination;
@@ -212,10 +207,29 @@ struct sirius_physical_merge_sort::tiled_state {
     uint64_t begin, end, first_splitter, splitter_count;
     std::vector<slot> destinations;
   };
-  struct merge_request {
-    static constexpr kind type = kind::MERGE;
+  struct merge_operation {
+    kind type;
     slot destination;
-    std::size_t tile_index;
+    std::size_t index;
+    template <typename Emit>
+    static auto execute(pipelineable_operator_data const& input,
+                        std::vector<cudf::table_view> const& views,
+                        sort_comparison_config const& comparison,
+                        ::cuda::stream_ref stream,
+                        rmm::device_async_resource_ref mr,
+                        Emit&& emit)
+    {
+      return views.size() == 1 ? input.get_data_batches().front()
+                               : emit(cudf::merge(views,
+                                                  comparison.key_columns,
+                                                  comparison.directions,
+                                                  comparison.null_precedence,
+                                                  stream,
+                                                  mr));
+    }
+    void complete(range_state& range,
+                  request const& task,
+                  cucascade::data_batch const& output) const;
   };
   struct publish_request {
     static constexpr kind type = kind::PUBLISH;
@@ -223,11 +237,10 @@ struct sirius_physical_merge_sort::tiled_state {
     std::size_t position;
   };
   using operation = std::variant<normalize_request,
-                                 coalesce_request,
                                  sample_request,
                                  order_request,
                                  extract_request,
-                                 merge_request,
+                                 merge_operation,
                                  publish_request>;
   struct request {
     std::vector<ref> sources;
@@ -247,9 +260,6 @@ struct sirius_physical_merge_sort::tiled_state {
     produced_batch output;
     uint64_t begin;
   };
-  struct coalesce_result {
-    produced_batch output;
-  };
   struct sample_result {
     produced_batch output;
   };
@@ -265,19 +275,11 @@ struct sirius_physical_merge_sort::tiled_state {
   struct extract_result {
     std::vector<extracted_piece> pieces;
   };
-  struct merge_result {
-    produced_batch output;
-  };
   struct publish_result {
     std::shared_ptr<cucascade::data_batch> batch;
   };
-  using result = std::variant<normalize_result,
-                              coalesce_result,
-                              sample_result,
-                              order_result,
-                              extract_result,
-                              merge_result,
-                              publish_result>;
+  using result =
+    std::variant<normalize_result, sample_result, order_result, extract_result, publish_result>;
 
   struct stage_work {
     tiled_merge_work_queue<work> queue;
@@ -294,12 +296,6 @@ struct sirius_physical_merge_sort::tiled_state {
   struct coalesce_stage : stage_work {
     std::vector<group> groups;
     std::size_t input_count{0};
-    void accept(coalesce_result const& value, request const& task)
-    {
-      groups.at(std::get<coalesce_request>(task.op).group_index).output =
-        storage_access::commit_replacement(
-          task.sources, value.output.destination, *value.output.batch);
-    }
   };
   struct sample_stage : stage_work {
     std::vector<ref> inputs;
@@ -339,13 +335,6 @@ struct sirius_physical_merge_sort::tiled_state {
   };
   struct merge_stage : stage_work {
     std::vector<tile> tiles;
-    void accept(merge_result const& value, request const& task)
-    {
-      auto& tile  = tiles.at(std::get<merge_request>(task.op).tile_index);
-      tile.result = storage_access::commit_replacement(
-        task.sources, value.output.destination, *value.output.batch);
-      tile.pieces.clear();
-    }
   };
   struct done_stage {
     std::vector<ref> results;
@@ -561,7 +550,7 @@ struct sirius_physical_merge_sort::tiled_state {
       for (auto const& piece : tile.pieces) {
         sources.push_back(piece.batch);
       }
-      add(op, r, std::move(sources), merge_request{scratch.allocate(RESULTS), t});
+      add(op, r, std::move(sources), merge_operation{kind::MERGE, scratch.allocate(RESULTS), t});
     }
   }
 
@@ -616,7 +605,7 @@ struct sirius_physical_merge_sort::tiled_state {
       if (g.inputs.size() == 1) {
         g.output = g.inputs.front();
       } else {
-        add(op, r, g.inputs, coalesce_request{scratch.allocate(INPUTS), i});
+        add(op, r, g.inputs, merge_operation{kind::COALESCE, scratch.allocate(INPUTS), i});
       }
     }
   }
@@ -788,6 +777,17 @@ struct sirius_physical_merge_sort::tiled_state {
   }
 };
 
+// Called under the coordinator mutex, after sink and device completion.
+void sirius_physical_merge_sort::tiled_state::merge_operation::complete(
+  range_state& range, request const& task, cucascade::data_batch const& output) const
+{
+  auto& replacement = type == kind::COALESCE
+                        ? std::get<coalesce_stage>(range.stage).groups.at(index).output
+                        : std::get<merge_stage>(range.stage).tiles.at(index).result;
+  replacement       = storage_access::commit_replacement(task.sources, destination, output);
+  if (type == kind::MERGE) { std::get<merge_stage>(range.stage).tiles.at(index).pieces.clear(); }
+}
+
 std::size_t sirius_physical_merge_sort::no_history_peak_memory_estimate(
   input_stats const& stats) const
 {
@@ -928,6 +928,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   auto mr     = space->get_default_allocator();
   // Keep partial outputs alive until the exception fence has completed.
   state::result completed;
+  std::vector<std::shared_ptr<cucascade::data_batch>> merged;
   auto emit = [&](std::unique_ptr<cudf::table> table, state::slot destination) {
     return state::produced_batch{
       destination, make_data_batch(std::move(table), *space, stream, batch_telemetry())};
@@ -940,7 +941,12 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
   try {
     std::visit(
       [&](auto const& item) {
-        if constexpr (std::decay_t<decltype(item)>::type == state::kind::PUBLISH) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(item)>, state::merge_operation>) {
+          // Output index zero is the sole owner used by sink and completion.
+          merged.push_back(item.execute(input, views, *comparison, stream, mr, [&](auto table) {
+            return make_data_batch(std::move(table), *space, stream, batch_telemetry());
+          }));
+        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::PUBLISH) {
           auto& value = completed.emplace<state::publish_result>();
           if (item.projection.empty()) {
             value.batch = input.get_data_batches().front();
@@ -951,19 +957,6 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
               stream,
               batch_telemetry());
           }
-        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::MERGE) {
-          auto& value = completed.emplace<state::merge_result>();
-          if (views.size() == 1) {
-            value.output = {item.destination, input.get_data_batches().front()};
-          } else {
-            value.output = emit(cudf::merge(views,
-                                            comparison->key_columns,
-                                            comparison->directions,
-                                            comparison->null_precedence,
-                                            stream,
-                                            mr),
-                                item.destination);
-          }
         } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::NORMALIZE) {
           auto& value = completed.emplace<state::normalize_result>();
           value.begin = item.begin;
@@ -972,15 +965,6 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
             {static_cast<cudf::size_type>(item.begin), static_cast<cudf::size_type>(item.end)},
             stream)[0];
           value.output = emit(std::make_unique<cudf::table>(view, stream, mr), item.destination);
-        } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::COALESCE) {
-          auto& value  = completed.emplace<state::coalesce_result>();
-          value.output = emit(cudf::merge(views,
-                                          comparison->key_columns,
-                                          comparison->directions,
-                                          comparison->null_precedence,
-                                          stream,
-                                          mr),
-                              item.destination);
         } else if constexpr (std::decay_t<decltype(item)>::type == state::kind::SAMPLE) {
           auto& value  = completed.emplace<state::sample_result>();
           value.output = emit(
@@ -1062,8 +1046,13 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     throw;
   }
   auto output = std::make_unique<state::task_data>(
-    state::batches(completed), input.item, input.execution, input.get_position());
-  output->completed     = std::move(completed);
+    merged.empty() ? state::batches(completed) : std::move(merged),
+    input.item,
+    input.execution,
+    input.get_position());
+  if (!std::holds_alternative<state::merge_operation>(request.op)) {
+    output->completed = std::move(completed);
+  }
   uint64_t output_bytes = 0, output_rows = 0;
   for (auto const& batch : output->get_data_batches()) {
     auto metadata = get_batch_rows_and_bytes(*batch);
@@ -1078,7 +1067,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     output->get_data_batches().size(),
     output_rows,
     output_bytes,
-    std::holds_alternative<state::order_result>(*output->completed)
+    output->completed && std::holds_alternative<state::order_result>(*output->completed)
       ? std::get<state::order_result>(*output->completed).splitter_count
       : 0,
     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
@@ -1108,6 +1097,10 @@ void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::strea
   auto const& data = dynamic_cast<tiled_state::task_data const&>(output);
   if (data.execution->type() == tiled_state::kind::PUBLISH) {
     sirius_physical_operator::sink(output, stream);
+    return;
+  }
+  if (auto* merge = std::get_if<tiled_state::merge_operation>(&data.execution->op)) {
+    tiled_state::storage_access::publish(merge->destination, data.get_data_batches().at(0));
     return;
   }
   auto publish = [](tiled_state::produced_batch const& output) {
@@ -1143,7 +1136,11 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
   }
   auto r = item.owner.lock();
   if (!r) { throw internal_exception("Missing sort range at completion"); }
-  r->accept(data.completed.value(), *item.execution);
+  if (auto* merge = std::get_if<state::merge_operation>(&item.execution->op)) {
+    merge->complete(*r, *item.execution, *data.get_data_batches().at(0));
+  } else {
+    r->accept(data.completed.value(), *item.execution);
+  }
   item.state = state::status::COMPLETE;
   if (item.execution->type() != state::kind::PUBLISH) {
     r->queue()->complete();

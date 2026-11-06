@@ -45,6 +45,7 @@ class injected_merge : public sirius_physical_merge_sort {
  public:
   using sirius_physical_merge_sort::sirius_physical_merge_sort;
   bool fail_compute{false};
+  bool replace_output{false};
   std::function<void()> before_compute;
   std::size_t attempts{0}, publications{0};
   bool reject_completion{false};
@@ -66,6 +67,10 @@ class injected_merge : public sirius_physical_merge_sort {
     auto output = sirius_physical_merge_sort::execute(input, stream);
     if (std::exchange(fail_compute, false)) {
       throw rmm::out_of_memory("injected before publication");
+    }
+    if (replace_output) {
+      auto const& batches = dynamic_cast<pipelineable_operator_data const&>(*output);
+      return batches.with_batches_preserving_rows(batches.get_data_batches());
     }
     return output;
   }
@@ -424,7 +429,8 @@ TEST_CASE("tiled extraction publishes independent pieces through real task compl
 TEST_CASE("tiled preprocessing normalizes coalesces and preserves ranges", "[tiled_merge]")
 {
   tiled_fixture f;
-  f.merge.chunk_bytes = 64;
+  f.merge.replace_output = true;
+  f.merge.chunk_bytes    = 64;
   f.input->set_num_partitions(4);
   for (int64_t i = 0; i < 32; ++i) {
     f.add({i}, 0);
