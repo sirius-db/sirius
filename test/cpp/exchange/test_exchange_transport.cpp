@@ -111,7 +111,7 @@ struct forged_peer {
   }
 };
 
-/// The encoded header of a batch of about 1 MiB: its frame 0 alone does not complete it, so a
+/// The encoded header of a batch of about 1.2 MB: its frame 0 alone does not complete it, so a
 /// receiver keeps it landing.
 std::vector<std::uint8_t> many_frame_header()
 {
@@ -159,7 +159,7 @@ TEST_CASE("a transport keeps nothing for a stream once it has ended", "[exchange
 TEST_CASE("one credit per peer and one send frame still deliver many-frame batches",
           "[exchange][transport]")
 {
-  // About 1 MiB a batch: 16 frames of 64 KiB through one frame at a time.
+  // About 1.2 MB a batch: 19 frames of 64 KiB through one frame at a time.
   cluster c(3, /*send_frames=*/1, /*recv_frames=*/2);
   all_to_all(c, {1}, 2, 30'000);
 }
@@ -191,26 +191,27 @@ TEST_CASE("a receiver with no room holds the frames until room appears", "[excha
 TEST_CASE("a sender holds a batch of a query until its last frame is staged",
           "[exchange][transport]")
 {
-  // About 1 MiB: 16 frames of 64 KiB, against 4 receive frames a receiver with no room keeps.
+  // About 1.2 MB: 19 frames of 64 KiB, against 4 receive frames a receiver with no room keeps.
   cluster c(2, 4, 4, loopback_hub::options{}, /*host=*/nullptr);
   auto& sender           = *c.ranks[0].t;
   auto& got              = *c.ranks[1].got;
   stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  auto const query       = sirius::exchange::query_of(stream);
   {
     auto const hold = hold_gpu();
     sender.send(stream, 1, gpu_batch(sample_table(30'000)));
     sender.close(stream, 1);
-    CHECK_FALSE(sender.wait_sent(5, std::chrono::milliseconds{500}));
-    CHECK(sender.wait_sent(6, std::chrono::milliseconds{0}));
+    CHECK_FALSE(sender.wait_sent(query, std::chrono::milliseconds{500}));
+    CHECK(sender.wait_sent(query + 1, std::chrono::milliseconds{0}));
   }
-  CHECK(sender.wait_sent(5, std::chrono::seconds{30}));
+  CHECK(sender.wait_sent(query, std::chrono::seconds{30}));
   REQUIRE(got.wait_for([&] { return got.ended.size() == 1; }));
 }
 
 TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everything",
           "[exchange][transport]")
 {
-  // About 1 MiB a batch against a 64 KiB cap: the first goes alone, the second waits for it.
+  // About 1.2 MB a batch against a 64 KiB cap: the first goes alone, the second waits for it.
   cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
   auto& sender = *c.ranks[0].t;
   auto& got    = *c.ranks[1].got;
@@ -234,7 +235,7 @@ TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everythi
 TEST_CASE("a batch with no room asks for it once, and lands once it has it",
           "[exchange][transport]")
 {
-  // About 1 MiB against a GPU held full and no host tier: it lands only after the hook frees room.
+  // About 1.2 MB against a GPU held full and no host tier: it lands only after the hook frees room.
   std::optional<std::vector<std::unique_ptr<cucascade::memory::reservation>>> hold;
   std::atomic<int> asked{0};
   transport::options opts;
@@ -257,7 +258,7 @@ TEST_CASE("a batch with no room asks for it once, and lands once it has it",
 TEST_CASE("a transport that makes no progress for the stall timeout fails both ranks",
           "[exchange][transport]")
 {
-  // About 1 MiB: more frames than credits, so the sender still holds the batch, and its memory,
+  // About 1.2 MB: more frames than credits, so the sender still holds the batch, and its memory,
   // while the receiver waits for room.
   cluster c(2, 4, 4, {}, /*host=*/nullptr, {.stall_timeout = std::chrono::milliseconds{300}});
   auto const hold = hold_gpu();
@@ -284,7 +285,7 @@ TEST_CASE("a failed write fails the sender and its peer", "[exchange][transport]
 
 TEST_CASE("a failed transport frees the batches it held before reporting", "[exchange][transport]")
 {
-  // About 1 MiB: 16 frames of 64 KiB, more than the 4 send frames, so the batch is still held
+  // About 1.2 MB: 19 frames of 64 KiB, more than the 4 send frames, so the batch is still held
   // when the first write fails.
   cluster c(2, 4, 4, {.fail_after_writes = 0}, env().host);
   auto& sender           = *c.ranks[0].t;
@@ -292,7 +293,7 @@ TEST_CASE("a failed transport frees the batches it held before reporting", "[exc
   sender.send(stream, 1, gpu_batch(sample_table(30'000)));
   auto& got = *c.ranks[0].got;
   REQUIRE(got.wait_for([&] { return got.error != nullptr; }));
-  CHECK(sender.wait_sent(5, std::chrono::seconds{5}));
+  CHECK(sender.wait_sent(sirius::exchange::query_of(stream), std::chrono::seconds{5}));
 }
 
 TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange][transport]")
