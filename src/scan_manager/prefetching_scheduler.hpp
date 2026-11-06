@@ -16,8 +16,9 @@
 
 #pragma once
 
-#include "io/cache/types.hpp"
 #include "planner/query_index.hpp"
+
+#include <cucascade/io/cache/types.hpp>
 
 #include <cstddef>
 #include <optional>
@@ -97,7 +98,7 @@ class prefetching_scheduler {
   /// Record @p stage for @p operator_id and re-position the cursor.  Unknown
   /// operator ids are ignored.  Reporting @c scan_stage::disposed retires the
   /// operator from the rotation.
-  void update(std::size_t operator_id, io::cache::scan_stage stage);
+  void update(std::size_t operator_id, cucascade::io::cache::scan_stage stage);
 
   /// The scan that should be prefetched next, or nullptr once every step is
   /// depleted.  Each call consumes one unit of the current member's quantum, so
@@ -135,7 +136,7 @@ class prefetching_scheduler {
   [[nodiscard]] bool exhausted() const noexcept { return _group >= _groups.size(); }
 
   /// Last stage reported for @p operator_id, or @c scan_stage::none.
-  [[nodiscard]] io::cache::scan_stage stage_of(std::size_t operator_id) const;
+  [[nodiscard]] cucascade::io::cache::scan_stage stage_of(std::size_t operator_id) const;
 
  private:
   struct entry {
@@ -147,7 +148,7 @@ class prefetching_scheduler {
     /// barrier_all (hold until depleted), 1 for pipeline, the step's count for
     /// barrier_serial.
     std::size_t quantum{1};
-    io::cache::scan_stage stage{io::cache::scan_stage::none};
+    cucascade::io::cache::scan_stage stage{cucascade::io::cache::scan_stage::none};
     bool depleted{false};
   };
 

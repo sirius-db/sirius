@@ -18,7 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     generate(
         &parsed.schema,
         &Options {
-            combined_event: true,
             ..Options::default()
         },
     )?;

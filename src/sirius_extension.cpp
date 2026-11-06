@@ -88,6 +88,8 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
+#include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -108,15 +110,6 @@ extern "C" int cudaProfilerStop();
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
-
-// PinTableFunction routes parquet reads through the scan manager's ioctx
-// instead of cudf's bundled file_source factory (which uses kvikio internally
-// and binds to a single CUDA context). This is mandatory in multi-GPU
-// configurations (enforced by sirius_config::enforce_sirius_backend_for_multi_gpu()).
-// Single-GPU users may still opt out via backend=kvikio; the
-// pin pipeline always routes through ioctx when one is available.
-#include "io/s3/duckdb_secret_config.hpp"
-#include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 
 #include <cuda_runtime_api.h>
 
@@ -1384,6 +1377,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       return metadata;
     };
 
+    // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
+    // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
+    // That is mandatory on multi-GPU.
     if (data.args.tier == "host") {
       // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
       // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local

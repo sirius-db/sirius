@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <map>
+#include <set>
+
 // sirius
 #include <op/sirius_physical_operator.hpp>
 #include <sirius_context.hpp>
@@ -70,6 +73,11 @@ class sirius_physical_result_collector : public sirius_physical_operator {
 
 class sirius_physical_materialized_collector : public sirius_physical_result_collector {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   sirius_physical_materialized_collector(::sirius::sirius_prepared_statement_data& data,
                                          duckdb::ClientContext& client_ctx);
   duckdb::unique_ptr<duckdb::ColumnDataCollection> result_collection;
@@ -99,6 +107,9 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
 
  private:
   duckdb::ClientContext& _client_ctx;
+  std::optional<bool> _positioned;
+  std::set<std::size_t> _seen_positions;
+  std::map<std::size_t, duckdb::unique_ptr<duckdb::ColumnDataCollection>> _positioned_collections;
 };
 
 }  // namespace op

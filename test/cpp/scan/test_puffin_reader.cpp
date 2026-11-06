@@ -24,13 +24,13 @@
 //
 // No GPU: file IO and parsing only.
 
-#include "io/io_errors.hpp"
 #include "op/scan/iceberg_delete_set.hpp"  // IWYU pragma: keep
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "utils/puffin_test_utils.hpp"
 
 #include <catch.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <roaring/roaring.hh>
 
 #include <algorithm>
@@ -99,7 +99,7 @@ class identity_changing_puffin_source final : public puffin_byte_source {
   }
   bool read(std::span<std::byte>) override
   {
-    throw sirius::io::object_changed_error(path_, "\"v1\"", "\"v2\"");
+    throw cucascade::io::object_changed_error(path_, "\"v1\"", "\"v2\"");
   }
   [[nodiscard]] std::streamoff size() const override { return size_; }
 
@@ -741,7 +741,7 @@ TEST_CASE("Charged Puffin preserves an opened-object identity failure",
   try {
     read_for_test(ref, true, &source);
     FAIL("identity change was not reported");
-  } catch (sirius::io::object_changed_error const& failure) {
+  } catch (cucascade::io::object_changed_error const& failure) {
     CHECK(failure.object_path() == ref.puffin_path);
     CHECK(failure.expected_tag() == "\"v1\"");
     CHECK(failure.observed_tag() == "\"v2\"");
@@ -1227,7 +1227,7 @@ TEST_CASE("Neutral Puffin metadata has independent limits and preserves source f
   provider.seen->fail_allocation = false;
   CHECK(ledger.charged_bytes({1, 1}) == 0);
   identity_changing_puffin_source changed(source.size(), "object");
-  CHECK_THROWS_AS(read_puffin_metadata(changed, allocator), sirius::io::object_changed_error);
+  CHECK_THROWS_AS(read_puffin_metadata(changed, allocator), cucascade::io::object_changed_error);
   cancelling_puffin_source cancelled(source.size());
   CHECK_THROWS_AS(read_puffin_metadata(cancelled, allocator), std::system_error);
   std::string many_keys = "{";

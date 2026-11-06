@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 
 namespace sirius {
 namespace op {
@@ -86,11 +87,39 @@ bool is_wide_integer_sum(sirius::aggregate_id id, sirius::logical_type const& in
   }
 }
 
+grouped_aggregate_layout::grouped_aggregate_layout(std::size_t num_keys,
+                                                   std::size_t num_partials,
+                                                   std::span<aggregate_slot const> slots)
+  : grouped_aggregate_layout(
+      num_keys,
+      num_partials,
+      static_cast<std::size_t>(std::ranges::count_if(
+        slots, [](auto const& slot) { return std::holds_alternative<first_slot>(slot); })))
+{
+}
+
+bool grouped_aggregate_layout::matches_output(std::span<aggregate_slot const> slots) const noexcept
+{
+  std::size_t plain_count = 0;
+  std::size_t first_count = 0;
+  for (auto const& slot : slots) {
+    if (auto const* plain = std::get_if<plain_slot>(&slot)) {
+      if (first_count > 0 || plain->partial_idx != plain_count++) { return false; }
+    } else if (auto const* first = std::get_if<first_slot>(&slot)) {
+      if (first->carried_idx != first_count++) { return false; }
+    } else {
+      return false;
+    }
+  }
+  return plain_count == num_partials() && first_count == num_carried();
+}
+
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions)
 {
   CudfAggregateDefinitions result;
+  duckdb::vector<sirius::logical_type> carried_types;
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
@@ -129,11 +158,10 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.cudf_aggregate_idx.push_back(col_idx);
       result.cudf_aggregate_struct_col_indices.push_back({});
       result.aggregate_slots.push_back(
-        {.is_avg              = true,
-         .cudf_idx            = sum_position,
-         .output_type         = sirius::require_cudf_type(aggr.return_type()),
-         .is_wide_integer_sum = wide,
-         .sums_hugeint_input  = sums_hugeint});
+        avg_slot{.sum_idx             = sum_position,
+                 .output_type         = sirius::require_cudf_type(aggr.return_type()),
+                 .is_wide_integer_sum = wide,
+                 .sums_hugeint_input  = sums_hugeint});
       auto sum_type = children[0]->return_type();
       switch (sum_type.id()) {
         case sirius::type_id::TINYINT:
@@ -189,9 +217,21 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
         result.cudf_aggregate_struct_col_indices.push_back(std::move(struct_indices));
       }
 
-      result.aggregate_slots.push_back(AggregateSlot{false, true, position});
+      result.aggregate_slots.push_back(count_distinct_slot{.partial_idx = position});
       result.local_types.push_back(sirius::logical_type::make(sirius::type_id::LIST));
       result.has_count_distinct = true;
+      continue;
+    }
+
+    // FIRST adds no cuDF aggregation; it reads input_idx into the carried block.
+    if (fid == sirius::aggregate_id::first) {
+      if (children.size() != 1 || !children[0]->is_reference()) {
+        throw_unsupported_aggregate(fid, "over anything but a single column reference");
+      }
+      result.aggregate_slots.push_back(
+        first_slot{.input_idx   = static_cast<int>(children[0]->as_reference().column_index),
+                   .carried_idx = carried_types.size()});
+      carried_types.push_back(aggr.return_type());
       continue;
     }
 
@@ -219,26 +259,59 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
-    bool const is_stddev_samp = fid == sirius::aggregate_id::stddev_samp;
-    result.aggregate_slots.push_back(
-      {.cudf_idx            = current_position,
-       .is_stddev_samp      = is_stddev_samp,
-       .is_wide_integer_sum = wide,
-       .returns_hugeint     = aggr.return_type().id() == sirius::type_id::HUGEINT,
-       .sums_hugeint_input  = sums_hugeint});
-    result.local_types.push_back(
-      is_stddev_samp ? sirius::logical_type::make(sirius::type_id::STRUCT) : aggr.return_type());
+    if (fid == sirius::aggregate_id::stddev_samp) {
+      result.aggregate_slots.push_back(stddev_samp_slot{.partial_idx = current_position});
+      result.local_types.push_back(sirius::logical_type::make(sirius::type_id::STRUCT));
+    } else {
+      result.aggregate_slots.push_back(
+        plain_slot{.partial_idx         = current_position,
+                   .is_wide_integer_sum = wide,
+                   .returns_hugeint     = aggr.return_type().id() == sirius::type_id::HUGEINT,
+                   .sums_hugeint_input  = sums_hugeint});
+      result.local_types.push_back(aggr.return_type());
+    }
   }
+  auto const layout = grouped_aggregate_layout{
+    result.group_idx.size(), result.cudf_aggregates.size(), result.aggregate_slots};
+  D_ASSERT(result.local_types.size() == layout.carried_column(0));
+  result.local_types.insert(
+    result.local_types.begin() + static_cast<std::ptrdiff_t>(layout.carried_column(0)),
+    carried_types.begin(),
+    carried_types.end());
+  D_ASSERT(result.local_types.size() == layout.num_columns());
 
   return result;
 }
 
-std::vector<bool> wide_integer_sum_mask(std::vector<AggregateSlot> const& slots,
+std::vector<int> carried_inputs(std::vector<aggregate_slot> const& aggregate_slots)
+{
+  std::vector<int> inputs;
+  for (auto const& slot : aggregate_slots) {
+    if (auto const* first = std::get_if<first_slot>(&slot)) {
+      D_ASSERT(first->carried_idx == inputs.size());
+      inputs.push_back(first->input_idx);
+    }
+  }
+  return inputs;
+}
+
+bool all_slots_plain(std::vector<aggregate_slot> const& aggregate_slots)
+{
+  return std::ranges::all_of(aggregate_slots, [](aggregate_slot const& slot) {
+    return std::holds_alternative<plain_slot>(slot);
+  });
+}
+
+std::vector<bool> wide_integer_sum_mask(std::vector<aggregate_slot> const& slots,
                                         std::size_t num_cudf_aggregates)
 {
   std::vector<bool> mask(num_cudf_aggregates, false);
   for (auto const& slot : slots) {
-    if (slot.is_wide_integer_sum) { mask[slot.cudf_idx] = true; }
+    if (auto const* plain = std::get_if<plain_slot>(&slot); plain && plain->is_wide_integer_sum) {
+      mask[plain->partial_idx] = true;
+    } else if (auto const* avg = std::get_if<avg_slot>(&slot); avg && avg->is_wide_integer_sum) {
+      mask[avg->sum_idx] = true;
+    }
   }
   return mask;
 }

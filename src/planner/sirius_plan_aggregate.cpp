@@ -284,12 +284,18 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   }
   masked_inputs.clear();
   if (expressions.empty()) { return child; }
-  child = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
+  child       = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
+  auto inputs = translate_expressions(std::move(expressions));
+  // DuckDB computes an aggregate's arguments and FILTER on every row before it filters, so they
+  // raise their errors even for the rows the FILTER drops.
+  for (auto const column : masked_columns) {
+    if (inputs[column] && inputs[column]->holds<sirius::ast::case_expr>()) {
+      inputs[column]->get<sirius::ast::case_expr>().eager = true;
+    }
+  }
   auto const estimated_cardinality = child->estimated_cardinality;
-  return push_projection(std::move(child),
-                         sirius::from_duckdb_vec(types),
-                         translate_expressions(std::move(expressions)),
-                         estimated_cardinality);
+  return push_projection(
+    std::move(child), sirius::from_duckdb_vec(types), std::move(inputs), estimated_cardinality);
 }
 
 /// Column positions a fused COUNT-join reads from the two join inputs. Each index addresses the
@@ -957,6 +963,28 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
                               aggregate.GetChildren()[0]->GetReturnType().IsNested())) {
       throw duckdb::NotImplementedException(
         "Ungrouped COUNT(DISTINCT) on a nested or multi-column input not supported in GPU");
+    }
+  }
+
+  // The Sirius aggregate node cannot carry an ORDER BY, so a FIRST refuses its own. A FILTER
+  // on FIRST is refused above because FIRST does not skip NULLs.
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=
+        sirius::aggregate_id::first) {
+      continue;
+    }
+    if (aggregate.GetOrderBys()) {
+      throw duckdb::NotImplementedException(
+        "first() with an ORDER BY clause is not supported on the GPU (falling back to CPU): " +
+        aggregate.ToString());
+    }
+    // One carried row per key answers one grouping set, and the set expansion copies no carried
+    // columns.
+    if (has_grouping_sets) {
+      throw duckdb::NotImplementedException(
+        "grouped FIRST is not supported over several grouping sets or beside a grouping function "
+        "(falling back to CPU)");
     }
   }
 

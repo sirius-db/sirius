@@ -16,11 +16,11 @@
 
 #include <catch.hpp>
 #include <core_functions_extension.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/parquet_delete_reader.hpp>
 #include <parquet_extension.hpp>
@@ -327,10 +327,10 @@ TEST_CASE("Iceberg consumes shared Parquet batches and rejects malformed positio
 {
   delete_fixture f;
   f.write(10000);
-  sirius::io::kvikio_context io;
+  auto io = std::make_shared<cucascade::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(f.path);
-  auto result = load_delete_payload(*f.connection.context, "test-table", &io, {}, discovery);
+  auto result = load_delete_payload(*f.connection.context, "test-table", io, {}, discovery);
   REQUIRE(result->positional_deletes.size() == 1);
   auto const& positions = result->positional_deletes.at("data.parquet");
   REQUIRE(positions.size() == 10000);
@@ -344,7 +344,7 @@ TEST_CASE("Iceberg consumes shared Parquet batches and rejects malformed positio
       f.connection.Query("COPY (SELECT 'data.parquet' AS file_path, " + std::string(expression) +
                          " AS pos) TO '" + escaped + "' (FORMAT PARQUET)");
     REQUIRE_FALSE(written->HasError());
-    REQUIRE_THROWS(load_delete_payload(*f.connection.context, "test-table", &io, {}, discovery));
+    REQUIRE_THROWS(load_delete_payload(*f.connection.context, "test-table", io, {}, discovery));
   }
 }
 
@@ -494,10 +494,10 @@ TEST_CASE("Remote Parquet deletes preserve caller context and native filesystem 
   f.path = "delete-remote://bucket/deletes.parquet";
   SECTION("versioned remote object") {}
   SECTION("unversioned remote object remains readable") { remote.versioned = false; }
-  sirius::io::kvikio_context io;
+  auto io = std::make_shared<cucascade::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(f.path);
-  auto result = load_delete_payload(*f.connection.context, "remote-table", &io, {}, discovery);
+  auto result = load_delete_payload(*f.connection.context, "remote-table", io, {}, discovery);
   REQUIRE(result->positional_deletes.at("data.parquet").size() == 10000);
   REQUIRE(remote.live_handles == 0);
 }
@@ -596,10 +596,10 @@ TEST_CASE("HTTP Parquet position deletes match SQL read_parquet", "[.][parquet_d
   auto expected = baseline->Fetch();
   REQUIRE(expected);
   REQUIRE(expected->GetValue(0, 0).GetValue<int64_t>() == 10000);
-  sirius::io::kvikio_context io;
+  auto io = std::make_shared<cucascade::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(f.path);
-  auto result = load_delete_payload(*f.connection.context, "remote-table", &io, {}, discovery);
+  auto result = load_delete_payload(*f.connection.context, "remote-table", io, {}, discovery);
   auto const& positions = result->positional_deletes.at("data.parquet");
   REQUIRE(positions.size() == 10000);
   int64_t sum = 0;
@@ -663,11 +663,11 @@ TEST_CASE("S3 Parquet position deletes match SQL and enforce credentials", "[.][
   REQUIRE(expected->GetValue(0, 0).GetValue<int64_t>() == 10000);
   auto expected_sum = expected->GetValue(1, 0).GetValue<int64_t>();
 
-  sirius::io::kvikio_context io;
+  auto io = std::make_shared<cucascade::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(uri);
   auto read = [&] {
-    return load_delete_payload(*f.connection.context, "s3-table", &io, {}, discovery);
+    return load_delete_payload(*f.connection.context, "s3-table", io, {}, discovery);
   };
   auto result           = read();
   auto const& positions = result->positional_deletes.at("data.parquet");
@@ -709,7 +709,7 @@ TEST_CASE("S3 Parquet position deletes match SQL and enforce credentials", "[.][
   configure_session(good, credential);
   configure_session(bad, "intentionally-invalid-test-secret");
   auto read_connection = [&](duckdb::Connection& con) {
-    return load_delete_payload(*con.context, "s3-table", &io, {}, discovery);
+    return load_delete_payload(*con.context, "s3-table", io, {}, discovery);
   };
   good.BeginTransaction();
   auto warmed = read_connection(good);

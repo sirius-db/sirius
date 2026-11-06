@@ -184,9 +184,9 @@ TEST_CASE("ranking evaluator matches DuckDB for every direction and NULL order",
   duckdb::Connection con(db);
   REQUIRE_FALSE(con.Query(create_table)->HasError());
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
-  auto mr     = cudf::get_current_device_resource_ref();
-  auto input  = make_input(stream, mr);
+  ::cuda::stream_ref stream = owning_stream;
+  auto mr                   = cudf::get_current_device_resource_ref();
+  auto input                = make_input(stream, mr);
 
   auto const order = GENERATE(
     direction{
@@ -220,9 +220,9 @@ TEST_CASE("ranking evaluator ranks over several order keys and numbers rows",
   duckdb::Connection con(db);
   REQUIRE_FALSE(con.Query(create_table)->HasError());
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
-  auto mr     = cudf::get_current_device_resource_ref();
-  auto input  = make_input(stream, mr);
+  ::cuda::stream_ref stream = owning_stream;
+  auto mr                   = cudf::get_current_device_resource_ref();
+  auto input                = make_input(stream, mr);
 
   SECTION("two order keys, one of them with NULLs")
   {
@@ -317,10 +317,10 @@ TEST_CASE("ranking evaluator partitions by strings and several columns, and orde
              "(9,NULL,1,NULL),(10,'x',2,-1.0),(11,'x',2,'-inf')")
       ->HasError());
   rmm::cuda_stream owning_stream;
-  auto stream    = owning_stream.view();
-  auto mr        = cudf::get_current_device_resource_ref();
-  auto const nan = std::numeric_limits<double>::quiet_NaN();
-  auto const inf = std::numeric_limits<double>::infinity();
+  ::cuda::stream_ref stream = owning_stream;
+  auto mr                   = cudf::get_current_device_resource_ref();
+  auto const nan            = std::numeric_limits<double>::quiet_NaN();
+  auto const inf            = std::numeric_limits<double>::infinity();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(
     column<int32_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, cudf::type_id::INT32, stream, mr));
@@ -361,8 +361,8 @@ TEST_CASE("ranking evaluator orders a string key and an integer key in different
              "(11,2,'c',3)")
       ->HasError());
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
-  auto mr     = cudf::get_current_device_resource_ref();
+  ::cuda::stream_ref stream = owning_stream;
+  auto mr                   = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(column<int32_t>({1, 1, 1, 1, 2, 2, 2, 2, 1, 0, 0, 2},
                                     cudf::type_id::INT32,
@@ -398,8 +398,8 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
           "[window_evaluator][window_ranking][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
-  auto mr     = cudf::get_current_device_resource_ref();
+  ::cuda::stream_ref stream = owning_stream;
+  auto mr                   = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(column<int32_t>({}, cudf::type_id::INT32, stream, mr));
   columns.push_back(column<int64_t>({}, cudf::type_id::INT64, stream, mr));
@@ -425,7 +425,6 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
       return evaluate_ranking_window(input->view(), partitions, order, functions, stream, mr);
     };
     CHECK_THROWS_AS(call({0}, spec, {}), std::invalid_argument);
-    CHECK_THROWS_AS(call({}, spec, {ranking_function::rank}), std::invalid_argument);
     CHECK_THROWS_AS(call({7}, spec, {ranking_function::rank}), std::invalid_argument);
     CHECK_THROWS_AS(call({0}, ranking_order{}, {ranking_function::rank}), std::invalid_argument);
     spec.columns = {-1};
@@ -439,6 +438,54 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
   }
 }
 
+TEST_CASE("ranking evaluator ranks a window without partition columns",
+          "[window_evaluator][window_ranking][gpu]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  REQUIRE_FALSE(con.Query(create_table)->HasError());
+  rmm::cuda_stream owning_stream;
+  auto stream      = owning_stream.view();
+  auto mr          = cudf::get_current_device_resource_ref();
+  auto input       = make_input(stream, mr);
+  auto const order = GENERATE(
+    direction{
+      "ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST},
+    direction{"ASC NULLS LAST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST},
+    direction{
+      "DESC NULLS FIRST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_FIRST},
+    direction{
+      "DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST});
+  INFO(order.sql);
+
+  SECTION("rank and dense_rank over one order key")
+  {
+    auto result = evaluate_ranking_window(input->view(),
+                                          {},
+                                          make_order({1}, {order}),
+                                          {ranking_function::rank, ranking_function::dense_rank},
+                                          stream,
+                                          mr);
+    check_against_duckdb(
+      con, std::string("ORDER BY v ") + order.sql, result->view(), {"rank", "dense_rank"}, stream);
+  }
+  SECTION("row_number with the id column breaking every tie")
+  {
+    auto result = evaluate_ranking_window(input->view(),
+                                          {},
+                                          make_order({1, 3}, {order, order}),
+                                          {ranking_function::row_number},
+                                          stream,
+                                          mr);
+    check_against_duckdb(con,
+                         std::string("ORDER BY v ") + order.sql + ", id " + order.sql,
+                         result->view(),
+                         {"row_number"},
+                         stream);
+  }
+}
+
 TEST_CASE("ranking evaluator ranks narrow integer carriers like their logical type",
           "[window_evaluator][window_ranking][gpu]")
 {
@@ -447,8 +494,8 @@ TEST_CASE("ranking evaluator ranks narrow integer carriers like their logical ty
   duckdb::Connection con(db);
   REQUIRE_FALSE(con.Query(create_table)->HasError());
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
-  auto mr     = cudf::get_current_device_resource_ref();
+  ::cuda::stream_ref stream = owning_stream;
+  auto mr                   = cudf::get_current_device_resource_ref();
   // The partition key k and the order key v of `create_table`, as INT8 and INT16 carriers.
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(column<int8_t>({1, 2, 1, 0, 2, 1, 0, 2, 1, 1, 0, 2},

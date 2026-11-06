@@ -6,14 +6,14 @@
  */
 
 #include "catch.hpp"
-#include "io/datasource_factory.hpp"
+#include "io/scoped_object_store_configs.hpp"
 
 TEST_CASE("S3 config scopes isolate paths and publish immutable replacement snapshots",
           "[s3][routing]")
 {
   sirius::io::scoped_object_store_configs scopes;
 
-  sirius::io::object_store_config alpha;
+  cucascade::io::object_store_config alpha;
   alpha.endpoint   = "http://127.0.0.1:19001";
   alpha.region     = "us-east-1";
   alpha.access_key = "alpha-key";

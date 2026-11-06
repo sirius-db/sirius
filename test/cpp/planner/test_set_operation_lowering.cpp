@@ -228,6 +228,8 @@ sirius_physical_hash_join& require_distinct_set_operation_plan(
   CHECK(dedup.group_idx == key_columns);
   CHECK(dedup.cudf_aggregates.empty());
   CHECK(dedup.cudf_aggregate_idx.empty());
+  CHECK(dedup.aggregate_slots.empty());
+  CHECK(dedup.local_types == types);
   REQUIRE(dedup.children.size() == 1);
   REQUIRE(dedup.children[0]->type == SiriusPhysicalOperatorType::HASH_JOIN);
   auto& join = dedup.children[0]->Cast<sirius_physical_hash_join>();
