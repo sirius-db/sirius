@@ -31,7 +31,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <iostream>
 #include <numeric>
 #include <random>
 #include <type_traits>
@@ -445,17 +444,16 @@ TEST_CASE("coalescing qualifies tiny caps and ordinary row sizing with wide keys
         previous = host[t];
       }
     }
+    INFO("sampled_merge_coalescing pre_k="
+         << k << " post_k=" << coalesced.size() << " chunk_bytes=" << chunk
+         << " row_limit=" << row_limit << " reservation_bytes=" << reservation.bytes
+         << " stride=" << p.stride << " sample_rows=" << sample_rows
+         << " sample_bytes=" << sample_bytes << " coalesce_peak=" << coalesce_peak
+         << " order_peak=" << order_peak << " splitters=" << splitters->num_rows()
+         << " max_tile_rows=" << *std::max_element(tile_rows.begin(), tile_rows.end())
+         << " coalesce_ms=" << std::chrono::duration<double, std::milli>(end - start).count());
     CHECK(std::accumulate(tile_rows.begin(), tile_rows.end(), uint64_t{0}) == k * rows);
     CHECK(*std::max_element(tile_rows.begin(), tile_rows.end()) <= row_limit);
-    std::cout << "sampled_merge_coalescing pre_k=" << k << " post_k=" << coalesced.size()
-              << " chunk_bytes=" << chunk << " row_limit=" << row_limit
-              << " reservation_bytes=" << reservation.bytes << " stride=" << p.stride
-              << " sample_rows=" << sample_rows << " sample_bytes=" << sample_bytes
-              << " coalesce_peak=" << coalesce_peak << " order_peak=" << order_peak
-              << " splitters=" << splitters->num_rows()
-              << " max_tile_rows=" << *std::max_element(tile_rows.begin(), tile_rows.end())
-              << " coalesce_ms=" << std::chrono::duration<double, std::milli>(end - start).count()
-              << std::endl;
   }
 }
 
@@ -521,19 +519,19 @@ TEST_CASE("measure sampled string ordering capacity and batched cut readback",
         sirius::get_cudf_table_view(ro), k / 2, splitters->view(), comparison, stream, mr);
       auto offsets    = copy_column_to_host<int32_t>(cuts->view(), stream);  // one bulk readback
       auto search_end = std::chrono::steady_clock::now();
-      CHECK(std::is_sorted(offsets.begin(), offsets.end()));
-      auto ms = [](auto a, auto b) {
+      auto ms         = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
       };
-      std::cout << "sampled_merge_capacity k=" << k << " input_rows=" << input_rows
-                << " row_limit=" << row_limit << " key_bytes=" << width << " stride=" << p.stride
-                << " sample_rows=" << sample_rows << " sample_bytes=" << sample_bytes
-                << " splitters=" << splitters->num_rows() << " order_baseline=" << baseline
-                << " reservation_bytes=" << reservation_bytes << " order_peak=" << order_peak
-                << " cut_bytes=" << offsets.size() * sizeof(int32_t)
-                << " explicit_cut_readbacks=1 sampling_ms=" << ms(start, sampling_end)
-                << " order_ms=" << ms(sampling_end, order_end)
-                << " search_and_readback_ms=" << ms(search_start, search_end) << std::endl;
+      INFO("sampled_merge_capacity k="
+           << k << " input_rows=" << input_rows << " row_limit=" << row_limit
+           << " key_bytes=" << width << " stride=" << p.stride << " sample_rows=" << sample_rows
+           << " sample_bytes=" << sample_bytes << " splitters=" << splitters->num_rows()
+           << " order_baseline=" << baseline << " reservation_bytes=" << reservation_bytes
+           << " order_peak=" << order_peak << " cut_bytes=" << offsets.size() * sizeof(int32_t)
+           << " explicit_cut_readbacks=1 sampling_ms=" << ms(start, sampling_end)
+           << " order_ms=" << ms(sampling_end, order_end)
+           << " search_and_readback_ms=" << ms(search_start, search_end));
+      CHECK(std::is_sorted(offsets.begin(), offsets.end()));
     }
   }
 }
@@ -597,14 +595,13 @@ TEST_CASE("full-row samples fit the original reservation without a sorted-key co
       tile_rows[t] += offsets[t + 1] - offsets[t];
     }
   }
+  INFO("sampled_merge_capacity_limit stride="
+       << p.stride << " fan_in=" << k << " source_rows=" << rows << " sample_rows=" << k * rows
+       << " sample_bytes=" << sample_bytes << " row_limit=" << row_limit
+       << " tile_key_bytes_at_most=" << row_limit * (width + 4) << " reservation_bytes="
+       << reservation_bytes << " measured_order_peak=" << tracker->get_peak_allocated_bytes(stream)
+       << " sample_order_admitted=true");
   CHECK(std::accumulate(tile_rows.begin(), tile_rows.end(), uint64_t{0}) == k * rows);
   CHECK(*std::max_element(tile_rows.begin(), tile_rows.end()) <= row_limit);
   stream.sync();
-  std::cout << "sampled_merge_capacity_limit stride=" << p.stride << " fan_in=" << k
-            << " source_rows=" << rows << " sample_rows=" << k * rows
-            << " sample_bytes=" << sample_bytes << " row_limit=" << row_limit
-            << " tile_key_bytes_at_most=" << row_limit * (width + 4)
-            << " reservation_bytes=" << reservation_bytes
-            << " measured_order_peak=" << tracker->get_peak_allocated_bytes(stream)
-            << " sample_order_admitted=true" << std::endl;
 }

@@ -1,7 +1,7 @@
 # Tiled merge simplification qualification
 
-Status: implementation checkpoints validated by the developer; final suite and workload
-qualification pending. This records the simplified coordinator, not the earlier recursive
+Status: implementation checkpoints and the final suite validated by the developer;
+workload comparison pending. This records the simplified coordinator, not the earlier recursive
 recovery policy. The operator contract is documented in [Operators](operators.md).
 
 ## Implementation and reported validation
@@ -32,15 +32,14 @@ compilation and GPU execution.
 - Its allocation fixture injects failures beneath the reservation tracker. Preparation
   exhaustion covers normalization, coalescing, merge, sampling, splitter selection,
   extraction and publication. The coalescing and merge parameters were added during the
-  final audit and still require execution. The one-row owning-copy test checks compute
+  final audit and passed in the developer-reported final suite run. The one-row owning-copy test checks compute
   exhaustion. These are injected failures, not measured physical GPU capacity limits.
 - The retry case verifies successful replay and preserved rows. It does not independently
   demonstrate successful reservation growth for every operation.
 - `test_gpu_sampled_merge.cpp` covers comparison semantics including nulls, NaNs, signed zero,
   mixed directions, hidden string keys and peer-heavy inputs. `test_physical_merge_sort.cpp`
   covers operator ordering and projection, and `test_merge_pipeline_fusion.cpp` exercises
-  query results through pipeline integration. Final execution of these selections has not
-  yet been reported for the simplified coordinator.
+  query results through pipeline integration. The developer reported that all selections below passed at `c902383f`.
 - Dedicated operator coverage for multiple splitter pages and cancellation has not been
   established by this audit. Helper-level large inputs do not establish those lifecycle paths.
 
@@ -48,15 +47,16 @@ No new test cases were introduced. Four cases exercising removed recovery behavi
 deleted; retained failure assertions were updated, and the existing preparation-failure
 parameterization was extended to cover the removed coalescing/merge recovery paths.
 
-## Final validation request
+## Final suite validation
 
-After building, run the existing selections:
+The developer reported that the build and this combined selection passed at `c902383f`:
 
 ```bash
 pixi run build/release/test/cpp/sirius_unittest "[tiled_merge],[physical_merge_sort],[sort_comparison],[gpu_sampled_merge],[sampled_merge],[merge_fusion]"
 ```
 
-Record GPU model/count and any skipped cases alongside the result.
+GPU model/count and skipped-case details remain unspecified. Subsequent changes only
+replace unconditional test stdout with Catch2 failure diagnostics; they have not been rebuilt.
 
 ## Workload comparison
 
