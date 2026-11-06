@@ -20,6 +20,7 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/window/cumulative.hpp"
 #include "op/window/ranking.hpp"
 #include "op/window/whole_partition.hpp"
 #include "sirius_config.hpp"
@@ -55,8 +56,9 @@ struct ranking_window_expression {
 // Planning IR only: not an executable operator. All slots index the prepared input
 // (original columns followed by hidden expressions), except output_slot, which
 // indexes the visible output (original columns followed by window results).
-// A window holds either `expressions` (aggregates over the whole partition) or `rankings`
-// (ranking functions over `ranking_order`), never both.
+// A window holds either `expressions` (aggregates) or `rankings` (ranking functions over
+// `ranking_order`), never both. The aggregates are over the whole partition, or running aggregates
+// over `ranking_order` when `cumulative` is set.
 struct window_plan {
   duckdb::idx_t input_width;
   duckdb::vector<duckdb::LogicalType> prepared_types;
@@ -65,8 +67,12 @@ struct window_plan {
   std::vector<std::unique_ptr<ast::node>> hidden_expressions;
   std::vector<whole_partition_expression> expressions;
   std::vector<ranking_window_expression> rankings;
-  // Order key slots, direction and NULL placement shared by all `rankings`.
+  // Order key slots, direction and NULL placement shared by all `rankings`, or by all running
+  // aggregates.
   op::ranking_order ranking_order;
+  // Whether `expressions` are running aggregates over `ranking_order` (the frame `ROWS BETWEEN
+  // UNBOUNDED PRECEDING AND CURRENT ROW`).
+  bool cumulative = false;
 };
 
 /**

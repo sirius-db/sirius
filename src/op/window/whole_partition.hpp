@@ -108,4 +108,13 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
+/**
+ * @brief Check that every value of a DECIMAL128 sum column is below 10^38 in magnitude.
+ *
+ * @throws std::overflow_error if a value reaches the DECIMAL(38) bound.
+ */
+void check_decimal_sum_fits(cudf::column_view sums,
+                            ::cuda::stream_ref stream,
+                            rmm::device_async_resource_ref mr);
+
 }  // namespace sirius::op

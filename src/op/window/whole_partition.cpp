@@ -245,6 +245,23 @@ std::vector<whole_partition_aggregate> normalize(std::vector<whole_partition_agg
 
 }  // namespace
 
+void check_decimal_sum_fits(cudf::column_view sums,
+                            ::cuda::stream_ref stream,
+                            rmm::device_async_resource_ref mr)
+{
+  constexpr auto limit = int128_pow10(38);
+  auto bounds          = cudf::minmax(sums, stream, mr);
+  for (auto const* bound : {bounds.first.get(), bounds.second.get()}) {
+    if (bound->is_valid(stream)) {
+      auto const value =
+        static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(*bound).value(stream);
+      if (value <= -limit || value >= limit) {
+        throw std::overflow_error("Window sum exceeds DECIMAL(38)");
+      }
+    }
+  }
+}
+
 std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   cudf::table_view input,
   std::vector<cudf::size_type> const& partition_columns,
@@ -424,19 +441,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
       std::any_of(aggregates.begin(), aggregates.end(), [&](auto const& aggregate) {
         return aggregate.argument_column == arg.column && aggregate.function == aggregate_id::sum;
       });
-    if (decimal_sum) {
-      constexpr auto limit = int128_pow10(38);
-      auto bounds          = cudf::minmax(arg.sum->view(), stream, mr);
-      for (auto const* bound : {bounds.first.get(), bounds.second.get()}) {
-        if (bound->is_valid(stream)) {
-          auto const value =
-            static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(*bound).value(stream);
-          if (value <= -limit || value >= limit) {
-            throw std::overflow_error("Whole-partition window sum exceeds DECIMAL(38)");
-          }
-        }
-      }
-    }
+    if (decimal_sum) { check_decimal_sum_fits(arg.sum->view(), stream, mr); }
     if (arg.needs_avg) {
       auto sum   = cudf::cast(arg.sum->view(), f64, stream, mr);
       auto count = cudf::cast(results[i].results[1]->view(), f64, stream, mr);

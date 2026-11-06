@@ -336,11 +336,62 @@ TEST_CASE_METHOD(WindowFixture,
 }
 
 TEST_CASE_METHOD(WindowFixture,
+                 "running window aggregates execute on GPU",
+                 "[integration][gpu_execution][window_sql]")
+{
+  // Every ORDER BY identifies a row within its partition, so the result does not depend on the
+  // order of peers.
+  std::string const frame = " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+  for (std::string const window : {"ORDER BY id" + frame,
+                                   "PARTITION BY p ORDER BY id" + frame,
+                                   "PARTITION BY p,q ORDER BY id DESC" + frame,
+                                   "PARTITION BY s ORDER BY q NULLS FIRST,id" + frame,
+                                   "PARTITION BY p ORDER BY q DESC NULLS LAST,id DESC" + frame,
+                                   "PARTITION BY p+1 ORDER BY v*2,id" + frame}) {
+    compare_window("SELECT id,sum(v) OVER (" + window + "),min(v) OVER (" + window +
+                   "),max(v) OVER (" + window + "),count(v) OVER (" + window + "),count(*) OVER (" +
+                   window + ") FROM w");
+  }
+  // Decimal, floating point and date arguments.
+  compare_window("SELECT id,sum(d) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),min(d) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),max(d) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  compare_window("SELECT id,sum(f) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  compare_window("SELECT id,min(DATE '2020-01-01'+v) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),max(DATE '2020-01-01'+v) OVER (PARTITION BY p ORDER BY id" + frame +
+                 ") FROM w");
+  compare_window("SELECT id,sum(v::BIGINT) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),sum(v::SMALLINT) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  compare_window("SELECT id,count(s) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  // Several stages: a running aggregate next to a ranking function and a whole partition aggregate.
+  compare_window("SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),rank() OVER (PARTITION BY p ORDER BY id),sum(v) OVER (PARTITION BY p) FROM w");
+  compare_window("SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),max(v) OVER (PARTITION BY q ORDER BY id" + frame + ") FROM w");
+  // A running aggregate of an aggregate, over a join, the shape of TPC-DS Q51.
+  compare_window("SELECT p,q,sum(sum(d)) OVER (PARTITION BY p ORDER BY q" + frame +
+                 ") FROM (SELECT p,q,d FROM w WHERE q IS NOT NULL) GROUP BY p,q");
+  compare_window(
+    "SELECT p,q,max(a) OVER (PARTITION BY p ORDER BY q" + frame +
+    "),max(b) OVER (PARTITION BY p ORDER BY q" + frame +
+    ") FROM (SELECT coalesce(x.p,y.p) p,coalesce(x.q,y.q) q,x.s a,y.s b FROM "
+    "(SELECT p,q,sum(d) s FROM w WHERE q IS NOT NULL AND id%2=0 GROUP BY p,q) x FULL OUTER JOIN "
+    "(SELECT p,q,sum(d) s FROM w WHERE q IS NOT NULL AND id%3=0 GROUP BY p,q) y "
+    "ON x.p=y.p AND x.q=y.q)");
+}
+
+TEST_CASE_METHOD(WindowFixture,
                  "unsupported SQL window semantics retain CPU fallback",
                  "[integration][gpu_execution][window_sql]")
 {
   expect_plan_fallback_matches_cpu("SELECT id,sum(v) OVER (ORDER BY id) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,rank() OVER (ORDER BY v) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,avg(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,min(f) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT id,percent_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");
@@ -351,7 +402,7 @@ TEST_CASE_METHOD(WindowFixture,
                  "original TPC-DS window query probes",
                  "[integration][gpu_execution][window_tpcds]")
 {
-  auto const number         = GENERATE(12, 20, 36, 47, 53, 57, 63, 67, 70, 86, 89, 98);
+  auto const number         = GENERATE(12, 20, 36, 47, 51, 53, 57, 63, 67, 70, 86, 89, 98);
   auto const root           = std::filesystem::path(__FILE__).parent_path();
   auto const* override_path = std::getenv("SIRIUS_TPCDS_TEST_DB_PATH");
   auto const database =
@@ -475,6 +526,11 @@ TEST_CASE("SQL windows on two GPUs", "[integration][window_sql][multi_gpu]")
         "dense_rank() OVER (PARTITION BY p ORDER BY v) FROM w",
         "SELECT id,row_number() OVER (PARTITION BY p ORDER BY id DESC) FROM w",
         "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),sum(v) OVER (PARTITION BY id%5) FROM "
+        "w",
+        "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND "
+        "CURRENT ROW),max(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND "
+        "CURRENT ROW) FROM w",
+        "SELECT id,sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM "
         "w"}) {
     INFO(sql);
     run_ok("SET gpu_execution=false");
