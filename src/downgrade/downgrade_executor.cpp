@@ -233,11 +233,9 @@ void downgrade_executor::processing_loop()
       // Resolve the source memory space for filtering candidates
       source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-      // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK
-      // tier. NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on
-      // the post-#637 architecture): if preferred_numa_node is set, stable_partition the matching
-      // HOST space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space
-      // first.
+      // Build the target list: a GPU-source executor spills to the HOST spaces, then DISK; a
+      // HOST-source executor spills to DISK only. When preferred_numa_node is set, the matching
+      // HOST space(s) are moved to the front so cand->convert() tries the NUMA-local space first.
       if (_space_id.tier == cucascade::memory::Tier::GPU) {
         auto host_span =
           _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);

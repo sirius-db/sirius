@@ -37,6 +37,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -74,6 +75,22 @@ class convertible_data_batch : public convertible_data {
   }
 
   /**
+   * @brief Whether a batch currently in @p cur_space is one this conversion should move.
+   *
+   * False once a source-bound batch has left its source space, or when it already sits in a
+   * target space. convertible_gpu_pipeline_task applies the same rule under a shared lock before
+   * convert() re-checks it under the exclusive one.
+   */
+  static bool should_convert(
+    cucascade::memory::memory_space const* cur_space,
+    cucascade::memory::memory_space const* source_space,
+    const std::vector<const cucascade::memory::memory_space*>& target_spaces)
+  {
+    if (source_space != nullptr && cur_space != source_space) { return false; }
+    return std::find(target_spaces.begin(), target_spaces.end(), cur_space) == target_spaces.end();
+  }
+
+  /**
    * @brief Convert this batch to reside in one of the target memory spaces.
    *
    * Acquires an exclusive (mutable) lock on the batch -- blocking if blocking=true,
@@ -106,13 +123,8 @@ class convertible_data_batch : public convertible_data {
     }
     auto& mut = *mut_opt;
 
-    // Check if the batch is already in the target space, or has left its source space.
     auto cur_space = mut.get_memory_space();
-    if (_source_space != nullptr && cur_space != _source_space) { return std::nullopt; }
-    for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
-      const auto* space = target_spaces[idx];
-      if (cur_space == space) { return std::nullopt; }
-    }
+    if (!should_convert(cur_space, _source_space, target_spaces)) { return std::nullopt; }
 
     // A batch going to the GPU needs room for its decoded form, which for a compressed
     // batch is larger than what it occupies now.

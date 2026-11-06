@@ -29,7 +29,7 @@
 // data utilities
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <utils/telemetry_utils.hpp>
+#include <utils/convertible_task_test_utils.hpp>
 #include <utils/utils.hpp>
 
 // cucascade
@@ -51,12 +51,10 @@ using namespace sirius::parallel;
 
 namespace {
 
-/// Helper: get the tier of a data_batch using a temporary read-only lock.
-inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
-}
+using sirius::test::flat_key_extractor;
+using sirius::test::get_batch_size;
+using sirius::test::get_batch_tier;
+using sirius::test::make_test_gpu_task;
 
 cucascade::memory::memory_space* get_gpu_space(
   sirius::memory::sirius_memory_reservation_manager& mgr)
@@ -510,21 +508,6 @@ TEST_CASE("HOST-source monitor backs off when no disk is configured", "[downgrad
 
 namespace {
 
-/// Helper: get the size in bytes of a data_batch's data using a temporary read-only lock.
-inline size_t get_batch_size(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return ro.get_data()->get_size_in_bytes();
-}
-
-cucascade::memory::memory_space* first_space_of_tier(
-  sirius::memory::sirius_memory_reservation_manager& mgr, cucascade::memory::Tier tier)
-{
-  auto spaces = mgr.get_memory_spaces_for_tier(tier);
-  if (spaces.empty()) return nullptr;
-  return const_cast<cucascade::memory::memory_space*>(spaces.front());
-}
-
 // GPU (2 GB) + HOST (4 GB) + DISK (4 GB): every tier has room, so what moves is decided by the
 // source-space binding alone.
 std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_three_tier_manager()
@@ -547,31 +530,6 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_three_ti
     std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
   sirius::converter_registry::initialize();
   return manager;
-}
-
-/// One priority level for every task: these tests exercise the source-space filter, not ordering.
-sirius::exec::multi_index_priority_queue<sirius::parallel::itask>::key_extractor flat_extractor()
-{
-  return [](const sirius::parallel::itask&) {
-    return sirius::exec::index_keys{
-      0, sirius::op::SiriusPhysicalOperatorType::INVALID, 0, sirius::exec::no_preferred_device};
-  };
-}
-
-/// A gpu_pipeline_task whose input is the given batches, as the task-queue tier sees it.
-std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_queued_task(
-  uint64_t task_id, std::vector<std::shared_ptr<cucascade::data_batch>> batches)
-{
-  auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
-  auto local =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
-  auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
-    nullptr, sirius::test::make_test_telemetry_context());
-  return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
-    task_id,
-    std::vector<cucascade::shared_data_repository*>{},
-    std::move(local),
-    std::move(global));
 }
 
 /// A fresh batch moved to HOST, so a task can hold inputs in two spaces.
@@ -601,8 +559,8 @@ TEST_CASE("task conversion bound to HOST leaves the task's GPU batches on the GP
 {
   auto mem_mgr     = make_three_tier_manager();
   auto* gpu_space  = get_gpu_space(*mem_mgr);
-  auto* host_space = first_space_of_tier(*mem_mgr, cucascade::memory::Tier::HOST);
-  auto* disk_space = first_space_of_tier(*mem_mgr, cucascade::memory::Tier::DISK);
+  auto* host_space = mem_mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  auto* disk_space = mem_mgr->get_memory_space(cucascade::memory::Tier::DISK, 0);
   REQUIRE(gpu_space != nullptr);
   REQUIRE(host_space != nullptr);
   REQUIRE(disk_space != nullptr);
@@ -615,8 +573,8 @@ TEST_CASE("task conversion bound to HOST leaves the task's GPU batches on the GP
 
   sirius::exec::query_lifecycle_registry lifecycle;
   lifecycle.open_query(kTaskQueryId);
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_extractor());
-  REQUIRE(queue.push(make_queued_task(1, {gpu_batch, host_batch})));
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {gpu_batch, host_batch})));
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   auto cd = provider.get_next_convertible(host_space, /*front_to_back=*/false);
@@ -638,7 +596,7 @@ TEST_CASE("HOST executor spills only a mixed task's host batches to disk", "[dow
 {
   auto mem_mgr     = make_three_tier_manager();
   auto* gpu_space  = get_gpu_space(*mem_mgr);
-  auto* host_space = first_space_of_tier(*mem_mgr, cucascade::memory::Tier::HOST);
+  auto* host_space = mem_mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
   REQUIRE(gpu_space != nullptr);
   REQUIRE(host_space != nullptr);
 
@@ -650,8 +608,8 @@ TEST_CASE("HOST executor spills only a mixed task's host batches to disk", "[dow
   sirius::exec::query_lifecycle_registry lifecycle;
   lifecycle.open_query(kTaskQueryId);
   sirius::data::data_repository_manager_registry repo_registry;  // empty: task-queue tier only
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_extractor());
-  REQUIRE(queue.push(make_queued_task(1, {gpu_batch, host_batch})));
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {gpu_batch, host_batch})));
 
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade-host"},
@@ -701,8 +659,8 @@ TEST_CASE("task-queue downgrade credits only the bytes it moved", "[downgrade_di
   sirius::exec::query_lifecycle_registry lifecycle;
   lifecycle.open_query(kTaskQueryId);
   sirius::data::data_repository_manager_registry repo_registry;  // empty: task-queue tier only
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_extractor());
-  REQUIRE(queue.push(make_queued_task(1, {first, second})));
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {first, second})));
 
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
