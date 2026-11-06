@@ -70,9 +70,7 @@ enum class placement {
 /// size on every rank, since every rank plans the same estimate.
 constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
 constexpr std::size_t max_bloom_keys = std::size_t{1} << 30;
-/// A join whose estimated build is smaller publishes no filters: its build can be empty on some
-/// rank, and an empty build only takes part in the merge once its probe has finished, while the
-/// ranks with build rows hold their probe until the merge completes.
+/// A hash join whose estimated build has fewer rows publishes no merged Bloom filters.
 constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
 /// A join's build side is broadcast, and its probe side stays where it is, when the whole build
 /// fits this budget on every GPU and sending it to every rank moves fewer bytes than hashing both
