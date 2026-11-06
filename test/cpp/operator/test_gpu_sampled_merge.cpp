@@ -444,6 +444,7 @@ TEST_CASE("coalescing qualifies tiny caps and ordinary row sizing with wide keys
         previous = host[t];
       }
     }
+    auto coalesce_ms = std::chrono::duration<double, std::milli>(end - start).count();
     INFO("sampled_merge_coalescing pre_k="
          << k << " post_k=" << coalesced.size() << " chunk_bytes=" << chunk
          << " row_limit=" << row_limit << " reservation_bytes=" << reservation.bytes
@@ -451,7 +452,7 @@ TEST_CASE("coalescing qualifies tiny caps and ordinary row sizing with wide keys
          << " sample_bytes=" << sample_bytes << " coalesce_peak=" << coalesce_peak
          << " order_peak=" << order_peak << " splitters=" << splitters->num_rows()
          << " max_tile_rows=" << *std::max_element(tile_rows.begin(), tile_rows.end())
-         << " coalesce_ms=" << std::chrono::duration<double, std::milli>(end - start).count());
+         << " coalesce_ms=" << coalesce_ms);
     CHECK(std::accumulate(tile_rows.begin(), tile_rows.end(), uint64_t{0}) == k * rows);
     CHECK(*std::max_element(tile_rows.begin(), tile_rows.end()) <= row_limit);
   }
