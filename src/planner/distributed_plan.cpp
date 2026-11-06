@@ -204,7 +204,10 @@ struct rewriter {
   {
     if (!join.publishes_dynamic_filters()) { return; }
     auto const build_rows = join.children[1]->estimated_cardinality;
-    if (build_rows < min_merged_build_rows) {
+    // A right semi or anti join publishes before its probe side drains; a merge would make that
+    // wait on every rank's build.
+    if (build_rows < min_merged_build_rows || join.join_type == duckdb::JoinType::RIGHT_SEMI ||
+        join.join_type == duckdb::JoinType::RIGHT_ANTI) {
       join.cancel_dynamic_filter_publication();
       shape += "f";
       return;
@@ -245,6 +248,12 @@ struct rewriter {
         auto& build       = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
         auto const world  = static_cast<std::uint64_t>(service->world_size());
         auto const bbytes = estimated_bytes(*build.children[0]);
+        // A BUILD_FILTER (right semi and anti joins only, which publish nothing distributed)
+        // would publish this rank's keys alone, before the exchange: it goes.
+        if (build.children[0]->type == T::BUILD_FILTER) {
+          auto input        = std::move(build.children[0]->children[0]);
+          build.children[0] = std::move(input);
+        }
         if (emits_build_rows_only_with_probe(join.join_type) &&
             bbytes <= max_broadcast_build_bytes &&
             bbytes <= estimated_bytes(*probe.children[0]) / std::max<std::uint64_t>(world - 1, 1)) {

@@ -323,6 +323,54 @@ TEST_CASE("distribute_plan broadcasts a small build and hashes a large one", "[e
   }
 }
 
+TEST_CASE("distribute_plan drops a right semi or anti join's early build publication",
+          "[exchange][planner]")
+{
+  fixture f;
+  std::string const join_type = GENERATE("SEMI", "ANTI");
+  CAPTURE(join_type);
+  // The filtered side is the smaller, so DuckDB builds on it: a right semi or anti join, which
+  // one process plans with a BUILD_FILTER that publishes before the build is complete.
+  auto const sql =
+    "SELECT b.k FROM big b " + join_type + " JOIN big2 c ON b.k = c.k WHERE b.v <> 0";
+  {
+    auto const local = f.lowered(sql);
+    auto* join       = find(*local, T::HASH_JOIN);
+    REQUIRE(join);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().join_type ==
+            (join_type == "SEMI" ? duckdb::JoinType::RIGHT_SEMI : duckdb::JoinType::RIGHT_ANTI));
+    REQUIRE(find(*local, T::BUILD_FILTER));
+    // At least 2^14 rows, or distribute_plan cancels the publication as too small to merge anyway.
+    REQUIRE(join->children[1]->estimated_cardinality >= std::size_t{1} << 14);
+  }
+  ranks c(2, f.gpu());
+  auto plans = plan_on_every_rank(f, sql, 2);
+  REQUIRE(distribute(plans, c, f) == std::vector<std::string>(2));
+  for (auto& p : plans) {
+    CHECK_FALSE(find(*p, T::BUILD_FILTER));
+    auto* join = find(*p, T::HASH_JOIN);
+    REQUIRE(join);
+    auto& hash_join = join->Cast<sirius::op::sirius_physical_hash_join>();
+    // Nothing merges this join's filters, and its targets expect none before it runs.
+    CHECK(hash_join.dynamic_filter_plan().distributed() == nullptr);
+    auto const& targets = hash_join.dynamic_filter_plan().probe_targets();
+    REQUIRE_FALSE(targets.empty());
+    for (auto const& target : targets) {
+      // As execution does once planning is over; then a snapshot is terminal when every
+      // producer has finished.
+      target.filter_set->freeze_registration();
+      auto const snapshot = target.filter_set->snapshot();
+      CHECK(snapshot.terminal());
+      CHECK(snapshot.empty());
+    }
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK(sink_below(*side)->spec().routing == exchange_spec::mode::hash);
+    }
+  }
+}
+
 TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
           "[exchange][planner]")
 {
