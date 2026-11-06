@@ -297,7 +297,7 @@ TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "
     services[r]->attach(stream, std::make_shared<recording_inbound>(got[r], stream));
   }
   for (rank_t r = 0; r < 2; ++r) {
-    services[r]->send(stream, 1 - r, exchange_batch(r, 1 - r, 0, 20'000));
+    services[r]->send(stream, 1 - r, exchange_batch(r, 1 - r, stream, 0, 20'000));
     services[r]->close(stream, 1 - r);
   }
   for (rank_t r = 0; r < 2; ++r) {
@@ -306,7 +306,7 @@ TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "
     std::lock_guard lock{g.mutex};
     REQUIRE_FALSE(g.error);
     CHECK(g.batches[{1 - r, stream}] ==
-          std::vector<table_digest>{digest(exchange_batch(1 - r, r, 0, 20'000))});
+          std::vector<table_digest>{digest(exchange_batch(1 - r, r, stream, 0, 20'000))});
   }
   // The last reference tears down the service, then the fabric and the rings.
   services.clear();
