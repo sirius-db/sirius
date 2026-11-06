@@ -24,16 +24,28 @@
 #include "sirius/exception.hpp"
 
 #include <cudf/copying.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/types.hpp>
+#include <cudf/unary.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -80,6 +92,97 @@ std::shared_ptr<cucascade::data_batch> ship(std::shared_ptr<cucascade::data_batc
   return landing->seal(recv_stream.view());
 }
 
+std::vector<std::uint8_t> fixed_width_bytes(cudf::column_view const& column)
+{
+  auto const width = cudf::size_of(column.type());
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(column.size()) * width);
+  REQUIRE(cudaMemcpy(bytes.data(),
+                     static_cast<std::uint8_t const*>(column.head()) + column.offset() * width,
+                     bytes.size(),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  return bytes;
+}
+
+/// A strings column's rows on the host; the offsets may be INT32 or INT64, so they are read as
+/// INT64.
+std::vector<std::string> strings_to_host(cudf::column_view const& column)
+{
+  cudf::strings_column_view const strings(column);
+  auto const offsets_column = cudf::cast(strings.offsets(), cudf::data_type{cudf::type_id::INT64});
+  std::vector<std::int64_t> offsets(static_cast<std::size_t>(column.size()) + 1);
+  REQUIRE(cudaMemcpy(offsets.data(),
+                     offsets_column->view().data<std::int64_t>() + column.offset(),
+                     offsets.size() * sizeof(std::int64_t),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  std::vector<char> chars(static_cast<std::size_t>(offsets.back()));
+  REQUIRE(cudaMemcpy(chars.data(),
+                     strings.chars_begin(cudf::get_default_stream()),
+                     chars.size(),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  std::vector<std::string> rows;
+  rows.reserve(column.size());
+  for (std::size_t i = 0; i + 1 < offsets.size(); ++i) {
+    rows.emplace_back(chars.data() + offsets[i], chars.data() + offsets[i + 1]);
+  }
+  return rows;
+}
+
+/// Requires @p actual to hold @p expected's values and NULL positions, row for row.
+void check_same_rows(cudf::table_view const& expected, cudf::table_view const& actual)
+{
+  REQUIRE(actual.num_columns() == expected.num_columns());
+  REQUIRE(actual.num_rows() == expected.num_rows());
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  for (cudf::size_type i = 0; i < expected.num_columns(); ++i) {
+    INFO("column " << i);
+    auto const& want = expected.column(i);
+    auto const& got  = actual.column(i);
+    REQUIRE(got.type() == want.type());
+    CHECK(got.null_count() == want.null_count());
+    // Compared as bools: Catch would print every row of a mismatch.
+    bool const same_nulls = utils::copy_validity_to_host(got) == utils::copy_validity_to_host(want);
+    CHECK(same_nulls);
+    bool const same_values = want.type().id() == cudf::type_id::STRING
+                               ? strings_to_host(got) == strings_to_host(want)
+                               : fixed_width_bytes(got) == fixed_width_bytes(want);
+    CHECK(same_values);
+  }
+}
+
+/// The gate of test_spill_converter_ordering.cpp: parks a stream until the test releases it.
+struct delay_state {
+  std::atomic<bool> release{false};
+  std::atomic<bool> entered{false};
+  std::atomic<bool> timed_out{false};
+
+  ~delay_state() { release.store(true, std::memory_order_release); }
+};
+
+void CUDART_CB block_until_released(void* user_data)
+{
+  auto* state = static_cast<delay_state*>(user_data);
+  state->entered.store(true, std::memory_order_release);
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (!state->release.load(std::memory_order_acquire)) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      state->timed_out.store(true, std::memory_order_release);
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+}
+
+bool wait_for_flag(std::atomic<bool> const& flag,
+                   std::chrono::milliseconds timeout = std::chrono::seconds{5})
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!flag.load(std::memory_order_acquire)) {
+    if (std::chrono::steady_clock::now() >= deadline) { return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
+
 }  // namespace
 
 TEST_CASE("a GPU batch lands on the GPU frame by frame", "[exchange][batch_io]")
@@ -109,6 +212,113 @@ TEST_CASE("a batch lands on host when the GPU has no room", "[exchange][batch_io
     CHECK(dynamic_cast<cucascade::host_data_representation const*>(ro.get_data()) != nullptr);
   }
   CHECK(digest(received) == expected);
+}
+
+TEST_CASE("a host landing spread over several host blocks keeps every value and NULL",
+          "[exchange][batch_io]")
+{
+  auto const* host_mr =
+    env().host->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+  REQUIRE(host_mr != nullptr);
+  auto const block = host_mr->get_block_size();
+  // About 3.2 MB; frames that do not divide the block size straddle block edges.
+  constexpr std::size_t frame = 100'000;
+  REQUIRE(block % frame != 0);
+  auto batch = gpu_batch(sample_table(80'000));
+  {
+    rmm::cuda_stream stream;
+    auto out = outgoing_batch::make(batch, stream.view());
+    REQUIRE(out.has_value());
+    REQUIRE(out->stream_bytes() > 2 * block);
+  }
+  std::shared_ptr<cucascade::data_batch> received;
+  {
+    auto const hold = hold_gpu();
+    received        = ship(batch, frame, Tier::HOST);
+  }
+  {
+    auto ro = received->to_read_only();
+    REQUIRE(ro.get_current_tier() == Tier::HOST);
+    auto const& host = ro.get_data()->cast<cucascade::host_data_representation>();
+    CHECK(host.get_host_table()->allocation->size() > 2);
+  }
+  CHECK(digest(received) == digest(batch));  // brings the received batch to the GPU
+  auto const want = batch->to_read_only();
+  auto const got  = received->to_read_only();
+  check_same_rows(sirius::get_cudf_table_view(want), sirius::get_cudf_table_view(got));
+}
+
+TEST_CASE("a send waits for the batch's pending writer", "[exchange][batch_io]")
+{
+  constexpr cudf::size_type rows = 50'000;
+  std::vector<std::int32_t> values(rows);
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    values[i] = i * 3 + 1;
+  }
+  auto const final_values = numeric_column(cudf::data_type{cudf::type_id::INT32}, values);
+  auto stale =
+    numeric_column(cudf::data_type{cudf::type_id::INT32}, std::vector<std::int32_t>(rows, -1));
+  auto* const target = stale->mutable_view().data<std::int32_t>();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(stale));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  // Non-blocking, so nothing on the legacy default stream waits behind the gate.
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream send_stream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream recv_stream;
+  rmm::device_buffer send_frame(rows * sizeof(std::int32_t), send_stream.view());
+  send_stream.synchronize();
+  std::shared_ptr<cucascade::data_batch> batch;
+  std::optional<outgoing_batch> out;
+  std::unique_ptr<incoming_batch> landing;
+  delay_state gate;
+  absl::Cleanup release_producer = [&] {
+    gate.release.store(true, std::memory_order_release);
+    producer.synchronize_no_throw();
+    send_stream.synchronize_no_throw();
+  };
+  REQUIRE(cudaLaunchHostFunc(producer.value(), block_until_released, &gate) == cudaSuccess);
+  // The batch's last write, queued behind the gate.
+  REQUIRE(cudaMemcpyAsync(target,
+                          final_values->view().data<std::int32_t>(),
+                          rows * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToDevice,
+                          producer.value()) == cudaSuccess);
+  batch = sirius::make_data_batch(
+    std::move(table), *env().gpu, producer.view(), sirius::telemetry::batch_telemetry_info{});
+  REQUIRE(wait_for_flag(gate.entered));
+
+  out = outgoing_batch::make(batch, send_stream.view());
+  REQUIRE(out.has_value());
+  auto const bytes = out->stream_bytes();
+  REQUIRE(bytes <= send_frame.size());
+  landing = incoming_batch::land(
+    decode_header(encode_header(out->header())), *env().gpu, env().host, recv_stream.view());
+  REQUIRE(landing != nullptr);
+  CHECK(landing->tier() == Tier::GPU);
+  recv_stream.synchronize();
+  // The copy out of the batch and its delivery, both on the send stream.
+  out->copy_range(0, bytes, send_frame.data(), send_stream.view());
+  landing->copy_in(0, send_frame.data(), bytes, send_stream.view());
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  CHECK(cudaStreamQuery(send_stream.value()) == cudaErrorNotReady);
+  CHECK_FALSE(gate.timed_out.load());
+
+  gate.release.store(true, std::memory_order_release);
+  send_stream.synchronize();
+  REQUIRE_FALSE(gate.timed_out.load());
+  out.reset();
+  auto const received = landing->seal(recv_stream.view());
+  auto const ro       = received->to_read_only();
+  if (cudaEvent_t writer = ro.get_writer_event()) {
+    REQUIRE(cudaEventSynchronize(writer) == cudaSuccess);
+  }
+  auto const column = sirius::get_cudf_table_view(ro).column(0);
+  CHECK(column.null_count() == 0);
+  bool const every_value_final = utils::copy_column_to_host<std::int32_t>(column) == values;
+  CHECK(every_value_final);
 }
 
 TEST_CASE("a landing with no room anywhere is refused, not waited for", "[exchange][batch_io]")
