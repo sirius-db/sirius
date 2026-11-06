@@ -40,7 +40,8 @@ class inbound {
                         std::shared_ptr<cucascade::data_batch> data) = 0;
   /// Rank @p from will send no more.
   virtual void on_end(rank_t from) = 0;
-  /// The exchange failed: no more batches will come.
+  /// The exchange failed. A batch callback already selected for delivery may still run
+  /// concurrently or afterward.
   virtual void on_error(std::exception_ptr error) = 0;
 };
 

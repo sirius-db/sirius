@@ -182,8 +182,11 @@ std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
     host != nullptr
       ? host->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>()
       : nullptr;
-  if (gpu_need > gpu.get_max_memory() &&
-      (host_mr == nullptr || out->_header.stream_bytes > host->get_max_memory())) {
+  // The host resource throws, rather than declining, for a block-rounded request over its limit.
+  bool const host_fits =
+    host_mr != nullptr &&
+    rmm::align_up(out->_header.stream_bytes, host_mr->get_block_size()) <= host->get_max_memory();
+  if (gpu_need > gpu.get_max_memory() && !host_fits) {
     throw sirius::internal_exception(
       "exchange: a {}-byte batch can land neither on the GPU ({} bytes) nor in host memory",
       out->_header.stream_bytes,
@@ -209,7 +212,7 @@ std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
   }
 
   // 2. Host blocks, laid out at the stream's own offsets.
-  if (host_mr == nullptr) { return nullptr; }
+  if (!host_fits) { return nullptr; }
   auto const bytes = out->_header.stream_bytes;
   if (auto reservation = host->make_reservation_or_null(bytes)) {
     try {
@@ -250,10 +253,10 @@ void incoming_batch::copy_in(std::size_t begin,
 
 std::shared_ptr<cucascade::data_batch> incoming_batch::seal(rmm::cuda_stream_view stream)
 {
-  auto const batch_id = sirius::get_next_batch_id();
-  auto probe          = telemetry::quent_data_batch_probe::create({}, batch_id);
   if (_tier == Tier::HOST) {
-    auto table = cucascade::memory::host_table_allocation::create(
+    auto const batch_id = sirius::get_next_batch_id();
+    auto probe          = telemetry::quent_data_batch_probe::create({}, batch_id);
+    auto table          = cucascade::memory::host_table_allocation::create(
       std::move(_host_blocks), _header.columns, _header.stream_bytes);
     return cucascade::data_batch::make(
       batch_id,
@@ -272,10 +275,8 @@ std::shared_ptr<cucascade::data_batch> incoming_batch::seal(rmm::cuda_stream_vie
     columns.push_back(rebuild(c, next));
   }
   _gpu_buffers.clear();
-  auto repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(columns)), *_space, stream);
-  if (repr->get_writer_event() == nullptr) { repr->record_writer_event(stream); }
-  return cucascade::data_batch::make(batch_id, std::move(repr), std::move(probe));
+  return sirius::make_data_batch(
+    std::make_unique<cudf::table>(std::move(columns)), *_space, stream, {});
 }
 
 }  // namespace sirius::exchange
