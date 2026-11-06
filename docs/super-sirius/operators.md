@@ -718,12 +718,19 @@ descriptors contain repository locations and host metadata; ordinary task prepar
 acquires read handles and restores only the selected work's inputs on its assigned GPU.
 Full backing allocations count even when an operation reads a slice.
 
-At claim time, the coordinator captures an immutable operation-specific request containing
+When scheduling work, the coordinator constructs an immutable operation-specific request containing
 source handles, comparison settings and the operation's parameters. Extraction requests
 include splitter bounds and destination slots; publication requests include the final
 projection. GPU execution reads this request and prepared batches without dereferencing
 range state. Runtime batch replacement preserves the same request through reservation
 retries. Scheduling identity and reservation-attempt metadata remain in the task adapter.
+Operation-specific results pair each output batch with its destination. Extraction results
+also retain the original contribution intervals; splitter-selection results retain the
+page list and splitter count. The adapter derives the runtime batch list from these
+results and rebinds their batch pointers when runtime materialization replaces batches.
+Publication and completion consume the paired results rather than parallel metadata
+and batch arrays.
+
 
 
 The task creator claims operator-local work under a mutex from pending queues. Completion
