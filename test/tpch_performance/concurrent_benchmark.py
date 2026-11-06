@@ -7,7 +7,7 @@ are retained between requests unless validation is enabled.
 """
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import csv
 import hashlib
 import json
@@ -39,20 +39,33 @@ FIELDS = (
 )
 
 
+def uses_concurrent_runner(args):
+    return args.concurrency > 1 or args.concurrency_mode == "cooperative"
+
+
+def execution_count(args, queries):
+    copies = args.concurrency if args.concurrency_mode == "identical" else 1
+    return copies * len(queries) * args.iterations
+
+
 def check_arguments(args):
     if args.concurrency < 1:
         raise SystemExit("--concurrency must be positive")
-    if args.concurrency == 1:
+    if not uses_concurrent_runner(args):
         if args.stream_order is not None:
             raise SystemExit("--stream-order requires --concurrency > 1")
         return
+    if args.concurrency_mode == "cooperative" and args.stream_order == "permuted":
+        raise SystemExit(
+            "--concurrency-mode cooperative uses --queries order; --stream-order permuted is not supported"
+        )
     if args.mode is not None:
         raise SystemExit(
-            "--mode is not supported with concurrency > 1; use --stream-order"
+            "--mode is not supported by the concurrent runner; use --stream-order"
         )
     if args.profile == "cold":
         raise SystemExit(
-            "--profile cold resets shared caches per query; incompatible with concurrency > 1"
+            "--profile cold resets shared caches per query; incompatible with the concurrent runner"
         )
     if args.precmd != "none" or args.nsys_profile:
         raise SystemExit(
@@ -60,7 +73,7 @@ def check_arguments(args):
         )
     if args.pin_after_iteration != 0:
         raise SystemExit(
-            "--pin-after-iteration is not supported with concurrency > 1; only an initial union pin is allowed"
+            "--pin-after-iteration is not supported by the concurrent runner; only an initial union pin is allowed"
         )
     if args.iterations < 1:
         raise SystemExit("--iterations must be positive")
@@ -239,12 +252,22 @@ def supervise(args, directory, config_path, validate, references, compression_pl
         {
             "schema_version": 2,
             "concurrency": args.concurrency,
+            "concurrency_mode": args.concurrency_mode,
             "sirius_max_concurrent_queries": limit,
-            "stream_order": args.stream_order or "permuted",
-            "stream_queries": orders_for(
-                queries, args.concurrency, args.stream_order or "permuted"
+            "stream_order": (
+                "same"
+                if args.concurrency_mode == "cooperative"
+                else args.stream_order or "permuted"
             ),
-            "executions_per_engine": args.concurrency * len(queries) * args.iterations,
+            "stream_queries": (
+                orders_for(queries, args.concurrency, args.stream_order or "permuted")
+                if args.concurrency_mode == "identical"
+                else None
+            ),
+            "shared_query_order": (
+                queries if args.concurrency_mode == "cooperative" else None
+            ),
+            "executions_per_engine": execution_count(args, queries),
             "pin_policy": "union-before-run" if args.pin != "none" else "none",
             "validation": validate,
             "validation_memory_limit_mb": args.validation_memory_limit_mb,
@@ -276,7 +299,7 @@ def supervise(args, directory, config_path, validate, references, compression_pl
     spec_path = directory / "concurrent_request.json"
     write_json(spec_path, spec)
     print(
-        f"Concurrent clients: {args.concurrency}; configured Sirius admission: {limit}",
+        f"Concurrent clients: {args.concurrency}; mode: {args.concurrency_mode}; configured Sirius admission: {limit}",
         flush=True,
     )
     termination = "completed"
@@ -406,6 +429,36 @@ def run_phase(
     records, captures, setup_errors = [], {}, []
     lock = threading.Lock()
     stop = threading.Event()
+    # Reserve each stream's first request in stream order. Subsequent requests
+    # are claimed atomically by whichever stream is ready, with no iteration barrier.
+    pending = (
+        deque(
+            (iteration, query)
+            for iteration in range(args.iterations)
+            for query in queries
+        )
+        if args.concurrency_mode == "cooperative"
+        else deque()
+    )
+    initial = [pending.popleft() if pending else None for _ in orders]
+    queue_lock = threading.Lock()
+
+    def requests(stream, order):
+        if args.concurrency_mode == "identical":
+            for iteration in range(args.iterations):
+                for query in order:
+                    yield iteration, query
+            return
+        first = initial[stream - 1]
+        if first is not None:
+            yield first
+        while not stop.is_set():
+            with queue_lock:
+                if not pending:
+                    return
+                request = pending.popleft()
+            yield request
+
     epoch = [None]
     barrier = threading.Barrier(
         args.concurrency + 1, action=lambda: epoch.__setitem__(0, time.perf_counter())
@@ -426,64 +479,63 @@ def run_phase(
                 con.execute("PRAGMA profiling_mode='detailed'")
             barrier.wait()
             sequence = 0
-            for iteration in range(args.iterations):
-                for query in order:
-                    if stop.is_set():
-                        return
-                    key = (engine, stream, query, iteration)
-                    label = f"readonly_s{stream}_q{query}_i{iteration}"
-                    try:
-                        if s3_input is not None:
-                            s3_input.refresh_secret(con, use_gpu)
-                        if use_gpu:
-                            con.execute(f"CALL sirius_set_query_label('{label}')")
-                        elif args.duckdb_profiling:
-                            path = directory / engine / f"stream{stream}" / f"q{query}"
-                            path.mkdir(parents=True, exist_ok=True)
-                            sql_path = str(
-                                path / f"profile_iter{iteration}.json"
-                            ).replace("'", "''")
-                            con.execute(f"PRAGMA profiling_output='{sql_path}'")
-                        start, end, count, rows, status, error = execute_request(
-                            con,
-                            query_texts[f"q{query}"],
-                            args.query_timeout,
-                            capture,
-                            budget,
+            for iteration, query in requests(stream, order):
+                if stop.is_set():
+                    return
+                key = (engine, stream, query, iteration)
+                label = f"readonly_s{stream}_q{query}_i{iteration}"
+                try:
+                    if s3_input is not None:
+                        s3_input.refresh_secret(con, use_gpu)
+                    if use_gpu:
+                        con.execute(f"CALL sirius_set_query_label('{label}')")
+                    elif args.duckdb_profiling:
+                        path = directory / engine / f"stream{stream}" / f"q{query}"
+                        path.mkdir(parents=True, exist_ok=True)
+                        sql_path = str(path / f"profile_iter{iteration}.json").replace(
+                            "'", "''"
                         )
-                    except Exception as exc:
-                        start = end = time.perf_counter()
-                        count, rows, status, error = 0, None, "error", str(exc)
-                    record = dict(
-                        zip(
-                            FIELDS,
-                            (
-                                engine,
-                                stream,
-                                f"q{query}",
-                                iteration,
-                                sequence,
-                                start - epoch[0],
-                                end - epoch[0],
-                                end - start,
-                                status,
-                                count,
-                                error,
-                            ),
-                        )
+                        con.execute(f"PRAGMA profiling_output='{sql_path}'")
+                    start, end, count, rows, status, error = execute_request(
+                        con,
+                        query_texts[f"q{query}"],
+                        args.query_timeout,
+                        capture,
+                        budget,
                     )
-                    with lock:
-                        records.append(record)
-                        if rows is not None:
-                            captures[key] = rows
-                        writer.writerow(record)
-                        output.flush()
-                    sequence += 1
-                    if (
-                        "validation capture budget exceeded" in error
-                        or "runtime is unavailable" in error.lower()
-                    ):
-                        stop.set()
+                except Exception as exc:
+                    start = end = time.perf_counter()
+                    count, rows, status, error = 0, None, "error", str(exc)
+                record = dict(
+                    zip(
+                        FIELDS,
+                        (
+                            engine,
+                            stream,
+                            f"q{query}",
+                            iteration,
+                            sequence,
+                            start - epoch[0],
+                            end - epoch[0],
+                            end - start,
+                            status,
+                            count,
+                            error,
+                        ),
+                    )
+                )
+                with lock:
+                    records.append(record)
+                    if rows is not None:
+                        captures[key] = rows
+                    writer.writerow(record)
+                    output.flush()
+                sequence += 1
+                if (
+                    "validation capture budget exceeded" in error
+                    or "runtime is unavailable" in error.lower()
+                ):
+                    stop.set()
         except threading.BrokenBarrierError:
             pass
         except BaseException as exc:
@@ -732,7 +784,7 @@ def run(spec):
                     for (_, _, q, _), rows in sorted(phase_captures.items()):
                         references.setdefault(q, rows)
                 summaries[engine] = summarize(
-                    records, args.concurrency * args.iterations * len(queries), errors
+                    records, execution_count(args, queries), errors
                 )
                 write_json(
                     directory / "concurrent_summary.json",
