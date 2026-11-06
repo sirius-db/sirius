@@ -79,6 +79,7 @@ target_sources(
           sirius_physical_hash_join.cpp
           sirius_physical_limit.cpp
           sirius_physical_merge_sort.cpp
+          sirius_physical_tiled_merge_sort.cpp
           sirius_physical_nested_loop_join.cpp
           sirius_physical_operator.cpp
           sirius_physical_operator_type.cpp

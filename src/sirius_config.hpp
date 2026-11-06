@@ -57,6 +57,7 @@ constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_CHUNK_BYTES     = DEFAULT_BATCH_SIZE;
 
 /// Fallback BUILD_PROBE budgets with the default hash partition size equal to batch size.
 /// Resolution derives the index budget from startup hash_partition_bytes; the resident budget
@@ -179,6 +180,9 @@ struct operator_params {
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.
   uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
+
+  /// Decoded-byte target for owning ORDER BY runs and merge chunks; one row may exceed it.
+  uint64_t sort_chunk_bytes = config::DEFAULT_SORT_CHUNK_BYTES;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;

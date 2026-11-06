@@ -232,6 +232,10 @@ class operator_data {
    */
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
 
+  // A finite replan marker commits dependencies but processes no payload. Such
+  // results retain failed-attempt observations, never successful payload history.
+  [[nodiscard]] virtual bool is_control_only() const noexcept { return false; }
+
  private:
   /// Producer-assigned device preference; nullopt until set_preferred_device_id.
   std::optional<int> _preferred_device_id;
@@ -486,6 +490,11 @@ class partitioned_operator_data : public pipelineable_operator_data {
 
  private:
   std::optional<std::size_t> _partition_idx;
+};
+
+struct task_attempt_context {
+  std::size_t granted_bytes;
+  std::size_t effective_ceiling;  // selected memory space's attainable maximum, not free memory
 };
 
 /**
@@ -882,6 +891,10 @@ class sirius_physical_operator {
   void push_data_batch_at_position(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t position);
+  void push_data_batch_at_position(std::string_view port_id,
+                                   std::shared_ptr<::cucascade::data_batch> batch,
+                                   std::size_t position,
+                                   std::size_t partition);
 
   /// Publish to destination zero after on_input_batch_pushed observes the batch.
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
@@ -950,6 +963,22 @@ class sirius_physical_operator {
    */
   virtual void on_input_batch_pushed(std::string_view port_id, ::cucascade::data_batch& batch);
 
+ public:
+  // Attempt notification precedes preparation. The recovery hook runs only for
+  // source == sink, after exception synchronization and before any sink entry.
+  // It may return a control input; it must not publish, retain locks, retire
+  // sources or mutate shared progress. nullptr retains ordinary retry behavior.
+  virtual void notify_task_attempt(operator_data&, task_attempt_context) {}
+  virtual std::unique_ptr<operator_data> recover_preparation_failure(operator_data const&,
+                                                                     task_attempt_context)
+  {
+    return nullptr;
+  }
+  // Exactly once after every sink destination and stream completion succeeds.
+  // Retries and partial publication never reach this hook; callback failure is fatal.
+  virtual void on_task_output_published(operator_data const&) {}
+
+ protected:
   std::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! Lookup map: port name -> raw pointer into _ports_list (never owns)
   std::unordered_map<std::string, port*> ports;

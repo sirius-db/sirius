@@ -488,6 +488,9 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
   // carrier contracts are established at wrap time from the finished sidecars.
   D_ASSERT(slot->type != sirius::op::SiriusPhysicalOperatorType::PARTITION &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::CONCAT &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_NORMALIZE &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_CUTS &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_EXTRACT &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_SORT &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_GROUP_BY &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_TOP_N &&

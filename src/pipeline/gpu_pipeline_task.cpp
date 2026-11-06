@@ -706,6 +706,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
+  op::task_attempt_context const attempt{reservation_bytes,
+                                         requested_memory_space->get_max_memory()};
+  if (source_op) { source_op->notify_task_attempt(*local_state._input_data, attempt); }
 
   auto executor_thread_resource_id = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()};
   if (auto const& h = telemetry::executor_thread_telemetry_state.handle) {
@@ -737,6 +740,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     // is accurate.
     stream.sync();
   } catch (const rmm::out_of_memory& oom) {
+    // Observe the failure before asking the operator for a control input. No
+    // shared progress can commit until ordinary publication/completion below.
+    synchronize_after_exception(stream, pipeline);
     auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
     std::optional<std::size_t> retry_requested_bytes;
     if (auto const* cc_oom =
@@ -757,12 +763,23 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
-    SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
-                     pipeline->get_pipeline_id());
-    throw oom_reschedule_exception(
-      std::move(local_state._input_data),
-      local_state._start_operator_index,
-      std::string("OOM while preparing batches for processing: ") + oom.what());
+    bool replanned = false;
+    if (source_op && sink_op && source_op.get() == sink_op.get()) {
+      auto replacement = source_op->recover_preparation_failure(*local_state._input_data, attempt);
+      if (replacement) {
+        // Dropping failed prepared input releases its handles before control compute.
+        local_state._input_data = std::move(replacement);
+        replanned               = true;
+      }
+    }
+    if (!replanned) {
+      SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
+                       pipeline->get_pipeline_id());
+      throw oom_reschedule_exception(
+        std::move(local_state._input_data),
+        local_state._start_operator_index,
+        std::string("OOM while preparing batches for processing: ") + oom.what());
+    }
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
                      pipeline->get_pipeline_id(),
@@ -839,7 +856,13 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     // before: peak_allocated_bytes is a running high-water mark for the whole stream, so recording
     // here also captures whatever the sink's own deferral restoration allocated -- otherwise a
     // reservation sized from this history would systematically undercount a sink port's true peak.
-    if (output_data) {
+    if (output_data && output_data->is_control_only()) {
+      auto peak               = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      auto materialized_bytes = local_state.get_reservation_size_info()->bytes_to_materialize_input;
+      peak                    = peak > materialized_bytes ? peak - materialized_bytes : 0;
+      _global_state->cast<gpu_pipeline_task_global_state>().get_memory_history().record_on_failure(
+        input_basis, peak);
+    } else if (output_data) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
       // operators. Clamp at zero to avoid size_t underflow when estimates exceed the observed peak.
@@ -878,6 +901,10 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     }
 
     stream.sync();
+    // This lifecycle contract is independent of the sink's algorithm.
+    if (output_data && sink_op) {
+      sink_op->on_task_output_published(materialized ? *materialized : *output_data);
+    }
   } catch (...) {
     // output_data and materialized were declared outside this try, so they remain alive until
     // every sink/finalization enqueue on the task stream has quiesced.
@@ -975,6 +1002,15 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
     info.peak_memory_estimate =
       (max_estimate > 0) ? max_estimate : memory::saturating_mul(input_basis, 2);
+  }
+
+  // Explicit input working sets can impose an admission floor. The default
+  // pipelineable input reports only its byte basis and leaves history-based sizing intact.
+  if (input_type == op::operator_data_type::PIPELINEABLE && ls._input_data) {
+    auto floor = ls._input_data->get_estimated_working_set_size_in_bytes();
+    if (floor > input_basis) {
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, floor);
+    }
   }
 
   auto const normal_reservation =

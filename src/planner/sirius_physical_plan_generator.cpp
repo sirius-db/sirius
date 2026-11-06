@@ -41,6 +41,7 @@
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "log/logging.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
@@ -1521,12 +1522,14 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
-//! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
+//! Replace an ORDER_BY slot with `MERGE_SORT → SORT_EXTRACT → SORT_CUTS →
+//! SORT_NORMALIZE → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
 //! original_input`. Destructive: ORDER_BY's
 //! `projections`/`types` are overwritten with the identity over the input's types so every
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
-//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
+//! in `operators[]` of the SORT_PARTITION pipeline. Each subsequent sort stage has
+//! its own pipeline and FULL repository boundary.
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                    const sirius::operator_params& op_params)
 {
@@ -1547,6 +1550,16 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     }
     order_ptr->projections = std::move(identity_proj);
     order_ptr->types       = child_types;
+    order_ptr->chunk_bytes = op_params.sort_chunk_bytes;
+    if (!order_ptr->chunk_bytes) {
+      throw sirius::invalid_input_exception("sort_chunk_bytes must be greater than zero");
+    }
+    for (auto const& type : child_types) {
+      if (type.id() == sirius::type_id::STRUCT || type.id() == sirius::type_id::LIST ||
+          type.id() == sirius::type_id::ARRAY) {
+        throw sirius::not_implemented_exception("GPU ORDER BY supports scalar payloads only");
+      }
+    }
 
     auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
       order_ptr,
@@ -1580,7 +1593,13 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       merge->set_final_projections(std::move(original_projections), std::move(output_types));
     }
 
-    merge->children.push_back(std::move(partition));
+    auto normalize = duckdb::make_uniq<sirius::op::sirius_physical_sort_normalize>(order_ptr);
+    normalize->children.push_back(std::move(partition));
+    auto cuts = duckdb::make_uniq<sirius::op::sirius_physical_sort_cuts>(order_ptr);
+    cuts->children.push_back(std::move(normalize));
+    auto extract = duckdb::make_uniq<sirius::op::sirius_physical_sort_extract>(order_ptr);
+    extract->children.push_back(std::move(cuts));
+    merge->children.push_back(std::move(extract));
     return merge;
   });
 }

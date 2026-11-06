@@ -107,6 +107,9 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::PARTITION: return "PARTITION";
     case SiriusPhysicalOperatorType::CONCAT: return "CONCAT";
     case SiriusPhysicalOperatorType::PASSTHROUGH_SINK: return "PASSTHROUGH_SINK";
+    case SiriusPhysicalOperatorType::SORT_NORMALIZE: return "SORT_NORMALIZE";
+    case SiriusPhysicalOperatorType::SORT_CUTS: return "SORT_CUTS";
+    case SiriusPhysicalOperatorType::SORT_EXTRACT: return "SORT_EXTRACT";
     case SiriusPhysicalOperatorType::MERGE_SORT: return "MERGE_SORT";
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY: return "MERGE_GROUP_BY";
     case SiriusPhysicalOperatorType::MERGE_TOP_N: return "MERGE_TOP_N";
