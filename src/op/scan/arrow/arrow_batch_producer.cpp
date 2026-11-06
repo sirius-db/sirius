@@ -213,10 +213,12 @@ struct arrow_push_queue::impl {
         value.retained_bytes > bounds.max_offered_bytes || value.array->length > bounds.max_rows)
       throw std::invalid_argument("Arrow offered input exceeds its declared bounds");
     auto types = validate_arrow_host_flat(*value.schema, *value.array, value.metadata_lengths);
-    validate_arrow_bound_schema(*value.schema, types, program);
+    if (types != *program.input_types)
+      throw transparent::arrow_schema_drift_error("Arrow schema does not match its bound program");
     if (copy_size(value, types) > aligned(bounds.max_copy_bytes) ||
         arrow_import_staging_bytes(*value.array, types) > bounds.staging_bytes)
       throw std::invalid_argument("Arrow offered input exceeds copy or normalization bounds");
+    validate_arrow_bound_schema(*value.schema, types, program);
   }
 };
 arrow_push_queue::arrow_push_queue(materialization_program p,

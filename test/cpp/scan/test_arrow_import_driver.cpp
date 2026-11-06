@@ -790,20 +790,31 @@ TEST_CASE("Arrow rootless descriptors require normal EOS from the bound source",
 TEST_CASE("Arrow copy and normalization bounds are checked before accepting an offer",
           "[arrow_driver][fw_s4]")
 {
-  auto mode     = GENERATE(0, 1);
+  enum class scenario { copy, normalization, copy_with_precision_drift };
+  auto test =
+    GENERATE(scenario::copy, scenario::normalization, scenario::copy_with_precision_drift);
+  auto program       = integer_program();
+  auto owner         = std::make_shared<integer_tree>();
+  bool normalization = test == scenario::normalization;
+  arrow_push_limits limits{3, 8192, normalization ? 8192U : 16U, normalization ? 1U : 8192U};
+  if (test == scenario::copy_with_precision_drift) {
+    program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL32, -2}};
+    program.input_types        = program.output_types;
+    program.decimal_precisions = {8};
+    owner->field.format        = "d:9,2,32";
+  }
   auto counters = make_counters(false);
   int failures  = 0;
   std::exception_ptr reported;
   auto q = std::make_shared<arrow_push_queue>(
-    integer_program(),
-    arrow_push_limits{3, 8192, mode == 0 ? 16U : 8192U, mode == 1 ? 1U : 8192U},
+    program,
+    limits,
     [&](auto error) {
       ++failures;
       reported = error;
     },
     counters);
-  harness h(counters, q);
-  auto owner   = std::make_shared<integer_tree>();
+  harness h(counters, q, program);
   auto offered = owner->offer(owner);
   auto error   = capture_rejection([&] { q->offer(offered); });
   CHECK(reported == error);
@@ -1012,12 +1023,11 @@ TEST_CASE("Arrow push refuses decimal precision drift even when the scale matche
     reported = error;
   });
   harness h(counters, q, program);
-  auto offered = std::async(
-    std::launch::async, [&] { return capture_rejection([&] { q->offer(owner->offer(owner)); }); });
-  auto status = offered.wait_for(2s);
+  auto offered = std::async(std::launch::async, [&] { q->offer(owner->offer(owner)); });
+  auto status  = offered.wait_for(2s);
   if (status != std::future_status::ready) q->cancel();
-  auto error = offered.get();
   REQUIRE(status == std::future_status::ready);
+  auto error = capture_rejection([&] { offered.get(); });
   CHECK(reported == error);
   check_physical_failure(error, "Arrow decimal precision does not match its bound program", true);
   CHECK(failures == 1);
