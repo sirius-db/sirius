@@ -23,11 +23,13 @@ namespace sirius::ducklake {
 class binding_handle;
 struct unit_scan_options;
 struct inline_delete_preparation;
+struct dv_visibility;
 // One original unit, not a whole-table scan. Only a verified binding can create
 // it. Registration stays closed until the complete input profile is qualified.
 class parquet_unit_ingestible final : public op::scan::parquet_gpu_ingestible {
  public:
   static scan_manager::unit_envelope envelope(unit_descriptor const&);
+  static dv_visibility const& file_visibility(op::scan::prepared_visibility const&);
   void preflight_for_query() override;
   metadata_scan_task_t next_split_provider(io::ioctx_resolver) override;
   metadata_claim try_claim_split(io::ioctx_resolver) override;

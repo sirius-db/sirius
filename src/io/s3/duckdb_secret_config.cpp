@@ -242,10 +242,11 @@ void install_duckdb_s3_config(duckdb::ClientContext& context,
     manager.install_s3_config(path, resolve_duckdb_s3_secret(context, path, defaults));
 }
 
-std::shared_ptr<cucascade::io::ioctx> capture_duckdb_s3_context(duckdb::ClientContext& context,
-                                                 scan_manager::sirius_scan_manager& manager,
-                                                 std::string_view path,
-                                                 object_store_config const& defaults)
+std::shared_ptr<cucascade::io::ioctx> capture_duckdb_s3_context(
+  duckdb::ClientContext& context,
+  scan_manager::sirius_scan_manager& manager,
+  std::string_view path,
+  object_store_config const& defaults)
 {
   if (!is_s3_path(path)) return {};
   return manager.capture_s3_context(path, resolve_duckdb_s3_secret(context, path, defaults));

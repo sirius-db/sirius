@@ -17,9 +17,10 @@
 #pragma once
 
 #include "io/ioctx_resolver.hpp"
-#include <cucascade/io/uri_parser.hpp>
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_stop_token.hpp"
+
+#include <cucascade/io/uri_parser.hpp>
 
 namespace sirius::op::scan {
 // Planning only: lookup must not open objects, resolve credentials or probe the network.
@@ -43,10 +44,10 @@ puffin_io_capability inspect_puffin_io(std::string const& path, Lookup&& lookup)
     result.remote = path.find("://") != std::string::npos;
   }
   if (!result.remote) return result;
-  auto backend = lookup(path);
-  result.backend_available =
-    scheme == "s3" && backend &&
-    (*backend == cucascade::io::io_context_type::restful || *backend == cucascade::io::io_context_type::kvikio);
+  auto backend             = lookup(path);
+  result.backend_available = scheme == "s3" && backend &&
+                             (*backend == cucascade::io::io_context_type::restful ||
+                              *backend == cucascade::io::io_context_type::kvikio);
   return result;
 }
 

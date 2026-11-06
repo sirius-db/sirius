@@ -528,8 +528,8 @@ class sirius_scan_manager {
 
   /// Atomically install and retain this caller's resolved access scope. The returned
   /// context remains valid when another connection replaces the same URI's config.
-  std::shared_ptr<cucascade::io::ioctx> capture_s3_context(std::string_view path,
-                                                        cucascade::io::object_store_config config);
+  std::shared_ptr<cucascade::io::ioctx> capture_s3_context(
+    std::string_view path, cucascade::io::object_store_config config);
 
   /// \brief Prepare per-scan state for the given query.
   ///
@@ -1162,7 +1162,7 @@ class sirius_scan_manager {
   /// in the dtor.
   // Both helpers require _routed_io_ctxs_build_mtx; retire contexts after unlocking.
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_type_locked(cucascade::io::io_context_type type,
-                                                           std::string_view path);
+                                                              std::string_view path);
   void install_s3_config_locked(std::string_view path,
                                 cucascade::io::object_store_config config,
                                 std::vector<std::shared_ptr<cucascade::io::ioctx>>& retired);

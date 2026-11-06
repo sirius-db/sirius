@@ -5,8 +5,8 @@
  * See the LICENSE file at the repo root for the full text.
  */
 
-#include "io/path_utils.hpp"
 #include "catch.hpp"
+#include "io/path_utils.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/scan/parquet_delete_reader.hpp"
@@ -823,7 +823,8 @@ TEST_CASE("Captured S3 contexts isolate native readers across connections",
         throw;
       }
       captured.arrive_and_wait();
-      return sirius::io::open_datasource(context, file.path, cucascade::io::open_hint::generic)->size();
+      return sirius::io::open_datasource(context, file.path, cucascade::io::open_hint::generic)
+        ->size();
     };
     auto a = std::async(std::launch::async, open_after_both_captured, first_config);
     auto b = std::async(std::launch::async, open_after_both_captured, second_config);

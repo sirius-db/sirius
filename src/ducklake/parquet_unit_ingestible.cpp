@@ -240,6 +240,12 @@ struct visibility_owner {
   std::shared_ptr<dv_visibility const> visibility;
 };
 }  // namespace
+
+dv_visibility const& parquet_unit_ingestible::file_visibility(
+  op::scan::prepared_visibility const& prepared)
+{
+  return *dynamic_cast<sealed_file const&>(prepared).visibility;
+}
 struct inline_delete_preparation {
   struct copied_positions {
     std::shared_ptr<claimed_unit> claim;
@@ -575,7 +581,7 @@ op::scan::filtered_table parquet_unit_ingestible::materialize_metadata_to_table(
     return static_cast<sealed_file const&>(*deps[i].visibility);
   };
   if (std::none_of(deps.begin(), deps.end(), [](auto const& dep) {
-        return !static_cast<sealed_file const&>(*dep.visibility).visibility->positions.empty();
+        return !file_visibility(*dep.visibility).positions.empty();
       }))
     return base;
   if (base.state != op::scan::filter_state::UNFILTERED)

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "io/path_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "ducklake/binding_bridge.hpp"
 #include "ducklake/dv_visibility.hpp"
@@ -22,11 +21,9 @@
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "ducklake/scan_ingestible.hpp"
 #include "exec/streaming_fragment.hpp"
-#include <cucascade/io/io_errors.hpp>
+#include "io/path_utils.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
-#include <cucascade/cudf/datasource.hpp>
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
-#include "op/scan/ready_input_coalescer.hpp"
 #include "op/scan/puffin_io.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "op/scan/ready_input_coalescer.hpp"
@@ -36,7 +33,6 @@
 #include "transparent/connection_provenance.hpp"
 #include "util/env_guard.hpp"
 #include "utils/dynamic_filter_test_utils.hpp"
-#include <loopback_range_server.hpp>
 #include "utils/offset_fault_server.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
@@ -48,6 +44,8 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/enums/statement_type.hpp>
@@ -60,6 +58,7 @@
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <loopback_range_server.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -5067,11 +5066,10 @@ std::filesystem::path remote_delete_cache_config(std::string const& directory)
   output << config;
   return path;
 }
-std::unique_ptr<cucascade::io::datasource> cache_remote_delete(
-  duckdb::Connection& con,
-  duckdb::SiriusContext& runtime,
-  std::string const& uri,
-  std::vector<uint8_t> const& expected)
+std::unique_ptr<cucascade::io::datasource> cache_remote_delete(duckdb::Connection& con,
+                                                               duckdb::SiriusContext& runtime,
+                                                               std::string const& uri,
+                                                               std::vector<uint8_t> const& expected)
 {
   auto context = sirius::io::s3::capture_duckdb_s3_context(
     *con.context,
@@ -5457,8 +5455,8 @@ TEST_CASE("DuckLake REST deletes preserve bound snapshot visibility",
             REQUIRE(std::holds_alternative<sm::preparation_job>(claim));
             auto metadata = std::get<sm::preparation_job>(std::move(claim)).run({});
             if (!metadata) continue;
-            auto const& visibility =
-              dynamic_cast<dl::dv_visibility const&>(*metadata->dependencies().front().visibility);
+            auto const& visibility = dl::parquet_unit_ingestible::file_visibility(
+              *metadata->dependencies().front().visibility);
             if (snapshot_deletes && puffin) CHECK(visibility.validated_blobs == 2);
             REQUIRE(visibility.positions.size() == 2);
             CHECK(visibility.positions[0] == 1);
@@ -5558,7 +5556,7 @@ TEST_CASE("DuckLake remote delete queries enforce backend identity contracts",
   }
   auto response = std::make_shared<cucascade::test::range_response_control>();
   if (fault_kind == 6) {
-    fault.body.control = response;
+    fault.body.control          = response;
     fault.body.hold_after_bytes = 0;
   }
   cucascade::test::loopback_range_server healthy(bytes, good), failing(bytes, fault);
@@ -5627,7 +5625,7 @@ TEST_CASE("DuckLake remote delete queries enforce backend identity contracts",
     auto reads                                 = decoded.load();
     duckdb::unique_ptr<duckdb::QueryResult> failed;
     if (fault_kind == 6) {
-      auto active  = std::async(std::launch::async, [&] { return con.Query(sql); });
+      auto active = std::async(std::launch::async, [&] { return con.Query(sql); });
       cucascade::test::response_release_guard unblock{response};
       REQUIRE(response->wait_for_holds(1, std::chrono::seconds(15)));
       CHECK(provider->outstanding() > 0);
@@ -5875,7 +5873,8 @@ TEST_CASE("DuckLake remote Puffin byte source retains snapshots and charged owne
       auto after = runtime->get_transparent_execution_stats();
       CHECK(after.fallbacks == before.fallbacks);
       CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
-      CHECK(failing.targeted_reads() > direct_hits);  // SQL must independently reach the same fault site.
+      CHECK(failing.targeted_reads() >
+            direct_hits);  // SQL must independently reach the same fault site.
       CHECK(failing.all_gets_matched_etag());
       if (!truncated) CHECK(failed->GetError().find("HTTP 400") != std::string::npos);
       endpoint(healthy.endpoint());
@@ -5951,7 +5950,8 @@ TEST_CASE("DuckLake remote Puffin byte source retains snapshots and charged owne
   std::array<std::byte, 4> prefix;
   REQUIRE(opened.source->seek(0));
   CHECK_THROWS_AS(opened.source->read(prefix), cucascade::io::object_changed_error);
-  CHECK_THROWS_AS(native->Read(prefix.data(), prefix.size(), 0), cucascade::io::object_changed_error);
+  CHECK_THROWS_AS(native->Read(prefix.data(), prefix.size(), 0),
+                  cucascade::io::object_changed_error);
 }
 
 TEST_CASE("DuckLake remote deletes publish earlier files under bounded preparation",
@@ -5962,8 +5962,9 @@ TEST_CASE("DuckLake remote deletes publish earlier files under bounded preparati
   CAPTURE(puffin, permits);
   sirius::test::scoped_temp_directory disk;
   auto config = write_lake_config(disk.directory, [&](YAML::Node& config) {
-    config["sirius"]["executor"]["scan_manager"]["num_threads"]                         = 2;
-    config["sirius"]["executor"]["scan_manager"]["preparation"]["max_inflight_dv_jobs"] = permits;
+    auto manager                          = config["sirius"]["executor"]["scan_manager"];
+    manager["num_threads"]                = 2;
+    manager["preparation"]["max_permits"] = permits;
   });
   sirius::test::shared_test_env env(config);
   auto con = env.make_connection();
@@ -5979,7 +5980,7 @@ TEST_CASE("DuckLake remote deletes publish earlier files under bounded preparati
     run("INSERT INTO lake.q SELECT i FROM range(" + std::to_string(i * 100) + "," +
         std::to_string((i + 1) * 100) + ") r(i)");
   run("DELETE FROM lake.q WHERE id%100=0");
-  // DuckLake reuses one preparation slot per scan, not one per file.
+  // Each scan reserves one permit, leaving no extra permits for additional files.
   std::string sql = permits == 1 ? "SELECT id FROM lake.q"
                                  : "SELECT id FROM lake.q UNION ALL SELECT id FROM lake.q";
   auto expected   = ducklake_result_bag(*run(sql));
@@ -5997,8 +5998,8 @@ TEST_CASE("DuckLake remote deletes publish earlier files under bounded preparati
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
     cucascade::test::range_fault_policy policy;
     policy.successful_head_etag = policy.successful_get_etag = "\"progress\"";
-    controls[i] = std::make_shared<cucascade::test::range_response_control>();
-    policy.body.control = controls[i];
+    controls[i]                  = std::make_shared<cucascade::test::range_response_control>();
+    policy.body.control          = controls[i];
     policy.body.hold_after_bytes = 0;
     servers.push_back(std::make_unique<cucascade::test::loopback_range_server>(bytes, policy));
     auto scope = "s3://progress-" + std::to_string(i) + "/";
@@ -6079,21 +6080,25 @@ TEST_CASE("DuckLake remote deletes publish earlier files under bounded preparati
   run("SET scan_task_batch_size=1");
   run("SET sirius_test_hold_footer_index=" + std::to_string(UINT64_MAX));
   auto before  = runtime->get_transparent_execution_stats();
-  auto active = std::async(std::launch::async, [&] { return con.Query(sql); });
+  auto active  = std::async(std::launch::async, [&] { return con.Query(sql); });
   auto unblock = std::shared_ptr<void>(nullptr, [&](void*) {
-    for (auto const& control : controls) control->release_all();
+    for (auto const& control : controls)
+      control->release_all();
   });
   // Release the first two distinct files as they start reading. Keep the last
   // response in flight until the earlier files have published their batches.
   std::set<size_t> started;
   size_t blocked = controls.size();
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  auto deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   while (started.size() < controls.size() && std::chrono::steady_clock::now() < deadline) {
     for (size_t i = 0; i < controls.size(); ++i) {
-      if (started.contains(i) || !controls[i]->wait_for_holds(1, std::chrono::milliseconds(5))) continue;
+      if (started.contains(i) || !controls[i]->wait_for_holds(1, std::chrono::milliseconds(5)))
+        continue;
       started.insert(i);
-      if (started.size() < controls.size()) controls[i]->release_all();
-      else blocked = i;
+      if (started.size() < controls.size())
+        controls[i]->release_all();
+      else
+        blocked = i;
     }
   }
   REQUIRE(blocked < data_paths.size());

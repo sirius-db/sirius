@@ -17,8 +17,9 @@
 #pragma once
 
 #include "io/s3/duckdb_secret_config.hpp"
-#include <cucascade/io/uri_parser.hpp>
 #include "transparent/plan_source_policy.hpp"
+
+#include <cucascade/io/uri_parser.hpp>
 
 #include <string>
 #include <string_view>

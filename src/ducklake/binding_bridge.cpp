@@ -470,7 +470,8 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   options.check_stop             = check_stop;
   options.verify_remote          = [&](CachingFileHandle& handle) {
     if (!remote)
-      throw cucascade::io::descriptor_mismatch_error("DuckLake local Parquet delete requires a regular file");
+      throw cucascade::io::descriptor_mismatch_error(
+        "DuckLake local Parquet delete requires a regular file");
     auto current = io::s3::validated_identity(*handle.GetFileHandle());
     // The initial footer check runs on the owner before any workers are scheduled.
     if (!remote_identity)
@@ -538,9 +539,10 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   // The shared reader verifies local physical identity across every handle.
   // This local token identifies this completed read only; no cross-read cache
   // may treat it as a reusable file version. Remote reads retain backend identity.
-  result->delete_identity         = remote_identity
-                                      ? remote_identity->object_key
-                                      : "duckdb.parquet.read:" + std::to_string(cucascade::io::next_open_generation());
+  result->delete_identity =
+    remote_identity
+      ? remote_identity->object_key
+      : "duckdb.parquet.read:" + std::to_string(cucascade::io::next_open_generation());
   result->positions               = accumulator->positions();
   result->last_validated_position = accumulator->last_position();
   result->parquet_validated       = true;
