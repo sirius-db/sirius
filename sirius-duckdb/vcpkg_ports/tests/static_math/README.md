@@ -5,7 +5,7 @@ archives and expose explicit CMake targets. RAFT and cuVS patches select these
 targets. A matching CUDA toolkit is still required to compile Sirius.
 
 `VCPKG_CUDA_VERSION=12` selects the CUDA 12.9.1 redistributables; `13` selects
-CUDA 13.3.0. Each port's `redistrib.json` pins component versions and archive
+CUDA 13.5.0. Each port's `redistrib.json` pins component versions and archive
 SHA512 hashes for Linux x64 and arm64 (SBSA). The port version denotes the CUDA
 13 component, following the existing nvjitlink port convention. CUDA 12 obtains
 culibos from the cudart archive; CUDA 13 has a separate culibos archive.
