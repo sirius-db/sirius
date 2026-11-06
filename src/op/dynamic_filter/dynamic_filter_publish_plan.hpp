@@ -18,6 +18,7 @@
 
 #include "op/dynamic_filter/config.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
+#include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 
 #include <cudf/types.hpp>
 
@@ -52,11 +53,10 @@ struct dynamic_filter_condition_shape {
 enum class dynamic_filter_route_class : std::uint8_t { scan, direct };
 
 struct dynamic_filter_publication_policy {
-  static constexpr double k_default_domain_coverage_threshold = 0.9;
-  static constexpr double k_default_inlist_max_l2_fraction    = 0.125;
+  static constexpr double k_default_inlist_max_l2_fraction = 0.125;
 
   bool emit_zone_map_filters            = false;
-  double domain_coverage_threshold      = k_default_domain_coverage_threshold;
+  double domain_coverage_threshold      = default_dynamic_filter_domain_coverage_threshold;
   double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
   bool enable_multi_partition           = false;
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
@@ -79,12 +79,18 @@ class dynamic_filter_publish_plan final {
     // EMPTY means the probe has no cuDF representation.
     cudf::data_type probe_storage_type{cudf::type_id::EMPTY};
     dynamic_filter_condition_shape key_shape{};
-    // Exact base-table row bound; 0 disables coverage gating.
-    std::size_t build_key_domain_cardinality = 0;
-    // Required before row count can represent key-domain coverage.
+    // A zero cardinality disables coverage gating.
+    dynamic_filter_domain_evidence build_key_domain{};
+    // Genuine uniqueness proof, independent of usefulness declarations.
     bool build_key_proven_unique = false;
     // NULL-safe equality: retain probe NULLs as conservative false positives.
     bool preserve_nulls = false;
+
+    /// Whether the domain gate may judge this key: a uniqueness proof or a backed declaration
+    [[nodiscard]] bool domain_gate_eligible() const noexcept
+    {
+      return build_key_proven_unique || build_key_domain.has_backed_declaration();
+    }
 
     [[nodiscard]] bool operator==(admitted_key const&) const = default;
   };

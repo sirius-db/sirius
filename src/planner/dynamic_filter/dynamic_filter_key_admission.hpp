@@ -53,13 +53,13 @@ namespace sirius::planner {
  * Admission requires equality, non-cast shapes, bound materialized sides, and a supported build
  * type. A composite uniqueness proof does not prove an individual column unique.
  *
- * @throw std::invalid_argument if `condition_shapes` or a non-empty domain vector does not align
+ * @throw std::invalid_argument if `condition_shapes` or a non-empty evidence vector does not align
  * with @p conditions
  */
 [[nodiscard]] std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
-  std::vector<std::size_t> const& condition_domain_cardinalities,
+  std::vector<op::dynamic_filter_domain_evidence> const& condition_domain_evidence,
   std::optional<std::size_t> build_side_unique_column = std::nullopt);
 
 /**

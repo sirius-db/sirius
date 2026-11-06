@@ -21,6 +21,11 @@
 namespace sirius::op {
 
 /**
+ * @brief Default row-domain coverage at which an eligible key skips optional filters
+ */
+inline constexpr double default_dynamic_filter_domain_coverage_threshold = 0.9;
+
+/**
  * @brief Default per-GPU cap on one join's accumulated Bloom arrays
  * (`max_dynamic_filter_bloom_bytes_per_gpu`).
  */

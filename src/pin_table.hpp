@@ -39,6 +39,8 @@ struct PinTableArgs {
   std::string tier;
   std::string name;
   std::optional<std::vector<std::string>> cols;
+  /// Per-column usefulness hints from `unique_cols`; each name denotes an independent key.
+  std::vector<std::string> declared_unique_columns;
   /// Optional per-call request for Simpatico pin compression. When omitted,
   /// the legacy session/config setting remains the default.
   std::optional<bool> compression;

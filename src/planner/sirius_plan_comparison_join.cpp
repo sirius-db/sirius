@@ -479,8 +479,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
-    build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
-                   : std::vector<std::size_t>{};
+    build_evidence ? build_key_domain_evidence_for(op, context, sirius_context->get_scan_manager())
+                   : std::vector<sirius::op::dynamic_filter_domain_evidence>{};
 
   // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
   // context, prove_unique_columns considers declared PRIMARY KEYs alone.

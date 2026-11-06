@@ -21,6 +21,7 @@
 #include "op/scan/dynamic_filter_merge.hpp"
 #include "sirius/exception.hpp"
 #include "utils/host_allocation_fault.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/test_validation_utility.hpp"
 
@@ -48,7 +49,9 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -222,6 +225,75 @@ TEST_CASE("begin allocates zeroed partials under exact per-GPU leases",
   REQUIRE(fixture.possible_rows(1, absent, 0) < 64);
   fixture.require_members({batch, other});
   REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
+}
+
+TEST_CASE("declared domain coverage gates accumulation before partial allocation",
+          "[dynamic_filter][multi_partition][domain_evidence]")
+{
+  auto const all_gated = GENERATE(false, true);
+  auto const gated_key = GENERATE(std::size_t{0}, std::size_t{1});
+  auto const threshold = GENERATE(0.9, 0.45);
+  CAPTURE(all_gated, gated_key, threshold);
+  acc::fixture fixture;
+  auto const first  = fixture.make_batch(0, 0, 1000);
+  auto const second = fixture.make_batch(0, 5000, 1000);
+  auto const before = fixture.allocated_bytes();
+  auto plan         = [&] {
+    auto const base = fixture.make_plan(256 * mib);
+    auto keys       = base.admitted_keys();
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+      keys[index].build_key_proven_unique = false;
+      keys[index].build_key_domain        = {
+                       .cardinality     = all_gated || index == gated_key ? std::size_t{2000} : std::size_t{10000},
+                       .source          = op::dynamic_filter_domain_source::pinned_parquet_exact,
+                       .declared_unique = true};
+    }
+    return op::dynamic_filter_publish_plan{std::move(keys),
+                                           base.probe_targets(),
+                                           base.replica_spaces(),
+                                                   {.domain_coverage_threshold = threshold,
+                                                    .enable_multi_partition    = true,
+                                                    .max_bloom_bytes_per_gpu   = 256 * mib}};
+  }();
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+  REQUIRE(fixture.begin({first, second}, std::move(plan)) == !all_gated);
+  auto const selection = fixture.stats.snapshot();
+  REQUIRE(selection.keys_considered == 2);
+  REQUIRE(selection.keys_with_known_domain == 2);
+  REQUIRE(selection.keys_skipped_domain_gate == (all_gated ? 2 : 1));
+  REQUIRE(selection.accumulations_started == (all_gated ? 0 : 1));
+  REQUIRE(fixture.allocated_bytes()[0] == before[0] + (all_gated ? 0 : partial_bytes(2000, 1)));
+  require_no_tracker(fixture);
+
+  std::size_t decisions = 0;
+  std::size_t skips     = 0;
+  for (auto const& record : logs.records()) {
+    if (!record.message.starts_with("[dynamic_filter_domain] path=accumulated ")) { continue; }
+    INFO(record.message);
+    REQUIRE(record.message.find("provenance=pinned_parquet_exact eligible=1") != std::string::npos);
+    ++decisions;
+    skips += record.message.ends_with("decision=skip");
+  }
+  REQUIRE(decisions == selection.keys_considered);
+  REQUIRE(skips == selection.keys_skipped_domain_gate);
+
+  if (all_gated) {
+    fixture.session->finish_input();
+    REQUIRE(fixture.channel->snapshot().empty());
+    REQUIRE(fixture.stats.snapshot().accumulation_publications_finished == 0);
+  } else {
+    fixture.contribute(first);
+    fixture.contribute(second);
+    fixture.publish(0, second->get_batch_id());
+    REQUIRE(fixture.stats.snapshot().accumulation_publications_finished == 1);
+    REQUIRE(acc::filters_on_column(*fixture.channel, gated_key).empty());
+    REQUIRE(fixture.possible_rows(1 - gated_key, first, 0) == 1000);
+    REQUIRE(fixture.possible_rows(1 - gated_key, second, 0) == 1000);
+  }
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
+  require_no_tracker(fixture);
+  fixture.require_storage_returned(before);
 }
 
 TEST_CASE("accumulation never starts without a usable geometry or inventory",
@@ -1262,6 +1334,60 @@ TEST_CASE("accumulation declines admitted key types it cannot insert",
     }
   }
   REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
+}
+
+TEST_CASE("inapplicable accumulation keys cannot report a declared coverage skip",
+          "[dynamic_filter][multi_partition][domain_evidence]")
+{
+  auto const key_type =
+    GENERATE(cudf::type_id::STRING, cudf::type_id::TIMESTAMP_DAYS, cudf::type_id::INT32);
+  CAPTURE(key_type);
+  bool const incompatible_probe = key_type == cudf::type_id::INT32;
+  acc::fixture fixture;
+  auto const batch  = make_mixed_batch(fixture, key_type, 0, 95);
+  auto const before = fixture.allocated_bytes();
+  auto plan         = [&] {
+    auto const base =
+      fixture.make_plan(256 * mib,
+                                {cudf::data_type{key_type}},
+                                {},
+                                {cudf::data_type{incompatible_probe ? cudf::type_id::FLOAT64 : key_type}});
+    auto keys                            = base.admitted_keys();
+    keys.front().build_key_proven_unique = false;
+    keys.front().build_key_domain        = {
+                     .cardinality     = 100,
+                     .source          = op::dynamic_filter_domain_source::pinned_parquet_exact,
+                     .declared_unique = true};
+    return op::dynamic_filter_publish_plan{
+      std::move(keys),
+      base.probe_targets(),
+      base.replica_spaces(),
+              {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 256 * mib}};
+  }();
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+  REQUIRE_FALSE(fixture.begin({batch}, std::move(plan)));
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.keys_considered == 1);
+  REQUIRE(counters.keys_with_known_domain == 1);
+  REQUIRE(counters.keys_skipped_domain_gate == 0);
+  REQUIRE(counters.keys_skipped_bloom_unsupported == (incompatible_probe ? 0 : 1));
+  REQUIRE(counters.bindings_skipped_incompatible_probe == (incompatible_probe ? 1 : 0));
+  REQUIRE(counters.accumulations_started == 0);
+  REQUIRE(fixture.allocated_bytes() == before);
+  std::size_t decisions = 0;
+  for (auto const& record : logs.records()) {
+    if (!record.message.starts_with("[dynamic_filter_domain] path=accumulated ")) { continue; }
+    INFO(record.message);
+    REQUIRE(record.message.find("provenance=pinned_parquet_exact eligible=0") != std::string::npos);
+    REQUIRE(record.message.ends_with("decision=keep"));
+    ++decisions;
+  }
+  REQUIRE(decisions == counters.keys_considered);
+  fixture.session->finish_input();
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(fixture.channel->snapshot().empty());
+  require_no_tracker(fixture);
+  fixture.require_storage_returned(before);
 }
 
 TEST_CASE("an accumulated filter probes like every other membership filter",

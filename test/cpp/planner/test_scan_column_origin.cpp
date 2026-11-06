@@ -52,10 +52,12 @@
 #include <utility>
 #include <vector>
 
-using sirius::planner::build_key_domain_cardinalities;
+using sirius::op::dynamic_filter_domain_evidence;
+using sirius::op::dynamic_filter_domain_source;
+using sirius::planner::build_key_domain_evidence_for;
 using sirius::planner::origin_policy;
 using sirius::planner::resolve_scan_column_origin;
-using sirius::planner::detail::resolve_build_key_scans;
+using sirius::planner::detail::resolve_build_key_scan_columns;
 
 namespace {
 
@@ -87,23 +89,30 @@ constexpr std::size_t stub_cardinality_of(duckdb::idx_t table_index)
 }
 
 struct stub_cardinality_source {
-  std::optional<std::size_t> operator()(duckdb::LogicalGet const& get) const
+  dynamic_filter_domain_evidence operator()(duckdb::LogicalGet const& get,
+                                            std::size_t ordinal) const
   {
-    return stub_cardinality_of(get.table_index.index);
+    return {stub_cardinality_of(get.table_index.index),
+            dynamic_filter_domain_source::pinned_parquet_exact,
+            ordinal == 2};
   }
 };
 
 struct refusing_source {
-  std::optional<std::size_t> operator()(duckdb::LogicalGet const&) const { return std::nullopt; }
+  dynamic_filter_domain_evidence operator()(duckdb::LogicalGet const&, std::size_t) const
+  {
+    return {};
+  }
 };
 
-// Count cardinality lookups to verify per-scan memoization.
+// Count evidence lookups to verify per-column memoization.
 struct counting_source {
   std::size_t* calls = nullptr;
-  std::optional<std::size_t> operator()(duckdb::LogicalGet const& get) const
+  dynamic_filter_domain_evidence operator()(duckdb::LogicalGet const& get,
+                                            std::size_t ordinal) const
   {
     ++*calls;
-    return stub_cardinality_of(get.table_index.index);
+    return stub_cardinality_source{}(get, ordinal);
   }
 };
 
@@ -665,32 +674,49 @@ TEST_CASE("build keys resolve through the build child only", "[dynamic_filter][b
     make_ref(1), duckdb::LogicalType::BIGINT));  // cast: refused
   auto join = make_traced_join(std::move(build_sides));
 
-  auto const scans = resolve_build_key_scans(*join);
+  auto const scans = resolve_build_key_scan_columns(*join);
 
   REQUIRE(scans.size() == 3);
-  REQUIRE(scans[0] == join->children[1].get());
-  REQUIRE(scans[1] == nullptr);
-  REQUIRE(scans[2] == nullptr);
+  REQUIRE(scans[0]);
+  REQUIRE(scans[0]->get == join->children[1].get());
+  REQUIRE(scans[0]->ordinal == 2);
+  REQUIRE_FALSE(scans[1]);
+  REQUIRE_FALSE(scans[2]);
 
   // The domain is the BUILD table's cardinality; the probe table's distinct stub value proves the
   // walk read condition.right, not condition.left.
-  auto const domains = build_key_domain_cardinalities(*join, stub_cardinality_source{});
-  REQUIRE(domains == std::vector<std::size_t>{stub_cardinality_of(1), 0, 0});
+  auto const domains = build_key_domain_evidence_for(*join, stub_cardinality_source{});
+  REQUIRE(domains.size() == 3);
+  REQUIRE(domains[0].cardinality == stub_cardinality_of(1));
+  REQUIRE(domains[0].declared_unique);
+  REQUIRE(domains[0].source == dynamic_filter_domain_source::pinned_parquet_exact);
+  for (std::size_t i : {1, 2}) {
+    REQUIRE(domains[i].cardinality == 0);
+    REQUIRE(domains[i].source == dynamic_filter_domain_source::unknown);
+    REQUIRE_FALSE(domains[i].declared_unique);
+  }
 }
 
-TEST_CASE("evidence source is consulted once per distinct resolved scan",
+TEST_CASE("evidence source is consulted once per distinct resolved scan column",
           "[dynamic_filter][build_key_domain]")
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> build_sides;
   build_sides.push_back(make_ref(0));
   build_sides.push_back(make_ref(2));  // same scan, different ordinal
+  build_sides.push_back(make_ref(0));
+  build_sides.push_back(make_ref(2));
   auto join = make_traced_join(std::move(build_sides));
 
   std::size_t calls  = 0;
-  auto const domains = build_key_domain_cardinalities(*join, counting_source{.calls = &calls});
+  auto const domains = build_key_domain_evidence_for(*join, counting_source{.calls = &calls});
 
-  REQUIRE(domains == std::vector<std::size_t>{stub_cardinality_of(1), stub_cardinality_of(1)});
-  REQUIRE(calls == 1);
+  REQUIRE(domains.size() == 4);
+  for (std::size_t i = 0; i < domains.size(); ++i) {
+    CHECK(domains[i].cardinality == stub_cardinality_of(1));
+    CHECK(domains[i].source == dynamic_filter_domain_source::pinned_parquet_exact);
+    CHECK(domains[i].declared_unique == (i % 2 == 1));
+  }
+  REQUIRE(calls == 2);
 }
 
 TEST_CASE("a refusing evidence source yields zero for every key",
@@ -700,7 +726,34 @@ TEST_CASE("a refusing evidence source yields zero for every key",
   build_sides.push_back(make_ref(0));
   auto join = make_traced_join(std::move(build_sides));
 
-  auto const domains = build_key_domain_cardinalities(*join, refusing_source{});
+  auto const domains = build_key_domain_evidence_for(*join, refusing_source{});
 
-  REQUIRE(domains == std::vector<std::size_t>{0});
+  REQUIRE(domains.size() == 1);
+  REQUIRE(domains[0].cardinality == 0);
+  REQUIRE(domains[0].source == dynamic_filter_domain_source::unknown);
+  REQUIRE_FALSE(domains[0].declared_unique);
+}
+
+TEST_CASE("multiplying build lineage never asks for domain evidence",
+          "[dynamic_filter][build_key_domain][domain_evidence]")
+{
+  duckdb::unique_ptr<duckdb::LogicalOperator> subtree;
+  SECTION("inner join")
+  {
+    subtree = make_join(duckdb::JoinType::INNER, make_get(1, 2), make_get(2, 1));
+  }
+  SECTION("cross product")
+  {
+    subtree = duckdb::make_uniq<duckdb::LogicalCrossProduct>(make_get(1, 2), make_get(2, 1));
+  }
+  auto join = make_join(duckdb::JoinType::INNER, make_get(0, 1), std::move(subtree));
+  join->conditions.push_back(make_condition(make_ref(0), make_ref(0)));
+  join->ResolveOperatorTypes();
+  std::size_t calls  = 0;
+  auto const domains = build_key_domain_evidence_for(*join, counting_source{.calls = &calls});
+  REQUIRE(domains.size() == 1);
+  CHECK(domains[0].cardinality == 0);
+  CHECK(domains[0].source == dynamic_filter_domain_source::unknown);
+  CHECK_FALSE(domains[0].declared_unique);
+  CHECK(calls == 0);
 }
