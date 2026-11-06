@@ -39,7 +39,6 @@
 #include <cucascade/memory/topology_discovery.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/settings.hpp>
@@ -55,7 +54,6 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <optional>
 #include <set>
@@ -1513,7 +1511,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
       current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
       current_setting('max_build_probe_resident_bytes')::UBIGINT,
-      current_setting('spill_compression')::BOOLEAN
+      current_setting('spill_compression')::BOOLEAN,
+      current_setting('pin_table_prove_unique_keys')::BOOLEAN,
+      current_setting('pin_table_unique_exact_max_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1559,6 +1559,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_FALSE(resident_reset->HasError());
   require_resident_budget(9 * mib);
   REQUIRE(settings->Collection().GetValue(23, 0).GetValue<bool>());
+  REQUIRE_FALSE(settings->Collection().GetValue(24, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(25, 0).GetValue<uint64_t>() == 9 * mib);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =

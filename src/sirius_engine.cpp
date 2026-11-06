@@ -16,16 +16,13 @@
 
 #include "sirius_engine.hpp"
 
-#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -41,11 +38,9 @@
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
-#include "sirius_interface.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
@@ -373,11 +368,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   }
 
   // Create the plan-time context with one immutable snapshot of query policy.
-  const pipeline::pipeline_build_context build_ctx{
-    sirius_ctx_ptr->get_telemetry_context(),
-    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    std::move(active_gpu_ids),
-    std::move(query_operator_params)};
+  const pipeline::pipeline_build_context build_ctx{sirius_ctx_ptr->get_telemetry_context(),
+                                                   std::move(active_gpu_ids),
+                                                   std::move(query_operator_params)};
 
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);

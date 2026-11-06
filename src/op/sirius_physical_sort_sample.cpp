@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_sort_sample.hpp"
 
-#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "exchange/all_gather.hpp"
@@ -24,7 +23,7 @@
 #include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
-#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -33,7 +32,6 @@
 #include <cudf/search.hpp>
 
 #include <algorithm>
-#include <functional>
 #include <numeric>
 
 namespace sirius {

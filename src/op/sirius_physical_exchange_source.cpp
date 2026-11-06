@@ -202,7 +202,7 @@ void sirius_physical_exchange_source::set_pipeline(
   sirius_physical_operator::set_pipeline(std::move(pipeline));
 }
 
-sirius::OrderPreservationType sirius_physical_exchange_source::source_order() const
+sirius::OrderPreservationType sirius_physical_exchange_source::output_order_preservation() const
 {
   return _state->ordered ? sirius::OrderPreservationType::FIXED_ORDER
                          : sirius::OrderPreservationType::NO_ORDER;

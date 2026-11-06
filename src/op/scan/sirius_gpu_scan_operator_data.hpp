@@ -256,15 +256,14 @@ class scan_operator_input : public op::operator_data {
   /// The datasources this split reads through.  Stage reporting wants only
   /// these; going through @ref get_fadvise_hints for it would drag every byte
   /// range along.
-  [[nodiscard]] std::span<const std::shared_ptr<sirius::io::sirius_datasource>> get_datasources()
-    const
+  [[nodiscard]] std::span<const std::shared_ptr<cucascade::io::datasource>> get_datasources() const
   {
     if (!has_scan_metadata()) { return {}; }
     return std::get<std::shared_ptr<scan_info>>(materialization_info)->datasources();
   }
 
   /// Report @p site to the readahead manager and to every hinted datasource.
-  void update(io::cache::scan_stage site) const;
+  void update(cucascade::io::cache::scan_stage site) const;
 
   /**
    * @brief Prepare this split for execution in the requested memory space.
@@ -301,6 +300,8 @@ class scan_operator_input : public op::operator_data {
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
   [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override;
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes(
+    std::optional<int> device) const;
 
   [[nodiscard]] const scan_info& get_scan_info() const
   {
@@ -377,6 +378,10 @@ class scan_operator_input : public op::operator_data {
   bool cached_view_possible{false};
   /// Possible membership applications attached to this split's current decoded rows.
   std::vector<applied_entry> decode_attached;
+  /// The scan's per-output-column normalization targets, set when the scan's output assembly is a
+  /// leading identity, so a compacted decode may write restored columns directly in their target
+  /// type. Empty otherwise.
+  std::vector<cudf::data_type> decode_restore_types;
   /// Operator-shared latch for "compacting this scan's batches during decode
   /// does not pay off", stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands

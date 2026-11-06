@@ -86,15 +86,16 @@ namespace cucascade::memory {
 class memory_space;
 }  // namespace cucascade::memory
 
+namespace cucascade::io {
+class ioctx;
+}  // namespace cucascade::io
+
 namespace sirius {
 
 namespace op::scan {
 class gpu_ingestible;
 class scan_info;
 }  // namespace op::scan
-namespace io {
-class ioctx;
-}  // namespace io
 namespace scan_manager {
 class host_pin_placement;
 }  // namespace scan_manager
@@ -180,6 +181,13 @@ struct pin_materialization_options {
   /// leaves the probe off, which is the default; the caller derives it from
   /// @c late_mat::pin_unique_probe_selection.
   std::vector<bool> probe_unique_columns;
+  /// Positional with @c probe_unique_columns: true = the column is observed automatically
+  /// (see @c late_mat::pin_unique_automatic_selection). Empty = none.
+  std::vector<bool> probe_unique_automatic;
+  /// Cap on the bytes retained for the exact uniqueness stage across all columns together, a shared
+  /// budget rather than a per-column allowance; 0 = a share of the GPU memory space's capacity
+  /// (see @c late_mat::exact_uniqueness_byte_cap).
+  std::uint64_t unique_exact_max_bytes = 0;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
@@ -201,7 +209,7 @@ struct pin_materialization_options {
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options = {});
 
@@ -301,7 +309,7 @@ host_pin_result materialize_pin_to_host(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   scan_manager::host_pin_placement& placement,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options = {});
@@ -325,7 +333,7 @@ host_pin_result materialize_pin_to_host(
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options = {});

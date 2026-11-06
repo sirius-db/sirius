@@ -23,25 +23,21 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
-#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "yyjson.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
-
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/string_util.hpp>
 #include <duckdb/common/types/blob.hpp>
-#include <duckdb/parser/sql_statement.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
@@ -57,7 +53,6 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <transparent/read_view_registry.hpp>
-#include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/log_test_utils.hpp>
@@ -380,6 +375,11 @@ class ParquetCountCarrierFixture : public MultiFormatFixtureBase {
           "SELECT CASE WHEN i % 4 = 0 THEN NULL::BIGINT ELSE i END AS id, "
           "NULL::BOOLEAN AS flag FROM range(257) t(i)");
     write("empty.parquet", rows + " WHERE false");
+    // `v` is INTEGER in one file and BIGINT in the other, and equal to `k` in both.
+    write("drift/a.parquet",
+          "SELECT (i % 7)::INTEGER AS k, (i % 7)::INTEGER AS v FROM range(129) t(i)");
+    write("drift/b.parquet",
+          "SELECT (i % 7)::INTEGER AS k, (i % 7)::BIGINT AS v FROM range(128) t(i)");
     // Keep COUNT(*) in the scan instead of answering it from parquet statistics.
     optimizer_guard =
       std::make_unique<sirius::test::disabled_optimizers_guard>(*con, "statistics_propagation");
@@ -443,6 +443,28 @@ TEST_CASE_METHOD(ParquetCountCarrierFixture,
   compare_gpu_vs_cpu("SELECT part, count(*) FROM read_parquet(" +
                      scratch.file_literal("evolved/part=*/*.parquet") +
                      ", hive_partitioning=true, union_by_name=true) GROUP BY part ORDER BY part");
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet type drift under a FIRST input is refused by the scan",
+                 "[integration][scan][parquet][gpu][schema_evolution][distinct]")
+{
+  std::string const drift = "read_parquet(" + scratch.file_literal("drift/*.parquet") +
+                            ", union_by_name=true, hive_partitioning=false)";
+  // A FIRST's input is semantic, so the scan refuses the drift before cuDF concatenates both
+  // widths; the CPU answers.
+  for (auto const& query : {"SELECT k, first(v) FROM " + drift + " GROUP BY k",
+                            "SELECT DISTINCT ON (k) k, v FROM " + drift}) {
+    INFO(query);
+    sirius::test::scoped_recording_log_sink logs;
+    compare_gpu_vs_cpu(query, std::nullopt, gpu_route::runtime_fallback);
+    bool refused = false;
+    for (auto const& record : logs.records())
+      if (record.message.find("Parquet column 'v' has unqualified type drift from INTEGER to "
+                              "BIGINT") != std::string::npos)
+        refused = true;
+    CHECK(refused);
+  }
 }
 
 TEST_CASE_METHOD(ParquetCountCarrierFixture,
@@ -1948,6 +1970,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - mapped virtual rows preserve deletion positions",
+                 "[integration][gpu_execution][iceberg][schema_evolution][virtual_columns]")
+{
+  bool const filtered = GENERATE(false, true);
+  auto query          = "SELECT count, score, fruit, added, file_row_number FROM " +
+               pinned_scan(evolved_fields_path) + (filtered ? " WHERE count >= 3" : "") +
+               " ORDER BY count;";
+  std::vector<std::vector<std::string>> expected{{"1", "1.5", "NULL", "7", "0"},
+                                                 {"3", "NULL", "NULL", "7", "2"},
+                                                 {"5", "5.5", "NULL", "7", "4"}};
+  if (filtered) expected.erase(expected.begin());
+  expect_iceberg_rows(query, gpu_route::gpu, std::move(expected));
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - evolution preserves count and NULL predicates",
                  "[integration][gpu_execution][iceberg][schema_evolution]")
 {
@@ -2070,7 +2107,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "iceberg internal queries remain invisible with global GPU execution enabled",
+                 "iceberg manifest queries remain invisible with global GPU execution enabled",
                  "[integration][gpu_execution][iceberg][transparent][read_view]")
 {
   REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=false")->HasError());
@@ -2095,9 +2132,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE_FALSE(enabled->HasError());
     REQUIRE(enabled->Collection().GetValue(0, 0).GetValue<bool>());
   }
-  sirius::io::kvikio_context ioctx;
-  auto const reads_before = sirius::op::scan::iceberg_delete_data_uncached_read_count();
-  // Positional deletes read Parquet metadata; deletion vectors also reread their Avro manifest.
+  // Deletion vectors also require an Avro manifest query during discovery.
   for (auto const* dataset : {"iceberg_snapshot_deletes", "iceberg_v3_deletion_vector"}) {
     auto const table = (get_project_root() / "test/cpp/integration/data" / dataset).string();
     CAPTURE(table);
@@ -2106,12 +2141,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(inventory.inventory);
     auto discovery = sirius::op::scan::discover_from_manifests(
       *con->context, table, std::move(*inventory.inventory));
-    auto data = sirius::op::scan::load_delete_payload(
-      *con->context, table, &ioctx, current_snapshot_id(table), discovery);
-    REQUIRE(data);
-    REQUIRE_FALSE(data->positional_deletes.empty());
+    REQUIRE(discovery.positional_delete_files.size() + discovery.deletion_vector_entries.size() ==
+            1);
   }
-  CHECK(sirius::op::scan::iceberg_delete_data_uncached_read_count() == reads_before + 2);
   auto const after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
   CHECK(after.provider_internal_skips == before.provider_internal_skips);
@@ -3429,8 +3461,8 @@ TEST_CASE_METHOD(
   REQUIRE_FALSE(sibling.Query("SELECT 1")->HasError());
   auto discovery = sirius::op::scan::discover_from_manifests(
     *con->context, v2_path, std::move(*inventory.inventory));
-  sirius::io::kvikio_context ioctx;
-  auto data = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto data  = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
   REQUIRE(data);
   REQUIRE(data->positional_deletes.size() == 1);
   CHECK(data->positional_deletes.begin()->second == std::vector<int64_t>{1, 3});
@@ -3439,8 +3471,8 @@ TEST_CASE_METHOD(
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 1);
   REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
   auto cached =
-    sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
-  auto hit = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+    sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
+  auto hit = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
   CHECK(cached != hit);
   CHECK(cached->positional_deletes == data->positional_deletes);
   CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==

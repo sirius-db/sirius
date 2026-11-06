@@ -34,6 +34,11 @@ namespace op {
 
 class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE;
 
@@ -55,6 +60,9 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   //! Schema emitted by the per-task partial aggregate. AVG expands to SUM + COUNT here; the
   //! MERGE_AGGREGATE above this operator collapses those carriers to the declared SQL schema.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_local_output_types() const;
+
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const input_stats& stats) const override;
 
   bool is_source() const override { return true; }
 

@@ -46,6 +46,11 @@ namespace {
 constexpr std::size_t kMiB = 1024ull * 1024ull;
 
 struct test_source_operator : sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   test_source_operator() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0)
   {
   }
@@ -161,7 +166,7 @@ class estimator_dag {
     return nullptr;
   }
 
-  pipeline_build_context _ctx{nullptr, true};
+  pipeline_build_context _ctx{nullptr};
   sirius_pipeline_build_state _bs;
   std::vector<std::unique_ptr<test_source_operator>> _ops;
   std::vector<std::unique_ptr<cucascade::shared_data_repository>> _repos;

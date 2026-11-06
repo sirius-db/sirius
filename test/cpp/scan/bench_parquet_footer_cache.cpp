@@ -4,11 +4,11 @@
  */
 // Hidden integration microbenchmark: real local files and the production footer
 // resolver. Copies share the same small schema; this is not a TPC benchmark.
-#include "io/kvikio/kvikio_context.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/parquet_metadata.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -40,13 +40,13 @@ TEST_CASE("Ten thousand real Parquet files reuse verified footer records",
   }
   // Files were just copied: OS page cache is warm in both passes. Only the
   // metadata cache changes from cold to warm; raw prefetch is not initialized.
-  auto context = std::make_shared<sirius::io::kvikio_context>();
+  auto context = std::make_shared<cucascade::io::kvikio_context>();
   auto options = cudf::io::parquet_reader_options::builder().build();
   for (int pass = 0; pass < 2; ++pass) {
     auto start  = std::chrono::steady_clock::now();
     size_t hits = 0;
     for (auto const& path : paths) {
-      auto source   = context->open_datasource(path);
+      auto source   = cucascade::io::open_datasource(context, path);
       bool hit      = false;
       auto metadata = sirius::op::scan::resolve_parquet_metadata(*source, 0, path, options, &hit);
       REQUIRE(metadata->file_metadata()->num_rows == 25);

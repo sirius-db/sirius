@@ -35,7 +35,10 @@ void preparation_failure::validate() const
 transparent::failure_cause classify_failure(preparation_failure const& failure)
 {
   failure.validate();
-  return {failure.cause, failure.detail};
+  transparent::failure_cause result{failure.cause, failure.detail};
+  auto original = transparent::classify_failure(failure.original, failure.cause);
+  if (original.cause == result.cause) result.reason = std::move(original.reason);
+  return result;
 }
 preparation_unit::preparation_unit(unit_key key,
                                    required_input_set required,

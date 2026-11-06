@@ -20,9 +20,6 @@
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cudf/cudf_utils.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/io_context.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "sirius_context.hpp"
@@ -33,28 +30,24 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/utilities/error.hpp>
-#include <cudf/utilities/span.hpp>
-#include <cudf/utilities/traits.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda/stream>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
-#include <duckdb/common/types/vector.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/storage/block_manager.hpp>
-#include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/compression/roaring/roaring.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -68,7 +61,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <future>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -722,7 +714,7 @@ void batched_h2d(std::vector<void*> const& dst,
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
-                      sirius::io::sirius_datasource& datasource,
+                      cucascade::io::datasource& datasource,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
@@ -813,7 +805,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
 
   // One coalesced range + contiguous dst span per piece.
-  std::vector<io::slice> ranges;
+  std::vector<cucascade::io::slice> ranges;
   ranges.reserve(pieces.size());
   std::size_t total_read = 0;
   for (auto const& p : pieces) {
@@ -994,7 +986,7 @@ std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   duckdb_native_ingestible_table_info const& table_info,
-  sirius::io::sirius_datasource* datasource,
+  cucascade::io::datasource* datasource,
   cucascade::memory::memory_space& mem_space,
   ::cuda::stream_ref stream)
 {

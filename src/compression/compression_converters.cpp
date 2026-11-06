@@ -19,7 +19,6 @@
 #include "compressed_disk_representation.hpp"
 #include "compressed_representation.hpp"
 #include "compressed_scan.hpp"
-#include "device_compressed_blob.hpp"
 #include "spill_compression.hpp"
 #include "telemetry/nvtx.hpp"
 

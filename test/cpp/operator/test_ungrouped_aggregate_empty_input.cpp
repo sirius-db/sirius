@@ -30,6 +30,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/lists/lists_column_view.hpp>
 
@@ -57,6 +58,7 @@ using expressions = duckdb::vector<std::unique_ptr<sirius::ast::node>>;
 using schema      = duckdb::vector<logical_type>;
 
 auto const bigint  = logical_type::make(type_id::BIGINT);
+auto const hugeint = logical_type::make(type_id::HUGEINT);
 auto const integer = logical_type::make(type_id::INTEGER);
 
 std::unique_ptr<sirius::ast::node> aggregate(aggregate_id kind,
@@ -87,6 +89,11 @@ class hint_walker final : public sirius::creator::task_creator {
 
 class capture_result final : public sirius_physical_operator {
  public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   explicit capture_result(schema types)
     : sirius_physical_operator(SiriusPhysicalOperatorType::RESULT_COLLECTOR, std::move(types), 1)
   {
@@ -116,7 +123,7 @@ class capture_result final : public sirius_physical_operator {
 struct merge_fixture {
   sirius::pipeline::pipeline_build_context context{nullptr};
   cucascade::shared_data_repository_manager repositories;
-  sirius_physical_operator producer;
+  test_physical_operator producer;
   sirius_physical_ungrouped_aggregate_merge merge;
   capture_result collector;
   std::shared_ptr<sirius_pipeline> upstream;
@@ -250,27 +257,28 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
   auto manager            = sirius::test::operator_utils::initialize_memory_manager();
   auto* space             = manager->get_memory_space(Tier::GPU, 0);
   REQUIRE(space != nullptr);
+  // DuckDB returns HUGEINT for SUM and sum_no_overflow over INTEGER and BIGINT.
   schema types{bigint,
                bigint,
                bigint,
-               bigint,
+               hugeint,
                input_type,
                input_type,
                input_type,
                logical_type::make(type_id::DOUBLE),
-               bigint,
+               hugeint,
                logical_type::make(type_id::DOUBLE)};
   auto make_aggregates = [input_type] {
     expressions result;
     result.push_back(aggregate(aggregate_id::count_star, bigint));
     result.push_back(aggregate(aggregate_id::count, bigint, input_type));
     result.push_back(aggregate(aggregate_id::count, bigint, input_type, true));
-    result.push_back(aggregate(aggregate_id::sum, bigint, input_type));
+    result.push_back(aggregate(aggregate_id::sum, hugeint, input_type));
     result.push_back(aggregate(aggregate_id::min, input_type, input_type));
     result.push_back(aggregate(aggregate_id::max, input_type, input_type));
     result.push_back(aggregate(aggregate_id::first, input_type, input_type));
     result.push_back(aggregate(aggregate_id::avg, logical_type::make(type_id::DOUBLE), input_type));
-    result.push_back(aggregate(aggregate_id::sum_no_overflow, bigint, input_type));
+    result.push_back(aggregate(aggregate_id::sum_no_overflow, hugeint, input_type));
     result.push_back(
       aggregate(aggregate_id::stddev_samp, logical_type::make(type_id::DOUBLE), input_type));
     return result;
@@ -285,9 +293,18 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
     auto partial = local.execute(pipelineable_operator_data({input}), default_stream());
     auto batch   = only_batch(*partial);
     auto view    = sirius::get_cudf_table_view(*batch);
+    // FIRST occupies a value column and an input-row-count column. AVG's
+    // sum/count and the later aggregate states follow both FIRST columns.
+    constexpr cudf::size_type first_row_count = 7;
+    constexpr cudf::size_type avg_sum         = 8;
+    constexpr cudf::size_type stddev_state    = 11;
+    REQUIRE(view.num_columns() == 12);
     CHECK(view.column(3).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
-    CHECK(view.column(7).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
-    CHECK(view.column(10).type() == cudf::data_type{cudf::type_id::STRUCT});
+    REQUIRE(view.column(first_row_count).type() == cudf::data_type{cudf::type_id::INT64});
+    CHECK(view.column(first_row_count).null_count() == 0);
+    CHECK(copy_column_to_host<int64_t>(view.column(first_row_count)) == std::vector<int64_t>{0});
+    CHECK(view.column(avg_sum).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+    CHECK(view.column(stddev_state).type() == cudf::data_type{cudf::type_id::STRUCT});
     fixture.merge.push_data_batch("default", std::move(batch));
   }
   fixture.close_input();

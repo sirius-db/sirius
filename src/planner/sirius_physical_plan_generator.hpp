@@ -48,6 +48,7 @@ class Value;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
+class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalCrossProduct;
@@ -61,6 +62,7 @@ class LogicalGet;
 class LogicalLimit;
 class LogicalOrder;
 class LogicalTopN;
+class LogicalWindow;
 class LogicalProjection;
 class LogicalSetOperation;
 class LogicalMaterializedCTE;
@@ -135,19 +137,9 @@ class sirius_physical_plan_generator {
   //! sink
   static bool use_batch_index(duckdb::ClientContext& context,
                               sirius::op::sirius_physical_operator& plan);
-  //! Whether or not we should preserve insertion order for executing the given sink
-  static bool preserve_insertion_order(duckdb::ClientContext& context,
-                                       sirius::op::sirius_physical_operator& plan);
-  //! The order preservation type of the given operator decided by recursively looking at its
-  //! children
-  static sirius::OrderPreservationType order_preservation_recursive(
-    sirius::op::sirius_physical_operator& op);
-
-  //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
-  [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
 
   //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
-  //! type, or `planned_aggregate_type` of it; @p subject names the input in the message.
+  //! type; @p subject names the input in the message.
   static void require_planned_schema(std::span<sirius::logical_type const> planned,
                                      duckdb::vector<duckdb::LogicalType> const& declared,
                                      std::string_view subject);
@@ -157,8 +149,8 @@ class sirius_physical_plan_generator {
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
-  // &op);
+  //! Plan an INNER ANY join as a cross product filtered by its condition; other join types throw.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalColumnDataGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -175,14 +167,14 @@ class sirius_physical_plan_generator {
     duckdb::LogicalCrossProduct& op);
   //! Lower a join with no conditions to the nested loop join's cross product. Shared by the
   //! LogicalCrossProduct overload and by plan_comparison_join for a LogicalComparisonJoin whose
-  //! condition list is empty, so the two entry points cannot drift.
+  //! condition list is empty, so the two entry points cannot drift. Leaves
+  //! op.estimated_cardinality to the caller.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_cross_product_join(
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
     duckdb::JoinType join_type,
-    std::size_t lhs_cardinality,
-    std::size_t rhs_cardinality,
+    std::size_t estimated_cardinality,
     duckdb::vector<std::size_t> left_projection_map,
     duckdb::vector<std::size_t> right_projection_map);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
@@ -209,6 +201,7 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalWindow& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalPositionalJoin &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -218,7 +211,7 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! Dispatches a set operation on its type; EXCEPT / INTERSECT throw, so they run on the CPU.
+  //! Dispatches a set operation on its type.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -249,14 +242,20 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  //! Lowers EXCEPT ALL / INTERSECT ALL to tag, UNION ALL, per-group tag sums, and
+  //! `sirius_physical_replicate`; refuses the distinct forms.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
+    duckdb::LogicalSetOperation& op);
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
     duckdb::LogicalSetOperation& op);
 
-  //! A zero-aggregate grouped aggregate over @p child keyed on its @p key_columns, in that order;
-  //! its output is exactly those columns.
+  //! A grouped aggregate over @p child keyed on its @p key_columns, in that order, carrying each of
+  //! @p carried_columns through a FIRST; its output is the keys, then the carried columns.
   static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_dedup(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
     std::span<duckdb::idx_t const> key_columns,
+    std::span<duckdb::idx_t const> carried_columns,
     duckdb::idx_t estimated_cardinality);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
@@ -276,7 +275,6 @@ class sirius_physical_plan_generator {
                                         std::string_view operation);
 
   // private:
-  bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
   std::size_t delim_index = 0;

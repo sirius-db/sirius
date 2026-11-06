@@ -182,6 +182,11 @@ class residual_filter {
   [[nodiscard]] std::unique_ptr<sirius::ast::node> against_progress(
     std::span<predicate_progress const> progress) const;
   [[nodiscard]] std::size_t size() const noexcept { return _conjuncts.size(); }
+  [[nodiscard]] std::vector<predicate_progress> progress_from_answers(
+    std::span<std::size_t const> answered_positions, bool answers_enforced) const;
+  [[nodiscard]] std::vector<predicate_progress> progress_from_legacy_answers(
+    std::span<std::size_t const> answered_positions, bool answers_enforced) const;
+  void validate_progress(std::span<predicate_progress const> progress) const;
 
  private:
   struct conjunct {

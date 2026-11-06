@@ -2,7 +2,7 @@
 // Sirius as the model source instead of falling back to quent's build info.
 use std::path::Path;
 
-use quent_instrumentation_build::{Options, generate};
+use quent_instrumentation_build::{EventOptions, Options, generate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     quent_build_info::emit_source();
@@ -18,10 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     generate(
         &parsed.schema,
         &Options {
-            serde: true,
-            combined_event: true,
+            events: EventOptions {
+                serde: true,
+                combined_event: true,
+                ..EventOptions::default()
+            },
             analyzer_package: Some("sirius-telemetry-analyzer".to_owned()),
-            collector_sink: true,
+            collector_sink: cfg!(feature = "collector"),
             ..Options::default()
         },
     )?;

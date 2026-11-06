@@ -17,6 +17,13 @@ Benchmarking tools for comparing DuckDB (CPU) vs Sirius (GPU) on TPC-H queries a
 3. Ensure parquet data exists (auto-generated if missing via `generate_tpch_data.sh`).
    - On the GB300 machine, the SF1000 dataset is at `/home/nvidia/tpch_parquet_sf1000`.
 
+For `generate_tpch_data.sh --format duckdb`, keys use `INTEGER` until their full
+dataset range requires `BIGINT`, matching tpchgen-rs's Parquet defaults. Each key
+family widens across all tables together: order keys at integer SF358, part keys
+at SF10,738, customer keys at SF14,317, and supplier keys at SF214,749. Nation and
+region keys stay `INTEGER`. Clustered DuckDB datasets use the same widths.
+Regenerate existing datasets to apply the new types.
+
 ## Running Benchmarks
 
 All commands run from the **project root** directory.

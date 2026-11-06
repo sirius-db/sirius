@@ -15,7 +15,7 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/common/arrow/arrow_wrapper.hpp>
 #include <exec/arrow_result_stream.hpp>
 #include <utils/parquet_fixture_utils.hpp>

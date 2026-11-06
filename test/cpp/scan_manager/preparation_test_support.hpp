@@ -18,12 +18,14 @@
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <atomic>
+#include <functional>
 #include <limits>
 
 namespace sirius::scan_manager::test {
 struct reservation_observation {
   std::atomic<uint64_t> outstanding{0}, requests{0}, allocations{0}, allocated_bytes{0};
   bool fail_allocation = false;
+  std::function<void()> before_allocate;
 };
 class fake_backing final : public reservation_backing {
  public:
@@ -41,6 +43,7 @@ class fake_backing final : public reservation_backing {
   }
   backing_allocation allocate(uint64_t bytes) override
   {
+    if (seen_->before_allocate) seen_->before_allocate();
     ++seen_->allocations;
     if (seen_->fail_allocation) throw std::bad_alloc();
     auto charge = charge_size(bytes);

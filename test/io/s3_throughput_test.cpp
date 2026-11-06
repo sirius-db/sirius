@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// s3_throughput_test — raw S3 read throughput via the Sirius REST reactor.
+// s3_throughput_test — raw S3 read throughput via cuCascade's REST backend (rest_ioctx).
 //
 // For each selected file the benchmark picks random non-overlapping aligned
 // slices of --chunk-size to satisfy the --per-file read budget. One batched
@@ -34,9 +34,10 @@
 //       --config       sirius_s3.yml
 
 #include "exec/semi_future.hpp"
-#include "io/types.hpp"
 #include "s3_bench_common.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
@@ -134,8 +135,8 @@ std::vector<std::size_t> pick_offsets(std::size_t file_size,
 // ---------------------------------------------------------------------------
 
 struct file_work {
-  std::unique_ptr<sirius::io::sirius_datasource> ds;
-  std::vector<sirius::io::slice> slices;
+  std::unique_ptr<cucascade::io::datasource> ds;
+  std::vector<cucascade::io::slice> slices;
   std::size_t total_bytes{0};
 };
 
@@ -155,7 +156,7 @@ std::vector<file_work> prepare_work(engine& eng,
   std::size_t next_block = 0;
   for (auto const& f : files) {
     file_work w;
-    w.ds = eng.io_ctx().open_datasource(f.path);
+    w.ds = cucascade::io::open_datasource(eng.io_ctx_ptr(), f.path);
 
     const std::size_t n_chunks = per_file_bytes / chunk_bytes;
     auto offsets               = pick_offsets(f.size_bytes, chunk_bytes, n_chunks, rng);
@@ -185,7 +186,7 @@ std::size_t count_segments(std::vector<file_work> const& work)
 
 /// Issue each file's logical slices in one host_readv_async_io call, attach an
 /// inline callback to each file future that counts down a latch, then wait.
-/// Reads are submitted from the main thread; callbacks fire on reactor threads.
+/// Reads are submitted from the main thread; callbacks fire on REST runner threads.
 iteration_result run_once(engine& eng, std::vector<file_work>& work)
 {
   std::atomic<std::size_t> bytes_read{0};

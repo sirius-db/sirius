@@ -21,8 +21,6 @@
 // passes null_equality::EQUAL when the equi-key condition is null-safe.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
-#include <duckdb/optimizer/optimizer.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 

@@ -38,7 +38,7 @@ thrift-compiler = "0.22.*"
 
 [feature.be.tasks]
 # Build libsirius from source via the repo-root build (creates build/release, which
-# sirius-sys links by default).
+# sirius-ffi uses through sirius-sys by default).
 engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",description = "Build the Sirius engine (libsirius) from source for the BE to link"}
 
 # Engine-linked BE (default `sirius-engine` feature); needs the engine artifact and

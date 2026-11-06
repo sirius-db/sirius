@@ -32,10 +32,7 @@
 #include <sirius/exception.hpp>
 
 // standard library
-#include <algorithm>
 #include <cstddef>
-#include <ranges>
-#include <variant>
 
 // Single source of truth for "how many cuDF AST operators does this Sirius AST
 // alternative lower to, recursively." Drives the AST-vs-MATERIALIZE strategy
@@ -88,12 +85,9 @@ std::size_t between::cudf_ast_op_count() const
 
 std::size_t cast::cudf_ast_op_count() const
 {
-  // Only target types in supported_ast_cast_types_native lower to a single
-  // CAST_TO_* cuDF AST op; others force materialize.
-  bool const supported = std::find(supported_ast_cast_types_native.begin(),
-                                   supported_ast_cast_types_native.end(),
-                                   target_type.id()) != supported_ast_cast_types_native.end();
-  return supported ? 1 + child->cudf_ast_op_count() : 0;
+  // Only casts ast_supports_cast admits lower to a single CAST_TO_* cuDF AST op; others force
+  // materialize.
+  return ast_supports_cast(child->return_type(), target_type) ? 1 + child->cudf_ast_op_count() : 0;
 }
 
 std::size_t unary_op::cudf_ast_op_count() const
@@ -130,17 +124,7 @@ std::size_t in_list::cudf_ast_op_count() const
 
 std::size_t function_call::cudf_ast_op_count() const
 {
-  if (date_operation().has_value()) { return 0; }
-  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
-  if (return_type().is_decimal() || std::ranges::any_of(arguments(), [](auto const& arg) {
-        return arg->return_type().is_decimal();
-      })) {
-    return 0;
-  }
-  bool const supported =
-    std::find(supported_ast_functions.begin(), supported_ast_functions.end(), function()) !=
-    supported_ast_functions.end();
-  if (!supported) { return 0; }
+  if (!ast_supports_function(*this)) { return 0; }
   std::size_t count = 1;
   for (auto const& a : arguments()) {
     count += a->cudf_ast_op_count();

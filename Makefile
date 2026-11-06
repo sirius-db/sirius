@@ -36,8 +36,13 @@ sirius-duckdb: release
 		SIRIUS_INSTALL_DIR="$(CURDIR)/build/release/install" \
 		EXT_FLAGS="$(EXT_FLAGS) -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
+# Development tooling from the Pixi environment; set SIRIUS_CMAKE_FLAGS= without it.
+SIRIUS_CMAKE_FLAGS ?= -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+	-DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
+	-DCMAKE_LINKER_TYPE=MOLD
+
 build/%/build.ninja: $(CMAKE_INPUTS)
-	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))"
+	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))" $(SIRIUS_CMAKE_FLAGS)
 
 release: build/release/build.ninja
 	$(CMAKE) --build --preset release --target $(BUILD_TARGETS)
@@ -112,7 +117,7 @@ list-presets:
 #                     TPC-H Q1-Q22 suite) with SeaweedFS auto-managed, in strict mode.
 # `make s3-test-large`
 #                     large-fixture gate, run as two processes. Both run the
-#                     SF10 lineitem cases, with cache.mode sirius in the first
+#                     SF10 lineitem cases, with cache.mode cucs in the first
 #                     and cache.mode none in the second
 #                     (SIRIUS_TEST_S3_LARGE=1 makes the harness generate and
 #                     upload lineitem_sf10.parquet; needs the DuckDB CLI from
@@ -175,7 +180,7 @@ s3-test-large:
 	  exit 1; \
 	fi
 	@# Two processes, so SeaweedFS is brought up once per group: first the SF10
-	@# lineitem cases with cache.mode sirius ([large-cache]) plus the SF1 TPC-H
+	@# lineitem cases with cache.mode cucs ([large-cache]) plus the SF1 TPC-H
 	@# suite and the 1001-object glob case, which use cache.mode none; then the
 	@# SF10 lineitem cases with cache.mode none ([large-nocache]). Catch2
 	@# OR-combines specs within one argument via commas (multiple positional args

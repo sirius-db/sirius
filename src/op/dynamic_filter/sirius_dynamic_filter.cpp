@@ -18,8 +18,6 @@
 #include "memory/runtime_stream_pool.hpp"
 
 #include <cudf/fixed_point/fixed_point.hpp>
-#include <cudf/search.hpp>
-#include <cudf/utilities/traits.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
 #include <rmm/cuda_device.hpp>

@@ -11,11 +11,9 @@
 #include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -30,8 +28,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
 #include <map>
 #include <mutex>
+#endif
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -872,6 +872,22 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       selection.enumerate_by_index = index_walk_pick &&
                                      selection.route == sc::decode_route::bitpack_mask &&
                                      sel.survivor_count > 0;
+      // Forward the caller's restore type only for a lossless widening of the stored type: same
+      // DECIMAL scale, a wider signed integer, or TIMESTAMP_DAYS for a narrowed DATE.
+      // Unsigned storage is excluded: the JIT decoder has no unsigned element types.
+      if (i < request.output_types.size() && request.output_types[i].has_value()) {
+        auto const stored = column.dtype;
+        auto const target = *request.output_types[i];
+        bool const decimal_widening =
+          cudf::is_fixed_point(stored) && cudf::is_fixed_point(target) &&
+          stored.scale() == target.scale() && cudf::size_of(target) > cudf::size_of(stored);
+        bool const integer_widening =
+          cudf::is_integral_not_bool(stored) && !cudf::is_unsigned(stored) &&
+          ((cudf::is_integral_not_bool(target) && !cudf::is_unsigned(target)) ||
+           target.id() == cudf::type_id::TIMESTAMP_DAYS) &&
+          cudf::size_of(target) > cudf::size_of(stored);
+        if (decimal_widening || integer_widening) { selection.output_type = target; }
+      }
       if (selection.route == sc::decode_route::full || selection.enumerate_by_index)
         wait_for_indices(wave2.next_stream());
       decoded_positions.push_back(i);

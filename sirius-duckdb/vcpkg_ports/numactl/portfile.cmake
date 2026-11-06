@@ -35,6 +35,16 @@ vcpkg_replace_string(
 #endif]]
   [[#define SYMVER(a,b) /* disabled for static linking */]])
 
+# Removing SYMVER also removes the public aliases of the v2 affinity functions.
+# Keep their modern bitmask ABI available to static consumers such as cuCascade.
+foreach(affinity_api IN ITEMS numa_sched_getaffinity numa_sched_setaffinity)
+  vcpkg_replace_string(
+    "${SOURCE_PATH}/syscall.c"
+    "make_internal_alias(${affinity_api}_v2);"
+    "make_internal_alias(${affinity_api}_v2);\nextern __typeof__(${affinity_api}_v2) ${affinity_api} __attribute__((alias(\"${affinity_api}_v2\")));"
+  )
+endforeach()
+
 vcpkg_cmake_configure(SOURCE_PATH "${SOURCE_PATH}")
 
 vcpkg_cmake_install()

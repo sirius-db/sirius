@@ -27,6 +27,15 @@ A session is built from three pieces:
 
 The session (`exec::stream_session`) is the id-addressed router over these operators.
 
+## Ordering across fragment boundaries
+
+Streams carry batches without logical positions. Both `STREAMING_SOURCE` and `STREAMING_SINK`
+declare `NO_ORDER`, including single-destination and broadcast sinks. Positions established within
+one fragment are local to that producer; independent senders can reuse the same position and
+transport relays do not preserve it. A global `ORDER BY` therefore requires a merge or sort on the
+sort keys in the receiving plan. A LIMIT directly over a stream can use `UNORDERED_STREAMING_LIMIT`.
+Available batches can be consumed before all senders close.
+
 ## The model: the repository is the queue
 
 A `cucascade::shared_data_repository` already *is* a thread-safe queue of `data_batch`es, and it
@@ -72,9 +81,9 @@ class batch_stream {
   bool drained() const;               // clean end only
   void wait();                        // not atomic with try_pull — loop and re-check
 
-  // Hooks (single slot; fire after unlocking; registering on an ended stream fires immediately)
+  // Hooks (single slot; fire after unlocking)
   void set_on_data(function<void()>);           // persistent — fires on every push and on fail()
-  void set_on_end_of_stream(function<void()>);
+  void set_on_end_of_stream(function<void()>);  // registration on a terminal stream fires it
 };
 ```
 

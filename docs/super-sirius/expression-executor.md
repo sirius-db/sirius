@@ -205,6 +205,76 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
+### Conditional evaluation and row-dependent errors
+
+DuckDB evaluates a CASE branch only on the rows that select it. A WHEN sees the rows no earlier
+WHEN matched (NULL does not match), a THEN sees the rows its WHEN matched, and ELSE sees the rest.
+A COALESCE argument sees the rows that every earlier argument left NULL. A branch therefore never
+raises an error for a row it does not produce, as in `CASE WHEN n = 1 THEN a + n ELSE a END` where
+`a + n` overflows on rows with other `n`.
+
+`case_expr` and `coalesce` first evaluate eagerly as described above: every CASE branch, and every
+COALESCE argument while nulls remain, over the whole batch. Checked operations reject the batch
+when any row is invalid. They raise `sirius::invalid_input_exception`, or
+`sirius::not_implemented_exception` when DuckDB must produce the error. A branch whose type the
+GPU cannot map, such as a hand-written `error()`, raises `duckdb::InvalidInputException`. On any of
+these, `with_selective_retry` releases the eager pass's temporaries and evaluates the expression
+again with DuckDB's semantics:
+
+- `evaluate_on_selected_rows` compacts the referenced input columns to the rows of a BOOL8 mask
+  and evaluates the branch in a child `expression_evaluator`. The parent's AST tree, temporaries
+  and caches stay intact, and the result has the branch's declared type.
+- A branch that no row reaches is not evaluated, as in DuckDB, so even an expression the GPU
+  cannot evaluate at all may sit there. A CASE stops at the first WHEN that no row reaches.
+- `cudf::boolean_mask_scatter` writes each branch's rows into the result.
+
+Only the outermost conditional retries. A conditional nested in an eager pass runs eagerly and
+leaves its error to the enclosing retry, and one nested in a selective pass runs selectively at
+once. Nested conditionals therefore cost at most one eager and one selective pass at any depth;
+retrying at every level would double the work per level.
+
+An error from this second pass is legitimate and propagates. A query that succeeds eagerly pays
+nothing for the retry, and a new checked operation is covered without a list of fallible
+operations. Other exceptions, such as out-of-memory, propagate without a retry, and so does an
+error over an input without columns, which cannot carry a row count. The eager pass tests an
+`error()` THEN's WHEN on every row, which is exact only for the first WHEN, so a CASE with an
+`error()` THEN after its first WHEN evaluates selectively at once. Only hand-written SQL produces
+one. Tests are tagged `[conditional_errors]`.
+
+In a predicate, DuckDB's Select evaluates an AND operand only on the rows every earlier operand
+passed, and an OR operand only on the rows none passed. Predicates are FILTER conditions and
+WHEN conditions. DuckDB keeps the plan's operand order whenever an operand can raise. So
+`WHERE b - c <> -1 AND n // (b - c) > 1` never divides on a row where `b - c` is -1. The GPU
+matches this in two places:
+
+- `evaluate_predicate` evaluates an AND or OR at the top of a predicate eagerly. If that raises
+  one of the errors above, it evaluates each operand on its rows through
+  `evaluate_on_selected_rows`, and each operand is itself a predicate. The result reads false for
+  rows that do not pass, where an eager AND or OR may read NULL; a predicate does not tell the two
+  apart.
+- A CASE evaluates its WHENs as predicates when it retries. `select()` evaluates its predicate
+  this way only after `enable_short_circuit()`, which the FILTER operator calls.
+
+Scans leave it off. DuckDB orders a scan's filters by estimated cost, and Sirius does not
+reproduce that order. Short-circuiting in another order could return rows where DuckDB raises an
+error. Outside predicates DuckDB evaluates every AND and OR operand on every row, and so does the
+GPU, as in a projection's `SELECT b - c <> -1 AND n // (b - c) > 1`. BETWEEN and IN evaluate every
+operand on every row in both, too.
+
+The planner lowers `agg(x) FILTER (WHERE f)` to `agg(CASE WHEN f THEN x ELSE NULL END)`. DuckDB
+instead computes `x` and `f` on every row and filters afterwards, so their errors raise for rows the
+FILTER drops. The planner marks this CASE `eager`. An eager CASE evaluates its WHEN as a value
+rather than a predicate, evaluates every branch on every row, and does not retry. A CASE inside `x`
+still retries on its own, as DuckDB evaluates it lazily.
+
+DuckDB also computes a derived table's columns on every row in their own projection, so in
+`SELECT CASE WHEN n < 100 THEN x ELSE a END FROM (SELECT a, n, a + n AS x FROM t)` the sum `a + n`
+raises for every row. [Projection folding](physical-plan-generation.md#projection-folding) would
+substitute `a + n` into the THEN, where it sees only some rows. It therefore keeps an inner
+expression other than a column or a constant in its own projection when the outer one reads it in
+a slot that may skip rows: a THEN, an ELSE, a WHEN after the first, a COALESCE argument after the
+first, or an AND or OR operand after the first inside a WHEN.
+
 Handlers that read an operand as a column evaluate it with `evaluate_as_column`, which broadcasts
 a scalar result to the input's row count. These are the date parts (including `millisecond` and
 `microsecond`), `date_trunc`, `round`, the string functions `strlen`, `length`, `upper`, `lower`,
@@ -215,6 +285,15 @@ all-constant calls: statistics propagation reduces `coalesce(<non-null constant>
 constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d))` reaches the
 GPU as `month(DATE '2020-02-01')`.
 Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
+
+`date_trunc` must return the type DuckDB declares: a microsecond `TIMESTAMP`. A DATE input
+normally uses cuDF's day-resolution `TIMESTAMP_DAYS` type. If that type reaches a parent
+`CASE` or `COALESCE`, it cannot be combined with a TIMESTAMP branch.
+
+For a DATE input, every GPU-supported unit is a day or finer, so truncation does not change
+the date. The evaluator converts it to a `TIMESTAMP` with `cast_date_to_timestamp`, which
+preserves infinities. For a TIMESTAMP input, it uses `cudf::datetime::floor_datetimes` to
+round to the requested unit.
 
 `in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that.
 
@@ -262,6 +341,18 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
+### HUGEINT
+
+HUGEINT is carried as cuDF DECIMAL128 with scale 0, an exact 128-bit integer with the layout of
+`duckdb::hugeint_t`; its constants are `sirius::decimal128` values with scale 0. Like DECIMAL
+(`logical_type::has_fixed_point_carrier`), HUGEINT arithmetic is materialized rather than lowered
+to the cuDF AST. `//` and `%` accept column divisors on the GPU after the checks described below.
+A cast from HUGEINT to a narrower integer or DECIMAL first checks the
+column's range and throws `not_implemented_exception` when a value does not fit, so the query falls
+back and DuckDB raises its conversion error (or returns NULL under `TRY_CAST`). Such casts never
+lower to the AST, whose integer casts wrap (`ast_supports_cast`); a cast to DOUBLE does. A cast to
+VARCHAR uses `cudf::strings::from_fixed_point`. Tests are tagged `[hugeint]`.
+
 `DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
 match their already-bound signatures and execute through `date_arithmetic_checked()`.
 The helper uses a libcudf JIT transform with public CCCL overflow helpers and error
@@ -273,6 +364,34 @@ collisions. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
+
+### DECIMAL to integer casts
+
+DECIMAL-to-integer casts round to the nearest integer, with ties away from zero, then check the
+destination range. NULLs remain NULL. On overflow, `TRY_CAST` returns NULL and `CAST` replays on
+the CPU. A UHUGEINT result above UINT64 also replays on the CPU, including under `TRY_CAST`.
+Tests are tagged `[decimal_integer_cast]`.
+
+### Division and modulo
+
+`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
+calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
+either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
+which preserves DuckDB's `error_on_division_by_zero` setting. A guarded
+`CASE WHEN b = 0 THEN NULL ELSE a // b END` stays on the GPU: the division is retried on the rows
+that ELSE selects (see [Conditional evaluation](#conditional-evaluation-and-row-dependent-errors)).
+With fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
+`TRY(...)` continues to use plan-time CPU fallback.
+
+Integer column divisors, including HUGEINT, first use an exact non-NULL range reduction. A minimum
+above zero or a maximum below -1 rules out both exceptional divisors and skips the row checks.
+Inconclusive ranges retain the exact checks, including their paired-NULL semantics.
+
+A proven nonzero constant divisor other than -1 can use the existing cuDF AST path. Other divisors
+materialize under every evaluation strategy; the standalone translator declines them as well, so
+join and scan predicates cannot bypass the checks. The shared `ast_supports_function` predicate
+keeps those decisions aligned. Ordinary floating-point `/` retains its existing route. Regression
+tests are tagged `[checked_division]`.
 
 ### Arity and negation
 
@@ -325,7 +444,7 @@ The following translate directly into cuDF AST nodes:
 | Comparison | `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NOT DISTINCT FROM` (via `NULL_EQUALS`) |
 | Logical | `AND`, `OR` (Kleene `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR`), `NOT` |
 | BETWEEN | Translated to `(val >= lower) AND (val <= upper)` |
-| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`) |
+| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`); from HUGEINT only `DOUBLE` (`ast_supports_cast`) |
 
 Anything outside this set is an AST breaker and forces materialization at that node.
 
@@ -358,7 +477,7 @@ A second overload, `translate_expression_with_names`, produces `cudf::ast::colum
 These return `nullopt`, causing the caller to fall back to row-by-row evaluation:
 - `case_expr` nodes
 - `coalesce` nodes and `TRY`
-- `cast` with non-fixed-width target types (e.g., VARCHAR)
+- `cast` with non-fixed-width target types (e.g., VARCHAR), and a HUGEINT cast to anything but DOUBLE
 - `IS DISTINCT FROM` (throws `NotImplementedException`)
 
 ### Join Condition Translation
@@ -377,6 +496,7 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the condi
 | `src/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
 | `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
 | `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
+| `src/expression_evaluator/selective_evaluation.cpp` | Selective retry of CASE, COALESCE, and a predicate's AND and OR on row subsets |
 | `src/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
 | `src/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
 | `src/expression_evaluator/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |

@@ -109,23 +109,14 @@ impl OperatorEntity for Operator {
             parent_operator_ids: data.parent_operator_ids.clone(),
             instance_name: data.instance_name.clone(),
             operator_type_name: data.type_name.clone(),
-            custom_attributes: data
-                .custom_attributes
-                .iter()
-                .map(|attribute| (attribute.key.clone(), attribute.value.clone()))
-                .collect(),
+            custom_attributes: data.custom_attributes.0.clone(),
             statistics: data.statistics.as_ref().map(|statistics| {
                 query_engine_ui::OperatorStatistics {
                     custom_statistics: statistics
                         .iter()
-                        .map(|attribute| {
-                            (
-                                attribute.key.clone(),
-                                query_engine_ui::OperatorStatistic {
-                                    value: attribute.value.clone(),
-                                    quantity: None,
-                                },
-                            )
+                        .map(|attribute| query_engine_ui::OperatorStatistic {
+                            value: attribute.clone(),
+                            quantity: None,
                         })
                         .collect(),
                 }

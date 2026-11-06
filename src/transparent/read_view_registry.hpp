@@ -69,7 +69,8 @@ read_view_comparison compare_read_views(
   candidate_origin,
   std::span<original_binding const> logical_original,
   std::span<op::scan::read_view_fingerprint const> physical_original,
-  std::span<candidate_binding const> candidate);
+  std::span<candidate_binding const> candidate,
+  std::span<candidate_binding const> skipped = {});
 read_view_comparison compare_read_views(
   candidate_origin,
   op::scan::logical_bound_read_view_capture const* logical_original,
@@ -108,7 +109,17 @@ class read_view_registry {
     return entries_;
   }
   [[nodiscard]] std::vector<candidate_binding> candidate_bindings() const;
+  // Scans of materialized CTE definitions that planning dropped because nothing reads them.
+  // DuckDB's plan still contains them, so comparison counts them beside the planned scans.
+  void record_skipped_scans(std::vector<op::scan::logical_bound_read_view> views);
+  [[nodiscard]] std::vector<candidate_binding> const& skipped_bindings() const noexcept
+  {
+    return skipped_;
+  }
   void record_verdict(op::scan::scan_contract_id id, op::scan::certification_result const& result);
+  // Trusted planning only, before correspondence is published or dispatch begins.
+  void bind_split_validator(op::scan::scan_contract_id,
+                            std::shared_ptr<op::scan::split_validator const>);
   // Returns true only for the first refusal of this LogicalGet in this query.
   bool record_declined_lookup(duckdb::LogicalGet const&, planner::lookup_decline);
   [[nodiscard]] auto const& declined_lookups() const noexcept { return declined_lookups_; }
@@ -134,6 +145,7 @@ class read_view_registry {
     duckdb::idx_t);
 
   std::vector<read_view_registry_entry> entries_;
+  std::vector<candidate_binding> skipped_;
   std::unordered_map<duckdb::idx_t, declined_lookup_record> declined_lookups_;
   std::unordered_map<op::scan::scan_contract_id, std::size_t> by_contract_id_;
   std::unordered_map<uint64_t, std::size_t> by_scan_node_id_;

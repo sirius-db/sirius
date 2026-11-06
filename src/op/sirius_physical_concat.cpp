@@ -19,7 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "telemetry/nvtx.hpp"
 
 #include <limits>

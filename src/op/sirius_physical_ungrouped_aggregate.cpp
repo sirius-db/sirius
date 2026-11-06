@@ -31,7 +31,7 @@
 #include "op/input_free_operator_data.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
-#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -130,6 +130,12 @@ struct aggregate_spec {
   /// SUM or AVG that DuckDB accumulates in HUGEINT (is_wide_integer_sum). Its one-row partial
   /// sum is DECIMAL128 with scale 0 so that the merge cannot overflow INT64.
   bool wide_integer_sum = false;
+  /// The DuckDB result is HUGEINT, carried as DECIMAL128 with scale 0. An integer input reduced in
+  /// INT64 has its one-row partial widened to that carrier, so the merge sums DECIMAL128 partials.
+  bool returns_hugeint = false;
+  /// SUM or AVG over HUGEINT: its DECIMAL128 partials can approach 2^127, so the merge checks their
+  /// total cannot pass it.
+  bool sums_hugeint_input = false;
 };
 
 struct aggregate_layout {
@@ -138,10 +144,10 @@ struct aggregate_layout {
   std::vector<cudf::aggregation::Kind> merge_kinds;
   std::vector<std::optional<cudf::size_type>>
     merge_nth_index;  // when merge_kinds[i] == NTH_ELEMENT
-  bool has_avg              = false;
-  bool has_count_distinct   = false;
-  bool has_stddev           = false;
-  bool has_wide_integer_sum = false;
+  bool has_first          = false;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
+  bool has_stddev         = false;
 };
 
 /// The local (partial) sum type of a wide integer SUM or AVG: DECIMAL(38, 0), carried on the GPU
@@ -181,7 +187,11 @@ aggregate_layout build_aggregate_layout(
     spec.local_count_idx = std::numeric_limits<size_t>::max();
     spec.wide_integer_sum =
       !children.empty() && is_wide_integer_sum(agg.function(), children[0]->return_type());
-    layout.has_wide_integer_sum |= spec.wide_integer_sum;
+    spec.returns_hugeint    = agg_return_type.id() == duckdb::LogicalTypeId::HUGEINT;
+    spec.sums_hugeint_input = (agg.function() == sirius::aggregate_id::sum ||
+                               agg.function() == sirius::aggregate_id::avg) &&
+                              !children.empty() &&
+                              children[0]->return_type().id() == sirius::type_id::HUGEINT;
 
     switch (agg.function()) {
       case sirius::aggregate_id::count_star:
@@ -298,6 +308,12 @@ aggregate_layout build_aggregate_layout(
         layout.local_types.push_back(agg_return_type);
         layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
         layout.merge_nth_index.push_back(0);  // first element
+        // A NULL first row is a value; an empty partial has no first row.
+        spec.local_count_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_first = true;
         break;
       default:
         throw not_implemented_exception(
@@ -382,6 +398,28 @@ duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_lo
     local_types.push_back(sirius::from_duckdb(type));
   }
   return local_types;
+}
+
+std::size_t sirius_physical_ungrouped_aggregate::no_history_peak_memory_estimate(
+  const input_stats& stats) const
+{
+  // Empty inputs still allocate scalar results, validity masks and partial states.
+  // Allow sixteen RMM-aligned allocations per aggregate and input batch for fixed-width
+  // states, including STDDEV's three scalar states and temporary columns.
+  constexpr std::size_t rmm_allocation_alignment_bytes = 256;
+  constexpr std::size_t scalar_state_bytes             = 16 * rmm_allocation_alignment_bytes;
+  std::size_t state_units                              = aggregates.size();
+  // Account for offsets and child buffers as in the merge's empty-input estimate.
+  // Inspect local types: COUNT(DISTINCT) returns an integer but carries a LIST partial.
+  for (auto const& type : get_local_output_types()) {
+    if (type.is_varchar() || type.is_array() || type.id() == sirius::type_id::LIST) {
+      state_units = memory::saturating_add(state_units, std::size_t{2});
+    }
+  }
+  auto const partials =
+    memory::saturating_mul(state_units, std::max(stats.num_batches, std::size_t{1}));
+  return std::max(sirius_physical_operator::no_history_peak_memory_estimate(stats),
+                  memory::saturating_mul(partials, scalar_state_bytes));
 }
 
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
@@ -500,6 +538,9 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
               cudf::get_element(col, 0, stream, cudf::get_current_device_resource_ref());
           }
           cols.push_back(cudf::make_column_from_scalar(*first_scalar, 1, stream));
+          auto count = make_numeric_scalar_with_value<int64_t>(
+            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+          cols.push_back(cudf::make_column_from_scalar(*count, 1, stream));
           break;
         }
         case aggregate_kind::SUM:
@@ -528,10 +569,16 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           std::optional<cudf::data_type> widen_partial_to;
           std::unique_ptr<cudf::column> partial;
           if (spec.wide_integer_sum) {
-            // INTEGER, or BIGINT and HUGEINT carried as INT64: aggregate inputs keep their native
-            // carriers, and wide_integer_sum rejects any other type.
+            // INTEGER or BIGINT: aggregate inputs keep their native carriers, and
+            // wide_integer_sum rejects any other type.
             partial = wide_integer_sum(col, stream, space->get_default_allocator());
           } else {
+            if (spec.returns_hugeint && !is_decimal) {
+              // cuDF cannot reduce integers into a decimal: sum_no_overflow and SMALLINT or
+              // BOOLEAN inputs are reduced in INT64 and the partial widened to HUGEINT's carrier.
+              out_type         = cudf::data_type{cudf::type_id::INT64};
+              widen_partial_to = wide_integer_sum_type();
+            }
             if (spec.kind == aggregate_kind::SUM || spec.kind == aggregate_kind::AVG) {
               if (col.type().id() == cudf::type_id::DECIMAL32 ||
                   col.type().id() == cudf::type_id::DECIMAL64) {
@@ -709,12 +756,32 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   if (input_batches.size() == 1) {
     merged_batch = input.get_data_batches()[0];  // forward the owned input batch (idle at park)
   } else {
-    merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());
+    std::vector<std::optional<cudf::size_type>> first_row_counts(layout.local_types.size());
+    for (auto const& spec : layout.aggregates) {
+      if (spec.kind == aggregate_kind::FIRST)
+        first_row_counts[spec.local_sum_idx] = spec.local_count_idx;
+    }
+    // cuDF's SUM wraps past 128 bits; a HUGEINT input's partials can get there.
+    for (auto const& spec : layout.aggregates) {
+      if (!spec.sums_hugeint_input) { continue; }
+      std::vector<cudf::column_view> partials;
+      for (auto const& batch : input_batches) {
+        partials.push_back(
+          batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view().column(
+            static_cast<cudf::size_type>(spec.local_sum_idx)));
+      }
+      require_decimal128_partial_sums_in_range(partials, stream, space->get_default_allocator());
+    }
+    merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(input_batches,
+                                                             layout.merge_kinds,
+                                                             layout.merge_nth_index,
+                                                             stream,
+                                                             *space,
+                                                             batch_telemetry(),
+                                                             first_row_counts);
   }
 
-  if (!layout.has_avg && !layout.has_stddev && !layout.has_count_distinct &&
-      !layout.has_wide_integer_sum) {
+  if (!layout.has_first && !layout.has_avg && !layout.has_stddev && !layout.has_count_distinct) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
@@ -740,13 +807,6 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     } else if (spec.kind == aggregate_kind::STDDEV_SAMP) {
       output_cols.push_back(finalize_stddev(
         merged_view.column(spec.local_sum_idx), stream, space->get_default_allocator()));
-    } else if (spec.wide_integer_sum) {
-      // The DECIMAL128 total becomes the INT64 result, or the query falls back if it overflows.
-      auto const& col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
-      output_cols.push_back(
-        narrow_wide_integer_sum(std::make_unique<cudf::column>(col_view, stream),
-                                stream,
-                                cudf::get_current_device_resource_ref()));
     } else {
       auto const& col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
       output_cols.push_back(std::make_unique<cudf::column>(col_view, stream));

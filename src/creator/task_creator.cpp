@@ -29,7 +29,6 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -37,7 +36,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -698,7 +696,10 @@ void task_creator::manager_loop()
             }
 
             while (!node->all_ports_empty()) {
-              auto task_lock  = pipeline->get_task_creation_lock();
+              auto task_lock = pipeline->get_task_creation_lock();
+              // Serialize this check with task registration and pipeline completion. A claim
+              // may race this check, but any extra task is counted and safely claims zero rows.
+              if (pipeline->is_pipeline_finished() || pipeline->is_limit_exhausted()) { break; }
               auto input_data = node->get_next_task_input_data();
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());

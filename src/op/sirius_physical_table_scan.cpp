@@ -20,14 +20,13 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
-#include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/table/table.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -85,13 +84,15 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
   auto& [port_name, port_ptr] = *ports.begin();
 
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+  std::optional<std::size_t> position;
   uint64_t accumulated_bytes = 0;
   size_t batch_count         = 0;
   // Cap per-task batch count to avoid grabbing too many compressed batches
   // whose representation bytes understate their actual GPU processing cost.
   constexpr size_t max_batches_per_task = 32;
   while (true) {
-    auto batch = port_ptr->repo->pop_next_data_batch();
+    auto [batch, batch_position] = port_ptr->repo->pop_next_data_batch_with_position();
+    position                     = batch_position;
     if (!batch) { break; }
     uint64_t batch_bytes = 0;
     {
@@ -101,13 +102,14 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
     accumulated_bytes += batch_bytes;
     input_batch.push_back(std::move(batch));
     ++batch_count;
+    if (position) { break; }
     if (accumulated_bytes >= config::DEFAULT_SCAN_TASK_BATCH_SIZE ||
         batch_count >= max_batches_per_task) {
       break;
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch, position);
 }
 
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
@@ -120,7 +122,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // Passthrough inputs arrive with filter and projection already applied upstream, in
   // batches small enough that concatenation is not needed.
   if (passthrough) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches(),
+                                                        input.get_position());
   }
 
   if (input_batches.empty()) { return std::make_unique<pipelineable_operator_data>(); }
@@ -208,7 +211,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // columns than the operator's output type list expects.
   std::size_t expected_output_columns = types.size();
   if (expected_output_columns == 0) {
-    return std::make_unique<pipelineable_operator_data>(std::vector{std::move(output_batch)});
+    return std::make_unique<pipelineable_operator_data>(std::vector{std::move(output_batch)},
+                                                        input.get_position());
   }
 
   // Read batch column count under read-only lock, then release lock before mutation
@@ -272,7 +276,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.push_back(std::move(output_batch));
-  return std::make_unique<pipelineable_operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches, input.get_position());
 }
 
 }  // namespace op

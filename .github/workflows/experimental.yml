@@ -45,7 +45,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: git submodule update --init --depth=1 --jobs 2 experimental/starrocks/starrocks experimental/starrocks/brpc
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true
@@ -54,7 +54,7 @@ jobs:
           environments: cn
 
       # Scope by package: `--all` would also reach the sibling rust/ workspace via the
-      # `sirius` path dep. Mirrors check.yml's scoped rust/ fmt check.
+      # `sirius-ffi` path dep. Mirrors check.yml's scoped rust/ fmt check.
       - name: fmt
         run: pixi run --locked -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
 
@@ -90,7 +90,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: git submodule update --init --depth=1 experimental/doris/doris
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true
@@ -99,7 +99,7 @@ jobs:
           environments: be
 
       # Scope by package: `--all` would also reach the sibling rust/ workspace via the
-      # `sirius` path dep.
+      # `sirius-ffi` path dep.
       - name: fmt
         run: pixi run --locked -e be cargo fmt --package sirius-doris-be --package doris-plan-translator --package doris-thrift --package doris-proto -- --check
 

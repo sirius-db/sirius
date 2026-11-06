@@ -132,6 +132,14 @@ constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
 /// Budget when GPU tier capacity cannot be read at planning time.
 constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
+/// 0 = auto: a share of the pinning GPU memory space's capacity, below.
+constexpr uint64_t DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES = 0;
+
+/// Share of the GPU memory space capacity that the values retained across all columns may occupy
+/// in the pin-time exact uniqueness check when its cap is auto. The check's peak is about three
+/// times the retained bytes, so this keeps it near 30% of the space.
+constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -165,12 +173,13 @@ struct operator_params {
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
-  /// Target size (bytes) for the concat operator output batch.
+  /// Target output batch size (bytes) for CONCAT and REPLICATE. REPLICATE may exceed the target by
+  /// one row.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.
-  uint64_t cross_join_task_bytes = config::derived_default_batch_size();
+  uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
@@ -266,6 +275,22 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
+  /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
+  /// When on, pin_table observes every column it is not already asked to observe; an observed
+  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
+  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
+  /// late materialization asks for.
+  bool prove_unique_keys{true};
+
+  /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
+  /// sorts a whole column when its chunks overlap in range. Earlier columns take priority when the
+  /// cap is short; the check's peak GPU use is about three times the cap. A column that no longer
+  /// fits stays unproven. 0 = a share (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the
+  /// pinning GPU memory space's capacity. Applies to every observed column, whether late
+  /// materialization or join-key proofs asked for it.
+  uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
@@ -394,7 +419,7 @@ struct sirius_config {
   /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
   /// scan_manager config, which is its only consumer, so the two can never
   /// disagree.
-  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  [[nodiscard]] const cucascade::io::cache::config& get_cache_config() const noexcept
   {
     return _scan_manager_config.cache;
   }
@@ -406,7 +431,7 @@ struct sirius_config {
 
   /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
   /// Set this before initializing consumers of the scan-manager configuration.
-  void set_object_store_config(io::object_store_config config) noexcept;
+  void set_object_store_config(cucascade::io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -444,16 +469,17 @@ struct sirius_config {
   friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called by parsed_sirius_config::resolve after
-  /// memory capacities and operator defaults are resolved.
+  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
+  /// override and the uring prefetch reactors, in that order. Called by
+  /// parsed_sirius_config::resolve after memory capacities and operator
+  /// defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
-  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
+  /// force @c _scan_manager_config.backend to @c io_backend::native (the
+  /// native backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from @ref finalize_derived_config.
-  void enforce_sirius_backend_for_multi_gpu();
+  void enforce_native_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
@@ -486,6 +512,9 @@ class parsed_sirius_config {
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
+  /// embedder check backend-dependent options before the engine is brought up.
+  [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
   [[nodiscard]] sirius_config resolve(
     const cucascade::memory::system_topology_info& topology) const;
 

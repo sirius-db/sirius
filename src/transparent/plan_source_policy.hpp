@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -41,7 +42,8 @@ struct scan_source_policy {
 };
 struct plan_source_policy {
   std::vector<scan_source_policy> scans;
-  bool discovery_complete = true;
+  bool discovery_complete            = true;
+  std::exception_ptr discovery_error = {};
   [[nodiscard]] bool cpu_replay_permitted() const noexcept;
   [[nodiscard]] bool reads_sirius_owned_s3() const noexcept;
   [[nodiscard]] std::string reason() const;

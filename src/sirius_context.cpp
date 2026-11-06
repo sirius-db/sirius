@@ -19,10 +19,8 @@
 #include "compression/spill_compression.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
-#include "cuda/device_health.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
-#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -40,7 +38,6 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_sql_rewrite.hpp"
@@ -58,7 +55,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -72,9 +68,6 @@
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
-#include <io/types.hpp>
-#include <io/uring/uring_ioctx.hpp>
-#include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 
 #include <algorithm>
@@ -89,9 +82,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
-#include <variant>
 
 namespace duckdb {
 
@@ -1645,6 +1636,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
   snapshot.split_flushed_for_schema =
     physical_counters_->split_flushed_for_schema.load(std::memory_order_relaxed);
+  snapshot.arrow_schema_drift_refusals =
+    physical_counters_->arrow_schema_drift_refusals.load(std::memory_order_relaxed);
   snapshot.parquet_type_mismatch_observed =
     physical_counters_->type_mismatches.load(std::memory_order_relaxed);
   snapshot.parquet_type_refusals =

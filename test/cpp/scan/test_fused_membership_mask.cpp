@@ -37,13 +37,10 @@
 #include "scan/fused_scan_filter_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/null_mask.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda_runtime.h>
 

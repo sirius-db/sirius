@@ -29,6 +29,7 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -41,6 +42,11 @@ namespace op {
 
 class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::HASH_GROUP_BY;
 
@@ -77,16 +83,34 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   /// integer SUM input (planner::resolve_sum_input_bounds); nullopt when unproven.
   std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
   /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
-  /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
+  /// (see wide_integer_sum_mask), whose partial result may be DECIMAL128.
   std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
+  /// Max groups in the previous batch for a widened BIGINT SUM to be summed as two INT64 halves
+  /// instead of over DECIMAL128. From a group-count sweep on an RTX PRO 6000: the halves win up to
+  /// 10K groups (contention on cuDF's 128-bit CAS), tie at 100K-300K, and lose from 1M on (a second
+  /// atomic per row). 64K sits inside the tie range, well below the losses.
+  static constexpr std::int64_t split_wide_sum_max_groups = 1 << 16;
+
+  /// Groups in the most recent batch this operator aggregated; -1 until the first one. Batches
+  /// that start before any count is known split: a wasted split costs a few percent at most,
+  /// while a wasted DECIMAL128 sum with few groups costs up to 3x.
+  std::atomic<std::int64_t> _last_batch_groups{-1};
+
   // Partial aggregate layout and finalization metadata
-  std::vector<AggregateSlot> aggregate_slots;
+  std::vector<aggregate_slot> aggregate_slots;
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
 
  public:
+  [[nodiscard]] bool has_first() const { return has_slot<first_slot>(aggregate_slots); }
+
+  [[nodiscard]] grouped_aggregate_layout partial_layout() const
+  {
+    return {num_output_group_columns(), cudf_aggregates.size(), aggregate_slots};
+  }
+
   /// Whether the aggregate computes several grouping sets or GROUPING() functions. The local
   /// output then has a set id column and one column per GROUPING() function after the keys.
   [[nodiscard]] bool has_grouping_sets() const noexcept
@@ -113,24 +137,18 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   [[nodiscard]] bool has_stddev_samp() const;
 
-  //! Alternate carriers of the local output, for set_alternate_physical_types(): DECIMAL128 for
-  //! the column of each wide integer SUM, whose partial is INT64 or, where the batch could
-  //! overflow INT64, DECIMAL128. Empty when no SUM is wide or `types` is not one column per cuDF
-  //! aggregate after the group columns.
+  //! Alternate carriers of the local output, for set_alternate_physical_types(). The partial of a
+  //! wide integer SUM, or of an aggregate whose result is HUGEINT, is INT64 or DECIMAL128 with
+  //! scale 0; its column's alternate is whichever of the two is not its native carrier. Empty when
+  //! no slot has two carriers or `types` is not one column per cuDF aggregate after the group
+  //! columns, followed by the FIRST carried columns.
   [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface
   bool is_source() const override { return true; }
 
-  sirius::OrderPreservationType source_order() const override
-  {
-    return sirius::OrderPreservationType::NO_ORDER;
-  }
-
   // Sink interface
   bool is_sink() const override { return true; }
-
-  bool sink_order_dependent() const override { return false; }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

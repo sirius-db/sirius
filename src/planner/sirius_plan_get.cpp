@@ -30,7 +30,6 @@
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -41,14 +40,14 @@
 #include "expression/ast/node.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/uri_parser.hpp"
+#include "io/path_utils.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
-#include "op/scan/iceberg_metadata_connection.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/scan_returned_types.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -58,13 +57,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1033,7 +1030,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     sirius::from_duckdb_vec(original_types),  // Use original types, not modified
     op.function,
     std::move(op.bind_data),
-    sirius::from_duckdb_vec(op.returned_types),
+    scan_returned_types(op.returned_types, column_ids),
     column_ids,
     duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
     duckdb::IdentifiersToStrings(op.names),

@@ -1,0 +1,193 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// sirius
+#include <cudf/cudf_utils.hpp>
+
+#include <expression/ast/node.hpp>
+#include <expression/ast/utils.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
+#include <sirius/exception.hpp>
+
+// duckdb
+#include <duckdb/common/exception.hpp>
+
+// cudf
+#include <cudf/copying.hpp>
+#include <cudf/replace.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/unary.hpp>
+
+// standard library
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace sirius {
+using evaluate_result = expression_evaluator::evaluate_result;
+
+evaluate_result expression_evaluator::with_selective_retry(
+  std::function<evaluate_result()> const& eager,
+  std::function<std::unique_ptr<cudf::column>()> const& selective,
+  bool eager_is_exact)
+{
+  // A zero-column input cannot carry the row count of a selection, so its errors propagate.
+  if (_input_table.num_columns() == 0) { return eager(); }
+  if (_in_selective_pass || !eager_is_exact) {
+    ++_selective_evaluation_count;
+    return evaluate_result(selective());
+  }
+  // The enclosing conditional's retry covers this one. Retrying here too would repeat the passes
+  // over this subtree once per level of nesting.
+  if (_in_eager_conditional) { return eager(); }
+
+  struct eager_scope {
+    bool& in_eager;
+    explicit eager_scope(bool& flag) : in_eager(flag) { in_eager = true; }
+    ~eager_scope() { in_eager = false; }
+  };
+  auto const first_temp_scalar = _temp_scalars.size();
+  auto const first_temp_column = _temp_columns.size();
+  try {
+    eager_scope const scope(_in_eager_conditional);
+    return eager();
+  } catch (invalid_input_exception const&) {
+    // A checked operation rejected a row, perhaps one its branch does not select.
+  } catch (not_implemented_exception const&) {
+    // Unsupported shapes throw this too, and fail again in the selective pass.
+  } catch (duckdb::InvalidInputException const&) {
+    // A type the GPU cannot map, such as a hand-written error()'s, fails only the branch it is in.
+  }
+
+  // Release what the failed pass left. AST nodes built before it address temporaries by index, so
+  // the slots stay.
+  for (auto i = first_temp_scalar; i < _temp_scalars.size(); ++i) {
+    _temp_scalars[i].reset();
+  }
+  for (auto i = first_temp_column; i < _temp_columns.size(); ++i) {
+    _temp_columns[i].reset();
+  }
+  std::erase_if(_restored_reference_cache, [first_temp_column](auto const& entry) {
+    return entry.temp_column_index >= first_temp_column;
+  });
+
+  ++_selective_evaluation_count;
+  return evaluate_result(selective());
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_on_selected_rows(
+  sirius::ast::node const& expr,
+  cudf::column_view const* selection,
+  cudf::data_type type,
+  bool predicate)
+{
+  cudf::table_view input = _input_table;
+  std::unique_ptr<cudf::table> compacted;
+  if (selection != nullptr) {
+    std::vector<cudf::size_type> referenced;
+    sirius::ast::visit_references(expr, [&referenced](sirius::ast::reference const& ref) {
+      referenced.push_back(static_cast<cudf::size_type>(ref.column_index));
+    });
+    std::ranges::sort(referenced);
+    referenced.erase(std::unique(referenced.begin(), referenced.end()), referenced.end());
+
+    // Compact only the referenced columns. The first compacted column fills the slots @p expr does
+    // not read; when it reads none, the compacted selection does, carrying the row count.
+    std::vector<cudf::column_view> to_compact;
+    to_compact.reserve(std::max<std::size_t>(referenced.size(), 1));
+    for (auto const index : referenced) {
+      to_compact.push_back(_input_table.column(index));
+    }
+    if (referenced.empty()) { to_compact.push_back(*selection); }
+    compacted =
+      sirius::apply_retention_mask(cudf::table_view{to_compact}, *selection, _stream, _mr);
+    // DuckDB never evaluates a branch that no row selects, so its errors must not surface here.
+    if (compacted->num_rows() == 0) { return nullptr; }
+
+    std::vector<cudf::column_view> slots(_input_table.num_columns(),
+                                         compacted->get_column(0).view());
+    for (std::size_t i = 0; i < referenced.size(); ++i) {
+      slots[referenced[i]] = compacted->get_column(i).view();
+    }
+    input = cudf::table_view{slots};
+  }
+
+  // A child evaluator keeps this evaluator's AST tree, temporaries and caches, which describe the
+  // full input, intact. Its evaluate() also restores the declared type of @p expr.
+  expression_evaluator child(
+    &expr, _mr, _stream, _policy, _min_ast_size, _like_swar_fastpath, _like_cache);
+  child._in_selective_pass = true;
+  // Fold the child's counters even when it raises, so tests also see the work of failed passes.
+  struct fold_counters {
+    expression_evaluator& parent;
+    expression_evaluator const& child;
+    ~fold_counters()
+    {
+      parent._like_shared_cache_lookup_count += child._like_shared_cache_lookup_count;
+      parent._ast_jit_evaluation_count += child._ast_jit_evaluation_count;
+      parent._selective_evaluation_count += child._selective_evaluation_count;
+      parent._restored_reference_cast_count += child._restored_reference_cast_count;
+      parent._narrow_domain_comparison_count += child._narrow_domain_comparison_count;
+    }
+  } const fold{*this, child};
+  return cast_to_type(std::move(child.evaluate_roots(input, predicate)->release()[0]), type);
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_mask_on_selected_rows(
+  sirius::ast::node const& expr, cudf::column const* candidates)
+{
+  auto const rows = candidates ? std::optional{candidates->view()} : std::nullopt;
+  auto mask       = evaluate_on_selected_rows(expr,
+                                        rows ? &*rows : nullptr,
+                                        cudf::data_type{cudf::type_id::BOOL8},
+                                        /*predicate=*/true);
+  if (!mask) { return nullptr; }
+  // A NULL predicate does not pass.
+  if (mask->has_nulls()) {
+    mask = cudf::replace_nulls(
+      mask->view(), cudf::numeric_scalar<bool>(false, true, _stream, _mr), _stream, _mr);
+  }
+  if (!rows) { return mask; }
+  auto const none =
+    sirius::make_constant_column<bool>(false, _input_table.num_rows(), _stream, _mr);
+  return scatter_selected(mask->view(), none->view(), *rows);
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::undecided_rows(cudf::column const* candidates,
+                                                                   cudf::column_view const& decided)
+{
+  if (!candidates) {
+    return cudf::unary_operation(decided, cudf::unary_operator::NOT, _stream, _mr);
+  }
+  return cudf::copy_if_else(
+    cudf::numeric_scalar<bool>(false, true, _stream, _mr), *candidates, decided, _stream, _mr);
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::scatter_selected(
+  cudf::column_view const& value,
+  cudf::column_view const& target,
+  cudf::column_view const& selection)
+{
+  auto scattered = cudf::boolean_mask_scatter(
+    cudf::table_view{{value}}, cudf::table_view{{target}}, selection, _stream, _mr);
+  return std::move(scattered->release()[0]);
+}
+
+}  // namespace sirius

@@ -55,7 +55,7 @@ this automatically by invoking `llvm-symbolizer` from your `PATH`.
 
 **Inside `pixi shell` this works out of the box** — the `llvm-tools` dependency
 provides an `llvm-symbolizer` matching the clang version Sirius is built with
-(kept at `21.*` in `pixi.toml`, alongside `clang`). So you do **not** need to
+(kept at `22.*` in `pixi.toml`, alongside `clang`). So you do **not** need to
 set `external_symbolizer_path`; just run with the `*SAN_OPTIONS` shown below.
 
 > Keeping the symbolizer in lockstep with the compiler matters: a mismatched

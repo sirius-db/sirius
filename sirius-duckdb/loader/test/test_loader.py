@@ -46,6 +46,7 @@ class LoaderTests(unittest.TestCase):
         environment["SIRIUS_TEST_DRIVER_VERSION"] = str(version)
         environment.pop("SIRIUS_TEST_DRIVER_ERROR", None)
         environment.pop("SIRIUS_TEST_BACKEND_FAILURE", None)
+        environment.pop("SIRIUS_DISABLE", None)
         environment.update(env or {})
         prelude = (
             f"SET extension_directories=[{quote(self.root / 'installed')}];"
@@ -64,9 +65,45 @@ class LoaderTests(unittest.TestCase):
         self.assertIn(message, result.stderr)
         self.assertNotIn('"exception_type"', result.stderr)
 
+    def rows(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def status(self, sql, **kwargs):
+        return self.rows(self.query(sql + "SELECT * FROM sirius_status();", **kwargs))[
+            0
+        ]
+
+    def assert_fallback(self, sql, reason, **kwargs):
+        """LOAD succeeds, queries run on the CPU, and explicit GPU requests fail with the reason."""
+        status = self.status(sql, **kwargs)
+        self.assertFalse(status["backend_loaded"])
+        self.assertFalse(status["gpu_execution"])
+        self.assertIn(reason, status["fallback_reason"])
+        self.assertEqual(
+            self.rows(
+                self.query(
+                    sql
+                    + "SET gpu_execution = false;"
+                    + "SELECT sum(i)::BIGINT AS total, current_setting('gpu_execution') AS enabled"
+                    + " FROM range(1000) t(i);",
+                    **kwargs,
+                )
+            ),
+            [{"total": 499500, "enabled": False}],
+        )
+        for request in [
+            "SET gpu_execution = true;",
+            "SET GLOBAL gpu_execution = true;",
+            "SELECT * FROM gpu_execution('SELECT 42');",
+        ]:
+            with self.subTest(request=request):
+                self.assert_failure(self.query(sql + request, **kwargs), reason)
+        return status
+
     def test_driver_boundaries_and_repeated_load(self):
         for version, backend in [
-            (12000, 12),
+            (12080, 12),
             (12090, 12),
             (12999, 12),
             (13000, 13),
@@ -78,64 +115,157 @@ class LoaderTests(unittest.TestCase):
                     f"INSTALL {quote(self.backend(backend))};"
                     f"INSTALL {quote(self.loader)};"
                     "LOAD sirius; LOAD sirius;"
-                    "SELECT sirius_test_backend() AS backend;",
+                    "SELECT sirius_test_backend() AS test_backend, s.*"
+                    " FROM sirius_status() s;",
                     version=version,
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout), [{"backend": backend}])
-
-    def test_unsupported_driver(self):
-        for version in [0, 11080, 11999]:
-            with self.subTest(version=version):
-                self.assert_failure(
-                    self.query(f"LOAD {quote(self.loader)};", version=version),
-                    "requires an NVIDIA driver supporting CUDA 12 or newer",
+                self.assertEqual(
+                    self.rows(result),
+                    [
+                        {
+                            "test_backend": backend,
+                            "driver_found": True,
+                            "cuda_driver_version": f"{version // 1000}.{version % 1000 // 10}",
+                            "backend": f"sirius_cuda{backend}",
+                            "backend_loaded": True,
+                            "gpu_execution": True,
+                            "fallback_reason": None,
+                        }
+                    ],
                 )
 
-    def test_driver_query_error(self):
-        self.assert_failure(
-            self.query(
-                f"LOAD {quote(self.loader)};", env={"SIRIUS_TEST_DRIVER_ERROR": "999"}
-            ),
-            "cuDriverGetVersion failed with error 999",
+    def test_status_reports_disabled_gpu_execution(self):
+        status = self.status(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};"
+            "SET gpu_execution = false;"
         )
+        self.assertTrue(status["backend_loaded"])
+        self.assertFalse(status["gpu_execution"])
+
+    def test_status_reports_disabled_runtime(self):
+        status = self.status(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
+            env={"SIRIUS_DISABLE": "1"},
+        )
+        self.assertTrue(status["backend_loaded"])
+        self.assertFalse(status["gpu_execution"])
+        self.assertIsNone(status["fallback_reason"])
+
+    def test_prepared_status_reads_current_setting(self):
+        result = self.query(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};"
+            "SET gpu_execution = false;"
+            "PREPARE status AS SELECT gpu_execution FROM sirius_status();"
+            "SET gpu_execution = true;"
+            "EXECUTE status;"
+        )
+        self.assertEqual(self.rows(result), [{"gpu_execution": True}])
+
+    def test_loaded_backend_owns_gpu_execution(self):
+        result = self.query(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};"
+            "SELECT count(*) AS stubs FROM duckdb_functions()"
+            " WHERE function_name = 'gpu_execution';"
+        )
+        self.assertEqual(self.rows(result), [{"stubs": 0}])
+
+    def test_unsupported_driver(self):
+        for version in [0, 11080, 11999, 12000, 12070]:
+            with self.subTest(version=version):
+                status = self.assert_fallback(
+                    f"LOAD {quote(self.loader)};",
+                    "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: "
+                    f"reported CUDA version {version // 1000}.{version % 1000 // 10}",
+                    version=version,
+                )
+                self.assertTrue(status["driver_found"])
+                self.assertEqual(
+                    status["cuda_driver_version"],
+                    f"{version // 1000}.{version % 1000 // 10}",
+                )
+                self.assertIsNone(status["backend"])
+
+    def test_driver_query_error(self):
+        status = self.assert_fallback(
+            f"LOAD {quote(self.loader)};",
+            "cuDriverGetVersion failed with error 999",
+            env={"SIRIUS_TEST_DRIVER_ERROR": "999"},
+        )
+        self.assertTrue(status["driver_found"])
+        self.assertIsNone(status["cuda_driver_version"])
 
     def test_missing_version_symbol(self):
-        self.assert_failure(
-            self.query(f"LOAD {quote(self.loader)};", driver="missing-symbol"),
+        self.assert_fallback(
+            f"LOAD {quote(self.loader)};",
             "has no cuDriverGetVersion",
+            driver="missing-symbol",
         )
 
     def test_missing_driver(self):
-        self.assert_failure(
-            self.query(
-                f"LOAD {quote(self.loader)};",
-                env={
-                    "LD_PRELOAD": str(self.fixtures / "libsirius_test_hide_driver.so")
-                },
-            ),
+        status = self.assert_fallback(
+            f"LOAD {quote(self.loader)};",
+            "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: "
             "cannot open libcuda.so.1",
+            env={"LD_PRELOAD": str(self.fixtures / "libsirius_test_hide_driver.so")},
+        )
+        self.assertEqual(
+            {k: status[k] for k in ["driver_found", "cuda_driver_version", "backend"]},
+            {"driver_found": False, "cuda_driver_version": None, "backend": None},
+        )
+
+    def test_fallback_is_silent_and_logged(self):
+        hide = {"LD_PRELOAD": str(self.fixtures / "libsirius_test_hide_driver.so")}
+        result = self.query(f"LOAD {quote(self.loader)};", env=hide)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        result = self.query(
+            "CALL enable_logging(level = 'info', storage = 'memory');"
+            f"LOAD {quote(self.loader)};"
+            "SELECT message FROM duckdb_logs WHERE message LIKE '%Sirius%';",
+            env=hide,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The CLI first prints an empty result for CALL enable_logging.
+        [entry] = json.loads(result.stdout.splitlines()[-1])
+        self.assertRegex(
+            entry["message"],
+            r"^Sirius GPU execution is unavailable; queries run on DuckDB's CPU engine\. "
+            r"Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: cannot open",
         )
 
     def test_does_not_fall_back_to_cuda12(self):
-        result = self.query(
-            f"INSTALL {quote(self.backend(12))}; LOAD {quote(self.loader)};"
+        status = self.assert_fallback(
+            f"INSTALL {quote(self.backend(12))}; LOAD {quote(self.loader)};",
+            "Sirius selected sirius_cuda13 for CUDA driver version 13.0",
         )
+        self.assertEqual(status["backend"], "sirius_cuda13")
+        self.assertIn("not found", status["fallback_reason"])
+        self.assertNotIn("automatically install", status["fallback_reason"])
         self.assert_failure(
-            result, "Sirius selected sirius_cuda13 for CUDA driver version 13.0"
+            self.query(
+                f"INSTALL {quote(self.backend(12))}; LOAD {quote(self.loader)};"
+                "SELECT sirius_test_backend();"
+            ),
+            "sirius_test_backend does not exist",
         )
-        self.assertIn("not found", result.stderr)
-        self.assertNotIn("automatically install", result.stderr)
+
+    def test_unavailable_repository(self):
+        status = self.assert_fallback(
+            f"SET autoinstall_extension_repository={quote(self.root / 'missing')};"
+            f"LOAD {quote(self.loader)};",
+            "Sirius selected sirius_cuda13 for CUDA driver version 13.0",
+            autoinstall=True,
+        )
+        self.assertEqual(status["backend"], "sirius_cuda13")
 
     def test_selected_backend_already_loaded(self):
         result = self.query(
             f"LOAD {quote(self.backend(13))}; LOAD {quote(self.loader)};"
-            "SELECT sirius_test_backend() AS backend;"
+            "SELECT sirius_test_backend() AS backend, backend_loaded FROM sirius_status();"
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), [{"backend": 13}])
+        self.assertEqual(self.rows(result), [{"backend": 13, "backend_loaded": True}])
 
     def test_backend_initialization_error(self):
+        # Once the backend starts initializing, a failure is reported rather than hidden.
         for autoinstall in [False, True]:
             with self.subTest(autoinstall=autoinstall):
                 result = self.query(

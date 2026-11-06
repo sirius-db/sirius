@@ -4,7 +4,7 @@ A quick path from nothing installed to a GPU-accelerated query. Full details, re
 [docs/README.md](https://github.com/{{REPO}}/blob/main/docs/README.md).
 
 **Requirements**: Linux (amd64 or arm64), NVIDIA GPU Turing or newer (compute capability 7.5+), and either CUDA 12.x
-(driver >=525.60.13) or CUDA 13.x (driver >=580.65.06) matching the file you download below.
+(driver >=570.26) or CUDA 13.x (driver >=580.65.06) matching the file you download below.
 
 ### 1. Install DuckDB {{DUCKDB_VERSION}}
 

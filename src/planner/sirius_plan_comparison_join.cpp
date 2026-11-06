@@ -15,11 +15,11 @@
  */
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -34,9 +34,10 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/join_condition.hpp"
-#include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
@@ -50,7 +51,6 @@
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
@@ -62,15 +62,84 @@
 
 namespace sirius::planner {
 
+/// Whether @p get is a plain parquet scan whose output columns are the files' own columns, read by
+/// name. A pin proves something about those columns, so a scan that maps, renames, merges or
+/// synthesizes columns (iceberg_scan resolves them by field id and fills in added columns and
+/// partition values; union_by_name and an explicit schema merge and remap the files') may return
+/// different values under the same name. An allowlist, so a scan this does not know is not proven.
+static bool returns_raw_parquet_columns(duckdb::LogicalGet const& get)
+{
+  auto const function_name = get.function.GetName().GetIdentifierName();
+  if (function_name != "read_parquet" && function_name != "parquet_scan") { return false; }
+  auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (multi_file == nullptr) { return false; }
+  auto const& options = multi_file->file_options;
+  return !options.union_by_name && options.schema.empty() && options.bound_schema.empty() &&
+         options.mapping == duckdb::MultiFileColumnMappingMode::BY_NAME;
+}
+
+/// Output position of a parquet scan's column that the pinned copy of the same files proved
+/// distinct at pin time (see late_mat::unique_probe: no nulls and no repeated value across the
+/// whole table), or an empty set. Only the scan's own files count, so a filter or projection above
+/// the scan keeps the fact valid: a subset of distinct values is distinct.
+static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
+  duckdb::SiriusContext* sirius_context, duckdb::LogicalGet& get)
+{
+  if (sirius_context == nullptr || !returns_raw_parquet_columns(get)) { return {}; }
+  auto const files = resolve_parquet_scan_file_paths(
+    get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
+  if (files.empty()) { return {}; }
+  auto const entry = sirius_context->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+  if (!entry) { return {}; }
+  auto const& pinned_names = entry->cache_info.names;
+  auto const proven_unique = [&](std::string const& name) {
+    for (std::size_t entry_idx = 0; entry_idx < pinned_names.size(); ++entry_idx) {
+      if (pinned_names[entry_idx] == name) {
+        return entry_idx < entry->proven_unique_columns.size() &&
+               entry->proven_unique_columns[entry_idx];
+      }
+    }
+    return false;
+  };
+
+  // A Hive partition column takes its value from the directory name, even when the files also hold
+  // a column of that name, so what the pin proved about the file column says nothing about it.
+  std::unordered_set<duckdb::idx_t> hive_partition_columns;
+  if (auto const* multi_file =
+        dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
+    for (auto const& partition : multi_file->reader_bind.hive_partitioning_indexes) {
+      hive_partition_columns.insert(partition.index);
+    }
+  }
+
+  auto const& column_ids  = get.GetColumnIds();
+  auto const& proj_ids    = get.projection_ids;
+  auto const output_count = proj_ids.empty() ? column_ids.size() : proj_ids.size();
+  for (duckdb::idx_t output_idx = 0; output_idx < output_count; ++output_idx) {
+    auto const column_idx           = proj_ids.empty() ? output_idx : proj_ids[output_idx];
+    auto const primary_column_index = column_ids[column_idx].GetPrimaryIndex();
+    // Virtual columns (row ids and the like) have no pinned counterpart.
+    if (primary_column_index >= get.names.size()) { continue; }
+    if (hive_partition_columns.contains(primary_column_index)) { continue; }
+    auto const& column_name = get.names[primary_column_index].GetIdentifierName();
+    if (proven_unique(column_name)) {
+      SIRIUS_LOG_DEBUG("[join] build key '{}' proven distinct by the pinned table", column_name);
+      return {output_idx};
+    }
+  }
+  return {};
+}
+
 /// Returns a set of output column indices proven to form a unique key for the
 /// given logical operator subtree, or an empty set if uniqueness cannot be proven.
-static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
+static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::SiriusContext* sirius_context,
+                                                              duckdb::LogicalOperator& op)
 {
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET: {
       auto& get  = op.Cast<duckdb::LogicalGet>();
       auto table = get.GetTable();
-      if (!table) { return {}; }
+      if (!table) { return prove_unique_from_pin(sirius_context, get); }
 
       const auto& constraints = table->GetConstraints();
       const auto& column_ids  = get.GetColumnIds();
@@ -145,12 +214,12 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
       // These operators only truncate rows — no column remapping.
       if (op.children.empty()) { return {}; }
-      return prove_unique_columns(*op.children[0]);
+      return prove_unique_columns(sirius_context, *op.children[0]);
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_FILTER: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
       auto& filter = op.Cast<duckdb::LogicalFilter>();
       if (!filter.HasProjectionMap()) { return child_unique; }
@@ -165,7 +234,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 
     case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
       auto& order = op.Cast<duckdb::LogicalOrder>();
       if (!order.HasProjectionMap()) { return child_unique; }
@@ -179,7 +248,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 
     case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
 
       auto& proj = op.Cast<duckdb::LogicalProjection>();
@@ -201,8 +270,8 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       if (op.children.size() != 2) { return {}; }
       auto& join = op.Cast<duckdb::LogicalComparisonJoin>();
 
-      auto left_unique  = prove_unique_columns(*op.children[0]);
-      auto right_unique = prove_unique_columns(*op.children[1]);
+      auto left_unique  = prove_unique_columns(sirius_context, *op.children[0]);
+      auto right_unique = prove_unique_columns(sirius_context, *op.children[1]);
       if (left_unique.empty() && right_unique.empty()) { return {}; }
 
       // Collect equality key columns on each side (only direct column refs).
@@ -413,7 +482,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
                    : std::vector<std::size_t>{};
 
-  auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
+  // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
+  // context, prove_unique_columns considers declared PRIMARY KEYs alone.
+  auto* const pin_facts_context =
+    sirius_context && duckdb::query_operator_options(context)->prove_unique_keys
+      ? sirius_context.get()
+      : nullptr;
+  auto build_side_unique_cols  = prove_unique_columns(pin_facts_context, *op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;
@@ -430,13 +505,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       case duckdb::JoinType::LEFT:
       case duckdb::JoinType::RIGHT:
       case duckdb::JoinType::OUTER:
+        op.estimated_cardinality = memory::saturating_mul(lhs_cardinality, rhs_cardinality);
         return make_cross_product_join(
           op,
           std::move(left),
           std::move(right),
           op.join_type,
-          lhs_cardinality,
-          rhs_cardinality,
+          op.estimated_cardinality,
           duckdb::vector<std::size_t>(op.left_projection_map.begin(), op.left_projection_map.end()),
           duckdb::vector<std::size_t>(op.right_projection_map.begin(),
                                       op.right_projection_map.end()));

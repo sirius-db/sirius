@@ -30,7 +30,6 @@
 // unequal-length arms across many batches, and multi-GPU device placement.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/pinned_table_guard.hpp>
 #include <utils/scoped_sirius_setting.hpp>
@@ -158,11 +157,10 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
-                 "gpu_execution UNION over HUGEINT aggregates narrowed to BIGINT",
+                 "gpu_execution UNION ALL over HUGEINT aggregates",
                  "[integration][gpu_execution][union][union_all]")
 {
-  // DuckDB types sum(INTEGER) as HUGEINT and the union declares that, but each GPU arm plans the
-  // aggregate as BIGINT, so the union's declared type and its arms' planned type differ.
+  // DuckDB types sum(INTEGER) as HUGEINT; the union and its aggregate arms all plan that type.
   compare_gpu_vs_cpu("SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub");
   compare_gpu_vs_cpu(
     "SELECT s + 1 FROM (SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub) t");
@@ -190,7 +188,7 @@ TEST_CASE_METHOD(UnionFixture,
     "SELECT k, count(*) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t GROUP BY k");
   compare_gpu_vs_cpu("SELECT sum(k) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t");
 
-  // Ordering downstream, where UNION's NO_ORDER source_order() decides the plan's preservation.
+  // An explicit downstream ORDER BY establishes the union result's sequence.
   compare_gpu_vs_cpu_ordered(
     "SELECT k FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t ORDER BY k NULLS LAST");
   compare_gpu_vs_cpu_ordered(
@@ -254,10 +252,10 @@ TEST_CASE_METHOD(UnionFixture,
                  "[integration][gpu_execution][union][union_all]")
 {
   // EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not error, and not
-  // silently return the union of both inputs. Both are refused during plan generation (the
-  // set-operation builder's switch), so this asserts a plan-time fallback. The helper also
-  // compares against the CPU result, which is what pins "still the right answer" without a
-  // hand-rolled second check.
+  // silently return the union of both inputs. Both are refused during plan generation
+  // (`plan_except_intersect` refuses the distinct forms), so this asserts a plan-time fallback.
+  // The helper also compares against the CPU result, which is what pins "still the right answer"
+  // without a hand-rolled second check.
   expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
   expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
 }
@@ -491,10 +489,10 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
-                 "gpu_execution distinct UNION over HUGEINT aggregates narrowed to BIGINT",
+                 "gpu_execution distinct UNION over HUGEINT aggregates",
                  "[integration][gpu_execution][union]")
 {
-  // The DISTINCT groups on the union's declared HUGEINT over arms planned as BIGINT.
+  // The DISTINCT groups on the union's HUGEINT sums.
   compare_gpu_vs_cpu("SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ub");
   // Equal sums must collapse to one row.
   compare_gpu_vs_cpu("SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ua");

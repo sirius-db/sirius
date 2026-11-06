@@ -1,8 +1,10 @@
 target_sources(
   sirius_objects
-  PRIVATE c_api/error.cpp
+  PRIVATE c_api/config.cpp
+          c_api/error.cpp
           c_api/version.cpp
           config.cpp
+          config_loading.cpp
           debug_utils.cpp
           pin_table.cpp
           sirius_config.cpp
