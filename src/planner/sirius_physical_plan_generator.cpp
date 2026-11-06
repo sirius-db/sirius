@@ -82,6 +82,7 @@
 #include "planner/sirius_plan_window.hpp"
 #include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/preparation_ledger.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -2420,6 +2421,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
     throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
+    throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use
     // an unclassified runtime_error. Never replace typed contract/cleanup errors.
@@ -2459,6 +2463,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
+    throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
     throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use

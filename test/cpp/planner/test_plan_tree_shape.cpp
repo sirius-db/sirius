@@ -48,6 +48,7 @@
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
@@ -1853,11 +1854,11 @@ TEST_CASE("require_planned_schema accepts only the declared type", "[plan_tree_s
     generator::require_planned_schema(std::span{&planned, 1}, {declared}, "probe");
   };
   CHECK_NOTHROW(require(hugeint, LogicalType::HUGEINT));
-  CHECK_THROWS_AS(require(bigint, LogicalType::HUGEINT), duckdb::NotImplementedException);
+  CHECK_THROWS_AS(require(bigint, LogicalType::HUGEINT), sirius::not_implemented_exception);
   CHECK_NOTHROW(require(bigint, LogicalType::BIGINT));
   CHECK_THROWS_WITH(require(hugeint, LogicalType::BIGINT),
                     Catch::Matchers::ContainsSubstring("probe: the planned input has"));
-  CHECK_THROWS_AS(require(integer, LogicalType::BIGINT), duckdb::NotImplementedException);
+  CHECK_THROWS_AS(require(integer, LogicalType::BIGINT), sirius::not_implemented_exception);
   CHECK_THROWS_WITH(generator::require_planned_schema(std::span{&bigint, 1}, {}, "probe"),
                     Catch::Matchers::ContainsSubstring("has 1 column but the node declares 0"));
 }

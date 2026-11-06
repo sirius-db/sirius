@@ -259,6 +259,30 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution distinct set operations deduplicate surviving composite rows",
+                 "[integration][gpu_execution][set_operation][setop_distinct]")
+{
+  std::string keyword;
+  SECTION("EXCEPT") { keyword = "EXCEPT"; }
+  SECTION("INTERSECT") { keyword = "INTERSECT"; }
+
+  run_ok("CREATE TABLE setop_left (k INTEGER, v VARCHAR);");
+  run_ok("CREATE TABLE setop_right (k INTEGER, v VARCHAR);");
+  run_ok(
+    "INSERT INTO setop_left VALUES "
+    "(1, 'a'), (1, 'a'), (2, 'b'), (2, 'b'), (NULL, 'n'), (NULL, 'n'), "
+    "(NULL, NULL), (NULL, NULL), (3, NULL), (3, NULL);");
+  run_ok(
+    "INSERT INTO setop_right VALUES "
+    "(1, 'a'), (1, 'a'), (NULL, 'n'), (NULL, 'n'), (NULL, NULL), (3, 'other');");
+  run_ok("CHECKPOINT;");
+
+  compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM setop_right");
+  compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM uempty");
+  compare_gpu_vs_cpu("SELECT k, v FROM uempty " + keyword + " SELECT k, v FROM setop_right");
+}
+
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution deduplicates a non-recursive WITH RECURSIVE UNION",
                  "[integration][gpu_execution][union]")
 {
@@ -548,4 +572,56 @@ TEST_CASE_METHOD(UnionFloatFixture,
     compare_gpu_vs_cpu_canonical("SELECT f FROM fa UNION SELECT f FROM fb");
     compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT f FROM fa UNION SELECT f FROM fb) t");
   }
+}
+
+namespace {
+
+class DistinctSetOperationFloatFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  DistinctSetOperationFloatFixture()
+  {
+    run_ok("CREATE TABLE set_float_l (d DOUBLE, f REAL);");
+    run_ok("CREATE TABLE set_float_r (d DOUBLE, f REAL);");
+    run_ok("CREATE TABLE set_float_no_nan (d DOUBLE, f REAL);");
+    run_ok(
+      "INSERT INTO set_float_l VALUES "
+      "(-(0.0::DOUBLE), -(0.0::REAL)), (0.0, 0.0), "
+      "('NaN'::DOUBLE, 'NaN'::REAL), ('NaN'::DOUBLE, 'NaN'::REAL), "
+      "('Infinity'::DOUBLE, 'Infinity'::REAL), ('Infinity'::DOUBLE, 'Infinity'::REAL), "
+      "('-Infinity'::DOUBLE, '-Infinity'::REAL), (NULL, NULL), (NULL, NULL), "
+      "(1.5, 1.5), (2.5, 2.5), (2.5, 2.5);");
+    run_ok(
+      "INSERT INTO set_float_r VALUES "
+      "(0.0::DOUBLE, 0.0::REAL), (0.0, 0.0), "
+      "(-('NaN'::DOUBLE), -('NaN'::REAL)), (-('NaN'::DOUBLE), -('NaN'::REAL)), "
+      "('Infinity'::DOUBLE, 'Infinity'::REAL), ('-Infinity'::DOUBLE, '-Infinity'::REAL), "
+      "(NULL, NULL), (NULL, NULL), (1.5, 1.5), (3.5, 3.5), (3.5, 3.5);");
+    run_ok(
+      "INSERT INTO set_float_no_nan VALUES "
+      "(0.0::DOUBLE, 0.0::REAL), ('Infinity'::DOUBLE, 'Infinity'::REAL), "
+      "('-Infinity'::DOUBLE, '-Infinity'::REAL), (NULL, NULL), (1.5, 1.5), (3.5, 3.5);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(DistinctSetOperationFloatFixture,
+                 "gpu_execution distinct set operations match floating key equality",
+                 "[integration][gpu_execution][set_operation][setop_float]")
+{
+  std::string const column  = GENERATE("d", "f");
+  std::string const keyword = GENERATE("EXCEPT", "INTERSECT");
+  INFO(column << " " << keyword);
+  auto compare = [&](std::string const& left, std::string const& right) {
+    auto const sql =
+      "SELECT " + column + " FROM " + left + " " + keyword + " SELECT " + column + " FROM " + right;
+    compare_gpu_vs_cpu_canonical(sql);
+    compare_gpu_vs_cpu("SELECT count(*) FROM (" + sql + ") q");
+  };
+  compare("set_float_l", "set_float_r");
+  compare("set_float_r", "set_float_l");
+  // EXCEPT must retain one NaN here; the matching-arm case alone removes every left NaN.
+  compare("set_float_l", "set_float_no_nan");
+  compare("set_float_l", "set_float_r WHERE false");
 }

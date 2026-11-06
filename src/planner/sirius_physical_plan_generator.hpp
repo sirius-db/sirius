@@ -145,8 +145,8 @@ class sirius_physical_plan_generator {
   static sirius::OrderPreservationType order_preservation_recursive(
     sirius::op::sirius_physical_operator& op);
 
-  //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
-  //! type; @p subject names the input in the message.
+  //! Throws sirius::not_implemented_exception (CPU fallback) unless each @p planned column is its
+  //! @p declared type; @p subject names the input in the message.
   static void require_planned_schema(std::span<sirius::logical_type const> planned,
                                      duckdb::vector<duckdb::LogicalType> const& declared,
                                      std::string_view subject);
@@ -249,8 +249,9 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
-  //! Lowers distinct EXCEPT / INTERSECT to a null-safe ANTI / SEMI hash join, and their
-  //! ALL forms to tag, UNION ALL, per-group tag sums, and `sirius_physical_replicate`.
+  //! Lowers distinct EXCEPT / INTERSECT to full-row deduplication over a null-safe ANTI / SEMI hash
+  //! join, and their ALL forms to tag, UNION ALL, per-group tag sums, and
+  //! `sirius_physical_replicate`.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
     duckdb::LogicalSetOperation& op);
 

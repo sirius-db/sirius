@@ -37,7 +37,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 | `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
-| `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (distinct forms) | `HASH_JOIN` (null-safe ANTI / SEMI) under the binder's DISTINCT | `src/planner/sirius_plan_set_operation.cpp` |
+| `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (distinct forms) | `HASH_GROUP_BY` over `HASH_JOIN` (null-safe ANTI / SEMI) | `src/planner/sirius_plan_set_operation.cpp` |
 
 `LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
 
@@ -79,7 +79,7 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 
 **File:** `src/planner/sirius_plan_set_operation.cpp`
 
-`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. The distinct forms lower as DuckDB lowers them: a hash join of the left input against the right, with one `IS NOT DISTINCT FROM` key per column, so `NULL` matches `NULL`. `INTERSECT` is a `SEMI` join and `EXCEPT` an `ANTI` join. The left input is always the probe and output side. The binder puts a `DISTINCT` above the set operation, so the join itself does not deduplicate.
+`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. The distinct forms use a hash join of the left input against the right, with one `IS NOT DISTINCT FROM` key per column, so `NULL` matches `NULL`. `INTERSECT` is a `SEMI` join and `EXCEPT` an `ANTI` join. The left input is always the probe and output side. The builder then groups by every output column with no aggregates to deduplicate the surviving rows. This preserves the node's distinct semantics independently of its parent; the binder's enclosing `DISTINCT` can be redundant.
 
 The `ALL` forms lower by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
 
@@ -92,7 +92,7 @@ The `ALL` forms lower by counting rows rather than by joining, as Spark does. A 
 The builder throws `NotImplementedException`, so the query falls back to CPU, for:
 
 - nested-type and `ARRAY` columns;
-- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values;
+- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values. The builder checks the operator and both logical inputs while their collation metadata is available;
 - in the `ALL` forms, `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
 - an input whose planned column type differs from the declared type. Aggregate results retain DuckDB's `HUGEINT` type throughout the set-operation plan;
 - in the distinct forms, keys the GPU hash join does not support.
