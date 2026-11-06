@@ -20,6 +20,7 @@
 
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "partitioned_join_test_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
 #include <cudf/concatenate.hpp>
@@ -47,27 +48,6 @@ using namespace sirius::test::operator_utils;
 
 namespace {
 
-struct finishable_pipeline : sirius::pipeline::sirius_pipeline {
-  explicit finishable_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
-    : sirius_pipeline(ctx)
-  {
-  }
-
-  [[nodiscard]] bool is_pipeline_finished() const override { return finished; }
-
-  bool finished = false;
-};
-
-//! Depth-first, root-first numbering of a bare operator tree, standing in for
-//! pipeline::assign_operator_ids in fixtures that never build pipelines.
-void number_operator_tree(sirius_physical_operator& op, size_t& next_id)
-{
-  op.operator_id = next_id++;
-  for (auto& child : op.children) {
-    if (child) { number_operator_tree(*child, next_id); }
-  }
-}
-
 cucascade::memory::memory_space& gpu_space() { return *get_default_gpu_space(); }
 
 /// A join on probe (key INT, payload INT) = build (key INT), in BUILD_PROBE mode with one
@@ -77,8 +57,8 @@ struct chunked_join {
   duckdb::unique_ptr<sirius_physical_hash_join> join;
   cucascade::shared_data_repository build_repo;
   cucascade::shared_data_repository probe_repo;
-  std::shared_ptr<finishable_pipeline> build_pipeline;
-  std::shared_ptr<finishable_pipeline> probe_pipeline;
+  std::shared_ptr<controllable_pipeline> build_pipeline;
+  std::shared_ptr<controllable_pipeline> probe_pipeline;
   sirius::pipeline::sirius_pipeline_build_state build_state;
 };
 
@@ -130,14 +110,13 @@ std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type,
   number_operator_tree(*f->join, next_id);
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*f->join, nullptr);
 
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
-  f->build_pipeline = std::make_shared<finishable_pipeline>(ctx);
-  f->probe_pipeline = std::make_shared<finishable_pipeline>(ctx);
+  f->build_pipeline = std::make_shared<controllable_pipeline>(false);
+  f->probe_pipeline = std::make_shared<controllable_pipeline>(false);
   f->build_state.add_pipeline_operator(*f->build_pipeline, *f->join->children[1]);
   f->build_state.add_pipeline_operator(*f->probe_pipeline, *f->join->children[0]);
   auto attach = [&](std::string_view name,
                     cucascade::shared_data_repository& repo,
-                    std::shared_ptr<finishable_pipeline> source) {
+                    std::shared_ptr<controllable_pipeline> source) {
     auto port          = std::make_unique<sirius_physical_operator::port>();
     port->type         = MemoryBarrierType::PARTIAL;
     port->repo         = &repo;
@@ -151,8 +130,14 @@ std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type,
   // BUILD_PROBE admission needs a measured row count; model an INTEGER build.
   uint64_t const build_bytes = 64ULL << 20;
   uint64_t const build_rows  = build_bytes / sizeof(int32_t);
-  auto const strategy        = f->join->get_partition_strategy(partition_sizing_input{
-    build_bytes, true, true, build_bytes, build_rows, build_rows, build_bytes});
+  auto const strategy =
+    f->join->get_partition_strategy(partition_sizing_input{.total_bytes          = build_bytes,
+                                                           .is_build_side        = true,
+                                                           .build_foldable       = true,
+                                                           .combined_total_bytes = build_bytes,
+                                                           .total_rows           = build_rows,
+                                                           .measured_rows        = build_rows,
+                                                           .resident_bytes       = build_bytes});
   REQUIRE(strategy.build_probe);
   REQUIRE_FALSE(strategy.broadcast);
   REQUIRE(strategy.num_partitions == 1);

@@ -40,6 +40,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <op/sirius_physical_operator.hpp>
 #include <utils/utils.hpp>
 
 #include <cstddef>
@@ -53,6 +54,16 @@
 #include <vector>
 
 namespace sirius::test::operator_utils {
+
+//! Depth-first, root-first numbering of a bare operator tree, standing in for
+//! pipeline::assign_operator_ids in fixtures that never build pipelines.
+inline void number_operator_tree(sirius::op::sirius_physical_operator& op, std::size_t& next_id)
+{
+  op.operator_id = next_id++;
+  for (auto& child : op.children) {
+    if (child) { number_operator_tree(*child, next_id); }
+  }
+}
 
 using data_repository_mgr = cucascade::data_repository_manager;
 

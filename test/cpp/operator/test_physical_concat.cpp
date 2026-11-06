@@ -77,16 +77,6 @@ struct hash_join_test_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
-//! Depth-first, root-first numbering of a bare operator tree, standing in for
-//! pipeline::assign_operator_ids in fixtures that never build pipelines.
-void number_operator_tree(sirius_physical_operator& op, size_t& next_id)
-{
-  op.operator_id = next_id++;
-  for (auto& child : op.children) {
-    if (child) { number_operator_tree(*child, next_id); }
-  }
-}
-
 auto& get_shared_memory_manager()
 {
   static auto manager = sirius::test::operator_utils::initialize_memory_manager();
