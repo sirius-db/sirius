@@ -271,13 +271,41 @@ TEST_CASE("whole-partition window planner activates only admitted windows",
   REQUIRE(find(find, *physical));
 }
 
-TEST_CASE("whole-partition activation rejects chained stages", "[planner][window_plan]")
+TEST_CASE("window stages plan as stacked WINDOW operators", "[planner][window_plan]")
 {
   window_fixture fixture;
-  auto logical = fixture.bind(
-    "SELECT sum(s) OVER (PARTITION BY p) FROM (SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t");
-  REQUIRE_THROWS_AS(sirius::planner::validate_window_stages(*logical),
-                    duckdb::NotImplementedException);
+  sirius::planner::sirius_physical_plan_generator generator(*fixture.con.context);
+  auto count = [](auto&& self, sirius::op::sirius_physical_operator& op) -> std::size_t {
+    std::size_t windows = op.type == sirius::op::SiriusPhysicalOperatorType::WINDOW ? 1 : 0;
+    for (auto& child : op.children) {
+      windows += self(self, *child);
+    }
+    return windows;
+  };
+  std::vector<std::pair<std::string, std::size_t>> const cases = {
+    {"SELECT rank() OVER (PARTITION BY p ORDER BY v),sum(v) OVER (PARTITION BY p) FROM w", 2},
+    {"SELECT rank() OVER (PARTITION BY p ORDER BY v),dense_rank() OVER (PARTITION BY p ORDER BY v) "
+     "FROM w",
+     1},
+    {"SELECT rank() OVER (PARTITION BY p ORDER BY v),rank() OVER (PARTITION BY p ORDER BY q) "
+     "FROM w",
+     2},
+    {"SELECT avg(d) OVER (PARTITION BY p,q),rank() OVER (PARTITION BY p ORDER BY v) FROM w", 2},
+    {"SELECT sum(v) OVER (PARTITION BY p),sum(v) OVER (PARTITION BY q) FROM w", 2},
+    {"SELECT sum(v) OVER (PARTITION BY p+1),rank() OVER (PARTITION BY q%2 ORDER BY v*2) FROM w", 2},
+    {"SELECT sum(s) OVER (PARTITION BY p) FROM (SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t",
+     2}};
+  // The physical plan cannot scan the fixture's in-memory table, so read from a VALUES list.
+  std::string const source = "FROM (VALUES (1,1,1,1.00::DECIMAL(18,2))) w(p,q,v,d)";
+  for (auto const& [query, windows] : cases) {
+    auto sql = query;
+    for (auto at = sql.find("FROM w"); at != std::string::npos; at = sql.find("FROM w", at)) {
+      sql.replace(at, 6, source);
+    }
+    INFO(sql);
+    auto physical = generator.create_plan(fixture.bind(sql));
+    CHECK(count(count, *physical) == windows);
+  }
 }
 
 TEST_CASE("ranking window planning records the order keys and bound types",
