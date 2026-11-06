@@ -17,9 +17,12 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "exchange/all_gather.hpp"
+#include "exchange/exchange_service.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "memory/runtime_stream_pool.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
@@ -34,9 +37,11 @@
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
@@ -49,6 +54,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <concepts>
@@ -200,6 +206,14 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
   return counts;
 }
 
+void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
+                        std::vector<key_filters>& per_key,
+                        ::cuda::stream_ref stream);
+void leave_merges(dynamic_filter_publish_plan::distributed_merge const& d,
+                  std::size_t first,
+                  std::size_t count) noexcept;
+void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -334,6 +348,7 @@ struct dynamic_filter_publication_session::state {
   void settle() noexcept
   {
     std::optional<completion> settled;
+    bool leave_merge = false;
     {
       std::scoped_lock lock(mutex);
       if (inventory && current != phase::TERMINAL && active_operations == 0 &&
@@ -341,8 +356,11 @@ struct dynamic_filter_publication_session::state {
         settled = accumulation_result;
         record(outcome);
         complete(*settled, true);
+        leave_merge = plan.distributed() != nullptr && !std::exchange(merge_started, true);
       }
     }
+    // The other ranks wait on this rank's share of each key's merge, which it ended without.
+    if (leave_merge) { merge_without_filters(plan); }
     if (settled) {
       sirius::log::log_noexcept([&] {
         SIRIUS_LOG_DEBUG("[dynamic_filter_publication_session] accumulation settled: outcome={}",
@@ -417,6 +435,13 @@ struct dynamic_filter_publication_session::state {
         key.membership        = filter;
         key.membership_domain = filter->domain();
       }
+      if (auto const* distributed = plan.distributed()) {
+        {
+          std::scoped_lock lock(mutex);
+          merge_started = true;
+        }
+        merge_across_ranks(*distributed, per_key, stream);
+      }
       std::optional<std::chrono::steady_clock::duration> latency;
       auto const counts = fan_out(plan, producers, per_key, [&] {
         latency = std::chrono::steady_clock::now() - final_commit;
@@ -490,7 +515,9 @@ struct dynamic_filter_publication_session::state {
   // The ID of the batch whose contribution completed the inventory, while its task's publication is
   // owed and has not run.
   std::optional<std::uint64_t> pending_publication;
-  phase current       = phase::OPEN;
+  phase current = phase::OPEN;
+  /// Distributed: this rank has started its part in every key's merge, with filters or without.
+  bool merge_started  = false;
   bool sealed         = false;
   bool input_closed   = false;
   bool cancelled      = false;
@@ -569,6 +596,18 @@ void dynamic_filter_publication_session::restrict_replicas_to(
   if (!operation.plan.enabled()) { operation.complete(completion::SKIPPED); }
 }
 
+void dynamic_filter_publication_session::set_distributed(
+  dynamic_filter_publish_plan::distributed_merge merge)
+{
+  std::scoped_lock lock(_state->mutex);
+  if (_state->sealed) {
+    throw std::logic_error(
+      "[dynamic_filter_publication_session::set_distributed] the plan cannot change during "
+      "execution");
+  }
+  _state->plan.set_distributed(std::move(merge));
+}
+
 void dynamic_filter_publication_session::seal_plan() noexcept
 {
   std::scoped_lock lock(_state->mutex);
@@ -637,12 +676,20 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    auto const geometry = detail::accumulated_bloom_geometry::try_create(
-      rows, keys.size(), plan.max_bloom_bytes_per_gpu());
+    // A build too large for the cap gets a Bloom cut to it: more false positives, still a filter.
+    // Distributed, every rank takes the plan's size, uncapped, so the ranks' filters merge.
+    auto const* distributed = plan.distributed();
+    auto const cap =
+      distributed ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
+    auto const wanted = distributed ? distributed->bloom_keys : rows;
+    auto const sized_for =
+      distributed ? wanted : std::min(rows, bloom_keys_within_cap(cap, keys.size()));
+    auto const geometry =
+      detail::accumulated_bloom_geometry::try_create(sized_for, keys.size(), cap);
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
       auto const required                    = detail::accumulated_bloom_geometry::try_create(
-        rows, keys.size(), std::numeric_limits<std::uint64_t>::max());
+        sized_for, keys.size(), std::numeric_limits<std::uint64_t>::max());
       SIRIUS_LOG_INFO(
         "[dynamic_filter_publication_session] accumulated Bloom refused: per-GPU cap, rows={}, "
         "active_keys={}, required_bytes={}, cap={}",
@@ -651,6 +698,14 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         required ? std::to_string(required->arrays_bytes) : "overflow",
         plan.max_bloom_bytes_per_gpu());
       return false;
+    }
+    if (sized_for < wanted) {
+      SIRIUS_LOG_INFO(
+        "[dynamic_filter_publication_session] accumulated Bloom cut to the per-GPU cap: sized for "
+        "{} keys instead of {}, cap={}",
+        sized_for,
+        wanted,
+        plan.max_bloom_bytes_per_gpu());
     }
 
     auto const& replicas = plan.replica_spaces();
@@ -854,16 +909,21 @@ void dynamic_filter_publication_session::observe_whole_build(
     auto* space = source.get_data() ? source.get_memory_space() : nullptr;
     if (!space || source.get_current_tier() != cucascade::memory::Tier::GPU ||
         !operation.plan.has_replica_on_device(space->get_device_id())) {
+      {
+        std::scoped_lock lock(operation.mutex);
+        if (operation.stats) {
+          operation.stats->publications_skipped_source_not_resident.fetch_add(
+            1, std::memory_order_relaxed);
+        }
+        // Reopened, the session merges from finish_input(), which then sees it open.
+        if (!operation.input_closed) {
+          operation.current = state::phase::OPEN;
+          return;
+        }
+      }
+      merge_without_filters(operation.plan);
       std::scoped_lock lock(operation.mutex);
-      if (operation.stats) {
-        operation.stats->publications_skipped_source_not_resident.fetch_add(
-          1, std::memory_order_relaxed);
-      }
-      if (operation.input_closed) {
-        operation.complete(operation.cancelled ? completion::CANCELLED : completion::SKIPPED);
-      } else {
-        operation.current = state::phase::OPEN;
-      }
+      operation.complete(operation.cancelled ? completion::CANCELLED : completion::SKIPPED);
       return;
     }
 
@@ -957,6 +1017,145 @@ std::unique_ptr<cudf::scalar> restore_scalar(cudf::scalar const& bound,
 }
 }  // namespace
 
+namespace {
+
+/**
+ * @brief Distributed: ORs every rank's Bloom for each admitted key into this rank's, so it holds
+ * every rank's build keys, or drops the key's filter unless every rank sent one of the same size
+ * and key domain. Every rank calls it for every admitted key, in order, filter or not, since the
+ * others wait for it.
+ */
+void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
+                        std::vector<key_filters>& per_key,
+                        ::cuda::stream_ref stream)
+{
+  // A rank's contribution: rep | family | scale | storage bytes | the Bloom's words, as UINT32.
+  constexpr std::size_t header = 4;
+  auto const mr                = d.gpu->get_default_allocator();
+  // The peers wait on this rank in every key's gather, so however this ends, this rank takes part
+  // in the gathers it has not entered. Keys from a failed one on publish nothing: this rank's Bloom
+  // alone would drop rows another rank's build matches.
+  std::size_t entered = 0;
+  auto const give_up  = [&](std::size_t from) {
+    for (auto j = from; j < per_key.size(); ++j) {
+      per_key[j].membership.reset();
+    }
+    leave_merges(d, entered, per_key.size());
+  };
+  try {
+    for (std::size_t k = 0; k < per_key.size(); ++k) {
+      auto& membership = per_key[k].membership;
+      auto* bloom      = dynamic_cast<sirius_dynamic_bloom_filter*>(membership.get());
+      std::array<std::uint32_t, header> head{};
+      std::shared_ptr<cucascade::data_batch> mine;
+      if (bloom) {
+        auto const bytes = bloom->storage_bytes();
+        head             = {static_cast<std::uint32_t>(bloom->domain().rep),
+                            static_cast<std::uint32_t>(bloom->domain().family),
+                            static_cast<std::uint32_t>(bloom->domain().scale),
+                            static_cast<std::uint32_t>(bytes)};
+        auto column      = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::UINT32},
+          static_cast<cudf::size_type>(header + bytes / sizeof(std::uint32_t)),
+          cudf::mask_state::UNALLOCATED,
+          stream,
+          mr);
+        auto* words = column->mutable_view().data<std::uint32_t>();
+        RMM_CUDA_TRY(
+          cudaMemcpyAsync(words, head.data(), sizeof(head), cudaMemcpyHostToDevice, stream.get()));
+        RMM_CUDA_TRY(cudaMemcpyAsync(
+          words + header, bloom->storage(), bytes, cudaMemcpyDeviceToDevice, stream.get()));
+        std::vector<std::unique_ptr<cudf::column>> columns;
+        columns.push_back(std::move(column));
+        mine = sirius::make_data_batch(
+          std::make_unique<cudf::table>(std::move(columns)), *d.gpu, stream, {});
+      }
+      std::vector<std::shared_ptr<cucascade::data_batch>> all;
+      try {
+        // all_gather sends and closes to every rank before it waits: once called, this rank has
+        // taken its part in key k, even if it throws.
+        entered = k + 1;
+        all     = exchange::all_gather(
+          *d.service, d.first_stream + k, std::move(mine), *d.gpu, stream.get(), d.timeout);
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_WARN(
+          "[publish_dynamic_filters] key {}: filters not merged across ranks: {}", k, e.what());
+        // A rank missing from this gather is missing from the later ones too.
+        give_up(k);
+        return;
+      }
+      if (!bloom) { continue; }
+      std::vector<std::uint32_t const*> others;
+      bool mergeable =
+        std::all_of(all.begin(), all.end(), [](auto const& t) { return t != nullptr; });
+      if (mergeable) {
+        // Every rank's header in one copy-back, so the key costs one host sync, not one per rank.
+        std::vector<std::array<std::uint32_t, header>> heads(all.size());
+        for (exchange::rank_t r = 0; r < all.size(); ++r) {
+          auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
+          RMM_CUDA_TRY(cudaMemcpyAsync(
+            heads[r].data(), theirs, sizeof(heads[r]), cudaMemcpyDeviceToHost, stream.get()));
+          if (r != d.service->rank()) { others.push_back(theirs + header); }
+        }
+        stream.sync();
+        mergeable =
+          std::all_of(heads.begin(), heads.end(), [&](auto const& h) { return h == head; });
+      }
+      if (!mergeable) {
+        SIRIUS_LOG_DEBUG(
+          "[publish_dynamic_filters] key {}: a rank sent no filter or another kind; "
+          "nothing published for it.",
+          k);
+        membership.reset();
+        continue;
+      }
+      try {
+        for (auto const* words : others) {
+          bloom->merge_from(words, bloom->storage_bytes(), stream);
+        }
+      } catch (...) {
+        // `all` and this Bloom must outlive every OR already queued on `stream`.
+        auto error = std::current_exception();
+        stream.sync();
+        std::rethrow_exception(error);
+      }
+      // The gathered filters are freed with `all`, after the merges have read them.
+      stream.sync();
+    }
+  } catch (...) {
+    give_up(0);
+    throw;
+  }
+}
+
+/// Takes this rank's part, with nothing, in the merges of admitted keys [first, count).
+void leave_merges(dynamic_filter_publish_plan::distributed_merge const& d,
+                  std::size_t first,
+                  std::size_t count) noexcept
+{
+  try {
+    for (auto k = first; k < count; ++k) {
+      exchange::leave_all_gather(*d.service, d.first_stream + k);
+    }
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("[publish_dynamic_filters] taking part in the merge without filters: {}",
+                    e.what());
+  }
+}
+
+/// Distributed: this rank's share of every key's merge when it publishes nothing, so the other
+/// ranks drop each key's filter at once instead of at the merge timeout.
+///
+/// Without waiting for the other ranks, since this rank keeps nothing from the merge: the caller
+/// finalizes a pipeline, and may be the exchange's engine thread delivering an end of stream, which
+/// a waiting merge would itself need to move its messages.
+void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept
+{
+  if (auto const* d = plan.distributed()) { leave_merges(*d, 0, plan.admitted_keys().size()); }
+}
+
+}  // namespace
+
 // 4. Whole-build publication: build the filters from one complete build, publish them to the
 // probe targets, and record the outcome.
 dynamic_filter_publication_outcome publish_dynamic_filters(
@@ -974,7 +1173,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   }
   dynamic_filter_publication_outcome outcome;
 
-  if (build_view.num_rows() == 0) {
+  // Distributed, neither shortcut applies: the other ranks wait on this rank's share of the merge.
+  // An empty build contributes an empty Bloom, and this rank still publishes the others' keys.
+  if (build_view.num_rows() == 0 && plan.distributed() == nullptr) {
     SIRIUS_LOG_DEBUG("[publish_dynamic_filters] Skipping dynamic filter push: empty build table.");
     return outcome;
   }
@@ -984,10 +1185,12 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   };
   auto const& probe_targets = plan.probe_targets();
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
-    SIRIUS_LOG_DEBUG(
-      "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
     outcome.publications_skipped_targets_drained = 1;
-    return outcome;
+    if (plan.distributed() == nullptr) {
+      SIRIUS_LOG_DEBUG(
+        "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
+      return outcome;
+    }
   }
 
   auto const& admitted_keys = plan.admitted_keys();
@@ -1012,11 +1215,14 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
+  auto const bloom_keys    = plan.distributed() ? plan.distributed()->bloom_keys : std::size_t{0};
 
   std::vector<key_filters> per_key(admitted_keys.size());
   // Build columns restored from a narrowed carrier; filters copy from them asynchronously on
   // `stream`, so they must outlive the synchronize below.
   std::vector<std::unique_ptr<cudf::column>> restored_build_columns;
+  // Distributed: a failure before the merge must still take this rank's part in it.
+  bool merge_started = false;
 
   try {
     for (std::size_t admitted_key_index = 0; admitted_key_index < admitted_keys.size();
@@ -1098,7 +1304,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       // carrier the build arrived at and then restored to the recorded type: two scalars, not the
       // whole column, so a narrowed build publishes the same zone map a native one does.
       filters.zone_map_type = admitted_key.storage_type;
-      if (plan.emit_zone_map_filters() &&
+      if (plan.emit_zone_map_filters() && plan.distributed() == nullptr &&
           sirius::op::sirius_dynamic_zone_map_filter::supports(admitted_key.storage_type)) {
         nvtx_scoped_range vr{"dynfilter::build_zone_map"};
         auto min_s = cudf::reduce(col,
@@ -1145,17 +1351,23 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
           admitted_key_index);
       }
 
-      auto const chosen = choose_membership_filter(
-        {.build_rows               = valid_rows,
-         .l2_cache_bytes           = l2_bytes,
-         .estimated_hash_set_bytes = set_bytes,
-         .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
-         .supports_small_in_list =
-           fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
-         .supports_hash_in_list =
-           fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
-         .supports_bloom =
-           fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
+      // Distributed: a Bloom of the size every rank builds, so the ranks' filters can be merged.
+      auto const distributed_bloom = plan.distributed() != nullptr && fits_rep &&
+                                     sirius::op::sirius_dynamic_bloom_filter::supports(col.type());
+      auto const chosen =
+        plan.distributed() != nullptr
+          ? (distributed_bloom ? membership_filter_kind::bloom : membership_filter_kind::none)
+          : choose_membership_filter(
+              {.build_rows               = valid_rows,
+               .l2_cache_bytes           = l2_bytes,
+               .estimated_hash_set_bytes = set_bytes,
+               .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
+               .supports_small_in_list =
+                 fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
+               .supports_hash_in_list =
+                 fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
+               .supports_bloom =
+                 fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
 
       char const* choice = "none";
       switch (chosen) {
@@ -1175,8 +1387,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         }
         case membership_filter_kind::bloom: {
           nvtx_scoped_range vr{"dynfilter::build_bloom"};
-          filters.membership =
-            std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
+          filters.membership = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+            col, bloom_keys, stream, allocator_ref);
           choice = "bloom";
           break;
         }
@@ -1196,6 +1408,11 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         l2_bytes,
         plan.inlist_max_l2_fraction(),
         choice);
+    }
+
+    if (auto const* distributed = plan.distributed()) {
+      merge_started = true;
+      merge_across_ranks(*distributed, per_key, stream);
     }
 
     // Finish construction and replication before publishing to independent consumer streams.
@@ -1246,6 +1463,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   } catch (...) {
     // Retire accepted work before the outer filter owners are destroyed during unwinding.
     auto error = std::current_exception();
+    if (!merge_started) { merge_without_filters(plan); }
     stream.sync();
     std::rethrow_exception(error);
   }
@@ -1254,17 +1472,30 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
 void dynamic_filter_publication_session::finish_input() noexcept
 {
   auto& operation = *_state;
+  bool merge      = false;
   {
     std::scoped_lock lock(operation.mutex);
     operation.seal();
     operation.input_closed = true;
     if (operation.current == state::phase::OPEN) {
-      operation.complete(completion::SKIPPED);
+      merge = operation.plan.enabled() && operation.plan.distributed() != nullptr;
+      if (merge) {
+        operation.current = state::phase::PUBLISHING;
+      } else {
+        operation.complete(completion::SKIPPED);
+      }
     } else if (operation.current == state::phase::COLLECTING && !operation.accumulation_result) {
       operation.end_attempt(completion::SKIPPED,
                             &dynamic_filter_stats_snapshot::accumulations_incomplete);
     }
     operation.abandon_pending_publication();
+  }
+  if (merge) {
+    // Every other rank waits on this rank's share of each key's merge. This rank never saw a whole
+    // build, so it may hold keys: it sends no filter, never an empty one.
+    merge_without_filters(operation.plan);
+    std::scoped_lock lock(operation.mutex);
+    operation.complete(completion::SKIPPED);
   }
   operation.settle();
 }

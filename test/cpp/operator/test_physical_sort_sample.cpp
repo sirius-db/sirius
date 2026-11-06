@@ -202,17 +202,42 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
-  src_pipeline->set_finished(true);
+  src_pipeline->set_finished(false);
   attach_port(sample_op, *repo, src_pipeline);
 
-  // Upstream finished but produced no batches — must not block waiting for sample bytes.
-  auto hint = sample_op.get_next_task_hint();
-  REQUIRE(hint.has_value());
-  REQUIRE(hint->hint == TaskCreationHint::READY);
-  REQUIRE(hint->producer == &sample_op);
+  SECTION("not distributed")
+  {
+    src_pipeline->set_finished(true);
+    // Upstream finished but produced no batches — must not block waiting for sample bytes.
+    auto hint = sample_op.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    REQUIRE(hint->hint == TaskCreationHint::READY);
+    REQUIRE(hint->producer == &sample_op);
 
-  // No batches to pull; execute() should still be able to mark boundaries done.
-  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+    // No batches to pull; execute() should still be able to mark boundaries done.
+    REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+    CHECK_FALSE(sample_op.runs_without_input());
+  }
+
+  SECTION("distributed: a boundary task with no input")
+  {
+    sample_op.set_distributed({nullptr, 0, nullptr, {}});
+
+    // The boundary task is owed before upstream finishes, but cannot run yet.
+    CHECK_FALSE(sample_op.all_ports_empty());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+    src_pipeline->set_finished(true);
+    auto hint = sample_op.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    CHECK(hint->hint == TaskCreationHint::READY);
+
+    auto input = sample_op.get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    CHECK(batch_count(*input) == 0);
+    CHECK(sample_op.runs_without_input());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+  }
 }
 
 TEST_CASE("sirius_physical_sort_sample get_next_task_hint returns nullopt while scheduled",

@@ -162,7 +162,6 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
   // lock, holding only their shared_ptr to this state. Note the map is NOT cleared — other
   // queries own their own entries, and this one is brand new.
   for (const auto& pipeline : pipelines) {
-    pipeline->set_task_creator(this);
     if (pipeline->is_query_terminal()) { pipeline->set_completion_handler(handler); }
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) {
@@ -181,15 +180,25 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
     state->global_states.emplace(operator_id, std::move(gs));
   }
 
-  std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
-  state->lookahead_queue.clear();
-  auto scan_operators            = query.get_scan_operators();
-  state->index_of_next_lookahead = 0;
-  if (!scan_operators.empty()) {
-    auto begin = scan_operators.begin() + 1;
-    for (auto it = begin; it != scan_operators.end(); ++it) {
-      state->lookahead_queue.push_back(*it);
+  {
+    std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
+    state->lookahead_queue.clear();
+    auto scan_operators            = query.get_scan_operators();
+    state->index_of_next_lookahead = 0;
+    if (!scan_operators.empty()) {
+      auto begin = scan_operators.begin() + 1;
+      for (auto it = begin; it != scan_operators.end(); ++it) {
+        state->lookahead_queue.push_back(*it);
+      }
     }
+  }
+
+  // Last: an exchange or streaming source schedules from another thread once its pipeline has a
+  // creator, and a worker that finds no global state for the source drops the batch it took. An
+  // exchange source notified earlier schedules nothing; it is scheduled again when its stream
+  // ends, which waits on this rank's own producer and so comes after the query starts.
+  for (const auto& pipeline : pipelines) {
+    pipeline->set_task_creator(this);
   }
 }
 
@@ -706,7 +715,8 @@ void task_creator::manager_loop()
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
               if (!input_data ||
-                  (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
+                  (pipelineable_input && pipelineable_input->get_data_batches().empty() &&
+                   !node->runs_without_input())) {
                 // no data to create task for
                 break;
               }

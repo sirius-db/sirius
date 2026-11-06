@@ -19,6 +19,7 @@
 #include "memory/runtime_stream_pool.hpp"
 
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
@@ -399,6 +400,14 @@ std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) n
 sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                                                          ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
+  : sirius_dynamic_bloom_filter(keys, 0, stream, mr)
+{
+}
+
+sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const& keys,
+                                                         std::size_t capacity_keys,
+                                                         ::cuda::stream_ref stream,
+                                                         rmm::device_async_resource_ref mr)
 {
   // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
   // device; `build.compacted` stays alive until add_async is queued on `stream`.
@@ -406,7 +415,7 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
   _domain          = build.domain;
   auto const n     = build.keys.size();
   ::cuda::stream_ref const s{stream.get()};
-  auto const num_blocks = bloom_blocks_for(n);
+  auto const num_blocks = bloom_blocks_for(capacity_keys > 0 ? capacity_keys : n);
   _impl                 = std::make_unique<impl>();
   _impl->source_device  = build.source_device;
 
@@ -432,6 +441,66 @@ std::shared_ptr<sirius_dynamic_bloom_filter> sirius_dynamic_bloom_filter::make_a
   // The constructor is private, so std::make_shared cannot reach it; ownership is taken at once.
   return std::shared_ptr<sirius_dynamic_bloom_filter>{
     new sirius_dynamic_bloom_filter{domain, std::move(completed)}};
+}
+
+namespace {
+
+__global__ void or_words(std::uint32_t* into, std::uint32_t const* from, std::size_t count)
+{
+  auto const i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count) { into[i] |= from[i]; }
+}
+
+}  // namespace
+
+void const* sirius_dynamic_bloom_filter::storage() const
+{
+  if (auto const* accumulated = _impl->find_accumulated(_impl->source_device)) {
+    return accumulated->bits->data();
+  }
+  auto const* source = _impl->find(_impl->source_device);
+  return std::visit([](auto const& bloom) -> void const* { return bloom->data(); }, source->bloom);
+}
+
+std::size_t sirius_dynamic_bloom_filter::storage_bytes() const
+{
+  if (auto const* accumulated = _impl->find_accumulated(_impl->source_device)) {
+    return accumulated->blocks * bloom_bytes_per_block;
+  }
+  auto const* source = _impl->find(_impl->source_device);
+  return std::visit(
+    [](auto const& bloom) {
+      using filter_type = typename std::decay_t<decltype(bloom)>::element_type;
+      return bloom->block_extent() * filter_type::words_per_block *
+             sizeof(typename filter_type::word_type);
+    },
+    source->bloom);
+}
+
+void sirius_dynamic_bloom_filter::merge_from(void const* words,
+                                             std::size_t bytes,
+                                             ::cuda::stream_ref stream)
+{
+  if (bytes != storage_bytes() || bytes % sizeof(std::uint32_t) != 0) {
+    throw std::invalid_argument("[sirius_dynamic_bloom_filter] merging a filter of another size");
+  }
+  // Distributed ranks run on one GPU each, so a merged filter has no other replica to update.
+  if (replica_count() > 1) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter] merge_from on a filter on several GPUs");
+  }
+  cudaPointerAttributes attributes{};
+  CUDF_CUDA_TRY(cudaPointerGetAttributes(&attributes, words));
+  if (attributes.type == cudaMemoryTypeDevice && attributes.device != _impl->source_device) {
+    throw std::invalid_argument("[sirius_dynamic_bloom_filter] merging a filter on another GPU");
+  }
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_impl->source_device}};
+  auto* into                 = static_cast<std::uint32_t*>(const_cast<void*>(storage()));
+  auto const count           = bytes / sizeof(std::uint32_t);
+  constexpr unsigned threads = 256;
+  auto const blocks          = static_cast<unsigned>(::cuda::ceil_div(count, std::size_t{threads}));
+  or_words<<<blocks, threads, 0, stream.get()>>>(
+    into, static_cast<std::uint32_t const*>(words), count);
+  CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(

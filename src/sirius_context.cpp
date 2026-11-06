@@ -27,6 +27,8 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "exchange/exchange_runtime.hpp"
+#include "exchange/exchange_service.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
@@ -38,6 +40,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
@@ -574,6 +577,20 @@ void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirem
   }
   // The sole query-wide work barrier: includes manager-held tasks, callbacks and spill victims.
   query_lifecycle_.wait_for_work(query_id);
+  // The exchange may still hold batches this rank sent, until their last frame is staged; they
+  // must be freed before the query's memory is released.
+  if (auto const distributed = distributed_query_of(query_id); distributed != 0) {
+    std::shared_ptr<sirius::exchange::exchange_service> service;
+    {
+      std::lock_guard lock{exchange_mutex_};
+      service = exchange_service_;
+    }
+    if (service && !service->wait_sent(distributed, std::chrono::minutes{1})) {
+      SIRIUS_LOG_WARN("Distributed query {}: sent batches still held by the exchange after 1 min",
+                      distributed);
+    }
+    if (service) { service->forget(distributed); }
+  }
 }
 
 std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
@@ -706,6 +723,7 @@ void SiriusContext::StandaloneQueryScope::release() noexcept
   }
   if (connection_state_) {
     connection_state_->execution_window_active = false;
+    connection_state_->active_window           = 0;
     connection_state_->execution_options.reset();
   }
   permit_.reset();
@@ -757,15 +775,23 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
   window_id_  = sirius::make_query_id(static_cast<std::uint32_t>(permit_.ticket()));
   completion_ = std::make_shared<sirius::pipeline::completion_handler>(
     ctx.window_task_counter(),
-    [registry = &ctx_.query_lifecycle_, id = window_id_](std::exception_ptr error) {
+    [registry = &ctx_.query_lifecycle_, id = window_id_, owner = &ctx_](std::exception_ptr error) {
       registry->report_failure(error, id);
+      owner->abort_distributed_query(id, error);
     });
   completion_->injections = sirius::transparent::latch_replay_injections(context);
   if (completion_->injections) ctx.record_certification_budget(false, false, 10);
   completion_->non_rollbackable_state =
     completion_->injections && completion_->injections->non_rollbackable_state;
   connection_state_ = get_sirius_connection_state(context);
-  if (connection_state_) connection_state_->execution_window_active = true;
+  if (connection_state_) {
+    connection_state_->execution_window_active = true;
+    connection_state_->active_window           = sirius::value_of(window_id_);
+    if (auto const planned = std::exchange(connection_state_->planned_distributed_query, 0)) {
+      std::lock_guard lock{ctx_.exchange_mutex_};
+      ctx_.distributed_by_window_[sirius::value_of(window_id_)] = planned;
+    }
+  }
   std::snprintf(begin_tag_,
                 sizeof(begin_tag_),
                 "QueryBegin instance=%p connection=%llu window=%llu query=%llu",
@@ -878,6 +904,10 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
     log_window_event("end", "unwind");
     release();
     state_ = scope_state::FAILED;
+  }
+  {
+    std::lock_guard lock{ctx_.exchange_mutex_};
+    ctx_.distributed_by_window_.erase(sirius::value_of(window_id_));
   }
   std::lock_guard lock(ctx_.window_completions_mutex_);
   ctx_.window_completions_.erase(sirius::value_of(window_id_));
@@ -1190,6 +1220,15 @@ void SiriusContext::release_resources() noexcept
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
+  // The exchange's engine thread lands batches in memory_manager_'s spaces and calls into sources
+  // and the components above: stop it while they all still exist. Plans can hold the service past
+  // terminate() (a prepared statement), so dropping this reference alone would not stop it.
+  std::shared_ptr<sirius::exchange::exchange_service> exchange;
+  {
+    std::lock_guard lock{exchange_mutex_};
+    exchange = std::move(exchange_service_);
+  }
+  if (exchange) { exchange->shutdown(); }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
@@ -1242,6 +1281,126 @@ void SiriusContext::release_resources() noexcept
   topology_index_.reset();
 
   is_initialized_ = false;
+}
+
+uint64_t SiriusContext::next_distributed_query(ClientContext& context)
+{
+  std::lock_guard lock{exchange_mutex_};
+  auto const connection = context.GetConnectionId();
+  if (!distributed_connection_) { distributed_connection_ = connection; }
+  if (*distributed_connection_ != connection) {
+    throw sirius::invalid_input_exception(
+      "distributed execution runs on one connection per process: connection {} runs it, so "
+      "connection {} cannot",
+      *distributed_connection_,
+      connection);
+  }
+  auto const query = ++distributed_queries_;
+  if (auto state = get_sirius_connection_state(context)) {
+    if (state->active_window != 0) {
+      distributed_by_window_[state->active_window] = query;
+    } else {
+      state->planned_distributed_query = query;
+    }
+  }
+  return query;
+}
+
+void SiriusContext::release_distributed_connection(ClientContext& context)
+{
+  std::lock_guard lock{exchange_mutex_};
+  if (distributed_connection_ == context.GetConnectionId()) { distributed_connection_.reset(); }
+}
+
+void SiriusContext::set_exchange_service_for_testing(
+  std::shared_ptr<sirius::exchange::exchange_service> service)
+{
+  std::lock_guard lock{exchange_mutex_};
+  exchange_service_ = std::move(service);
+}
+
+void SiriusContext::adopt_distributed_query(ClientContext& context, uint64_t query)
+{
+  auto state = get_sirius_connection_state(context);
+  if (query == 0 || !state || state->active_window == 0) { return; }
+  std::lock_guard lock{exchange_mutex_};
+  distributed_by_window_[state->active_window] = query;
+}
+
+uint64_t SiriusContext::distributed_query_of(sirius::query_id_t window)
+{
+  std::lock_guard lock{exchange_mutex_};
+  auto const it = distributed_by_window_.find(sirius::value_of(window));
+  return it == distributed_by_window_.end() ? 0 : it->second;
+}
+
+void SiriusContext::abort_distributed_query(sirius::query_id_t window,
+                                            std::exception_ptr const& error) noexcept
+{
+  try {
+    auto const query = distributed_query_of(window);
+    if (query == 0) { return; }
+    std::shared_ptr<sirius::exchange::exchange_service> service;
+    {
+      std::lock_guard lock{exchange_mutex_};
+      service = exchange_service_;
+    }
+    if (!service) { return; }
+    std::string what = "unknown error";
+    try {
+      std::rethrow_exception(error);
+    } catch (std::exception const& e) {
+      what = e.what();
+    } catch (...) {
+    }
+    SIRIUS_LOG_WARN("Distributed query {} failed; aborting it on every rank: {}", query, what);
+    service->abort(query, what);
+  } catch (std::exception const& e) {  // best effort: the peers' own timeouts remain
+    try {
+      SIRIUS_LOG_WARN("Aborting distributed window {} on the other ranks failed: {}",
+                      sirius::value_of(window),
+                      e.what());
+    } catch (...) {
+    }
+  } catch (...) {
+  }
+}
+
+std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_service(
+  sirius::operator_params const& params)
+{
+  std::lock_guard lock{exchange_mutex_};
+  if (exchange_service_) {
+    if (params.exchange_peers != exchange_peers_ || params.exchange_rank != exchange_rank_ ||
+        params.exchange_host_staging != exchange_host_staging_) {
+      throw sirius::invalid_input_exception(
+        "sirius_exchange_peers, sirius_exchange_rank and sirius_exchange_host_staging cannot "
+        "change once connected");
+    }
+    return exchange_service_;
+  }
+  if (params.exchange_rank >= params.exchange_peers.size()) {
+    throw sirius::invalid_input_exception(
+      "sirius_exchange_rank {} of {} peers", params.exchange_rank, params.exchange_peers.size());
+  }
+  auto& memory = get_memory_manager();
+  auto* gpu    = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* host   = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
+  sirius::exchange::nixl_exchange_options opts;
+  opts.staging = sirius::exchange::parse_host_staging(params.exchange_host_staging);
+  // A batch with no room asks the GPU's downgrade executor for it, as a task would. terminate()
+  // shuts the exchange down before the executors go.
+  opts.transport_options.request_room = [&downgrade = get_downgrade_executor(gpu->get_id()),
+                                         gpu](std::size_t bytes) {
+    static_cast<void>(
+      downgrade.request_downgrade([gpu, bytes] { return gpu->get_available_memory() >= bytes; }));
+  };
+  exchange_service_ = sirius::exchange::make_nixl_exchange(
+    params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+  exchange_peers_        = params.exchange_peers;
+  exchange_rank_         = params.exchange_rank;
+  exchange_host_staging_ = params.exchange_host_staging;
+  return exchange_service_;
 }
 
 sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memory_manager()
@@ -1933,6 +2092,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       validated_sirius_plan = planner->create_plan(std::move(logical_plan));
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
+    // The plan's distributed query number, if it has one: a later statement that reuses the plan
+    // (EXECUTE of a prepared statement) ties it to its own execution window.
+    auto const validated_distributed_query = conn_state ? conn_state->planned_distributed_query : 0;
 
     duckdb::Value read_view_injection;
     if (context.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",
@@ -1994,7 +2156,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       0,
       std::move(validated_sirius_plan),
       validated_plan_pin_epoch,
-      context.transaction.ActiveTransaction().global_transaction_id);
+      context.transaction.ActiveTransaction().global_transaction_id,
+      validated_distributed_query);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.
@@ -2240,6 +2403,7 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
 {
   SIRIUS_LOG_INFO("Connection closed.");
+  if (context_) { context_->release_distributed_connection(context); }
   // remove the context from the registered state
   context.registered_state->Remove("sirius_state");
   context.registered_state->Remove("sirius_connection_state");

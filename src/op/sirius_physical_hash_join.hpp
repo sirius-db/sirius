@@ -326,6 +326,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     _dynamic_filter_session.restrict_replicas_to(admitted_gpu_ids);
   }
 
+  void set_distributed_dynamic_filters(dynamic_filter_publish_plan::distributed_merge merge)
+  {
+    _dynamic_filter_session.set_distributed(std::move(merge));
+  }
+
   void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
@@ -336,6 +341,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   [[nodiscard]] dynamic_filter_publication_session& dynamic_filter_session() noexcept
   {
     return _dynamic_filter_session;
+  }
+
+  /**
+   * @brief The build CONCAT has finalized. Distributed, this rank's filter publication closes now
+   * rather than at this join's own finalize, after its probe side: a peer's merge waits on this
+   * rank's share, and that peer's probe rows may wait on its publication.
+   */
+  void on_build_input_finished() noexcept
+  {
+    if (_dynamic_filter_session.plan().distributed() != nullptr) {
+      _dynamic_filter_session.finish_input();
+    }
   }
 
   static void build_join_pipelines(pipeline::sirius_pipeline& current,

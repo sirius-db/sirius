@@ -7,6 +7,7 @@ target_sources(
           dynamic_filter/build_key_domain.cpp
           dynamic_filter/dynamic_filter_key_admission.cpp
           dynamic_filter/dynamic_filter_target_discovery.cpp
+          distributed_plan.cpp
           gpu_admission.cpp
           join_key_nullability.cpp
           query.cpp

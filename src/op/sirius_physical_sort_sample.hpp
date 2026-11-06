@@ -16,13 +16,23 @@
 
 #pragma once
 
+#include "exchange/transport.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "sirius_config.hpp"
 
 #include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
 
 #include <atomic>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace sirius::exchange {
+class exchange_service;
+}
 
 namespace sirius {
 namespace op {
@@ -55,6 +65,31 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
 
+  /**
+   * @brief Sampling across the ranks of a range exchange.
+   *
+   * Every rank shares an evenly spaced summary of its sample, and merges all of them in rank
+   * order, so every rank holds the same global sample. From it each derives the same world size
+   * minus one boundaries for the range exchange after this operator, and its own partition
+   * boundaries from the part of the sample inside its range. Every rank's boundary task joins the
+   * exchange, one with no input included.
+   */
+  struct distributed_sampling {
+    std::shared_ptr<exchange::exchange_service> service;
+    /// The all-gather's stream id, the same on every rank.
+    exchange::stream_id stream{0};
+    /// Where gathered summaries are merged.
+    cucascade::memory::memory_space* gpu{nullptr};
+    /// Receives the range exchange's boundaries.
+    std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries;
+  };
+  void set_distributed(distributed_sampling sampling) { _distributed = std::move(sampling); }
+
+  //! Rows of each rank's sample summary shared in distributed mode, at least.
+  static constexpr std::size_t distributed_summary_rows = 1024;
+  //! Sample rows each of a rank's partitions gets from the global sample.
+  static constexpr std::size_t summary_rows_per_partition = 32;
+
  public:
   bool is_source() const override { return true; }
   // SORT_SAMPLE is not a pipeline sink — it runs as an intermediate operator in the
@@ -69,6 +104,16 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Override to pull sample bytes before boundary computation, then one batch at a time
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  //! Distributed: the boundary task is still owed, input or not, until it has been claimed.
+  [[nodiscard]] bool all_ports_empty() override;
+  //! Distributed: the boundary task runs with no input, since every rank's all-gather waits for
+  //! it. get_next_task_input_data() has already claimed it (SCHEDULED) when this is asked.
+  [[nodiscard]] bool runs_without_input() const override
+  {
+    return _distributed.has_value() &&
+           _boundary_state.load(std::memory_order_acquire) != BoundaryState::DONE;
+  }
 
   //! Get the computed partition boundaries (P-1 rows, sort key columns only)
   const cudf::table& get_partition_boundaries() const { return *_partition_boundaries; }
@@ -86,6 +131,21 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
  private:
+  //! Distributed mode: shares @p sample_keys (sorted, possibly empty), then sets both sets of
+  //! boundaries from the global sample; this rank keeps up to @p num_parts partitions.
+  void compute_distributed_boundaries(cudf::table_view sample_keys,
+                                      std::size_t sample_bytes,
+                                      std::size_t num_parts,
+                                      std::vector<cudf::order> const& column_order,
+                                      std::vector<cudf::null_order> const& null_precedence,
+                                      ::cuda::stream_ref stream);
+
+  std::optional<distributed_sampling> _distributed;
+  //! Distributed: the all-gather's result, kept for an OOM retry of the boundary task, since the
+  //! peers will not gather on that stream again. Only one boundary task runs at a time.
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _gathered;
+  //! Distributed: this rank has entered the all-gather.
+  bool _gather_entered = false;
   //! Partition boundary rows (P-1 rows containing sort key column values)
   std::unique_ptr<cudf::table> _partition_boundaries;
 
