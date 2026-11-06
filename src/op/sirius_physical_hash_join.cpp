@@ -1521,6 +1521,7 @@ static cudf::column_view as_gather_map(rmm::device_uvector<cudf::size_type> cons
   return cudf::column_view(
     cudf::data_type(cudf::type_id::INT32), indices.size(), indices.data(), nullptr, 0, 0, {});
 }
+
 // Core of gather_join_output over cuDF gather maps; a null map means that side is not gathered.
 static std::unique_ptr<cudf::table> gather_join_table_from_maps(
   duckdb::JoinType join_type,
