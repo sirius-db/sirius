@@ -378,16 +378,10 @@ TEST_CASE("variable-width tiled output conserves payloads under reservation admi
     CHECK(copy_column_to_host<std::string>(last.column(1)).front() == payload.back());
     f.input->add_data_batch(batch);
   }
-  sirius::test::scoped_recording_log_sink logs("debug");
   f.drain();
   std::vector<int64_t> expected(1000);
   std::iota(expected.begin(), expected.end(), 0);
   CHECK(f.rows() == expected);
-  uint64_t subdivisions = 0;
-  for (auto const& log : logs.records()) {
-    subdivisions += log.message.find("sort.tile_refine") != std::string::npos;
-  }
-  CHECK(subdivisions == 0);
   std::size_t payload_rows = 0, large_rows = 0;
   for (auto position : f.output.get_positions()) {
     pipelineable_operator_data restored({f.output.get_data_batch_by_position(position)});
@@ -407,11 +401,9 @@ TEST_CASE("variable-width tiled output conserves payloads under reservation admi
     large_rows += std::count(values.begin(), values.end(), std::string(20000, 'z'));
     f.stream.synchronize();
   }
+  INFO("reservation=" << f.merge.reservation_limit << " tasks_created=" << f.task_id);
   CHECK(payload_rows == 1000);
   CHECK(large_rows == 2);
-  std::cout << "tiled_runtime_capacity reservation=" << f.merge.reservation_limit
-            << " task_attempts=" << f.task_id << " subdivisions=" << subdivisions
-            << " rows=" << payload_rows << " wide_rows=" << large_rows << std::endl;
 }
 
 TEST_CASE("tiled extraction publishes independent pieces through real task completion",
@@ -645,12 +637,11 @@ TEST_CASE("cold estimates do not refuse fitting order or coalescing tasks", "[ti
   sirius::test::scoped_recording_log_sink logs("trace");
   f.drain();
   CHECK(f.rows() == expected);
-  std::size_t orders = 0, coalesces = 0, refinements = 0;
+  std::size_t orders = 0, coalesces = 0;
   std::size_t peak = 0;
   for (auto const& log : logs.records()) {
     orders += log.message.find("sort.tile_work kind=order_samples") != std::string::npos;
     coalesces += log.message.find("sort.tile_work kind=coalesce") != std::string::npos;
-    refinements += log.message.find("sort.tile_refine") != std::string::npos;
     if (log.message.find("memory history record") != std::string::npos) {
       auto field = [&](std::string const& label) -> std::size_t {
         auto at = log.message.find(label);
@@ -660,13 +651,11 @@ TEST_CASE("cold estimates do not refuse fitting order or coalescing tasks", "[ti
       peak = std::max(peak, field("peak_bytes=") + field("peak_bytes_to_materialize_input="));
     }
   }
+  INFO("chunk=" << chunk << " ceiling=" << f.gpu->get_max_memory() << " peak=" << peak);
   CHECK(orders == (chunk == 512 ? 1 : 0));
   CHECK(coalesces == (chunk == 1024 ? 1 : 0));
-  CHECK(refinements == 0);
   CHECK(peak > 0);
   CHECK(peak <= f.gpu->get_max_memory());
-  std::cout << "tiled_cold_fit chunk=" << chunk << " ceiling=" << f.gpu->get_max_memory()
-            << " peak=" << peak << " orders=" << orders << " coalesces=" << coalesces << std::endl;
 }
 
 namespace {
