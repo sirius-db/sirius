@@ -79,6 +79,7 @@ class sirius_engine;
 }  // namespace sirius
 
 namespace sirius::exchange {
+class distributed_session;
 class exchange_service;
 }  // namespace sirius::exchange
 
@@ -829,6 +830,14 @@ class SiriusContext : public ClientContextState {
   void set_exchange_service_for_testing(
     std::shared_ptr<sirius::exchange::exchange_service> service);
 
+  /// \brief This process's distributed session, or null until its first distributed use (a
+  /// distributed plan, or SET sirius_exchange_rank with the peers set). Once set, it stays until
+  /// this context is destroyed.
+  [[nodiscard]] sirius::exchange::distributed_session* distributed() const noexcept
+  {
+    return distributed_.load(std::memory_order_acquire);
+  }
+
   /// \brief @p context's open execution window runs distributed query @p query, which an earlier
   /// statement planned (a prepared statement's validated plan). No-op for 0 or without a window.
   void adopt_distributed_query(ClientContext& context, uint64_t query);
@@ -1056,18 +1065,15 @@ class SiriusContext : public ClientContextState {
   std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
     semantic_decline_counts_{};
 
-  // terminate() shuts the service down before the memory manager: its transport uses its spaces.
-  std::mutex exchange_mutex_;
-  std::vector<std::string> exchange_peers_;
-  uint32_t exchange_rank_{0};
-  sirius::exchange::host_staging exchange_host_staging_{};
-  std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
-  uint64_t distributed_queries_{0};
-  /// The connection that runs this process's distributed queries.
-  std::optional<connection_t> distributed_connection_;
-  /// Each open execution window's distributed query. A window may retire while another
-  /// connection's window runs, so it names its own.
-  std::unordered_map<uint64_t, uint64_t> distributed_by_window_;
+  /// distributed(), created on first use.
+  sirius::exchange::distributed_session& distributed_session_for_use();
+  std::mutex distributed_create_mutex_;
+  /// The session behind distributed(). It stays until this context is destroyed, so after the
+  /// first distributed use each execution window takes the session's lock twice: when its query
+  /// work retires and when the window ends. terminate() shuts its exchange down before the memory
+  /// manager: its transport uses the memory spaces.
+  std::unique_ptr<sirius::exchange::distributed_session> distributed_owner_;
+  std::atomic<sirius::exchange::distributed_session*> distributed_{nullptr};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
