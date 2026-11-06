@@ -2,6 +2,10 @@
 #include "c_api/error_internal.hpp"
 #include "c_api/plan_internal.hpp"
 
+#include <absl/strings/ascii.h>
+#include <absl/strings/escaping.h>
+#include <utf8proc.h>
+
 #include <algorithm>
 #include <array>
 #include <set>
@@ -45,64 +49,27 @@ std::string bytes(const char* data, size_t size)
 }
 bool has_uri_scheme(std::string_view path)
 {
-  auto alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
   auto colon = path.find(':');
-  if (colon == std::string_view::npos || colon == 0 || !alpha(path.front())) { return false; }
-  return std::all_of(path.begin() + 1, path.begin() + colon, [&](char c) {
-    return alpha(c) || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.';
-  });
+  if (colon == std::string_view::npos || colon == 0 || !absl::ascii_isalpha(path.front())) {
+    return false;
+  }
+  return path.substr(0, colon).find_first_not_of(
+           "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-") ==
+         std::string_view::npos;
 }
-bool utf8(std::string_view text)
+bool is_valid_utf8(std::string_view text)
 {
-  for (size_t i = 0; i < text.size();) {
-    auto first = static_cast<unsigned char>(text[i++]);
-    if (first < 0x80) { continue; }
-    unsigned count   = 0;
-    uint32_t code    = 0;
-    uint32_t minimum = 0;
-    if (first >= 0xc2 && first <= 0xdf) {
-      count   = 1;
-      code    = first & 0x1f;
-      minimum = 0x80;
-    } else if (first >= 0xe0 && first <= 0xef) {
-      count   = 2;
-      code    = first & 0x0f;
-      minimum = 0x800;
-    } else if (first >= 0xf0 && first <= 0xf4) {
-      count   = 3;
-      code    = first & 0x07;
-      minimum = 0x10000;
-    } else {
-      return false;
-    }
-    if (count > text.size() - i) { return false; }
-    for (unsigned j = 0; j < count; ++j) {
-      auto next = static_cast<unsigned char>(text[i++]);
-      if ((next & 0xc0) != 0x80) { return false; }
-      code = (code << 6) | (next & 0x3f);
-    }
-    if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) { return false; }
+  while (!text.empty()) {
+    utf8proc_int32_t codepoint;
+    auto length = utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t*>(text.data()),
+                                   std::min<size_t>(text.size(), 4),
+                                   &codepoint);
+    if (length < 0) { return false; }
+    text.remove_prefix(static_cast<size_t>(length));
   }
   return true;
 }
-std::string quoted(std::string_view value)
-{
-  constexpr char hex[] = "0123456789abcdef";
-  std::string result   = "\"";
-  for (unsigned char c : value) {
-    if (c == '"' || c == '\\') {
-      result += '\\';
-      result += static_cast<char>(c);
-    } else if (c < 0x20 || c >= 0x7f) {
-      result += "\\x";
-      result += hex[c >> 4];
-      result += hex[c & 15];
-    } else {
-      result += static_cast<char>(c);
-    }
-  }
-  return result + '"';
-}
+std::string quoted(std::string_view value) { return "\"" + absl::CHexEscape(value) + "\""; }
 // Print shared expression nodes once; expanding a shared DAG can grow exponentially.
 std::string expression_text(const sirius_expression& expression,
                             std::unordered_map<const sirius_expression*, size_t>& ids,
@@ -169,7 +136,7 @@ sirius_status sirius_schema_create(const sirius_field* fields,
     std::set<std::string> names;
     for (size_t i = 0; i < count; ++i) {
       auto name = bytes(fields[i].name, fields[i].name_size);
-      require(utf8(name), "Field name is not UTF-8");
+      require(is_valid_utf8(name), "Field name is not UTF-8");
       require(names.insert(name).second, "Duplicate field name");
       require(fields[i].type == SIRIUS_TYPE_BOOLEAN || fields[i].type == SIRIUS_TYPE_INT64,
               "Unsupported field type");

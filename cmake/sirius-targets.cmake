@@ -56,6 +56,8 @@ set(SIRIUS_LINK_LIBRARIES
     ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable
+    absl::strings
+    utf8proc::utf8proc
     kvikio::kvikio)
 if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)

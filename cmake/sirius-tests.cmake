@@ -554,14 +554,15 @@ set_target_properties(
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
-# Construction uses only the C++ standard library; exercise the production
-# sources on CPU CI.
+# Construction uses only host-side libraries; exercise the production sources on
+# CPU CI.
 find_package(Threads REQUIRED)
 add_executable(sirius_plan_unittest test/cpp/plan/test_c_api_plan.cpp
                                     src/c_api/plan.cpp src/c_api/error.cpp)
 target_include_directories(sirius_plan_unittest PRIVATE include src)
-target_link_libraries(sirius_plan_unittest PRIVATE Catch2::Catch2WithMain
-                                                   Threads::Threads)
+target_link_libraries(
+  sirius_plan_unittest PRIVATE Catch2::Catch2WithMain Threads::Threads
+                               absl::strings utf8proc::utf8proc)
 set_target_properties(
   sirius_plan_unittest
   PROPERTIES CXX_STANDARD 20

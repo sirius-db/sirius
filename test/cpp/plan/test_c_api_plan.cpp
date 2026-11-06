@@ -125,6 +125,38 @@ TEST_CASE("C plan construction owns schemas and paths without opening sources", 
   CHECK(std::string(observed.name, observed.name_size) == "id");
 }
 
+TEST_CASE("Plan descriptions escape literal path bytes", "[public_plan]")
+{
+  auto fields            = schema();
+  const std::string path = "./quote\"\\line\n\t\xff";
+  sirius_plan_node* raw  = nullptr;
+  REQUIRE(sirius_plan_scan_parquet(path.data(), path.size(), fields.get(), &raw, nullptr) ==
+          SIRIUS_SUCCESS);
+  node_handle source(raw, sirius_plan_node_release);
+  auto result = plan(source.get());
+  CHECK(std::string(sirius_plan_describe(result.get()))
+          .find(R"(ParquetScan(path="./quote\"\\line\n\t\xff"))") != std::string::npos);
+}
+
+TEST_CASE("Plan descriptions escape UTF-8 names and adjacent hexadecimal digits", "[public_plan]")
+{
+  const sirius_field field{"\xc3\xa9", 2, SIRIUS_TYPE_INT64, 0};
+  sirius_schema* raw_schema = nullptr;
+  REQUIRE(sirius_schema_create(&field, 1, &raw_schema, nullptr) == SIRIUS_SUCCESS);
+  schema_handle fields(raw_schema, sirius_schema_release);
+  const std::string path =
+    "./\xff"
+    "a";
+  sirius_plan_node* raw = nullptr;
+  REQUIRE(sirius_plan_scan_parquet(path.data(), path.size(), fields.get(), &raw, nullptr) ==
+          SIRIUS_SUCCESS);
+  node_handle source(raw, sirius_plan_node_release);
+  auto result                   = plan(source.get());
+  const std::string description = sirius_plan_describe(result.get());
+  CHECK(description.find(R"(path="./\xff\x61")") != std::string::npos);
+  CHECK(description.find(R"(Output: "\xc3\xa9": Int64)") != std::string::npos);
+}
+
 TEST_CASE("C expressions enforce types and exact input scopes", "[public_plan]")
 {
   auto fields            = schema();
@@ -181,14 +213,16 @@ TEST_CASE("C expressions enforce types and exact input scopes", "[public_plan]")
 
 TEST_CASE("C schemas reject malformed names and field descriptors", "[public_plan]")
 {
-  const std::array<std::string, 8> invalid_names{"",
-                                                 std::string("a\0b", 3),
-                                                 "\xff",
-                                                 "\xc0\xaf",
-                                                 "\xed\xa0\x80",
-                                                 "\xf4\x90\x80\x80",
-                                                 "\xe2\x82",
-                                                 "\x80"};
+  const std::array<std::string, 10> invalid_names{"",
+                                                  std::string("a\0b", 3),
+                                                  "\xff",
+                                                  "\xc0\xaf",
+                                                  "\xe0\x80\xaf",
+                                                  "\xf0\x80\x80\xaf",
+                                                  "\xed\xa0\x80",
+                                                  "\xf4\x90\x80\x80",
+                                                  "\xe2\x82",
+                                                  "\x80"};
   for (const auto& name : invalid_names) {
     sirius_field field{name.data(), name.size(), SIRIUS_TYPE_INT64, 0};
     sirius_schema* out = nullptr;
@@ -230,13 +264,17 @@ TEST_CASE("C plan failures clear outputs and provide optional diagnostics", "[pu
   REQUIRE(error != nullptr);
   CHECK(sirius_error_message_size(error) != 0);
   sirius_error_destroy(error);
-  for (const std::string path :
-       {"", "s3://bucket/file", "file:/tmp/data.parquet", "file:data.parquet", "s3:bucket/file"}) {
+  for (const std::string path : {"",
+                                 "s3://bucket/file",
+                                 "file:/tmp/data.parquet",
+                                 "file:data.parquet",
+                                 "s3:bucket/file",
+                                 "a+b.c-d:x"}) {
     CHECK(sirius_plan_scan_parquet(path.data(), path.size(), fields.get(), &invalid, nullptr) ==
           SIRIUS_INVALID_ARGUMENT);
   }
   for (const std::string path :
-       {"./name:part", "*.parquet", "a?.parquet", "a[b].parquet", "a].parquet"}) {
+       {"./name:part", "1a:x.parquet", "*.parquet", "a?.parquet", "a[b].parquet", "a].parquet"}) {
     sirius_plan_node* local = nullptr;
     REQUIRE(sirius_plan_scan_parquet(path.data(), path.size(), fields.get(), &local, nullptr) ==
             SIRIUS_SUCCESS);
