@@ -1075,6 +1075,38 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a NOT EXISTS subquery under a delim CTE plans as an ANTI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // A NOT EXISTS predicate (null-safe keys) inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE NOT EXISTS (SELECT 1 FROM parts q WHERE q.pk = i.fk "
+    "  AND q.pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  bool has_anti = false;
+  for (auto* node : joins) {
+    auto const type = node->Cast<sirius::op::sirius_physical_hash_join>().join_type;
+    CHECK(type != duckdb::JoinType::MARK);
+    has_anti = has_anti || type == duckdb::JoinType::ANTI || type == duckdb::JoinType::RIGHT_ANTI;
+  }
+  CHECK(has_anti);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - MARK joins DuckDB keeps are not converted under a delim CTE",
                  "[plan_tree_shape][isolated_context][mark_conversion]")
 {
