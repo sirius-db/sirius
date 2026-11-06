@@ -94,7 +94,7 @@ std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type,
   if (join_type == duckdb::JoinType::MARK) {
     f->logical_join->types.push_back(LogicalType::BOOLEAN);
   }
-  if (join_type == duckdb::JoinType::INNER) {
+  if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT) {
     f->logical_join->types.push_back(LogicalType::INTEGER);
   }
   auto probe_child =
@@ -399,6 +399,16 @@ TEST_CASE("chunked BUILD_PROBE INNER join joins every chunk's build rows", "[bui
         std::vector<int32_t>{20, 40, 40});
   CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(2))) ==
         std::vector<int32_t>{2, 4, 4});
+}
+
+TEST_CASE("a BUILD_PROBE LEFT join rejects a build split into chunks", "[build_probe]")
+{
+  // LEFT cannot combine per-chunk results: a probe row unmatched in one chunk may match another.
+  auto f     = make_chunked_join(duckdb::JoinType::LEFT);
+  auto input = deliver_chunked(
+    *f, {int_batch({2}), int_batch({4})}, probe_batch(int_batch({2, 4, 7}), {20, 40, 70}));
+  CHECK_THROWS_WITH(f->join->execute(*input, cudf::get_default_stream()),
+                    Catch::Matchers::ContainsSubstring("cannot combine a build split"));
 }
 
 TEST_CASE("a chunked BUILD_PROBE build that fails on a later chunk frees the chunks it built",
