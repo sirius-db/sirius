@@ -18,6 +18,7 @@
 #include "op/order/bounded_sort.hpp"
 #include "op/order/gpu_sampled_merge.hpp"
 #include "op/order/sampled_merge.hpp"
+#include "op/order/tiled_merge_work_queue.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -107,7 +108,10 @@ struct sirius_physical_merge_sort::tiled_state {
   struct region {
     phase stage{phase::NORMALIZE};
     std::vector<ref> inputs;
-    std::vector<std::shared_ptr<work>> items;
+    tiled_merge_work_queue<work> work_items;
+    std::weak_ptr<region> parent;
+    std::size_t unfinished_children{0};
+    bool enqueued{false};
     std::vector<std::vector<std::pair<uint64_t, ref>>> normalized;
     std::vector<std::shared_ptr<group>> groups;
     std::vector<std::optional<ref>> samples;
@@ -154,8 +158,9 @@ struct sirius_physical_merge_sort::tiled_state {
   };
 
   std::vector<std::shared_ptr<region>> roots;
-  std::vector<std::shared_ptr<region>> regions;
-  std::vector<std::shared_ptr<work>> finals;
+  std::deque<std::shared_ptr<region>> ready_regions;
+  tiled_merge_work_queue<work> finals;
+  std::size_t unfinished_roots{0};
   bool publishing{false}, finished{false};
   std::vector<std::size_t> partitions = std::vector<std::size_t>(STORAGE_COUNT, 0);
 
@@ -168,37 +173,36 @@ struct sirius_physical_merge_sort::tiled_state {
     if (next > repo->num_partitions()) { repo->set_num_partitions(next); }
     return {repo, index, 0};
   }
-  static bool complete(region const& r)
+  static bool complete(region const& r) { return r.work_items.complete_stage(); }
+  static bool actionable(region const& r)
   {
-    return std::all_of(
-      r.items.begin(), r.items.end(), [](auto const& w) { return w->state == status::COMPLETE; });
+    return r.stage != phase::DONE &&
+           (!r.work_items.pending.empty() || (complete(r) && !r.unfinished_children));
   }
-  static bool ready(region const& r)
+  void enqueue(std::shared_ptr<region> const& r)
   {
-    if (r.stage == phase::DONE) { return false; }
-    if (r.stage == phase::MERGING && complete(r)) {
-      return std::all_of(r.tiles.begin(), r.tiles.end(), [](auto const& t) {
-        return !t.rows || t.result || (t.child && t.child->stage == phase::DONE);
-      });
+    if (!r->enqueued && actionable(*r)) {
+      ready_regions.push_back(r);
+      r->enqueued = true;
     }
-    return complete(r) || std::any_of(r.items.begin(), r.items.end(), [](auto const& w) {
-             return w->state == status::PENDING;
-           });
-  }
-  bool roots_complete() const
-  {
-    return std::all_of(
-      roots.begin(), roots.end(), [](auto const& r) { return r->stage == phase::DONE; });
   }
   bool ready() const
   {
-    if (finished) { return false; }
-    if (roots_complete()) {
-      return !publishing || std::any_of(finals.begin(), finals.end(), [](auto const& w) {
-        return w->state == status::PENDING;
-      });
+    return !finished && (!ready_regions.empty() || (!unfinished_roots && !publishing) ||
+                         !finals.pending.empty());
+  }
+  void finish(std::shared_ptr<region> const& r)
+  {
+    if (r->stage == phase::DONE) { throw internal_exception("Sort region completed twice"); }
+    r->stage = phase::DONE;
+    if (auto parent = r->parent.lock()) {
+      if (!parent->unfinished_children) { throw internal_exception("Sort child count underflow"); }
+      --parent->unfinished_children;
+      enqueue(parent);
+    } else {
+      if (!unfinished_roots) { throw internal_exception("Sort root count underflow"); }
+      --unfinished_roots;
     }
-    return std::any_of(regions.begin(), regions.end(), [](auto const& r) { return ready(*r); });
   }
   static void retire(region const& r, ref const& input)
   {
@@ -226,9 +230,11 @@ struct sirius_physical_merge_sort::tiled_state {
       child->inputs.push_back(piece.batch);
     }
     child->retained_parent_sources = child->inputs;
-    tile.child                     = child;
+    child->parent                  = parent;
+    enqueue(child);
+    ++parent->unfinished_children;
+    tile.child = child;
     tile.pieces.clear();
-    regions.push_back(child);
     SIRIUS_LOG_DEBUG("sort.tile_refine rows={}, child_R={}", tile.rows, child->requested_row_limit);
   }
   void flatten_results(std::shared_ptr<region> const& r, uint64_t& position)
@@ -245,7 +251,7 @@ struct sirius_physical_merge_sort::tiled_state {
       item->sources              = {*tile.result};
       item->destination.position = position;
       position                   = sm::checked_add(position, 1);
-      finals.push_back(item);
+      finals.add(item);
     }
   }
   std::shared_ptr<work> add(std::shared_ptr<region> const& r, kind type, std::vector<ref> sources)
@@ -254,7 +260,8 @@ struct sirius_physical_merge_sort::tiled_state {
     item->type    = type;
     item->owner   = r;
     item->sources = std::move(sources);
-    r->items.push_back(item);
+    r->work_items.add(item);
+    enqueue(r);
     return item;
   }
   void coalesce(sirius_physical_merge_sort& op,
@@ -318,7 +325,6 @@ struct sirius_physical_merge_sort::tiled_state {
           r->inputs = std::move(next);
           r->normalized.clear();
         }
-        r->items.clear();
         r->normalized.resize(r->inputs.size());
         for (std::size_t i = 0; i < r->inputs.size(); ++i) {
           auto const& input = r->inputs[i];
@@ -332,7 +338,7 @@ struct sirius_physical_merge_sort::tiled_state {
             item->destination = allocate(op, INPUTS);
           }
         }
-        if (!r->items.empty()) { return; }
+        if (!r->work_items.pending.empty()) { return; }
         r->normalized.clear();
         r->stage             = phase::COALESCE;
         r->coalescing_inputs = r->inputs.size();
@@ -352,14 +358,13 @@ struct sirius_physical_merge_sort::tiled_state {
           flatten(*g, r->inputs);
         }
         r->groups.clear();
-        r->items.clear();
         uint64_t rows = 0, bytes = 0;
         for (auto const& input : r->inputs) {
           rows  = sm::checked_add(rows, input.rows);
           bytes = sm::checked_add(bytes, input.bytes);
         }
         if (!rows) {
-          r->stage = phase::DONE;
+          finish(r);
           return;
         }
         auto average = bytes ? 1 + (bytes - 1) / rows : uint64_t{1};
@@ -393,7 +398,6 @@ struct sirius_physical_merge_sort::tiled_state {
           item->destination = {op._tile_storage[SAMPLES], r->sample_partition, i};
         }
       } else if (r->stage == phase::SAMPLE) {
-        r->items.clear();
         std::vector<ref> samples;
         uint64_t rows = 0;
         for (auto const& input : r->samples) {
@@ -409,7 +413,6 @@ struct sirius_physical_merge_sort::tiled_state {
         r->splitter_partition = item->destination.partition;
         r->stage              = phase::ORDER;
       } else if (r->stage == phase::ORDER) {
-        r->items.clear();
         for (uint64_t t = 0; t <= r->splitter_count; ++t) {
           auto location = allocate(op, PIECES);
           r->tiles.push_back({location.partition, r->inputs.size(), {}, 0});
@@ -461,7 +464,6 @@ struct sirius_physical_merge_sort::tiled_state {
         }
         r->pages.clear();
         r->inputs.clear();
-        r->items.clear();
         for (auto const& parent : r->retained_parent_sources) {
           parent.retire();
         }
@@ -469,7 +471,6 @@ struct sirius_physical_merge_sort::tiled_state {
         r->stage = phase::TILES;
         return;
       } else if (r->stage == phase::TILES) {
-        r->items.clear();
         for (std::size_t t = 0; t < r->tiles.size(); ++t) {
           auto& tile = r->tiles[t];
           if (!tile.rows) { continue; }
@@ -483,12 +484,8 @@ struct sirius_physical_merge_sort::tiled_state {
         }
         r->stage = phase::MERGING;
       } else if (r->stage == phase::MERGING) {
-        if (!std::all_of(r->tiles.begin(), r->tiles.end(), [](auto const& tile) {
-              return !tile.rows || tile.result || (tile.child && tile.child->stage == phase::DONE);
-            })) {
-          return;
-        }
-        r->stage = phase::DONE;
+        if (r->unfinished_children) { return; }
+        finish(r);
         return;
       }
     }
@@ -566,7 +563,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
         }
       }
       _tiled_state->roots.push_back(r);
-      _tiled_state->regions.push_back(r);
+      ++_tiled_state->unfinished_roots;
+      _tiled_state->enqueue(r);
     }
     SIRIUS_LOG_DEBUG("sort.tile_ranges ranges={}, nonempty_ranges={}",
                      _tiled_state->roots.size(),
@@ -574,45 +572,42 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
                                    _tiled_state->roots.end(),
                                    [](auto const& r) { return !r->inputs.empty(); }));
   }
-  for (;;) {
-    for (std::size_t i = 0; i < _tiled_state->regions.size(); ++i) {
-      auto r = _tiled_state->regions[i];
-      _tiled_state->advance(*this, r);
-      for (auto const& item : r->items) {
-        if (item->state != tiled_state::status::PENDING) { continue; }
-        std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-        for (auto const& input : item->sources) {
-          batches.push_back(input.get());
-        }
-        auto data   = std::make_unique<tiled_state::task_data>(std::move(batches), item);
-        item->state = tiled_state::status::CLAIMED;
-        return data;
+  while (!_tiled_state->ready_regions.empty()) {
+    auto r = std::move(_tiled_state->ready_regions.front());
+    _tiled_state->ready_regions.pop_front();
+    r->enqueued = false;
+    _tiled_state->advance(*this, r);
+    if (auto item = r->work_items.claim()) {
+      std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+      for (auto const& input : item->sources) {
+        batches.push_back(input.get());
       }
+      auto data   = std::make_unique<tiled_state::task_data>(std::move(batches), item);
+      item->state = tiled_state::status::CLAIMED;
+      _tiled_state->enqueue(r);
+      return data;
     }
-    if (_tiled_state->roots_complete()) {
-      if (!_tiled_state->publishing) {
-        uint64_t position = 0;
-        for (auto const& root : _tiled_state->roots) {
-          _tiled_state->flatten_results(root, position);
-        }
-        _tiled_state->publishing = true;
-        if (_tiled_state->finals.empty()) { _tiled_state->finished = true; }
-      }
-      for (auto const& item : _tiled_state->finals) {
-        if (item->state != tiled_state::status::PENDING) { continue; }
-        auto task = std::make_unique<tiled_state::task_data>(
-          std::vector<std::shared_ptr<cucascade::data_batch>>{item->sources.front().get()},
-          item,
-          item->destination.position);
-        item->state = tiled_state::status::CLAIMED;
-        return task;
-      }
-    }
-    // Returning no task parks the creator until a device task completes. Consume
-    // ready host-only transitions here, so a TILES transition or completed child
-    // cannot leave pending work with no task capable of waking the creator.
-    if (!_tiled_state->ready()) { return nullptr; }
+    _tiled_state->enqueue(r);
   }
+  if (!_tiled_state->unfinished_roots) {
+    if (!_tiled_state->publishing) {
+      uint64_t position = 0;
+      for (auto const& root : _tiled_state->roots) {
+        _tiled_state->flatten_results(root, position);
+      }
+      _tiled_state->publishing = true;
+      if (_tiled_state->finals.complete_stage()) { _tiled_state->finished = true; }
+    }
+    if (auto item = _tiled_state->finals.claim()) {
+      auto task = std::make_unique<tiled_state::task_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>{item->sources.front().get()},
+        item,
+        item->destination.position);
+      item->state = tiled_state::status::CLAIMED;
+      return task;
+    }
+  }
+  return nullptr;
 }
 
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data const& input_data,
@@ -936,12 +931,14 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
     }
   }
   item.state = state::status::COMPLETE;
+  if (item.type != state::kind::PUBLISH) {
+    r->work_items.complete();
+    _tiled_state->enqueue(r);
+  }
   if (item.type == state::kind::PUBLISH) {
     item.sources.front().retire();
-    _tiled_state->finished =
-      std::all_of(_tiled_state->finals.begin(), _tiled_state->finals.end(), [](auto const& final) {
-        return final->state == state::status::COMPLETE;
-      });
+    _tiled_state->finals.complete();
+    _tiled_state->finished = _tiled_state->finals.complete_stage();
   }
 }
 
