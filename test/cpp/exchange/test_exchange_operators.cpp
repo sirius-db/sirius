@@ -272,15 +272,16 @@ TEST_CASE("range exchange sends each row to the rank whose range holds it", "[ex
   auto sources         = exchange_all(c, 2, spec, 2, false, false);
   std::vector<std::int64_t> const lo{0, 1'500'000, 2'000'100};
   std::vector<std::int64_t> const hi{1'500'000, 2'000'100, 3'000'000};
-  std::size_t total = 0;
+  std::vector<std::int64_t> all;
   for (rank_t r = 0; r < c.world(); ++r) {
     auto got = flat(drain(*sources[r]));
-    total += got.size();
     for (auto const k : got) {
       CHECK((k >= lo[r] && k < hi[r]));
     }
+    all.insert(all.end(), got.begin(), got.end());
   }
-  CHECK(total == all_keys(3, 2).size());
+  std::sort(all.begin(), all.end());
+  CHECK(all == all_keys(3, 2));
 }
 
 TEST_CASE("broadcast exchange sends every row to every rank", "[exchange][operators]")
