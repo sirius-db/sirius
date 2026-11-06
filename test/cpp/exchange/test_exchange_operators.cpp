@@ -416,7 +416,7 @@ TEST_CASE("a stream that brings nothing hands on one empty batch, unless nothing
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
-  CHECK(source.get_next_task_hint()->hint == sirius::op::TaskCreationHint::READY);
+  CHECK(source.get_next_task_hint().value().hint == sirius::op::TaskCreationHint::READY);
   auto data = source.get_next_task_input_data();
   REQUIRE(data != nullptr);
   auto const& batches = dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches();
@@ -512,16 +512,18 @@ TEST_CASE("an aborted query fails its streams on every rank, and only its stream
   sirius_physical_exchange_source unrelated(
     key_value_types(), 0, c.all[1].service, other, {0, 1}, false);
 
-  c.all[0].service->abort(5, "injected failure");
+  c.all[0].service->abort(sirius::exchange::query_of(aborted), "injected failure");
 
   CHECK_THROWS(here.get_next_task_input_data());
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-  while (there.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+  while (there.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY) {
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   CHECK_THROWS(there.get_next_task_input_data());
-  CHECK(unrelated.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY);
+  auto const untouched = unrelated.get_next_task_hint();
+  REQUIRE(untouched.has_value());
+  CHECK(untouched->hint == sirius::op::TaskCreationHint::WAITING_FOR_INPUT_DATA);
 
   // A stream of the query attached after the abort fails at once.
   sirius_physical_exchange_source late(
@@ -548,7 +550,7 @@ TEST_CASE("a receiver that throws aborts its query on every rank, and the next q
     key_value_types(), 0, c.all[0].service, failing + 1, {0, 1}, false);
   c.all[0].service->send(failing, 1, key_value_batch(0, 0));
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-  while (here.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+  while (here.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY) {
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
@@ -570,7 +572,7 @@ TEST_CASE("a failed exchange fails the next task of its sources", "[exchange][op
   sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[0].service, 8, spec);
   sink_batch(sink, key_value_batch(0, 0));
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-  while (source.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+  while (source.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY) {
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
@@ -587,14 +589,17 @@ TEST_CASE("a failed exchange tells a later query to restart every rank", "[excha
   sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[0].service, 8, spec);
   sink_batch(sink, key_value_batch(0, 0));
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-  while (failed.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+  while (failed.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY) {
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
-  sirius_physical_exchange_source later(key_value_types(), 0, c.all[1].service, 9, {0, 1}, false);
+  // Streams 8 and the failed one are query 0; fail-stop must also refuse another query.
+  stream_id const next_query = sirius::exchange::make_stream_id(1, 1);
+  sirius_physical_exchange_source later(
+    key_value_types(), 0, c.all[1].service, next_query, {0, 1}, false);
   CHECK_THROWS_WITH(later.get_next_task_input_data(),
                     Catch::Matchers::ContainsSubstring("restart every rank"));
-  CHECK_THROWS_WITH(c.all[0].service->send(9, 1, key_value_batch(0, 1)),
+  CHECK_THROWS_WITH(c.all[0].service->send(next_query, 1, key_value_batch(0, 1)),
                     Catch::Matchers::ContainsSubstring("restart every rank"));
 }
 
@@ -620,7 +625,7 @@ TEST_CASE("a retired query's late arrivals are dropped, a later query's still ke
   CHECK(flat(drain(kept)).size() == rows_per_batch);
   sirius_physical_exchange_source fresh(
     key_value_types(), 0, c.all[1].service, retired, {0}, false);
-  CHECK(fresh.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY);
+  CHECK(fresh.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY);
   CHECK_FALSE(fresh.all_ports_empty());
 }
 
@@ -645,7 +650,7 @@ TEST_CASE("a stream detached before its peer sends drops what arrives for it",
   CHECK(flat(drain(kept)).size() == rows_per_batch);
   sirius_physical_exchange_source fresh(
     key_value_types(), 0, c.all[1].service, detached, {0}, false);
-  CHECK(fresh.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY);
+  CHECK(fresh.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY);
   CHECK_FALSE(fresh.all_ports_empty());
 }
 
@@ -680,9 +685,9 @@ TEST_CASE("a rank stops sending for a query a peer aborted, and still closes its
   stream_id const stream = sirius::exchange::make_stream_id(5, 1);
   sirius_physical_exchange_source there(
     key_value_types(), 0, c.all[1].service, stream, {0, 1}, false);
-  c.all[0].service->abort(5, "injected failure");
+  c.all[0].service->abort(sirius::exchange::query_of(stream), "injected failure");
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-  while (there.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+  while (there.get_next_task_hint().value().hint != sirius::op::TaskCreationHint::READY) {
     REQUIRE(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
