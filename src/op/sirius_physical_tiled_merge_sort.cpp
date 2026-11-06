@@ -28,6 +28,7 @@
 #include <chrono>
 #include <format>
 #include <numeric>
+#include <unordered_set>
 
 namespace sirius::op {
 namespace sm = sampled_merge;
@@ -61,9 +62,24 @@ struct sirius_physical_merge_sort::tiled_state {
     cucascade::shared_data_repository* repo;
     std::size_t partition, position;
   };
+  struct identity {
+    cucascade::shared_data_repository* repo;
+    std::size_t partition;
+    uint64_t id;
+    bool operator==(identity const&) const = default;
+  };
+  struct identity_hash {
+    std::size_t operator()(identity const& key) const noexcept
+    {
+      auto hash = std::hash<cucascade::shared_data_repository*>{}(key.repo);
+      hash ^= std::hash<std::size_t>{}(key.partition) + (hash << 6) + (hash >> 2);
+      return hash ^ (std::hash<uint64_t>{}(key.id) + (hash << 6) + (hash >> 2));
+    }
+  };
   struct ref {
     slot location;
     uint64_t id, rows, bytes;
+    identity key() const { return {location.repo, location.partition, id}; }
     auto get() const
     {
       auto batch = location.repo->get_data_batch_by_id(id, location.partition);
@@ -122,6 +138,8 @@ struct sirius_physical_merge_sort::tiled_state {
     // Refinement retains the unpublished parent's pieces until its transpose
     // commits, even if normalization/coalescing has produced replacements.
     std::vector<ref> retained_parent_sources;
+    std::unordered_set<identity, identity_hash> retained_parent_ids;
+    std::size_t creator_visits{0};
     sm::parameters sampling{};
     uint64_t row_limit{0}, splitter_count{0}, requested_row_limit{0}, coalescing_inputs{0};
     std::size_t sample_partition{0}, splitter_partition{0};
@@ -220,6 +238,9 @@ struct sirius_physical_merge_sort::tiled_state {
   void finish(std::shared_ptr<region> const& r)
   {
     if (r->stage == phase::DONE) { throw internal_exception("Sort region completed twice"); }
+    SIRIUS_LOG_DEBUG("sort.tile_schedule claims={}, region_visits={}",
+                     r->work_items.inspections,
+                     r->creator_visits);
     r->stage = phase::DONE;
     if (auto parent = r->parent.lock()) {
       if (!parent->unfinished_children) { throw internal_exception("Sort child count underflow"); }
@@ -232,15 +253,7 @@ struct sirius_physical_merge_sort::tiled_state {
   }
   static void retire(region const& r, ref const& input)
   {
-    if (std::none_of(r.retained_parent_sources.begin(),
-                     r.retained_parent_sources.end(),
-                     [&](ref const& parent) {
-                       return parent.location.repo == input.location.repo &&
-                              parent.location.partition == input.location.partition &&
-                              parent.id == input.id;
-                     })) {
-      input.retire();
-    }
+    if (!r.retained_parent_ids.contains(input.key())) { input.retire(); }
   }
   void refine(sirius_physical_merge_sort& op,
               std::shared_ptr<region> const& parent,
@@ -248,7 +261,7 @@ struct sirius_physical_merge_sort::tiled_state {
   {
     auto& tile = parent->tiles.at(index);
     if (tile.rows <= 1) {
-      throw invalid_input_exception("An individual sort row cannot fit admission");
+      throw invalid_input_exception("Cannot further refine a one-row sort tile after task failure");
     }
     auto child                 = std::make_shared<region>();
     child->requested_row_limit = std::max(uint64_t{1}, tile.rows / 2);
@@ -256,7 +269,10 @@ struct sirius_physical_merge_sort::tiled_state {
       child->inputs.push_back(piece.batch);
     }
     child->retained_parent_sources = child->inputs;
-    child->parent                  = parent;
+    for (auto const& input : child->inputs) {
+      child->retained_parent_ids.insert(input.key());
+    }
+    child->parent = parent;
     enqueue(child);
     ++parent->unfinished_children;
     tile.child = child;
@@ -494,6 +510,7 @@ struct sirius_physical_merge_sort::tiled_state {
           parent.retire();
         }
         r->retained_parent_sources.clear();
+        r->retained_parent_ids.clear();
         r->stage = phase::TILES;
         return;
       } else if (r->stage == phase::TILES) {
@@ -577,11 +594,6 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
       for (auto id : ids) {
         auto batch = repo->get_data_batch_by_id(id, p);
         auto input = tiled_state::ref::describe({repo, p, 0}, *batch);
-        if (input.bytes > reservation_limit) {
-          throw invalid_input_exception(
-            "Sort contribution cannot be restored under the configured reservation; reduce "
-            "producer chunks");
-        }
         if (input.rows) {
           r->inputs.push_back(input);
         } else {
@@ -602,14 +614,18 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     auto r = std::move(_tiled_state->ready_regions.front());
     _tiled_state->ready_regions.pop_front();
     r->enqueued = false;
+    ++r->creator_visits;
     _tiled_state->advance(*this, r);
-    if (auto item = r->work_items.claim()) {
+    auto data = r->work_items.claim([](auto const& item) {
       std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+      batches.reserve(item->sources.size());
       for (auto const& input : item->sources) {
         batches.push_back(input.get());
       }
-      auto data   = std::make_unique<tiled_state::task_data>(std::move(batches), item);
-      item->state = tiled_state::status::CLAIMED;
+      return std::make_unique<tiled_state::task_data>(std::move(batches), item);
+    });
+    if (data) {
+      data->item->state = tiled_state::status::CLAIMED;
       _tiled_state->enqueue(r);
       return data;
     }
@@ -624,12 +640,14 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
       _tiled_state->publishing = true;
       if (_tiled_state->finals.complete_stage()) { _tiled_state->finished = true; }
     }
-    if (auto item = _tiled_state->finals.claim()) {
-      auto task = std::make_unique<tiled_state::task_data>(
+    auto task = _tiled_state->finals.claim([](auto const& item) {
+      return std::make_unique<tiled_state::task_data>(
         std::vector<std::shared_ptr<cucascade::data_batch>>{item->sources.front().get()},
         item,
         item->destination.position);
-      item->state = tiled_state::status::CLAIMED;
+    });
+    if (task) {
+      task->item->state = tiled_state::status::CLAIMED;
       return task;
     }
   }
@@ -783,7 +801,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     cudaStreamSynchronize(stream.get());
     // Let ordinary retries grow an underestimated reservation first. Once the
     // configured capacity is granted, only subdivision or a normal error remains.
-    if (input.admitted_bytes && input.admitted_bytes < input.attempt_ceiling) { throw; }
+    if (input.admitted_bytes < input.attempt_ceiling) { throw; }
     // No sink has been entered. Smaller disjoint work can be committed by the
     // ordinary success callback; partial sink publication can never reach here.
     switch (item.type) {
@@ -808,11 +826,12 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
         result->action = state::recovery::COPY_SPANS;
         break;
       default:
-        throw invalid_input_exception(
-          state::failure(input,
-                         "compute",
-                         reservation_limit,
-                         "sample or final output capacity envelope exceeded"));
+        throw invalid_input_exception(state::failure(
+          input,
+          "compute",
+          reservation_limit,
+          item.type == state::kind::PUBLISH ? "final projection/output capacity envelope exceeded"
+                                            : "supported sample allocation envelope exceeded"));
     }
     SIRIUS_LOG_DEBUG("sort.tile_recovery kind={}, completed_copies={}, spans={}, action={}",
                      state::name(item.type),
@@ -859,8 +878,14 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::recover_preparation_f
   auto const& item = *data.item;
   using kind       = tiled_state::kind;
   if (item.type != kind::COALESCE && item.type != kind::MERGE) {
+    auto reason = item.type == kind::PUBLISH ? "final-result restoration envelope exceeded"
+                                             : "source/page restoration envelope exceeded";
+    throw invalid_input_exception(
+      tiled_state::failure(data, "preparation", reservation_limit, reason));
+  }
+  if (item.type == kind::MERGE && item.sources.size() == 1) {
     throw invalid_input_exception(tiled_state::failure(
-      data, "preparation", reservation_limit, "source/page restoration envelope exceeded"));
+      data, "preparation", reservation_limit, "individual piece restoration envelope exceeded"));
   }
   auto output = std::make_unique<tiled_state::task_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{}, data.item);

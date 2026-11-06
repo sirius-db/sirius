@@ -234,6 +234,10 @@ TEST_CASE("production bounded ORDER BY exceeds configured GPU capacity", "[.][bo
   uint64_t initial_rows = 0, initial_bytes = 0, peak = 0, restore = 0, spill = 0, merge_tasks = 0;
   uint64_t output_bytes = 0, max_runs = 0;
   double local_ms = 0, merge_ms = 0;
+  uint64_t coalesce_tasks = 0, order_tasks = 0, sample_tasks = 0, extraction_tasks = 0;
+  uint64_t reservation_requests = 0, max_request = 0,
+           min_request      = std::numeric_limits<uint64_t>::max();
+  uint64_t scheduled_claims = 0, creator_visits = 0;
   uint64_t ranges = 0, nonempty_ranges = 0, intermediate_bytes = 0, subdivisions = 0,
            subdivision_copies = 0;
   uint64_t boundary_readbacks = 0, boundary_waits = 0, task_waits = 0, oom_reschedules = 0;
@@ -261,7 +265,21 @@ TEST_CASE("production bounded ORDER BY exceeds configured GPU capacity", "[.][bo
     if (message.starts_with("sort.tiles ")) {
       max_runs = std::max(max_runs, sort_metric(message, "inputs="));
     }
+    if (message.find("Acquiring memory reservation for pipeline") != std::string::npos) {
+      auto request = sort_metric(message, " of ");
+      ++reservation_requests;
+      max_request = std::max(max_request, request);
+      min_request = std::min(min_request, request);
+    }
+    if (message.starts_with("sort.tile_schedule ")) {
+      scheduled_claims += sort_metric(message, "claims=");
+      creator_visits += sort_metric(message, "region_visits=");
+    }
     if (message.starts_with("sort.tile_work ")) {
+      coalesce_tasks += message.find("kind=coalesce,") != std::string::npos;
+      order_tasks += message.find("kind=order_samples,") != std::string::npos;
+      sample_tasks += message.find("kind=sample,") != std::string::npos;
+      extraction_tasks += message.find("kind=extract,") != std::string::npos;
       if (message.find("kind=merge,") != std::string::npos) { ++merge_tasks; }
       if (message.find("kind=normalize,") != std::string::npos) { ++subdivisions; }
       if (message.find("kind=extract,") != std::string::npos ||
@@ -346,8 +364,12 @@ TEST_CASE("production bounded ORDER BY exceeds configured GPU capacity", "[.][bo
             << " subdivisions=" << subdivisions << " subdivision_copies=" << subdivision_copies
             << " boundary_readbacks=" << boundary_readbacks << " boundary_waits=" << boundary_waits
             << " task_waits=" << task_waits << " oom_reschedules=" << oom_reschedules
-            << " local_ms=" << local_ms << " merge_ms=" << merge_ms << " elapsed_s=" << elapsed
-            << std::endl;
+            << " coalesce_tasks=" << coalesce_tasks << " order_tasks=" << order_tasks
+            << " sample_tasks=" << sample_tasks << " extraction_tasks=" << extraction_tasks
+            << " reservation_requests=" << reservation_requests << " min_request=" << min_request
+            << " max_request=" << max_request << " scheduled_claims=" << scheduled_claims
+            << " creator_visits=" << creator_visits << " local_ms=" << local_ms
+            << " merge_ms=" << merge_ms << " elapsed_s=" << elapsed << std::endl;
 }
 
 namespace {

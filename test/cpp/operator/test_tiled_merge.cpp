@@ -293,14 +293,19 @@ TEST_CASE("preparation subdivision commits only through ordinary publication", "
   CHECK(f.rows() == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }
 
-TEST_CASE("an unrestorable sort row fails before claiming work", "[tiled_merge]")
+TEST_CASE("resident source forwarding is not refused by a planner byte allowance", "[tiled_merge]")
 {
   tiled_fixture f;
   f.merge.reservation_limit = 128;
-  f.input->add_data_batch(make_string_batch(*f.gpu, {std::string(200, 'x')}));
-  CHECK_THROWS_AS(f.merge.get_next_task_input_data(), sirius::invalid_input_exception);
-  CHECK(f.input->total_size() == 1);
-  CHECK(f.repo("sort_tile_inputs")->all_empty());
+  f.merge.chunk_bytes       = 4096;
+  auto expected             = std::string(200, 'x');
+  f.input->add_data_batch(make_string_batch(*f.gpu, {expected}));
+  f.drain();
+  REQUIRE(f.output.total_size() == 1);
+  auto batch = f.output.get_data_batch_by_position(0);
+  auto read  = batch->to_read_only();
+  CHECK(copy_column_to_host<std::string>(sirius::get_cudf_table_view(read).column(0)) ==
+        std::vector<std::string>{expected});
 }
 
 namespace {
@@ -341,9 +346,11 @@ TEST_CASE("tiled final fan-out failure retains its result and is never replayed"
   REQUIRE(results->total_size() == 1);
   std::weak_ptr<cucascade::data_batch> source = results->get_data_batch_by_position(0, 0);
   auto task                                   = f.task(std::move(final));
+  auto callbacks                              = f.merge.publications;
   CHECK_THROWS_AS(task->execute(f.stream), rmm::out_of_memory);
   task.reset();
   CHECK(f.output.total_size() == 1);
+  CHECK(f.merge.publications == callbacks);
   CHECK(results->total_size() == 1);
   CHECK_FALSE(f.merge.get_next_task_input_data());
   CHECK_FALSE(f.merge.all_ports_empty());
@@ -556,6 +563,9 @@ TEST_CASE("concurrent tiled claims cannot duplicate sample work", "[tiled_merge]
     if (!data) { continue; }
     claimed.push_back(std::move(data));
   }
+  CHECK_FALSE(f.merge.all_ports_empty());
+  CHECK_FALSE(f.merge.get_next_task_input_data());
+  CHECK_FALSE(f.merge.get_next_task_hint());
   for (auto& data : claimed) {
     auto const& batches = dynamic_cast<pipelineable_operator_data const&>(*data).get_data_batches();
     REQUIRE(batches.size() == 1);
@@ -659,14 +669,27 @@ TEST_CASE("cold estimates do not refuse fitting order or coalescing tasks", "[ti
   f.drain();
   CHECK(f.rows() == expected);
   std::size_t orders = 0, coalesces = 0, refinements = 0;
+  std::size_t peak = 0;
   for (auto const& log : logs.records()) {
     orders += log.message.find("sort.tile_work kind=order_samples") != std::string::npos;
     coalesces += log.message.find("sort.tile_work kind=coalesce") != std::string::npos;
     refinements += log.message.find("sort.tile_refine") != std::string::npos;
+    if (log.message.find("memory history record") != std::string::npos) {
+      auto field = [&](std::string const& label) -> std::size_t {
+        auto at = log.message.find(label);
+        REQUIRE(at != std::string::npos);
+        return std::stoull(log.message.substr(at + label.size()));
+      };
+      peak = std::max(peak, field("peak_bytes=") + field("peak_bytes_to_materialize_input="));
+    }
   }
   CHECK(orders == (chunk == 512 ? 1 : 0));
   CHECK(coalesces == (chunk == 1024 ? 1 : 0));
   CHECK(refinements == 0);
+  CHECK(peak > 0);
+  CHECK(peak <= f.gpu->get_max_memory());
+  std::cout << "tiled_cold_fit chunk=" << chunk << " ceiling=" << f.gpu->get_max_memory()
+            << " peak=" << peak << " orders=" << orders << " coalesces=" << coalesces << std::endl;
 }
 
 TEST_CASE("tiled stage work selection inspects each work item once", "[tiled_merge_schedule]")
@@ -1010,4 +1033,65 @@ TEST_CASE("publication callback failure is fatal after one sink publication", "[
   CHECK(f.repo("sort_tile_results")->total_size() == 1);
   CHECK_FALSE(f.merge.get_next_task_input_data());
   CHECK_FALSE(f.merge.all_ports_empty());
+}
+
+TEST_CASE("an exhausted one-row copy reports its actual allocation boundary", "[tiled_merge]")
+{
+  auto fault = std::make_shared<allocation_fault>();
+  tiled_fixture f(1, fault_options(fault));
+  f.merge.chunk_bytes = 8;
+  f.add({1, 2});
+  auto data              = reach_work(f, "normalize");
+  auto task              = f.task(std::move(data), nullptr, true);
+  f.merge.before_compute = [fault] { fault->remaining = 0; };
+  CHECK_THROWS_WITH(task->execute(f.stream),
+                    Catch::Matchers::ContainsSubstring("one-row owning copy cannot fit"));
+  fault->remaining       = -1;
+  f.merge.before_compute = {};
+  task.reset();
+  CHECK(f.input->total_size() == 1);
+  CHECK_FALSE(f.merge.all_ports_empty());
+}
+
+TEST_CASE("single-piece preparation failure terminates without recursive refinement",
+          "[tiled_merge]")
+{
+  auto fault = std::make_shared<allocation_fault>();
+  tiled_fixture f(1, fault_options(fault));
+  f.add({1});
+  auto data = f.merge.get_next_task_input_data();  // one-piece merge forwards ownership
+  REQUIRE(data);
+  auto sources = dynamic_cast<pipelineable_operator_data const&>(*data).get_data_batches();
+  spill_tiled_inputs(f);
+  auto task        = f.task(std::move(data), nullptr, true);
+  fault->remaining = 0;
+  CHECK_THROWS_WITH(task->execute(f.stream),
+                    Catch::Matchers::ContainsSubstring("individual piece restoration"));
+  fault->remaining = -1;
+  task.reset();
+  CHECK_FALSE(f.merge.get_next_task_input_data());
+  CHECK_FALSE(f.merge.get_next_task_hint());
+  CHECK_FALSE(f.merge.all_ports_empty());
+  CHECK(sources.front()->get_read_only_count() == 0);
+  CHECK(f.input->total_size() == 1);
+}
+
+TEST_CASE("task metadata allocation failure preserves its pending queue entry",
+          "[tiled_merge_schedule]")
+{
+  tiled_merge_work_queue<int> stage;
+  stage.add(std::make_shared<int>(17));
+  CHECK_THROWS_AS(stage.claim([](auto const&) -> std::unique_ptr<int> { throw std::bad_alloc{}; }),
+                  std::bad_alloc);
+  CHECK(stage.outstanding == 1);
+  CHECK(stage.inspections == 0);
+  CHECK(stage.pending.size() == 1);
+  auto data = stage.claim([](auto const& item) { return std::make_unique<int>(*item); });
+  REQUIRE(data);
+  CHECK(*data == 17);
+  CHECK(stage.pending.empty());
+  CHECK_FALSE(stage.complete_stage());
+  stage.complete();
+  CHECK(stage.complete_stage());
+  CHECK(stage.inspections == 1);
 }

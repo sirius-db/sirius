@@ -646,11 +646,13 @@ After the FULL producer barrier, the operator snapshots each range's contributio
 Oversized contributions are normalized into owning pieces by row subdivision. Small
 contributions are grouped in fixed order toward `sort_chunk_bytes` and merged with
 `cudf::merge`; singleton groups pass through. This is one coalescing pass, not repeated
-merging toward a single run. Admission may split groups further. Contribution ordinals
+merging toward a single run. Exhausted restoration/allocation failures can split
+groups further; cold admission estimates do not split them. Contribution ordinals
 are assigned after coalescing completes, independently of task completion order.
 
-The operator chooses an output row target `R` from decoded-size metadata, the chunk
-target, native row limits and its capacity allowance. For `k` nonempty contributions,
+The operator chooses `R = max(1, min(native_rows, chunk_bytes / ceil_average_row_bytes))`
+from decoded-size metadata. Child regions additionally cap `R` at half their parent's
+rows. This target is independent of the cold admission multiplier. For `k` nonempty contributions,
 regular sampling uses:
 
 ```text
@@ -718,11 +720,18 @@ descriptors contain repository locations and host metadata; ordinary task prepar
 acquires read handles and restores only the selected work's inputs on its assigned GPU.
 Full backing allocations count even when an operation reads a slice.
 
-The task creator claims operator-local work under a mutex. Preparation/compute retries do
-not advance shared progress. `gpu_pipeline_task` notifies the operator of its reservation
-and can request preparation-OOM recovery for the merge source/sink. Progress, dependencies
-and retirement commit through `on_task_output_published()` only after successful sink
-publication and device completion. Partial sink or final fan-out failure fails the query;
+The task creator claims operator-local work under a mutex from pending queues. Completion
+counts cover outstanding work, child regions, roots and final publications; only actionable
+regions enter the ready queue. Completed descriptors leave the work queue when claimed;
+tasks retain them through retries. Scheduling order does not assign result positions.
+
+Preparation/compute retries do not advance shared progress. Defaulted physical-operator
+lifecycle hooks receive each attempt's granted reservation and attainable device ceiling,
+request preparation recovery only for a source that is also the sink, and notify successful
+publication. The runtime does not inspect sort phases or recovery actions. Progress,
+dependencies and retirement commit through `on_task_output_published()` only after successful
+sink publication and device completion. Control-only recovery records failed-attempt peaks,
+without training successful payload peaks or input/output ratios. Partial sink or final fan-out failure fails the query;
 it must not replay an already partially published task. Cancellation uses normal query
 gates, task draining and repository retirement.
 
@@ -730,16 +739,27 @@ Capacity is not guaranteed for arbitrary input distributions. Sample ordering st
 assembles all samples for a region; when `s=1`, every key is sampled. Coalescing reduces
 fragmentation-driven fan-in, but extreme skew can still exceed sample memory or native
 limits. The implementation reports an error rather than selecting another merge engine.
-Its conservative workspace multiplier is currently also used in preflight capacity and
-subdivision decisions; it is not a measured lower bound on required memory. Narrowing a
-copy interval cannot reduce the source backing needed for restoration, so subdivision
-alone does not make every source-restoration failure recoverable.
+`merge_cold_peak_estimate()` supplies the ordinary estimator only; it is not a feasibility
+gate or a permanent reservation floor. History can reduce requests. OOM retry floors grow
+for the same work, while new smaller work starts without its parent's floor. The executor
+clamps requests to the selected memory space's attainable ceiling; transient unavailability
+does not establish exhaustion.
+
+After ordinary growth retries exhaust that ceiling, preparation recovery splits COALESCE
+source groups or creates per-piece child work for MERGE. Restoration failures for extraction,
+copies, samples, ordering and final publication terminate with a site-specific envelope
+error. Narrowing an output interval would retain the same restoration backing. Compute
+failures can halve copy intervals or turn discovered extraction spans into independent
+copy tasks; search failure before spans exist terminates explicitly. A one-row copy that
+actually fails allocation reports that boundary. Diagnostics include the work kind, failure
+site, owning backing/page bytes, granted bytes, effective ceiling and configured ceiling.
 
 Host work/cut metadata and piece counts grow with contribution and tile counts. Assess
 memory and throughput using sample bytes, pre/post-coalescing fan-in, owning piece counts,
 task peaks, spill/restoration traffic and stage times, rather than output chunk size alone.
-See [Memory Management](memory-management.md) for admission and
-[Data Management](data-management.md) for repository positions and payload ownership.
+See [Memory Management](memory-management.md) for admission,
+[Data Management](data-management.md) for repository positions and payload ownership,
+and [the review qualification](tiled-merge-review-qualification.md) for measured evidence.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`

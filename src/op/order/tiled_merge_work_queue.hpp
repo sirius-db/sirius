@@ -18,6 +18,8 @@
 #include <deque>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace sirius::op {
 // Only the tiled operator's finite stage/final-publication lists use this queue.
@@ -33,13 +35,21 @@ struct tiled_merge_work_queue {
     pending.push_back(std::move(item));
     ++outstanding;
   }
-  std::shared_ptr<Work> claim()
+  // Prepare task-owned metadata before committing the claim. Allocation failure
+  // leaves both the pending item and its outstanding count intact.
+  template <typename Prepare>
+  auto claim(Prepare&& prepare)
   {
-    if (pending.empty()) { return nullptr; }
-    auto item = std::move(pending.front());
+    using result_type = std::invoke_result_t<Prepare, std::shared_ptr<Work> const&>;
+    if (pending.empty()) { return result_type{}; }
+    auto result = std::forward<Prepare>(prepare)(pending.front());
     pending.pop_front();
     ++inspections;
-    return item;
+    return result;
+  }
+  std::shared_ptr<Work> claim()
+  {
+    return claim([](auto const& item) { return item; });
   }
   void complete()
   {
