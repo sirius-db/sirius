@@ -86,11 +86,24 @@ struct sirius_physical_exchange_source::state {
            unordered_empty() && held.empty();
   }
 
-  /// Nominates the pipeline's head for a task, as STREAMING_SOURCE does on data.
+  /// Nominates the pipeline's head for a task, as STREAMING_SOURCE does on data. Not under mutex:
+  /// the task creator can call back into this source.
   void schedule()
   {
-    auto p = pipeline.lock();
-    if (!p) { return; }
+    // Before `p`, so this callback lets go of the pipeline while it still holds the plan.
+    exec::query_lifecycle_registry::work_lease lease;
+    std::shared_ptr<pipeline::sirius_pipeline> p;
+    {
+      std::lock_guard lock{mutex};
+      p = pipeline.lock();
+      if (!p) { return; }
+      // The pipeline borrows its operators from the plan, which retirement destroys once no work
+      // lease is held: a callback that cannot take one must not touch the plan.
+      if (lifecycle != nullptr) {
+        lease = lifecycle->try_acquire_work(query_id);
+        if (!lease) { return; }
+      }
+    }
     auto* creator = p->get_task_creator();
     auto head     = p->get_source();
     if (creator && head) { creator->schedule(head.get()); }
@@ -195,6 +208,7 @@ void sirius_physical_exchange_source::set_pipeline(
   {
     std::lock_guard lock{_state->mutex};
     _state->pipeline = pipeline;
+    _state->query_id = pipeline->get_query_id();
   }
   sirius_physical_operator::set_pipeline(std::move(pipeline));
 }
@@ -228,8 +242,7 @@ void sirius_physical_exchange_source::bind_repository()
   if (!pipeline) { return; }
   for (auto const& p : get_ports()) {
     if (p->repo == nullptr) { continue; }
-    _state->query_id = pipeline->get_query_id();
-    _state->repo     = p->repo;
+    _state->repo = p->repo;
     for (auto& batch : _state->queue) {
       _state->repo->add_data_batch(std::move(batch));
     }
