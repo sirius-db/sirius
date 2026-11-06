@@ -186,25 +186,17 @@ std::pair<std::unique_ptr<nixl_rank>, std::unique_ptr<nixl_rank>> two_ranks(
 
 }  // namespace
 
-TEST_CASE("two ranks in one process exchange batches over NIXL", "[exchange][nixl]")
+TEST_CASE("two ranks in one process exchange batches over NIXL or through host staging",
+          "[exchange][nixl]")
 {
-  auto [r0, r1] = two_ranks(nixl_fabric::host_staging::never);
-  REQUIRE_FALSE(r0->fab->host_staged(1));
-  r0->start();
-  r1->start();
-
-  send_all(*r0->t, {1, 2}, 2, 20'000);
-  send_all(*r1->t, {1, 2}, 2, 20'000);
-  check_all(r0->got, 0, 2, {1, 2}, 2, 20'000);
-  check_all(r1->got, 1, 2, {1, 2}, 2, 20'000);
-}
-
-TEST_CASE("two ranks in one process exchange batches through host staging", "[exchange][nixl]")
-{
-  // Frames go device to host into the peer's shared-memory mirror, then host to device.
-  auto [r0, r1] = two_ranks(nixl_fabric::host_staging::always);
-  REQUIRE(r0->fab->host_staged(1));
-  REQUIRE(r1->fab->host_staged(0));
+  // Host staging: frames go device to host into the peer's shared-memory mirror, then host to
+  // device.
+  auto const staging =
+    GENERATE(nixl_fabric::host_staging::never, nixl_fabric::host_staging::always);
+  auto [r0, r1]     = two_ranks(staging);
+  bool const staged = staging == nixl_fabric::host_staging::always;
+  REQUIRE(r0->fab->host_staged(1) == staged);
+  REQUIRE(r1->fab->host_staged(0) == staged);
   r0->start();
   r1->start();
 

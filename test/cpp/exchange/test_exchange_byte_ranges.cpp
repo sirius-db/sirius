@@ -68,13 +68,6 @@ TEST_CASE("byte_ranges_for_rank tiles every file exactly once", "[exchange][byte
   require_exact_tiling({5, 5}, 8);
 }
 
-TEST_CASE("byte_ranges_for_rank splits one file between two ranks", "[exchange][byte_range]")
-{
-  std::vector<std::uint64_t> const files{1000};
-  CHECK(byte_ranges_for_rank(files, 0, 2) == std::vector<file_byte_range>{{0, 0, 500}});
-  CHECK(byte_ranges_for_rank(files, 1, 2) == std::vector<file_byte_range>{{0, 500, 500}});
-}
-
 TEST_CASE("byte_ranges_for_rank balances unevenly sized files by bytes", "[exchange][byte_range]")
 {
   // Whole-file striping would give rank 0 files 0 and 2 (700 bytes) and rank 1 only file 1.

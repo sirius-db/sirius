@@ -137,13 +137,8 @@ void all_to_all(cluster& c, std::vector<stream_id> const& streams, int per_strea
 
 }  // namespace
 
-TEST_CASE("every rank sends to every rank, itself included", "[exchange][transport]")
-{
-  cluster c(3, /*send_frames=*/4, /*recv_frames=*/8);
-  all_to_all(c, {7, 9}, 3, 5'000);
-}
-
-TEST_CASE("a transport keeps nothing for a stream once it has ended", "[exchange][transport]")
+TEST_CASE("every rank sends to every rank, then the same streams again once they ended",
+          "[exchange][transport]")
 {
   // The same ids carry a second round only if both ends forgot the first: its end and its counts.
   cluster c(3, /*send_frames=*/4, /*recv_frames=*/8);
@@ -271,19 +266,8 @@ TEST_CASE("a transport that makes no progress for the stall timeout fails both r
                     Catch::Matchers::ContainsSubstring("no progress"));
 }
 
-TEST_CASE("a failed write fails the sender and its peer", "[exchange][transport]")
-{
-  cluster c(2, 4, 4, {.fail_after_writes = 0}, env().host);
-  c.ranks[0].t->send(3, 1, gpu_batch(sample_table(1'000)));
-  for (auto& r : c.ranks) {
-    auto& got = *r.got;
-    REQUIRE(got.wait_for([&] { return got.error != nullptr; }));
-  }
-  CHECK_THROWS(c.ranks[0].t->send(3, 1, gpu_batch(sample_table(1'000))));
-  CHECK_THROWS(c.ranks[1].t->close(3, 0));
-}
-
-TEST_CASE("a failed transport frees the batches it held before reporting", "[exchange][transport]")
+TEST_CASE("a failed write fails both ranks, and frees the batches the sender held",
+          "[exchange][transport]")
 {
   // About 1.2 MB: 19 frames of 64 KiB, more than the 4 send frames, so the batch is still held
   // when the first write fails.
@@ -291,9 +275,13 @@ TEST_CASE("a failed transport frees the batches it held before reporting", "[exc
   auto& sender           = *c.ranks[0].t;
   stream_id const stream = sirius::exchange::make_stream_id(5, 1);
   sender.send(stream, 1, gpu_batch(sample_table(30'000)));
-  auto& got = *c.ranks[0].got;
-  REQUIRE(got.wait_for([&] { return got.error != nullptr; }));
+  for (auto& r : c.ranks) {
+    auto& got = *r.got;
+    REQUIRE(got.wait_for([&] { return got.error != nullptr; }));
+  }
   CHECK(sender.wait_sent(sirius::exchange::query_of(stream), std::chrono::seconds{5}));
+  CHECK_THROWS(sender.send(stream, 1, gpu_batch(sample_table(1'000))));
+  CHECK_THROWS(c.ranks[1].t->close(stream, 0));
 }
 
 TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange][transport]")
