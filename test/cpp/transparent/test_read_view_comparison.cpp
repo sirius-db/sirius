@@ -87,6 +87,28 @@ TEST_CASE("Copy-origin correspondence is one-to-one", "[transparent][read_view]"
   CHECK(comparison.reason == "binding_mismatch");
 }
 
+TEST_CASE("Copy-origin candidates may read an identical view fewer times",
+          "[transparent][read_view]")
+{
+  auto a = view("a.parquet");
+  auto b = view("b.parquet");
+  std::vector<original_binding> logical{{10, a}, {20, a}, {30, b}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(a), fingerprint(b)};
+
+  std::vector<candidate_binding> merged{{10, a}, {30, b}};
+  auto comparison = compare_read_views(candidate_origin::copy, logical, physical, merged);
+  CHECK(comparison.equal);
+
+  // Every view must still be read, and none more often than the original did.
+  std::vector<candidate_binding> dropped{{10, a}, {20, a}};
+  CHECK(compare_read_views(candidate_origin::copy, logical, physical, dropped).reason ==
+        "fingerprint_mismatch");
+  std::vector<original_binding> once{{10, a}, {30, b}};
+  std::vector<read_view_fingerprint> physical_once{fingerprint(a), fingerprint(b)};
+  std::vector<candidate_binding> more{{10, a}, {20, a}, {30, b}};
+  CHECK_FALSE(compare_read_views(candidate_origin::copy, once, physical_once, more).equal);
+}
+
 TEST_CASE("Replan-origin read views admit only a single corresponding scan",
           "[transparent][read_view]")
 {

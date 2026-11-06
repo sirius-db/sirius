@@ -2937,6 +2937,14 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
 
+static void SetEnableDelimAggregateReuse(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_delim_aggregate_reuse = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DELIM_AGGREGATE_REUSE to {}",
+                   params->enable_delim_aggregate_reuse);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3419,6 +3427,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_delim_aggregate_reuse",
+                    "compute decorrelated subquery aggregates from the delim join's outer rows",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_delim_aggregate_reuse),
+                    SetEnableDelimAggregateReuse);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

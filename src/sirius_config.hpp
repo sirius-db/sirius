@@ -118,6 +118,8 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
+constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
+
 /// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
@@ -287,6 +289,11 @@ struct operator_params {
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim join
+  /// materializes rather than by rescanning the subquery's tables, when those rows are provably the
+  /// same. See `reuse_delim_rows_for_subquery_aggregates`.
+  bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
