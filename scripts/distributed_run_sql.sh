@@ -3,6 +3,8 @@
 # result). Every rank runs the whole file: define tables over every file of each table, the same
 # on every rank. Each statement is one distributed query; each rank scans its own byte range of
 # each table.
+# One host only. Across hosts, start each rank on its own host with the same
+# sirius_exchange_peers list and its own sirius_exchange_rank.
 #   pixi run scripts/distributed_run_sql.sh <ranks> <file.sql> [base port=27000] [log dir=/tmp]
 # Needs a build configured with -DSIRIUS_WITH_NIXL=ON.
 set -euo pipefail
@@ -13,6 +15,8 @@ logs=${4:-/tmp}
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/nixl_env.sh"
 build="$here/../sirius-duckdb/build/release"
+gpus=$(nvidia-smi -L | wc -l)
+if ((ranks > gpus)); then echo "$ranks ranks need $ranks GPUs; this host has $gpus" >&2; exit 2; fi
 
 peers=""
 for ((i = 0; i < ranks; i++)); do peers+="${peers:+,}127.0.0.1:$((port + i))"; done

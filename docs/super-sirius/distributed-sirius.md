@@ -290,14 +290,16 @@ Without it, a distributed query fails with "needs a Sirius built with -DSIRIUS_W
 `scripts/nixl_env.sh` sets the runtime paths:
 
 - NIXL's libraries and its UCX ahead of the pixi environment's own UCX;
-- `NIXL_PLUGIN_DIR`;
-- `UCX_TLS=cuda_copy,cuda_ipc,tcp,self`.
+- `NIXL_PLUGIN_DIR`.
+
+It leaves `UCX_TLS` alone, so UCX picks its transports (NVLink, InfiniBand, TCP) from the hardware.
 
 ## Running TPC-H Q12 on 4 GPUs
 
 `scripts/distributed_run_sql.sh <ranks> <file.sql> [base port] [log dir]` runs a SQL file on N
 local GPUs, rank i on GPU i, and prints rank 0's output. It prepends loading the extension,
-`enable_duckdb_fallback = false` and the two exchange settings.
+`enable_duckdb_fallback = false` and the two exchange settings. It runs on one host only and
+refuses more ranks than the host has GPUs.
 
 ```bash
 cat > /tmp/q12.sql <<'SQL'
