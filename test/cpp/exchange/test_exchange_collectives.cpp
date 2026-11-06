@@ -33,6 +33,7 @@
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "operator/partitioned_join_test_utils.hpp"
+#include "planner/distributed_plan.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/null_mask.hpp>
@@ -475,7 +476,7 @@ TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter 
   auto rank1         = sirius::test::operator_utils::make_partitioned_join(
     {.side_types  = {duckdb::LogicalType::BIGINT},
              .filter_plan = filter_plan(rank1_channel, 64 * KiB)});
-  rank1.join->set_distributed_dynamic_filters(merge_over(c.all[1].service, 4096));
+  sirius::planner::install_filter_merge(*rank1.join, merge_over(c.all[1].service, 4096));
   auto& build_concat = *rank1.join->children[1];
   REQUIRE(build_concat.type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
 

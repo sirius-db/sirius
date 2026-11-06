@@ -218,11 +218,11 @@ struct rewriter {
     // so every rank reserves the same streams.
     auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
-    join.set_distributed_dynamic_filters(
-      {.service      = service,
-       .first_stream = first,
-       .gpu          = gpu,
-       .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
+    install_filter_merge(join,
+                         {.service      = service,
+                          .first_stream = first,
+                          .gpu          = gpu,
+                          .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
     shape += "F";
   }
 
@@ -634,4 +634,13 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
   }
 }
 
+void install_filter_merge(op::sirius_physical_hash_join& join,
+                          op::dynamic_filter_publish_plan::distributed_merge merge)
+{
+  join.set_distributed_dynamic_filters(std::move(merge));
+  // finish_input() never waits: a publication not yet started leaves each key's merge, and one
+  // already running completes on its own.
+  join.children[1]->add_finalize_listener(
+    [&session = join.dynamic_filter_session()] { session.finish_input(); });
+}
 }  // namespace sirius::planner
