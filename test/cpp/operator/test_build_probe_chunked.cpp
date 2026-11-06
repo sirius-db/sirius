@@ -309,10 +309,27 @@ std::vector<int32_t> times_ten(std::vector<int32_t> values)
   return values;
 }
 
-std::vector<int32_t> sorted(std::vector<int32_t> values)
+using rows_t = std::vector<std::vector<int32_t>>;
+
+/// The rows of an all-INT32 result as sorted tuples, so a probe row paired with the wrong build or
+/// payload values does not pass as it would when each column is sorted on its own.
+rows_t sorted_rows(cudf::table_view const& view)
 {
-  std::sort(values.begin(), values.end());
-  return values;
+  std::vector<std::vector<int32_t>> columns;
+  for (auto const& column : view) {
+    columns.push_back(copy_column_to_host<int32_t>(column));
+  }
+  rows_t rows(view.num_rows());
+  for (auto& row : rows) {
+    row.reserve(columns.size());
+  }
+  for (auto const& column : columns) {
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+      rows[r].push_back(column[r]);
+    }
+  }
+  std::sort(rows.begin(), rows.end());
+  return rows;
 }
 
 }  // namespace
@@ -367,10 +384,7 @@ TEST_CASE("chunked BUILD_PROBE SEMI join emits a row matched by two chunks once"
   auto result = run_chunked(*f,
                             {int_batch({2, 4}), int_batch({4, 6})},
                             probe_batch(int_batch({1, 2, 4, 6, 7}), {10, 20, 40, 60, 70}));
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(0))) ==
-        std::vector<int32_t>{2, 4, 6});
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(1))) ==
-        std::vector<int32_t>{20, 40, 60});
+  CHECK(sorted_rows(result.view) == rows_t{{2, 20}, {4, 40}, {6, 60}});
 }
 
 TEST_CASE("chunked BUILD_PROBE ANTI join emits only rows no chunk matches", "[build_probe]")
@@ -379,9 +393,7 @@ TEST_CASE("chunked BUILD_PROBE ANTI join emits only rows no chunk matches", "[bu
   auto result = run_chunked(*f,
                             {int_batch({2, 4}), int_batch({4, 6})},
                             probe_batch(int_batch({1, 2, 4, 6, 7}), {10, 20, 40, 60, 70}));
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(0))) == std::vector<int32_t>{1, 7});
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(1))) ==
-        std::vector<int32_t>{10, 70});
+  CHECK(sorted_rows(result.view) == rows_t{{1, 10}, {7, 70}});
 }
 
 TEST_CASE("chunked BUILD_PROBE INNER join joins every chunk's build rows", "[build_probe]")
@@ -392,13 +404,8 @@ TEST_CASE("chunked BUILD_PROBE INNER join joins every chunk's build rows", "[bui
   // One batch per chunk's join, not one concatenated batch.
   CHECK(result.num_batches == 2);
   // Build key 4 appears once in each chunk, so probe row 4 joins twice, as with one table.
-  REQUIRE(result.view.num_columns() == 3);
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(0))) ==
-        std::vector<int32_t>{2, 4, 4});
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(1))) ==
-        std::vector<int32_t>{20, 40, 40});
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(2))) ==
-        std::vector<int32_t>{2, 4, 4});
+  // Rows are (probe key, payload, build key).
+  CHECK(sorted_rows(result.view) == rows_t{{2, 20, 2}, {4, 40, 4}, {4, 40, 4}});
 }
 
 TEST_CASE("a BUILD_PROBE LEFT join rejects a build split into chunks", "[build_probe]")
@@ -432,8 +439,7 @@ TEST_CASE("a chunked BUILD_PROBE build that fails on a later chunk frees the chu
   auto output = f->join->execute(*input, stream.view());
   stream.synchronize();  // the checks below copy on the default stream
   auto result = collect(std::move(output));
-  CHECK(sorted(copy_column_to_host<int32_t>(result.view.column(0))) ==
-        std::vector<int32_t>{1, 2, 4, 7});
+  CHECK(sorted_rows(result.view) == rows_t{{1, 10}, {2, 20}, {4, 40}, {7, 70}});
 }
 
 TEST_CASE("a chunked BUILD_PROBE probe that fails keeps the built chunks for the retry",
