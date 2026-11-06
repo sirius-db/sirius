@@ -18,6 +18,7 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/sirius_plan_delim_aggregate_reuse.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
@@ -58,6 +59,22 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
   duckdb::Value setting;
   auto lookup_result = context.TryGetCurrentSetting("parquet_footer_statistics", setting);
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
+}
+
+/// The option as `query_operator_options` resolves it, without creating the session's overrides:
+/// those snapshot the global configuration, which would stop the session from seeing later
+/// changes to it.
+bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_delim_aggregate_reuse;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_delim_aggregate_reuse;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
 }
 
 using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
@@ -262,7 +279,19 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    auto copy = copy_logical_plan(*captured, context);
+    if (delim_aggregate_reuse_enabled(context)) {
+      try {
+        sirius::planner::reuse_delim_rows_for_subquery_aggregates(
+          context, input.optimizer.binder, copy);
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: delim aggregate reuse failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy = copy_logical_plan(*captured, context);
+      }
+    }
+    conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
     // indistinguishable from "GPU ran and was slow": the query still returns correct
