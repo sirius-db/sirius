@@ -116,12 +116,13 @@ inline std::unique_ptr<cudf::column> numeric_column(cudf::data_type type,
   return column;
 }
 
-/// INT64s, then nullable INT32s, DECIMAL(38,2)s and strings.
-inline std::unique_ptr<cudf::table> sample_table(std::size_t rows)
+/// INT64s from @p first_key, then nullable INT32s, DECIMAL(38,2)s and strings.
+inline std::unique_ptr<cudf::table> sample_table(std::size_t rows,
+                                                 std::int64_t first_key = 1'000'000)
 {
   auto stream = utils::default_stream();
   std::vector<std::int64_t> keys(rows);
-  std::iota(keys.begin(), keys.end(), std::int64_t{1'000'000});
+  std::iota(keys.begin(), keys.end(), first_key);
   std::vector<std::int32_t> small(rows);
   std::vector<__int128> amounts(rows);
   std::vector<std::string> flags(rows);
