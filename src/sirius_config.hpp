@@ -27,7 +27,9 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -72,7 +74,7 @@ constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 /// cuDF's row-count limit (`std::numeric_limits<cudf::size_type>::max()`): the most rows one
 /// BUILD_PROBE build chunk may hold.
-constexpr uint64_t DEFAULT_BUILD_CHUNK_MAX_ROWS = 2147483647ULL;
+constexpr uint64_t DEFAULT_BUILD_CHUNK_MAX_ROWS = std::numeric_limits<std::int32_t>::max();
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid

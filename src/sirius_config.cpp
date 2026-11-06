@@ -442,7 +442,8 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("build_chunk_max_rows", opt.build_chunk_max_rows);
   if (opt.build_chunk_max_rows == 0 ||
       opt.build_chunk_max_rows > config::DEFAULT_BUILD_CHUNK_MAX_ROWS) {
-    throw std::runtime_error("'operator_params.build_chunk_max_rows': must be in [1, 2147483647]");
+    throw std::runtime_error("'operator_params.build_chunk_max_rows': must be in [1, " +
+                             std::to_string(config::DEFAULT_BUILD_CHUNK_MAX_ROWS) + "]");
   }
   r.optional("cross_join_task_bytes", yaml::bytes(opt.cross_join_task_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
