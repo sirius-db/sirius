@@ -37,6 +37,14 @@ namespace sirius::exec {
 class query_lifecycle_registry;
 }
 
+namespace duckdb {
+class ClientContext;
+}
+
+namespace sirius::op {
+class sirius_physical_table_scan;
+}
+
 namespace sirius::op::scan {
 class parquet_ingestible_table_info;
 }
@@ -46,6 +54,8 @@ struct operator_params;
 }
 
 namespace sirius::planner {
+
+struct connector;
 
 /**
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of
@@ -105,5 +115,20 @@ struct file_byte_range {
 void assign_files_to_rank(op::scan::parquet_ingestible_table_info& info,
                           std::vector<std::string> files,
                           operator_params const& op_params);
+
+/**
+ * @brief Refuses, in distributed mode, a scan that @p source would lower to a read no rank split:
+ * a DuckDB table, `sirius_read_parquet` of one URI, or a Parquet scan whose plan carries its own
+ * byte ranges. Each rank would read all of it, and the query's answer would count it once per rank.
+ *
+ * The plan generator calls it once per scan, before lowering, only when distributed; the other
+ * refusals (`filename`/`file_index`, too few remote files) need the bound files and stay in
+ * assign_files_to_rank.
+ *
+ * @throws sirius::not_implemented_exception naming what cannot be split.
+ */
+void check_distributed_scan(op::sirius_physical_table_scan const& scan,
+                            connector const& source,
+                            duckdb::ClientContext& context);
 
 }  // namespace sirius::planner
