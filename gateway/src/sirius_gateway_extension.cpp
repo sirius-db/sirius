@@ -66,6 +66,8 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                                      vector<Identifier>& names)
 {
   names              = {"rank",
+                        "name",
+                        "registered",
                         "pid",
                         "gpu",
                         "host",
@@ -77,6 +79,8 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                         "running_query_id",
                         "queued"};
   types              = {LogicalType::UINTEGER,
+                        LogicalType::VARCHAR,
+                        LogicalType::BOOLEAN,
                         LogicalType::BIGINT,
                         LogicalType::VARCHAR,
                         LogicalType::VARCHAR,
@@ -93,6 +97,8 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
   auto const queued  = Value::UBIGINT(gateway.waiting());
   for (auto const& r : gateway.status()) {
     data->rows.push_back({Value::UINTEGER(r.index),
+                          Value(r.name),
+                          Value::BOOLEAN(r.registered),
                           Value::BIGINT(r.pid),
                           Value(r.gpu),
                           Value(r.host),
@@ -112,6 +118,23 @@ std::string string_setting(ClientContext& context, char const* name)
   Value value;
   return context.TryGetCurrentSetting(name, value) && !value.IsNull() ? value.ToString()
                                                                       : std::string();
+}
+
+/// The start options that come from `sirius_gateway_*` settings.
+void read_settings(ClientContext& context, sirius_gateway::start_options& options)
+{
+  options.duckdb_binary    = string_setting(context, "sirius_gateway_duckdb_binary");
+  options.sirius_extension = string_setting(context, "sirius_gateway_sirius_extension");
+  options.rank_init        = string_setting(context, "sirius_gateway_rank_init");
+  options.rank_launcher    = string_setting(context, "sirius_gateway_rank_launcher");
+  options.log_dir          = string_setting(context, "sirius_gateway_log_dir");
+  options.boot_id_sql      = string_setting(context, "sirius_gateway_rank_boot_id_sql");
+  options.exit_sql         = string_setting(context, "sirius_gateway_rank_exit_sql");
+  if (options.log_dir.empty()) {
+    options.log_dir =
+      (std::filesystem::temp_directory_path() / ("sirius_gateway_" + std::to_string(getpid())))
+        .string();
+  }
 }
 
 unique_ptr<FunctionData> start_bind(ClientContext& context,
@@ -142,16 +165,7 @@ unique_ptr<FunctionData> start_bind(ClientContext& context,
       options.quack_base_port = value.GetValue<uint32_t>();
     }
   }
-  options.duckdb_binary    = string_setting(context, "sirius_gateway_duckdb_binary");
-  options.sirius_extension = string_setting(context, "sirius_gateway_sirius_extension");
-  options.rank_init        = string_setting(context, "sirius_gateway_rank_init");
-  options.rank_launcher    = string_setting(context, "sirius_gateway_rank_launcher");
-  options.log_dir          = string_setting(context, "sirius_gateway_log_dir");
-  if (options.log_dir.empty()) {
-    options.log_dir =
-      (std::filesystem::temp_directory_path() / ("sirius_gateway_" + std::to_string(getpid())))
-        .string();
-  }
+  read_settings(context, options);
   auto& gateway = gateway_of(input);
   gateway.start(context, std::move(options));
   return status_rows(gateway, types, names);
@@ -163,6 +177,72 @@ unique_ptr<FunctionData> stop_bind(ClientContext& context,
                                    vector<Identifier>& names)
 {
   gateway_of(input).stop(context);
+  return status_rows(gateway_of(input), types, names);
+}
+
+/// sirius_gateway_add_rank('host:port', exchange_port := P, token := T[, fingerprint := F,
+/// name := N, exchange_host := H]): the rank's Quack address, and where its peers reach its
+/// exchange (default: the Quack host).
+unique_ptr<FunctionData> add_rank_bind(ClientContext& context,
+                                       TableFunctionBindInput& input,
+                                       vector<LogicalType>& types,
+                                       vector<Identifier>& names)
+{
+  sirius_gateway::rank_spec spec;
+  auto address = input.inputs[0].ToString();
+  if (StringUtil::StartsWith(address, "quack:")) { address = address.substr(6); }
+  auto const colon = address.rfind(':');
+  if (colon == std::string::npos) {
+    throw InvalidInputException("sirius_gateway_add_rank: '%s' is not host:port", address);
+  }
+  spec.quack_host = address.substr(0, colon);
+  spec.quack_port = std::stoul(address.substr(colon + 1));
+  for (auto const& [name, value] : input.named_parameters) {
+    auto const key = StringUtil::Lower(name.GetIdentifierName());
+    if (key == "exchange_port") {
+      spec.exchange_port = value.GetValue<uint32_t>();
+    } else if (key == "token") {
+      spec.token = value.ToString();
+    } else if (key == "fingerprint") {
+      spec.fingerprint = value.ToString();
+    } else if (key == "name") {
+      spec.name = value.ToString();
+    } else if (key == "exchange_host") {
+      spec.exchange_host = value.ToString();
+    }
+  }
+  if (spec.exchange_port == 0 || spec.token.empty()) {
+    throw InvalidInputException("sirius_gateway_add_rank needs exchange_port := and token :=");
+  }
+  if (spec.name.empty()) { spec.name = address; }
+  if (spec.exchange_host.empty()) { spec.exchange_host = spec.quack_host; }
+  gateway_of(input).add_rank(context, std::move(spec));
+  return status_rows(gateway_of(input), types, names);
+}
+
+unique_ptr<FunctionData> drop_rank_bind(ClientContext& context,
+                                        TableFunctionBindInput& input,
+                                        vector<LogicalType>& types,
+                                        vector<Identifier>& names)
+{
+  gateway_of(input).drop_rank(context, input.inputs[0].ToString());
+  return status_rows(gateway_of(input), types, names);
+}
+
+/// Test hook: sirius_gateway_test_serve(port, token, init_sql) starts a CPU DuckDB that runs
+/// init_sql and serves Quack, for tests to add as a rank. Console only.
+unique_ptr<FunctionData> test_serve_bind(ClientContext& context,
+                                         TableFunctionBindInput& input,
+                                         vector<LogicalType>& types,
+                                         vector<Identifier>& names)
+{
+  sirius_gateway::start_options options;
+  read_settings(context, options);
+  options.sirius_extension.clear();
+  gateway_of(input).test_serve(options,
+                               input.inputs[0].GetValue<uint32_t>(),
+                               input.inputs[1].ToString(),
+                               input.inputs[2].ToString());
   return status_rows(gateway_of(input), types, names);
 }
 
@@ -271,6 +351,19 @@ void LoadInternal(ExtensionLoader& loader)
   start.GetSignature().AddKeywordOnly(
     "quack_base_port", LogicalType::INTEGER, Value::INTEGER(9500));
   loader.RegisterFunction(start);
+  auto add_rank = add("sirius_gateway_add_rank", {LogicalType::VARCHAR}, scan_rows, add_rank_bind);
+  add_rank.GetSignature().AddKeywordOnly("exchange_port", LogicalType::INTEGER, Value::INTEGER(0));
+  add_rank.GetSignature().AddKeywordOnly("token", LogicalType::VARCHAR, Value(""));
+  add_rank.GetSignature().AddKeywordOnly("fingerprint", LogicalType::VARCHAR, Value(""));
+  add_rank.GetSignature().AddKeywordOnly("name", LogicalType::VARCHAR, Value(""));
+  add_rank.GetSignature().AddKeywordOnly("exchange_host", LogicalType::VARCHAR, Value(""));
+  loader.RegisterFunction(add_rank);
+  loader.RegisterFunction(
+    add("sirius_gateway_drop_rank", {LogicalType::VARCHAR}, scan_rows, drop_rank_bind));
+  loader.RegisterFunction(add("sirius_gateway_test_serve",
+                              {LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                              scan_rows,
+                              test_serve_bind));
   loader.RegisterFunction(add("sirius_gateway_stop", {}, scan_rows, stop_bind));
   loader.RegisterFunction(add("sirius_gateway_restart", {}, scan_rows, restart_bind));
   loader.RegisterFunction(add("sirius_gateway_status", {}, scan_rows, status_bind));
@@ -326,6 +419,16 @@ void LoadInternal(ExtensionLoader& loader)
                             "gateway kills the rank and restarts every rank",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(30));
+  config.AddExtensionOption("sirius_gateway_rank_boot_id_sql",
+                            "Query that names a registered rank's process; it changes when the "
+                            "rank restarts",
+                            LogicalType::VARCHAR,
+                            Value("SELECT boot_id FROM sirius_rank_info()"));
+  config.AddExtensionOption("sirius_gateway_rank_exit_sql",
+                            "Statement that ends a registered rank's process, for its launcher to "
+                            "start it again",
+                            LogicalType::VARCHAR,
+                            Value("CALL sirius_rank_exit()"));
   config.AddExtensionOption("sirius_gateway_query_id_setting",
                             "Setting that carries the query number to each rank; empty sends none",
                             LogicalType::VARCHAR,

@@ -4,6 +4,7 @@
 
 #include <sys/types.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -39,12 +40,38 @@ struct start_options {
   /// SQL every rank's session runs after the exchange settings.
   std::string rank_init;
   std::string log_dir;
+  /// How a registered rank names its process, and how it is asked to exit for its launcher to
+  /// restart it (`sirius_gateway_rank_boot_id_sql`, `sirius_gateway_rank_exit_sql`).
+  std::string boot_id_sql;
+  std::string exit_sql;
+};
+
+/// A rank started outside the gateway, by a launcher that restarts it whenever it exits;
+/// added with `sirius_gateway_add_rank`.
+struct rank_spec {
+  std::string name;
+  std::string quack_host;
+  uint32_t quack_port = 0;
+  std::string exchange_host;
+  uint32_t exchange_port = 0;
+  std::string token;
+  /// The rank's TLS certificate, pinned; empty: plain TCP, for a rank on this host.
+  std::string fingerprint;
+  /// The process the gateway last saw: the next join asks it to exit, and waits for a new one.
+  std::string boot_id;
 };
 
 /// One rank process and the gateway's one session on it.
 struct rank {
   uint32_t index = 0;
-  pid_t pid      = -1;
+  std::string name;
+  /// Started outside the gateway (a rank_spec); otherwise spawned by sirius_gateway_start.
+  bool registered        = false;
+  uint32_t quack_port    = 0;
+  uint32_t exchange_port = 0;
+  std::string token;
+  std::string fingerprint;
+  pid_t pid = -1;
   /// The rank reads its stdin until EOF, so closing this ends it.
   int stdin_fd = -1;
   std::string gpu;
@@ -74,6 +101,10 @@ class gateway_state {
   explicit gateway_state(duckdb::DatabaseInstance& db) : db_(db) {}
 
   void start(duckdb::ClientContext& context, start_options options);
+  /// Registers a rank started outside the gateway; the next statement rebuilds the ranks with it.
+  void add_rank(duckdb::ClientContext& context, rank_spec spec);
+  /// Unregisters a rank added with add_rank; the next statement rebuilds the ranks without it.
+  void drop_rank(duckdb::ClientContext& context, std::string const& name);
   void stop(duckdb::ClientContext& context);
   void restart(duckdb::ClientContext& context);
   /// Runs @p sql on every rank and returns rank 0's result.
@@ -81,6 +112,8 @@ class gateway_state {
 
   struct rank_status {
     uint32_t index;
+    std::string name;
+    bool registered;
     int64_t pid;
     std::string gpu;
     std::string host;
@@ -97,6 +130,12 @@ class gateway_state {
   uint64_t running_query_id();
   /// Test hook (`sirius_gateway_test_signal`): sends @p signal to rank @p index's process.
   void signal_rank(uint32_t index, int signal);
+  /// Test hook (`sirius_gateway_test_serve`): starts a DuckDB that runs @p init_sql, then serves
+  /// Quack on 127.0.0.1:@p port, for tests to register as a rank. It ends with the gateway.
+  void test_serve(start_options const& options,
+                  uint32_t port,
+                  std::string const& token,
+                  std::string const& init_sql);
   uint64_t waiting();
   std::vector<std::string> ddl_log();
 
@@ -121,7 +160,12 @@ class gateway_state {
   };
 
   void start_locked(duckdb::ClientContext& context, start_options options);
-  void connect_rank(rank& r, std::string const& token);
+  /// Attaches to @p r and opens its session, retrying until @p patience runs out. A registered
+  /// rank still running the process the gateway last saw is asked to exit, and its replacement
+  /// waited for.
+  void connect_rank(rank& r, std::chrono::seconds patience);
+  /// Under state_mutex_: the registered rank named @p name, or null.
+  rank_spec* find_registered(std::string const& name);
   void stop_locked();
   /// @param replay Whether @p sql comes from the DDL log, so is neither logged nor recovered.
   std::shared_ptr<rank_result> run_locked(duckdb::ClientContext& context,
@@ -150,6 +194,8 @@ class gateway_state {
   /// Guards the fields below for readers that do not hold the turn.
   std::mutex state_mutex_;
   std::vector<rank> ranks_;
+  std::vector<rank_spec> registered_;
+  std::vector<rank> test_servers_;
   start_options options_;
   cluster_state state_ = cluster_state::stopped;
   std::string reason_;
@@ -161,12 +207,19 @@ class gateway_state {
 /// Rank process lifecycle; `rank_supervisor.cpp`.
 /// A local rank runs the DuckDB binary itself; a remote one runs
 /// `<rank_launcher> <host> <gpu> <quack port> <duckdb binary> <init file>`.
-void spawn_rank(start_options const& options, std::string const& token, rank& r);
+/// @p init_sql runs before the rank serves Quack.
+void spawn_rank(start_options const& options,
+                std::string const& token,
+                rank& r,
+                std::string const& init_sql = {});
 /// Whether @p host names an address of one of this machine's interfaces.
 bool is_local_host(std::string const& host);
+/// @p host as an IPv4 address: NIXL takes only numeric peer addresses.
+std::string numeric_address(std::string const& host);
 /// Closes the rank's stdin, waits briefly for it to exit, then kills it.
 void end_rank(rank& r);
-/// Whether the rank's process is gone; reaps it.
+/// Whether the rank's process is gone; reaps it. A registered rank has no process here, and is
+/// never gone by this test.
 bool rank_exited(rank& r);
 std::string log_path(start_options const& options, uint32_t index);
 
