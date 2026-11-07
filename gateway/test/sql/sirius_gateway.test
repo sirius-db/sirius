@@ -181,6 +181,11 @@ FROM quack_query('quack:127.0.0.1:19500', 'SELECT 1');
 ----
 gateway's console
 
+statement error con2
+CALL sirius_rank_exit();
+----
+gateway's console
+
 statement ok con2
 DISCONNECT;
 
