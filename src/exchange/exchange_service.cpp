@@ -16,6 +16,7 @@
 
 #include "exchange/exchange_service.hpp"
 
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
@@ -41,6 +42,11 @@ std::string what_of(std::exception_ptr const& error)
   }
 }
 
+std::uint64_t bytes_of(cucascade::data_batch& batch)
+{
+  return batch.to_read_only().get_data()->get_size_in_bytes();
+}
+
 }  // namespace
 
 exchange_service::exchange_service(fabric& fabric,
@@ -54,6 +60,13 @@ exchange_service::exchange_service(fabric& fabric,
                                  rank_t from,
                                  std::uint64_t batch,
                                  std::shared_ptr<cucascade::data_batch> data) {
+                            if (from != _rank && data) {
+                              auto const bytes = bytes_of(*data);
+                              std::lock_guard lock{_mutex};
+                              auto& t = _traffic[query_of(stream)];
+                              t.received_bytes += bytes;
+                              ++t.received_batches;
+                            }
                             if (auto r = receiver_of(stream, {from, batch, data})) {
                               r->on_batch(from, batch, std::move(data));
                             }
@@ -179,8 +192,14 @@ void exchange_service::send(stream_id stream,
                             rank_t to,
                             std::shared_ptr<cucascade::data_batch> batch)
 {
+  auto const bytes = to != _rank && batch ? bytes_of(*batch) : 0;
   {
     std::lock_guard lock{_mutex};
+    if (bytes > 0) {
+      auto& t = _traffic[query_of(stream)];
+      t.sent_bytes += bytes;
+      ++t.sent_batches;
+    }
     if (_error) { std::rethrow_exception(_error); }
     // A peer failed this query: stop producing for it. close() still goes through, since sinks
     // and all-gathers close their streams on the way out.
@@ -255,6 +274,18 @@ void exchange_service::forget_range(distributed_query_id first, distributed_quer
   std::erase_if(_detached, [&](stream_id stream) { return in_range(query_of(stream)); });
   std::erase_if(_held, [&](auto const& h) { return in_range(query_of(h.first)); });
   _aborted.erase(_aborted.lower_bound(first), _aborted.upper_bound(last));
+  for (auto t = _traffic.lower_bound(first); t != _traffic.end() && t->first <= last;) {
+    SIRIUS_LOG_INFO(
+      "exchange: query {} on rank {}: sent {:.3f} GB in {} batches, received {:.3f} GB in {} "
+      "batches",
+      t->first,
+      _rank,
+      static_cast<double>(t->second.sent_bytes) / 1e9,
+      t->second.sent_batches,
+      static_cast<double>(t->second.received_bytes) / 1e9,
+      t->second.received_batches);
+    t = _traffic.erase(t);
+  }
 }
 
 }  // namespace sirius::exchange
