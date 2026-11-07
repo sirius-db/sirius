@@ -459,12 +459,15 @@ struct transport::engine {
         progress = true;
         continue;
       }
-      // Each staged run is up to max_write_frames consecutive send frames; post() writes it in
-      // as few writes as the peer's consecutive credits allow.
+      // Each staged run is up to max_write_frames consecutive send frames, and no more than the
+      // fabric writes to this peer at once (a TCP lane carries one frame); post() writes it in as
+      // few writes as the peer's consecutive credits allow.
+      auto const run_frames = static_cast<std::uint32_t>(
+        std::clamp<std::size_t>(fab.max_write_bytes(peer) / frame_bytes(), 1, max_write_frames));
       while (p.next_k < p.frames && !free_send.empty() && p.unwritten < credits_per_peer) {
         auto const sends = longest_run(free_send);
-        auto const n     = std::min(
-          {p.frames - p.next_k, max_write_frames, sends.length, credits_per_peer - p.unwritten});
+        auto const n =
+          std::min({p.frames - p.next_k, run_frames, sends.length, credits_per_peer - p.unwritten});
         take(free_send, {sends.first, n});
         auto const& batch = p.current->out;
         auto const at     = static_cast<std::size_t>(p.next_k) * frame_bytes();

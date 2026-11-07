@@ -1363,6 +1363,7 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
       opts.mnnvl                = sirius::exchange::parse_mnnvl(params.exchange_mnnvl);
       opts.frame_bytes          = params.exchange_frame_bytes;
       opts.send_frames          = params.exchange_send_frames;
+      opts.tcp_lanes            = params.exchange_tcp_lanes;
       opts.recv_frames_per_peer = params.exchange_recv_frames_per_peer;
       // A batch with no room asks the GPU's downgrade executor for it, as a task would.
       // terminate() shuts the exchange down before the executors go.
