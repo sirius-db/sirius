@@ -998,11 +998,12 @@ connected, none of these settings can change, on any connection.
 |----------|---------|-------------|
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
-| `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
+| `sirius_exchange_host_staging` | `auto` | How exchange writes reach a peer that is not written over the NVLink fabric (`sirius_exchange_mnnvl`). `auto`: over TCP lanes to ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without peer access. `always`: the mirror for every same-host peer, and TCP lanes to other hosts. `never`: NIXL to every peer. `remote`: TCP lanes to every peer (tests). Same on every rank; set it before `sirius_exchange_rank`, which connects. |
 | `sirius_exchange_mnnvl` | `auto` | `auto`, `require` or `off` put the exchange's rings in fabric memory, so that GPUs on other nodes of the NVLink domain write them over NVLink. `auto` falls back to `cudaMalloc` with a warning; `require` fails instead. Same on every rank. |
-| `sirius_exchange_frame_bytes` | 16777216 | The exchange's frame size; a positive multiple of 256 up to 1 GiB. One write covers up to half a peer's receive frames. Same on every rank. |
+| `sirius_exchange_frame_bytes` | 16777216 | The exchange's frame size; a positive multiple of 256 up to 1 GiB. One write covers up to half a peer's receive frames, or one frame over TCP lanes. Same on every rank. |
 | `sirius_exchange_send_frames` | 32 | Send frames, shared by all peers; they bound the bytes in flight. Same on every rank. |
-| `sirius_exchange_recv_frames_per_peer` | 16 | Receive frames (credits) each peer may fill; ring memory grows with this times the peers. Same on every rank. |
+| `sirius_exchange_recv_frames_per_peer` | 16 | Receive frames (credits) each peer may fill; ring memory grows with this times the peers. A TCP lane carries one frame, so fewer frames than lanes leave lanes idle. Same on every rank. |
+| `sirius_exchange_tcp_lanes` | 0 | TCP lanes per rank to ranks on other hosts (at most 64). 0 shares 16 among the ranks on this host, at least 2 each. Set it before `sirius_exchange_rank`. |
 | `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the [gateway](distributed-gateway.md) on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
 
 ### Pinned Tables

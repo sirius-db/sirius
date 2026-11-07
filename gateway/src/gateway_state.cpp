@@ -712,17 +712,13 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     if (give_up) { throw duckdb::InterruptException(); }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
-    // every peer, so the ranks run it in parallel. Shared-memory staging reaches only processes
-    // on one host, and 'auto' can take a GPU on another host for one here, so ranks on several
-    // hosts never stage.
-    auto const several_hosts = std::any_of(
-      ranks_.begin(), ranks_.end(), [&](rank const& r) { return r.host != ranks_[0].host; });
+    // every peer, so the ranks run it in parallel. Host staging stays 'auto': ranks tell other
+    // hosts apart by boot id and reach them over TCP lanes.
     std::vector<std::vector<std::string>> setup(ranks_.size());
     for (auto& r : ranks_) {
       auto& sql = setup[r.index];
       if (!options_.sirius_extension.empty()) {
         sql.push_back("SET enable_duckdb_fallback = false");
-        if (several_hosts) { sql.push_back("SET sirius_exchange_host_staging = 'never'"); }
         sql.push_back("SET sirius_exchange_mnnvl = " + KeywordHelper::WriteQuoted(options_.mnnvl));
         sql.push_back("SET sirius_exchange_frame_bytes = " + std::to_string(options_.frame_bytes));
         sql.push_back("SET sirius_exchange_send_frames = " + std::to_string(options_.send_frames));

@@ -120,6 +120,7 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
   nixl_fabric::config cfg{rank, std::move(peers)};
   cfg.staging = opts.staging;
   cfg.mnnvl   = opts.mnnvl;
+  cfg.lanes   = opts.tcp_lanes;
   b->fabric   = std::make_unique<nixl_fabric>(std::move(cfg), *b->send, *b->recv);
   probe_nvlink_peers(*b->fabric, opts);
   b->service = std::make_unique<exchange_service>(
