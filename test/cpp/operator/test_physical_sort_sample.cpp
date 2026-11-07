@@ -24,6 +24,7 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
@@ -238,6 +239,25 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
     CHECK(sample_op.runs_without_input());
     CHECK(sample_op.get_next_task_input_data() == nullptr);
   }
+}
+
+TEST_CASE("sirius_physical_sort_sample with no input ends with one partition, whatever its keys",
+          "[physical_sort_sample]")
+{
+  // A key that is not a column reference fails only once there is a sample to cut.
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.emplace_back(
+    duckdb::OrderType::ASCENDING,
+    duckdb::OrderByNullType::NULLS_LAST,
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)));
+  sirius_physical_sort_sample sample_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    1000);
+  pipelineable_operator_data empty{std::vector<std::shared_ptr<cucascade::data_batch>>{}};
+  REQUIRE_NOTHROW(sample_op.execute(empty, cudf::get_default_stream()));
+  CHECK(sample_op.boundaries_computed());
+  CHECK(sample_op.get_num_partitions() == 1);
 }
 
 TEST_CASE("sirius_physical_sort_sample get_next_task_hint returns nullopt while scheduled",

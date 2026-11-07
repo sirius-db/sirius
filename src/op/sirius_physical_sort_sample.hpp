@@ -130,15 +130,29 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Release the partition boundaries table to free GPU memory
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
+ protected:
+  //! Partition boundaries, as make_boundaries() derives them.
+  struct boundaries {
+    std::size_t num_partitions = 1;
+    //! num_partitions - 1 rows of the sort key columns; null for one partition.
+    std::unique_ptr<cudf::table> table;
+  };
+
+  //! The boundaries for @p num_parts partitions from the sorted @p sample_keys (no columns and a
+  //! null @p space with no input); the default picks evenly spaced rows. Runs again on a retry.
+  virtual boundaries make_boundaries(cudf::table_view sample_keys,
+                                     std::size_t sample_bytes,
+                                     std::size_t num_parts,
+                                     cucascade::memory::memory_space* space,
+                                     ::cuda::stream_ref stream);
+
  private:
-  //! Distributed mode: shares @p sample_keys (sorted, possibly empty), then sets both sets of
-  //! boundaries from the global sample; this rank keeps up to @p num_parts partitions.
-  void compute_distributed_boundaries(cudf::table_view sample_keys,
-                                      std::size_t sample_bytes,
-                                      std::size_t num_parts,
-                                      std::vector<cudf::order> const& column_order,
-                                      std::vector<cudf::null_order> const& null_precedence,
-                                      ::cuda::stream_ref stream);
+  //! Distributed mode: shares @p sample_keys (sorted, possibly empty), then sets the exchange's
+  //! boundaries and returns this rank's from the global sample; it keeps up to @p num_parts.
+  boundaries distributed_boundaries(cudf::table_view sample_keys,
+                                    std::size_t sample_bytes,
+                                    std::size_t num_parts,
+                                    ::cuda::stream_ref stream);
 
   std::optional<distributed_sampling> _distributed;
   //! Distributed: the all-gather's result, kept for an OOM retry of the boundary task, since the
