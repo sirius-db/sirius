@@ -115,6 +115,18 @@ make -C "$PIXI_PROJECT_ROOT" &&
 make -C "$PIXI_PROJECT_ROOT/gateway" release
 """
 
+[tasks.sirius-gateway]
+description = "Start the distributed gateway (scripts/sirius_gateway.sh; --help for options)."
+cmd = '"$PIXI_PROJECT_ROOT/scripts/sirius_gateway.sh"'
+
+[tasks.sirius-node]
+description = "Start one rank per GPU on this host and register them with the gateway (scripts/sirius_node.sh)."
+cmd = '"$PIXI_PROJECT_ROOT/scripts/sirius_node.sh"'
+
+[tasks.sirius-client]
+description = "Open a DuckDB shell connected to the gateway (scripts/sirius_client.sh)."
+cmd = '"$PIXI_PROJECT_ROOT/scripts/sirius_client.sh"'
+
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."
 cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"
