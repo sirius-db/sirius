@@ -1,0 +1,127 @@
+# name: test/sql/sirius_gateway_autostart.test
+# description: the first statement starts the registered ranks, without sirius_gateway_start
+# group: [sirius_gateway]
+
+require sirius_gateway
+
+require quack
+
+# Quack's errors mention HTTP, which the runner would otherwise take as a reason to skip the file.
+set ignore_error_messages
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_autostart';
+
+# CPU stand-ins for sirius_rank_info and sirius_rank_exit, as in sirius_gateway_registry.test.
+statement ok
+SET GLOBAL sirius_gateway_rank_boot_id_sql = 'SELECT id FROM boot';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_exit_sql = 'UPDATE boot SET id = id || ''+''';
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+or register ranks with sirius_gateway_add_rank
+
+statement ok
+FROM sirius_gateway_test_serve(19930, 'autotoken', 'CREATE TABLE boot AS SELECT ''a'' AS id');
+
+statement ok
+FROM sirius_gateway_test_serve(19931, 'autotoken', 'CREATE TABLE boot AS SELECT ''b'' AS id');
+
+statement ok
+SET GLOBAL sirius_gateway_min_ranks = 2;
+
+query TT
+SELECT name, cluster FROM sirius_gateway_add_rank('127.0.0.1:19930', exchange_port := 27230, token := 'autotoken', name := 'a');
+----
+a	stopped
+
+# Too few ranks: the statement fails, and the gateway stays stopped.
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+the gateway starts once 2 ranks are registered (sirius_gateway_min_ranks); 1 are
+
+# A rank's node registers it itself, as a Quack client of the gateway, once the gateway allows it.
+statement ok
+SET GLOBAL quack_authorization_function = 'sirius_gateway_route';
+
+statement ok
+CALL quack_serve('quack:127.0.0.1:19932', token := 'gateway-token');
+
+statement ok con2
+ATTACH 'quack:127.0.0.1:19932' AS gw (TOKEN 'gateway-token');
+
+statement ok con2
+CONNECT gw;
+
+statement error con2
+FROM sirius_gateway_add_rank('127.0.0.1:19931', exchange_port := 27231, token := 'autotoken', name := 'b');
+----
+can only be called on the gateway's console
+
+statement ok
+SET GLOBAL sirius_gateway_allow_remote_join = true;
+
+statement ok con2
+FROM sirius_gateway_add_rank('127.0.0.1:19931', exchange_port := 27231, token := 'autotoken', name := 'b');
+
+statement error con2
+CALL quack_cancel('x');
+----
+can only be called on the gateway's console
+
+# The first statement starts both ranks, each as a new process.
+query T
+FROM sirius_gateway_run('SELECT id FROM boot');
+----
+a+
+
+query ITT
+SELECT rank, name, cluster FROM sirius_gateway_status() ORDER BY rank;
+----
+0	a	ready
+1	b	ready
+
+# The node registering its restarted rank again changes nothing: no restart.
+statement ok con2
+FROM sirius_gateway_add_rank('127.0.0.1:19931', exchange_port := 27231, token := 'autotoken', name := 'b');
+
+query T
+SELECT DISTINCT cluster FROM sirius_gateway_status();
+----
+ready
+
+query T
+FROM sirius_gateway_run('SELECT id FROM boot');
+----
+a+
+
+statement ok
+FROM sirius_gateway_run('CREATE OR REPLACE VIEW v AS SELECT 42 AS x');
+
+# A membership change still restarts the ranks at the next statement, and replays the log.
+statement ok
+FROM sirius_gateway_drop_rank('b');
+
+query TI
+FROM sirius_gateway_run('SELECT id, (FROM v) FROM boot');
+----
+a++	42
+
+# After an explicit stop, statements do not start the ranks again.
+statement ok
+FROM sirius_gateway_stop();
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()

@@ -113,30 +113,6 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
   return std::move(data);
 }
 
-std::string string_setting(ClientContext& context, char const* name)
-{
-  Value value;
-  return context.TryGetCurrentSetting(name, value) && !value.IsNull() ? value.ToString()
-                                                                      : std::string();
-}
-
-/// The start options that come from `sirius_gateway_*` settings.
-void read_settings(ClientContext& context, sirius_gateway::start_options& options)
-{
-  options.duckdb_binary    = string_setting(context, "sirius_gateway_duckdb_binary");
-  options.sirius_extension = string_setting(context, "sirius_gateway_sirius_extension");
-  options.rank_init        = string_setting(context, "sirius_gateway_rank_init");
-  options.rank_launcher    = string_setting(context, "sirius_gateway_rank_launcher");
-  options.log_dir          = string_setting(context, "sirius_gateway_log_dir");
-  options.boot_id_sql      = string_setting(context, "sirius_gateway_rank_boot_id_sql");
-  options.exit_sql         = string_setting(context, "sirius_gateway_rank_exit_sql");
-  if (options.log_dir.empty()) {
-    options.log_dir =
-      (std::filesystem::temp_directory_path() / ("sirius_gateway_" + std::to_string(getpid())))
-        .string();
-  }
-}
-
 unique_ptr<FunctionData> start_bind(ClientContext& context,
                                     TableFunctionBindInput& input,
                                     vector<LogicalType>& types,
@@ -165,7 +141,7 @@ unique_ptr<FunctionData> start_bind(ClientContext& context,
       options.quack_base_port = value.GetValue<uint32_t>();
     }
   }
-  read_settings(context, options);
+  sirius_gateway::read_settings(context, options);
   auto& gateway = gateway_of(input);
   gateway.start(context, std::move(options));
   return status_rows(gateway, types, names);
@@ -237,7 +213,7 @@ unique_ptr<FunctionData> test_serve_bind(ClientContext& context,
                                          vector<Identifier>& names)
 {
   sirius_gateway::start_options options;
-  read_settings(context, options);
+  sirius_gateway::read_settings(context, options);
   options.sirius_extension.clear();
   gateway_of(input).test_serve(options,
                                input.inputs[0].GetValue<uint32_t>(),
@@ -321,11 +297,15 @@ void scan_run(ClientContext&, TableFunctionInput& input, DataChunk& output)
   }
 }
 
-void route_function(DataChunk& args, ExpressionState&, Vector& result)
+void route_function(DataChunk& args, ExpressionState& state, Vector& result)
 {
+  Value allow;
+  auto const allow_join =
+    state.GetContext().TryGetCurrentSetting("sirius_gateway_allow_remote_join", allow) &&
+    !allow.IsNull() && allow.GetValue<bool>();
   BinaryExecutor::Execute<string_t, string_t, string_t>(
     args.data[0], args.data[1], result, args.size(), [&](string_t, string_t sql) {
-      return StringVector::AddString(result, sirius_gateway::route(sql.GetString()));
+      return StringVector::AddString(result, sirius_gateway::route(sql.GetString(), allow_join));
     });
 }
 
@@ -414,6 +394,17 @@ void LoadInternal(ExtensionLoader& loader)
     "for long queries",
     LogicalType::UBIGINT,
     Value::UBIGINT(3600));
+  config.AddExtensionOption(
+    "sirius_gateway_allow_remote_join",
+    "Let clients call sirius_gateway_add_rank and sirius_gateway_drop_rank, "
+    "so that ranks register themselves",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(false));
+  config.AddExtensionOption("sirius_gateway_min_ranks",
+                            "Registered ranks the gateway waits for before the first statement "
+                            "starts them; until then statements fail",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(1));
   config.AddExtensionOption("sirius_gateway_cancel_grace",
                             "Seconds a cancelled statement may keep running on a rank before the "
                             "gateway kills the rank and restarts every rank",
