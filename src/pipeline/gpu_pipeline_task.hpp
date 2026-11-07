@@ -326,6 +326,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// MemorySpace used by the task reservation (nil id = none).
   quent::Uuid _reservation_memory_resource_id{quent::nil_uuid()};
   uint64_t _reservation_bytes = 0;
+  bool _unsafe_completion     = false;
 };
 
 /**

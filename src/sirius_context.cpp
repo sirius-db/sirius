@@ -19,6 +19,7 @@
 #include "compression/spill_compression.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
+#include "cuda/gpu_completion.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -343,6 +344,15 @@ bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
   return conn_state && conn_state->is_internal_query_active();
 }
 
+std::optional<sirius::query_id_t> SiriusContext::active_query_for(ClientContext const& outer) const
+{
+  std::lock_guard lock(window_completions_mutex_);
+  for (auto const& [id, window] : active_windows_) {
+    if (window.outer == &outer) return window.query_id;
+  }
+  return std::nullopt;
+}
+
 void SiriusContext::InternalQueryGuard::before_transaction_start(ClientContext& outer,
                                                                  AttachedDatabase const& database,
                                                                  bool read_only)
@@ -350,16 +360,7 @@ void SiriusContext::InternalQueryGuard::before_transaction_start(ClientContext& 
   if (read_only) { return; }
   auto ctx = outer.registered_state->Get<SiriusContext>("sirius_state");
   if (!ctx) { return; }
-  std::optional<sirius::query_id_t> query_id;
-  {
-    std::lock_guard lock(ctx->window_completions_mutex_);
-    for (auto const& [id, window] : ctx->active_windows_) {
-      if (window.outer == &outer) {
-        query_id = window.query_id;
-        break;
-      }
-    }
-  }
+  auto query_id = ctx->active_query_for(outer);
   // Snapshot first: never nest the window mutex with the scan-manager key mutex.
   // This gate enforces transaction ordering, not ClientContext thread safety.
   if (query_id && ctx->get_scan_manager().holds_checkpoint_key(*query_id, database)) {
@@ -513,7 +514,7 @@ void SiriusContext::throw_runtime_unavailable() const
     "Sirius GPU runtime is unavailable after a mandatory cleanup failure or fatal device error; "
     "CPU execution continues. Restart the process to restore GPU execution.";
   auto cause = query_lifecycle_.runtime_failure_message();
-  if (!cause.empty()) message += " First fatal CUDA failure: " + cause;
+  if (!cause.empty()) message += " First GPU runtime failure: " + cause;
   throw SiriusRuntimeUnavailableException(message);
 }
 
@@ -588,6 +589,7 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   // after the query future already delivered an unrelated error.
   auto completion = window_completion(query_id);
   retire_query_work(query_id, query_retirement_mode::cancelled);
+  query_lifecycle_.require_gpu_completion();
   // Finish physical retirement, then retain checkpoint keys if a reader failed to close.
   if (completion) completion->throw_if_preparation_cleanup_failed();
   auto const keys_released = release_query_state(query_id, inject_failure);
@@ -1185,11 +1187,44 @@ void SiriusContext::release_resources() noexcept
   // Stop every producer and every borrower BEFORE destroying the task_scheduler.
   // Creation workers and downgrade executors borrow the scheduler and its task queue.
   if (task_scheduler_) { task_scheduler_->stop(); }
-  if (scan_manager_) { scan_manager_->stop(); }
+  if (scan_manager_) { scan_manager_->stop_workers(); }
   if (task_creator_) { task_creator_->stop_thread_pool(); }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
+  if (is_initialized_ && event_publisher_) event_publisher_->stop();
+  auto record_shutdown_failure = [&](std::exception_ptr error) {
+    query_lifecycle_.report_failure(error);
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_ERROR("GPU shutdown completion unconfirmed: {}",
+                       query_lifecycle_.runtime_failure_message());
+    });
+  };
+  if (query_lifecycle_.unsafe_completion()) {
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_ERROR("GPU shutdown preserves earlier completion failure: {}",
+                       query_lifecycle_.runtime_failure_message());
+    });
+  } else if (memory_manager_) {
+    auto wait_for_current_device = [&] {
+      auto completion = sirius::observe_gpu_completion(cudaDeviceSynchronize(),
+                                                       sirius::gpu_completion_point::shutdown);
+      if (!completion) record_shutdown_failure(std::make_exception_ptr(completion.error));
+    };
+    for (auto const* space :
+         memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      try {
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
+        wait_for_current_device();
+      } catch (...) {
+        sirius::unjoined_gpu_work error{cudaErrorUnknown, sirius::gpu_completion_point::shutdown};
+        error.remember_prior_error(std::current_exception());
+        record_shutdown_failure(std::make_exception_ptr(error));
+      }
+    }
+    wait_for_current_device();
+  }
+  if (scan_manager_) { scan_manager_->reset_all(); }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
@@ -1198,33 +1233,21 @@ void SiriusContext::release_resources() noexcept
   }
   // Outstanding leases make resource destruction unsafe; failure here must be fatal.
   query_lifecycle_.clear();
-  task_creator_.reset();
-  downgrade_executors_.clear();
-  task_scheduler_.reset();
-  telemetry_context_.reset();
-
-  if (memory_manager_) {
-    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    for (auto const* space : gpu_spaces) {
-      cleanup([&] {
-        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-        cudaDeviceSynchronize();
-      });
-    }
-    cudaDeviceSynchronize();
-  }
-
   scan_manager_.reset();
 
-  // Free pinned cuVS indexes and release their GPU reservations while the
-  // memory manager is still alive. The device was synchronized just above, so
-  // no kernels are still reading the index buffers being freed here.
+  // Release indexes and reservations while the memory manager is still alive.
+  // Shutdown keeps the existing release order even if completion was unconfirmed.
   cuvs_index_cache_.reset();
 
   // Drop any remaining per-query repositories while the memory manager is still alive. The
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
   // no borrower can outlive this.
   data_repository_registry_.clear();
+
+  task_creator_.reset();
+  downgrade_executors_.clear();
+  task_scheduler_.reset();
+  telemetry_context_.reset();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
@@ -1380,7 +1403,10 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
       : query->get_pipelines().front()->get_operator_params().enable_pinned_zone_map_pruning,
     task_creator_->get_active_gpu_ids(query_id),
     handler,
-    std::move(interrupted));
+    [this, interrupted = std::move(interrupted)] {
+      if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
+      return interrupted && interrupted();
+    });
   return query;
 }
 
@@ -2215,7 +2241,7 @@ void SiriusContextExtensionCallback::initialize_context()
 {
   if (disabled_ || context_) { return; }
 
-  auto context = duckdb::make_shared_ptr<SiriusContext>();
+  auto context = make_shared_ptr<SiriusContext>();
   context->initialize(config_);
   context_ = std::move(context);
 }

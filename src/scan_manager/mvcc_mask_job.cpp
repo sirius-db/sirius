@@ -19,6 +19,7 @@
 #include "exec/completion_controller.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "log/logging.hpp"
+#include "memory/host_reservation.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
@@ -133,7 +134,8 @@ std::size_t numa_node_for(ccm::memory_space const& space,
 mvcc_mask_workset prepare_mvcc_mask_tasks(
   std::span<mvcc_mask_job_request> requests,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius::memory::topology_index const& topology)
+  sirius::memory::topology_index const& topology,
+  std::function<void()> const& check_running)
 {
   mvcc_mask_workset workset;
   if (requests.empty()) { return workset; }
@@ -277,7 +279,8 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
   for (auto& [numa_node, layout] : nodes) {
     auto const total_bytes = layout.blocks_used * block_size;
     ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST, numa_node);
-    auto reservation = reservation_manager.request_reservation(host_req, total_bytes);
+    auto reservation = sirius::memory::reserve_host_memory(
+      reservation_manager, host_req, total_bytes, check_running);
     if (!reservation) {
       throw std::runtime_error("[prepare_mvcc_mask_tasks] failed to reserve " +
                                std::to_string(total_bytes) +
@@ -358,9 +361,10 @@ void finalize_mvcc_masks(mvcc_mask_workset& workset)
 void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
                         exec::scoped_dispatcher& dispatcher,
                         cucascade::memory::memory_reservation_manager& reservation_manager,
-                        sirius::memory::topology_index const& topology)
+                        sirius::memory::topology_index const& topology,
+                        std::function<void()> const& check_running)
 {
-  auto workset = prepare_mvcc_mask_tasks(requests, reservation_manager, topology);
+  auto workset = prepare_mvcc_mask_tasks(requests, reservation_manager, topology, check_running);
   if (workset.fill_tasks.empty()) { return; }
   SIRIUS_LOG_DEBUG("[run_mvcc_mask_jobs] {} dirty chunk(s), {} fill task(s) across {} request(s)",
                    workset.works.size(),

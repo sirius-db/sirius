@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -153,7 +154,8 @@ struct mvcc_mask_workset {
 [[nodiscard]] mvcc_mask_workset prepare_mvcc_mask_tasks(
   std::span<mvcc_mask_job_request> requests,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius::memory::topology_index const& topology);
+  sirius::memory::topology_index const& topology,
+  std::function<void()> const& check_running = {});
 
 /**
  * @brief Reset every work whose fill dropped no rows back to the default
@@ -182,6 +184,7 @@ void finalize_mvcc_masks(mvcc_mask_workset& workset);
 void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
                         exec::scoped_dispatcher& dispatcher,
                         cucascade::memory::memory_reservation_manager& reservation_manager,
-                        sirius::memory::topology_index const& topology);
+                        sirius::memory::topology_index const& topology,
+                        std::function<void()> const& check_running = {});
 
 }  // namespace sirius::scan_manager

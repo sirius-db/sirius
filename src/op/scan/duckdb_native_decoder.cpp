@@ -20,6 +20,7 @@
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cudf/cudf_utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "memory/host_reservation.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "sirius_context.hpp"
@@ -716,6 +717,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
                       cucascade::io::datasource& datasource,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
+                      std::function<void()> const& check_running,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
                       ::cuda::stream_ref stream)
@@ -790,7 +792,8 @@ void submit_and_await(rmm::device_buffer& device_buf,
   std::size_t const host_bytes = (cur_block + 1) * bsz;
   ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST,
                                                          static_cast<std::size_t>(host_numa_node));
-  auto reservation = host_mem_mgr.request_reservation(host_req, host_bytes);
+  auto reservation =
+    sirius::memory::reserve_host_memory(host_mem_mgr, host_req, host_bytes, check_running);
   if (!reservation) {
     throw std::runtime_error(std::string(kTag) + " failed to reserve " +
                              std::to_string(host_bytes) + " bytes of host staging memory");
@@ -1079,13 +1082,21 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     // them into one sequential read without pulling the larger unprojected-column waste
     // that sits between row groups.
     std::size_t const coalesce_max_gap = sf_bm->GetBlockHeaderSize();
-    submit_and_await(device_buf,
-                     staging,
-                     *datasource,
-                     sirius_st->get_memory_manager(),
-                     host_numa,
-                     coalesce_max_gap,
-                     stream);
+    submit_and_await(
+      device_buf,
+      staging,
+      *datasource,
+      sirius_st->get_memory_manager(),
+      [&, id = sirius_st->active_query_for(context)] {
+        if (sirius_st->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+          sirius_st->throw_runtime_unavailable();
+        if (context.IsInterrupted() ||
+            (id && !sirius_st->get_query_lifecycle_registry().accepts_work(*id)))
+          throw duckdb::InterruptException();
+      },
+      host_numa,
+      coalesce_max_gap,
+      stream);
   } else if (!staging.host_copies.empty()) {
     // All-host split: no file io, no staging blocks, no SiriusContext needed.
     submit_host_only_and_await(device_buf, staging, stream);
