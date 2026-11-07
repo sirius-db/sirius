@@ -163,6 +163,33 @@ TEST_CASE("one credit per peer and one send frame still deliver many-frame batch
   all_to_all(c, {1}, 2, 30'000);
 }
 
+TEST_CASE("one write covers consecutive frames, up to half a peer's credits",
+          "[exchange][transport]")
+{
+  // 8 credits per peer: writes of up to 4 frames, so two can be in flight to a peer. About
+  // 1.2 MB a batch: 19 frames of 64 KiB.
+  cluster c(2, /*send_frames=*/16, /*recv_frames=*/8);
+  all_to_all(c, {1, 2}, 3, 30'000);
+  CHECK(c.hub.largest_write() == 4 * 64 * KiB);
+}
+
+TEST_CASE("one write per frame when a peer has one credit", "[exchange][transport]")
+{
+  cluster c(2, /*send_frames=*/16, /*recv_frames=*/1);
+  all_to_all(c, {1}, 2, 30'000);
+  CHECK(c.hub.largest_write() == 64 * KiB);
+}
+
+TEST_CASE("a write past the frames a peer holds fails the receiver", "[exchange][transport]")
+{
+  // Rank 1 holds rank 0's receive frames 0 to 3; frames 2 to 4 are not all its own.
+  forged_peer f;
+  sirius::exchange::frame_message m{1, 0, 0, 2, 3 * 64 * KiB, many_frame_header()};
+  m.frames = 3;
+  f.forge(m);
+  f.fails_with("which it does not hold");
+}
+
 TEST_CASE("notifications may arrive in any order", "[exchange][transport]")
 {
   // Several notifications arrive together and shuffled: frames before their header, ends
@@ -442,8 +469,11 @@ TEST_CASE("a transport destroyed right after close and abort still sends them",
 TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange][transport]")
 {
   using namespace sirius::exchange;
+  frame_message several{7, 3, 4, 2, 3 * 1024, {}};
+  several.frames = 3;
   std::vector<message> const all{frame_message{7, 3, 0, 5, 1024, {1, 2, 3}},
                                  frame_message{7, 3, 4, 6, 99, {}},
+                                 several,
                                  credit_message{{1, 2, 3}},
                                  credit_message{},
                                  end_message{7, 12},
@@ -462,6 +492,10 @@ TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange]
                   sirius::invalid_input_exception);
   CHECK_THROWS_AS(decode(encode(frame_message{1, 1, 0, 0, 8, {}})),
                   sirius::invalid_input_exception);
+  // A write of no frames.
+  frame_message none{1, 1, 2, 0, 8, {}};
+  none.frames = 0;
+  CHECK_THROWS_AS(decode(encode(none)), sirius::invalid_input_exception);
   // A frame and an end with a byte too many, a credit with one too few.
   auto frame = encode(frame_message{7, 3, 0, 5, 1024, {1, 2, 3}});
   frame.push_back('\0');
