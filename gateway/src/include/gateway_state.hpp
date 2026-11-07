@@ -15,6 +15,12 @@
 
 namespace sirius_gateway {
 
+/// Where the ranks stand as a whole. Fail-stop: anything that may leave the ranks out of step
+/// (a lost or killed rank, a broken exchange, a state change some ranks missed) is `failed`,
+/// and the next statement restarts every rank and replays the DDL log first.
+enum class cluster_state { stopped, starting, ready, failed };
+char const* to_string(cluster_state state);
+
 /// How to start the ranks; filled from `sirius_gateway_start`'s arguments and the
 /// `sirius_gateway_*` settings.
 struct start_options {
@@ -78,11 +84,18 @@ class gateway_state {
     std::string gpu;
     std::string host;
     std::string uri;
+    /// The rank's process: up or exited.
     std::string state;
+    cluster_state cluster;
+    /// Why the cluster is stopped or failed.
     std::string error;
   };
   std::vector<rank_status> status();
   uint64_t last_query_id();
+  /// The query number of the statement running now, or 0.
+  uint64_t running_query_id();
+  /// Test hook (`sirius_gateway_test_signal`): sends @p signal to rank @p index's process.
+  void signal_rank(uint32_t index, int signal);
   uint64_t waiting();
   std::vector<std::string> ddl_log();
 
@@ -91,6 +104,16 @@ class gateway_state {
   struct outcome {
     std::unique_ptr<duckdb::QueryResult> result;
     std::optional<duckdb::ErrorData> error;
+  };
+  /// When a fan-out cancels its calls: the client interrupting, and the statement timeout.
+  struct fan_out_policy {
+    bool watch_client  = true;
+    uint64_t timeout_s = 0;
+  };
+  struct fan_out_result {
+    std::vector<outcome> outcomes;
+    /// Why the calls were cancelled; empty if they were not.
+    std::string cancelled;
   };
 
   void start_locked(duckdb::ClientContext& context, start_options options);
@@ -101,12 +124,15 @@ class gateway_state {
                                           std::string const& sql,
                                           bool replay);
   /// Runs @p statements on every rank, each rank's in order, ranks in parallel. Cancels them on
-  /// every rank if @p context is interrupted or the statement timeout passes, and then sets
-  /// @p cancelled to the reason.
-  std::vector<outcome> fan_out(duckdb::ClientContext& context,
-                               std::vector<std::vector<std::string>> const& statements,
-                               std::string& cancelled);
+  /// every rank if @p context is interrupted or the timeout passes, and then sets the result's
+  /// cancelled to the reason.
+  fan_out_result fan_out(duckdb::ClientContext& context,
+                         std::vector<std::vector<std::string>> const& statements,
+                         fan_out_policy policy);
   void cancel_all();
+  fan_out_policy client_policy(duckdb::ClientContext& context);
+  /// Under state_mutex_: the cluster is failed for @p reason, unless it already was.
+  void fail_locked(std::string reason);
   /// Starts fresh ranks with the last options and replays the DDL log on them.
   void recover_locked(duckdb::ClientContext& context);
 
@@ -121,8 +147,10 @@ class gateway_state {
   std::mutex state_mutex_;
   std::vector<rank> ranks_;
   start_options options_;
-  std::string broken_;
-  uint64_t query_id_ = 0;
+  cluster_state state_ = cluster_state::stopped;
+  std::string reason_;
+  uint64_t query_id_         = 0;
+  uint64_t running_query_id_ = 0;
   std::vector<std::string> ddl_log_;
 };
 
