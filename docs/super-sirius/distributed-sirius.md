@@ -77,10 +77,16 @@ fixed-width or `STRING`.
 
 ### Transport (`src/exchange/transport.*`, `messages.*`, `fabric.hpp`)
 
-Each rank has a send ring and a receive ring. Both are fixed-size frames in one plain `cudaMalloc`
-region, and they are the only memory NIXL registers. They are not pool memory: UCX `cuda_ipc`
-cannot export stream-ordered allocations, and a pool block could be reused while a peer's write
-into it is still landing.
+Each rank has a send ring and a receive ring. Both are fixed-size frames in one device region,
+and they are the only memory NIXL registers. The region comes from `cuMemCreate` with a fabric
+handle where the GPU and driver allow it (see [NVLink between nodes](#nvlink-between-nodes-mnnvl)),
+else from `cudaMalloc`. It is never pool memory: UCX `cuda_ipc` cannot export stream-ordered
+allocations, and a pool block could be reused while a peer's write into it is still landing.
+
+- **Writes.** One write covers as many consecutive frames as the sender holds consecutive send
+  frames and credits for, up to half a peer's credits, so two writes to a peer can be in flight.
+  NVLink between nodes needs large writes: one write at a time moves about 450 GB/s at 16 MB,
+  700 at 128 MB and 770 at 1 GB, because each write costs about 15 µs.
 
 - **Credits.** The receive ring is split evenly among the peers at start. A sender writes only
   into the frames it holds, and gets each one back once the receiver has copied it out. There is
@@ -131,6 +137,40 @@ its path to every peer at start. Staging maps the peer's mirror from this host's
 works only between ranks on one host that share `/dev/shm`; ranks on several hosts, or in separate
 IPC namespaces, need `never` until #2372. A rank that crashes leaves its mirror in `/dev/shm`;
 the launchers in `scripts/` remove mirrors whose process is gone before they start.
+
+### NVLink between nodes (MNNVL)
+
+On GB200 NVL systems, GPUs on different nodes of one NVLink domain reach each other's memory over
+NVLink, at up to about 780 GB/s each way per GPU pair, against about 98 GB/s over the RDMA rails.
+UCX `cuda_ipc` does this through the IMEX daemon, but only for memory with a fabric handle
+(`CU_MEM_HANDLE_TYPE_FABRIC`). Plain `cudaMalloc` memory has only a legacy IPC handle, and UCX then
+moves it over the network without a word. So with `sirius_exchange_mnnvl` at `auto` (the default)
+or `require`, a rank allocates both rings with `cuMemCreate` and a fabric handle
+(`src/exchange/fabric_memory.*`), rounded up to the allocation granularity. Without fabric
+handles (no support, or no IMEX channel open), `auto` logs why and uses `cudaMalloc`; `require`
+fails.
+
+The hello also carries whether the receive ring is in fabric memory and the GPU's NVLink domain:
+the cluster UUID and clique id from NVML's fabric info (`nvidia-smi -q`, section Fabric). A peer
+whose GPU is in this GPU's domain, both rings in fabric memory, gets the path "NIXL over the
+NVLink fabric" (`choose_path()` in `src/exchange/path_choice.*`); every other peer gets the path
+it had before. `require` fails at connect for a peer that cannot be reached that way.
+
+UCX picks its transport per endpoint and says nothing when `cuda_ipc` cannot map a peer's memory.
+So after connecting, a rank times one write, as large as the transport's largest, to each peer on
+the fabric path, into its own credit frames there, and logs the rate. Below 150 GB/s it warns
+(`require`: fails) that UCX did not take `cuda_ipc`. `UCX_PROTO_INFO=y` prints the transport of
+each UCX protocol, for example `cuda_ipc/cuda` for a put from `cuda/GPU0` to `cuda/dev[0]`.
+
+The ring sizes are settings, the same on every rank: `sirius_exchange_frame_bytes` (16 MiB),
+`sirius_exchange_send_frames` (32, shared by the peers) and `sirius_exchange_recv_frames_per_peer`
+(8). A rank's ring memory is `frame × (send frames + receive frames × peers)`: 1.4 GiB with 8
+ranks, 9.4 GiB with 72 (credits on demand, #2371, would bound it).
+
+`scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` runs the hidden `[nixl_pairs]` test on
+two nodes of a Slurm partition, one rank per GPU paired with the same GPU on the other node: one
+and four pairs, one and both directions, 1 GB and 128 MB batches, then smaller batches, then a
+check of every value. It writes `summary.md` with GB/s per phase next to raw NIXL's.
 
 ### Operators (`src/op/sirius_physical_exchange_{sink,source}.*`)
 
@@ -393,12 +433,15 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | Tag | Covers |
 |---|---|
 | `[exchange][wire]`, `[exchange][batch_io]` | Headers and refusals; batches through 64 KiB to 1 MiB frames to the GPU and host |
-| `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; shuffled notifications; no room; failed writes |
+| `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; writes of several frames; shuffled notifications; no room; failed writes |
 | `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
 | `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only; CI does not build NIXL yet) |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
+| `[exchange][path]` | The path rule (NVLink domain, fabric rings, staging, `require`); a frame ring in fabric memory |
+| `[nixl_bandwidth]` (hidden) | All-to-all bandwidth, one rank per process: `TEST='[nixl_bandwidth]' scripts/distributed_test_nixl.sh 4` |
+| `[nixl_pairs]` (hidden) | GPU pairs on two nodes, 1 GB to 64 KB batches, both directions, every value checked: `scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` |
 | `[dynamic_filter][probe]` | Merging two Blooms of one capacity |
 
 ## Files
