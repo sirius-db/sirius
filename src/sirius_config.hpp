@@ -247,7 +247,7 @@ struct operator_params {
   /// Distributed execution: send frames, shared by all peers.
   uint32_t exchange_send_frames = 32;
   /// Distributed execution: receive frames (credits) each peer may fill.
-  uint32_t exchange_recv_frames_per_peer = 8;
+  uint32_t exchange_recv_frames_per_peer = 16;
 
   /// Nonzero: the number of the next distributed query, set by a gateway that numbers every
   /// rank's queries. Must increase; zero numbers queries per process.

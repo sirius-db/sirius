@@ -449,7 +449,7 @@ void read_settings(ClientContext& context, start_options& options)
   options.send_frames = static_cast<uint32_t>(
     std::stoull(setting(context, "sirius_gateway_exchange_send_frames", "32")));
   options.recv_frames = static_cast<uint32_t>(
-    std::stoull(setting(context, "sirius_gateway_exchange_recv_frames_per_peer", "8")));
+    std::stoull(setting(context, "sirius_gateway_exchange_recv_frames_per_peer", "16")));
   options.log_dir     = setting(context, "sirius_gateway_log_dir", "");
   options.boot_id_sql = setting(context, "sirius_gateway_rank_boot_id_sql", "");
   options.joined_sql  = setting(context, "sirius_gateway_rank_joined_sql", "");

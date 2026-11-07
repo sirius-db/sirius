@@ -42,12 +42,13 @@ constexpr std::size_t max_frame_bytes = std::size_t{1} << 30;
 /// Ring sizing: @p send_frames staging frames shared by all peers, and @p recv_frames_per_peer
 /// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. A write covers
 /// up to half a peer's credits of consecutive frames: NVLink between nodes needs writes of 16 MiB
-/// or more (about 450 GB/s at 16 MiB, 700 at 128 MiB, 770 at 1 GiB). The sizing is fixed until
-/// credits are granted on demand (#2371).
+/// or more (about 450 GB/s at 16 MiB, 700 at 128 MiB, 770 at 1 GiB), and 16 credits of 16 MiB
+/// keep two 128 MiB writes to a peer in flight. The sizing is fixed until credits are granted on
+/// demand (#2371).
 struct nixl_exchange_options {
   std::size_t frame_bytes            = std::size_t{16} * 1024 * 1024;  // 16 MiB
   std::uint32_t send_frames          = 32;
-  std::uint32_t recv_frames_per_peer = 8;
+  std::uint32_t recv_frames_per_peer = 16;
   host_staging staging               = host_staging::automatic;
   mnnvl_mode mnnvl                   = mnnvl_mode::automatic;
   transport::options transport_options;
