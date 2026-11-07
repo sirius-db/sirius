@@ -53,6 +53,11 @@ namespace sirius::exchange {
  * is a device-to-host copy into that peer's mirror, followed by a notification naming the bytes;
  * the peer copies them host-to-device into its receive ring and only then hands the write's own
  * notification on. One PCIe crossing each way, no copy through the CPU.
+ *
+ * **NVLink fabric (MNNVL).** `cuda_ipc` also reaches a GPU on another node of the same NVLink
+ * domain, but only for memory with a fabric handle. The hello therefore carries whether the
+ * receive ring is in fabric memory and the GPU's NVLink domain (NVML fabric info); a peer in this
+ * GPU's domain, both rings in fabric memory, is written over NVLink (choose_path()).
  */
 class nixl_fabric : public fabric {
  public:
@@ -64,6 +69,8 @@ class nixl_fabric : public fabric {
     std::vector<std::string> peers;
     std::chrono::milliseconds connect_timeout{std::chrono::minutes{2}};
     host_staging staging{host_staging::automatic};
+    /// require: fail unless every peer is reached over the NVLink fabric.
+    mnnvl_mode mnnvl{mnnvl_mode::automatic};
   };
 
   /// Blocks until every peer is reached or @p cfg.connect_timeout passes. @p send and @p recv must
@@ -92,7 +99,19 @@ class nixl_fabric : public fabric {
   void poll(std::vector<fabric_notification>& out) override;
 
   /// Whether writes to @p peer go through its host mirror rather than NIXL.
-  [[nodiscard]] bool host_staged(rank_t peer) const { return _peers.at(peer).staged; }
+  [[nodiscard]] bool host_staged(rank_t peer) const
+  {
+    return _peers.at(peer).route == path::shared_memory;
+  }
+  /// How writes reach @p peer.
+  [[nodiscard]] path path_to(rank_t peer) const { return _peers.at(peer).route; }
+
+  /// Writes @p bytes from the start of the send ring to offset @p dst of @p peer's receive ring,
+  /// with no notification, and waits until it is done. Not for a shared_memory peer, nor while a
+  /// transport uses the fabric.
+  /// @return the seconds the write took.
+  /// @throws sirius::internal_exception when the write fails or takes more than ten seconds.
+  [[nodiscard]] double timed_write(rank_t peer, std::size_t dst, std::size_t bytes);
 
  private:
   struct peer {
@@ -104,9 +123,11 @@ class nixl_fabric : public fabric {
     std::uint32_t device{0};
     std::uint32_t pid{0};
     std::string pci_bus_id;
+    bool fabric_ring{false};
+    nvlink_domain domain;
     bool hello{false};
-    /// Writes go through the peer's receive mirror, mapped here at mirror.
-    bool staged{false};
+    path route{path::nixl};
+    /// shared_memory: the peer's receive mirror, mapped here.
     std::byte* mirror{nullptr};
   };
 

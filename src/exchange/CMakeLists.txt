@@ -6,8 +6,10 @@ target_sources(
           exchange_runtime.cpp
           exchange_service.cpp
           fabric.cpp
+          fabric_memory.cpp
           messages.cpp
           nixl_fabric.cpp
+          path_choice.cpp
           rank_control.cpp
           transport.cpp
           wire.cpp)
