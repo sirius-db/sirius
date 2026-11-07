@@ -199,19 +199,17 @@ read_view_comparison compare_read_views_impl(
   if (!candidate.empty() && candidate.front().view && candidate.front().view->identity) {
     result.candidate_hash = candidate.front().view->identity->fingerprint.hash;
   }
+  bool const multi_replan = origin == candidate_origin::replan && planned.size() > 1;
   if (origin == candidate_origin::replan) {
-    result.correspondence = planned.empty() ? "none" : "single";
-    if (planned.size() > 1) {
-      result.correspondence = "none";
-      result.reason         = "no_correspondence";
-      return result;
-    }
+    // For multi-scan replans, table indexes propose pairs; the checks below
+    // must still prove identity and required selector equality.
+    result.correspondence = planned.empty() ? "none" : multi_replan ? "table_index_replan" : "single";
   } else {
     result.correspondence = "table_index";
   }
   if (!compare_multiset(physical_original, candidate, result)) return result;
 
-  if (origin == candidate_origin::replan) {
+  if (origin == candidate_origin::replan && !multi_replan) {
     if (planned.empty()) {
       result.equal = true;
       return result;
@@ -229,25 +227,22 @@ read_view_comparison compare_read_views_impl(
     return result;
   }
 
-  if (logical_original.size() != candidate.size()) {
-    result.reason = "binding_mismatch";
+  auto pairing_failed = [&] {
+    if (multi_replan) result.correspondence = "none";
+    result.reason = multi_replan ? "no_correspondence" : "binding_mismatch";
     return result;
-  }
+  };
+  if (logical_original.size() != candidate.size()) return pairing_failed();
   std::unordered_set<duckdb::idx_t> matched_table_indexes;
   matched_table_indexes.reserve(candidate.size());
   for (auto const& candidate_binding : candidate) {
-    if (!matched_table_indexes.insert(candidate_binding.table_index).second) {
-      result.reason = "binding_mismatch";
-      return result;
-    }
+    if (!matched_table_indexes.insert(candidate_binding.table_index).second) return pairing_failed();
     auto const found =
       std::find_if(logical_original.begin(), logical_original.end(), [&](auto const& original) {
         return original.table_index == candidate_binding.table_index;
       });
-    if (found == logical_original.end() || !same_identity(found->view, candidate_binding.view)) {
-      result.reason = "binding_mismatch";
-      return result;
-    }
+    if (found == logical_original.end() || !same_identity(found->view, candidate_binding.view))
+      return pairing_failed();
     if (!selector_proven(*candidate_binding.view, found->view)) {
       result.reason = "selector_unproven";
       return result;
