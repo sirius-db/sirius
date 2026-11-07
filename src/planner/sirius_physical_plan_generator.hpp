@@ -24,6 +24,7 @@
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -68,9 +69,22 @@ class LogicalSetOperation;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
 class TableFilterSet;
+class Binder;
 }  // namespace duckdb
 
 namespace sirius::planner {
+
+/// Rewrite nested decorrelated `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)`
+/// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: a LEFT
+/// DELIM_JOIN against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery plus a filter. The replacement
+/// emits the same column bindings as the nodes it replaces. Subqueries DuckDB left as plain SEMI
+/// or ANTI joins (`delim_join_as_cte`) over a table pinned in GPU memory are merged only when those
+/// joins are estimated to exceed @p gpu_memory_budget bytes; 0 merges them regardless. Returns the
+/// number of subqueries rewritten.
+std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
+                                                 duckdb::Binder& binder,
+                                                 duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
+                                                 std::uint64_t gpu_memory_budget = 0);
 
 /// Attribution attached to every scan contract created by one plan build.
 /// Execution-time plans carry a window id; plans built before an execution
