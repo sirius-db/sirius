@@ -31,8 +31,9 @@
  */
 namespace sirius::exchange {
 
-/// Rides with the write of one frame: the receive frame holds bytes [k * frame size, + bytes)
-/// of batch @p batch of @p stream. Frame 0 carries the batch's encoded header.
+/// Rides with the write of @p frames consecutive frames: receive frames [recv_frame, +frames)
+/// hold bytes [k * frame size, + bytes) of batch @p batch of @p stream, which are its frames
+/// [k, k + frames). Frame 0 carries the batch's encoded header.
 struct frame_message {
   std::uint64_t stream{0};
   std::uint64_t batch{0};
@@ -40,6 +41,9 @@ struct frame_message {
   std::uint32_t recv_frame{0};
   std::uint64_t bytes{0};
   std::vector<std::uint8_t> header;
+  /// One write covers several frames when the sender holds consecutive credits: fewer, larger
+  /// writes reach far more of NVLink's bandwidth.
+  std::uint32_t frames{1};
 
   bool operator==(frame_message const&) const = default;
 };
