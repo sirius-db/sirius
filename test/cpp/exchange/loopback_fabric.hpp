@@ -54,6 +54,8 @@ class loopback_hub {
     unsigned deliver_every = 1;
     /// Fail every write after this many succeeded.
     std::optional<std::uint64_t> fail_after_writes;
+    /// The most bytes one write may carry, as fabric::max_write_bytes() reports it.
+    std::optional<std::size_t> max_write_bytes;
   };
 
   loopback_hub(rank_t world, options opts) : _opts(opts), _inboxes(world), _recv(world, nullptr) {}
@@ -119,6 +121,11 @@ class loopback_hub {
            bytes > seen && !_hub._largest_write.compare_exchange_weak(seen, bytes);) {}
       _writes.emplace(_next, std::move(w));
       return _next++;
+    }
+
+    std::size_t max_write_bytes(rank_t peer) const override
+    {
+      return _hub._opts.max_write_bytes.value_or(fabric::max_write_bytes(peer));
     }
 
     write_status status(std::uint64_t id) override
