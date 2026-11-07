@@ -41,7 +41,7 @@ SELECT current_setting('sirius_gateway_exchange_mnnvl'),
        current_setting('sirius_gateway_exchange_send_frames'),
        current_setting('sirius_gateway_exchange_recv_frames_per_peer');
 ----
-auto	16777216	32	8
+auto	16777216	32	16
 
 # With no ranks, a statement waits sirius_gateway_join_wait seconds for some to register.
 statement ok
