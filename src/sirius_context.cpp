@@ -30,6 +30,7 @@
 #include "exchange/distributed_session.hpp"
 #include "exchange/exchange_runtime.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/rank_control.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "exec/thread_util.hpp"
 #include "helper/transaction_utils.hpp"
@@ -1441,8 +1442,10 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
       };
       cucascade::exec::thread_util::scoped_thread_affinity startup_affinity(
         config_.get_worker_startup_cpus());
-      return sirius::exchange::make_nixl_exchange(
+      auto exchange = sirius::exchange::make_nixl_exchange(
         params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+      sirius::exchange::note_exchange_joined();
+      return exchange;
     });
 }
 
