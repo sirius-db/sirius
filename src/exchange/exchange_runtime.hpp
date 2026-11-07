@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "exchange/host_staging.hpp"
+#include "exchange/path_choice.hpp"
 #include "exchange/transport.hpp"
 
 #include <cstddef>
@@ -34,19 +34,22 @@ namespace sirius::exchange {
 
 class exchange_service;
 
-/// "auto", "always" or "never", as the sirius_exchange_host_staging setting takes it.
-/// @throws sirius::invalid_input_exception on any other value.
-[[nodiscard]] host_staging parse_host_staging(std::string_view value);
+/// The most send frames, and receive frames per peer, a rank may have.
+constexpr std::uint32_t max_ring_frames = 1024;
+/// The largest frame: 1 GiB.
+constexpr std::size_t max_frame_bytes = std::size_t{1} << 30;
 
 /// Ring sizing: @p send_frames staging frames shared by all peers, and @p recv_frames_per_peer
-/// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. 8 MiB frames
-/// keep NIXL writes large enough to reach link bandwidth. The sizing is fixed until credits are
-/// granted on demand (#2371).
+/// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. A write covers
+/// up to half a peer's credits of consecutive frames: NVLink between nodes needs writes of 16 MiB
+/// or more (about 450 GB/s at 16 MiB, 700 at 128 MiB, 770 at 1 GiB). The sizing is fixed until
+/// credits are granted on demand (#2371).
 struct nixl_exchange_options {
-  std::size_t frame_bytes            = std::size_t{8} * 1024 * 1024;  // 8 MiB
-  std::uint32_t send_frames          = 16;
+  std::size_t frame_bytes            = std::size_t{16} * 1024 * 1024;  // 16 MiB
+  std::uint32_t send_frames          = 32;
   std::uint32_t recv_frames_per_peer = 8;
   host_staging staging               = host_staging::automatic;
+  mnnvl_mode mnnvl                   = mnnvl_mode::automatic;
   transport::options transport_options;
 };
 

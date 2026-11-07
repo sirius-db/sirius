@@ -59,7 +59,9 @@ constexpr std::size_t staged_header_bytes = 1 + 2 * sizeof(std::uint64_t);
 constexpr std::size_t pci_bus_id_bytes    = NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE;
 
 // kind | u32 rank | u32 device | u64 receive ring base | u64 receive ring bytes | u32 pid |
-// PCI bus id of the GPU, NUL-padded (names the receive mirror and decides host staging)
+// PCI bus id of the GPU, NUL-padded (names the receive mirror and decides host staging) |
+// u32 receive ring in fabric memory | u32 NVLink clique id | 16-byte NVLink cluster UUID (all
+// zero: no NVLink domain)
 struct hello {
   rank_t rank;
   std::uint32_t device;
@@ -67,6 +69,9 @@ struct hello {
   std::uint64_t bytes;
   std::uint32_t pid;
   char pci_bus_id[pci_bus_id_bytes];
+  std::uint32_t fabric_ring;
+  std::uint32_t clique_id;
+  std::uint8_t cluster_uuid[16];
 };
 
 std::string mirror_name(std::uint32_t pid, rank_t rank)
@@ -129,6 +134,27 @@ bool some_gpu_lacks_peer_access(std::string const& bus_id)
     }
   }
   return false;
+}
+
+/// The NVLink domain of the GPU at @p bus_id, by NVML's fabric info; invalid when NVML cannot
+/// tell or the GPU's fabric registration has not completed.
+nvlink_domain nvlink_domain_of(std::string const& bus_id)
+{
+  nvlink_domain out;
+  nvmlDevice_t device{};
+  if (!nvml_up() || nvmlDeviceGetHandleByPciBusId_v2(bus_id.c_str(), &device) != NVML_SUCCESS) {
+    return out;
+  }
+  nvmlGpuFabricInfoV_t info{};
+  info.version = nvmlGpuFabricInfo_v3;
+  if (nvmlDeviceGetGpuFabricInfoV(device, &info) != NVML_SUCCESS ||
+      info.state != NVML_GPU_FABRIC_STATE_COMPLETED || info.status != NVML_SUCCESS) {
+    return out;
+  }
+  static_assert(sizeof(info.clusterUuid) == sizeof(out.cluster_uuid));
+  std::memcpy(out.cluster_uuid.data(), info.clusterUuid, out.cluster_uuid.size());
+  out.clique_id = info.cliqueId;
+  return out;
 }
 
 /// Maps @p bytes of the shared-memory object @p name, creating it when @p create.
@@ -201,6 +227,12 @@ void require_free_port(std::uint16_t port)
 
 std::string agent_name(rank_t rank) { return "sirius-exchange-" + std::to_string(rank); }
 
+template <typename Peer>
+endpoint endpoint_of(Peer const& p, rank_t rank)
+{
+  return endpoint{rank, p.pci_bus_id, p.fabric_ring, p.domain};
+}
+
 nixl_reg_dlist_t ring_descs(frame_ring const& ring, int device)
 {
   nixl_reg_dlist_t descs(VRAM_SEG);
@@ -247,8 +279,10 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   RMM_CUDA_TRY(cudaStreamCreateWithFlags(&_h2d, cudaStreamNonBlocking));
   char bus_id[pci_bus_id_bytes] = {};
   RMM_CUDA_TRY(cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), _device));
-  _peers[_rank].pci_bus_id = bus_id;
-  _peers[_rank].pid        = static_cast<std::uint32_t>(::getpid());
+  _peers[_rank].pci_bus_id  = bus_id;
+  _peers[_rank].pid         = static_cast<std::uint32_t>(::getpid());
+  _peers[_rank].fabric_ring = recv.in_fabric_memory();
+  _peers[_rank].domain      = nvlink_domain_of(bus_id);
   // The mirror exists before the hello names it, so a peer that hears the hello can map it. In
   // automatic mode only a same-host GPU without peer access to this one would stage to it.
   bool const mirror = _peers.size() > 1 && (cfg.staging == host_staging::always ||
@@ -296,8 +330,12 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
              _recv.bytes(),
              // 0: no mirror, which map_mirror() on a peer reports.
              _mirror != nullptr ? _peers[_rank].pid : 0u,
+             {},
+             _peers[_rank].fabric_ring ? 1u : 0u,
+             _peers[_rank].domain.clique_id,
              {}};
   std::memcpy(mine.pci_bus_id, bus_id, sizeof(mine.pci_bus_id));
+  std::memcpy(mine.cluster_uuid, _peers[_rank].domain.cluster_uuid.data(), 16);
   auto const me = encode_hello(mine);
   std::vector<bool> greeted(_peers.size(), false);
   std::vector<bool> ready(_peers.size(), false);
@@ -348,19 +386,30 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   }
 
   // Every peer's hello is in: choose each peer's path.
+  auto const& self = _peers[_rank];
+  if (cfg.mnnvl != mnnvl_mode::off) {
+    SIRIUS_LOG_INFO("exchange: rank {} rings in {} memory, NVLink domain {}",
+                    _rank,
+                    self.fabric_ring ? "fabric" : "cudaMalloc",
+                    self.domain.to_string());
+  }
   for (rank_t r = 0; r < _peers.size(); ++r) {
     if (r == _rank) { continue; }
     auto& p = _peers[r];
-    p.staged =
-      cfg.staging == host_staging::always || (cfg.staging == host_staging::automatic &&
-                                              !peer_access(_peers[_rank].pci_bus_id, p.pci_bus_id));
-    if (p.staged) { map_mirror(r); }
-    SIRIUS_LOG_INFO("exchange: rank {} (GPU {}) -> rank {} (GPU {}): {}",
+    p.route = choose_path(
+      endpoint_of(self, _rank),
+      endpoint_of(p, r),
+      cfg.staging,
+      cfg.mnnvl,
+      cfg.staging != host_staging::automatic || peer_access(self.pci_bus_id, p.pci_bus_id));
+    if (p.route == path::shared_memory) { map_mirror(r); }
+    SIRIUS_LOG_INFO("exchange: rank {} (GPU {}) -> rank {} (GPU {}, NVLink domain {}): {}",
                     _rank,
-                    _peers[_rank].pci_bus_id,
+                    self.pci_bus_id,
                     r,
                     p.pci_bus_id,
-                    p.staged ? "host-staged through pinned shared memory" : "NIXL");
+                    p.domain.to_string(),
+                    describe(p.route));
   }
   std::move(release_on_throw).Cancel();
 }
@@ -466,7 +515,10 @@ void nixl_fabric::receive()
         p.device     = h.device;
         p.pid        = h.pid;
         p.pci_bus_id.assign(h.pci_bus_id, strnlen(h.pci_bus_id, sizeof(h.pci_bus_id)));
-        p.hello = true;
+        p.fabric_ring = h.fabric_ring != 0;
+        std::memcpy(p.domain.cluster_uuid.data(), h.cluster_uuid, p.domain.cluster_uuid.size());
+        p.domain.clique_id = h.clique_id;
+        p.hello            = true;
         continue;
       }
       if (!body.empty() && body.front() == staged_kind) {
@@ -505,7 +557,7 @@ std::uint64_t nixl_fabric::write(
     throw sirius::invalid_input_exception(
       "exchange NIXL: a {}-byte write from {} to {} is outside the rings", bytes, src, dst);
   }
-  if (p.staged) {
+  if (p.route == path::shared_memory) {
     RMM_CUDA_TRY(
       cudaMemcpyAsync(p.mirror + dst, _send.base() + src, bytes, cudaMemcpyDeviceToHost, _d2h));
     auto* copied = take_event();
@@ -537,6 +589,39 @@ std::uint64_t nixl_fabric::write(
   }
   _writes.emplace(_next_write, req);
   return _next_write++;
+}
+
+double nixl_fabric::timed_write(rank_t peer, std::size_t dst, std::size_t bytes)
+{
+  auto const& p = _peers.at(peer);
+  if (p.route == path::shared_memory || bytes > _send.bytes() || dst + bytes > p.recv_bytes) {
+    throw sirius::invalid_input_exception(
+      "exchange NIXL: a timed {}-byte write to {} of rank {} is not possible", bytes, dst, peer);
+  }
+  nixl_xfer_dlist_t local(VRAM_SEG);
+  local.addDesc(nixlBasicDesc(
+    reinterpret_cast<std::uintptr_t>(_send.base()), bytes, static_cast<std::uint64_t>(_device)));
+  nixl_xfer_dlist_t remote(VRAM_SEG);
+  remote.addDesc(nixlBasicDesc(p.recv_base + dst, bytes, p.device));
+  nixl_opt_args_t extra;
+  extra.backends.push_back(_backend);
+  nixlXferReqH* req = nullptr;
+  check(_agent->createXferReq(NIXL_WRITE, local, remote, p.agent, req, &extra), "createXferReq");
+  absl::Cleanup release_req = [&] { static_cast<void>(_agent->releaseXferReq(req)); };
+  auto const start          = std::chrono::steady_clock::now();
+  auto const deadline       = start + std::chrono::seconds{10};
+  auto s                    = _agent->postXferReq(req);
+  while (s == NIXL_IN_PROG && std::chrono::steady_clock::now() < deadline) {
+    s = _agent->getXferStatus(req);
+  }
+  auto const seconds =
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  if (s == NIXL_IN_PROG) {
+    throw sirius::internal_exception(
+      "exchange NIXL: a timed {}-byte write to rank {} took over ten seconds", bytes, peer);
+  }
+  check(s, "timed write");
+  return seconds;
 }
 
 fabric::write_status nixl_fabric::status(std::uint64_t id)
