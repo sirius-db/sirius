@@ -1,0 +1,95 @@
+# name: test/sql/sirius_gateway_join.test
+# description: registered ranks that never joined serve as they are; a dead one restarts the ranks before the next statement
+# group: [sirius_gateway]
+
+require sirius_gateway
+
+require quack
+
+# Quack's errors mention HTTP, which the runner would otherwise take as a reason to skip the file.
+set ignore_error_messages
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_join';
+
+# CPU stand-ins: the boot table names the process and says whether it joined. The session setup
+# joins it, as SET sirius_exchange_rank does, and asking it to exit gives a new process.
+statement ok
+SET GLOBAL sirius_gateway_rank_boot_id_sql = 'SELECT id FROM boot';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_joined_sql = 'SELECT joined FROM boot';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_exit_sql = 'UPDATE boot SET id = id || ''+'', joined = false';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'UPDATE boot SET joined = true';
+
+statement ok
+FROM sirius_gateway_test_serve(19940, 'jointoken', 'CREATE TABLE boot AS SELECT ''a'' AS id, false AS joined');
+
+statement ok
+FROM sirius_gateway_test_serve(19941, 'jointoken', 'CREATE TABLE boot AS SELECT ''b'' AS id, false AS joined');
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19940', exchange_port := 27240, token := 'jointoken', name := 'a');
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19941', exchange_port := 27241, token := 'jointoken', name := 'b');
+
+# A process that never joined serves as it is.
+query TT
+FROM sirius_gateway_run('SELECT id, joined FROM boot');
+----
+a	true
+
+# One that has joined restarts to join again.
+statement ok
+FROM sirius_gateway_restart();
+
+query TT
+FROM sirius_gateway_run('SELECT id, joined FROM boot');
+----
+a+	true
+
+statement ok
+FROM sirius_gateway_run('CREATE OR REPLACE VIEW v AS SELECT 42 AS x');
+
+# A registered rank that died between statements: its launcher starts it again, here 2 s later,
+# and the next statement restarts the ranks and replays the log first, without an error.
+statement ok
+FROM sirius_gateway_test_signal(1, 9);
+
+statement ok
+FROM sirius_gateway_test_serve(19941, 'jointoken', '.shell sleep 2
+CREATE TABLE boot AS SELECT ''b2'' AS id, false AS joined');
+
+query TI
+FROM sirius_gateway_run('SELECT id, (FROM v) FROM boot');
+----
+a++	42
+
+query TT
+SELECT name, last_error FROM sirius_gateway_status() WHERE last_error IS NOT NULL;
+----
+b	lost: quack:127.0.0.1:19941 took no connection
+
+query TTI
+FROM quack_query('quack:127.0.0.1:19941', 'SELECT id, joined, (FROM v) FROM boot', token := 'jointoken');
+----
+b2	true	42
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'ready';
+----
+2
+
+statement ok
+FROM sirius_gateway_stop();

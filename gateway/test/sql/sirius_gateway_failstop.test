@@ -103,6 +103,12 @@ SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'r
 ----
 2
 
+# The status keeps each rank's last failure.
+query IT
+SELECT rank, regexp_replace(last_error, ';.*', '') FROM sirius_gateway_status() WHERE last_error IS NOT NULL;
+----
+1	rank 1 exited
+
 # A rank that stops answering ignores the cancel: after the grace period the gateway kills it.
 statement ok
 SET sirius_gateway_statement_timeout = 1;

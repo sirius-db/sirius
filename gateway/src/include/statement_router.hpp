@@ -7,7 +7,7 @@ namespace sirius_gateway {
 /// Rewrites a Quack client's SQL so each statement runs on every rank through
 /// `sirius_gateway_run`, except reads of the gateway itself (`sirius_gateway_status`,
 /// `sirius_gateway_log`), which run on the gateway.
-/// With @p allow_join (`sirius_gateway_allow_remote_join`), `sirius_gateway_add_rank` and
+/// With @p allow_join (`sirius_gateway_allow_join`), `sirius_gateway_add_rank` and
 /// `sirius_gateway_drop_rank` also run on the gateway, so that a rank's node can register it.
 /// @throws duckdb::InvalidInputException for settings the gateway owns, and for the other
 /// `sirius_gateway_*` and `quack_*` functions, which only the gateway's console may call.
