@@ -313,11 +313,19 @@ void LoadInternal(ExtensionLoader& loader)
                             "Directory for rank init files and logs; empty uses a temporary one",
                             LogicalType::VARCHAR,
                             Value(""));
+  // A rank waiting on a peer that never ran the query has no bound of its own, so 0 can hold
+  // the gateway's one turn forever.
   config.AddExtensionOption(
     "sirius_gateway_statement_timeout",
-    "Seconds one statement may run before it is cancelled on every rank; 0 is none",
+    "Seconds one statement may run before it is cancelled on every rank; 0 is none. Raise it "
+    "for long queries",
     LogicalType::UBIGINT,
-    Value::UBIGINT(0));
+    Value::UBIGINT(3600));
+  config.AddExtensionOption("sirius_gateway_cancel_grace",
+                            "Seconds a cancelled statement may keep running on a rank before the "
+                            "gateway kills the rank and restarts every rank",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(30));
   config.AddExtensionOption("sirius_gateway_query_id_setting",
                             "Setting that carries the query number to each rank; empty sends none",
                             LogicalType::VARCHAR,

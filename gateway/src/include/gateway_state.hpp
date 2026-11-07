@@ -53,8 +53,9 @@ struct rank {
   bool remote = false;
   std::string uri;
   std::string catalog;
-  /// The only user of `catalog`, CONNECTed to it: the rank's persistent session.
-  std::unique_ptr<duckdb::Connection> channel;
+  /// The only user of `catalog`, CONNECTed to it: the rank's persistent session. Shared with
+  /// the call running on it, which may outlive the statement if the gateway gives up on it.
+  std::shared_ptr<duckdb::Connection> channel;
   /// That session's Quack connection id, which `quack_cancel` takes.
   std::string session;
 };
@@ -109,11 +110,14 @@ class gateway_state {
   struct fan_out_policy {
     bool watch_client  = true;
     uint64_t timeout_s = 0;
+    uint64_t grace_s   = 30;
   };
   struct fan_out_result {
     std::vector<outcome> outcomes;
     /// Why the calls were cancelled; empty if they were not.
     std::string cancelled;
+    /// Ranks killed because they did not stop within the grace period after the cancel.
+    std::vector<uint32_t> killed;
   };
 
   void start_locked(duckdb::ClientContext& context, start_options options);
@@ -123,13 +127,13 @@ class gateway_state {
   std::shared_ptr<rank_result> run_locked(duckdb::ClientContext& context,
                                           std::string const& sql,
                                           bool replay);
-  /// Runs @p statements on every rank, each rank's in order, ranks in parallel. Cancels them on
-  /// every rank if @p context is interrupted or the timeout passes, and then sets the result's
-  /// cancelled to the reason.
+  /// Runs @p statements on every rank, each rank's in order, ranks in parallel. If @p context is
+  /// interrupted or the timeout passes, no rank starts another statement, and quack_cancel is
+  /// sent every 100 ms to each rank still running; a rank still running after the grace period
+  /// is killed, and a call still stuck after that is abandoned.
   fan_out_result fan_out(duckdb::ClientContext& context,
                          std::vector<std::vector<std::string>> const& statements,
                          fan_out_policy policy);
-  void cancel_all();
   fan_out_policy client_policy(duckdb::ClientContext& context);
   /// Under state_mutex_: the cluster is failed for @p reason, unless it already was.
   void fail_locked(std::string reason);
