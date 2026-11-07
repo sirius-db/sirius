@@ -974,7 +974,7 @@ connected, none of these settings can change, on any connection.
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. Needs a build with `-DSIRIUS_WITH_NIXL=ON`. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
 | `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
-| `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the gateway on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
+| `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the [gateway](distributed-gateway.md) on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
 
 ### Pinned Tables
 
