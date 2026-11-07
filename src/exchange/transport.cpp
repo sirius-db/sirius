@@ -30,6 +30,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <optional>
@@ -48,6 +49,35 @@ std::uint32_t slot_of(rank_t from, rank_t to) { return from < to ? from : from -
 std::uint32_t frames_for(std::uint64_t stream_bytes, std::size_t frame_bytes)
 {
   return static_cast<std::uint32_t>(utils::ceil_div<std::uint64_t>(stream_bytes, frame_bytes));
+}
+
+/// Consecutive frame numbers [first, first + length).
+struct frame_run {
+  std::uint32_t first{0};
+  std::uint32_t length{0};
+};
+
+/// The longest run of consecutive frame numbers in @p pool (the first of equals), which it
+/// sorts; empty for an empty pool.
+frame_run longest_run(std::vector<std::uint32_t>& pool)
+{
+  std::sort(pool.begin(), pool.end());
+  frame_run best{};
+  std::size_t start = 0;
+  for (std::size_t i = 1; i <= pool.size(); ++i) {
+    if (i < pool.size() && pool[i] == pool[i - 1] + 1) { continue; }
+    auto const length = static_cast<std::uint32_t>(i - start);
+    if (length > best.length) { best = {pool[start], length}; }
+    start = i;
+  }
+  return best;
+}
+
+/// Removes the frames of @p run, which a sorted @p pool holds, from it.
+void take(std::vector<std::uint32_t>& pool, frame_run run)
+{
+  auto const at = std::lower_bound(pool.begin(), pool.end(), run.first);
+  pool.erase(at, at + run.length);
 }
 
 /// cudaEvent_t, created once and reused. Destroys every event it created, checked out or not, so
@@ -101,6 +131,9 @@ struct transport::engine {
   options opts;
   int device{0};
   std::uint32_t credits_per_peer{0};
+  /// The most frames one write covers: half a peer's credits, so that two writes to a peer can
+  /// be in flight while the receiver copies the first out.
+  std::uint32_t max_write_frames{1};
   rmm::cuda_stream send_stream;
   rmm::cuda_stream recv_stream;
   event_pool events;
@@ -124,6 +157,8 @@ struct transport::engine {
     std::optional<queued> current;
     std::uint32_t next_k{0};
     std::uint32_t frames{0};
+    /// Frames staged for this peer and not yet written: at most its credits.
+    std::uint32_t unwritten{0};
   };
   std::vector<peer_out> out;
   /// stage() starts at this peer, one further each pass, so low ranks get no head start on the
@@ -134,16 +169,19 @@ struct transport::engine {
   struct staged_frame {
     cudaEvent_t copied;
     rank_t peer;
+    /// The first of message.frames send frames not yet written.
     std::uint32_t send_frame;
+    /// The frames not yet written; its recv_frame is chosen per write.
     frame_message message;
     /// The batch, held until its last frame is staged.
     std::shared_ptr<outgoing_batch> batch;
+    bool copy_done{false};
   };
   std::deque<staged_frame> staged;  // in send-stream order
 
   struct posted_write {
     std::uint64_t id;
-    std::uint32_t send_frame;
+    frame_run send_frames;
   };
   std::vector<posted_write> writes;
 
@@ -165,7 +203,7 @@ struct transport::engine {
   struct copy_out {
     cudaEvent_t copied;
     landing_key key;
-    std::uint32_t recv_frame;
+    frame_run recv_frames;
   };
   std::deque<copy_out> copies;  // in receive-stream order
 
@@ -200,6 +238,8 @@ struct transport::engine {
         throw sirius::invalid_input_exception(
           "exchange: {} receive frames for {} peers", recv_ring.frames(), peers);
       }
+      max_write_frames =
+        std::max<std::uint32_t>(1, std::min(credits_per_peer, send_ring.frames()) / 2);
     }
     if (send_ring.frame_bytes() != recv_ring.frame_bytes()) {
       throw sirius::invalid_input_exception("exchange: send and receive frames differ in size");
@@ -245,12 +285,21 @@ struct transport::engine {
   void on_frame(rank_t from, frame_message m)
   {
     auto const first = slot_of(from, fab.rank()) * credits_per_peer;
-    if (m.recv_frame < first || m.recv_frame >= first + credits_per_peer ||
-        recv_in_use[m.recv_frame]) {
+    if (m.frames == 0 || m.recv_frame < first || m.frames > credits_per_peer ||
+        m.recv_frame - first > credits_per_peer - m.frames) {
       throw sirius::invalid_input_exception(
-        "exchange: rank {} wrote receive frame {}, which it does not hold", from, m.recv_frame);
+        "exchange: rank {} wrote receive frames [{}, +{}), which it does not hold",
+        from,
+        m.recv_frame,
+        m.frames);
     }
-    recv_in_use[m.recv_frame] = true;
+    for (std::uint32_t f = m.recv_frame; f < m.recv_frame + m.frames; ++f) {
+      if (recv_in_use[f]) {
+        throw sirius::invalid_input_exception(
+          "exchange: rank {} wrote receive frame {}, which it does not hold", from, f);
+      }
+      recv_in_use[f] = true;
+    }
     landing_key const key{from, m.stream, m.batch};
     auto& l = landings[key];
     if (m.k == 0) {
@@ -279,17 +328,25 @@ struct transport::engine {
     }
     for (auto const& m : l.waiting) {
       auto const at = static_cast<std::uint64_t>(m.k) * frame_bytes();
-      if (m.k >= l.seen.size() || l.seen[m.k] ||
-          m.bytes != std::min<std::uint64_t>(frame_bytes(), l.header->stream_bytes - at)) {
+      bool const fits =
+        m.k < l.seen.size() && m.frames <= l.seen.size() - m.k &&
+        m.bytes == std::min<std::uint64_t>(std::uint64_t{m.frames} * frame_bytes(),
+                                           l.header->stream_bytes - at) &&
+        frames_for(m.bytes, frame_bytes()) == m.frames &&
+        std::none_of(
+          l.seen.begin() + m.k, l.seen.begin() + m.k + m.frames, [](bool seen) { return seen; });
+      if (!fits) {
         throw sirius::invalid_input_exception(
-          "exchange: frame {} of {} bytes does not fit a {}-byte batch, or came twice",
+          "exchange: a write of frames [{}, +{}) and {} bytes does not fit a {}-byte batch, or "
+          "came twice",
           m.k,
+          m.frames,
           m.bytes,
           l.header->stream_bytes);
       }
-      l.seen[m.k] = true;
+      std::fill(l.seen.begin() + m.k, l.seen.begin() + m.k + m.frames, true);
       l.in->copy_in(at, recv_ring.frame(m.recv_frame), m.bytes, recv_stream.view());
-      copies.push_back({events.record(recv_stream.view()), key, m.recv_frame});
+      copies.push_back({events.record(recv_stream.view()), key, {m.recv_frame, m.frames}});
     }
     l.waiting.clear();
     return true;
@@ -346,12 +403,15 @@ struct transport::engine {
       auto const c = copies.front();
       copies.pop_front();
       progress                         = true;
-      recv_in_use[c.recv_frame]        = false;
       auto const [from, stream, batch] = c.key;
-      credits_back[from].push_back(c.recv_frame);
+      for (auto f = c.recv_frames.first; f < c.recv_frames.first + c.recv_frames.length; ++f) {
+        recv_in_use[f] = false;
+        credits_back[from].push_back(f);
+      }
       auto it = landings.find(c.key);
       auto& l = it->second;
-      if (++l.copied < l.seen.size()) { continue; }
+      l.copied += c.recv_frames.length;
+      if (l.copied < l.seen.size()) { continue; }
       auto received = l.in->seal(recv_stream.view());
       landings.erase(it);
       try {
@@ -374,7 +434,9 @@ struct transport::engine {
 
   // ---- sending -------------------------------------------------------------------------------
 
-  /// Stages the next frames of each peer's current batch, while send frames and credits last.
+  /// Stages the next frames of each peer's current batch into the send ring, while send frames
+  /// last and the peer has less than a window (its credits) staged and not yet written. Staging
+  /// does not wait for credits, so a returned credit finds the next frames already copied.
   bool stage(std::mutex& mutex)
   {
     bool progress    = false;
@@ -397,20 +459,26 @@ struct transport::engine {
         progress = true;
         continue;
       }
-      while (p.next_k < p.frames && !free_send.empty() && !p.credits.empty()) {
-        auto const send_frame = free_send.back();
-        free_send.pop_back();
-        auto const recv_frame = p.credits.back();
-        p.credits.pop_back();
+      // Each staged run is up to max_write_frames consecutive send frames; post() writes it in
+      // as few writes as the peer's consecutive credits allow.
+      while (p.next_k < p.frames && !free_send.empty() && p.unwritten < credits_per_peer) {
+        auto const sends = longest_run(free_send);
+        auto const n     = std::min(
+          {p.frames - p.next_k, max_write_frames, sends.length, credits_per_peer - p.unwritten});
+        take(free_send, {sends.first, n});
         auto const& batch = p.current->out;
         auto const at     = static_cast<std::size_t>(p.next_k) * frame_bytes();
-        auto const bytes  = std::min<std::size_t>(frame_bytes(), batch->stream_bytes() - at);
-        batch->copy_range(at, at + bytes, send_ring.frame(send_frame), send_stream.view());
-        frame_message m{p.current->stream, p.current->batch, p.next_k, recv_frame, bytes, {}};
+        auto const bytes =
+          std::min<std::size_t>(std::size_t{n} * frame_bytes(), batch->stream_bytes() - at);
+        batch->copy_range(at, at + bytes, send_ring.frame(sends.first), send_stream.view());
+        // The receive frames are chosen when the run is written.
+        frame_message m{p.current->stream, p.current->batch, p.next_k, 0, bytes, {}};
+        m.frames = n;
+        p.unwritten += n;
         if (p.next_k == 0) { m.header = encode_header(batch->header()); }
         staged.push_back(
-          {events.record(send_stream.view()), peer, send_frame, std::move(m), batch});
-        ++p.next_k;
+          {events.record(send_stream.view()), peer, sends.first, std::move(m), batch});
+        p.next_k += n;
         progress = true;
       }
       if (p.next_k == p.frames) { p.current.reset(); }
@@ -423,24 +491,49 @@ struct transport::engine {
   std::size_t post(bool& progress)
   {
     std::size_t released = 0;
-    while (!staged.empty() && events.done(staged.front().copied)) {
-      auto f = std::move(staged.front());
-      staged.pop_front();
-      progress         = true;
-      auto const bytes = f.message.bytes;
-      auto const src   = static_cast<std::size_t>(f.send_frame) * frame_bytes();
-      auto const dst   = static_cast<std::size_t>(f.message.recv_frame) * frame_bytes();
-      auto const last =
-        static_cast<std::uint64_t>(f.message.k) * frame_bytes() + bytes == f.batch->stream_bytes();
-      writes.push_back(
-        {fab.write(f.peer, src, dst, bytes, encode(std::move(f.message))), f.send_frame});
-      if (last) { released += f.batch->stream_bytes(); }
+    // Copies finish in send-stream order: past the first one still running, none is done.
+    for (auto it = staged.begin(); it != staged.end();) {
+      auto& f = *it;
+      if (!f.copy_done) {
+        if (!events.done(f.copied)) { break; }
+        f.copy_done = true;
+      }
+      auto& p = out[f.peer];
+      // Write the run's frames into the peer's longest runs of consecutive credits.
+      while (f.message.frames > 0 && !p.credits.empty()) {
+        auto const credits = longest_run(p.credits);
+        auto const n       = std::min(credits.length, f.message.frames);
+        take(p.credits, {credits.first, n});
+        frame_message w = f.message;
+        w.recv_frame    = credits.first;
+        w.frames        = n;
+        w.bytes        = std::min<std::uint64_t>(std::uint64_t{n} * frame_bytes(), f.message.bytes);
+        auto const src = static_cast<std::size_t>(f.send_frame) * frame_bytes();
+        auto const dst = static_cast<std::size_t>(credits.first) * frame_bytes();
+        auto const last =
+          static_cast<std::uint64_t>(w.k) * frame_bytes() + w.bytes == f.batch->stream_bytes();
+        auto const bytes = w.bytes;
+        writes.push_back(
+          {fab.write(f.peer, src, dst, bytes, encode(std::move(w))), {f.send_frame, n}});
+        f.send_frame += n;
+        f.message.k += n;
+        f.message.frames -= n;
+        f.message.bytes -= bytes;
+        f.message.header.clear();  // only the write of frame 0 carries it
+        p.unwritten -= n;
+        progress = true;
+        if (last) { released += f.batch->stream_bytes(); }
+      }
+      it = f.message.frames == 0 ? staged.erase(it) : std::next(it);
     }
     for (auto it = writes.begin(); it != writes.end();) {
       switch (fab.status(it->id)) {
         case fabric::write_status::pending: ++it; break;
         case fabric::write_status::done:
-          free_send.push_back(it->send_frame);
+          for (auto f = it->send_frames.first; f < it->send_frames.first + it->send_frames.length;
+               ++f) {
+            free_send.push_back(f);
+          }
           it       = writes.erase(it);
           progress = true;
           break;
@@ -691,10 +784,18 @@ void transport::run()
         throw sirius::internal_exception("exchange: no progress for {} ms",
                                          e.opts.stall_timeout.count());
       }
-      // The fabric has no blocking wait: poll often while frames are in flight, less when idle.
+      // The fabric has no blocking wait. Right after progress, frames move every few
+      // microseconds (a 64 MiB write over NVLink takes about 90): spin, as a sleep alone would
+      // cost tens of microseconds each time. Then poll often while frames are in flight, less
+      // when idle.
+      constexpr std::chrono::microseconds spin_after_progress{500};
       constexpr std::chrono::microseconds busy_poll_interval{20};
       constexpr std::chrono::microseconds idle_poll_interval{200};
-      std::this_thread::sleep_for(e.busy() ? busy_poll_interval : idle_poll_interval);
+      if (e.busy() && now - last_progress < spin_after_progress) {
+        std::this_thread::yield();
+      } else {
+        std::this_thread::sleep_for(e.busy() ? busy_poll_interval : idle_poll_interval);
+      }
     }
   } catch (...) {
     auto const error = std::current_exception();

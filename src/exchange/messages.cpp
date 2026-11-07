@@ -27,7 +27,8 @@ namespace {
 static_assert(std::endian::native == std::endian::little, "exchange messages are little-endian");
 
 // u8 kind | body, as native integers:
-//   frame:  u64 stream | u64 batch | u32 k | u32 recv frame | u64 bytes | u32 n | n header bytes
+//   frame:  u64 stream | u64 batch | u32 k | u32 recv frame | u64 bytes | u32 frames | u32 n |
+//           n header bytes
 //   credit: u32 n | n x u32 frame
 //   end:    u64 stream | u64 batches
 //   error:  utf-8 text to the end
@@ -74,6 +75,7 @@ std::string encode(message const& m)
                           put(out, f.k);
                           put(out, f.recv_frame);
                           put(out, f.bytes);
+                          put(out, f.frames);
                           put(out, static_cast<std::uint32_t>(f.header.size()));
                           out.append(reinterpret_cast<char const*>(f.header.data()),
                                      f.header.size());
@@ -113,6 +115,10 @@ message decode(std::string_view in)
       f.k          = take<std::uint32_t>(in);
       f.recv_frame = take<std::uint32_t>(in);
       f.bytes      = take<std::uint64_t>(in);
+      f.frames     = take<std::uint32_t>(in);
+      if (f.frames == 0) {
+        throw sirius::invalid_input_exception("exchange message: a write of no frames");
+      }
       auto const n = take<std::uint32_t>(in);
       if (n != in.size()) {
         throw sirius::invalid_input_exception(
