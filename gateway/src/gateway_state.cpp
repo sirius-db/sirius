@@ -72,8 +72,8 @@ bool changes_state(std::string const& sql)
 }
 
 /// Whether @p sql only reads the catalog: SELECTs whose every table, at any depth, is a
-/// `duckdb_*()` or `pragma_*()` table function or one of the statement's top-level CTEs. Quack
-/// sends such reads on every client's ATTACH.
+/// `duckdb_*()`, `pragma_*()` or `sirius_rank_info()` table function or one of the statement's
+/// top-level CTEs. Quack sends such reads on every client's ATTACH.
 bool reads_only_catalog(std::string const& sql)
 {
   using namespace duckdb;
@@ -106,7 +106,7 @@ bool reads_only_catalog(std::string const& sql)
               ? StringUtil::Lower(f.Cast<FunctionExpression>().FunctionName().GetIdentifierName())
               : std::string{};
           only = only && (StringUtil::StartsWith(name, "duckdb_") ||
-                          StringUtil::StartsWith(name, "pragma_"));
+                          StringUtil::StartsWith(name, "pragma_") || name == "sirius_rank_info");
           break;
         }
         case TableReferenceType::JOIN:
@@ -187,6 +187,7 @@ bool transport_failed(std::string const& message)
 bool rank_unreachable(std::string const& message)
 {
   return message.find("Failed to send message") != std::string::npos ||
+         message.find("Invalid connection id") != std::string::npos ||
          message.find("did not answer; abandoned") != std::string::npos;
 }
 
@@ -367,8 +368,14 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     state_ = cluster_state::starting;
     reason_.clear();
   }
-  if (options.ranks == 0) {
-    throw InvalidInputException("sirius_gateway_start needs at least one rank");
+  std::vector<rank_spec> registered;
+  {
+    std::lock_guard lock{state_mutex_};
+    registered = registered_;
+  }
+  if (options.ranks == 0 && registered.empty()) {
+    throw InvalidInputException(
+      "sirius_gateway_start needs at least one rank, or ranks added with sirius_gateway_add_rank");
   }
   if (!options.gpus.empty() && options.gpus.size() != options.ranks) {
     throw InvalidInputException(
@@ -378,17 +385,19 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     throw InvalidInputException(
       "hosts lists %d hosts for %d ranks", options.hosts.size(), options.ranks);
   }
-  if (options.duckdb_binary.empty()) {
+  if (options.ranks > 0 && options.duckdb_binary.empty()) {
     throw InvalidInputException(
       "SET sirius_gateway_duckdb_binary to the DuckDB that runs each rank");
   }
   std::filesystem::create_directories(options.log_dir);
 
-  std::vector<rank> ranks(options.ranks);
-  std::string peers;
+  auto const token = random_token();
+  std::vector<rank> ranks(options.ranks + registered.size());
   for (uint32_t i = 0; i < options.ranks; ++i) {
     auto& r  = ranks[i];
     r.index  = i;
+    r.name   = "rank_" + std::to_string(i);
+    r.token  = token;
     r.gpu    = options.gpus.empty() ? std::to_string(i) : options.gpus[i];
     r.host   = options.hosts.empty() ? "127.0.0.1" : options.hosts[i];
     r.remote = !is_local_host(r.host);
@@ -400,22 +409,58 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
         r.host);
     }
     // A remote rank's launcher forwards this port to the rank's own 127.0.0.1.
-    r.uri     = "quack:127.0.0.1:" + std::to_string(options.quack_base_port + i);
-    r.catalog = "sirius_rank_" + std::to_string(i);
-    peers += (i ? "," : "") + r.host + ":" + std::to_string(options.exchange_base_port + i);
+    r.quack_port    = options.quack_base_port + i;
+    r.exchange_port = options.exchange_base_port + i;
+    r.uri           = "quack:127.0.0.1:" + std::to_string(r.quack_port);
   }
-  auto const token = random_token();
+  // Registered ranks follow the spawned ones, in the order they were added.
+  for (uint32_t j = 0; j < registered.size(); ++j) {
+    auto& r         = ranks[options.ranks + j];
+    auto const& s   = registered[j];
+    r.index         = options.ranks + j;
+    r.name          = s.name;
+    r.registered    = true;
+    r.host          = s.exchange_host;
+    r.exchange_port = s.exchange_port;
+    r.quack_port    = s.quack_port;
+    r.token         = s.token;
+    r.fingerprint   = s.fingerprint;
+    r.uri           = "quack:" + s.quack_host + ":" + std::to_string(s.quack_port);
+  }
+  // A loopback exchange address reaches only its own host's ranks, and NIXL then waits two
+  // minutes for the others; refuse the mix at once.
+  auto const loopback = [](std::string const& host) {
+    return host == "localhost" || host == "::1" || host.rfind("127.", 0) == 0;
+  };
+  for (auto& r : ranks) {
+    r.host = numeric_address(r.host);
+  }
+  for (auto const& r : ranks) {
+    if (loopback(r.host) && !std::all_of(ranks.begin(), ranks.end(), [&](rank const& other) {
+          return loopback(other.host);
+        })) {
+      throw InvalidInputException(
+        "rank %s's exchange address %s is a loopback address, which the other ranks cannot reach",
+        r.name,
+        r.host);
+    }
+  }
+  std::string peers;
+  for (auto& r : ranks) {
+    r.catalog = "sirius_rank_" + std::to_string(r.index);
+    peers += (r.index ? "," : "") + r.host + ":" + std::to_string(r.exchange_port);
+  }
   try {
     {
       std::lock_guard lock{state_mutex_};
       ranks_   = std::move(ranks);
       options_ = options;
       for (auto& r : ranks_) {
-        spawn_rank(options_, token, r);
+        if (!r.registered) { spawn_rank(options_, token, r); }
       }
     }
     for (auto& r : ranks_) {
-      connect_rank(r, token);
+      connect_rank(r, 600s);
     }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
@@ -453,12 +498,19 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
   }
 }
 
-void gateway_state::connect_rank(rank& r, std::string const& token)
+void gateway_state::connect_rank(rank& r, std::chrono::seconds patience)
 {
   Connection admin{db_};
-  auto const attach = "ATTACH " + KeywordHelper::WriteQuoted(r.uri) + " AS " + r.catalog +
-                      " (TOKEN " + KeywordHelper::WriteQuoted(token) + ")";
-  auto const deadline = steady_clock::now() + 600s;
+  auto attach = "ATTACH " + KeywordHelper::WriteQuoted(r.uri) + " AS " + r.catalog + " (TOKEN " +
+                KeywordHelper::WriteQuoted(r.token);
+  if (!r.fingerprint.empty()) {
+    attach += ", SSL_FINGERPRINT " + KeywordHelper::WriteQuoted(r.fingerprint);
+    // Quack's TLS client reads http_timeout (30 s by default) for every call, so a longer
+    // statement would fail; its plain client waits a day. The statement timeout bounds both.
+    admin.Query("SET GLOBAL http_timeout = 86400");
+  }
+  attach += ")";
+  auto const deadline = steady_clock::now() + patience;
   for (;;) {
     {
       std::lock_guard lock{state_mutex_};
@@ -472,20 +524,105 @@ void gateway_state::connect_rank(rank& r, std::string const& token)
     auto result =
       attached->HasError() ? std::move(attached) : channel->Query("CONNECT " + r.catalog);
     if (!result->HasError()) { result = channel->Query("SELECT 1"); }
-    if (!result->HasError()) {
+    // A registered rank joins as a new process: its exchange's peers are fixed once it connects.
+    // While it still runs the process the gateway last saw, ask that one to exit; its launcher
+    // starts a new one.
+    std::string retiring;
+    if (!result->HasError() && r.registered) {
+      auto boot = channel->Query(options_.boot_id_sql);
+      if (boot->HasError()) {
+        result = std::move(boot);
+      } else {
+        auto const id = boot->Fetch()->GetValue(0, 0).ToString();
+        std::lock_guard lock{state_mutex_};
+        auto* spec = find_registered(r.name);
+        if (spec && spec->boot_id == id) {
+          retiring = id;
+        } else if (spec) {
+          spec->boot_id = id;
+        }
+      }
+      if (!retiring.empty()) { channel->Query(options_.exit_sql); }
+    }
+    if (!result->HasError() && retiring.empty()) {
       auto id =
         admin.Query("SELECT quack_connection_id(" + KeywordHelper::WriteQuoted(r.catalog) + ")");
       if (id->HasError()) { throw IOException("rank %d: %s", r.index, id->GetError()); }
+      std::lock_guard lock{state_mutex_};
       r.session = id->Fetch()->GetValue(0, 0).ToString();
       r.channel = std::move(channel);
       return;
     }
-    if (steady_clock::now() > deadline) {
-      throw IOException("rank %d did not answer at %s: %s", r.index, r.uri, result->GetError());
+    if (steady_clock::now() >= deadline) {
+      if (!retiring.empty()) {
+        throw IOException("rank %d (%s) still runs the process the gateway asked to exit (%s)",
+                          r.index,
+                          r.name,
+                          retiring);
+      }
+      throw IOException(
+        "rank %d (%s) did not answer at %s: %s", r.index, r.name, r.uri, result->GetError());
     }
     channel.reset();
     admin.Query("DETACH DATABASE IF EXISTS " + r.catalog);
     std::this_thread::sleep_for(200ms);
+  }
+}
+
+rank_spec* gateway_state::find_registered(std::string const& name)
+{
+  auto it = std::find_if(
+    registered_.begin(), registered_.end(), [&](auto const& s) { return s.name == name; });
+  return it == registered_.end() ? nullptr : &*it;
+}
+
+void gateway_state::add_rank(ClientContext& context, rank_spec spec)
+{
+  turn t{*this, context};
+  {
+    std::lock_guard lock{state_mutex_};
+    if (find_registered(spec.name)) {
+      throw InvalidInputException("a rank named %s is already registered", spec.name);
+    }
+    registered_.push_back(spec);
+  }
+  // Fail now, with Quack's own error, on a wrong address, token or fingerprint. The probe
+  // records the rank's boot id, so its first join restarts it.
+  rank probe;
+  probe.name           = spec.name;
+  probe.registered     = true;
+  probe.uri            = "quack:" + spec.quack_host + ":" + std::to_string(spec.quack_port);
+  probe.catalog        = "sirius_probe";
+  probe.token          = spec.token;
+  probe.fingerprint    = spec.fingerprint;
+  options_.boot_id_sql = setting(context, "sirius_gateway_rank_boot_id_sql", "");
+  try {
+    connect_rank(probe, 10s);
+  } catch (...) {
+    std::lock_guard lock{state_mutex_};
+    registered_.pop_back();
+    throw;
+  }
+  probe.channel.reset();
+  Connection{db_}.Query("DETACH DATABASE IF EXISTS sirius_probe");
+
+  std::lock_guard lock{state_mutex_};
+  if (state_ != cluster_state::stopped) {
+    fail_locked("membership changed: added " + spec.name +
+                ", so the gateway restarts the ranks before the next statement");
+  }
+}
+
+void gateway_state::drop_rank(ClientContext& context, std::string const& name)
+{
+  turn t{*this, context};
+  std::lock_guard lock{state_mutex_};
+  auto* spec = find_registered(name);
+  if (!spec) { throw InvalidInputException("no rank named %s was added", name); }
+  registered_.erase(registered_.begin() + (spec - registered_.data()));
+  if (state_ != cluster_state::stopped) {
+    fail_locked("membership changed: dropped " + name +
+                ", so the gateway restarts the ranks before the next statement");
   }
 }
 
@@ -627,7 +764,7 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
       killed += (killed.empty() ? "" : ", ") + std::to_string(i);
     }
     fatal = prefix + ran.cancelled + "; rank " + killed + " did not stop within " +
-            std::to_string(policy.grace_s) + " s of the cancel and was killed";
+            std::to_string(policy.grace_s) + " s of the cancel";
   } else if (!lost.empty()) {
     std::string names;
     for (auto const i : lost) {
@@ -770,6 +907,20 @@ void gateway_state::signal_rank(uint32_t index, int signal)
   }
 }
 
+void gateway_state::test_serve(start_options const& options,
+                               uint32_t port,
+                               std::string const& token,
+                               std::string const& init_sql)
+{
+  std::filesystem::create_directories(options.log_dir);
+  rank server;
+  server.index = port;
+  server.uri   = "quack:127.0.0.1:" + std::to_string(port);
+  spawn_rank(options, token, server, init_sql);
+  std::lock_guard lock{state_mutex_};
+  test_servers_.push_back(std::move(server));
+}
+
 uint64_t gateway_state::running_query_id()
 {
   std::lock_guard lock{state_mutex_};
@@ -781,11 +932,36 @@ std::vector<gateway_state::rank_status> gateway_state::status()
   std::lock_guard lock{state_mutex_};
   std::vector<rank_status> rows;
   for (auto const& r : ranks_) {
-    rows.push_back(
-      {r.index, r.pid, r.gpu, r.host, r.uri, r.pid < 0 ? "exited" : "up", state_, reason_});
+    auto const up = r.registered ? r.channel != nullptr : r.pid >= 0;
+    rows.push_back({r.index,
+                    r.name,
+                    r.registered,
+                    r.pid,
+                    r.gpu,
+                    r.host,
+                    r.uri,
+                    up ? "up" : "exited",
+                    state_,
+                    reason_});
+  }
+  // Added since the ranks last started: they join on the next statement.
+  for (auto const& spec : registered_) {
+    if (std::none_of(
+          ranks_.begin(), ranks_.end(), [&](rank const& r) { return r.name == spec.name; })) {
+      rows.push_back({0,
+                      spec.name,
+                      true,
+                      -1,
+                      "",
+                      spec.exchange_host,
+                      "quack:" + spec.quack_host + ":" + std::to_string(spec.quack_port),
+                      "registered",
+                      state_,
+                      reason_});
+    }
   }
   if (rows.empty() && state_ != cluster_state::ready) {
-    rows.push_back({0, -1, "", "", "", to_string(state_), state_, reason_});
+    rows.push_back({0, "", false, -1, "", "", "", to_string(state_), state_, reason_});
   }
   return rows;
 }

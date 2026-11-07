@@ -1,0 +1,126 @@
+# name: test/sql/sirius_gateway_registry.test
+# description: ranks started outside the gateway: add, join as a new process, drop
+# group: [sirius_gateway]
+
+require sirius_gateway
+
+require quack
+
+# Quack's errors mention HTTP, which the runner would otherwise take as a reason to skip the file.
+set ignore_error_messages
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_registry';
+
+# CPU stand-ins for sirius_rank_info and sirius_rank_exit: a rank's process is the id in its
+# boot table, and asking it to exit gives it a new one.
+statement ok
+SET GLOBAL sirius_gateway_rank_boot_id_sql = 'SELECT id FROM boot';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_exit_sql = 'UPDATE boot SET id = id || ''+''';
+
+statement ok
+FROM sirius_gateway_test_serve(19910, 'regtoken', 'CREATE TABLE boot AS SELECT ''a'' AS id');
+
+statement ok
+FROM sirius_gateway_test_serve(19911, 'regtoken', 'CREATE TABLE boot AS SELECT ''b'' AS id');
+
+statement error
+FROM sirius_gateway_add_rank('127.0.0.1:19910', exchange_port := 27210);
+----
+needs exchange_port := and token :=
+
+query TTT
+SELECT name, state, cluster FROM sirius_gateway_add_rank('127.0.0.1:19910', exchange_port := 27210, token := 'regtoken');
+----
+127.0.0.1:19910	registered	stopped
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27211, token := 'regtoken', name := 'b');
+
+statement error
+FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27211, token := 'regtoken', name := 'b');
+----
+already registered
+
+# Every rank joins as a new process: the one seen when it was added is asked to exit first.
+query ITTT
+SELECT rank, name, state, cluster FROM sirius_gateway_start(0) ORDER BY rank;
+----
+0	127.0.0.1:19910	up	ready
+1	b	up	ready
+
+query T
+FROM sirius_gateway_run('SELECT id FROM boot');
+----
+a+
+
+# The stand-in keeps its catalog when it "exits", so the replayed DDL must allow that.
+statement ok
+FROM sirius_gateway_run('CREATE OR REPLACE VIEW v AS SELECT 42 AS x');
+
+statement ok
+FROM sirius_gateway_restart();
+
+query TI
+FROM sirius_gateway_run('SELECT id, (FROM v) FROM boot');
+----
+a++	42
+
+# A membership change takes effect at the next statement, which restarts every rank.
+query TT
+SELECT DISTINCT cluster, error FROM sirius_gateway_drop_rank('b');
+----
+failed	membership changed: dropped b, so the gateway restarts the ranks before the next statement
+
+query TI
+FROM sirius_gateway_run('SELECT id, (FROM v) FROM boot');
+----
+a+++	42
+
+query I
+SELECT count(*) FROM sirius_gateway_status();
+----
+1
+
+statement error
+FROM sirius_gateway_drop_rank('b');
+----
+no rank named b
+
+statement ok
+FROM sirius_gateway_test_serve(19912, 'regtoken', 'CREATE TABLE boot AS SELECT ''c'' AS id');
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19912', exchange_port := 27212, token := 'regtoken', name := 'c');
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+query ITT
+SELECT rank, name, state FROM sirius_gateway_status() ORDER BY rank;
+----
+0	127.0.0.1:19910	up
+1	c	up
+
+# Ranks the gateway spawns come first, then the registered ones.
+query ITT
+SELECT rank, name, registered FROM sirius_gateway_start(1, quack_base_port := 19920) ORDER BY rank;
+----
+0	rank_0	false
+1	127.0.0.1:19910	true
+2	c	true
+
+query T
+SELECT state FROM sirius_gateway_stop() WHERE name = 'c';
+----
+registered
