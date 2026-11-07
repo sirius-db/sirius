@@ -294,6 +294,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
     test/cpp/planner/test_distributed_scan_refusals.cpp
+    test/cpp/planner/test_one_rank_parity.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
