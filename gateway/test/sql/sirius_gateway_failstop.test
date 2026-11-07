@@ -116,7 +116,7 @@ FROM sirius_gateway_test_signal(1, 19);
 statement error
 FROM sirius_gateway_run('SELECT 1');
 ----
-did not stop within 2 s of the cancel and was killed
+did not stop within 2 s of the cancel
 
 query I
 SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'failed';

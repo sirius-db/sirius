@@ -1,6 +1,7 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "gateway_state.hpp"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
@@ -29,7 +30,10 @@ std::string log_path(start_options const& options, uint32_t index)
   return options.log_dir + "/rank_" + std::to_string(index) + ".log";
 }
 
-void spawn_rank(start_options const& options, std::string const& token, rank& r)
+void spawn_rank(start_options const& options,
+                std::string const& token,
+                rank& r,
+                std::string const& init_sql)
 {
   auto const init = options.log_dir + "/rank_" + std::to_string(r.index) + ".init.sql";
   {
@@ -37,6 +41,7 @@ void spawn_rank(start_options const& options, std::string const& token, rank& r)
     if (!options.sirius_extension.empty()) {
       out << "LOAD " << KeywordHelper::WriteQuoted(options.sirius_extension) << ";\n";
     }
+    if (!init_sql.empty()) { out << init_sql << ";\n"; }
     out << "CALL quack_serve(" << KeywordHelper::WriteQuoted(r.uri)
         << ", token := " << KeywordHelper::WriteQuoted(token) << ");\n";
     if (!out) { throw IOException("cannot write %s", init); }
@@ -66,7 +71,7 @@ void spawn_rank(start_options const& options, std::string const& token, rank& r)
                     ? std::vector<std::string>{options.rank_launcher,
                                                r.host,
                                                r.gpu,
-                                               std::to_string(options.quack_base_port + r.index),
+                                               std::to_string(r.quack_port),
                                                options.duckdb_binary,
                                                init}
                     : std::vector<std::string>{options.duckdb_binary, "-unsigned", "-init", init};
@@ -124,8 +129,27 @@ bool is_local_host(std::string const& host)
   return local;
 }
 
+std::string numeric_address(std::string const& host)
+{
+  addrinfo hints{};
+  hints.ai_family   = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* found   = nullptr;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0 || found == nullptr) {
+    throw IOException("cannot resolve the exchange address %s", host);
+  }
+  char address[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET,
+            &reinterpret_cast<sockaddr_in const*>(found->ai_addr)->sin_addr,
+            address,
+            sizeof(address));
+  freeaddrinfo(found);
+  return address;
+}
+
 bool rank_exited(rank& r)
 {
+  if (r.registered) { return false; }
   if (r.pid < 0) { return true; }
   int status    = 0;
   auto const rc = waitpid(r.pid, &status, WNOHANG);
@@ -136,6 +160,7 @@ bool rank_exited(rank& r)
 
 void end_rank(rank& r)
 {
+  if (r.registered) { return; }  // its launcher owns its process
   if (r.stdin_fd >= 0) {
     close(r.stdin_fd);
     r.stdin_fd = -1;

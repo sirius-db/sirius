@@ -28,7 +28,8 @@ constexpr std::array<char const*, 6> rank_settings{"sirius_distributed_query_id"
 
 bool is_gateway_name(std::string const& name)
 {
-  return StringUtil::StartsWith(name, "sirius_gateway_") || StringUtil::StartsWith(name, "quack_");
+  return StringUtil::StartsWith(name, "sirius_gateway_") ||
+         StringUtil::StartsWith(name, "quack_") || StringUtil::StartsWith(name, "sirius_rank_");
 }
 
 /// Functions a statement calls at its top level: `CALL f()`, `FROM f()`, `SELECT f()`.
