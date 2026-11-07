@@ -16,8 +16,11 @@
 
 #pragma once
 
+#include "exchange/fabric_memory.hpp"
+
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,21 +32,34 @@ using rank_t = std::uint32_t;
 /// The exchange's id for one logical flow of batches, the same on every rank.
 using stream_id = std::uint64_t;
 
+/// Where a frame ring's memory comes from.
+enum class ring_memory {
+  /// `cudaMalloc`: other processes on this host only.
+  plain,
+  /// Fabric memory where the GPU and driver allow it, else `cudaMalloc`.
+  fabric_or_plain,
+  /// Fabric memory, or the constructor throws.
+  fabric,
+};
+
 /**
- * @brief Fixed-size frames in one `cudaMalloc` region.
+ * @brief Fixed-size frames in one device region.
  *
  * Each process has two: a send ring that batches are staged into, and a receive ring that peers
- * write into. They are the only memory the fabric registers, once. Plain `cudaMalloc`, never pool
- * memory: UCX's `cuda_ipc` cannot export stream-ordered allocations, and a pool block could be
- * handed to a kernel while a peer's write into it is still landing.
+ * write into. They are the only memory the fabric registers, once. Never pool memory: UCX's
+ * `cuda_ipc` cannot export stream-ordered allocations, and a pool block could be handed to a
+ * kernel while a peer's write into it is still landing. In fabric memory (fabric_memory.hpp),
+ * a GPU on another node of the NVLink domain can write the ring directly.
  */
 class frame_ring {
  public:
-  /// Allocates @p frames frames of @p frame_bytes each on the current device.
+  /// Allocates @p frames frames of @p frame_bytes each on the current device, from @p memory.
   /// @throws sirius::invalid_input_exception on zero frames, or a frame size that is zero or not
   ///         a multiple of 256 bytes.
   /// @throws sirius::internal_exception when the allocation fails, naming its size.
-  frame_ring(std::uint32_t frames, std::size_t frame_bytes);
+  frame_ring(std::uint32_t frames,
+             std::size_t frame_bytes,
+             ring_memory memory = ring_memory::plain);
   ~frame_ring();
 
   // The fabric registers the base address, so the region never moves.
@@ -59,11 +75,17 @@ class frame_ring {
   {
     return _base + static_cast<std::size_t>(frame) * _frame_bytes;
   }
+  /// Whether the ring is in fabric memory.
+  [[nodiscard]] bool in_fabric_memory() const noexcept { return _fabric.has_value(); }
+  /// Why a fabric_or_plain ring is not in fabric memory; empty otherwise.
+  [[nodiscard]] std::string const& why_not_fabric() const noexcept { return _why_not_fabric; }
 
  private:
   std::uint32_t _frames;
   std::size_t _frame_bytes;
   std::byte* _base{nullptr};
+  std::optional<fabric_memory> _fabric;
+  std::string _why_not_fabric;
 };
 
 /// A notification a peer sent, alone or with a write.
