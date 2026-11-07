@@ -21,10 +21,12 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_sort_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -376,7 +378,8 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
 {
   fixture f;
   ranks c(2, f.gpu());
-  auto plans = plan_on_every_rank(f, "SELECT k, v FROM big ORDER BY v DESC NULLS FIRST, k", 2);
+  auto const sql = std::string{"SELECT k, v FROM big ORDER BY v DESC NULLS FIRST, k"};
+  auto plans     = plan_on_every_rank(f, sql, 2);
   REQUIRE(distribute(plans, c, f) == std::vector<std::string>(2));
   // The result is gathered to rank 0 in rank order.
   REQUIRE(plans[0]->type == T::EXCHANGE_SOURCE);
@@ -397,6 +400,22 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   auto* sample = find(*plans[0], T::SORT_SAMPLE);
   REQUIRE(sample);
   CHECK(sample->runs_without_input());
+  // The planned sample was replaced by one that gathers every rank's sample. SORT_PARTITION
+  // reads its boundaries through a pointer, which must follow, and the settings carry over.
+  auto const* distributed =
+    dynamic_cast<sirius::op::sirius_physical_distributed_sort_sample const*>(sample);
+  REQUIRE(distributed);
+  CHECK(partition->Cast<sirius::op::sirius_physical_sort_partition>().get_sample_op() == sample);
+  auto const local = f.lowered(sql);
+  auto const& planned =
+    find(*local, T::SORT_SAMPLE)->Cast<sirius::op::sirius_physical_sort_sample>();
+  CHECK(distributed->sort_sample_bytes() == planned.sort_sample_bytes());
+  CHECK(distributed->max_partition_bytes_override() == planned.max_partition_bytes_override());
+  CHECK(distributed->max_partition_memory_fraction() == planned.max_partition_memory_fraction());
+  CHECK(distributed->orders.size() == planned.orders.size());
+  CHECK(distributed->types == planned.types);
+  CHECK(distributed->estimated_cardinality == planned.estimated_cardinality);
+  CHECK(distributed->children.size() == 1);
 }
 
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")

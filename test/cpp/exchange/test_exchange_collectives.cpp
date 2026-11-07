@@ -25,6 +25,7 @@
 #include "exchange/loopback_fabric.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -58,6 +59,7 @@ using namespace sirius::test::exchange_utils;
 using sirius::exchange::exchange_service;
 using sirius::op::exchange_spec;
 using sirius::op::pipelineable_operator_data;
+using sirius::op::sirius_physical_distributed_sort_sample;
 using sirius::op::sirius_physical_sort_sample;
 
 /// Ranks in one process, each with an exchange service over the loopback fabric.
@@ -171,9 +173,10 @@ duckdb::vector<sirius::logical_type> key_types()
   return sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
 }
 
-/// SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small enough that a
-/// rank keeps several.
+/// A distributed SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small
+/// enough that a rank keeps several.
 std::unique_ptr<sirius_physical_sort_sample> make_sample(
+  sirius_physical_distributed_sort_sample::distributed_sampling sampling,
   duckdb::OrderType order       = duckdb::OrderType::ASCENDING,
   duckdb::OrderByNullType nulls = duckdb::OrderByNullType::NULLS_FIRST)
 {
@@ -182,11 +185,13 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample(
                       nulls,
                       duckdb::make_uniq<duckdb::BoundReferenceExpression>(
                         duckdb::LogicalType::BIGINT, duckdb::idx_t{0}));
-  return std::make_unique<sirius_physical_sort_sample>(key_types(),
-                                                       std::move(orders),
-                                                       /*estimated_cardinality=*/60'000,
-                                                       /*sort_sample_bytes=*/1 << 20,
-                                                       /*max_partition_bytes=*/64 * KiB);
+  return std::make_unique<sirius_physical_distributed_sort_sample>(
+    key_types(),
+    std::move(orders),
+    /*estimated_cardinality=*/60'000,
+    std::move(sampling),
+    /*sort_sample_bytes=*/1 << 20,
+    /*max_partition_bytes=*/64 * KiB);
 }
 
 using sirius::op::dynamic_filter_publish_plan;
@@ -655,11 +660,10 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   std::vector<std::unique_ptr<sirius_physical_sort_sample>> samples;
   std::vector<std::shared_ptr<cudf::table const>> boundaries(world);
   for (rank_t r = 0; r < world; ++r) {
-    samples.push_back(make_sample());
-    samples[r]->set_distributed(
+    samples.push_back(make_sample(
       {c.all[r].service, 21, env().gpu, [&boundaries, r](std::shared_ptr<cudf::table const> b) {
          boundaries[r] = std::move(b);
-       }});
+       }}));
   }
   // Skewed inputs: rank 0 holds low keys, rank 1 spread ones, rank 2 none at all.
   std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> inputs(world);
@@ -701,18 +705,17 @@ TEST_CASE("an OOM after the boundary all-gather retries without gathering again"
   std::vector<std::shared_ptr<cudf::table const>> boundaries(world);
   bool failed_once = false;
   for (rank_t r = 0; r < world; ++r) {
-    samples.push_back(make_sample());
-    samples[r]->set_distributed(
-      {c.all[r].service,
-       22,
-       env().gpu,
-       [&boundaries, &failed_once, r](std::shared_ptr<cudf::table const> b) {
-         // Runs after the all-gather has returned.
-         if (r == 0 && !std::exchange(failed_once, true)) {
-           throw rmm::out_of_memory("injected after the all-gather");
-         }
-         boundaries[r] = std::move(b);
-       }});
+    samples.push_back(
+      make_sample({c.all[r].service,
+                   22,
+                   env().gpu,
+                   [&boundaries, &failed_once, r](std::shared_ptr<cudf::table const> b) {
+                     // Runs after the all-gather has returned.
+                     if (r == 0 && !std::exchange(failed_once, true)) {
+                       throw rmm::out_of_memory("injected after the all-gather");
+                     }
+                     boundaries[r] = std::move(b);
+                   }}));
   }
   std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> inputs(world);
   inputs[0]        = {keys_batch(0, 1, 20'000)};
@@ -768,11 +771,13 @@ TEST_CASE("a DESC NULLS LAST range exchange keeps rank order and puts NULLs on t
 
   on_every_rank(world, [&](rank_t r) {
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 33, spec);
-    auto sample = make_sample(duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST);
-    sample->set_distributed(
-      {c.all[r].service, 34, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
-         sink.set_range_boundaries(std::move(b));
-       }});
+    auto sample = make_sample(
+      {c.all[r].service,
+       34,
+       env().gpu,
+       [&sink](std::shared_ptr<cudf::table const> b) { sink.set_range_boundaries(std::move(b)); }},
+      duckdb::OrderType::DESCENDING,
+      duckdb::OrderByNullType::NULLS_LAST);
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
@@ -840,11 +845,10 @@ TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted ra
   // As in a plan: SORT_SAMPLE's boundaries go to the EXCHANGE_SINK after it.
   on_every_rank(world, [&](rank_t r) {
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 31, spec);
-    auto sample = make_sample();
-    sample->set_distributed(
-      {c.all[r].service, 32, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
-         sink.set_range_boundaries(std::move(b));
-       }});
+    auto sample =
+      make_sample({c.all[r].service, 32, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
+                     sink.set_range_boundaries(std::move(b));
+                   }});
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
