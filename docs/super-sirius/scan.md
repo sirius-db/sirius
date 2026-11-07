@@ -708,6 +708,27 @@ Separately from the `fs_cache`, the ioctx always exposes a `metadata_store` so p
 
 Metadata opens advance a per-path observation fence using the existing monotonic `open_generation`; an unchanged identity keeps its cached artifact. A producer for a superseded identity can finish for its callers but cannot republish into the index. Concurrent misses for the same path, identity and parser profile share one result or exception; a failed flight is removed so a later request can retry. The store's stop-token wait cancels only that waiter, leaving the producer and other waiters intact. `statistics()` and `describe_metadata_store()` expose hits, misses, joined waits, builds, failures, cancelled waiters, stale publications and in-flight work. The dump also lists entry keys, identities, generations and holder counts. These are event counts and ownership diagnostics, not memory budgets.
 
+#### HOST downgrade reclaim
+
+HOST downgrade executors reclaim only cache bytes above the prefetch reservation on their
+own NUMA space: `reclaim(mode, min(deficit, releasable_bytes(numa)), numa)`. Before
+repository/task spilling they use `reclaim_mode::idle`; only if a known byte target remains
+unmet after dispatched spills settle do they use `reclaim_mode::forced`. Predicate-only
+requests use an unbounded deficit, still capped at releasable bytes. Credit is capped at the
+pre-pass releasable snapshot, since only overflow above the reservation relieves HOST
+pressure. Chunks inside the reservation are kept; with no DISK target, a cache with no such
+overflow makes the HOST monitor back off.
+
+Idle reclaim preserves subscribed chunks; forced reclaim may discard their cached staging
+buffers. Both modes leave pinned readers and in-flight loads untouched. Only the default
+local ioctx cache is bound to HOST executors; caches on routed remote contexts are not swept
+by this path.
+
+`reset_sirius_cache()` delegates to `SiriusContext::reset_caches()`: it pauses HOST processing
+and monitoring, clears their borrowed cache pointers, rebuilds scan-manager caches, binds the
+current local cache (or `nullptr`), and resumes the executors. Rebinding and resumption are
+attempted even if rebuilding throws, so a failed reset cannot leave a dangling cache pointer.
+
 ### Cache Internals
 
 These are cuCascade's; see `include/cucascade/io/cache/` and `src/io/cache/fs_cache.cpp` in the submodule.
