@@ -29,6 +29,7 @@
 #include "duckdb/planner/planner.hpp"
 #include "exchange/exchange_runtime.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/rank_control.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
@@ -1465,6 +1466,7 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   };
   exchange_service_ = sirius::exchange::make_nixl_exchange(
     params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+  sirius::exchange::note_exchange_joined();
   exchange_peers_        = params.exchange_peers;
   exchange_rank_         = params.exchange_rank;
   exchange_host_staging_ = params.exchange_host_staging;

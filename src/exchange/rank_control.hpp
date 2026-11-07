@@ -23,11 +23,15 @@ class DatabaseInstance;
 namespace sirius::exchange {
 
 /// Registers the functions a distributed gateway uses to restart a rank it did not start:
-/// - `sirius_rank_info()`: this process's pid and boot id, a random id made once per process, so
-///   the gateway can tell a restarted rank from the one it asked to exit;
+/// - `sirius_rank_info()`: this process's pid; its boot id, a random id made once per process, so
+///   the gateway can tell a restarted rank from the one it asked to exit; and whether it joined
+///   (note_exchange_joined), since only a process that has must restart to join other ranks;
 /// - `CALL sirius_rank_exit()`: replies, then shuts Sirius down and ends the process, for the
 ///   rank's launcher to start it again. The exchange's peers are fixed once it connects, so
 ///   joining a new set of ranks takes a new process.
 void register_rank_control_functions(duckdb::DatabaseInstance& instance);
+
+/// Records that this process's exchange connected to its peers, which it cannot change after.
+void note_exchange_joined() noexcept;
 
 }  // namespace sirius::exchange
