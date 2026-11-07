@@ -58,6 +58,9 @@ constexpr char staged_kind                = '\x7e';
 constexpr std::size_t staged_header_bytes = 1 + 2 * sizeof(std::uint64_t);
 constexpr std::size_t pci_bus_id_bytes    = NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE;
 
+// The main agent's metadata, for the peer's writer: kind | the metadata.
+constexpr char metadata_kind = '\x7c';
+
 // kind | u32 rank | u32 device | u64 receive ring base | u64 receive ring bytes | u32 pid |
 // PCI bus id of the GPU, NUL-padded (names the receive mirror and decides host staging) |
 // u32 receive ring in fabric memory | u32 NVLink clique id | 16-byte NVLink cluster UUID (all
@@ -226,6 +229,7 @@ void require_free_port(std::uint16_t port)
 }
 
 std::string agent_name(rank_t rank) { return "sirius-exchange-" + std::to_string(rank); }
+std::string writer_name(rank_t rank) { return agent_name(rank) + "-writer"; }
 
 template <typename Peer>
 endpoint endpoint_of(Peer const& p, rank_t rank)
@@ -266,9 +270,10 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
       throw sirius::invalid_input_exception("exchange NIXL: peer address '{}' is not host:port",
                                             address);
     }
-    p.host            = address.substr(0, colon);
-    p.agent           = agent_name(r);
-    _rank_of[p.agent] = r;
+    p.host                   = address.substr(0, colon);
+    p.agent                  = agent_name(r);
+    _rank_of[p.agent]        = r;
+    _rank_of[writer_name(r)] = r;
   }
 
   require_free_port(_peers[_rank].port);
@@ -315,9 +320,23 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   nixl_b_params_t params;
   check(_agent->getPluginParams("UCX", mems, params), "getPluginParams(UCX)");
   check(_agent->createBackend("UCX", params, _backend), "createBackend(UCX)");
+  nixlAgentConfig writer_cfg(/*use_prog_thread=*/false,
+                             /*use_listen_thread=*/false,
+                             0,
+                             nixl_thread_sync_t::NIXL_THREAD_SYNC_RW);
+  _writer = std::make_unique<nixlAgent>(writer_name(_rank), writer_cfg);
+  nixl_b_params_t writer_params;
+  check(_writer->getPluginParams("UCX", mems, writer_params), "getPluginParams(UCX)");
+  check(_writer->createBackend("UCX", writer_params, _writer_backend), "createBackend(UCX)");
   create_lock.unlock();
-  check(_agent->registerMem(ring_descs(_send, _device)), "registerMem(send ring)");
+  check(_writer->registerMem(ring_descs(_send, _device)), "registerMem(send ring)");
   check(_agent->registerMem(ring_descs(_recv, _device)), "registerMem(receive ring)");
+  std::string metadata(1, metadata_kind);
+  {
+    nixl_blob_t md;
+    check(_agent->getLocalMD(md), "getLocalMD");
+    metadata += md;
+  }
 
   // Fetch every peer's metadata from its listener and send it a hello. A peer that is not up
   // yet refuses the fetch, so fetches repeat until the deadline. The listener serves metadata
@@ -355,9 +374,10 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
       if (known && !greeted[r]) {
         check(_agent->makeConnection(p.agent), "makeConnection");
         check(_agent->genNotif(p.agent, me), "genNotif(hello)");
+        check(_agent->genNotif(p.agent, metadata), "genNotif(metadata)");
         greeted[r] = true;
       }
-      if (known && p.hello) {
+      if (known && p.hello && p.writer_ready) {
         nixl_xfer_dlist_t ring(VRAM_SEG);
         ring.addDesc(nixlBasicDesc(p.recv_base, p.recv_bytes, p.device));
         if (_agent->checkRemoteMD(p.agent, ring) == NIXL_SUCCESS) {
@@ -439,22 +459,22 @@ nixl_fabric::~nixl_fabric() { release(); }
 
 void nixl_fabric::release() noexcept
 {
-  if (_agent) {
+  if (_writer) {
     // A write still in flight reads the send ring: give it a moment before deregistering.
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
     for (auto& [id, req] : _writes) {
-      while (_agent->getXferStatus(req) == NIXL_IN_PROG &&
+      while (_writer->getXferStatus(req) == NIXL_IN_PROG &&
              std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::microseconds{100});
       }
-      if (auto const s = _agent->releaseXferReq(req); s != NIXL_SUCCESS) {
+      if (auto const s = _writer->releaseXferReq(req); s != NIXL_SUCCESS) {
         SIRIUS_LOG_WARN(
           "exchange NIXL: releasing write {} failed: {}", id, nixlEnumStrings::statusStr(s));
       }
     }
-    static_cast<void>(_agent->deregisterMem(ring_descs(_send, _device)));
-    static_cast<void>(_agent->deregisterMem(ring_descs(_recv, _device)));
+    static_cast<void>(_writer->deregisterMem(ring_descs(_send, _device)));
   }
+  if (_agent) { static_cast<void>(_agent->deregisterMem(ring_descs(_recv, _device))); }
   // Copies still in flight read or write the mirrors: let them finish first.
   if (_d2h != nullptr) { static_cast<void>(cudaStreamSynchronize(_d2h)); }
   if (_h2d != nullptr) { static_cast<void>(cudaStreamSynchronize(_h2d)); }
@@ -515,6 +535,22 @@ void nixl_fabric::receive()
         p.hello            = true;
         continue;
       }
+      if (!body.empty() && body.front() == metadata_kind) {
+        auto& p = _peers[it->second];
+        if (agent != p.agent) {
+          throw sirius::invalid_input_exception(
+            "exchange NIXL: metadata for {} came from {}", p.agent, agent);
+        }
+        std::string loaded;
+        check(_writer->loadRemoteMD(body.substr(1), loaded), "loadRemoteMD");
+        if (loaded != p.agent) {
+          throw sirius::invalid_input_exception(
+            "exchange NIXL: {} sent the metadata of {}", agent, loaded);
+        }
+        check(_writer->makeConnection(p.agent), "makeConnection(writer)");
+        p.writer_ready = true;
+        continue;
+      }
       if (!body.empty() && body.front() == staged_kind) {
         std::uint64_t at    = 0;
         std::uint64_t bytes = 0;
@@ -572,13 +608,13 @@ std::uint64_t nixl_fabric::write(
   nixl_xfer_dlist_t remote(VRAM_SEG);
   remote.addDesc(nixlBasicDesc(p.recv_base + dst, bytes, p.device));
   nixl_opt_args_t extra;
-  extra.backends.push_back(_backend);
+  extra.backends.push_back(_writer_backend);
   extra.notif       = std::move(notification);
   nixlXferReqH* req = nullptr;
-  check(_agent->createXferReq(NIXL_WRITE, local, remote, p.agent, req, &extra), "createXferReq");
-  auto const posted = _agent->postXferReq(req);
+  check(_writer->createXferReq(NIXL_WRITE, local, remote, p.agent, req, &extra), "createXferReq");
+  auto const posted = _writer->postXferReq(req);
   if (posted != NIXL_SUCCESS && posted != NIXL_IN_PROG) {
-    static_cast<void>(_agent->releaseXferReq(req));
+    static_cast<void>(_writer->releaseXferReq(req));
     check(posted, "postXferReq");
   }
   _writes.emplace(_next_write, req);
@@ -598,15 +634,15 @@ double nixl_fabric::timed_write(rank_t peer, std::size_t dst, std::size_t bytes)
   nixl_xfer_dlist_t remote(VRAM_SEG);
   remote.addDesc(nixlBasicDesc(p.recv_base + dst, bytes, p.device));
   nixl_opt_args_t extra;
-  extra.backends.push_back(_backend);
+  extra.backends.push_back(_writer_backend);
   nixlXferReqH* req = nullptr;
-  check(_agent->createXferReq(NIXL_WRITE, local, remote, p.agent, req, &extra), "createXferReq");
-  absl::Cleanup release_req = [&] { static_cast<void>(_agent->releaseXferReq(req)); };
+  check(_writer->createXferReq(NIXL_WRITE, local, remote, p.agent, req, &extra), "createXferReq");
+  absl::Cleanup release_req = [&] { static_cast<void>(_writer->releaseXferReq(req)); };
   auto const start          = std::chrono::steady_clock::now();
   auto const deadline       = start + std::chrono::seconds{10};
-  auto s                    = _agent->postXferReq(req);
+  auto s                    = _writer->postXferReq(req);
   while (s == NIXL_IN_PROG && std::chrono::steady_clock::now() < deadline) {
-    s = _agent->getXferStatus(req);
+    s = _writer->getXferStatus(req);
   }
   auto const seconds =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -640,9 +676,9 @@ fabric::write_status nixl_fabric::status(std::uint64_t id)
   if (it == _writes.end()) {
     throw sirius::invalid_input_exception("exchange NIXL: unknown write {}", id);
   }
-  auto const s = _agent->getXferStatus(it->second);
+  auto const s = _writer->getXferStatus(it->second);
   if (s == NIXL_IN_PROG) { return write_status::pending; }
-  static_cast<void>(_agent->releaseXferReq(it->second));
+  static_cast<void>(_writer->releaseXferReq(it->second));
   _writes.erase(it);
   if (s != NIXL_SUCCESS) {
     SIRIUS_LOG_ERROR("exchange NIXL: write {} failed: {}", id, nixlEnumStrings::statusStr(s));

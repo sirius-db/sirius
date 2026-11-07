@@ -44,6 +44,8 @@ namespace sirius::exchange {
  * It returns once every peer has answered, so the transport starts with every peer reachable.
  *
  * There is no other control channel: everything after the hello is a NIXL write or notification.
+ * Writes come from a second agent, the writer, which has no listener: each rank sends its main
+ * agent's metadata to every peer after its hello, and the peer's writer loads it.
  *
  * **Host staging.** UCX moves GPU memory between processes with `cuda_ipc`, which needs peer
  * access between the two GPUs. Without it (GPUs under different PCIe switches on many hosts) UCX
@@ -123,6 +125,8 @@ class nixl_fabric : public fabric {
     std::uint32_t device{0};
     std::uint32_t pid{0};
     std::string pci_bus_id;
+    /// The writer has loaded the peer's main agent's metadata.
+    bool writer_ready{false};
     bool fabric_ring{false};
     nvlink_domain domain;
     bool hello{false};
@@ -162,8 +166,16 @@ class nixl_fabric : public fabric {
   int _device{0};
   std::vector<peer> _peers;
   std::unordered_map<std::string, rank_t> _rank_of;
+  /// Registers the receive ring, serves its metadata on the listen port, and carries every
+  /// notification; never initiates a write.
   std::unique_ptr<nixlAgent> _agent;
   nixlBackendH* _backend{nullptr};
+  /// Registers the send ring and initiates every write, into the peers' main agents. UCX 1.21
+  /// crashes when a worker puts to an endpoint a peer's puts already wired up
+  /// (ucp_worker_add_rkey_config reads a NULL lanes_distance with RC lanes); with writes only
+  /// from this agent, every endpoint carries puts one way.
+  std::unique_ptr<nixlAgent> _writer;
+  nixlBackendH* _writer_backend{nullptr};
   std::map<std::uint64_t, nixlXferReqH*> _writes;
   std::uint64_t _next_write{1};
   std::vector<fabric_notification> _backlog;
