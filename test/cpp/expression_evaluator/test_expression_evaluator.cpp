@@ -21,6 +21,7 @@
 #include <utils/utils.hpp>
 
 // sirius
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
@@ -4411,4 +4412,194 @@ TEST_CASE("a constant of an unsupported scalar type names the type",
   REQUIRE_THROWS_WITH(
     run_execute(*space, input, one(make_null_const(logical_type::make(type_id::STRUCT)))),
     Catch::Matchers::ContainsSubstring("Unsupported scalar type: STRUCT"));
+}
+
+TEMPLATE_TEST_CASE("integer casts validate ranges before narrowing or changing signedness",
+                   "[expression_evaluator][integer_cast_bounds]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto& space                = *get_default_gpu_space();
+  auto const target_id       = GENERATE(type_id::TINYINT,
+                                  type_id::SMALLINT,
+                                  type_id::INTEGER,
+                                  type_id::UTINYINT,
+                                  type_id::USMALLINT,
+                                  type_id::UINTEGER,
+                                  type_id::UBIGINT);
+  auto const target          = logical_type::make(target_id);
+  auto const source          = logical_type::make(type_id::BIGINT);
+  bool const unsigned_target = target_id == type_id::UTINYINT || target_id == type_id::USMALLINT ||
+                               target_id == type_id::UINTEGER || target_id == type_id::UBIGINT;
+  auto const bits     = 8 * target.fixed_width_byte_size();
+  auto const maximum  = bits == 64 ? std::numeric_limits<int64_t>::max()
+                                   : (int64_t{1} << (bits - !unsigned_target)) - 1;
+  auto const minimum  = unsigned_target ? 0 : -maximum - 1;
+  auto const try_cast = GENERATE(false, true);
+  auto const evaluate = [&](std::vector<std::optional<int64_t>> const& rows) {
+    auto col = make_nullable_rep_column<int64_t>(
+      space, sirius::require_cudf_type(source), rows, std::numeric_limits<int64_t>::min());
+    // The DOUBLE cast and addition meet the default AST threshold even though the
+    // checked inner cast must materialize.
+    auto const floating = logical_type::make(type_id::DOUBLE);
+    std::vector<std::unique_ptr<ast_node>> terms;
+    terms.push_back(
+      make_cast(make_cast(make_ref_typed(0, source), target, try_cast), floating, false));
+    terms.push_back(make_double_const(1.0));
+    auto expr = make_func(sirius::function_id::add, std::move(terms), floating);
+    exp_executor executor(*expr,
+                          get_resource_ref(space),
+                          cudf::get_default_stream(),
+                          sirius::expression_query_policy{TestType::value});
+    auto output = executor.evaluate(cudf::table_view{{col->view()}});
+    if (!rows.empty()) {
+      CHECK(executor.ast_interpret_evaluation_count_for_testing() ==
+            (TestType::value == exp_strategy_enum::AST_INTERPRET));
+      CHECK(executor.ast_jit_evaluation_count_for_testing() ==
+            (TestType::value == exp_strategy_enum::AST_JIT));
+    }
+    return output;
+  };
+  for (auto const& rows : {std::vector<std::optional<int64_t>>{minimum, maximum, std::nullopt},
+                           std::vector<std::optional<int64_t>>{std::nullopt},
+                           std::vector<std::optional<int64_t>>{}}) {
+    auto output = evaluate(rows);
+    auto view   = output->view().column(0);
+    auto values = copy_column_to_host<double>(view);
+    auto valid  = copy_valids_to_host(view);
+    REQUIRE(values.size() == rows.size());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      CHECK(valid[i] == rows[i].has_value());
+      if (rows[i]) { CHECK(values[i] == static_cast<double>(*rows[i]) + 1.0); }
+    }
+  }
+  auto check_overflow = [&](int64_t outside) {
+    if (try_cast) {
+      auto output = evaluate({0, outside, std::nullopt, minimum});
+      auto view   = output->view().column(0);
+      REQUIRE(copy_valids_to_host(view) == std::vector<bool>{true, false, false, true});
+      auto values = copy_column_to_host<double>(view);
+      CHECK(values[0] == 1.0);
+      CHECK(values[3] == static_cast<double>(minimum) + 1.0);
+    } else {
+      REQUIRE_THROWS_AS(evaluate({0, outside}), sirius::not_implemented_exception);
+    }
+  };
+  check_overflow(minimum - 1);
+  if (maximum < std::numeric_limits<int64_t>::max()) { check_overflow(maximum + 1); }
+}
+
+TEMPLATE_TEST_CASE("unsigned BIGINT casts reject values above signed BIGINT maximum",
+                   "[expression_evaluator][integer_cast_bounds]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto& space       = *get_default_gpu_space();
+  auto const source = logical_type::make(type_id::UBIGINT);
+  auto col          = make_nullable_rep_column<uint64_t>(
+    space, sirius::require_cudf_type(source), {uint64_t{1} << 63}, 0);
+  auto expr =
+    make_cast(make_cast(make_ref_typed(0, source), logical_type::make(type_id::BIGINT), false),
+              logical_type::make(type_id::DOUBLE),
+              false);
+  REQUIRE_THROWS_AS(
+    run_native_ast(space, expr.get(), cudf::table_view{{col->view()}}, TestType::value),
+    sirius::not_implemented_exception);
+}
+
+TEST_CASE("integer TRY_CAST keeps valid rows across a sliced validity mask",
+          "[expression_evaluator][integer_cast_bounds]")
+{
+  auto& space       = *get_default_gpu_space();
+  auto const source = logical_type::make(type_id::UBIGINT);
+  auto const target = logical_type::make(type_id::BIGINT);
+  std::vector<std::optional<uint64_t>> rows(70, 7);
+  rows[0]  = std::numeric_limits<uint64_t>::max();
+  rows[32] = std::nullopt;
+  rows[33] = uint64_t{1} << 63;
+  rows[65] = std::numeric_limits<int64_t>::max();
+  auto col = make_nullable_rep_column<uint64_t>(space, sirius::require_cudf_type(source), rows, 0);
+  auto slice  = cudf::slice(col->view(), {1, 68}, cudf::get_default_stream()).front();
+  auto expr   = make_cast(make_ref_typed(0, source), target, true);
+  auto out    = run_native_ast(space, expr.get(), cudf::table_view{{slice}}, MAT);
+  auto result = out->view().column(0);
+  REQUIRE(result.null_count() == 2);
+  auto valid  = copy_valids_to_host(result);
+  auto values = copy_column_to_host<int64_t>(result);
+  for (int i = 0; i < result.size(); ++i) {
+    CHECK(valid[i] == (i != 31 && i != 32));
+    if (valid[i]) { CHECK(values[i] == static_cast<int64_t>(*rows[i + 1])); }
+  }
+}
+
+TEST_CASE("checked integer cast uses the actual reference carrier on every batch",
+          "[expression_evaluator][integer_cast_bounds]")
+{
+  auto& space         = *get_default_gpu_space();
+  auto const source   = logical_type::make(type_id::BIGINT);
+  auto const target   = logical_type::make(type_id::INTEGER);
+  auto const fp       = logical_type::make(type_id::DOUBLE);
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const try_cast = GENERATE(false, true);
+  std::vector<std::unique_ptr<ast_node>> terms;
+  terms.push_back(make_cast(make_cast(make_ref_typed(0, source), target, try_cast), fp, false));
+  terms.push_back(make_double_const(1.0));
+  auto expr = make_func(sirius::function_id::add, std::move(terms), fp);
+  exp_executor executor(*expr,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy});
+  auto evaluate = [&](cudf::column const& col) {
+    return executor.evaluate(cudf::table_view{{col.view()}});
+  };
+  auto narrower = make_nullable_rep_column<int16_t>(
+    space, cudf::data_type{cudf::type_id::INT16}, {-1, std::nullopt, 32767}, -1);
+  auto equal = make_nullable_rep_column<int32_t>(
+    space, cudf::data_type{cudf::type_id::INT32}, {-1, std::nullopt, 32767}, -1);
+  for (auto const* input : {narrower.get(), equal.get()}) {
+    auto result = evaluate(*input);
+    auto view   = result->view().column(0);
+    REQUIRE(copy_valids_to_host(view) == std::vector<bool>{true, false, true});
+    auto values = copy_column_to_host<double>(view);
+    CHECK(values[0] == 0.0);
+    CHECK(values[2] == 32768.0);
+    CHECK(executor.restored_reference_cast_count_for_testing() == 0);
+  }
+  auto native =
+    make_carrier_column<int64_t>(space, sirius::require_cudf_type(source), {int64_t{1} << 32, 0});
+  if (try_cast) {
+    auto result = evaluate(*native);
+    CHECK(copy_valids_to_host(result->view().column(0)) == std::vector<bool>{false, true});
+  } else {
+    REQUIRE_THROWS_AS(evaluate(*native), sirius::not_implemented_exception);
+  }
+
+  // UINT16 fits INTEGER even though the logical UBIGINT domain does not.
+  auto const unsigned_source = logical_type::make(type_id::UBIGINT);
+  auto from_unsigned         = make_cast(make_ref_typed(0, unsigned_source), target, try_cast);
+  auto raw_unsigned =
+    make_carrier_column<uint16_t>(space, cudf::data_type{cudf::type_id::UINT16}, {0, 65535});
+  exp_executor unsigned_executor(*from_unsigned,
+                                 get_resource_ref(space),
+                                 cudf::get_default_stream(),
+                                 sirius::expression_query_policy{strategy});
+  auto promoted = unsigned_executor.evaluate(cudf::table_view{{raw_unsigned->view()}});
+  CHECK(copy_column_to_host<int32_t>(promoted->view().column(0)) == std::vector<int32_t>{0, 65535});
+  CHECK(unsigned_executor.restored_reference_cast_count_for_testing() == 0);
+
+  // Even a narrow signed reference may contain negative values.
+  auto unsigned_expr =
+    make_cast(make_ref_typed(0, source), logical_type::make(type_id::UBIGINT), try_cast);
+  auto run_unsigned = [&] {
+    return run_native_ast(
+      space, unsigned_expr.get(), cudf::table_view{{narrower->view()}}, strategy);
+  };
+  if (try_cast) {
+    auto result = run_unsigned();
+    CHECK(copy_valids_to_host(result->view().column(0)) == std::vector<bool>{false, false, true});
+  } else {
+    REQUIRE_THROWS_AS(run_unsigned(), sirius::not_implemented_exception);
+  }
 }

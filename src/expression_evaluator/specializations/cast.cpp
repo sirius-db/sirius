@@ -19,6 +19,7 @@
 #include <expression_evaluator/date_cast.hpp>
 #include <expression_evaluator/decimal_integer_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/integer_cast.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <helper/timestamp_semantics.hpp>
@@ -54,6 +55,22 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
   }
 }
 
+cudf::ast::jit::op integer_cast_jit_op(cudf::type_id target)
+{
+  using op = cudf::ast::jit::op;
+  switch (target) {
+    case cudf::type_id::INT8: return op::CAST_TO_INT8;
+    case cudf::type_id::INT16: return op::CAST_TO_INT16;
+    case cudf::type_id::INT32: return op::CAST_TO_INT32;
+    case cudf::type_id::INT64: return op::CAST_TO_INT64;
+    case cudf::type_id::UINT8: return op::CAST_TO_UINT8;
+    case cudf::type_id::UINT16: return op::CAST_TO_UINT16;
+    case cudf::type_id::UINT32: return op::CAST_TO_UINT32;
+    case cudf::type_id::UINT64: return op::CAST_TO_UINT64;
+    default: throw internal_exception("expected a native integer cast target");
+  }
+}
+
 // Largest power of ten an int128 holds is 10^38.
 constexpr __int128_t power_of_ten(int32_t exponent)
 {
@@ -64,9 +81,10 @@ constexpr __int128_t power_of_ten(int32_t exponent)
   return result;
 }
 
-// cuDF narrows a DECIMAL128 HUGEINT carrier by wrapping, where DuckDB's CAST raises an error and
+// cuDF narrows integer values by wrapping, where DuckDB's CAST raises an error and
 // TRY_CAST returns NULL. Throw when any value lies outside @p target's SQL range so the query
-// falls back to DuckDB, which gives its exact behavior. Wider targets need no check.
+// falls back to DuckDB, which gives its exact behavior.
+// Targets containing the full source domain need no check.
 void require_hugeint_cast_in_range(cudf::column_view const& input,
                                    logical_type const& target,
                                    ::cuda::stream_ref stream,
@@ -112,12 +130,28 @@ void require_hugeint_cast_in_range(cudf::column_view const& input,
   if (!range) { return; }
   if (range->minimum < minimum || range->maximum > maximum) {
     throw not_implemented_exception(
-      "[expression_evaluator:cast] HUGEINT value out of range for {}; falling back to DuckDB",
+      "[expression_evaluator:cast] Integer value out of range for {}; falling back to DuckDB",
       target.to_string());
   }
 }
 
 }  // namespace
+
+bool checked_integer_cast_fits_carrier(ast::cast const& cast, cudf::data_type carrier)
+{
+  auto const& source = cast.child->return_type();
+  if (cast.kind != ast::cast_kind::semantic ||
+      !integer_cast_requires_range_check(source, cast.target_type) ||
+      !is_narrowable_numeric_type(source) || !can_restore_to(carrier, require_cudf_type(source))) {
+    return false;
+  }
+  auto const target = require_cudf_type(cast.target_type);
+  // A narrower unsigned carrier can also fit entirely in a wider signed target.
+  return carrier == target || can_restore_to(carrier, target) ||
+         (narrow_domain_of(carrier) == narrow_domain::UNSIGNED_INTEGER &&
+          narrow_domain_of(target) == narrow_domain::SIGNED_INTEGER &&
+          cudf::size_of(carrier) < cudf::size_of(target));
+}
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, evaluation_mode mode)
 {
@@ -147,7 +181,26 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
   auto const return_type = sirius::require_cudf_type(alt.target_type);
-  auto child             = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
+  std::optional<cudf::data_type> fitting_carrier;
+  if (auto const* ref = std::get_if<ast::reference>(&alt.child->v)) {
+    auto const carrier = _input_table.column(ref->column_index).type();
+    if (checked_integer_cast_fits_carrier(alt, carrier)) { fitting_carrier = carrier; }
+  }
+  if (fitting_carrier) {
+    if (*fitting_carrier == return_type) {
+      return evaluate_narrow_domain_operand(*alt.child, fitting_carrier, mode);
+    }
+    // A JIT parent can widen the proven carrier in registers instead of materializing a column.
+    if (mode == evaluation_mode::AST &&
+        _policy.strategy == expression_evaluator_strategy::AST_JIT) {
+      auto child            = evaluate_narrow_domain_operand(*alt.child, fitting_carrier, mode);
+      auto const& cast_expr = cudf::ast::jit::operation(
+        _ast_tree, integer_cast_jit_op(return_type.id()), {child.get_expr()});
+      return evaluate_result(compose(cast_expr, {&child}));
+    }
+  }
+  auto child =
+    evaluate_narrow_domain_operand(*alt.child, fitting_carrier, evaluation_mode::MATERIALIZE);
   if (child.is_scalar()) {
     child = evaluate_result(
       cudf::make_column_from_scalar(child.get_scalar(), _input_table.num_rows(), _stream, _mr));
@@ -178,6 +231,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
              return_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
     // Carrier restores were handled above; only semantic casts reach this branch.
     result_column = temporal::cast_to_microseconds_checked(input, _stream, _mr);
+  } else if (!fitting_carrier && alt.child->return_type().id() != type_id::HUGEINT &&
+             integer_cast_requires_range_check(alt.child->return_type(), alt.target_type)) {
+    result_column = cast_checked_integer(input, return_type, alt.try_cast, _stream, _mr);
   } else {
     if (alt.child->return_type().id() == type_id::HUGEINT) {
       require_hugeint_cast_in_range(input, alt.target_type, _stream, _mr);

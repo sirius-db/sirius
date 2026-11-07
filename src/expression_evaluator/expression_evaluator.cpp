@@ -240,6 +240,7 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_e
   }
   // MATERIALIZE uses a small interpreted AST for floating comparison semantics.
   // Building that AST must not opt a query into the JIT backend.
+  ++_ast_interpret_evaluation_count;
   return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
 }
 
