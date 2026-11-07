@@ -19,6 +19,7 @@
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "exchange/exchange_runtime.hpp"
+#include "exchange/rank_control.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -2475,6 +2476,9 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                                   SiriusSetSessionLabelBind);
   CreateTableFunctionInfo set_session_label_info(set_session_label);
   catalog.CreateTableFunction(transaction, set_session_label_info);
+
+  // Lets a distributed gateway restart this rank to join a new set of peers.
+  sirius::exchange::register_rank_control_functions(instance);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

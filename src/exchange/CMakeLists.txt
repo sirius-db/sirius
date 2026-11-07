@@ -6,6 +6,7 @@ target_sources(
           exchange_service.cpp
           fabric.cpp
           messages.cpp
+          rank_control.cpp
           transport.cpp
           wire.cpp)
 
