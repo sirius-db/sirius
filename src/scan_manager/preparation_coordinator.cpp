@@ -17,6 +17,7 @@
 #include "scan_manager/preparation_coordinator.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "op/scan/ready_input_coalescer.hpp"
 
 #include <algorithm>
 #include <deque>
@@ -1110,10 +1111,25 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
     }
     ready_results.pop_back();
     source.active_result = index;
+    auto* coalescer      = source.hooks.coalescer.get();
+    auto* sharing        = dynamic_cast<op::scan::ready_input_coalescer*>(coalescer);
+    auto successor_ready = [&] {
+      std::lock_guard guard(gate->mutex);
+      if (gate->closed) return false;
+      for (auto candidate : ready_results) {
+        auto const& next = slots[candidate];
+        if (next.source_id == slot.source_id && next.input && !next.unit)
+          return sharing->can_share(*next.input);
+      }
+      return false;
+    };
     lock.unlock();
-    auto step = slot.input
-                  ? source.hooks.coalescer->advance(*slot.input, slot.cursor, options.drain_quantum)
-                  : op::scan::batch_coalescer::cursor_step{nullptr, true};
+    op::scan::batch_coalescer::cursor_step step{nullptr, true};
+    if (slot.input) {
+      step = sharing ? sharing->advance_ready(
+                         *slot.input, slot.cursor, options.drain_quantum, successor_ready)
+                     : coalescer->advance(*slot.input, slot.cursor, options.drain_quantum);
+    }
     lock.lock();
     bool const emitted = static_cast<bool>(step.batch);
     queue_batch(lock, slot.source_id, std::move(step.batch));

@@ -507,8 +507,10 @@ class parquet_batch_coalescer : public batch_coalescer {
     bool const schema_changed =
       !file->row_groups.empty() && !_slices.empty() &&
       (_run_original_schema != file->original_schema || _run_arrow_schema != file->arrow_schema);
+    auto const* mapped_file =
+      dynamic_cast<mapped_parquet_visibility const*>(file->dependencies().front().visibility.get());
     bool const mapping_changed =
-      !_slices.empty() &&
+      !_slices.empty() && !(mapped_file && _run_mapping == file->field_mapping) &&
       ((_run_mapping && file->field_mapping) ? !_run_mapping->compatible_with(*file->field_mapping)
                                              : _run_mapping != file->field_mapping);
     // Plain virtual scans may choose the same replacement carrier independently
@@ -519,12 +521,20 @@ class parquet_batch_coalescer : public batch_coalescer {
       !_run_mapping && !file->field_mapping && _run_reader_options && file->reader_options &&
       _run_reader_options->get_column_names() == file->reader_options->get_column_names() &&
       _run_reader_options->get_column_indices() == file->reader_options->get_column_indices();
-    if (!_slices.empty() &&
-        (schema_changed || _partition_values != file->partition_values ||
-         _disable_pushdown != file->disable_filter_pushdown ||
-         _requires_row_positions != file->requires_row_positions ||
-         (_run_reader_options != file->reader_options && !same_virtual_projection) ||
-         mapping_changed)) {
+    bool const same_mapped_projection =
+      !_slices.empty() && _run_reader_options != file->reader_options && mapped_file &&
+      mapped_file->mapping == file->field_mapping &&
+      dynamic_cast<mapped_parquet_visibility const*>(_dependencies.back().visibility.get()) &&
+      _run_mapping && file->field_mapping && !mapping_changed && _run_reader_options &&
+      file->reader_options &&
+      _run_reader_options->get_column_names() == file->reader_options->get_column_names() &&
+      _run_reader_options->get_column_indices() == file->reader_options->get_column_indices();
+    if (!_slices.empty() && (schema_changed || _partition_values != file->partition_values ||
+                             _disable_pushdown != file->disable_filter_pushdown ||
+                             _requires_row_positions != file->requires_row_positions ||
+                             (_run_reader_options != file->reader_options &&
+                              !same_virtual_projection && !same_mapped_projection) ||
+                             mapping_changed)) {
       auto batch = emit_current();
       if (schema_changed && _counters)
         _counters->split_flushed_for_schema.fetch_add(1, std::memory_order_relaxed);
@@ -685,7 +695,11 @@ class parquet_batch_coalescer : public batch_coalescer {
     auto split            = std::make_unique<parquet_split_info>(std::move(hints));
     split->rg_slices      = std::move(_slices);
     split->reader_options = std::move(reader_options);
-    split->field_mapping  = _run_mapping;
+    // A compatible successor can trigger the byte cap before contributing a row group.
+    // Bind the emitted mapping to a file actually present in this batch.
+    auto const* witness =
+      dynamic_cast<mapped_parquet_visibility const*>(_dependencies.front().visibility.get());
+    split->field_mapping = witness ? witness->mapping : _run_mapping;
     split->set_column_chunk_byte_ranges(std::move(per_slice_ranges));
     split->plan                       = _plan;
     split->source_kind                = _source_kind;
@@ -2464,12 +2478,21 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     if (mapping.program().contract != _info->contract_id)
       throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
                                                     "mapped split belongs to another scan");
-    for (auto const& slice : split.rg_slices)
-      if (slice.file_metadata != mapping.metadata()->file_metadata() || !slice.datasource ||
-          slice.datasource->get_io_object().identity_cache_key() != mapping.identity())
+    for (size_t i = 0; i < split.rg_slices.size(); ++i) {
+      auto const& slice = split.rg_slices[i];
+      auto const* witness =
+        i < split.dependencies().size()
+          ? dynamic_cast<mapped_parquet_visibility const*>(split.dependencies()[i].visibility.get())
+          : nullptr;
+      auto const& file_mapping = witness ? witness->mapping : split.field_mapping;
+      if (!file_mapping ||
+          (file_mapping != split.field_mapping && !mapping.compatible_with(*file_mapping)) ||
+          slice.file_metadata != file_mapping->metadata()->file_metadata() || !slice.datasource ||
+          slice.datasource->get_io_object().identity_cache_key() != file_mapping->identity())
         throw transparent::classified_execution_error(
           transparent::late_failure_cause::certificate,
           "mapped split does not match its approved file");
+    }
   }
   // All-pruned fallback split (parquet_batch_coalescer::flush): every slice
   // carries zero row groups.

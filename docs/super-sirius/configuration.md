@@ -536,12 +536,12 @@ Those two knobs derive the settings below, which are therefore **not** individua
 
 ### `sirius.executor.scan_manager.preparation`
 
-These settings are loaded at initialization. Metadata jobs default to a limit of 4096; DV jobs have no configured count cap by default. `0` disables either job limit. `coordinator_workers: 0` selects dedicated coordinator threads; other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+These settings are loaded at initialization. The metadata job limit defaults to 4096. Setting `max_inflight_metadata_jobs` to `0` removes that limit. When `max_permits` is omitted or set to `0`, the scan worker count sets the upper bound on preparation permits. Setting `coordinator_workers` to `0` selects dedicated coordinator threads. Other count limits require positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`). `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`. Bare integers are milliseconds.
 
 | Key | Default | Description |
 |---|---|---|
 | `max_inflight_metadata_jobs` | 4096 | Maximum submitted metadata preparation jobs across the query, including queued work. `0` means unlimited. Completion returns the job slot. |
-| `max_inflight_dv_jobs` | unlimited | Maximum DV preparation jobs holding temporary-memory permits, including queued work. Omitted or `0` imposes no configured count cap. Admission may grant fewer permits when HOST memory is insufficient. |
+| `max_permits` | 0 | Maximum number of preparation memory permits shared across a statement. The scan worker count and available HOST memory can reduce the number granted. |
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
 | `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
@@ -556,7 +556,9 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 
 Both residence times start when the first input enters an empty accumulator; later arrivals do not reset them. Normal full-batch, compatibility-boundary, final-flush, and window-progress publication still apply. Downstream consumption means taking the batch from the connector, not completing GPU execution. To express a fixed time limit, set both residence values to the same duration.
 
-A file with a DV currently reads its footer and prepares its DV in the same job, so it uses a metadata job slot and a DV permit. The metadata limit does not size the DV reservation: admission reserves retained results plus K temporary workspaces, where K is bounded by the DV unit count, `scan_manager.num_threads`, and the DV limit when nonzero. Insufficient HOST memory may reduce K further. Neither setting changes the worker thread count. The previous `max_inflight_jobs` key is no longer accepted; use `max_inflight_metadata_jobs`.
+For a file with a DV, Iceberg reads the footer and prepares the DV in the same metadata job, using one metadata job slot and one preparation permit. Admission reserves HOST memory for retained results and one temporary workspace per granted permit. For Iceberg DV preparation alone, the number of DV units also bounds the grant. In existing configurations, replace `max_inflight_jobs` with `max_inflight_metadata_jobs` and `max_inflight_dv_jobs` with `max_permits`.
+
+DuckLake shares the same preparation permits for Puffin DVs, Parquet delete files and inline delete positions. The query owner discovers files as the scan proceeds. A file can hold its permit until the last batch that uses its delete positions releases them. Each DuckLake scan reserves one progress slot. When another Parquet file is discovered, its cursor may reserve a separate HOST workspace and retained-position budget. If that request is denied, a funded cursor prepares the file. The scans share the remaining permit count after admission has funded their progress minima and the known units.
 
 ```yaml
 sirius:
@@ -564,7 +566,7 @@ sirius:
     scan_manager:
       preparation:
         max_inflight_metadata_jobs: 4096
-        max_inflight_dv_jobs: 0
+        max_permits: 0
         coordinator_workers: 1
         native_reader_workers: 2
         max_native_readers: 64

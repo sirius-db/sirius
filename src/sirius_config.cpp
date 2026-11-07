@@ -367,7 +367,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& 
     out = static_cast<size_t>(*value);
   };
   limit("max_inflight_metadata_jobs", opt.max_inflight_metadata_jobs, true);
-  limit("max_inflight_dv_jobs", opt.max_inflight_dv_jobs, true);
+  limit("max_permits", opt.max_permits, true);
   limit("lookahead_batches", opt.lookahead_batches);
   limit("max_control_work", opt.max_control_work);
   limit("drain_quantum", opt.drain_quantum);

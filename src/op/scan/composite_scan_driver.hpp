@@ -23,15 +23,21 @@ struct composite_scan_child {
   std::shared_ptr<gpu_ingestible> source;
   std::shared_ptr<split_validator const> validator;
   later_check_set checks;
+  // True only for inputs that this scan's other participating children can validate
+  // and materialize with the same plan, subject to the inner coalescer's checks.
+  bool (*share_batches)(scan_info const&) = nullptr;
+  // An optional cursor charges its files to the HOST grant that funded it.
+  std::shared_ptr<scan_manager::preparation_ledger> ledger = {};
 };
 // Drives lazily discovered children on query-owner and metadata-worker lanes.
 // Children produce the same output schema and suppress their empty-source carriers.
-// Discovery runs on the query owner; nullopt ends the whole source.
+// Discovery runs on the query owner. A null result retires only that cursor,
+// so another cursor can handle a file whose optional slot was denied.
 // Claim/coalescing has one coordinator. Each child lane uses bounded advance
 // and returns at most one tail batch. Native-reader lanes are not supported.
 class composite_scan_driver {
  public:
-  using discover_child = std::function<std::optional<composite_scan_child>()>;
+  using discover_child = std::function<std::optional<composite_scan_child>(size_t slot)>;
   composite_scan_driver(scan_contract_id,
                         uint64_t generation,
                         later_check_set supported_checks,

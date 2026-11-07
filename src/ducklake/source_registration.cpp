@@ -94,7 +94,11 @@ std::optional<scan_manager::preparation_request> prepare_scan(op::sirius_physica
     wide_columns += column.storage_bytes > 8;
   }
   return scan_manager::preparation_request{
-    {{scan_ingestible::envelope(selected->selected.size(), strings, wide_columns)}, {}, true, 1},
+    {{scan_ingestible::envelope(selected->selected.size(), strings, wide_columns)},
+     {},
+     true,
+     1,
+     scan.contract_id},
     [](scan_manager::preparation_ledger&) {},
     [&scan, binding, selected](std::shared_ptr<scan_manager::preparation_admission> admission) {
       auto const& entry = scan.read_views->entry(scan.contract_id);

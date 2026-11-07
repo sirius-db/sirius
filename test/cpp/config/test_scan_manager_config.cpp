@@ -129,7 +129,7 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
       {"", 50, 50, 2000, 10},
       {"      preparation: {}\n", 50, 50, 2000, 10},
       {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 50, 50, 2000, 10},
-      {"      preparation:\n        max_inflight_dv_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_permits: 0\n", 50, 50, 2000, 10},
       {"      preparation:\n        interrupt_check_interval: 3\n", 50, 50, 2000, 3},
       {"      preparation:\n        interrupt_check_interval: 1s\n", 50, 50, 2000, 1000},
       {"      preparation:\n        partial_batch: {}\n", 50, 50, 2000, 10},
@@ -168,7 +168,7 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{interrupt_ms});
   CHECK(options.max_inflight_metadata_jobs ==
         (body.find("max_inflight_metadata_jobs: 0") != std::string::npos ? 0 : 4096));
-  CHECK(options.max_inflight_dv_jobs == 0);
+  CHECK(options.max_permits == 0);
 }
 
 TEST_CASE("Preparation timing YAML rejects invalid values and unknown keys",
@@ -217,7 +217,7 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
 {
   auto selected = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
   std::array keys{"max_inflight_metadata_jobs",
-                  "max_inflight_dv_jobs",
+                  "max_permits",
                   "lookahead_batches",
                   "max_control_work",
                   "drain_quantum",
@@ -243,7 +243,7 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
   REQUIRE(config.thread_pool.num_threads == workers);
   auto options = config.preparation.resolve(config.thread_pool.num_threads);
   std::array actual{options.max_inflight_metadata_jobs,
-                    options.max_inflight_dv_jobs,
+                    options.max_permits,
                     options.lookahead_batches,
                     options.max_control_work,
                     options.drain_quantum,
@@ -265,7 +265,7 @@ TEST_CASE("Preparation limit YAML rejects invalid values",
           "[scan_manager][config][preparation_config]")
 {
   auto key   = GENERATE("max_inflight_metadata_jobs",
-                      "max_inflight_dv_jobs",
+                      "max_permits",
                       "lookahead_batches",
                       "max_control_work",
                       "drain_quantum",
@@ -274,8 +274,7 @@ TEST_CASE("Preparation limit YAML rejects invalid values",
                       "coordinator_workers");
   auto value = GENERATE("0", "-1", "1.5", "many", "[]", "18446744073709551616");
   if ((std::string_view(key) == "max_inflight_metadata_jobs" ||
-       std::string_view(key) == "max_inflight_dv_jobs" ||
-       std::string_view(key) == "coordinator_workers") &&
+       std::string_view(key) == "max_permits" || std::string_view(key) == "coordinator_workers") &&
       std::string_view(value) == "0")
     return;
   INFO(key << ": " << value);
@@ -288,7 +287,8 @@ TEST_CASE("Preparation limit YAML rejects invalid values",
 
 TEST_CASE("Preparation YAML rejects retired keys", "[scan_manager][config][preparation_config]")
 {
-  auto key = GENERATE("max_active_units", "max_pending_results", "max_inflight_jobs");
+  auto key = GENERATE(
+    "max_active_units", "max_pending_results", "max_inflight_jobs", "max_inflight_dv_jobs");
   scoped_yaml yaml("sirius_preparation_old_window.yaml",
                    scan_manager_yaml(std::string("      preparation:\n        ") + key + ": 8\n"));
   CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),

@@ -21,6 +21,7 @@
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/preparation_gate.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/logging.hpp"
 #include "op/scan/parquet_batch_layout.hpp"
 #include "op/scan/positional_visibility.hpp"
 #include "op/scan/table_scan/split_validation.hpp"
@@ -34,9 +35,6 @@
 #include <duckdb/common/exception.hpp>
 
 namespace sirius::ducklake {
-struct parquet_visibility_state {
-  std::atomic<std::shared_ptr<dv_visibility const>> value;
-};
 namespace {
 namespace scan = op::scan;
 namespace sm   = scan_manager;
@@ -137,16 +135,20 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
   };
   return info;
 }
+// Only metadata preparation can seal the binding, original file and visibility together.
+// The alias in visibility holds the file's memory permit until the last dependent batch drains.
+struct sealed_file final : scan::mapped_parquet_visibility {
+  std::shared_ptr<preparation_identity const> scan;
+  size_t file_index;
+  std::string path;
+  std::shared_ptr<dv_visibility const> visibility;
+};
 class plain_validator final : public scan::split_validator {
  public:
-  plain_validator(unit_descriptor unit,
-                  uint64_t generation,
-                  std::shared_ptr<parquet_visibility_state> visibility,
-                  std::shared_ptr<mapping_witness> mapping)
-    : unit_(std::move(unit)),
-      generation_(generation),
-      visibility_(std::move(visibility)),
-      mapping_(std::move(mapping))
+  plain_validator(uint64_t generation, plain_info const& info)
+    : generation_(generation),
+      scan_(info.identities),
+      mapping_(info.owns_admission || !info.identities ? info.mapping : nullptr)
   {
   }
   bool accepts(scan::scan_info const& split) const noexcept override
@@ -158,27 +160,22 @@ class plain_validator final : public scan::split_validator {
   {
     auto evidence       = scan::parquet_split_validator()->inspect(context, split);
     auto const& parquet = dynamic_cast<scan::parquet_split_info const&>(split);
-    if (!parquet.field_mapping || parquet.field_mapping != mapping_->value.load() ||
-        parquet.field_mapping->program().generation != generation_ ||
+    if (!parquet.field_mapping || parquet.field_mapping->program().generation != generation_ ||
         parquet.field_mapping->program().contract != context.contract ||
         parquet.rg_slices.size() != split.dependencies().size())
       throw scan::certificate_incomplete(context.contract, {}, "DuckLake mapping evidence missing");
-    auto visibility = visibility_->value.load();
-    if (!visibility ||
-        (unit_.deletes != delete_format::none &&
-         (visibility->delete_identity.empty() ||
-          (unit_.deletes == delete_format::puffin ? !visibility->validated_blobs
-                                                  : !visibility->parquet_validated))) ||
-        (visibility->inline_count != unit_.inline_delete_count) ||
-        (!visibility->positions.empty() && !parquet.disable_filter_pushdown))
-      throw scan::certificate_incomplete(context.contract, {}, "DuckLake visibility is incomplete");
     for (size_t i = 0; i < parquet.rg_slices.size(); ++i) {
       auto const& slice = parquet.rg_slices[i];
-      if (slice.file_index != unit_.original_file_index || slice.file_path != unit_.input.path ||
-          split.dependencies()[i].visibility != visibility ||
-          visibility->data_identity != parquet.field_mapping->identity() ||
-          parquet.field_mapping->identity() !=
-            split.dependencies()[i].parquet_approval->object_identity)
+      auto const& dep   = split.dependencies()[i];
+      auto const* file  = dynamic_cast<sealed_file const*>(dep.visibility.get());
+      if (!file || file->scan != scan_ || (mapping_ && file->mapping != mapping_->value.load()) ||
+          file->file_index != slice.file_index || file->path != slice.file_path || !file->mapping ||
+          (i == 0 && parquet.field_mapping != file->mapping) ||
+          (parquet.field_mapping != file->mapping &&
+           !parquet.field_mapping->compatible_with(*file->mapping)) ||
+          file->mapping->metadata()->file_metadata() != slice.file_metadata ||
+          file->mapping->identity() != dep.parquet_approval->object_identity ||
+          (!file->visibility->positions.empty() && !parquet.disable_filter_pushdown))
         throw scan::certificate_incomplete(
           context.contract, {}, "DuckLake unit/visibility evidence mismatch");
     }
@@ -187,9 +184,8 @@ class plain_validator final : public scan::split_validator {
   }
 
  private:
-  unit_descriptor unit_;
   uint64_t generation_;
-  std::shared_ptr<parquet_visibility_state> visibility_;
+  std::shared_ptr<preparation_identity const> scan_;
   std::shared_ptr<mapping_witness> mapping_;
 };
 struct claimed_unit {
@@ -266,10 +262,9 @@ parquet_unit_ingestible::parquet_unit_ingestible(
     binding_(std::move(binding)),
     unit_(std::move(unit)),
     generation_(generation),
-    visibility_(std::make_shared<parquet_visibility_state>()),
     inline_deletes_(std::make_shared<inline_delete_preparation>()),
-    validator_(std::make_shared<plain_validator>(
-      unit_, generation_, visibility_, static_cast<plain_info const&>(table_info()).mapping)),
+    validator_(
+      std::make_shared<plain_validator>(generation_, static_cast<plain_info const&>(table_info()))),
     admission_(std::move(admission))
 {
   auto const& identities = static_cast<plain_info const&>(table_info()).identities;
@@ -381,11 +376,23 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
       auto retained = std::make_shared<visibility_owner>(owned, std::move(visibility));
       visibility    = std::shared_ptr<dv_visibility const>(retained, retained->visibility.get());
     }
-    std::shared_ptr<dv_visibility const> absent;
-    if (!visibility_->value.compare_exchange_strong(absent, visibility))
-      throw std::logic_error("DuckLake visibility was already sealed");
+    auto const& info = static_cast<plain_info const&>(table_info());
+    if (!file.field_mapping || file.field_mapping != info.mapping->value.load() ||
+        visibility->data_identity != file.field_mapping->identity() ||
+        visibility->inline_count != unit_.inline_delete_count ||
+        (unit_.deletes != delete_format::none &&
+         (visibility->delete_identity.empty() ||
+          (unit_.deletes == delete_format::puffin ? !visibility->validated_blobs
+                                                  : !visibility->parquet_validated))))
+      throw scan::certificate_incomplete(info.contract_id, {}, "DuckLake visibility is incomplete");
     file.disable_filter_pushdown |= !visibility->positions.empty();
-    deps[0].visibility = std::move(visibility);
+    auto sealed        = std::make_shared<sealed_file>();
+    sealed->scan       = info.identities;
+    sealed->mapping    = file.field_mapping;
+    sealed->file_index = file.file_index;
+    sealed->path       = file.file_path;
+    sealed->visibility = std::move(visibility);
+    deps[0].visibility = std::move(sealed);
     file.set_contract_payload(table_info().contract_id, std::move(certs), std::move(deps));
     return result;
   }};
@@ -498,7 +505,6 @@ void parquet_unit_ingestible::stop_preparation() noexcept { ledger_.reset(); }
 void parquet_unit_ingestible::finish_preparation() noexcept
 {
   stop_preparation();
-  visibility_->value.store({});
   inline_deletes_->ready.store({});
   if (static_cast<plain_info const&>(table_info()).owns_admission) admission_->finish();
 }
@@ -516,23 +522,35 @@ op::scan::filtered_table parquet_unit_ingestible::materialize_metadata_to_table(
 {
   op::scan::validate_split_for_gpu(
     table_info().contract_id, checks(), {}, info, *validator_, generation_, table_info().profiles);
-  auto visibility = visibility_->value.load();
-  auto base       = parquet_gpu_ingestible::materialize_metadata_to_table(
+  auto base = parquet_gpu_ingestible::materialize_metadata_to_table(
     info, space, stream, like, std::move(cache), policy);
-  if (visibility->positions.empty()) return base;
+  auto const& split = dynamic_cast<op::scan::parquet_split_info const&>(info);
+  if (split.rg_slices.size() > 1)
+    SIRIUS_LOG_DEBUG("DuckLake Parquet batch spans {} file slices", split.rg_slices.size());
+  auto deps    = split.dependencies();
+  auto file_at = [&](size_t i) -> sealed_file const& {
+    return static_cast<sealed_file const&>(*deps[i].visibility);
+  };
+  if (std::none_of(deps.begin(), deps.end(), [](auto const& dep) {
+        return !static_cast<sealed_file const&>(*dep.visibility).visibility->positions.empty();
+      }))
+    return base;
   if (base.state != op::scan::filter_state::UNFILTERED)
     throw std::logic_error("DuckLake DV requires unfiltered original file rows");
-  auto const& split = dynamic_cast<op::scan::parquet_split_info const&>(info);
-  auto layout       = op::scan::build_batch_layout(split);
+  auto layout = op::scan::build_batch_layout(split);
   rmm::device_async_resource_ref mr(space.get_default_allocator());
   auto table = base.table.release(stream, mr);
   if (!table) throw std::logic_error("DuckLake DV requires an owned decoded table");
-  auto filtered = op::scan::apply_positional_visibility(
+  size_t slice  = 0;
+  auto filtered = op::scan::apply_run_positional_visibility(
     std::move(table),
     layout,
-    [&](std::string const& path) {
-      if (path != unit_.input.path) throw std::logic_error("DuckLake DV row domain changed file");
-      return visibility->positions;
+    [&](scan::batch_row_run const& run) {
+      while (slice < deps.size() && file_at(slice).file_index != run.file_index)
+        ++slice;
+      if (slice == deps.size() || file_at(slice).path != run.data_file_path)
+        throw std::logic_error("DuckLake DV row domain changed file");
+      return file_at(slice).visibility->positions;
     },
     stream,
     mr);

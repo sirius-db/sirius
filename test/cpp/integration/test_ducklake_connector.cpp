@@ -21,6 +21,7 @@
 #include "ducklake/scan_ingestible.hpp"
 #include "exec/streaming_fragment.hpp"
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
+#include "op/scan/ready_input_coalescer.hpp"
 #include "planner/connector_registry.hpp"
 #include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -33,6 +34,7 @@
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/main/attached_database.hpp>
@@ -252,6 +254,8 @@ struct observed_host_reservations : sirius::scan_manager::reservation_provider {
   };
   sirius::scan_manager::memory_space_id space{cucascade::memory::Tier::HOST, 0};
   std::map<std::thread::id, std::weak_ptr<backing>> pending;
+  std::atomic<size_t> requests{0};
+  std::optional<size_t> request_limit;
   sirius::scan_manager::host_reservation_provider original;
   std::shared_ptr<observations> seen = std::make_shared<observations>();
   explicit observed_host_reservations(cucascade::memory::memory_reservation_manager& manager)
@@ -269,6 +273,8 @@ struct observed_host_reservations : sirius::scan_manager::reservation_provider {
   std::optional<sirius::scan_manager::reservation_grant> request(
     sirius::scan_manager::memory_space_id space, uint64_t bytes) override
   {
+    auto index = requests.fetch_add(1);
+    if (request_limit && index >= *request_limit) return {};
     auto grant = original.request(space, bytes);
     if (grant) {
       auto tracked  = std::make_shared<backing>(std::move(grant->handle), seen, grant->bytes);
@@ -292,6 +298,85 @@ struct observed_host_reservations : sirius::scan_manager::reservation_provider {
     pending.erase(std::this_thread::get_id());
   }
 };
+
+// Drive the real file jobs to completion before advancing the coalescer. This
+// makes readiness deterministic without relying on worker timing or debug logs.
+void check_ready_parquet_files(std::shared_ptr<sirius::ducklake::binding_handle> binding,
+                               cucascade::memory::memory_reservation_manager& manager)
+{
+  namespace dl                              = sirius::ducklake;
+  namespace sm                              = sirius::scan_manager;
+  namespace scan                            = sirius::op::scan;
+  constexpr scan::scan_contract_id contract = 17;
+  constexpr uint64_t generation             = 1;
+  constexpr size_t files                    = 3;
+  std::array<sm::scan_envelope, 1> envelope{
+    {{{dl::scan_ingestible::envelope(1, 0)}, {}, true, 1, contract}}};
+  auto ledger = std::make_unique<sm::preparation_ledger>(
+    std::make_shared<sm::host_reservation_provider>(manager));
+  auto space = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front()->get_id();
+  auto decision = ledger->admit(envelope, space, files);
+  REQUIRE(decision.deferred);
+  auto admission = std::make_shared<sm::preparation_admission>(std::move(ledger), decision);
+  dl::scan_ingestible source(std::move(binding), contract, generation, admission, {0}, false, {});
+  source.preflight_for_query();
+  source.attach_preparation_ledger(std::shared_ptr<sm::preparation_ledger>(admission->consume()));
+  auto io    = std::make_shared<cucascade::io::kvikio_context>();
+  auto lanes = source.make_preparation_sources([&](std::string_view) { return io; });
+  REQUIRE(lanes.size() == 2);
+  for (auto& lane : lanes)
+    lane.bind_wakeup({});
+  auto run = [](auto& lane) {
+    auto claim = lane.try_claim();
+    REQUIRE(std::holds_alternative<sm::preparation_job>(claim));
+    return std::get<sm::preparation_job>(std::move(claim)).run({});
+  };
+  for (size_t i = 0; i < files; ++i)
+    REQUIRE_FALSE(run(lanes[0]));
+  std::array<std::unique_ptr<scan::scan_info>, files> inputs;
+  for (size_t i = 0; i < files; ++i) {
+    inputs[i] = run(lanes[1]);
+    REQUIRE(inputs[i]);
+    REQUIRE(inputs[i]->certificates().size() == 1);
+    REQUIRE(inputs[i]->dependencies().size() == 1);
+    REQUIRE(inputs[i]->certificates().front().split_id == i);
+  }
+  auto& coalescer = dynamic_cast<scan::ready_input_coalescer&>(*lanes[1].coalescer);
+  std::vector<std::vector<size_t>> groups;
+  size_t partial_steps = 0;
+  for (size_t i = 0; i < files; ++i) {
+    size_t cursor = 0;
+    for (;;) {
+      size_t probes = 0;
+      auto step     = coalescer.advance_ready(*inputs[i], cursor, 1, [&] {
+        ++probes;
+        return i + 1 < files;
+      });
+      if (step.batch) {
+        auto evidence = source.materializer().validator->inspect({contract, {}, {}}, *step.batch);
+        CHECK(evidence.generation == generation);
+        auto& group = groups.emplace_back();
+        for (auto const& slice : step.batch->dependencies()) {
+          auto input = std::find_if(inputs.begin(), inputs.end(), [&](auto const& raw) {
+            return raw->dependencies().front().visibility == slice.visibility;
+          });
+          REQUIRE(input != inputs.end());
+          group.push_back((*input)->certificates().front().split_id);
+        }
+      }
+      CHECK(probes == (step.finished ? 1 : 0));
+      if (step.finished) break;
+      ++partial_steps;
+    }
+  }
+  CHECK(partial_steps >= files);
+  // The first two files share a schema. The third was written after adding a column.
+  const std::vector<std::vector<size_t>> expected{{0, 1}, {2}};
+  CHECK(groups == expected);
+  for (auto& lane : lanes)
+    lane.close();
+  source.finish_preparation();
+}
 
 // Exercise actual provider children with spare ledger capacity, so pending proves gate exclusion.
 void check_mixed_input_gate(std::shared_ptr<sirius::ducklake::binding_handle> const& binding,
@@ -1217,13 +1302,105 @@ TEST_CASE_METHOD(ducklake_fixture,
   CHECK(counters->arrow_batches_imported == 0);
 }
 
+TEST_CASE("DuckLake reserves optional preparation permits for discovered files",
+          "[isolated_context][ducklake][ducklake_dv_slots]")
+{
+  auto [file_count, limit, deny_extra] = GENERATE(table<unsigned, unsigned, bool>(
+    {{1, 0, false}, {2, 0, false}, {3, 1, false}, {3, 2, false}, {3, 2, true}}));
+  CAPTURE(file_count, limit, deny_extra);
+  sirius::test::scoped_temp_directory disk;
+  auto path = write_lake_config(disk.directory, [&](YAML::Node& config) {
+    auto manager                          = config["sirius"]["executor"]["scan_manager"];
+    manager["num_threads"]                = 3;
+    manager["preparation"]["max_permits"] = limit;
+  });
+  sirius::test::shared_test_env env(path);
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',0)");
+  query(con, "CALL lake.set_option('write_deletion_vectors',true)");
+  query(con, "CALL lake.set_option('parquet_row_group_size',2048)");
+  query(con, "CREATE TABLE lake.q(id BIGINT)");
+  for (unsigned i = 0; i < file_count; ++i) {
+    if (i == 2) query(con, "ALTER TABLE lake.q ADD COLUMN extra BIGINT DEFAULT 0");
+    query(con,
+          "INSERT INTO lake.q SELECT i+" + std::to_string(i * 8192) + (i == 2 ? ", i" : "") +
+            " FROM range(8192) t(i)");
+  }
+  if (file_count > 1) query(con, "DELETE FROM lake.q WHERE id%8192=(id//8192)+1");
+  auto sql             = "SELECT id FROM lake.q WHERE id%8192<5 ORDER BY id";
+  auto runtime         = sirius::test::get_registered_sirius_context(con);
+  auto observer        = duckdb::make_shared_ptr<provider_query_observer>();
+  bool checked_batches = false;
+  if (file_count == 3 && limit == 2 && !deny_extra) {
+    observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+      if (&context != con.context.get() || checked_batches) return;
+      auto* get = ducklake_get(plan);
+      if (!get) return;
+      checked_batches = true;
+      auto binding =
+        sirius::ducklake::binding_handle::capture(get->function, get->bind_data.get(), context);
+      REQUIRE(binding);
+      check_ready_parquet_files(std::move(binding), runtime->get_memory_manager());
+    };
+    duckdb::OptimizerExtension ext;
+    ext.optimizer_info    = observer;
+    ext.optimize_function = observe_provider_query;
+    duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), ext);
+  }
+  auto expected = ducklake_result_bag(*query(con, sql));
+  if (observer->inspect_plan) REQUIRE(checked_batches);
+  observer->inspect_plan = {};
+
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto backing = std::make_shared<observed_host_reservations>(runtime->get_memory_manager());
+  if (deny_extra) backing->request_limit = 1;
+  counters->preparation_provider_for_testing = backing;
+  uint32_t permits                           = 0;
+  counters->iceberg_statement_route_for_testing =
+    [&](std::string_view, const sirius::scan_manager::admission_decision& decision) {
+      permits = decision.n_permits;
+    };
+  const auto slots = std::min(file_count, limit ? limit : 3u);
+  const auto width = deny_extra ? 1u : slots;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::set<std::string> files;
+  counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
+    if (!footer) return;
+    std::unique_lock lock(mutex);
+    files.insert(file);
+    cv.notify_all();
+    // Keep the first footer in flight until another worker reaches a different
+    // file of this same scan. A serial discovery path cannot pass at width two.
+    if (!cv.wait_for(lock, std::chrono::seconds(10), [&] { return files.size() >= width; }))
+      throw std::runtime_error("DuckLake did not use its admitted DV preparation slots");
+  };
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->preparation_provider_for_testing.reset();
+    counters->iceberg_statement_route_for_testing = {};
+    counters->parquet_phase_for_testing           = {};
+  });
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  CHECK(permits == 1);
+  CHECK(files.size() == file_count);
+  CHECK(backing->requests == slots);
+  CHECK(backing->seen->peak_active == width);
+  CHECK(backing->seen->active == 0);
+}
+
 TEST_CASE("DuckLake joins refuse an insufficient preparation permit ceiling before data work",
           "[isolated_context][ducklake][ducklake_admission_minimum]")
 {
   if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   sirius::test::scoped_temp_directory disk;
   auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
-    config["sirius"]["executor"]["scan_manager"]["preparation"]["max_inflight_dv_jobs"] = 1;
+    config["sirius"]["executor"]["scan_manager"]["preparation"]["max_permits"] = 1;
   });
   sirius::test::shared_test_env env(config_path);
   auto con = env.make_connection();
@@ -1361,9 +1538,9 @@ TEST_CASE("Concurrent DuckLake scans release input budgets while GPU outputs rem
   CAPTURE(deletion, join);
   sirius::test::scoped_temp_directory disk;
   auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
-    config["sirius"]["max_concurrent_queries"]                                          = 2;
-    config["sirius"]["executor"]["scan_manager"]["max_concurrent_queries"]              = 2;
-    config["sirius"]["executor"]["scan_manager"]["preparation"]["max_inflight_dv_jobs"] = 2;
+    config["sirius"]["max_concurrent_queries"]                                 = 2;
+    config["sirius"]["executor"]["scan_manager"]["max_concurrent_queries"]     = 2;
+    config["sirius"]["executor"]["scan_manager"]["preparation"]["max_permits"] = 2;
   });
   sirius::test::shared_test_env env(config_path);
   auto con = env.make_connection();
@@ -1548,7 +1725,8 @@ TEST_CASE("Concurrent DuckLake scans release input budgets while GPU outputs rem
   CHECK(decoded >= (join ? 48 : 24));
   CHECK(counters->arrow_rows_imported.load() == imported + (join ? 36 : 18));
   CHECK_FALSE(observed->seen->exceeded);
-  CHECK(observed->seen->peak_active == 2);
+  CHECK(observed->seen->peak_active >= 2);  // both statements held their progress grants
+  CHECK(observed->seen->peak_active <= (join ? 2 : 4));
   CHECK(observed->seen->peak_live > 0);
   CHECK(observed->seen->live == 0);
   CHECK(observed->seen->grants == 0);

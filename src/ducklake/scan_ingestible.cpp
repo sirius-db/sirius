@@ -53,6 +53,11 @@ struct scan_ingestible::impl {
   std::vector<size_t> selected, outputs;
   std::vector<cudf::data_type> output_types;
   unit_scan_options options;
+  struct parquet_slot {
+    std::shared_ptr<preparation_slot> retained;
+    std::shared_ptr<preparation_gate> gate;
+  };
+  std::vector<parquet_slot> slots;
   bool count_only;
   uint64_t next_file = 0;
   impl(std::shared_ptr<binding_handle> b,
@@ -93,7 +98,7 @@ struct scan_ingestible::impl {
       output_types.push_back(*type);
     }
   }
-  std::optional<scan::composite_scan_child> discover()
+  std::optional<scan::composite_scan_child> discover(size_t slot)
   {
     auto descriptor = binding->unit_at(next_file);
     while (descriptor && binding->can_prune_unit(next_file)) {
@@ -111,16 +116,33 @@ struct scan_ingestible::impl {
     opts.profiles       = options.profiles;
     opts.identities     = options.identities;
     opts.inline_gate    = options.inline_gate;
-    opts.parquet_slot   = options.parquet_slot;
     opts.owns_admission = false;
     if (descriptor->kind == unit_kind::parquet) {
-      auto source = binding->make_parquet_unit(
+      auto& budget = slots.at(slot);
+      if (!budget.retained) {
+        // Discovery is serialized on the query owner. Leave next_file in place
+        // if this optional cursor cannot be funded. The progress cursor will read it.
+        auto extra = ledger->try_reserve_reusable_slot(contract, slot);
+        if (!extra) return {};
+        budget.retained =
+          std::make_shared<preparation_slot>(std::move(extra),
+                                             sm::unit_key{contract, options.identities->next()},
+                                             envelope(0, 0).retained);
+      }
+      state.ledger      = budget.retained->ledger();
+      opts.parquet_slot = budget.retained;
+      opts.inline_gate  = budget.gate;
+      auto source       = binding->make_parquet_unit(
         next_file, contract, generation, admission, selected, count_only, std::move(opts));
       state.validator = source->materializer().validator;
       state.checks    = scan::check_bit(scan::later_check::footer_per_file) |
                      scan::check_bit(scan::later_check::profile_per_file) |
                      scan::check_bit(scan::later_check::schema_per_file);
-      state.source = std::move(source);
+      state.source        = std::move(source);
+      state.share_batches = [](scan::scan_info const& input) {
+        auto const* file = dynamic_cast<scan::parquet_file_scan_info const*>(&input);
+        return file && !file->row_groups.empty();
+      };
     } else {
       auto source = binding->make_inline_unit(
         next_file, contract, generation, admission, count_only, selected, std::move(opts));
@@ -154,9 +176,11 @@ scan_ingestible::scan_ingestible(std::shared_ptr<binding_handle> binding,
                    scan::check_bit(scan::later_check::schema_per_file) |
                    scan::check_bit(scan::later_check::host_staged);
   driver_ = std::make_unique<scan::composite_scan_driver>(
-    contract, generation, supported, impl_->options.scan_task_batch_size, [state = impl_] {
-      return state->discover();
-    });
+    contract,
+    generation,
+    supported,
+    impl_->options.scan_task_batch_size,
+    [state = impl_](size_t slot) { return state->discover(slot); });
 }
 scan_ingestible::~scan_ingestible() = default;
 sm::unit_envelope scan_ingestible::envelope(size_t columns,
@@ -184,7 +208,8 @@ std::vector<scan_ingestible::preparation_source> scan_ingestible::make_preparati
 {
   return driver_->make_preparation_sources(
     resolve, impl_->ledger, _execution_completion, [state = impl_](sm::preparation_wakeup wake) {
-      state->options.inline_gate->wake = wake;
+      for (auto& slot : state->slots)
+        slot.gate->wake = wake;
     });
 }
 std::unique_ptr<scan::batch_coalescer> scan_ingestible::create_batch_coalescer() const
@@ -198,7 +223,12 @@ std::shared_ptr<sm::preparation_admission> scan_ingestible::preparation_admissio
 void scan_ingestible::attach_preparation_ledger(std::shared_ptr<sm::preparation_ledger> ledger)
 {
   if (!ledger || impl_->ledger) throw std::logic_error("DuckLake scan ledger attachment invalid");
-  impl_->options.parquet_slot = std::make_shared<preparation_slot>(
+  impl_->slots.resize(ledger->reusable_slot_limit(impl_->contract));
+  // Slot zero also serves inline input. The two sources share the progress permit.
+  impl_->slots.front().gate = impl_->options.inline_gate;
+  for (size_t i = 1; i < impl_->slots.size(); ++i)
+    impl_->slots[i].gate = std::make_shared<preparation_gate>();
+  impl_->slots.front().retained = std::make_shared<preparation_slot>(
     ledger,
     sm::unit_key{impl_->contract, impl_->options.identities->next()},
     envelope(0, 0).retained);
@@ -213,7 +243,7 @@ void scan_ingestible::finish_preparation() noexcept
 {
   driver_->finish_preparation();
   stop_preparation();
-  impl_->options.parquet_slot.reset();
+  impl_->slots.clear();
   impl_->admission->finish();
 }
 scan::ingestible_table_info const& scan_ingestible::table_info() const noexcept
