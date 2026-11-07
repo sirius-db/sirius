@@ -14,10 +14,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <functional>
-#include <future>
 #include <random>
 #include <regex>
 #include <set>
@@ -186,7 +186,91 @@ bool transport_failed(std::string const& message)
 /// forwarded port is gone, so the rank is lost.
 bool rank_unreachable(std::string const& message)
 {
-  return message.find("Failed to send message") != std::string::npos;
+  return message.find("Failed to send message") != std::string::npos ||
+         message.find("did not answer; abandoned") != std::string::npos;
+}
+
+/// One fan-out's calls, shared with the threads that run them so a call the gateway gives up on
+/// can finish on its own.
+struct fan_out_shared {
+  struct call {
+    std::shared_ptr<Connection> channel;
+    std::vector<std::string> statements;
+    std::unique_ptr<duckdb::QueryResult> result;
+    std::optional<duckdb::ErrorData> error;
+    bool done = false;  // under mutex
+  };
+  explicit fan_out_shared(std::size_t ranks) : calls(ranks), remaining(ranks) {}
+
+  std::vector<call> calls;
+  /// Set once the statement is cancelled: no rank starts another statement of its list.
+  std::atomic<bool> cancel{false};
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::size_t remaining;
+};
+
+void run_call(fan_out_shared& shared, std::size_t index)
+{
+  auto& call = shared.calls[index];
+  std::unique_ptr<duckdb::QueryResult> result;
+  std::optional<duckdb::ErrorData> error;
+  try {
+    for (auto const& sql : call.statements) {
+      if (shared.cancel) {
+        error = duckdb::ErrorData(duckdb::ExceptionType::INTERRUPT,
+                                  "cancelled before this rank started it");
+        break;
+      }
+      result = call.channel->Query(sql);
+      if (result->HasError()) {
+        error = result->GetErrorObject();
+        break;
+      }
+    }
+  } catch (std::exception& e) {
+    error = duckdb::ErrorData(e);
+  }
+  std::lock_guard lock{shared.mutex};
+  call.result = std::move(result);
+  call.error  = std::move(error);
+  call.done   = true;
+  --shared.remaining;
+  shared.changed.notify_all();
+}
+
+/// Sends quack_cancel every 100 ms to each rank whose call is still running, until told to
+/// stop. A cancel to a rank that does not answer blocks, so this runs apart from the fan-out,
+/// which never waits on it for long.
+struct canceller {
+  std::shared_ptr<fan_out_shared> shared;
+  std::vector<std::pair<std::string, std::string>> targets;  // catalog, Quack session
+  std::atomic<bool> stop{false};
+  std::mutex mutex;
+  std::condition_variable finished_cv;
+  bool finished = false;
+};
+
+void run_canceller(duckdb::DatabaseInstance& db, std::shared_ptr<canceller> self)
+{
+  try {
+    Connection control{db};
+    while (!self->stop) {
+      for (std::size_t i = 0; i < self->targets.size() && !self->stop; ++i) {
+        {
+          std::lock_guard lock{self->shared->mutex};
+          if (self->shared->calls[i].done) { continue; }
+        }
+        control.Query("FROM quack_cancel(" + KeywordHelper::WriteQuoted(self->targets[i].first) +
+                      ", " + KeywordHelper::WriteQuoted(self->targets[i].second) + ")");
+      }
+      std::this_thread::sleep_for(100ms);
+    }
+  } catch (std::exception&) {  // the fan-out's grace period still bounds the statement
+  }
+  std::lock_guard lock{self->mutex};
+  self->finished = true;
+  self->finished_cv.notify_all();
 }
 
 }  // namespace
@@ -383,7 +467,7 @@ void gateway_state::connect_rank(rank& r, std::string const& token)
           "rank %d exited during start; see %s", r.index, log_path(options_, r.index));
       }
     }
-    auto channel  = std::make_unique<Connection>(db_);
+    auto channel  = std::make_shared<Connection>(db_);
     auto attached = admin.Query(attach);
     auto result =
       attached->HasError() ? std::move(attached) : channel->Query("CONNECT " + r.catalog);
@@ -503,7 +587,7 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     auto const restored =
       fan_out(context,
               std::vector<std::vector<std::string>>(ranks_.size(), {"SET gpu_execution = true"}),
-              fan_out_policy{false, 0});
+              fan_out_policy{false, policy.grace_s, policy.grace_s});
     for (uint32_t i = 0; i < restored.outcomes.size(); ++i) {
       if (!restored.outcomes[i].error) { continue; }
       std::lock_guard lock{state_mutex_};
@@ -534,10 +618,17 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
       if (rank_exited(r)) { lost.insert(r.index); }
     }
   }
-  // Fail-stop, in order: a lost rank, a broken exchange, then a state change only some ranks
-  // made. Each leaves the ranks out of step.
+  // Fail-stop, in order: a killed rank, a lost one, a broken exchange, then a state change only
+  // some ranks made. Each leaves the ranks out of step.
   std::string fatal;
-  if (!lost.empty()) {
+  if (!ran.killed.empty()) {
+    std::string killed;
+    for (auto const i : ran.killed) {
+      killed += (killed.empty() ? "" : ", ") + std::to_string(i);
+    }
+    fatal = prefix + ran.cancelled + "; rank " + killed + " did not stop within " +
+            std::to_string(policy.grace_s) + " s of the cancel and was killed";
+  } else if (!lost.empty()) {
     std::string names;
     for (auto const i : lost) {
       names += (names.empty() ? "" : ", ") + std::to_string(i);
@@ -582,7 +673,8 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
 gateway_state::fan_out_policy gateway_state::client_policy(ClientContext& context)
 {
   return fan_out_policy{true,
-                        std::stoull(setting(context, "sirius_gateway_statement_timeout", "0"))};
+                        std::stoull(setting(context, "sirius_gateway_statement_timeout", "0")),
+                        std::stoull(setting(context, "sirius_gateway_cancel_grace", "30"))};
 }
 
 gateway_state::fan_out_result gateway_state::fan_out(
@@ -590,50 +682,79 @@ gateway_state::fan_out_result gateway_state::fan_out(
   std::vector<std::vector<std::string>> const& statements,
   fan_out_policy policy)
 {
-  fan_out_result out;
-  out.outcomes.resize(ranks_.size());
-  std::vector<std::future<void>> done;
-  for (uint32_t i = 0; i < ranks_.size(); ++i) {
-    done.push_back(std::async(std::launch::async, [this, &statements, &out, i] {
-      auto& outcome = out.outcomes[i];
-      try {
-        for (auto const& sql : statements[i]) {
-          outcome.result = ranks_[i].channel->Query(sql);
-          if (outcome.result->HasError()) {
-            outcome.error = outcome.result->GetErrorObject();
-            return;
-          }
-        }
-      } catch (std::exception& e) {
-        outcome.error = duckdb::ErrorData(e);
-      }
-    }));
+  auto shared = std::make_shared<fan_out_shared>(ranks_.size());
+  std::vector<std::thread> threads;
+  for (std::size_t i = 0; i < ranks_.size(); ++i) {
+    shared->calls[i].channel    = ranks_[i].channel;
+    shared->calls[i].statements = statements[i];
   }
+  for (std::size_t i = 0; i < ranks_.size(); ++i) {
+    threads.emplace_back([shared, i] { run_call(*shared, i); });
+  }
+
+  fan_out_result out;
+  std::shared_ptr<canceller> cancelling;
   auto const started = steady_clock::now();
-  for (auto& f : done) {
-    while (f.wait_for(100ms) != std::future_status::ready) {
-      if (!out.cancelled.empty()) { continue; }
+  std::optional<steady_clock::time_point> cancelled_at;
+  std::optional<steady_clock::time_point> killed_at;
+  for (;;) {
+    {
+      std::unique_lock lock{shared->mutex};
+      if (shared->changed.wait_for(lock, 100ms, [&] { return shared->remaining == 0; })) { break; }
+    }
+    auto const now = steady_clock::now();
+    if (!cancelled_at) {
       if (policy.watch_client && context.IsInterrupted()) {
         out.cancelled = "interrupted";
-      } else if (policy.timeout_s != 0 &&
-                 steady_clock::now() - started > std::chrono::seconds(policy.timeout_s)) {
+      } else if (policy.timeout_s != 0 && now - started > std::chrono::seconds(policy.timeout_s)) {
         out.cancelled = "timed out after " + std::to_string(policy.timeout_s) + " s";
       } else {
         continue;
       }
-      cancel_all();
+      cancelled_at       = now;
+      shared->cancel     = true;
+      cancelling         = std::make_shared<canceller>();
+      cancelling->shared = shared;
+      for (auto const& r : ranks_) {
+        cancelling->targets.emplace_back(r.catalog, r.session);
+      }
+      std::thread(run_canceller, std::ref(db_), cancelling).detach();
+    } else if (!killed_at && now - *cancelled_at > std::chrono::seconds(policy.grace_s)) {
+      // Every rank the gateway started has a process it owns: the rank, or for a remote rank
+      // the launcher, whose end drops the rank's forwarded port. Killing it ends the call.
+      killed_at = now;
+      std::lock_guard state_lock{state_mutex_};
+      std::lock_guard lock{shared->mutex};
+      for (uint32_t i = 0; i < ranks_.size(); ++i) {
+        if (shared->calls[i].done) { continue; }
+        out.killed.push_back(i);
+        if (ranks_[i].pid > 0) { kill(ranks_[i].pid, SIGKILL); }
+      }
+    } else if (killed_at && now - *killed_at > 10s) {
+      break;  // the calls still stuck are abandoned
+    }
+  }
+
+  if (cancelling) {
+    cancelling->stop = true;
+    std::unique_lock lock{cancelling->mutex};
+    cancelling->finished_cv.wait_for(lock, 5s, [&] { return cancelling->finished; });
+  }
+  std::lock_guard lock{shared->mutex};
+  out.outcomes.resize(ranks_.size());
+  for (std::size_t i = 0; i < ranks_.size(); ++i) {
+    auto& call = shared->calls[i];
+    if (call.done) {
+      threads[i].join();
+      out.outcomes[i].result = std::move(call.result);
+      out.outcomes[i].error  = std::move(call.error);
+    } else {
+      threads[i].detach();
+      out.outcomes[i].error = duckdb::ErrorData(
+        duckdb::ExceptionType::IO, "rank " + std::to_string(i) + " did not answer; abandoned");
     }
   }
   return out;
-}
-
-void gateway_state::cancel_all()
-{
-  Connection control{db_};
-  for (auto const& r : ranks_) {
-    control.Query("FROM quack_cancel(" + KeywordHelper::WriteQuoted(r.catalog) + ", " +
-                  KeywordHelper::WriteQuoted(r.session) + ")");
-  }
 }
 
 void gateway_state::signal_rank(uint32_t index, int signal)

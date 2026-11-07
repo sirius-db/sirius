@@ -1,5 +1,5 @@
 # name: test/sql/sirius_gateway_failstop.test
-# description: fail-stop over CPU ranks: what keeps the ranks serving, and what restarts them
+# description: fail-stop over CPU ranks: what keeps the ranks serving, what restarts them, and the cancel ladder
 # group: [sirius_gateway]
 
 require sirius_gateway
@@ -103,6 +103,34 @@ SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'r
 ----
 2
 
+# A rank that stops answering ignores the cancel: after the grace period the gateway kills it.
+statement ok
+SET sirius_gateway_statement_timeout = 1;
+
+statement ok
+SET sirius_gateway_cancel_grace = 2;
+
+statement ok
+FROM sirius_gateway_test_signal(1, 19);
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+did not stop within 2 s of the cancel and was killed
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'failed';
+----
+2
+
+statement ok
+SET sirius_gateway_statement_timeout = 3600;
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
 # A rank that answers the cancel stops, and nothing restarts.
 statement ok
 SET sirius_gateway_statement_timeout = 1;
@@ -118,7 +146,7 @@ SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'ready';
 2
 
 statement ok
-SET sirius_gateway_statement_timeout = 0;
+SET sirius_gateway_statement_timeout = 3600;
 
 query I
 SELECT state FROM sirius_gateway_stop();
