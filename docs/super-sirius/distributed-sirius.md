@@ -16,6 +16,9 @@ SELECT ...;                               -- the same statement on every rank
 
 Without `sirius_exchange_peers`, nothing here applies and queries run in one process as before.
 
+To set up the ranks, the [gateway](distributed-gateway.md) and a client on several machines, see
+the [distributed quick start](distributed-quickstart.md).
+
 ## Contents
 
 - [How a query runs](#how-a-query-runs)
@@ -310,11 +313,19 @@ connects it. Once it is connected, none of the settings can change, on any conne
 return a wrong answer.
 
 Every Sirius build includes the NIXL fabric (NIXL with its UCX backend, built with Sirius), so a
-distributed query needs no extra build option or runtime path. Sirius does not set `UCX_TLS`, so UCX
-picks its transports (NVLink, InfiniBand, TCP) from the hardware.
-The single-host launchers below default `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: when UCX
-picks InfiniBand on a multi-rail host, ranks on the same host can fail to connect. Set `UCX_TLS`
-yourself to override.
+distributed query needs no extra build option or runtime path. One command builds Sirius and the
+[gateway](distributed-gateway.md):
+
+```bash
+pixi run build-distributed
+```
+
+`scripts/launcher_env.sh` holds the defaults every launcher sources. A value you export first wins.
+
+| Variable | Default | Why |
+|---|---|---|
+| `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self` | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout"). |
+| `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 
 ## Running TPC-H Q12 on 4 GPUs
 
@@ -382,8 +393,10 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   restarted rank alone cannot reconnect to peers whose transport failed, and its
   `SET sirius_exchange_rank` fails after the 2-minute connect timeout (#2373). The
   [gateway](distributed-gateway.md) does this restart.
-- **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX pinned
-  to TCP by hand (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface).
+- **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
+  TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
+  scripts set both by default: `UCX_TLS` in `nixl_env.sh`, and `UCX_NET_DEVICES` from the
+  rank's address ([quick start](distributed-quickstart.md)).
   More than two hosts, and RDMA between hosts, are untested (#2372).
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
@@ -424,4 +437,5 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/op/cross_rank_sort_boundaries.hpp`, `src/op/distributed/sample_all_gather_boundaries.*` | `SORT_SAMPLE`'s boundary interface; boundaries from every rank's sample |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check; each rank's share of a table's files, and the scans no rank can split |
 | `src/op/dynamic_filter/cross_rank_filter_merge.hpp`, `src/op/distributed/bloom_all_gather_merge.*` | The publisher's merge interface; the Bloom merge across ranks |
-| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers |
+| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers on one host |
+| `scripts/launcher_env.sh` | Defaults every launcher sources: `UCX_TLS`, `DUCKDB_AGENT_MODE` |

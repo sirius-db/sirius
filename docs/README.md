@@ -98,6 +98,15 @@ SET GLOBAL gpu_execution = false;
 
 Execution is out-of-core with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling, and works with both **Parquet** and **DuckDB-native** storage. See [`gpu_execution`](gpu_execution.md) for build, configuration, and testing details.
 
+### Which mode do I need?
+
+| You have | Run | Notes |
+|---|---|---|
+| One machine with one or more GPUs | `pixi run duckdb` | Sirius uses every visible GPU in one process (`topology.num_gpus: all` is the default) |
+| Several machines with GPUs | The distributed gateway: see the [distributed quick start](super-sirius/distributed-quickstart.md) | One SQL endpoint; each statement runs on one process per GPU across the machines |
+
+Through the gateway, a query that Sirius cannot run fails; it does not fall back to the CPU.
+
 ## Python API
 
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
@@ -289,7 +298,7 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 </p>
 
 ## Future Roadmap
-Sirius is still under major development and we are working on adding more features to Sirius, such as multi-node, more operators, data types, accelerating more engines, and many more.
+Sirius is still under major development and we are working on adding more features to Sirius, such as more operators, data types, accelerating more engines, and many more.
 
 Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](mailto:siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
 
