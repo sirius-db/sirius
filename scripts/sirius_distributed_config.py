@@ -25,6 +25,8 @@ KEYS = {
     ("node", "networks"): "SIRIUS_NODE_NETWORKS",
     ("node", "quack_port"): "SIRIUS_NODE_QUACK_PORT",
     ("node", "exchange_port"): "SIRIUS_NODE_EXCHANGE_PORT",
+    ("exchange", "host_staging"): "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING",
+    ("exchange", "tcp_lanes"): "SIRIUS_GATEWAY_EXCHANGE_TCP_LANES",
     ("exchange", "mnnvl"): "SIRIUS_GATEWAY_EXCHANGE_MNNVL",
     ("exchange", "frame_bytes"): "SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES",
     ("exchange", "send_frames"): "SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES",
