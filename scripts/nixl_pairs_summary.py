@@ -59,9 +59,9 @@ def main():
                 ucx.add(re.sub(r"^\[[^]]*\] \[[^]]*\]\s*", "", line).strip())
 
     print(f"# [nixl_pairs] {out}\n")
-    config = out / "config.txt"
-    if config.exists():
-        print("```\n" + config.read_text().strip() + "\n```\n")
+    for name in ("config.txt", "ucx.txt"):
+        if (out / name).exists():
+            print("```\n" + (out / name).read_text().strip() + "\n```\n")
     print("| phase | total GB/s | per receiver | raw NIXL | share |")
     print("|---|---:|---|---:|---:|")
     for tag in order:

@@ -8,6 +8,7 @@
 # sirius_rank_node.conf.example) is sourced and may set every argument, as gpu, quack_port,
 # exchange_port, listen_host, dir; arguments given here win over it. It may also set:
 #   nixl_prefix, ucx_tls, ucx_net_devices  NIXL_PREFIX, UCX_TLS, UCX_NET_DEVICES, unless exported
+#                      (defaults: scripts/nixl_env.sh)
 #   priority_networks  CIDRs, e.g. 10.87.140.0/24; this host's first address in them is the listen
 #                      host, and its interface UCX_NET_DEVICES, unless those are set. Default: the
 #                      gateway's networks
@@ -65,6 +66,8 @@ fi
 [ -n "${nixl_prefix:-}" ] && export NIXL_PREFIX=${NIXL_PREFIX:-$nixl_prefix}
 [ -n "${ucx_tls:-}" ] && export UCX_TLS=${UCX_TLS:-$ucx_tls}
 [ -n "${ucx_net_devices:-}" ] && export UCX_NET_DEVICES=${UCX_NET_DEVICES:-$ucx_net_devices}
+# Before priority_networks names an interface: the GPU rail NICs win where the host has them.
+source "$here/nixl_env.sh"
 priority_networks=${priority_networks:-${networks:-}}
 if [ -n "$priority_networks" ]; then
   source "$here/sirius_net.sh"
@@ -78,7 +81,6 @@ if [ -n "$priority_networks" ]; then
 fi
 host=${4:-${listen_host:-$(hostname -f)}}
 dir=${5:-${dir:-/tmp/sirius_rank_$port}}
-source "$here/nixl_env.sh"
 build="$here/../sirius-duckdb/build/release"
 duckdb="$build/duckdb"
 # Under Slurm the task's own binding is already in CUDA_VISIBLE_DEVICES.

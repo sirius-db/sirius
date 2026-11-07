@@ -3645,7 +3645,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "Distributed execution: receive frames (credits) each peer may fill; GPU memory grows with "
     "it times the peers. Same on every rank; set before sirius_exchange_rank",
     LogicalType::UBIGINT,
-    Value::UBIGINT(8),
+    Value::UBIGINT(16),
     SetExchangeRecvFramesPerPeer);
   config.AddExtensionOption("sirius_distributed_query_id",
                             "Distributed execution: number of the next distributed query, set by "

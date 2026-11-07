@@ -218,7 +218,7 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 | `sirius_gateway_exchange_mnnvl` | `auto` | `sirius_exchange_mnnvl` for every rank: `auto`, `require` or `off` put the rings in fabric memory, for NVLink between nodes |
 | `sirius_gateway_exchange_frame_bytes` | 16777216 | `sirius_exchange_frame_bytes` for every rank |
 | `sirius_gateway_exchange_send_frames` | 32 | `sirius_exchange_send_frames` for every rank |
-| `sirius_gateway_exchange_recv_frames_per_peer` | 8 | `sirius_exchange_recv_frames_per_peer` for every rank |
+| `sirius_gateway_exchange_recv_frames_per_peer` | 16 | `sirius_exchange_recv_frames_per_peer` for every rank |
 | `sirius_gateway_log_dir` | temporary | Rank init files and logs |
 | `sirius_gateway_allow_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
 | `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them |

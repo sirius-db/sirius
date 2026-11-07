@@ -164,8 +164,10 @@ each UCX protocol, for example `cuda_ipc/cuda` for a put from `cuda/GPU0` to `cu
 
 The ring sizes are settings, the same on every rank: `sirius_exchange_frame_bytes` (16 MiB),
 `sirius_exchange_send_frames` (32, shared by the peers) and `sirius_exchange_recv_frames_per_peer`
-(8). A rank's ring memory is `frame × (send frames + receive frames × peers)`: 1.4 GiB with 8
-ranks, 9.4 GiB with 72 (credits on demand, #2371, would bound it).
+(16: two 128 MiB writes to a peer in flight). A rank's ring memory is
+`frame × (send frames + receive frames × peers)`: 2.25 GiB with 8 ranks, 18.3 GiB with 72
+(credits on demand, #2371, would bound it). With 8 receive frames per peer, one GPU pair moved
+626 GB/s instead of 706.
 
 `scripts/distributed_test_nixl_pairs.sh <node1>,<node2>` runs the hidden `[nixl_pairs]` test on
 two nodes of a Slurm partition, one rank per GPU paired with the same GPU on the other node: one
@@ -351,7 +353,7 @@ Without NIXL, a distributed query fails with "needs a Sirius built with -DSIRIUS
 
 | Variable | Default | Why |
 |---|---|---|
-| `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self` | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout") |
+| `UCX_TLS`, `UCX_NET_DEVICES` | `all` on the GPU rail NICs, if the host has them; else `cuda_copy,cuda_ipc,tcp,self` | Rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed) carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0. `UCX_NET_DEVICES=rails` asks for them. Without rail NICs, the transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout") |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 | `NIXL_PREFIX` | unset | Optional: only for a build whose RPATH does not find NIXL. When set, NIXL's libraries (and `UCX_PREFIX`'s UCX, if set) go ahead of the pixi environment's UCX on `LD_LIBRARY_PATH`, and `NIXL_PLUGIN_DIR` points at NIXL's plugins |
 

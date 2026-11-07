@@ -69,10 +69,10 @@ sirius:
       mnnvl: auto               # auto | require | off: NVLink between nodes (fabric memory)
       frame_bytes: 16777216
       send_frames: 32
-      recv_frames_per_peer: 8
-    ucx:
-      tls: cuda_copy,cuda_ipc,tcp,self
-      # net_devices: bond0      # default: the interface that holds the rank's address
+      recv_frames_per_peer: 16
+    ucx:                        # default: every transport on the GPU rail NICs, if any
+      # tls: cuda_copy,cuda_ipc,tcp,self
+      # net_devices: bond0      # without rail NICs: the interface that holds the rank's address
 ```
 
 Each key sets an environment variable that the scripts read. A variable you export wins over
@@ -95,9 +95,9 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `exchange.mnnvl` | `SIRIUS_GATEWAY_EXCHANGE_MNNVL` | `auto` | `sirius_gateway_exchange_mnnvl`, which the gateway sets as `sirius_exchange_mnnvl` on every rank: ranks on other nodes of the NVLink domain exchange over NVLink |
 | `exchange.frame_bytes` | `SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES` | 16777216 | `sirius_gateway_exchange_frame_bytes`: the exchange's frame size |
 | `exchange.send_frames` | `SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES` | 32 | `sirius_gateway_exchange_send_frames`: send frames shared by a rank's peers |
-| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 8 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill |
-| `ucx.tls` | `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self` | UCX transports; the default is `scripts/nixl_env.sh`'s |
-| `ucx.net_devices` | `UCX_NET_DEVICES` | the interface of the rank's address | UCX devices, for example `mlx5_0:1` |
+| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 16 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill |
+| `ucx.tls` | `UCX_TLS` | `all` on a host with GPU rail NICs, else `cuda_copy,cuda_ipc,tcp,self` | UCX transports; the default is `scripts/nixl_env.sh`'s |
+| `ucx.net_devices` | `UCX_NET_DEVICES` | the GPU rail NICs, else the interface of the rank's address | UCX devices, for example `mlx5_0:1`; `rails` asks for the rail NICs. The rail NICs are the active RDMA ports in no bond at the highest link speed (on GB200 nodes `mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1`). Notifications over RC on them let the exchange over NVLink reach full speed. Never list bond0 with them: UCX then hangs reaching a peer's bond0 address from a rail NIC |
 
 A gateway on an address other than loopback serves TLS. It writes the subnet of its address to
 `gateway.conf`, and nodes without `node.networks` pick their address in that subnet.
@@ -238,7 +238,7 @@ and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with
 | `rank N (<name>) still runs the process the gateway asked to exit` | The rank was asked to exit to join the new set of ranks, and did not within 10 minutes. See its `rank.log` |
 | `rank <name>'s exchange address 127.x.x.x is a loopback address, which the other ranks cannot reach` | The node's name resolves to a loopback address, which happens with `--gateway` and no networks. Pass `--networks` (or set `node.networks`) to pick a routable address |
 | `rank N failed its session setup: ...` | Usually the exchange: the ranks could not connect to each other. Check that the exchange ports are open, and `ucx.tls` and `ucx.net_devices` |
-| `Endpoint timeout` in a rank's log | UCX picked an InfiniBand port that the ranks cannot connect through. Keep the default `ucx.tls`, or set `ucx.net_devices` |
+| `Endpoint timeout` in a rank's log | UCX picked a port that the ranks cannot connect through. Keep the default `ucx.tls` and `ucx.net_devices`, or set `ucx.net_devices` to ports that reach every node |
 | `unknown key sirius.distributed.<key>`, `sirius.distributed.<key> must be a string, a number or a list of them` | Fix that key in `sirius.yaml`; the scripts apply none of the section until it is right. The first message lists the known keys |
 | `topology.num_gpus must be all or a positive count` | `num_gpus: 0` is an error; use `num_gpus: all` or leave the key out |
 

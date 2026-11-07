@@ -6,6 +6,10 @@
 #   sirius_default_address          "<interface> <address>" for the default route's interface
 #   sirius_address_network <addr>   the CIDR of this host's interface holding <addr>, e.g.
 #       10.87.140.32/27 for 10.87.140.53 on bond0
+#   sirius_rail_devices             UCX_NET_DEVICES for this host's GPU rail NICs, e.g.
+#       mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1 on a GB200 node: the active RDMA ports whose interface
+#       is in no bond, at the highest link speed among them (a GB200 node's BlueField ports are
+#       slower, and two of them form bond0). Fails with fewer than two
 # Each fails if there is no such address.
 
 _sirius_ip_int()
@@ -65,4 +69,24 @@ sirius_address_network()
     return 0
   done < <(ip -o -4 addr show)
   return 1
+}
+
+sirius_rail_devices()
+{
+  local dev net speed best=0 found=()
+  for dev in /sys/class/infiniband/*; do
+    [[ -r $dev/ports/1/state && $(<"$dev/ports/1/state") == *ACTIVE* ]] || continue
+    net=$(ls "$dev/device/net" 2> /dev/null | head -n 1)
+    [[ -n $net && ! -e /sys/class/net/$net/master ]] || continue
+    speed=$(cat "/sys/class/net/$net/speed" 2> /dev/null || echo 0)
+    [[ $speed =~ ^[0-9]+$ ]] || continue
+    if ((speed > best)); then
+      best=$speed
+      found=()
+    fi
+    ((speed == best)) && found+=("${dev##*/}:1")
+  done
+  ((${#found[@]} >= 2)) || return 1
+  local IFS=,
+  echo "${found[*]}"
 }

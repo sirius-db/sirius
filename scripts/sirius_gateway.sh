@@ -71,7 +71,7 @@ fi
 if ! [[ ${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-auto} =~ ^(auto|require|off)$ &&
   ${SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES:-16777216} =~ ^[0-9]+$ &&
   ${SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES:-32} =~ ^[0-9]+$ &&
-  ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-8} =~ ^[0-9]+$ ]]; then
+  ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-16} =~ ^[0-9]+$ ]]; then
   echo "SIRIUS_GATEWAY_EXCHANGE_MNNVL takes auto, require or off; _FRAME_BYTES, _SEND_FRAMES and _RECV_FRAMES_PER_PEER a number" >&2
   exit 2
 fi
@@ -167,7 +167,7 @@ init="$logs/gateway.init.sql"
   echo "SET GLOBAL sirius_gateway_exchange_mnnvl = '${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-auto}';"
   echo "SET GLOBAL sirius_gateway_exchange_frame_bytes = ${SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES:-16777216};"
   echo "SET GLOBAL sirius_gateway_exchange_send_frames = ${SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES:-32};"
-  echo "SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-8};"
+  echo "SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-16};"
   echo "SET GLOBAL sirius_gateway_allow_join = $([ "$allow_join" = 1 ] && echo true || echo false);"
   [ -z "${SIRIUS_GATEWAY_JOIN_WAIT:-}" ] || echo "SET GLOBAL sirius_gateway_join_wait = $SIRIUS_GATEWAY_JOIN_WAIT;"
   # replay_saved: a restarted gateway replays the DDL saved in the state dir, instead of
