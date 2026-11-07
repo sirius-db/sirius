@@ -40,9 +40,12 @@ sirius-duckdb: release
 SIRIUS_CMAKE_FLAGS ?= -DCMAKE_C_COMPILER_LAUNCHER=sccache \
 	-DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
 	-DCMAKE_LINKER_TYPE=MOLD
+# More configure flags that keep the defaults above, e.g. -DSIRIUS_WITH_NIXL=ON.
+SIRIUS_EXTRA_CMAKE_FLAGS ?=
 
 build/%/build.ninja: $(CMAKE_INPUTS)
-	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))" $(SIRIUS_CMAKE_FLAGS)
+	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))" $(SIRIUS_CMAKE_FLAGS) \
+		$(SIRIUS_EXTRA_CMAKE_FLAGS)
 
 release: build/release/build.ninja
 	$(CMAKE) --build --preset release --target $(BUILD_TARGETS)

@@ -102,6 +102,19 @@ run-clang-tidy -p build/clang-tidy -warnings-as-errors='-*' \
 description = "Start the local DuckDB shell with Sirius loaded."
 cmd = '''sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"'''
 
+# Distributed Sirius: docs/super-sirius/distributed-gateway.md.
+[tasks.build-distributed]
+description = "Build Sirius with the exchange's NIXL fabric (installing NIXL when missing) and the gateway."
+# Reconfigures (make -B) so that an existing build dir really turns NIXL on, and clears a
+# cached SIRIUS_NIXL_PREFIX so that NIXL comes from NIXL_PREFIX or install_nixl.sh's prefix.
+cmd = """
+"$PIXI_PROJECT_ROOT/scripts/install_nixl.sh" &&
+make -C "$PIXI_PROJECT_ROOT" -B build/release/build.ninja \
+  SIRIUS_EXTRA_CMAKE_FLAGS="-DSIRIUS_WITH_NIXL=ON -DSIRIUS_NIXL_PREFIX=" &&
+make -C "$PIXI_PROJECT_ROOT" &&
+make -C "$PIXI_PROJECT_ROOT/gateway" release
+"""
+
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."
 cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"

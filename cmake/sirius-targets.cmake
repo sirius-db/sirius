@@ -167,6 +167,18 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
+# libsirius finds libnixl without LD_LIBRARY_PATH (and NIXL its plugins next to
+# libnixl).
+if(SIRIUS_WITH_NIXL)
+  set_property(
+    TARGET sirius_shared
+    APPEND
+    PROPERTY BUILD_RPATH "${NIXL_LIBRARY_DIR}")
+  set_property(
+    TARGET sirius_shared
+    APPEND
+    PROPERTY INSTALL_RPATH "${NIXL_LIBRARY_DIR}")
+endif()
 # mold localizes GNU_UNIQUE symbols under --exclude-libs (rmm#826).
 if(CMAKE_LINKER_TYPE STREQUAL "MOLD")
   set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)

@@ -1,7 +1,14 @@
-# Runtime paths for a Sirius build with -DSIRIUS_WITH_NIXL=ON. Source it.
-#   NIXL_PREFIX (required): the NIXL install Sirius was built with.
+# Defaults for every Sirius launcher. Source it (under set -euo pipefail too). Each value you
+# export first wins.
+#   NIXL_PREFIX (optional): only for a build whose RPATH does not find NIXL, such as a static one.
 #   UCX_PREFIX (optional): the UCX that NIXL was built against, when it is not on the default path.
-export NIXL_PREFIX=${NIXL_PREFIX:?set NIXL_PREFIX to the NIXL install Sirius was built with}
+# The transports tested on one host and on two. Left to itself, UCX also picks the host's
+# InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint
+# timeout").
+export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
+# DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse it.
+export DUCKDB_AGENT_MODE=${DUCKDB_AGENT_MODE:-0}
+[[ -n ${NIXL_PREFIX:-} ]] || return 0
 _nixl_lib=$(set -- "$NIXL_PREFIX"/lib/*-linux-gnu; if [[ -d $1 ]]; then echo "$1"; else echo "$NIXL_PREFIX/lib"; fi)
 export NIXL_PLUGIN_DIR=${NIXL_PLUGIN_DIR:-$_nixl_lib/plugins}
 # NIXL and its UCX plugin must come before the pixi environment's own UCX.

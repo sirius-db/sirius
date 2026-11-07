@@ -39,12 +39,13 @@ option(ENABLE_STREAM_CHECK
 option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
 # The exchange's NIXL fabric (src/exchange/nixl_fabric.cpp) links an out-of-tree
-# NIXL install, given by SIRIUS_NIXL_PREFIX (default: $NIXL_PREFIX);
-# scripts/nixl_env.sh sets up its runtime paths.
+# NIXL install: SIRIUS_NIXL_PREFIX, else $NIXL_PREFIX, else where
+# scripts/install_nixl.sh installs it. An empty SIRIUS_NIXL_PREFIX is resolved
+# once and cached (cmake/sirius-dependencies.cmake).
 option(SIRIUS_WITH_NIXL "Build the exchange's NIXL fabric" OFF)
 set(SIRIUS_NIXL_PREFIX
-    "$ENV{NIXL_PREFIX}"
-    CACHE PATH "NIXL install prefix")
+    ""
+    CACHE PATH "NIXL install prefix (empty: $NIXL_PREFIX, else the default)")
 
 if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
