@@ -16,6 +16,9 @@ SELECT ...;                               -- the same statement on every rank
 
 Without `sirius_exchange_peers`, nothing here applies and queries run in one process as before.
 
+To set up the ranks, the [gateway](distributed-gateway.md) and a client on several machines, see
+the [distributed quick start](distributed-quickstart.md).
+
 ## Contents
 
 - [How a query runs](#how-a-query-runs)
@@ -278,24 +281,39 @@ connects it. Once it is connected, none of the settings can change, on any conne
 `enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU alone would
 return a wrong answer.
 
-NIXL is an optional build dependency, linked from an out-of-tree install:
+NIXL is an optional build dependency, linked from an out-of-tree install. One command installs
+it when missing and builds Sirius with it, and the [gateway](distributed-gateway.md):
 
 ```bash
-pixi run cmake --preset release -DSIRIUS_DUCKDB_SOURCE_DIR=$PWD/duckdb \
-  -DSIRIUS_WITH_NIXL=ON -DSIRIUS_NIXL_PREFIX=<NIXL install prefix>
-pixi run make
+pixi run build-distributed
 ```
 
-Without it, a distributed query fails with "needs a Sirius built with -DSIRIUS_WITH_NIXL=ON".
-`scripts/nixl_env.sh` sets the runtime paths:
+It runs `scripts/install_nixl.sh`, which builds NIXL (its core and UCX plugin, at the commit the
+exchange is tested with) against the pixi environment's UCX and installs it in
+`~/.sirius/nixl/<commit>` (`NIXL_PREFIX` sets another prefix), skipping an install whose UCX
+plugin still resolves its libraries. It lists the files it installs in
+`<prefix>/.sirius-install-nixl` and marks a finished install with
+`<prefix>/.sirius-install-nixl-done`. To reinstall, it removes only the listed files, never the
+whole prefix, and it refuses a prefix holding files it did not write. `build-distributed` then
+reconfigures the release build with `-DSIRIUS_WITH_NIXL=ON`, builds it, and builds the gateway.
 
-- NIXL's libraries and its UCX ahead of the pixi environment's own UCX;
-- `NIXL_PLUGIN_DIR`.
+Configure takes NIXL from `SIRIUS_NIXL_PREFIX`, else `$NIXL_PREFIX`, else
+`scripts/install_nixl.sh --print-prefix`, and fails with a pointer to `install_nixl.sh` when
+there is no NIXL there or its UCX plugin no longer finds UCX. The build directory caches the
+resolved prefix, so a later `NIXL_PREFIX` does not move it: run `pixi run build-distributed`
+again (it passes an empty `-DSIRIUS_NIXL_PREFIX=` so configure resolves it again), or configure
+with `-DSIRIUS_NIXL_PREFIX=<prefix>`. `libsirius` has NIXL's library directory in its RPATH, so
+the ranks need no `LD_LIBRARY_PATH`.
 
-It leaves `UCX_TLS` alone, so UCX picks its transports (NVLink, InfiniBand, TCP) from the hardware.
-The single-host launchers below default `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: when UCX
-picks InfiniBand on a multi-rail host, ranks on the same host can fail to connect. Set `UCX_TLS`
-yourself to override.
+Without NIXL, a distributed query fails with "needs a Sirius built with -DSIRIUS_WITH_NIXL=ON".
+
+`scripts/nixl_env.sh` holds the defaults every launcher sources. A value you export first wins.
+
+| Variable | Default | Why |
+|---|---|---|
+| `UCX_TLS` | `cuda_copy,cuda_ipc,tcp,self` | The transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout") |
+| `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
+| `NIXL_PREFIX` | unset | Optional: only for a build whose RPATH does not find NIXL. When set, NIXL's libraries (and `UCX_PREFIX`'s UCX, if set) go ahead of the pixi environment's UCX on `LD_LIBRARY_PATH`, and `NIXL_PLUGIN_DIR` points at NIXL's plugins |
 
 ## Running TPC-H Q12 on 4 GPUs
 
@@ -356,8 +374,10 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   earlier, and nothing reconnects. To recover, restart every rank: a restarted rank alone cannot
   reconnect to peers whose transport failed, and its `SET sirius_exchange_rank` fails after the
   2-minute connect timeout (#2373). The [gateway](distributed-gateway.md) does this restart.
-- **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX pinned
-  to TCP by hand (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface).
+- **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
+  TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
+  scripts set both by default: `UCX_TLS` in `nixl_env.sh`, and `UCX_NET_DEVICES` from the
+  rank's address ([quick start](distributed-quickstart.md)).
   More than two hosts, and RDMA between hosts, are untested (#2372).
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
@@ -393,4 +413,6 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/op/sirius_physical_sort_sample.*` | Distributed sampling |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check |
 | `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | Bloom merge across ranks |
-| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh`, `nixl_env.sh` | Launchers and runtime paths |
+| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers on one host |
+| `scripts/nixl_env.sh` | Defaults every launcher sources: `UCX_TLS`, `DUCKDB_AGENT_MODE`, and NIXL's paths when `NIXL_PREFIX` is set |
+| `scripts/install_nixl.sh` | Builds and installs NIXL for `-DSIRIUS_WITH_NIXL=ON`; `pixi run build-distributed` runs it |

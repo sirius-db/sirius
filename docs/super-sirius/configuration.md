@@ -33,6 +33,24 @@ queries wait in a cancellable FIFO queue. The former
 values fail configuration loading. See [Concurrent queries](concurrent-queries.md) for the
 maintenance, error and multi-GPU contracts.
 
+### Distributed launch section (`sirius.distributed`)
+
+Sirius accepts a `sirius.distributed` section and ignores it. The distributed launch scripts
+(`pixi run sirius-gateway`, `sirius-node`, `sirius-client`) read it, through
+`scripts/sirius_distributed_config.py`, from the same file Sirius loads: the gateway's name,
+ports, networks, the GPUs per node, and UCX transports. Each key sets an environment variable;
+one you export wins over the file. Any error in the section, such as an unknown key, stops the
+scripts with nothing applied. See the
+[distributed quick start](distributed-quickstart.md#configure) for every key.
+
+```yaml
+sirius:
+  distributed:
+    cluster: tpch
+    gateway: { min_ranks: 8, networks: 10.87.140.0/24 }
+    node: { gpus: all }
+```
+
 ### `SIRIUS_DISABLE`
 
 Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
@@ -90,7 +108,7 @@ config.load_from_file("/path/to/config.yaml");  // Optional
 ```yaml
 sirius:
   max_concurrent_queries: 1
-  topology: { num_gpus: 1 }
+  topology: { num_gpus: all }
   memory:
     gpu:
       usage_limit_fraction: 0.95
@@ -138,7 +156,7 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_gpus` | int | all visible GPUs | Non-negative number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
+| `num_gpus` | `all` or int | `all` | `all` uses every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`). A positive count uses that many. `0`, a negative count, or any other value is an error. Mutually exclusive with `gpu_ids`. |
 | `gpu_ids` | list of int | — | Non-empty list of unique, non-negative GPU device IDs. Mutually exclusive with `num_gpus`. |
 | `gpus_per_query` | int | `0` (all) | How many GPUs each query is allocated at admission time. `0` uses all active GPUs. Values exceeding the active GPU count are clamped to the full set. |
 
@@ -1089,7 +1107,7 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `SIRIUS_WITH_NIXL` | OFF | Build the exchange's NIXL fabric for [distributed execution](distributed-sirius.md), linking the NIXL install at `SIRIUS_NIXL_PREFIX` (default: the `NIXL_PREFIX` environment variable). |
+| `SIRIUS_WITH_NIXL` | OFF | Build the exchange's NIXL fabric for [distributed execution](distributed-sirius.md). It links the NIXL install at `SIRIUS_NIXL_PREFIX`, else at `$NIXL_PREFIX`, else at `scripts/install_nixl.sh --print-prefix` (`~/.sirius/nixl/<commit>`), and caches the resolved prefix in `SIRIUS_NIXL_PREFIX`; see [Settings and build](distributed-sirius.md#settings-and-build). `pixi run build-distributed` installs NIXL and turns this on. |
 
 ## Key Files
 

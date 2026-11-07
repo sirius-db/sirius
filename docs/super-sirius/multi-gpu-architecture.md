@@ -20,7 +20,9 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 
 The engine assumes a single process pinning the configured subset of visible GPUs
 (`CUDA_VISIBLE_DEVICES` bounds which GPUs Sirius can use; `sirius.topology` selects from that
-set). There is no notion of distributed multi-node execution in this codebase.
+set). This document covers that one process. Running one query across several processes and
+machines, one GPU each, is [Distributed Execution](distributed-sirius.md), driven by the
+[distributed gateway](distributed-gateway.md); see the [distributed quick start](distributed-quickstart.md).
 
 ## Tier Hierarchy
 
@@ -254,7 +256,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 - **`CUDA_VISIBLE_DEVICES`** scopes which GPUs Sirius may use. With the automatic topology
   default, `CUDA_VISIBLE_DEVICES=0,1` enables both visible GPUs. Set `sirius.topology.num_gpus` to
   use only a prefix of that visible set, or use `gpu_ids` to select a non-prefix subset.
-- **Single-process scope.** Sirius runs as a single OS process. Multi-process / multi-node execution is out of scope; the user is responsible for partitioning at a higher layer if needed.
+- **Single-process scope.** Everything here happens inside one OS process. Several processes, on one host or several, run one query together through the exchange ([Distributed Execution](distributed-sirius.md)).
 
 ## Key Source Files
 
