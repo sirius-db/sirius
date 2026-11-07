@@ -10,6 +10,8 @@
 # The token is SIRIUS_GATEWAY_TOKEN, or a random one printed at start. The gateway listens on
 # SIRIUS_GATEWAY_HOST (default 127.0.0.1); on any other host Quack serves TLS with a self-signed
 # certificate, which clients pin with ssl_fingerprint.
+# With 0 ranks it starts none: register ranks run by sirius_rank_node.sh with the
+# sirius_gateway_add_rank lines it prints, on this console, then CALL sirius_gateway_start(0).
 # Needs the gateway build (make -C gateway release) and a Sirius build with -DSIRIUS_WITH_NIXL=ON.
 set -euo pipefail
 ranks=$1
@@ -32,12 +34,16 @@ fi
 mkdir -p "$logs"
 
 init="$logs/gateway.init.sql"
+start=
+if [ "$ranks" -gt 0 ]; then
+  start="FROM sirius_gateway_start($ranks, gpus := '$gpus', hosts := '$hosts');"
+fi
 cat > "$init" <<SQL
 SET GLOBAL sirius_gateway_duckdb_binary = '$build/duckdb';
 SET GLOBAL sirius_gateway_sirius_extension = '$build/extension/sirius/sirius.duckdb_extension';
 SET GLOBAL sirius_gateway_rank_launcher = '$here/sirius_gateway_ssh_rank.sh';
 SET GLOBAL sirius_gateway_log_dir = '$logs';
-FROM sirius_gateway_start($ranks, gpus := '$gpus', hosts := '$hosts');
+$start
 SET GLOBAL quack_authorization_function = 'sirius_gateway_route';
 CALL quack_serve('quack:$host:$port', allow_other_hostname := true, token := '$token');
 SQL
