@@ -53,6 +53,10 @@ class distributed_session {
     std::vector<std::string> peers;
     std::uint32_t rank = 0;
     exchange::host_staging host_staging{};
+    std::string mnnvl;
+    std::uint64_t frame_bytes              = 0;
+    std::uint32_t send_frames              = 0;
+    std::uint32_t recv_frames_per_peer     = 0;
     bool operator==(settings const&) const = default;
 
     /// The exchange settings of @p params.

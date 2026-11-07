@@ -24,6 +24,35 @@ struct gateway_info : TableFunctionInfo {
   std::shared_ptr<gateway_state> state;
 };
 
+/// Refuses a value no rank takes, at SET rather than when the ranks start.
+void check_mnnvl(ClientContext&, SetScope, Value& parameter)
+{
+  auto const value = StringValue::Get(parameter);
+  if (value != "auto" && value != "require" && value != "off") {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_mnnvl must be auto, require or off, not '%s'", value);
+  }
+}
+
+void check_frame_bytes(ClientContext&, SetScope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0 || bytes % 256 != 0 || bytes > (1ull << 30)) {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_frame_bytes must be a positive multiple of 256 up to 1 GiB, not "
+      "%llu",
+      bytes);
+  }
+}
+
+void check_frames(ClientContext&, SetScope, Value& parameter)
+{
+  auto const frames = UBigIntValue::Get(parameter);
+  if (frames == 0 || frames > 1024) {
+    throw InvalidInputException("exchange frame counts must be 1 to 1024, not %llu", frames);
+  }
+}
+
 gateway_state& gateway_of(TableFunctionBindInput& input)
 {
   return *input.info->Cast<gateway_info>().state;
@@ -400,9 +429,13 @@ void LoadInternal(ExtensionLoader& loader)
   // Global, as Quack's own options are: the router and each statement read them in the client's
   // session, which a plain SET on the console would otherwise not reach.
   auto& config = DBConfig::GetConfig(db);
-  auto option  = [&](char const* name, char const* description, LogicalType type, Value fallback) {
+  auto option  = [&](char const* name,
+                    char const* description,
+                    LogicalType type,
+                    Value fallback,
+                    set_option_callback_t check = nullptr) {
     config.AddExtensionOption(
-      name, description, std::move(type), fallback, nullptr, SetScope::GLOBAL);
+      name, description, std::move(type), fallback, check, SetScope::GLOBAL);
   };
   option("sirius_gateway_duckdb_binary",
          "DuckDB binary that runs each rank",
@@ -416,6 +449,27 @@ void LoadInternal(ExtensionLoader& loader)
          "SQL each rank's session runs after the exchange settings",
          LogicalType::VARCHAR,
          Value(""));
+  option("sirius_gateway_exchange_mnnvl",
+         "sirius_exchange_mnnvl for every rank: auto, require or off put the "
+         "exchange's rings in fabric memory, for NVLink between nodes",
+         LogicalType::VARCHAR,
+         Value("auto"),
+         check_mnnvl);
+  option("sirius_gateway_exchange_frame_bytes",
+         "sirius_exchange_frame_bytes for every rank",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(16ull << 20),
+         check_frame_bytes);
+  option("sirius_gateway_exchange_send_frames",
+         "sirius_exchange_send_frames for every rank",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(32),
+         check_frames);
+  option("sirius_gateway_exchange_recv_frames_per_peer",
+         "sirius_exchange_recv_frames_per_peer for every rank",
+         LogicalType::UBIGINT,
+         Value::UBIGINT(8),
+         check_frames);
   option("sirius_gateway_log_dir",
          "Directory for rank init files and logs; empty uses a temporary one",
          LogicalType::VARCHAR,
