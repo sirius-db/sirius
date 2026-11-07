@@ -39,28 +39,40 @@ CREATE VIEW lineitem AS FROM read_parquet('/data/tpch_sf1000/lineitem/*.parquet'
 SELECT l_shipmode, count(*) FROM lineitem GROUP BY ALL;   -- every rank runs it; rank 0 answers
 ```
 
-**Several nodes.** On each node, run one rank per GPU under `scripts/sirius_rank_node.sh`, which
-starts the rank again whenever it exits and prints the line that registers it:
+**Several nodes.** Start a gateway with no ranks of its own. `SIRIUS_GATEWAY_PRIORITY_NETWORKS`
+picks the address it listens on, as StarRocks' `priority_networks` does, and
+`SIRIUS_GATEWAY_MIN_RANKS` is how many ranks the first statement waits for:
 
 ```bash
-pixi run scripts/sirius_rank_node.sh 0 9500 27000     # GPU, Quack port, exchange port
-# CALL sirius_gateway_add_rank('node-a:9500', exchange_port := 27000, token := '...', fingerprint := '...');
+SIRIUS_GATEWAY_PRIORITY_NETWORKS=10.87.140.0/24 SIRIUS_GATEWAY_MIN_RANKS=2 \
+  pixi run scripts/sirius_gateway.sh 0 9494 /home/me/sirius_gateway
 ```
 
-Then start a gateway with no ranks of its own, run each printed line on its console, and start the
-cluster of registered ranks:
+It writes its address, token and TLS fingerprint to `<log dir>/gateway.conf`. On each node, run one
+rank per GPU under `scripts/sirius_rank_node.sh`, with a config file that sources it (see
+`scripts/sirius_rank_node.conf.example`):
 
 ```bash
-SIRIUS_GATEWAY_HOST=$(hostname -f) SIRIUS_GATEWAY_TOKEN=my_token pixi run scripts/sirius_gateway.sh 0
+cat > rank0.conf <<'CONF'
+gpu=0
+quack_port=9500
+exchange_port=27000
+priority_networks=10.87.140.0/24   # listen address, and UCX_NET_DEVICES
+nixl_prefix=$HOME/tools/nvda_nixl
+ucx_tls=cuda_copy,cuda_ipc,tcp,self
+source /home/me/sirius_gateway/gateway.conf
+CONF
+pixi run scripts/sirius_rank_node.sh --config rank0.conf
 ```
 
-```sql
-CALL sirius_gateway_add_rank('node-a:9500', exchange_port := 27000, token := '...', fingerprint := '...');
-CALL sirius_gateway_start(0);
-```
+The script starts the rank again whenever it exits. Once the rank listens, it registers it with
+the gateway, as one of its clients, and again after every start of the rank. The first client
+statement then starts the registered ranks. Without a gateway in its config, the script prints
+the `sirius_gateway_add_rank` call (also in `<dir>/add_rank.sql`) for the gateway's console.
 
-`SIRIUS_GATEWAY_HOST` lets clients on other hosts reach the gateway, which then serves TLS; it
-listens on 127.0.0.1 by default. `sirius_gateway.sh` can also start ranks on other hosts itself,
+`SIRIUS_GATEWAY_HOST`, or `SIRIUS_GATEWAY_PRIORITY_NETWORKS`, lets clients on other hosts reach
+the gateway, which then serves TLS with a key pair kept in `<log dir>/tls`; it listens on
+127.0.0.1 by default. `sirius_gateway.sh` can also start ranks on other hosts itself,
 over SSH (`SIRIUS_GATEWAY_HOSTS`, `scripts/sirius_gateway_ssh_rank.sh`). Ranks that all run on
 one host need `UCX_TLS=cuda_copy,cuda_ipc,tcp,self`, as `distributed_run_sql.sh` sets: left to
 itself, UCX picks InfiniBand ports that GB200 hosts cannot connect through.
@@ -101,6 +113,7 @@ rank.
 | `BEGIN`, `COMMIT`, `ROLLBACK` | The client's own gateway session: one client's transaction never holds the others' statements. Each statement still commits on the ranks as it runs |
 | `sirius_gateway_status()`, `sirius_gateway_log()` | The gateway |
 | `SET` of a setting the gateway sets on each rank (`sirius_distributed_query_id`, `sirius_exchange_*`, `enable_duckdb_fallback`, `gpu_execution`) | Refused |
+| `sirius_gateway_add_rank`, `sirius_gateway_drop_rank`, with `sirius_gateway_allow_remote_join` on (`sirius_gateway.sh` with 0 ranks sets it) | The gateway: a node registers its rank. A client's token already runs any SQL on every rank |
 | Other `sirius_gateway_*`, `quack_*`, `sirius_rank_*` calls at a statement's top level (`CALL f()`, `FROM f()`, `SELECT f()`), and `SET` of such settings | Refused: gateway console only. Calls nested deeper are not checked |
 | `PREPARE`, `EXECUTE` | Refused: a prepared plan keeps the query number it was planned with |
 
@@ -116,6 +129,16 @@ A rank is **spawned** or **registered**.
   ranks next start.
   `sirius_gateway_drop_rank` unregisters it. Spawned ranks come first, then registered ones in
   the order they were added.
+
+**Starting registered ranks.** Until `sirius_gateway_start` or `sirius_gateway_stop` is called,
+a statement that finds no ranks running starts the registered ones itself, with the current
+`sirius_gateway_*` settings, as `sirius_gateway_start(0)` would, then replays the DDL log. While
+fewer than `sirius_gateway_min_ranks` (default 1) are registered, it fails instead of waiting,
+since registering takes the same turn. While no ranks run, the gateway answers the catalog reads
+a client's `ATTACH` sends from its own catalog, so attaching starts nothing and a node can attach
+to register its rank. Without `sirius_gateway_min_ranks`, a rank registered after the first
+statement restarts every rank. A start that fails is tried again by the next statement. After `sirius_gateway_stop`, only `sirius_gateway_start` or `sirius_gateway_restart`
+starts ranks.
 
 **Restart-to-join.** A rank's exchange peers are fixed once it connects, so every rank joins a
 new set of ranks as a new process. A spawned rank is restarted by the gateway. A registered rank
@@ -167,7 +190,7 @@ abandoned.
 | Function | What |
 |---|---|
 | `sirius_gateway_start(ranks, gpus :=, hosts :=, exchange_base_port :=, quack_base_port :=)` | Starts `ranks` spawned ranks plus the registered ones; clears the DDL log |
-| `sirius_gateway_add_rank('host:port', exchange_port :=, token :=, fingerprint :=, name :=, exchange_host :=)` | Registers a rank started outside the gateway. `exchange_port` and `token` are required; `name` defaults to the address. Unless the cluster is stopped, every rank restarts at the next statement |
+| `sirius_gateway_add_rank('host:port', exchange_port :=, token :=, fingerprint :=, name :=, exchange_host :=)` | Registers a rank started outside the gateway. `exchange_port` and `token` are required; `name` defaults to the address. Unless the cluster is stopped, every rank restarts at the next statement. The same rank again, with the same addresses and credentials, changes nothing |
 | `sirius_gateway_drop_rank(name)` | Unregisters a registered rank, likewise |
 | `sirius_gateway_restart()` | Restarts every rank and replays the DDL log |
 | `sirius_gateway_stop()` | Stops spawned ranks and disconnects registered ones |
@@ -187,6 +210,8 @@ On the ranks, Sirius adds `sirius_rank_info()` and `sirius_rank_exit()`
 | `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings |
 | `sirius_gateway_rank_launcher` | | Program that starts a spawned rank on another host |
 | `sirius_gateway_log_dir` | temporary | Rank init files and logs |
+| `sirius_gateway_allow_remote_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
+| `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them; until then statements fail |
 | `sirius_gateway_statement_timeout` | 3600 | Seconds before a statement is cancelled; 0 is none. A rank waiting on a peer that never ran the query has no bound of its own |
 | `sirius_gateway_cancel_grace` | 30 | Seconds a cancelled statement may keep running before its ranks are killed |
 | `sirius_gateway_rank_boot_id_sql` | `SELECT boot_id FROM sirius_rank_info()` | Names a registered rank's process |
@@ -202,7 +227,9 @@ On the ranks, Sirius adds `sirius_rank_info()` and `sirius_rank_exit()`
   evaluate on each rank. A `ROLLBACK` does not undo what ran on the ranks.
 - **The router is a deny-list** over top-level statements: a gateway function nested in a subquery
   reaches the ranks.
-- **In memory only:** the DDL log and the registered ranks are lost when the gateway restarts.
+- **In memory only:** the DDL log and the registered ranks are lost when the gateway restarts. A
+  node registers its rank again only when the rank starts again: after restarting the gateway,
+  restart the node scripts, or run each `<dir>/add_rank.sql` on its console.
 - **No heartbeat:** an idle rank that dies is found by the next statement, and a frozen remote
   rank only by the statement timeout. The gateway cannot kill a registered rank; a cancel it
   ignores holds the gateway's turn for up to the grace period plus 15 s, and the cluster is then
@@ -227,6 +254,7 @@ build/release/test/unittest "test/sql/*"
 | `sirius_gateway_hosts.test` | Spawned ranks on other hosts through the rank launcher |
 | `sirius_gateway_failstop.test` | Which outcomes fail the cluster, the root cause, a killed rank, the cancel ladder |
 | `sirius_gateway_registry.test` | Adding, joining, restarting and dropping registered ranks, with stand-ins for `sirius_rank_info` and `sirius_rank_exit` |
+| `sirius_gateway_autostart.test` | The first statement starting the registered ranks, `sirius_gateway_min_ranks`, a rank registered by a client, no start after a stop |
 
 The query-number rules, and `sirius_rank_info`'s boot id, are unit-tested in
 `test/cpp/exchange/test_exchange_query_windows.cpp` and `test_exchange_plan_reuse.cpp`. GPU runs are manual.
@@ -241,5 +269,7 @@ The query-number rules, and `sirius_rank_info`'s boot id, are unit-tested in
 | `gateway/src/sirius_gateway_extension.cpp` | SQL functions and settings |
 | `scripts/sirius_gateway.sh` | Starts a gateway and its spawned ranks |
 | `scripts/sirius_gateway_ssh_rank.sh` | Starts a spawned rank on another host over SSH |
-| `scripts/sirius_rank_node.sh` | Runs a registered rank and restarts it when it exits |
+| `scripts/sirius_rank_node.sh` | Runs a registered rank, restarts it when it exits, and registers it with the gateway |
+| `scripts/sirius_rank_node.conf.example` | A node's config file |
+| `scripts/sirius_net.sh` | Picks this host's address and interface in `priority_networks` |
 | `src/exchange/rank_control.cpp` | `sirius_rank_info`, `sirius_rank_exit` |
