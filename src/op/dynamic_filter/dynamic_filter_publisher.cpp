@@ -676,11 +676,11 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    // Distributed, every rank takes the plan's size, uncapped, so the ranks' filters merge.
-    auto const* distributed = plan.distributed();
+    // A fixed size (dynamic_filter_publication_policy::fixed_bloom_keys) is uncapped.
+    auto const fixed = plan.policy().fixed_bloom_keys;
     auto const cap =
-      distributed ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
-    auto const sized_for = distributed ? distributed->bloom_keys : rows;
+      fixed != 0 ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
+    auto const sized_for = fixed != 0 ? fixed : rows;
     auto const geometry =
       detail::accumulated_bloom_geometry::try_create(sized_for, keys.size(), cap);
     if (!geometry) {
@@ -696,6 +696,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         plan.max_bloom_bytes_per_gpu());
       return false;
     }
+
     auto const& replicas = plan.replica_spaces();
     if (replicas.empty()) {
       selection.accumulations_skipped_admission = 1;
@@ -1161,9 +1162,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   }
   dynamic_filter_publication_outcome outcome;
 
-  // Distributed, neither shortcut applies: the other ranks wait on this rank's share of the merge.
-  // An empty build contributes an empty Bloom, and this rank still publishes the others' keys.
-  if (build_view.num_rows() == 0 && plan.distributed() == nullptr) {
+  // With publish_when_empty_or_drained neither shortcut applies: a cross-rank merge waits on this
+  // process's part, so an empty build contributes an empty Bloom and still publishes the others'.
+  auto const& policy = plan.policy();
+  if (build_view.num_rows() == 0 && !policy.publish_when_empty_or_drained) {
     SIRIUS_LOG_DEBUG("[publish_dynamic_filters] Skipping dynamic filter push: empty build table.");
     return outcome;
   }
@@ -1174,7 +1176,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   auto const& probe_targets = plan.probe_targets();
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
     outcome.publications_skipped_targets_drained = 1;
-    if (plan.distributed() == nullptr) {
+    if (!policy.publish_when_empty_or_drained) {
       SIRIUS_LOG_DEBUG(
         "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
       return outcome;
@@ -1203,7 +1205,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
-  auto const bloom_keys    = plan.distributed() ? plan.distributed()->bloom_keys : std::size_t{0};
+  auto const bloom_keys    = policy.fixed_bloom_keys;
 
   std::vector<key_filters> per_key(admitted_keys.size());
   // Build columns restored from a narrowed carrier; filters copy from them asynchronously on
@@ -1292,7 +1294,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       // carrier the build arrived at and then restored to the recorded type: two scalars, not the
       // whole column, so a narrowed build publishes the same zone map a native one does.
       filters.zone_map_type = admitted_key.storage_type;
-      if (plan.emit_zone_map_filters() && plan.distributed() == nullptr &&
+      if (plan.emit_zone_map_filters() &&
           sirius::op::sirius_dynamic_zone_map_filter::supports(admitted_key.storage_type)) {
         nvtx_scoped_range vr{"dynfilter::build_zone_map"};
         auto min_s = cudf::reduce(col,
@@ -1339,23 +1341,18 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
           admitted_key_index);
       }
 
-      // Distributed: a Bloom of the size every rank builds, so the ranks' filters can be merged.
-      auto const distributed_bloom = plan.distributed() != nullptr && fits_rep &&
-                                     sirius::op::sirius_dynamic_bloom_filter::supports(col.type());
-      auto const chosen =
-        plan.distributed() != nullptr
-          ? (distributed_bloom ? membership_filter_kind::bloom : membership_filter_kind::none)
-          : choose_membership_filter(
-              {.build_rows               = valid_rows,
-               .l2_cache_bytes           = l2_bytes,
-               .estimated_hash_set_bytes = set_bytes,
-               .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
-               .supports_small_in_list =
-                 fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
-               .supports_hash_in_list =
-                 fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
-               .supports_bloom =
-                 fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
+      bool const in_list = fits_rep && !policy.bloom_only;
+      auto const chosen  = choose_membership_filter(
+        {.build_rows               = valid_rows,
+          .l2_cache_bytes           = l2_bytes,
+          .estimated_hash_set_bytes = set_bytes,
+          .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
+          .supports_small_in_list =
+            in_list && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
+          .supports_hash_in_list =
+            in_list && sirius::op::sirius_dynamic_in_list_filter::supports(col),
+          .supports_bloom =
+            fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
 
       char const* choice = "none";
       switch (chosen) {

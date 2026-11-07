@@ -70,6 +70,13 @@ struct dynamic_filter_publication_policy {
   double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
   bool enable_multi_partition           = false;
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
+  //! Membership filters are Blooms only, never IN-lists.
+  bool bloom_only = false;
+  //! Non-zero: every Bloom, whole-build or accumulated, is sized for this many keys whatever the
+  //! build's rows, and max_bloom_bytes_per_gpu does not cut it. Zero: sized from the build.
+  std::size_t fixed_bloom_keys = 0;
+  //! Publish even an empty build, or with every target drained, rather than skip the publication.
+  bool publish_when_empty_or_drained = false;
 };
 
 /**
@@ -167,6 +174,7 @@ class dynamic_filter_publish_plan final {
   {
     return _policy.max_bloom_bytes_per_gpu;
   }
+  [[nodiscard]] dynamic_filter_publication_policy const& policy() const noexcept { return _policy; }
 
   /**
    * @brief Retains replicas on the listed GPUs
@@ -197,8 +205,14 @@ class dynamic_filter_publish_plan final {
     /// A rank that has not sent its filter by then is given up on: the key publishes nothing.
     std::chrono::milliseconds timeout{default_timeout};
   };
+  /// Also sets the policy every rank must share for the merge: Blooms only, all of
+  /// merge.bloom_keys, and no publication shortcuts or zone maps.
   void set_distributed(distributed_merge merge)
   {
+    _policy.emit_zone_map_filters         = false;
+    _policy.bloom_only                    = true;
+    _policy.fixed_bloom_keys              = merge.bloom_keys;
+    _policy.publish_when_empty_or_drained = true;
     _distributed = std::make_shared<distributed_merge const>(std::move(merge));
   }
   [[nodiscard]] distributed_merge const* distributed() const noexcept { return _distributed.get(); }
