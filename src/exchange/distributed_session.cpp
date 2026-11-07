@@ -34,7 +34,8 @@ distributed_session::settings distributed_session::settings::from(operator_param
           .mnnvl                = params.exchange_mnnvl,
           .frame_bytes          = params.exchange_frame_bytes,
           .send_frames          = params.exchange_send_frames,
-          .recv_frames_per_peer = params.exchange_recv_frames_per_peer};
+          .recv_frames_per_peer = params.exchange_recv_frames_per_peer,
+          .tcp_lanes            = params.exchange_tcp_lanes};
 }
 
 std::shared_ptr<exchange_service> distributed_session::service(

@@ -18,8 +18,10 @@
 
 namespace sirius::exchange {
 
-/// Whether writes to a peer go through its pinned host mirror instead of NIXL. automatic: only to
-/// peers whose GPU lacks peer access to this one (NVML).
-enum class host_staging { automatic, always, never };
+/// Whether writes to a peer go through its pinned host mirror instead of NIXL. automatic: over TCP
+/// lanes to peers on other hosts, and through shared memory to peers on this host whose GPU lacks
+/// peer access to this one (NVML). always: also to every peer on this host. never: NIXL to every
+/// peer. remote: TCP lanes to every peer, even on this host (for tests).
+enum class host_staging { automatic, always, never, remote };
 
 }  // namespace sirius::exchange

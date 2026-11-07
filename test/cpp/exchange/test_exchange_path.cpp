@@ -90,6 +90,53 @@ TEST_CASE("off the NVLink fabric, the path is what it was", "[exchange][path]")
     path::nixl);
 }
 
+TEST_CASE("a peer on another host gets TCP lanes unless the NVLink fabric reaches it",
+          "[exchange][path]")
+{
+  auto on = [](endpoint e, char const* boot_id) {
+    e.boot_id = boot_id;
+    return e;
+  };
+  auto const me      = on(at(0, true, domain(7, 32766)), "boot-a");
+  auto const near    = on(at(1, false, {}), "boot-a");
+  auto const far     = on(at(1, false, {}), "boot-b");
+  auto const far_fab = on(at(1, true, domain(7, 32766)), "boot-b");
+  for (bool const peer_access : {true, false}) {
+    // Another host: lanes, whatever NVML says of a GPU it cannot see.
+    CHECK(choose_path(me, far, host_staging::automatic, mnnvl_mode::automatic, peer_access) ==
+          path::tcp_lanes);
+    CHECK(choose_path(me, far, host_staging::automatic, mnnvl_mode::off, peer_access) ==
+          path::tcp_lanes);
+    CHECK(choose_path(me, far_fab, host_staging::automatic, mnnvl_mode::off, peer_access) ==
+          path::tcp_lanes);
+    CHECK(choose_path(me, far, host_staging::always, mnnvl_mode::automatic, peer_access) ==
+          path::tcp_lanes);
+    CHECK(choose_path(me, far, host_staging::never, mnnvl_mode::automatic, peer_access) ==
+          path::nixl);
+    // The NVLink fabric reaches other hosts, and wins there.
+    CHECK(choose_path(me, far_fab, host_staging::automatic, mnnvl_mode::automatic, peer_access) ==
+          path::nvlink_fabric);
+    CHECK(choose_path(me, far_fab, host_staging::never, mnnvl_mode::require, peer_access) ==
+          path::nvlink_fabric);
+    CHECK(choose_path(me, far_fab, host_staging::always, mnnvl_mode::automatic, peer_access) ==
+          path::tcp_lanes);
+    // remote: lanes to every peer, even on this host or on the fabric.
+    for (auto const& peer : {near, far, far_fab}) {
+      CHECK(choose_path(me, peer, host_staging::remote, mnnvl_mode::automatic, peer_access) ==
+            path::tcp_lanes);
+    }
+    CHECK(choose_path(me, near, host_staging::always, mnnvl_mode::automatic, peer_access) ==
+          path::shared_memory);
+  }
+  // This host: as before.
+  CHECK(choose_path(me, near, host_staging::automatic, mnnvl_mode::automatic, true) == path::nixl);
+  CHECK(choose_path(me, near, host_staging::automatic, mnnvl_mode::automatic, false) ==
+        path::shared_memory);
+  CHECK_THROWS_WITH(choose_path(me, far, host_staging::automatic, mnnvl_mode::require, true),
+                    Catch::Matchers::ContainsSubstring("cannot write rank 1"));
+  CHECK(std::string{describe(path::tcp_lanes)} == "host-staged over TCP lanes");
+}
+
 TEST_CASE("sirius_exchange_mnnvl takes auto, require or off", "[exchange][path]")
 {
   CHECK(parse_mnnvl("auto") == mnnvl_mode::automatic);
