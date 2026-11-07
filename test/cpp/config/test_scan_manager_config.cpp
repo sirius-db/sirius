@@ -22,17 +22,21 @@
 
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/tls/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 using cucascade::io::cache::cache_mode;
 using cucascade::io::cache::eviction_policy;
@@ -107,6 +111,10 @@ std::string uring_yaml(std::string const& body)
 {
   return scan_manager_yaml("      uring:\n" + body);
 }
+
+std::string rest_yaml(std::string const& body) { return scan_manager_yaml("      rest:\n" + body); }
+
+std::string tls_yaml(std::string const& body) { return rest_yaml("        tls:\n" + body); }
 
 /// Loading @p text must fail, and the error must end with @p message (the loader
 /// prefixes it with the file it was reading).
@@ -681,30 +689,30 @@ TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][read
 
 TEST_CASE("backend string_to_enum accepts known backends", "[scan_manager][config][backend]")
 {
-  io_backend b = io_backend::kvikio;
+  io_backend b{};
 
   REQUIRE(string_to_enum("native", b));
   CHECK(b == io_backend::native);
 
-  REQUIRE(string_to_enum("kvikio", b));
-  CHECK(b == io_backend::kvikio);
+  REQUIRE(string_to_enum("cufile", b));
+  CHECK(b == io_backend::cufile);
 
   // Deprecated spelling of `native`, still accepted.
-  b = io_backend::kvikio;
   REQUIRE(string_to_enum("sirius", b));
   CHECK(b == io_backend::native);
 }
 
 TEST_CASE("backend string_to_enum rejects unknown backends", "[scan_manager][config][backend]")
 {
-  io_backend b = io_backend::kvikio;
+  io_backend b{};
 
   CHECK_FALSE(string_to_enum("", b));
   CHECK_FALSE(string_to_enum("NATIVE", b));
   CHECK_FALSE(string_to_enum("SIRIUS", b));
   CHECK_FALSE(string_to_enum("uring", b));
+  CHECK_FALSE(string_to_enum("kvikio", b));
   CHECK_FALSE(string_to_enum("true", b));
-  CHECK(b == io_backend::kvikio);
+  CHECK(b == io_backend::native);
 }
 
 TEST_CASE("backend enum_to_string returns canonical names", "[scan_manager][config][backend]")
@@ -713,8 +721,8 @@ TEST_CASE("backend enum_to_string returns canonical names", "[scan_manager][conf
 
   REQUIRE(enum_to_string(io_backend::native, out));
   CHECK(out == "native");
-  REQUIRE(enum_to_string(io_backend::kvikio, out));
-  CHECK(out == "kvikio");
+  REQUIRE(enum_to_string(io_backend::cufile, out));
+  CHECK(out == "cufile");
 }
 
 TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][config][backend]")
@@ -722,6 +730,27 @@ TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][
   scan_manager_config cfg{};
 
   CHECK(cfg.backend == io_backend::native);
+  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile.max_inflight == 32);
+  CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (256UL << 10));
+  CHECK(cfg.cufile.use_odirect);
+  CHECK_FALSE(cfg.cufile.compat_mode.has_value());
+}
+
+TEST_CASE("cuFile C++ config is validated before starting the scan manager",
+          "[scan_manager][config][backend][cufile]")
+{
+  scan_manager_config cfg{};
+  SECTION("reactor count") { cfg.cufile_n_reactors = 0; }
+  SECTION("inflight window") { cfg.cufile.max_inflight = 0; }
+  SECTION("operation bytes") { cfg.cufile.max_op_bytes = 4095; }
+  SECTION("direct policy")
+  {
+    cfg.cufile.use_odirect = false;
+    cfg.cufile.compat_mode = cucascade::io::cufile::compat::off;
+  }
+  CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(cfg), std::invalid_argument);
 }
 
 TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_config",
@@ -733,7 +762,6 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   cfg.cache.mode            = cache_mode::os;
   cfg.cache.eviction        = eviction_policy::idle;
   cfg.object_store.endpoint = "http://object-store.test:9000";
-  cfg.kvikio.task_size      = std::size_t{8} << 20;
   cfg.rest.max_connections  = 17;
 
   auto const io = cfg.to_io_config();
@@ -742,7 +770,6 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   CHECK(io.rest_n_reactors == 5);
   // A non-default value in each copied sub-config survives the copy.
   CHECK(io.object_store.endpoint == "http://object-store.test:9000");
-  CHECK(io.kvikio.task_size == std::optional<std::size_t>{std::size_t{8} << 20});
   CHECK(io.rest.max_connections == 17);
   CHECK(io.cache.eviction == eviction_policy::idle);
   // Sirius's uring default (readahead off) reaches cuCascade unchanged.
@@ -754,16 +781,15 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   CHECK_FALSE(io.uring.use_odirect);
   CHECK(io.cache.dispose_on_idle);
 
-  cfg.backend = io_backend::kvikio;
-  CHECK(cfg.to_io_config().backend == cucascade::io::io_backend::kvikio);
+  // 0 (size the REST pool from the NIC) is handed to cuCascade as is.
+  cfg.rest_n_reactors = 0;
+  CHECK(cfg.to_io_config().rest_n_reactors == 0);
+  cfg.backend = io_backend::cufile;
+  CHECK(cfg.to_io_config().backend == cucascade::io::io_backend::cufile);
 }
 
 TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][backend]")
 {
-  auto const kvikio = load_scan_manager("sirius_backend_kvikio.yaml",
-                                        single_gpu_scan_manager_yaml("      backend: kvikio\n"));
-  CHECK(kvikio.backend == io_backend::kvikio);
-
   auto const native = load_scan_manager("sirius_backend_native.yaml",
                                         single_gpu_scan_manager_yaml("      backend: native\n"));
   CHECK(native.backend == io_backend::native);
@@ -771,6 +797,141 @@ TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][b
   auto const omitted = load_scan_manager("sirius_backend_default.yaml",
                                          scan_manager_yaml("      uring_n_reactors: 2\n"));
   CHECK(omitted.backend == io_backend::native);
+}
+
+TEST_CASE("sirius_config rejects the removed kvikio backend and block",
+          "[scan_manager][config][backend]")
+{
+  require_load_error("sirius_backend_kvikio_removed.yaml",
+                     single_gpu_scan_manager_yaml("      backend: kvikio\n"),
+                     "'scan_manager.backend': backend: kvikio has been removed; "
+                     "use backend: native instead");
+  for (auto const* block : {"{}", "{task_size: 8 MiB}"}) {
+    require_load_error("sirius_kvikio_block_removed.yaml",
+                       scan_manager_yaml(std::string{"      kvikio: "} + block + "\n"),
+                       "'scan_manager.kvikio': removed; remove this block and use "
+                       "backend: native instead");
+  }
+}
+
+TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][backend][cufile]")
+{
+  auto const cfg =
+    load_scan_manager("sirius_backend_cufile.yaml",
+                      single_gpu_scan_manager_yaml("      backend: cufile\n"
+                                                   "      cufile_n_reactors: 3\n"
+                                                   "      cache:\n"
+                                                   "        mode: cucs\n"
+                                                   "      cufile:\n"
+                                                   "        max_inflight: 7\n"
+                                                   "        max_op_bytes: 8 MiB\n"
+                                                   "        gds_threshold: 128 KiB\n"
+                                                   "        use_odirect: false\n"
+                                                   "        compat_mode: on\n"
+                                                   "        poll_interval_us: 50\n"
+                                                   "        low_service_interval: 0\n"));
+  CHECK(cfg.backend == io_backend::cufile);
+  auto const io = cfg.to_io_config();
+  CHECK(io.backend == cucascade::io::io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 3);
+  CHECK(cfg.cufile.max_inflight == 7);
+  CHECK(cfg.cufile.max_op_bytes == (8UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (128UL << 10));
+  CHECK_FALSE(cfg.cufile.use_odirect);
+  CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::on);
+  CHECK(cfg.cufile.poll_interval_us == 50);
+  CHECK(cfg.cufile.low_service_interval == 0);
+#ifdef CUCASCADE_HAS_CUFILE
+  CHECK(io.cufile_n_reactors == cfg.cufile_n_reactors);
+  CHECK(io.cufile.max_inflight == cfg.cufile.max_inflight);
+  CHECK(io.cufile.max_op_bytes == cfg.cufile.max_op_bytes);
+  CHECK(io.cufile.gds_threshold == cfg.cufile.gds_threshold);
+  CHECK(io.cufile.use_odirect == cfg.cufile.use_odirect);
+  CHECK(io.cufile.compat_mode == cfg.cufile.compat_mode);
+  CHECK(io.cufile.poll_interval_us == cfg.cufile.poll_interval_us);
+  CHECK(io.cufile.low_service_interval == cfg.cufile.low_service_interval);
+#endif
+
+  for (auto const& [spelling, expected] :
+       {std::pair{"auto", cucascade::io::cufile::compat::automatic},
+        std::pair{"on", cucascade::io::cufile::compat::on},
+        std::pair{"off", cucascade::io::cufile::compat::off}}) {
+    auto const parsed =
+      load_scan_manager("sirius_cufile_compat.yaml",
+                        single_gpu_scan_manager_yaml(
+                          std::string{"      cufile:\n        compat_mode: "} + spelling + "\n"));
+    CHECK(parsed.cufile.compat_mode == expected);
+  }
+}
+
+TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
+          "[scan_manager][config][backend][cufile]")
+{
+  for (auto const& [body, key] :
+       {std::pair{"      cufile_n_reactors: 0\n", "scan_manager.cufile_n_reactors"},
+        std::pair{"      cufile_n_reactors: -1\n", "scan_manager.cufile_n_reactors"},
+        std::pair{"      cufile:\n        max_inflight: 0\n", "cufile.max_inflight"},
+        std::pair{"      cufile:\n        max_inflight: -1\n", "cufile.max_inflight"},
+        std::pair{"      cufile:\n        max_op_bytes: 4095\n", "cufile.max_op_bytes"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: -1\n",
+                  "cufile.n_max_concurrent_scans"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: 0\n", "not configurable"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: 4\n", "not configurable"},
+        std::pair{"      cufile:\n        gds_threshold: -1\n", "cufile.gds_threshold"},
+        std::pair{"      cufile:\n        poll_interval_us: -1\n", "cufile.poll_interval_us"},
+        std::pair{"      cufile:\n        low_service_interval: -1\n",
+                  "cufile.low_service_interval"},
+        std::pair{"      cufile:\n        compat_mode: ON\n", "cufile.compat_mode"},
+        std::pair{"      cufile:\n        compat_mode: ''\n", "cufile.compat_mode"},
+        std::pair{"      cufile:\n        use_odirect: false\n        compat_mode: off\n",
+                  "cufile.use_odirect"},
+        std::pair{"      cufile:\n        write_split_bytes: 4096\n", "write_split_bytes"},
+        std::pair{"      cufile:\n        register_min_bytes: 4096\n", "register_min_bytes"},
+        std::pair{"      io_backend: cufile\n", "io_backend"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_cufile_invalid.yaml", single_gpu_scan_manager_yaml(body));
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::ContainsSubstring(key));
+  }
+}
+
+TEST_CASE("the documented cuFile configuration example loads",
+          "[scan_manager][config][backend][cufile]")
+{
+  std::ifstream doc(SIRIUS_PROJECT_ROOT "/docs/super-sirius/configuration.md");
+  REQUIRE(doc.is_open());
+  bool in_yaml = false;
+  std::string block;
+  std::string example;
+  size_t examples = 0;
+  for (std::string line; std::getline(doc, line);) {
+    if (!in_yaml) {
+      if (line == "```yaml") {
+        in_yaml = true;
+        block.clear();
+      }
+    } else if (line == "```") {
+      if (block.find("backend: cufile") != std::string::npos) {
+        ++examples;
+        example = block;
+      }
+      in_yaml = false;
+    } else {
+      block += line + '\n';
+    }
+  }
+  REQUIRE(examples == 1);
+  scan_manager_config cfg;
+  REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_cufile.yaml", example));
+  CHECK(cfg.backend == io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile.max_inflight == 32);
+  CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (256UL << 10));
+  CHECK(cfg.cufile.use_odirect);
+  CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::automatic);
+  CHECK(cfg.cufile.poll_interval_us == 200);
+  CHECK(cfg.cufile.low_service_interval == 4);
 }
 
 TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
@@ -831,20 +992,549 @@ TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][
   CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
+TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport defaults",
+          "[scan_manager][config][rest][tls]")
+{
+  // Sirius sets no REST transport defaults of its own: an empty block must leave
+  // every field at cuCascade's struct default (compared field by field, so a
+  // cuCascade default change needs no edit here).
+  cucascade::io::rest::config const d{};
+  for (auto const* body : {"        {}\n", "        tls: {}\n"}) {
+    CAPTURE(body);
+    auto const cfg = load_scan_manager("sirius_rest_defaults.yaml", rest_yaml(body));
+    auto const& r  = cfg.rest;
+    CHECK(cfg.rest_n_reactors == 2);
+    CHECK(r.request_timeout_s == d.request_timeout_s);
+    CHECK(r.stall_speed_limit_bytes == d.stall_speed_limit_bytes);
+    CHECK(r.stall_time_s == d.stall_time_s);
+    CHECK(r.max_connections == d.max_connections);
+    CHECK(r.merge_max_gap == d.merge_max_gap);
+    CHECK(r.upkeep_interval == d.upkeep_interval);
+    CHECK(r.upkeep_http1 == d.upkeep_http1);
+    CHECK(r.conn_max_age == d.conn_max_age);
+    CHECK(r.min_segment_bytes == d.min_segment_bytes);
+    CHECK(r.max_segment_bytes == d.max_segment_bytes);
+    CHECK(r.receive_buffer_bytes == d.receive_buffer_bytes);
+    CHECK(r.queue_depth == d.queue_depth);
+    CHECK(r.iowq_max_unbound == d.iowq_max_unbound);
+    CHECK(r.wait_mode == d.wait_mode);
+    CHECK(r.dns_ttl == d.dns_ttl);
+    CHECK(r.dns_accumulate == d.dns_accumulate);
+    CHECK(r.dns_max_addresses == d.dns_max_addresses);
+    CHECK(r.connect_timeout == d.connect_timeout);
+    CHECK(r.keepalive_idle_s == d.keepalive_idle_s);
+    CHECK(r.keepalive_interval_s == d.keepalive_interval_s);
+    CHECK(r.keepalive_count == d.keepalive_count);
+    CHECK(r.min_mtu == d.min_mtu);
+    CHECK(r.mtu_reject_max_attempts == d.mtu_reject_max_attempts);
+    CHECK(r.close_with_rst == d.close_with_rst);
+    CHECK(r.fan_out == d.fan_out);
+    CHECK(r.interface == d.interface);
+    CHECK(r.pin_to_irq_cpus == d.pin_to_irq_cpus);
+    CHECK(r.write_split_bytes == d.write_split_bytes);
+    CHECK(r.expect_continue == d.expect_continue);
+    CHECK(r.continue_timeout == d.continue_timeout);
+    CHECK(r.complete_timeout_s == d.complete_timeout_s);
+    CHECK(r.max_write_connections == d.max_write_connections);
+    CHECK(r.max_retry_attempts == d.max_retry_attempts);
+    CHECK(r.max_auth_retry_attempts == d.max_auth_retry_attempts);
+    CHECK(r.retry_backoff_base == d.retry_backoff_base);
+    CHECK(r.retry_jitter == d.retry_jitter);
+    CHECK(r.honor_retry_after == d.honor_retry_after);
+    CHECK(r.footer_probe_bytes == d.footer_probe_bytes);
+    CHECK(r.list_max_matches == d.list_max_matches);
+    CHECK(r.list_max_scanned == d.list_max_scanned);
+    CHECK(r.tls.ktls == d.tls.ktls);
+    CHECK(r.tls.fallback_rx == d.tls.fallback_rx);
+    CHECK(r.tls.placement == d.tls.placement);
+    CHECK(r.tls.min_version == d.tls.min_version);
+    CHECK(r.tls.max_version == d.tls.max_version);
+    CHECK(r.tls.expect_no_pad == d.tls.expect_no_pad);
+    CHECK(r.tls.session_cache == d.tls.session_cache);
+    CHECK(r.tls.session_cache_per_endpoint == d.tls.session_cache_per_endpoint);
+    CHECK(r.tls.max_connection_bytes == d.tls.max_connection_bytes);
+    CHECK(r.tls.ciphersuites == d.tls.ciphersuites);
+    CHECK(r.tls.cipher_list == d.tls.cipher_list);
+    CHECK(r.tls.groups == d.tls.groups);
+    CHECK(r.tls.sni_override == d.tls.sni_override);
+    CHECK(r.tls.allow_tls13_without_rekey == d.tls.allow_tls13_without_rekey);
+    CHECK(r.tls.verify == d.tls.verify);
+  }
+}
+
+TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][rest]")
+{
+  using cucascade::io::rest::reactor_wait_mode;
+  auto const cfg = load_scan_manager("sirius_rest_transport.yaml",
+                                     scan_manager_yaml("      rest_n_reactors: 4\n"
+                                                       "      rest:\n"
+                                                       "        n_max_concurrent_scans: 5\n"
+                                                       "        request_timeout_s: 11\n"
+                                                       "        stall_speed_limit_bytes: 4096\n"
+                                                       "        stall_time_s: 3\n"
+                                                       "        merge_max_gap: 16 KiB\n"
+                                                       "        min_segment_bytes: 2 MiB\n"
+                                                       "        max_segment_bytes: 8 MiB\n"
+                                                       "        footer_probe_bytes: 64 KiB\n"
+                                                       "        list_max_matches: 13\n"
+                                                       "        list_max_scanned: 31\n"
+                                                       "        retry_backoff_base_ms: 7ms\n"
+                                                       "        retry_jitter_ms: 9\n"
+                                                       "        max_retry_attempts: 5\n"
+                                                       "        max_auth_retry_attempts: 2\n"
+                                                       "        honor_retry_after: false\n"
+                                                       "        max_connections: 13\n"
+                                                       "        conn_max_age_s: 2s\n"
+                                                       "        upkeep_interval_ms: 1500\n"
+                                                       "        upkeep_http1: true\n"
+                                                       "        connect_timeout_ms: 1200\n"
+                                                       "        dns_ttl_s: 30\n"
+                                                       "        dns_accumulate: true\n"
+                                                       "        dns_max_addresses: 8\n"
+                                                       "        keepalive_idle_s: 20\n"
+                                                       "        keepalive_interval_s: 5\n"
+                                                       "        keepalive_count: 3\n"
+                                                       "        min_mtu: 9001\n"
+                                                       "        mtu_reject_max_attempts: 2\n"
+                                                       "        close_with_rst: false\n"
+                                                       "        receive_buffer_bytes: 1 MiB\n"
+                                                       "        queue_depth: 256\n"
+                                                       "        wait_mode: uring\n"
+                                                       "        iowq_max_unbound: 9\n"
+                                                       "        fan_out: 3\n"
+                                                       "        interface: eth1\n"
+                                                       "        pin_to_irq_cpus: false\n"
+                                                       "        write_part_bytes: 10 MiB\n"
+                                                       "        expect_continue: true\n"
+                                                       "        continue_timeout_ms: 250\n"
+                                                       "        complete_timeout_s: 120\n"
+                                                       "        max_write_connections: 4\n"));
+  CHECK(cfg.rest_n_reactors == 4);
+  auto const check = [](cucascade::io::rest::config const& rest) {
+    CHECK(rest.n_max_concurrent_scans == 5);
+    CHECK(rest.n_max_concurrent_scans_explicit);
+    CHECK(rest.request_timeout_s == 11);
+    CHECK(rest.stall_speed_limit_bytes == 4096);
+    CHECK(rest.stall_time_s == 3);
+    CHECK(rest.merge_max_gap == (16UL << 10));
+    CHECK(rest.merge_gap_size() == (16UL << 10));
+    CHECK(rest.min_segment_bytes == (2UL << 20));
+    CHECK(rest.max_segment_bytes == (8UL << 20));
+    CHECK(rest.footer_probe_bytes == (64UL << 10));
+    CHECK(rest.list_max_matches == 13);
+    CHECK(rest.list_max_scanned == 31);
+    CHECK(rest.retry_backoff_base == std::chrono::milliseconds{7});
+    CHECK(rest.retry_jitter == std::chrono::milliseconds{9});
+    CHECK(rest.max_retry_attempts == 5);
+    CHECK(rest.max_auth_retry_attempts == 2);
+    CHECK_FALSE(rest.honor_retry_after);
+    CHECK(rest.max_connections == 13);
+    CHECK(rest.conn_max_age == std::chrono::seconds{2});
+    CHECK(rest.upkeep_interval == std::chrono::milliseconds{1500});
+    CHECK(rest.upkeep_http1);
+    CHECK(rest.connect_timeout == std::chrono::milliseconds{1200});
+    CHECK(rest.dns_ttl == std::chrono::seconds{30});
+    CHECK(rest.dns_accumulate);
+    CHECK(rest.dns_max_addresses == 8);
+    CHECK(rest.keepalive_idle_s == 20);
+    CHECK(rest.keepalive_interval_s == 5);
+    CHECK(rest.keepalive_count == 3);
+    CHECK(rest.min_mtu == 9001);
+    CHECK(rest.mtu_reject_max_attempts == 2);
+    CHECK_FALSE(rest.close_with_rst);
+    CHECK(rest.receive_buffer_bytes == (1UL << 20));
+    CHECK(rest.queue_depth == 256);
+    CHECK(rest.wait_mode == reactor_wait_mode::uring);
+    CHECK(rest.iowq_max_unbound == 9);
+    CHECK(rest.fan_out == 3);
+    CHECK(rest.interface == "eth1");
+    CHECK_FALSE(rest.pin_to_irq_cpus);
+    CHECK(rest.write_split_bytes == (10UL << 20));
+    CHECK(rest.expect_continue);
+    CHECK(rest.continue_timeout == std::chrono::milliseconds{250});
+    CHECK(rest.complete_timeout_s == 120);
+    CHECK(rest.max_write_connections == 4);
+  };
+  check(cfg.rest);
+  check(cfg.to_io_config().rest);
+  CHECK(cfg.to_io_config().rest_n_reactors == 4);
+}
+
+TEST_CASE("REST transport accepts documented zero sentinels and range boundaries",
+          "[scan_manager][config][rest]")
+{
+  auto const cfg = load_scan_manager("sirius_rest_transport_bounds.yaml",
+                                     scan_manager_yaml("      rest_n_reactors: 0\n"
+                                                       "      rest:\n"
+                                                       "        n_max_concurrent_scans: 0\n"
+                                                       "        request_timeout_s: 0\n"
+                                                       "        stall_speed_limit_bytes: 0\n"
+                                                       "        stall_time_s: 0\n"
+                                                       "        merge_max_gap: 0\n"
+                                                       "        conn_max_age_s: 0\n"
+                                                       "        upkeep_interval_ms: 0\n"
+                                                       "        retry_backoff_base_ms: 0\n"
+                                                       "        retry_jitter_ms: 0\n"
+                                                       "        max_retry_attempts: 1\n"
+                                                       "        max_auth_retry_attempts: 1\n"
+                                                       "        max_connections: 1\n"
+                                                       "        connect_timeout_ms: 1\n"
+                                                       "        min_segment_bytes: 1\n"
+                                                       "        max_segment_bytes: 1\n"
+                                                       "        keepalive_count: 0\n"
+                                                       "        min_mtu: 0\n"
+                                                       "        mtu_reject_max_attempts: 1\n"
+                                                       "        receive_buffer_bytes: 16 KiB\n"
+                                                       "        queue_depth: 2\n"
+                                                       "        iowq_max_unbound: 0\n"
+                                                       "        dns_max_addresses: 4096\n"
+                                                       "        footer_probe_bytes: 1 GiB\n"
+                                                       "        fan_out: 1\n"
+                                                       "        write_part_bytes: 5 MiB\n"
+                                                       "        continue_timeout_ms: 0\n"
+                                                       "        complete_timeout_s: 0\n"
+                                                       "        max_write_connections: 0\n"
+                                                       "        tls:\n"
+                                                       "          session_cache: false\n"
+                                                       "          session_cache_per_endpoint: 0\n"
+                                                       "          max_connection_bytes: 0\n"));
+  // rest_n_reactors 0 sizes the pool from the egress NIC when the REST ioctx is built.
+  CHECK(cfg.rest_n_reactors == 0);
+  CHECK(cfg.rest.n_max_concurrent_scans == 0);
+  CHECK(cfg.rest.n_max_concurrent_scans_explicit);
+  CHECK(cfg.rest.request_timeout_s == 0);
+  CHECK(cfg.rest.stall_speed_limit_bytes == 0);
+  CHECK(cfg.rest.stall_time_s == 0);
+  CHECK(cfg.rest.merge_gap_size() == 0);
+  CHECK(cfg.rest.conn_max_age.count() == 0);
+  CHECK(cfg.rest.upkeep_interval.count() == 0);
+  CHECK(cfg.rest.retry_backoff_base.count() == 0);
+  CHECK(cfg.rest.retry_jitter.count() == 0);
+  CHECK(cfg.rest.max_retry_attempts == 1);
+  CHECK(cfg.rest.max_auth_retry_attempts == 1);
+  CHECK(cfg.rest.max_connections == 1);
+  CHECK(cfg.rest.connect_timeout.count() == 1);
+  CHECK(cfg.rest.min_segment_bytes == 1);
+  CHECK(cfg.rest.max_segment_bytes == 1);
+  CHECK(cfg.rest.keepalive_count == 0);
+  CHECK(cfg.rest.min_mtu == 0);
+  CHECK(cfg.rest.mtu_reject_max_attempts == 1);
+  CHECK(cfg.rest.receive_buffer_bytes == (16UL << 10));
+  CHECK(cfg.rest.queue_depth == 2);
+  CHECK(cfg.rest.iowq_max_unbound == 0);
+  CHECK(cfg.rest.dns_max_addresses == 4096);
+  CHECK(cfg.rest.footer_probe_bytes == (1UL << 30));
+  CHECK(cfg.rest.fan_out == 1);
+  CHECK(cfg.rest.write_split_bytes == (5UL << 20));
+  CHECK(cfg.rest.continue_timeout.count() == 0);
+  CHECK(cfg.rest.complete_timeout_s == 0);
+  CHECK(cfg.rest.max_write_connections == 0);
+  CHECK(cfg.rest.tls.session_cache_per_endpoint == 0);
+  CHECK(cfg.rest.tls.max_connection_bytes == 0);
+
+  auto const upper = load_scan_manager("sirius_rest_transport_upper.yaml",
+                                       rest_yaml("        max_connections: 64\n"
+                                                 "        queue_depth: 32768\n"
+                                                 "        min_mtu: 65607\n"
+                                                 "        receive_buffer_bytes: 4 MiB\n"
+                                                 "        write_part_bytes: 5 GiB\n"
+                                                 "        max_write_connections: 64\n"));
+  CHECK(upper.rest.queue_depth == 32768);
+  CHECK(upper.rest.min_mtu == 65607);
+  CHECK(upper.rest.receive_buffer_bytes == (4UL << 20));
+  CHECK(upper.rest.write_split_bytes == (5UL << 30));
+  CHECK(upper.rest.max_write_connections == 64);
+
+  auto const tight =
+    load_scan_manager("sirius_rest_queue_tight.yaml",
+                      rest_yaml("        max_connections: 64\n        queue_depth: 128\n"));
+  CHECK(tight.rest.queue_depth == 128);
+
+  // The default fan-out (2) is clamped to a one-reactor pool rather than rejected,
+  // and any fan-out is left to the REST ioctx when the pool is NIC-sized.
+  auto const one = load_scan_manager("sirius_rest_fan_out_default.yaml",
+                                     scan_manager_yaml("      rest_n_reactors: 1\n"));
+  CHECK(one.rest.fan_out == 2);
+  auto const automatic = load_scan_manager("sirius_rest_fan_out_auto.yaml",
+                                           scan_manager_yaml("      rest_n_reactors: 0\n"
+                                                             "      rest:\n"
+                                                             "        fan_out: 8\n"));
+  CHECK(automatic.rest.fan_out == 8);
+}
+
+TEST_CASE("sirius_config rejects invalid REST transport ranges with key context",
+          "[scan_manager][config][rest]")
+{
+  for (auto const& [body, key] :
+       {std::pair{"n_max_concurrent_scans: -1", "n_max_concurrent_scans"},
+        std::pair{"request_timeout_s: -1", "request_timeout_s"},
+        std::pair{"stall_speed_limit_bytes: -1", "stall_speed_limit_bytes"},
+        std::pair{"stall_time_s: -1", "stall_time_s"},
+        std::pair{"conn_max_age_s: -1", "conn_max_age_s"},
+        std::pair{"upkeep_interval_ms: -1", "upkeep_interval_ms"},
+        std::pair{"retry_backoff_base_ms: -1", "retry_backoff_base_ms"},
+        std::pair{"retry_jitter_ms: -1", "retry_jitter_ms"},
+        std::pair{"max_retry_attempts: -1", "max_retry_attempts"},
+        std::pair{"max_retry_attempts: 0", "max_retry_attempts"},
+        std::pair{"max_auth_retry_attempts: -1", "max_auth_retry_attempts"},
+        std::pair{"max_auth_retry_attempts: 0", "max_auth_retry_attempts"},
+        std::pair{"list_max_matches: 0", "list_max_matches"},
+        std::pair{"list_max_scanned: -1", "list_max_scanned"},
+        std::pair{"footer_probe_bytes: 2 GiB", "footer_probe_bytes"},
+        std::pair{"connect_timeout_ms: 0", "connect_timeout_ms"},
+        std::pair{"connect_timeout_ms: -1", "connect_timeout_ms"},
+        std::pair{"connect_timeout_ms: 0.5ms", "connect_timeout_ms"},
+        std::pair{"max_connections: 0", "max_connections"},
+        std::pair{"max_connections: -1", "max_connections"},
+        std::pair{"max_connections: 4097", "max_connections"},
+        std::pair{"min_segment_bytes: 0", "min_segment_bytes"},
+        std::pair{"min_segment_bytes: -1", "min_segment_bytes"},
+        std::pair{"max_segment_bytes: -1", "max_segment_bytes"},
+        std::pair{"min_segment_bytes: 64 MiB", "max_segment_bytes"},
+        std::pair{"max_segment_bytes: 512 KiB", "max_segment_bytes"},
+        std::pair{"dns_ttl_s: 0", "dns_ttl_s"},
+        std::pair{"dns_max_addresses: 0", "dns_max_addresses"},
+        std::pair{"dns_max_addresses: 4097", "dns_max_addresses"},
+        std::pair{"keepalive_idle_s: 0", "keepalive_idle_s"},
+        std::pair{"keepalive_interval_s: 0", "keepalive_interval_s"},
+        std::pair{"keepalive_count: -1", "keepalive_count"},
+        std::pair{"min_mtu: 65608", "min_mtu"},
+        std::pair{"min_mtu: -1", "min_mtu"},
+        std::pair{"mtu_reject_max_attempts: 0", "mtu_reject_max_attempts"},
+        std::pair{"mtu_reject_max_attempts: 4294967296", "mtu_reject_max_attempts"},
+        std::pair{"receive_buffer_bytes: 8 KiB", "receive_buffer_bytes"},
+        std::pair{"receive_buffer_bytes: 8 MiB", "receive_buffer_bytes"},
+        std::pair{"queue_depth: 127", "queue_depth"},
+        std::pair{"queue_depth: 32769", "queue_depth"},
+        std::pair{"queue_depth: 0", "queue_depth"},
+        std::pair{"max_connections: 1024", "queue_depth"},
+        std::pair{"wait_mode: poll", "wait_mode"},
+        std::pair{"iowq_max_unbound: -1", "iowq_max_unbound"},
+        std::pair{"iowq_max_unbound: 4294967296", "iowq_max_unbound"},
+        std::pair{"fan_out: 0", "fan_out"},
+        std::pair{"write_part_bytes: 0", "write_part_bytes"},
+        std::pair{"write_part_bytes: -1", "write_part_bytes"},
+        std::pair{"write_part_bytes: 4 MiB", "write_part_bytes"},
+        std::pair{"write_part_bytes: 6 GiB", "write_part_bytes"},
+        std::pair{"expect_continue: maybe", "expect_continue"},
+        std::pair{"continue_timeout_ms: -1", "continue_timeout_ms"},
+        std::pair{"complete_timeout_s: -1", "complete_timeout_s"},
+        std::pair{"max_write_connections: -1", "max_write_connections"},
+        std::pair{"max_write_connections: 65", "max_write_connections"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_rest_transport_invalid.yaml",
+                     rest_yaml(std::string{"        "} + body + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring(std::string{"rest."} + key));
+  }
+
+  // The REST reactor count is a nonnegative total.
+  for (auto const* value : {"-1", "1.5", "many"}) {
+    CAPTURE(value);
+    scoped_yaml yaml("sirius_rest_reactors_invalid.yaml",
+                     scan_manager_yaml(std::string{"      rest_n_reactors: "} + value + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("rest_n_reactors"));
+  }
+
+  // An explicit fan-out may not exceed an explicit reactor count (rest_ioctx's rule).
+  require_load_error("sirius_rest_fan_out_too_wide.yaml",
+                     scan_manager_yaml("      rest_n_reactors: 2\n"
+                                       "      rest:\n"
+                                       "        fan_out: 3\n"),
+                     "'rest.fan_out': must be at most rest_n_reactors (2)");
+}
+
+TEST_CASE("sirius_config rejects REST keys the transport does not have",
+          "[scan_manager][config][rest]")
+{
+  // Never-released spellings of a different transport design (ring_entries is
+  // queue_depth here; the TLS handshake is bounded by connect_timeout_ms).
+  for (auto const* key : {"keep_warm_connections: 4",
+                          "enable_controller: false",
+                          "link_gbps: 100",
+                          "tls_handshake_timeout_ms: 3000",
+                          "ring_entries: 1024",
+                          "sqpoll: true",
+                          "defer_taskrun: true"}) {
+    CAPTURE(key);
+    scoped_yaml yaml("sirius_rest_unknown_key.yaml",
+                     rest_yaml(std::string{"        "} + key + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("unknown config key") &&
+                          Catch::Matchers::ContainsSubstring("in rest"));
+  }
+}
+
+TEST_CASE("sirius_config reads TLS transport policy", "[scan_manager][config][rest][tls]")
+{
+  namespace tls    = cucascade::io::tls;
+  auto const cfg   = load_scan_manager("sirius_rest_tls.yaml",
+                                     tls_yaml("          ktls: require\n"
+                                                "          user_space_rx: library\n"
+                                                "          recv_placement: iowq\n"
+                                                "          min_version: tls1.3\n"
+                                                "          max_version: tls1.3\n"
+                                                "          expect_no_pad: false\n"
+                                                "          session_cache: true\n"
+                                                "          session_cache_per_endpoint: 7\n"
+                                                "          max_connection_bytes: 12 GiB\n"
+                                                "          ciphersuites: TLS_AES_128_GCM_SHA256\n"
+                                                "          cipher_list: ECDHE-RSA-AES128-GCM-SHA256\n"
+                                                "          groups: X25519:P-256\n"
+                                                "          sni_override: object-store.test\n"
+                                                "          allow_tls13_without_rekey: false\n"));
+  auto const check = [](tls::config const& policy) {
+    CHECK(policy.ktls == tls::ktls_mode::require);
+    CHECK(policy.fallback_rx == tls::user_space_rx::library);
+    CHECK(policy.placement == tls::recv_placement::iowq);
+    CHECK(policy.min_version == tls::version_bound::tls1_3);
+    CHECK(policy.max_version == tls::version_bound::tls1_3);
+    CHECK_FALSE(policy.expect_no_pad);
+    CHECK(policy.session_cache);
+    CHECK(policy.session_cache_per_endpoint == 7);
+    CHECK(policy.max_connection_bytes == (12ULL << 30));
+    CHECK(policy.ciphersuites == "TLS_AES_128_GCM_SHA256");
+    CHECK(policy.cipher_list == "ECDHE-RSA-AES128-GCM-SHA256");
+    CHECK(policy.groups == "X25519:P-256");
+    CHECK(policy.sni_override == "object-store.test");
+    CHECK_FALSE(policy.allow_tls13_without_rekey);
+    CHECK(policy.verify);
+    CHECK(policy.ca_file.empty());
+    CHECK(policy.ca_dir.empty());
+    CHECK(policy.ca_blob.empty());
+  };
+  check(cfg.rest.tls);
+  check(cfg.to_io_config().rest.tls);
+}
+
+TEST_CASE("REST TLS enum spellings select the planned transport modes",
+          "[scan_manager][config][rest][tls]")
+{
+  namespace tls = cucascade::io::tls;
+  for (auto const& [spelling, expected] : {std::pair{"prefer", tls::ktls_mode::prefer},
+                                           std::pair{"require", tls::ktls_mode::require},
+                                           std::pair{"disable", tls::ktls_mode::disable}}) {
+    auto const cfg = load_scan_manager("sirius_tls_ktls.yaml",
+                                       tls_yaml(std::string{"          ktls: "} + spelling + "\n"));
+    CHECK(cfg.rest.tls.ktls == expected);
+  }
+  for (auto const& [spelling, expected] :
+       {std::pair{"record_layer", tls::user_space_rx::record_layer},
+        std::pair{"library", tls::user_space_rx::library}}) {
+    auto const cfg = load_scan_manager(
+      "sirius_tls_rx.yaml", tls_yaml(std::string{"          user_space_rx: "} + spelling + "\n"));
+    CHECK(cfg.rest.tls.fallback_rx == expected);
+  }
+  for (auto const& [spelling, expected] : {std::pair{"automatic", tls::recv_placement::automatic},
+                                           std::pair{"inline", tls::recv_placement::inline_},
+                                           std::pair{"iowq", tls::recv_placement::iowq}}) {
+    auto const cfg =
+      load_scan_manager("sirius_tls_placement.yaml",
+                        tls_yaml(std::string{"          recv_placement: "} + spelling + "\n"));
+    CHECK(cfg.rest.tls.placement == expected);
+  }
+  for (auto const& [spelling, expected] : {std::pair{"tls1.2", tls::version_bound::tls1_2},
+                                           std::pair{"tls1.3", tls::version_bound::tls1_3}}) {
+    auto const cfg = load_scan_manager("sirius_tls_version.yaml",
+                                       tls_yaml(std::string{"          min_version: "} + spelling +
+                                                "\n          max_version: " + spelling + "\n"));
+    CHECK(cfg.rest.tls.min_version == expected);
+    CHECK(cfg.rest.tls.max_version == expected);
+  }
+  auto const automatic = load_scan_manager("sirius_tls_max_auto.yaml",
+                                           tls_yaml("          max_version: auto\n"
+                                                    "          max_connection_bytes: 0\n"
+                                                    "          session_cache_per_endpoint: 1\n"));
+  CHECK_FALSE(automatic.rest.tls.max_version.has_value());
+  CHECK(automatic.rest.tls.max_connection_bytes == 0);
+  CHECK(automatic.rest.tls.session_cache_per_endpoint == 1);
+}
+
+TEST_CASE("sirius_config rejects invalid TLS policies with key context",
+          "[scan_manager][config][rest][tls]")
+{
+  for (auto const& [body, key] :
+       {std::pair{"ktls: auto", "ktls"},
+        std::pair{"ktls: user-space", "ktls"},
+        std::pair{"ktls: PREFER", "ktls"},
+        std::pair{"ktls: ''", "ktls"},
+        std::pair{"ktls: []", "ktls"},
+        std::pair{"user_space_rx: openssl", "user_space_rx"},
+        std::pair{"recv_placement: auto", "recv_placement"},
+        std::pair{"recv_placement: inline_", "recv_placement"},
+        std::pair{"min_version: auto", "min_version"},
+        std::pair{"min_version: tls1.1", "min_version"},
+        std::pair{"max_version: TLS1.3", "max_version"},
+        std::pair{"max_version: tls1.4", "max_version"},
+        std::pair{"min_version: tls1.3\n          max_version: tls1.2", "max_version"},
+        std::pair{"session_cache: true\n          session_cache_per_endpoint: 0",
+                  "session_cache_per_endpoint"},
+        std::pair{"session_cache_per_endpoint: -1", "session_cache_per_endpoint"},
+        std::pair{"session_cache_per_endpoint: 4294967296", "session_cache_per_endpoint"},
+        std::pair{"max_connection_bytes: -1", "max_connection_bytes"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_rest_tls_invalid.yaml",
+                     tls_yaml(std::string{"          "} + body + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring(std::string{"rest.tls."} + key));
+  }
+  for (auto const* body : {"        tls: []\n", "        tls: {unknown_tls_option: true}\n"}) {
+    scoped_yaml yaml("sirius_rest_tls_shape.yaml", rest_yaml(body));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("rest.tls"));
+  }
+  // Library-internal TLS fields are not configurable.
+  for (auto const* key :
+       {"alpn_http11: false", "client_cert_file: /c", "client_key_file: /k", "keylog_env: true"}) {
+    CAPTURE(key);
+    scoped_yaml yaml("sirius_rest_tls_internal.yaml",
+                     tls_yaml(std::string{"          "} + key + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("unknown config key"));
+  }
+}
+
+TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config][rest][tls]")
+{
+  for (auto const& [key, value] : {std::pair{"verify", "false"},
+                                   std::pair{"ca_file", "/tmp/ca.pem"},
+                                   std::pair{"ca_dir", "/tmp/certs"},
+                                   std::pair{"ca_blob", "PEM"}}) {
+    // Even a null value is a forbidden second trust source.
+    for (auto const* spelling : {value, "null"}) {
+      CAPTURE(key, spelling);
+      scoped_yaml yaml("sirius_tls_trust_rejected.yaml",
+                       tls_yaml(std::string{"          "} + key + ": " + spelling + "\n"));
+      using Catch::Matchers::ContainsSubstring;
+      if (std::string_view{key} == "verify") {
+        REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                            ContainsSubstring(std::string{"rest.tls."} + key) &&
+                              ContainsSubstring("trust is owned by object_store") &&
+                              ContainsSubstring("sirius_config::set_object_store_config()") &&
+                              ContainsSubstring("VERIFY_SSL"));
+      } else {
+        REQUIRE_THROWS_WITH(
+          sirius::parsed_sirius_config::from_file(yaml.path()),
+          ContainsSubstring(std::string{"rest.tls."} + key) &&
+            ContainsSubstring("trust is owned by object_store") &&
+            ContainsSubstring("sirius_config::set_object_store_config()") &&
+            ContainsSubstring("ca_bundle_path") && ContainsSubstring("NIX_SSL_CERT_FILE") &&
+            ContainsSubstring("SSL_CERT_FILE") && !ContainsSubstring("CREATE SECRET"));
+      }
+    }
+  }
+}
+
 TEST_CASE("sirius_config forces the native backend for multi-GPU",
           "[scan_manager][config][backend][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
 
-  auto const cfg = load_scan_manager("sirius_backend_multi_gpu.yaml",
-                                     "sirius:\n"
-                                     "  topology:\n"
-                                     "    num_gpus: 2\n"
-                                     "  executor:\n"
-                                     "    scan_manager:\n"
-                                     "      backend: kvikio\n");
-
-  CHECK(cfg.backend == io_backend::native);
+  auto const cufile = load_scan_manager("sirius_cufile_multi_gpu.yaml",
+                                        "sirius:\n  topology:\n    num_gpus: 2\n  executor:\n    "
+                                        "scan_manager:\n      backend: cufile\n");
+  CHECK(cufile.backend == io_backend::native);
 }
 
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")

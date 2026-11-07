@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <future>
@@ -41,6 +42,11 @@
 #include <optional>
 #include <thread>
 #include <vector>
+
+namespace cucascade::io::cache {
+class fs_cache;
+enum class reclaim_mode : std::uint8_t;
+}  // namespace cucascade::io::cache
 
 namespace sirius {
 namespace parallel {
@@ -116,6 +122,16 @@ class downgrade_executor {
   void start();
   void stop();
   void drain();
+
+  /// Quiesce processing, monitoring and workers; cancel queued requests. Idempotent.
+  /// The executor remains started, but accepts no requests until resume().
+  void pause();
+  void resume();
+
+  /// Non-owning default-local ioctx cache, used only by HOST executors to reclaim bytes above
+  /// the prefetch reservation from their own NUMA space. Wire before start() or while paused;
+  /// the owner must pause before replacing/destroying a bound cache.
+  void set_fs_cache(cucascade::io::cache::fs_cache* cache);
 
   /**
    * @brief Get the memory space this executor is responsible for.
@@ -204,6 +220,9 @@ class downgrade_executor {
   void monitor_loop();
   void cancel_pending_requests();
 
+  // Processing thread only: reclaim and credit only bytes that relieve this HOST space.
+  std::size_t reclaim_fs_cache(cucascade::io::cache::reclaim_mode mode, std::size_t deficit);
+
   /**
    * @brief Whether a downgrade from this executor's source tier could plausibly free memory.
    *
@@ -222,6 +241,9 @@ class downgrade_executor {
   std::thread _monitor_thread;
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
+  std::atomic<bool> _paused{false};
+  // Serializes lifecycle changes and cache rebinding, never acquired by executor threads.
+  std::mutex _lifecycle_mutex;
   std::atomic<size_t> _monitor_requests_issued{0};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
 
@@ -240,6 +262,7 @@ class downgrade_executor {
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
   /// Non-owning; the runtime or test fixture must outlive this executor.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
+  cucascade::io::cache::fs_cache* _fs_cache{nullptr};
 };
 
 }  // namespace parallel
