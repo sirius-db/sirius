@@ -25,6 +25,7 @@
 #include "exchange/loopback_fabric.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/distributed/bloom_all_gather_merge.hpp"
 #include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
@@ -209,15 +210,25 @@ dynamic_filter_publish_plan filter_plan(
     {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
 }
 
-/// The merge of every rank's filters, the same on every rank.
-dynamic_filter_publish_plan::distributed_merge merge_over(std::shared_ptr<exchange_service> service,
-                                                          std::size_t bloom_keys)
+/// The merge of every rank's filters for @p plan's keys, the same on every rank.
+std::shared_ptr<sirius::op::bloom_all_gather_merge> merge_over(
+  std::shared_ptr<exchange_service> service,
+  dynamic_filter_publish_plan const& plan,
+  std::chrono::milliseconds timeout = std::chrono::seconds{30})
 {
-  return {.service      = std::move(service),
-          .first_stream = 41,
-          .gpu          = env().gpu,
-          .bloom_keys   = bloom_keys,
-          .timeout      = std::chrono::seconds{30}};
+  return std::make_shared<sirius::op::bloom_all_gather_merge>(
+    std::move(service), 41, plan.admitted_keys().size(), *env().gpu, timeout);
+}
+
+/// Merges @p plan's filters across ranks, every rank's Blooms sized for @p bloom_keys keys.
+void merge_across_ranks(dynamic_filter_publish_plan& plan,
+                        std::shared_ptr<exchange_service> service,
+                        std::size_t bloom_keys,
+                        std::chrono::milliseconds timeout = std::chrono::seconds{30})
+{
+  auto merge = merge_over(std::move(service), plan, timeout);
+  plan.set_cross_rank_merge(std::move(merge),
+                            sirius::op::merged_bloom_policy(plan.policy(), bloom_keys));
 }
 
 /// The Bloom published to @p channel, or null.
@@ -243,7 +254,7 @@ struct accumulating_join {
                     std::uint64_t cap)
   {
     auto plan = filter_plan(channel, cap);
-    plan.set_distributed(merge_over(std::move(service), bloom_keys));
+    merge_across_ranks(plan, std::move(service), bloom_keys);
     session =
       std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), &stats);
   }
@@ -289,7 +300,7 @@ struct whole_build_join {
                             std::uint64_t cap      = 64 * KiB)
     : plan(filter_plan(channel, cap))
   {
-    plan.set_distributed(merge_over(std::move(service), bloom_keys));
+    merge_across_ranks(plan, std::move(service), bloom_keys);
   }
 
   sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
@@ -476,7 +487,8 @@ TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter 
   auto rank1         = sirius::test::operator_utils::make_partitioned_join(
     {.side_types  = {duckdb::LogicalType::BIGINT},
              .filter_plan = filter_plan(rank1_channel, 64 * KiB)});
-  sirius::planner::install_filter_merge(*rank1.join, merge_over(c.all[1].service, 4096));
+  sirius::planner::install_filter_merge(
+    *rank1.join, merge_over(c.all[1].service, rank1.join->dynamic_filter_plan()), 4096);
   auto& build_concat = *rank1.join->children[1];
   REQUIRE(build_concat.type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
 
@@ -512,9 +524,7 @@ TEST_CASE("a rank missing from one key's merge costs the others one timeout, not
       {{0, 0, int64}, {1, 1, int64}}}},
     {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
     {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 64 * KiB}};
-  auto merge    = merge_over(c.all[0].service, 4096);
-  merge.timeout = std::chrono::seconds{1};
-  plan.set_distributed(std::move(merge));
+  merge_across_ranks(plan, c.all[0].service, 4096, std::chrono::seconds{1});
   std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
   producers.push_back(channel->register_producer({0, 1}));
   channel->freeze_registration();

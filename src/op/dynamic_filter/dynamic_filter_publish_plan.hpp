@@ -16,13 +16,12 @@
 
 #pragma once
 
-#include "exchange/fabric.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "op/dynamic_filter/cross_rank_filter_merge.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 #include <cudf/types.hpp>
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -30,10 +29,6 @@
 
 namespace cucascade::memory {
 class memory_space;
-}
-
-namespace sirius::exchange {
-class exchange_service;
 }
 
 namespace sirius::op {
@@ -184,45 +179,30 @@ class dynamic_filter_publish_plan final {
   void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
 
   /**
-   * @brief Distributed execution: after an exchange, a rank's build holds only its share of the
-   * keys, so a filter from it alone would drop rows another rank's build matches. Each rank
-   * instead builds a Bloom of the same size per key, and every rank ORs them all. A key whose
-   * filters cannot all be merged publishes nothing; other filter kinds are not published.
+   * @brief Merges this join's filters with the same join's in other processes, under @p policy,
+   * which must make every process build filters that @p merge can combine.
+   *
+   * Only before the plan runs: dynamic_filter_publication_session::set_cross_rank_merge() refuses
+   * a sealed plan. Tests that build a plan directly call this one.
    */
-  struct distributed_merge {
-    std::shared_ptr<exchange::exchange_service> service;
-    /// Admitted key i merges on stream first_stream + i, the same on every rank.
-    exchange::stream_id first_stream = 0;
-    /// Where this rank's contribution and the gathered filters are allocated; required.
-    cucascade::memory::memory_space* gpu = nullptr;
-    /// Every rank's Bloom is sized for this many keys, on either publication path, so the Blooms
-    /// merge. max_bloom_bytes_per_gpu does not cut it: the merged Bloom holds every rank's keys,
-    /// and Q05 at SF3000 on 2 GPUs, cut to 256 MiB, got ~1.5 bits per key, filtered almost nothing
-    /// and ran 3.5x slower. The planner's clamp bounds it until the streaming OR (#2375).
-    std::size_t bloom_keys = 0;
-    /// Shorter than all_gather's default: a late rank should cost the filter, not stall the build.
-    static constexpr std::chrono::milliseconds default_timeout{std::chrono::minutes{2}};
-    /// A rank that has not sent its filter by then is given up on: the key publishes nothing.
-    std::chrono::milliseconds timeout{default_timeout};
-  };
-  /// Also sets the policy every rank must share for the merge: Blooms only, all of
-  /// merge.bloom_keys, and no publication shortcuts or zone maps.
-  void set_distributed(distributed_merge merge)
+  void set_cross_rank_merge(std::shared_ptr<cross_rank_filter_merge> merge,
+                            dynamic_filter_publication_policy policy)
   {
-    _policy.emit_zone_map_filters         = false;
-    _policy.bloom_only                    = true;
-    _policy.fixed_bloom_keys              = merge.bloom_keys;
-    _policy.publish_when_empty_or_drained = true;
-    _distributed = std::make_shared<distributed_merge const>(std::move(merge));
+    _cross_rank_merge = std::move(merge);
+    _policy           = policy;
   }
-  [[nodiscard]] distributed_merge const* distributed() const noexcept { return _distributed.get(); }
+  //! The merge set by set_cross_rank_merge(), or null when this process's filters stand alone.
+  [[nodiscard]] cross_rank_filter_merge* cross_rank_merge() const noexcept
+  {
+    return _cross_rank_merge.get();
+  }
 
  private:
   std::vector<admitted_key> _admitted_keys;
   std::vector<probe_target> _probe_targets;
   dynamic_filter_publication_policy _policy{};
   std::vector<dynamic_filter_replica_space> _replica_spaces;
-  std::shared_ptr<distributed_merge const> _distributed;
+  std::shared_ptr<cross_rank_filter_merge> _cross_rank_merge;
 };
 
 }  // namespace sirius::op

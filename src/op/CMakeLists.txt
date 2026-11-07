@@ -96,6 +96,7 @@ target_sources(
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
           distributed/sirius_physical_distributed_sort_sample.cpp
+          distributed/bloom_all_gather_merge.cpp
           sirius_physical_table_scan.cpp
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp

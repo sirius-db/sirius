@@ -54,6 +54,8 @@
  * `test_dynamic_filter_source_policy.cpp`.
  */
 
+#include "op/dynamic_filter/bloom_sizing.hpp"
+#include "op/dynamic_filter/cross_rank_filter_merge.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -83,6 +85,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -2095,4 +2098,139 @@ TEST_CASE("the plan reports replica presence per device", "[dynamic_filter][publ
 
   plan.restrict_replicas_to({kDeviceId + 1});
   CHECK_FALSE(plan.has_replica_on_device(kDeviceId));
+}
+
+namespace {
+
+/// Records the calls a publication makes to its cross-rank merge; merges nothing.
+struct recording_merge final : sirius::op::cross_rank_filter_merge {
+  std::size_t merges = 0;
+  std::size_t leaves = 0;
+  /// Per admitted key, whether the last merge() was handed a filter.
+  std::vector<bool> handed;
+  /// Whether merge() drops every key, as when another process sent none.
+  bool drop_all = false;
+
+  void merge(std::span<std::shared_ptr<sirius::op::sirius_dynamic_filter>> membership,
+             ::cuda::stream_ref) override
+  {
+    ++merges;
+    handed.clear();
+    for (auto& filter : membership) {
+      handed.push_back(filter != nullptr);
+      if (drop_all) { filter.reset(); }
+    }
+  }
+  void leave() noexcept override { ++leaves; }
+};
+
+/// The policy a cross-rank merge needs: Blooms only, of one size, no shortcuts, no zone maps.
+sirius::op::dynamic_filter_publication_policy merged_policy(std::size_t bloom_keys)
+{
+  return {.emit_zone_map_filters         = false,
+          .bloom_only                    = true,
+          .fixed_bloom_keys              = bloom_keys,
+          .publish_when_empty_or_drained = true};
+}
+
+/// A one-key INT64 plan publishing to @p channel, merged by @p merge when it is set.
+dynamic_filter_publish_plan one_key_plan(
+  publisher_fixture& fixture,
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel,
+  std::shared_ptr<recording_merge> merge = nullptr)
+{
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = std::move(channel),
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
+                                   std::move(targets),
+                                   std::move(fixture.replica_spaces),
+                                   {.emit_zone_map_filters = true}};
+  if (merge) { plan.set_cross_rank_merge(std::move(merge), merged_policy(4096)); }
+  return plan;
+}
+
+}  // namespace
+
+TEST_CASE("a publication with a cross-rank merge hands it each key's Bloom of the policy's size",
+          "[dynamic_filter][publisher][cross_rank]")
+{
+  publisher_fixture fixture;
+  // Three rows: on its own the publisher would pick the raw small IN-list, and a zone map.
+  fixture.add_key_column(3);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto merge   = std::make_shared<recording_merge>();
+  auto plan    = one_key_plan(fixture, channel, merge);
+
+  SECTION("the merged filter is published")
+  {
+    auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+    CHECK(merge->merges == 1);
+    CHECK(merge->leaves == 0);
+    CHECK(merge->handed == std::vector<bool>{true});
+    CHECK(outcome.filters_pushed == 1);
+    auto const published = filters_on_column(*channel, kProbeColumnIndex);
+    REQUIRE(published.size() == 1);
+    auto const* bloom =
+      dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(published.front().get());
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() ==
+          sirius::op::bloom_blocks_for(4096) * sirius::op::bloom_bytes_per_block);
+  }
+
+  SECTION("a key the merge drops publishes nothing")
+  {
+    merge->drop_all    = true;
+    auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+    CHECK(merge->merges == 1);
+    CHECK(outcome.filters_pushed == 0);
+    CHECK(filters_on_column(*channel, kProbeColumnIndex).empty());
+  }
+}
+
+TEST_CASE("an empty build with a cross-rank merge still takes part in it",
+          "[dynamic_filter][publisher][cross_rank]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(0);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto merge   = std::make_shared<recording_merge>();
+  auto plan    = one_key_plan(fixture, channel, merge);
+  static_cast<void>(publish_for_test(plan, fixture.build_view(), fixture.stream));
+  // An empty Bloom of the shared size, so the other processes still publish their keys.
+  CHECK(merge->merges == 1);
+  CHECK(merge->handed == std::vector<bool>{true});
+  CHECK(merge->leaves == 0);
+}
+
+TEST_CASE("a session closed before any build leaves its cross-rank merge once",
+          "[dynamic_filter][publisher][cross_rank]")
+{
+  publisher_fixture fixture;
+  auto merge = std::make_shared<recording_merge>();
+
+  SECTION("finish_input leaves once")
+  {
+    sirius::op::dynamic_filter_publication_session session(
+      one_key_plan(fixture, std::make_shared<sirius::op::sirius_dynamic_filter_set>(), merge));
+    session.finish_input();
+    session.finish_input();
+    session.finalize_input();
+    CHECK(merge->leaves == 1);
+    CHECK(merge->merges == 0);
+  }
+
+  SECTION("cancel neither merges nor leaves")
+  {
+    sirius::op::dynamic_filter_publication_session session(
+      one_key_plan(fixture, std::make_shared<sirius::op::sirius_dynamic_filter_set>(), merge));
+    session.cancel();
+    session.finish_input();
+    CHECK(merge->leaves == 0);
+    CHECK(merge->merges == 0);
+  }
 }
