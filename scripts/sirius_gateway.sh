@@ -33,6 +33,7 @@ Environment:
                                     none): a client cannot set it
   SIRIUS_GATEWAY_ALLOW_JOIN         1 lets ranks register themselves (default: 1 with 0 ranks)
   SIRIUS_GATEWAY_GPUS               with N ranks, each rank's GPU (e.g. 0,0)
+  SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING, SIRIUS_GATEWAY_EXCHANGE_TCP_LANES,
   SIRIUS_GATEWAY_EXCHANGE_MNNVL, SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES,
   SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES, SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER
                                     set sirius_gateway_exchange_*, which every rank takes
@@ -75,6 +76,11 @@ if ! [[ ${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-auto} =~ ^(auto|require|off)$ &&
   ${SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES:-32} =~ ^[0-9]+$ &&
   ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-16} =~ ^[0-9]+$ ]]; then
   echo "SIRIUS_GATEWAY_EXCHANGE_MNNVL takes auto, require or off; _FRAME_BYTES, _SEND_FRAMES and _RECV_FRAMES_PER_PEER a number" >&2
+  exit 2
+fi
+if ! [[ ${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-auto} =~ ^(auto|always|never|remote)$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_TCP_LANES:-0} =~ ^[0-9]+$ ]]; then
+  echo "SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING takes auto, always, never or remote; SIRIUS_GATEWAY_EXCHANGE_TCP_LANES a number" >&2
   exit 2
 fi
 
@@ -181,6 +187,8 @@ init="$logs/gateway.init.sql"
   [ -z "${SIRIUS_GATEWAY_JOIN_WAIT:-}" ] || echo "SET GLOBAL sirius_gateway_join_wait = $SIRIUS_GATEWAY_JOIN_WAIT;"
   [ -z "${SIRIUS_GATEWAY_STATEMENT_TIMEOUT:-}" ] ||
     echo "SET GLOBAL sirius_gateway_statement_timeout = $SIRIUS_GATEWAY_STATEMENT_TIMEOUT;"
+  echo "SET GLOBAL sirius_gateway_exchange_host_staging = '${SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING:-auto}';"
+  echo "SET GLOBAL sirius_gateway_exchange_tcp_lanes = ${SIRIUS_GATEWAY_EXCHANGE_TCP_LANES:-0};"
   # replay_saved: a restarted gateway replays the DDL saved in the state dir, instead of
   # deleting it as an explicit start from the console does.
   [ "$ranks" -eq 0 ] ||
