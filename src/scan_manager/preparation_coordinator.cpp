@@ -300,8 +300,10 @@ struct preparation_coordinator::state {
     stats.jobs_peak = std::max(stats.jobs_peak, jobs);
   }
   struct retired_slot {
+    preparation_gate::callback_use cleanup;
     std::unique_ptr<op::scan::scan_info> input;
     std::shared_ptr<preparation_unit> unit;
+    op::scan::split_dependencies partial;
   };
   // Detach under the gate; the caller destroys the returned owners after unlocking.
   retired_slot release_slot(size_t index)
@@ -318,11 +320,15 @@ struct preparation_coordinator::state {
     auto& source = sources[s.source_id];
     --source.outstanding;
     if (source.active_result == index) source.active_result.reset();
-    retired_slot retired{std::move(s.input), s.unit};
+    retired_slot retired;
+    retired.input = std::move(s.input);
+    retired.unit  = s.unit;
     if (s.unit) {
       // A worker may settle before the control driver reaches this unit during cancellation.
-      if (gate->closed) s.unit->cancel_under_gate();
-      units.erase(s.unit->key());
+      if (gate->closed && s.unit->cancel_under_gate(retired.partial))
+        retired.cleanup.activate_under_gate(gate);
+      auto registered = units.find(s.unit->key());
+      if (registered != units.end() && registered->second == s.unit) units.erase(registered);
     }
     s.unit.reset();
     s.status    = slot::phase::free;
@@ -334,12 +340,14 @@ struct preparation_coordinator::state {
   void settle(size_t index, std::unique_ptr<op::scan::scan_info> value) noexcept
   {
     auto const bytes = value ? value->preparation_bytes() : 0;
-    retired_slot retired;
     try {
-      std::lock_guard lock(gate->mutex);
+      std::unique_lock lock(gate->mutex);
       auto& s = slots[index];
       if (gate->closed) {
-        retired = release_slot(index);
+        auto retired = release_slot(index);
+        gate->notify_under_lock();
+        lock.unlock();
+        return;
       } else {
         auto& source = sources[s.source_id];
         if (bytes > std::numeric_limits<size_t>::max() - source.work_bytes)
@@ -358,9 +366,10 @@ struct preparation_coordinator::state {
     } catch (...) {
       completion->report_error(std::current_exception());
       stop();
-      std::lock_guard lock(gate->mutex);
-      retired = release_slot(index);
+      std::unique_lock lock(gate->mutex);
+      auto retired = release_slot(index);
       gate->notify_under_lock();
+      lock.unlock();
     }
   }
 
@@ -415,7 +424,7 @@ struct preparation_coordinator::state {
   bool advance_control(std::shared_ptr<state> const&, std::optional<std::chrono::milliseconds>);
   void run(std::shared_ptr<state> const&);
   control_step_result retire_step();
-  bool finish_step();
+  control_step_result finish_step();
 
   // Destroyed without the gate held; unpublished construction returns its output credit.
   struct publication_ticket {
@@ -790,11 +799,16 @@ std::shared_ptr<preparation_unit> preparation_coordinator::admit_unit(unit_key k
 }
 void preparation_coordinator::retire_unit(unit_key k)
 {
+  preparation_gate::callback_use use;
   decltype(state_->units)::node_type retired;
+  op::scan::split_dependencies partial;
   {
     std::lock_guard lock(state_->gate->mutex);
     retired = state_->units.extract(k);
-    if (retired && state_->gate->closed) retired.mapped()->cancel_under_gate();
+    if (retired) {
+      use.activate_under_gate(state_->gate);
+      if (state_->gate->closed) retired.mapped()->cancel_under_gate(partial);
+    }
     state_->gate->notify_under_lock();
   }
 }
@@ -1118,9 +1132,10 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
     bool const emitted = static_cast<bool>(step.batch);
     queue_batch(lock, slot.source_id, std::move(step.batch));
     if (step.finished) {
-      auto retired = release_slot(index);
-      lock.unlock();
-      retired = {};
+      {
+        auto retired = release_slot(index);
+        lock.unlock();
+      }
       lock.lock();
     } else
       ready_results.push_back(index);
@@ -1303,9 +1318,10 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
     if (source.on_native_reader()) ticket = source.native.abandon_claim();
     lock.lock();
     ticket->completed = true;
-    auto retired      = release_slot(index);
-    lock.unlock();
-    retired = {};
+    {
+      auto retired = release_slot(index);
+      lock.unlock();
+    }
     lock.lock();
     if (std::holds_alternative<preparation_exhausted>(claimed)) {
       source.status     = source_state::phase::enumeration_done;
@@ -1413,15 +1429,21 @@ preparation_coordinator::state::control_step_result preparation_coordinator::sta
     stop(stop_reason::normal_eos);
   }
   if (retirement == retirement_phase::cancelling) {
-    std::lock_guard lock(gate->mutex);
-    // Admission is closed. Resume by key because worker settlement can erase units between steps.
-    auto it = cancelled_through ? units.upper_bound(*cancelled_through) : units.begin();
-    for (size_t actions = 0; it != units.end() && actions < options.max_control_work; ++actions) {
-      it->second->cancel_under_gate();
+    for (size_t actions = 0; actions < options.max_control_work; ++actions) {
+      preparation_gate::callback_use use;
+      std::shared_ptr<preparation_unit> unit;
+      op::scan::split_dependencies partial;
+      std::lock_guard lock(gate->mutex);
+      // Resume by key: release callbacks and worker settlement can erase map entries.
+      auto it = cancelled_through ? units.upper_bound(*cancelled_through) : units.begin();
+      if (it == units.end()) {
+        retirement = retirement_phase::metadata;
+        break;
+      }
+      unit              = it->second;
       cancelled_through = it->first;
-      ++it;
+      if (unit->cancel_under_gate(partial)) use.activate_under_gate(gate);
     }
-    if (it == units.end()) retirement = retirement_phase::metadata;
     return {next::runnable};
   }
   if (retirement == retirement_phase::metadata) {
@@ -1455,11 +1477,12 @@ preparation_coordinator::state::control_step_result preparation_coordinator::sta
     if (retirement_progress || gate->wake_generation != retirement_wake) return {next::runnable};
     return {next::parked, retirement_wake};
   }
-  return {finish_step() ? next::finished : next::runnable};
+  return finish_step();
 }
 
-bool preparation_coordinator::state::finish_step()
+preparation_coordinator::state::control_step_result preparation_coordinator::state::finish_step()
 {
+  using next = control_step_result::status;
   // Keep final destruction on the control driver, but let other attempts run between slices.
   for (size_t actions = 0; actions < options.max_control_work; ++actions) {
     if (cleanup_source < sources.size()) {
@@ -1488,16 +1511,18 @@ bool preparation_coordinator::state::finish_step()
       auto retired = units.extract(units.begin());
       lock.unlock();
     } else {
+      // Explicit retirement can start after the reader barrier, including during close hooks.
+      if (gate->callbacks) return {next::parked, gate->wake_generation};
+      retirement = retirement_phase::finished;
       lock.unlock();
       if (stats.runs || stats.owner != std::thread::id{}) {
         completion->close_preparation_inputs();
         completion->preparation_quiescent();
       }
-      retirement = retirement_phase::finished;
-      return true;
+      return {next::finished};
     }
   }
-  return false;
+  return {next::runnable};
 }
 
 preparation_coordinator::state::control_step_result preparation_coordinator::state::control_step(

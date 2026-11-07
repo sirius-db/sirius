@@ -301,6 +301,36 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 3. **Execution.** Preparation starts after GPU consumers are ready. Metadata-only attempts advance coordination on the query owner. Attempts with query-owner or native-reader sources use the manager's shared coordinator pool by default; `coordinator_workers: 0` selects a dedicated thread per attempt. All drivers use the same control steps to coalesce and validate ready inputs, select a GPU, and publish batches to each operator's connector. Later scans can progress before earlier scans close. See [execution domains and ownership](scan-contracts-design.md#execution-and-ownership).
 4. **Teardown.** The coordinator closes each connector after all of its preparation lanes settle. Preparation errors are reported through the query completion handler, which preserves the first error. Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` drains that query's preparation and waits for its final control step to return, while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
 
+Preparation payloads are finally released outside the publication gate and live unit mutex.
+Out-of-lock unit cleanup and failure reporting remain counted until physical disposal
+finishes. The serialized control driver and metadata/query-owner/native-reader drain
+barriers prevent source advancement or quiescence from crossing owned disposal. Lookahead
+counters can settle before detached owners are destroyed; these counters are not physical
+byte reservations. Release callbacks may make bounded,
+nonthrowing gate observations or notifications, but must not synchronously drain or destroy
+their own coordinator. Stop closes admission immediately; the control driver cancels units
+and discards pending work in bounded slices. It stops the per-query dispatcher shared by
+preparation and cached scan work.
+Pending jobs are discarded without running their computation; their captures are released
+outside the gate and remain accounted until disposal completes. Other queries retain their
+own dispatchers. After preparation becomes quiescent, late stop notifications leave the
+retired dispatcher untouched; query work leases still protect the remaining execution users.
+Explicit unit retirement returns registry membership, not a physical
+byte reservation. External ready snapshots, provider caches and published consumer inputs
+keep their existing ownership; preparation quiescence does not invalidate them.
+
+The normal C++ suite includes `[preparation_cleanup]`. Linux allocation-refusal
+tests are hidden and require the existing test-only interposer explicitly:
+
+```bash
+pixi run cmake --build --preset release --target sirius_host_allocation_fault
+pixi run env LD_PRELOAD="$PWD/build/release/libsirius_host_allocation_fault.so" \
+  build/release/test/cpp/sirius_unittest '[preparation_allocation_fault]'
+```
+
+This interposer checks ordinary `operator new` on the armed thread, not all native,
+aligned, device or process allocations. CI runs this hidden group separately.
+
 ### split_provider
 
 `split_provider` borrows the operator-owned `gpu_ingestible` and supplies its I/O resolver to `make_preparation_sources()`. The coordinator claims owning jobs and runs them in their assigned execution domains. Synchronous pinning calls the ingestible task directly; it does not start a coordinator. Both paths use `preparation_stop_token`.
