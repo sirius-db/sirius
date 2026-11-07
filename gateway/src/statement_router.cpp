@@ -58,8 +58,15 @@ std::vector<std::string> called_functions(SQLStatement& stmt)
   return names;
 }
 
+/// Whether a client may call @p name, a gateway function, which then runs on the gateway.
+bool client_may_call(std::string const& name, bool allow_join)
+{
+  if (name == "sirius_gateway_status" || name == "sirius_gateway_log") { return true; }
+  return allow_join && (name == "sirius_gateway_add_rank" || name == "sirius_gateway_drop_rank");
+}
+
 /// Whether @p stmt runs on the gateway rather than on every rank.
-bool runs_on_gateway(SQLStatement& stmt)
+bool runs_on_gateway(SQLStatement& stmt, bool allow_join)
 {
   // Every client shares one session per rank, so a client's transaction there would hold every
   // other client's statements. It stays in the client's own gateway session instead; each
@@ -85,7 +92,7 @@ bool runs_on_gateway(SQLStatement& stmt)
   bool local = false;
   for (auto const& name : called_functions(stmt)) {
     if (!is_gateway_name(name)) { continue; }
-    if (name != "sirius_gateway_status" && name != "sirius_gateway_log") {
+    if (!client_may_call(name, allow_join)) {
       throw InvalidInputException("%s can only be called on the gateway's console", name);
     }
     local = true;
@@ -95,7 +102,7 @@ bool runs_on_gateway(SQLStatement& stmt)
 
 }  // namespace
 
-std::string route(std::string const& sql)
+std::string route(std::string const& sql, bool allow_join)
 {
   Parser parser{ParserOptions::Builtin()};
   try {
@@ -108,7 +115,7 @@ std::string route(std::string const& sql)
     // The parser leaves each statement's own text in query (and its location at 0).
     auto text = stmt->query;
     StringUtil::RTrim(text, ";\n\t ");
-    routed += runs_on_gateway(*stmt)
+    routed += runs_on_gateway(*stmt, allow_join)
                 ? text
                 : "FROM sirius_gateway_run(" + KeywordHelper::WriteQuoted(text) + ")";
     routed += ";\n";

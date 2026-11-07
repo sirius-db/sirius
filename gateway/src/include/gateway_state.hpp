@@ -102,6 +102,7 @@ class gateway_state {
 
   void start(duckdb::ClientContext& context, start_options options);
   /// Registers a rank started outside the gateway; the next statement rebuilds the ranks with it.
+  /// Registering the same rank again, with the same addresses and credentials, changes nothing.
   void add_rank(duckdb::ClientContext& context, rank_spec spec);
   /// Unregisters a rank added with add_rank; the next statement rebuilds the ranks without it.
   void drop_rank(duckdb::ClientContext& context, std::string const& name);
@@ -183,6 +184,11 @@ class gateway_state {
   void fail_locked(std::string reason);
   /// Starts fresh ranks with the last options and replays the DDL log on them.
   void recover_locked(duckdb::ClientContext& context);
+  /// Before any sirius_gateway_start or sirius_gateway_stop, and with no ranks running: starts
+  /// the registered ranks with the current settings and replays the DDL log, as
+  /// sirius_gateway_start(0) followed by a restart would. Throws while fewer than
+  /// `sirius_gateway_min_ranks` ranks are registered.
+  void auto_start_locked(duckdb::ClientContext& context);
 
   duckdb::DatabaseInstance& db_;
 
@@ -198,11 +204,17 @@ class gateway_state {
   std::vector<rank> test_servers_;
   start_options options_;
   cluster_state state_ = cluster_state::stopped;
+  /// Whether a statement with no ranks running starts the registered ones itself; an explicit
+  /// sirius_gateway_start or sirius_gateway_stop clears it.
+  bool auto_start_ = true;
   std::string reason_;
   uint64_t query_id_         = 0;
   uint64_t running_query_id_ = 0;
   std::vector<std::string> ddl_log_;
 };
+
+/// Fills @p options from the `sirius_gateway_*` settings of @p context.
+void read_settings(duckdb::ClientContext& context, start_options& options);
 
 /// Rank process lifecycle; `rank_supervisor.cpp`.
 /// A local rank runs the DuckDB binary itself; a remote one runs
