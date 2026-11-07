@@ -1,0 +1,24 @@
+# Config for scripts/sirius_rank_node.sh --config <file>: one file per rank, sourced by bash.
+# Arguments given on the command line win over these; exported NIXL_PREFIX and UCX_* win over the
+# nixl_prefix and ucx_* lines.
+
+gpu=0
+quack_port=9500
+exchange_port=27000
+
+# This host's first address in these CIDRs is the rank's listen and exchange address, and its
+# interface UCX_NET_DEVICES (for TCP; set ucx_net_devices for RDMA devices such as mlx5_0:1).
+priority_networks=10.87.140.0/24
+# listen_host=10.87.140.52
+# dir=/tmp/sirius_rank_9500
+
+nixl_prefix=$HOME/tools/nvda_nixl
+ucx_tls=cuda_copy,cuda_ipc,tcp,self
+# ucx_net_devices=bond0
+
+# The gateway to register with: sirius_gateway.sh writes these to <its log dir>/gateway.conf.
+# Without them the script prints the sirius_gateway_add_rank call for the gateway's console.
+# source /home/me/sirius_gateway/gateway.conf
+# gateway=10.87.140.52:9494
+# gateway_token=...
+# gateway_fingerprint=...
