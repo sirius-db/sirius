@@ -345,7 +345,7 @@ TEST_CASE("topology shapes", "[config][config_memory]")
   REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: [~]\n") ==
           "'sirius.topology.gpu_ids': element 0: expected a scalar, got null"
           "; GPUs Sirius uses, by count or by device id");
-  auto const root = read("sirius:\n  topology:\n    num_gpus: 0\n    gpu_ids: ~\n");
+  auto const root = read("sirius:\n  topology:\n    num_gpus: all\n    gpu_ids: ~\n");
   REQUIRE(root.topology.gpus.user_defined());
   REQUIRE(root.topology.gpus.get<std::size_t>() == 0);
 }

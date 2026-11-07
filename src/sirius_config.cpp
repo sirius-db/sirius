@@ -194,7 +194,8 @@ static std::optional<std::string> rest_fan_out_error(scan_manager::scan_manager_
 namespace {
 
 struct topology {
-  /// 0 = auto: use every GPU visible to topology discovery (CUDA_VISIBLE_DEVICES-aware).
+  /// 0 (`num_gpus: all`, the default): every GPU visible to topology discovery
+  /// (CUDA_VISIBLE_DEVICES-aware).
   std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{0}};
   /// 0 = all active GPUs per query (default). Positive value limits each query to the first
   /// N entries of the sorted active-GPU list, reserving the rest for future concurrent queries.
