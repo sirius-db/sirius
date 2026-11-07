@@ -3,9 +3,9 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/socket.h>
@@ -13,8 +13,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <thread>
 
@@ -61,20 +63,26 @@ void spawn_rank(start_options const& options,
   posix_spawn_file_actions_adddup2(&actions, in[0], STDIN_FILENO);
   posix_spawn_file_actions_adddup2(&actions, log, STDOUT_FILENO);
   posix_spawn_file_actions_adddup2(&actions, log, STDERR_FILENO);
+  // The rank keeps none of the gateway's other open files: a launch script's lock (fd 9 in
+  // sirius_gateway.sh) held by a rank that outlives the gateway would block the next gateway.
+  // The sysroot's glibc predates posix_spawn_file_actions_addclosefrom_np; a close action on an
+  // fd that is closed by the time of the spawn is ignored.
+  std::error_code no_proc;  // without /proc, the rank inherits them
+  for (auto const& entry : std::filesystem::directory_iterator("/proc/self/fd", no_proc)) {
+    int fd          = -1;
+    auto const name = entry.path().filename().string();
+    if (std::from_chars(name.data(), name.data() + name.size(), fd).ec == std::errc{} &&
+        fd > STDERR_FILENO) {
+      posix_spawn_file_actions_addclose(&actions, fd);
+    }
+  }
 
   std::vector<std::string> env;
   for (char** e = environ; *e != nullptr; ++e) {
     if (std::strncmp(*e, "CUDA_VISIBLE_DEVICES=", 21) != 0) { env.emplace_back(*e); }
   }
   env.push_back("CUDA_VISIBLE_DEVICES=" + r.gpu);
-  auto args     = r.remote
-                    ? std::vector<std::string>{options.rank_launcher,
-                                               r.host,
-                                               r.gpu,
-                                               std::to_string(r.quack_port),
-                                               options.duckdb_binary,
-                                               init}
-                    : std::vector<std::string>{options.duckdb_binary, "-unsigned", "-init", init};
+  std::vector<std::string> args{options.duckdb_binary, "-unsigned", "-init", init};
   auto pointers = [](std::vector<std::string>& strings) {
     std::vector<char*> result;
     for (auto& s : strings) {
@@ -98,37 +106,6 @@ void spawn_rank(start_options const& options,
   r.stdin_fd = in[1];
 }
 
-bool is_local_host(std::string const& host)
-{
-  addrinfo hints{};
-  hints.ai_family   = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  addrinfo* found   = nullptr;
-  if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0) { return false; }
-  ifaddrs* interfaces = nullptr;
-  if (getifaddrs(&interfaces) != 0) {
-    freeaddrinfo(found);
-    return false;
-  }
-  bool local = false;
-  for (auto* a = found; a != nullptr && !local; a = a->ai_next) {
-    for (auto* i = interfaces; i != nullptr && !local; i = i->ifa_next) {
-      if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != a->ai_family) { continue; }
-      if (a->ai_family == AF_INET) {
-        local = reinterpret_cast<sockaddr_in const*>(a->ai_addr)->sin_addr.s_addr ==
-                reinterpret_cast<sockaddr_in const*>(i->ifa_addr)->sin_addr.s_addr;
-      } else if (a->ai_family == AF_INET6) {
-        local = std::memcmp(&reinterpret_cast<sockaddr_in6 const*>(a->ai_addr)->sin6_addr,
-                            &reinterpret_cast<sockaddr_in6 const*>(i->ifa_addr)->sin6_addr,
-                            sizeof(in6_addr)) == 0;
-      }
-    }
-  }
-  freeifaddrs(interfaces);
-  freeaddrinfo(found);
-  return local;
-}
-
 std::string numeric_address(std::string const& host)
 {
   addrinfo hints{};
@@ -145,6 +122,34 @@ std::string numeric_address(std::string const& host)
             sizeof(address));
   freeaddrinfo(found);
   return address;
+}
+
+bool accepts_connections(std::string const& host, uint32_t port, std::chrono::milliseconds patience)
+{
+  addrinfo hints{};
+  hints.ai_family   = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* found   = nullptr;
+  if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &found) != 0) {
+    return false;
+  }
+  bool open = false;
+  for (auto* a = found; a != nullptr && !open; a = a->ai_next) {
+    int const fd = socket(a->ai_family, a->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { continue; }
+    if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) {
+      open = true;
+    } else if (errno == EINPROGRESS) {
+      pollfd p{fd, POLLOUT, 0};
+      int error       = 0;
+      socklen_t bytes = sizeof(error);
+      open            = poll(&p, 1, static_cast<int>(patience.count())) == 1 &&
+             getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &bytes) == 0 && error == 0;
+    }
+    close(fd);
+  }
+  freeaddrinfo(found);
+  return open;
 }
 
 bool rank_exited(rank& r)

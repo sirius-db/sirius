@@ -4,24 +4,36 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/attach_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/set_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <future>
 #include <random>
 #include <regex>
 #include <set>
+#include <string_view>
 #include <thread>
 
 namespace sirius_gateway {
@@ -53,6 +65,10 @@ std::string setting(ClientContext& context, char const* name, std::string fallba
   return fallback;
 }
 
+/// Words in setting and option names that hold credentials.
+constexpr std::array<char const*, 7> credential_words{
+  "secret", "token", "password", "key_id", "access_key", "connection_string", "credential"};
+
 /// Statements whose effect a fresh rank must see again: everything but reads.
 bool changes_state(std::string const& sql)
 {
@@ -70,6 +86,123 @@ bool changes_state(std::string const& sql)
       default: return true;
     }
   });
+}
+
+/// Whether @p sql carries credentials (CREATE SECRET, a secret-like setting, an ATTACH token),
+/// which the gateway keeps out of the DDL log file.
+bool holds_credentials(std::string const& sql)
+{
+  duckdb::Parser parser{duckdb::ParserOptions::Builtin()};
+  try {
+    parser.ParseQuery(sql);
+  } catch (std::exception&) {
+    return false;
+  }
+  auto const secret_like = [](std::string name) {
+    name = duckdb::StringUtil::Lower(name);
+    return std::any_of(std::begin(credential_words), std::end(credential_words), [&](auto word) {
+      return name.find(word) != std::string::npos;
+    });
+  };
+  return std::any_of(parser.statements.begin(), parser.statements.end(), [&](auto const& stmt) {
+    switch (stmt->type) {
+      case duckdb::StatementType::CREATE_STATEMENT:
+        return stmt->template Cast<duckdb::CreateStatement>().info->type ==
+               duckdb::CatalogType::SECRET_ENTRY;
+      case duckdb::StatementType::SET_STATEMENT:
+        return secret_like(stmt->template Cast<duckdb::SetStatement>().name.GetIdentifierName());
+      case duckdb::StatementType::ATTACH_STATEMENT: {
+        auto const& info = *stmt->template Cast<duckdb::AttachStatement>().info;
+        return std::any_of(info.parsed_options.begin(),
+                           info.parsed_options.end(),
+                           [&](auto const& option) { return secret_like(option.first); });
+      }
+      default: return false;
+    }
+  });
+}
+
+/// The DDL log file: `<sirius_gateway_state_dir>/ddl.sql`, or empty when that is not set.
+/// Each entry follows a line "-- entry <bytes>", so multi-line statements read back exactly, and
+/// ends with ";", so the file also runs as a script.
+std::filesystem::path ddl_file(ClientContext& context)
+{
+  auto const dir = setting(context, "sirius_gateway_state_dir", "");
+  return dir.empty() ? std::filesystem::path{} : std::filesystem::path{dir} / "ddl.sql";
+}
+
+constexpr std::string_view entry_mark = "-- entry ";
+
+/// Replaces @p file with @p log, less the entries that carry credentials: written to a new
+/// file, mode 600, then renamed, so a crash leaves the old log or the new one.
+void save_ddl_log(std::filesystem::path const& file, std::vector<std::string> const& log)
+{
+  std::string text =
+    "-- The sirius_gateway DDL log, replayed on every start of the ranks. Statements with "
+    "credentials are not saved.\n";
+  for (auto const& entry : log) {
+    if (holds_credentials(entry)) { continue; }
+    text += std::string{entry_mark} + std::to_string(entry.size()) + "\n" + entry + ";\n";
+  }
+  if (std::filesystem::create_directories(file.parent_path())) {
+    std::filesystem::permissions(file.parent_path(), std::filesystem::perms::owner_all);
+  }
+  auto const temp = file.string() + ".tmp";
+  int const fd    = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) { throw IOException("cannot write %s: %s", temp, std::strerror(errno)); }
+  bool written = fchmod(fd, 0600) == 0;
+  for (std::size_t at = 0; written && at < text.size();) {
+    auto const n = write(fd, text.data() + at, text.size() - at);
+    written      = n > 0;
+    at += written ? static_cast<std::size_t>(n) : 0;
+  }
+  written = fsync(fd) == 0 && written;
+  close(fd);
+  if (!written || rename(temp.c_str(), file.c_str()) != 0) {
+    auto const error = errno;
+    unlink(temp.c_str());
+    throw IOException("cannot write %s: %s", file.string(), std::strerror(error));
+  }
+}
+
+std::vector<std::string> load_ddl_log(std::filesystem::path const& file)
+{
+  std::ifstream in(file, std::ios::binary);
+  std::string const text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+  std::vector<std::string> log;
+  for (std::size_t at = 0; at < text.size();) {
+    auto const end = std::min(text.find('\n', at), text.size());
+    std::string_view const line{text.data() + at, end - at};
+    at = end + 1;
+    if (line.substr(0, entry_mark.size()) != entry_mark) { continue; }
+    std::size_t bytes = 0;
+    try {
+      bytes = std::stoull(std::string{line.substr(entry_mark.size())});
+    } catch (std::exception&) {
+      throw IOException("%s: bad entry line \"%s\"", file.string(), std::string{line});
+    }
+    if (at + bytes + 2 > text.size() || text.compare(at + bytes, 2, ";\n") != 0) {
+      throw IOException("%s: entry %d is cut short", file.string(), log.size() + 1);
+    }
+    log.push_back(text.substr(at, bytes));
+    at += bytes + 2;
+  }
+  return log;
+}
+
+/// Saves @p log to @p file, if set. Its statements already ran on every rank, so a failure to
+/// save is reported, not thrown: returns the error, also written to the gateway's stderr.
+std::string try_save_ddl_log(std::filesystem::path const& file, std::vector<std::string> const& log)
+{
+  if (file.empty()) { return {}; }
+  try {
+    save_ddl_log(file, log);
+    return {};
+  } catch (std::exception& e) {
+    auto const error = "cannot save the DDL log: " + duckdb::ErrorData(e).RawMessage();
+    std::fprintf(stderr, "sirius_gateway: %s\n", error.c_str());
+    return error;
+  }
 }
 
 /// Whether @p sql only reads the catalog: SELECTs whose every table, at any depth, is a
@@ -310,9 +443,9 @@ void read_settings(ClientContext& context, start_options& options)
   options.duckdb_binary    = setting(context, "sirius_gateway_duckdb_binary", "");
   options.sirius_extension = setting(context, "sirius_gateway_sirius_extension", "");
   options.rank_init        = setting(context, "sirius_gateway_rank_init", "");
-  options.rank_launcher    = setting(context, "sirius_gateway_rank_launcher", "");
   options.log_dir          = setting(context, "sirius_gateway_log_dir", "");
   options.boot_id_sql      = setting(context, "sirius_gateway_rank_boot_id_sql", "");
+  options.joined_sql       = setting(context, "sirius_gateway_rank_joined_sql", "");
   options.exit_sql         = setting(context, "sirius_gateway_rank_exit_sql", "");
   if (options.log_dir.empty()) {
     options.log_dir =
@@ -363,25 +496,38 @@ class gateway_state::turn {
   uint64_t ticket_;
 };
 
-void gateway_state::start(ClientContext& context, start_options options)
+void gateway_state::start(ClientContext& context, start_options options, bool replay_saved)
 {
   turn t{*this, context};
   {
     std::lock_guard lock{state_mutex_};
-    ddl_log_.clear();
+    if (!replay_saved) { ddl_log_.clear(); }
     auto_start_ = false;
+    if (replay_saved) { options_ = options; }
+  }
+  ranks_cv_.notify_all();
+  // A launch script restarts a gateway whose spawned ranks died with it: the saved log is the
+  // only record of their catalog, so it is replayed, not discarded.
+  if (replay_saved) {
+    recover_locked(context);
+    return;
   }
   start_locked(context, std::move(options));
+  // Only once the new ranks run: a start that fails keeps the saved log.
+  if (auto const file = ddl_file(context); !file.empty()) { std::filesystem::remove(file); }
 }
 
 void gateway_state::stop(ClientContext& context)
 {
   turn t{*this, context};
   stop_locked();
-  std::lock_guard lock{state_mutex_};
-  state_      = cluster_state::stopped;
-  reason_     = "stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()";
-  auto_start_ = false;
+  {
+    std::lock_guard lock{state_mutex_};
+    state_      = cluster_state::stopped;
+    reason_     = "stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()";
+    auto_start_ = false;
+  }
+  ranks_cv_.notify_all();
 }
 
 void gateway_state::restart(ClientContext& context)
@@ -392,8 +538,39 @@ void gateway_state::restart(ClientContext& context)
 
 std::shared_ptr<rank_result> gateway_state::run(ClientContext& context, std::string const& sql)
 {
+  wait_for_ranks(context, sql);
   turn t{*this, context};
   return run_locked(context, sql, false);
+}
+
+void gateway_state::wait_for_ranks(ClientContext& context, std::string const& sql)
+{
+  auto const min_ranks = std::stoull(setting(context, "sirius_gateway_min_ranks", "1"));
+  // Clamped to a year: a larger wait (the setting is UBIGINT) overflows the time point, which
+  // would put the deadline in the past and fail the statement at once.
+  auto const wait_s = std::min<uint64_t>(
+    std::stoull(setting(context, "sirius_gateway_join_wait", "600")), 365ULL * 24 * 3600);
+  auto const deadline = steady_clock::now() + std::chrono::seconds(wait_s);
+  std::unique_lock lock{state_mutex_};
+  auto const missing = [&] {
+    return auto_start_ && ranks_.empty() && registered_.size() < min_ranks;
+  };
+  if (!missing()) { return; }
+  lock.unlock();
+  // run_locked answers a client's ATTACH from the gateway's own catalog.
+  bool touches = false;
+  if (reads_only_catalog(sql, &touches) && touches) { return; }
+  lock.lock();
+  ++join_waiters_;
+  join_min_ranks_ = min_ranks;
+  struct leave {
+    std::size_t& waiters;
+    ~leave() { --waiters; }
+  } left{join_waiters_};
+  while (missing() && steady_clock::now() < deadline) {
+    ranks_cv_.wait_for(lock, 100ms);
+    if (context.IsInterrupted()) { throw duckdb::InterruptException(); }
+  }
 }
 
 void gateway_state::start_locked(ClientContext& context, start_options options)
@@ -409,6 +586,10 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     std::lock_guard lock{state_mutex_};
     registered = registered_;
   }
+  // By name, so that which rank is rank 0 does not depend on the order the nodes registered.
+  std::sort(registered.begin(), registered.end(), [](auto const& a, auto const& b) {
+    return a.name < b.name;
+  });
   if (options.ranks == 0 && registered.empty()) {
     throw InvalidInputException(
       "sirius_gateway_start needs at least one rank, or ranks added with sirius_gateway_add_rank");
@@ -416,10 +597,6 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
   if (!options.gpus.empty() && options.gpus.size() != options.ranks) {
     throw InvalidInputException(
       "gpus lists %d GPUs for %d ranks", options.gpus.size(), options.ranks);
-  }
-  if (!options.hosts.empty() && options.hosts.size() != options.ranks) {
-    throw InvalidInputException(
-      "hosts lists %d hosts for %d ranks", options.hosts.size(), options.ranks);
   }
   if (options.ranks > 0 && options.duckdb_binary.empty()) {
     throw InvalidInputException(
@@ -430,26 +607,18 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
   auto const token = random_token();
   std::vector<rank> ranks(options.ranks + registered.size());
   for (uint32_t i = 0; i < options.ranks; ++i) {
-    auto& r  = ranks[i];
-    r.index  = i;
-    r.name   = "rank_" + std::to_string(i);
-    r.token  = token;
-    r.gpu    = options.gpus.empty() ? std::to_string(i) : options.gpus[i];
-    r.host   = options.hosts.empty() ? "127.0.0.1" : options.hosts[i];
-    r.remote = !is_local_host(r.host);
-    if (r.remote && options.rank_launcher.empty()) {
-      throw InvalidInputException(
-        "rank %d's host %s is not this machine: SET sirius_gateway_rank_launcher to the program "
-        "that starts ranks there",
-        i,
-        r.host);
-    }
-    // A remote rank's launcher forwards this port to the rank's own 127.0.0.1.
+    auto& r         = ranks[i];
+    r.index         = i;
+    r.name          = "rank_" + std::to_string(i);
+    r.token         = token;
+    r.gpu           = options.gpus.empty() ? std::to_string(i) : options.gpus[i];
+    r.host          = "127.0.0.1";
+    r.quack_host    = r.host;
     r.quack_port    = options.quack_base_port + i;
     r.exchange_port = options.exchange_base_port + i;
     r.uri           = "quack:127.0.0.1:" + std::to_string(r.quack_port);
   }
-  // Registered ranks follow the spawned ones, in the order they were added.
+  // Registered ranks follow the spawned ones.
   for (uint32_t j = 0; j < registered.size(); ++j) {
     auto& r         = ranks[options.ranks + j];
     auto const& s   = registered[j];
@@ -457,6 +626,7 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     r.name          = s.name;
     r.registered    = true;
     r.host          = s.exchange_host;
+    r.quack_host    = s.quack_host;
     r.exchange_port = s.exchange_port;
     r.quack_port    = s.quack_port;
     r.token         = s.token;
@@ -495,9 +665,39 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
         if (!r.registered) { spawn_rank(options_, token, r); }
       }
     }
+    ranks_cv_.notify_all();
+    // Each join may wait minutes for a rank to start, so they run in parallel. The first error
+    // ends the other joins' retries, and is the one reported.
+    std::atomic<bool> give_up{false};
+    std::exception_ptr first;
+    rank const* first_failed = nullptr;
+    std::vector<std::future<void>> joins;
     for (auto& r : ranks_) {
-      connect_rank(r, 600s);
+      joins.push_back(std::async(std::launch::async, [&, this] {
+        try {
+          connect_rank(r, options_, 600s, true, give_up);
+        } catch (...) {
+          if (give_up.exchange(true)) { return; }
+          first        = std::current_exception();
+          first_failed = &r;
+        }
+      }));
     }
+    for (auto& join : joins) {
+      while (join.wait_for(100ms) != std::future_status::ready) {
+        if (context.IsInterrupted()) { give_up = true; }
+      }
+    }
+    if (first) {
+      try {
+        std::rethrow_exception(first);
+      } catch (std::exception& e) {
+        std::lock_guard lock{state_mutex_};
+        last_errors_[first_failed->name] = duckdb::ErrorData(e).RawMessage();
+        throw;
+      }
+    }
+    if (give_up) { throw duckdb::InterruptException(); }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
     // every peer, so the ranks run it in parallel. Shared-memory staging reaches only processes
@@ -519,8 +719,11 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     auto const setup_done = fan_out(context, setup, client_policy(context));
     for (uint32_t i = 0; i < setup_done.outcomes.size(); ++i) {
       if (setup_done.outcomes[i].error) {
-        throw IOException(
-          "rank %d failed its session setup: %s", i, setup_done.outcomes[i].error->RawMessage());
+        auto const what = "rank " + std::to_string(i) + " failed its session setup: " +
+                          setup_done.outcomes[i].error->RawMessage();
+        std::lock_guard lock{state_mutex_};
+        last_errors_[ranks_[i].name] = what;
+        throw IOException(what);
       }
     }
     std::lock_guard lock{state_mutex_};
@@ -534,7 +737,11 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
   }
 }
 
-void gateway_state::connect_rank(rank& r, std::chrono::seconds patience)
+void gateway_state::connect_rank(rank& r,
+                                 start_options const& options,
+                                 std::chrono::seconds patience,
+                                 bool join,
+                                 std::atomic<bool> const& give_up)
 {
   Connection admin{db_};
   auto attach = "ATTACH " + KeywordHelper::WriteQuoted(r.uri) + " AS " + r.catalog + " (TOKEN " +
@@ -552,7 +759,7 @@ void gateway_state::connect_rank(rank& r, std::chrono::seconds patience)
       std::lock_guard lock{state_mutex_};
       if (rank_exited(r)) {
         throw IOException(
-          "rank %d exited during start; see %s", r.index, log_path(options_, r.index));
+          "rank %d exited during start; see %s", r.index, log_path(options, r.index));
       }
     }
     auto channel  = std::make_shared<Connection>(db_);
@@ -560,16 +767,18 @@ void gateway_state::connect_rank(rank& r, std::chrono::seconds patience)
     auto result =
       attached->HasError() ? std::move(attached) : channel->Query("CONNECT " + r.catalog);
     if (!result->HasError()) { result = channel->Query("SELECT 1"); }
-    // A registered rank joins as a new process: its exchange's peers are fixed once it connects.
-    // While it still runs the process the gateway last saw, ask that one to exit; its launcher
-    // starts a new one.
+    // A registered rank's exchange peers are fixed once it joins. While it still runs the
+    // process the gateway last saw, and that process has joined, ask it to exit; its launcher
+    // starts a new one. A process that never joined serves as it is.
     std::string retiring;
-    if (!result->HasError() && r.registered) {
-      auto boot = channel->Query(options_.boot_id_sql);
+    if (!result->HasError() && join && r.registered) {
+      auto boot = channel->Query(options.boot_id_sql);
+      std::string id;
       if (boot->HasError()) {
         result = std::move(boot);
       } else {
-        auto const id = boot->Fetch()->GetValue(0, 0).ToString();
+        auto chunk = boot->Fetch();
+        id         = chunk && chunk->size() > 0 ? chunk->GetValue(0, 0).ToString() : "";
         std::lock_guard lock{state_mutex_};
         auto* spec = find_registered(r.name);
         if (spec && spec->boot_id == id) {
@@ -578,7 +787,19 @@ void gateway_state::connect_rank(rank& r, std::chrono::seconds patience)
           spec->boot_id = id;
         }
       }
-      if (!retiring.empty()) { channel->Query(options_.exit_sql); }
+      if (!retiring.empty() && !options.joined_sql.empty()) {
+        auto joined = channel->Query(options.joined_sql);
+        if (joined->HasError()) {
+          result = std::move(joined);
+          retiring.clear();
+        } else {
+          auto chunk = joined->Fetch();
+          if (!chunk || chunk->size() == 0 || !chunk->GetValue(0, 0).GetValue<bool>()) {
+            retiring.clear();
+          }
+        }
+      }
+      if (!retiring.empty()) { channel->Query(options.exit_sql); }
     }
     if (!result->HasError() && retiring.empty()) {
       auto id =
@@ -589,7 +810,9 @@ void gateway_state::connect_rank(rank& r, std::chrono::seconds patience)
       r.channel = std::move(channel);
       return;
     }
-    if (steady_clock::now() >= deadline) {
+    if (give_up || steady_clock::now() >= deadline) {
+      channel.reset();
+      admin.Query("DETACH DATABASE IF EXISTS " + r.catalog);
       if (!retiring.empty()) {
         throw IOException("rank %d (%s) still runs the process the gateway asked to exit (%s)",
                           r.index,
@@ -614,59 +837,71 @@ rank_spec* gateway_state::find_registered(std::string const& name)
 
 void gateway_state::add_rank(ClientContext& context, rank_spec spec)
 {
+  // A node registers its rank again after every restart: the same rank is no change, and does
+  // not wait for the turn, which a running statement holds.
+  auto const known_as_is = [&] {
+    std::lock_guard lock{state_mutex_};
+    auto const* known = find_registered(spec.name);
+    return known && known->quack_host == spec.quack_host && known->quack_port == spec.quack_port &&
+           known->exchange_host == spec.exchange_host &&
+           known->exchange_port == spec.exchange_port && known->token == spec.token &&
+           known->fingerprint == spec.fingerprint;
+  };
+  if (known_as_is()) { return; }
   turn t{*this, context};
-  {
-    std::lock_guard lock{state_mutex_};
-    if (auto const* known = find_registered(spec.name)) {
-      // A node registers its rank again after every restart: the same rank is no change.
-      if (known->quack_host == spec.quack_host && known->quack_port == spec.quack_port &&
-          known->exchange_host == spec.exchange_host &&
-          known->exchange_port == spec.exchange_port && known->token == spec.token &&
-          known->fingerprint == spec.fingerprint) {
-        return;
-      }
-      throw InvalidInputException("a different rank named %s is already registered", spec.name);
-    }
-    registered_.push_back(spec);
-  }
+  if (known_as_is()) { return; }
   // Fail now, with Quack's own error, on a wrong address, token or fingerprint. The probe
-  // records the rank's boot id, so its first join restarts it.
+  // records the rank's boot id: the first join uses that process, unless it has already joined.
+  start_options options;
+  read_settings(context, options);
   rank probe;
-  probe.name           = spec.name;
-  probe.registered     = true;
-  probe.uri            = "quack:" + spec.quack_host + ":" + std::to_string(spec.quack_port);
-  probe.catalog        = "sirius_probe";
-  probe.token          = spec.token;
-  probe.fingerprint    = spec.fingerprint;
-  options_.boot_id_sql = setting(context, "sirius_gateway_rank_boot_id_sql", "");
-  try {
-    connect_rank(probe, 10s);
-  } catch (...) {
-    std::lock_guard lock{state_mutex_};
-    registered_.pop_back();
-    throw;
-  }
+  probe.name        = spec.name;
+  probe.registered  = true;
+  probe.uri         = "quack:" + spec.quack_host + ":" + std::to_string(spec.quack_port);
+  probe.catalog     = "sirius_probe";
+  probe.token       = spec.token;
+  probe.fingerprint = spec.fingerprint;
+  connect_rank(probe, options, 10s, false, std::atomic<bool>{false});
+  auto boot = probe.channel->Query(options.boot_id_sql);
   probe.channel.reset();
   Connection{db_}.Query("DETACH DATABASE IF EXISTS sirius_probe");
-
-  std::lock_guard lock{state_mutex_};
-  if (state_ != cluster_state::stopped) {
-    fail_locked("membership changed: added " + spec.name +
-                ", so the gateway restarts the ranks before the next statement");
+  if (boot->HasError()) {
+    throw IOException("rank %s: %s: %s", spec.name, options.boot_id_sql, boot->GetError());
   }
+  auto chunk   = boot->Fetch();
+  spec.boot_id = chunk && chunk->size() > 0 ? chunk->GetValue(0, 0).ToString() : "";
+
+  {
+    std::lock_guard lock{state_mutex_};
+    auto* known         = find_registered(spec.name);
+    auto const replaced = known != nullptr;
+    if (replaced) {
+      *known = spec;
+    } else {
+      registered_.push_back(spec);
+    }
+    if (state_ != cluster_state::stopped) {
+      fail_locked("membership changed: " + std::string(replaced ? "replaced " : "added ") +
+                  spec.name + ", so the gateway restarts the ranks before the next statement");
+    }
+  }
+  ranks_cv_.notify_all();
 }
 
 void gateway_state::drop_rank(ClientContext& context, std::string const& name)
 {
   turn t{*this, context};
-  std::lock_guard lock{state_mutex_};
-  auto* spec = find_registered(name);
-  if (!spec) { throw InvalidInputException("no rank named %s was added", name); }
-  registered_.erase(registered_.begin() + (spec - registered_.data()));
-  if (state_ != cluster_state::stopped) {
-    fail_locked("membership changed: dropped " + name +
-                ", so the gateway restarts the ranks before the next statement");
+  {
+    std::lock_guard lock{state_mutex_};
+    auto* spec = find_registered(name);
+    if (!spec) { throw InvalidInputException("no rank named %s was added", name); }
+    registered_.erase(registered_.begin() + (spec - registered_.data()));
+    if (state_ != cluster_state::stopped) {
+      fail_locked("membership changed: dropped " + name +
+                  ", so the gateway restarts the ranks before the next statement");
+    }
   }
+  ranks_cv_.notify_all();
 }
 
 void gateway_state::stop_locked()
@@ -683,22 +918,52 @@ void gateway_state::stop_locked()
 
 void gateway_state::recover_locked(ClientContext& context)
 {
-  start_locked(context, options_);
   std::vector<std::string> log;
   {
     std::lock_guard lock{state_mutex_};
     log = ddl_log_;
   }
-  for (auto const& entry : log) {
+  // A gateway that restarted has an empty log: its ranks replay the one it saved.
+  auto const file      = ddl_file(context);
+  bool const from_file = log.empty() && !file.empty() && std::filesystem::exists(file);
+  if (from_file) {
+    log = load_ddl_log(file);
+    std::lock_guard lock{state_mutex_};
+    ddl_log_ = log;
+  }
+  start_locked(context, options_);
+  std::vector<std::string> kept;
+  std::string skipped;
+  for (std::size_t i = 0; i < log.size(); ++i) {
     try {
-      run_locked(context, entry, true);
+      run_locked(context, log[i], true);
+      kept.push_back(log[i]);
     } catch (std::exception& e) {
+      auto const error = duckdb::ErrorData(e).RawMessage();
       std::lock_guard lock{state_mutex_};
+      // A saved entry can fail for a reason outside the log: a file deleted since, or a secret,
+      // which is never saved. Failing on it would fail every later statement too, including the
+      // one that fixes it, so it is dropped, provided it failed alike on every rank (the cluster
+      // is still ready) and not because the client cancelled it.
+      bool const cancelled =
+        context.IsInterrupted() || error.find("cancelled on every rank") != std::string::npos;
+      if (from_file && state_ == cluster_state::ready && !cancelled) {
+        skipped += (skipped.empty() ? "" : "; ") + std::string{"skipped saved DDL entry "} +
+                   std::to_string(i + 1) + ": " + error;
+        continue;
+      }
       state_  = cluster_state::failed;
-      reason_ = "replaying \"" + entry + "\" failed: " + duckdb::ErrorData(e).RawMessage();
+      reason_ = "replaying \"" + log[i] + "\" failed: " + error;
       throw IOException(reason_);
     }
   }
+  if (skipped.empty()) { return; }
+  std::fprintf(stderr, "sirius_gateway: %s\n", skipped.c_str());
+  auto const save_error = try_save_ddl_log(file, kept);
+  std::lock_guard lock{state_mutex_};
+  ddl_log_ = std::move(kept);
+  // Shown in sirius_gateway_status's error column until the next state change or start.
+  reason_ = skipped + (save_error.empty() ? "" : "; " + save_error);
 }
 
 void gateway_state::auto_start_locked(ClientContext& context)
@@ -710,7 +975,7 @@ void gateway_state::auto_start_locked(ClientContext& context)
     registered = registered_.size();
   }
   if (registered == 0) { return; }
-  // Fail rather than wait: the rank that is missing registers through this same turn.
+  // wait_for_ranks gave up: the ranks that are missing register through this same turn.
   uint64_t const min_ranks = std::stoull(setting(context, "sirius_gateway_min_ranks", "1"));
   if (registered < min_ranks) {
     throw IOException(
@@ -749,13 +1014,29 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
                           "or register ranks with sirius_gateway_add_rank"
                         : reason_);
   }
-  bool failed = false;
+  // A registered rank has no process here: one that died since the last statement is found by
+  // its port, so that the ranks restart before this statement rather than fail it.
+  bool ready = false;
   {
     std::lock_guard lock{state_mutex_};
+    ready = state_ == cluster_state::ready;
+  }
+  auto const dead = ready && !replay ? unreachable_registered(2s) : std::vector<uint32_t>{};
+  bool failed     = false;
+  {
+    std::lock_guard lock{state_mutex_};
+    for (auto const i : dead) {
+      auto const& r        = ranks_[i];
+      last_errors_[r.name] = "lost: " + r.uri + " took no connection";
+      fail_locked("rank " + std::to_string(i) + " (" + r.name + ") does not answer at " + r.uri +
+                  ", so the gateway restarts the ranks");
+    }
     for (auto& r : ranks_) {
       if (rank_exited(r)) {
-        fail_locked("rank " + std::to_string(r.index) + " exited; see " +
-                    log_path(options_, r.index));
+        auto const what =
+          "rank " + std::to_string(r.index) + " exited; see " + log_path(options_, r.index);
+        last_errors_[r.name] = what;
+        fail_locked(what);
       }
     }
     failed = state_ == cluster_state::failed;
@@ -835,6 +1116,11 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     for (auto& r : ranks_) {
       if (rank_exited(r)) { lost.insert(r.index); }
     }
+    for (auto const i : lost) {
+      last_errors_[ranks_[i].name] =
+        "lost in query " + std::to_string(query) + ": " +
+        (errors[i] ? errors[i]->RawMessage() : std::string{"the process exited"});
+    }
   }
   // Fail-stop, in order: a killed rank, a lost one, a broken exchange, then a state change only
   // some ranks made. Each leaves the ranks out of step.
@@ -870,10 +1156,22 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     // A read changes nothing, and every rank has retired the query: the ranks keep serving.
     throw IOException("%sthe ranks disagree (%s)", prefix, failed_ranks);
   }
+  std::vector<std::string> log;
   {
     std::lock_guard lock{state_mutex_};
     if (state_ == cluster_state::failed) { throw IOException(reason_); }
-    if (!replay && changes_state(sql)) { ddl_log_.push_back(sql); }
+    if (!replay && changes_state(sql)) {
+      ddl_log_.push_back(sql);
+      log = ddl_log_;
+    }
+  }
+  if (!log.empty()) {
+    // The statement took effect on every rank, so it succeeds even if the log cannot be saved.
+    // The error (or, once saved, none) replaces an earlier note of a skipped entry or a save
+    // that failed.
+    auto const save_error = try_save_ddl_log(ddl_file(context), log);
+    std::lock_guard lock{state_mutex_};
+    if (state_ == cluster_state::ready) { reason_ = save_error; }
   }
 
   return collect(*outcomes[0].result);
@@ -929,8 +1227,8 @@ gateway_state::fan_out_result gateway_state::fan_out(
       }
       std::thread(run_canceller, std::ref(db_), cancelling).detach();
     } else if (!killed_at && now - *cancelled_at > std::chrono::seconds(policy.grace_s)) {
-      // Every rank the gateway started has a process it owns: the rank, or for a remote rank
-      // the launcher, whose end drops the rank's forwarded port. Killing it ends the call.
+      // A spawned rank's process is the gateway's own: killing it ends the call. A registered
+      // one is left to the cluster's failure, which the next statement's restart handles.
       killed_at = now;
       std::lock_guard state_lock{state_mutex_};
       std::lock_guard lock{shared->mutex};
@@ -966,15 +1264,42 @@ gateway_state::fan_out_result gateway_state::fan_out(
   return out;
 }
 
+std::vector<uint32_t> gateway_state::unreachable_registered(std::chrono::milliseconds patience)
+{
+  std::vector<std::pair<uint32_t, std::future<bool>>> probes;
+  {
+    std::lock_guard lock{state_mutex_};
+    for (auto const& r : ranks_) {
+      if (!r.registered) { continue; }
+      probes.emplace_back(
+        r.index,
+        std::async(std::launch::async, [host = r.quack_host, port = r.quack_port, patience] {
+          return accepts_connections(host, port, patience);
+        }));
+    }
+  }
+  std::vector<uint32_t> dead;
+  for (auto& [index, open] : probes) {
+    if (!open.get()) { dead.push_back(index); }
+  }
+  return dead;
+}
+
 void gateway_state::signal_rank(uint32_t index, int signal)
 {
   std::lock_guard lock{state_mutex_};
-  if (index >= ranks_.size() || ranks_[index].pid <= 0) {
-    throw InvalidInputException("no running rank %d", index);
+  if (index >= ranks_.size()) { throw InvalidInputException("no running rank %d", index); }
+  auto* process = &ranks_[index];
+  if (process->registered) {
+    auto const server = std::find_if(test_servers_.begin(),
+                                     test_servers_.end(),
+                                     [&](rank const& s) { return s.uri == process->uri; });
+    process           = server == test_servers_.end() ? nullptr : &*server;
   }
-  kill(ranks_[index].pid, signal);
+  if (!process || process->pid <= 0) { throw InvalidInputException("no running rank %d", index); }
+  kill(process->pid, signal);
   // A killed rank is gone before this returns, so the next statement finds it gone.
-  for (int i = 0; signal == SIGKILL && i < 500 && !rank_exited(ranks_[index]); ++i) {
+  for (int i = 0; signal == SIGKILL && i < 500 && !rank_exited(*process); ++i) {
     std::this_thread::sleep_for(10ms);
   }
 }
@@ -1002,6 +1327,15 @@ uint64_t gateway_state::running_query_id()
 std::vector<gateway_state::rank_status> gateway_state::status()
 {
   std::lock_guard lock{state_mutex_};
+  auto const reason     = join_waiters_ > 0 && ranks_.empty()
+                            ? "waiting for " + std::to_string(join_min_ranks_) +
+                            " ranks (sirius_gateway_min_ranks); " +
+                            std::to_string(registered_.size()) + " are registered"
+                            : reason_;
+  auto const last_error = [&](std::string const& name) {
+    auto const it = last_errors_.find(name);
+    return it == last_errors_.end() ? std::string{} : it->second;
+  };
   std::vector<rank_status> rows;
   for (auto const& r : ranks_) {
     auto const up = r.registered ? r.channel != nullptr : r.pid >= 0;
@@ -1014,7 +1348,8 @@ std::vector<gateway_state::rank_status> gateway_state::status()
                     r.uri,
                     up ? "up" : "exited",
                     state_,
-                    reason_});
+                    reason,
+                    last_error(r.name)});
   }
   // Added since the ranks last started: they join on the next statement.
   for (auto const& spec : registered_) {
@@ -1029,11 +1364,12 @@ std::vector<gateway_state::rank_status> gateway_state::status()
                       "quack:" + spec.quack_host + ":" + std::to_string(spec.quack_port),
                       "registered",
                       state_,
-                      reason_});
+                      reason,
+                      last_error(spec.name)});
     }
   }
   if (rows.empty() && state_ != cluster_state::ready) {
-    rows.push_back({0, "", false, -1, "", "", "", to_string(state_), state_, reason_});
+    rows.push_back({0, "", false, -1, "", "", "", to_string(state_), state_, reason, ""});
   }
   return rows;
 }

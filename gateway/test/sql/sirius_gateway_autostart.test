@@ -25,30 +25,42 @@ SET GLOBAL sirius_gateway_rank_boot_id_sql = 'SELECT id FROM boot';
 statement ok
 SET GLOBAL sirius_gateway_rank_exit_sql = 'UPDATE boot SET id = id || ''+''';
 
+statement ok
+SET GLOBAL sirius_gateway_rank_joined_sql = '';
+
+# A statement waits sirius_gateway_join_wait seconds for the ranks to register; 0 fails at once.
+statement ok
+SET GLOBAL sirius_gateway_join_wait = 0;
+
 statement error
 FROM sirius_gateway_run('SELECT 1');
 ----
 or register ranks with sirius_gateway_add_rank
 
 statement ok
-FROM sirius_gateway_test_serve(19930, 'autotoken', 'CREATE TABLE boot AS SELECT ''a'' AS id');
-
-statement ok
-FROM sirius_gateway_test_serve(19931, 'autotoken', 'CREATE TABLE boot AS SELECT ''b'' AS id');
+FROM sirius_gateway_test_serve(19930, 'autotoken', 'CREATE TABLE boot AS SELECT ''b'' AS id');
 
 statement ok
 SET GLOBAL sirius_gateway_min_ranks = 2;
 
 query TT
-SELECT name, cluster FROM sirius_gateway_add_rank('127.0.0.1:19930', exchange_port := 27230, token := 'autotoken', name := 'a');
+SELECT name, cluster FROM sirius_gateway_add_rank('127.0.0.1:19930', exchange_port := 27230, token := 'autotoken', name := 'b');
 ----
-a	stopped
+b	stopped
 
-# Too few ranks: the statement fails, and the gateway stays stopped.
+# Too few ranks: the statement waits sirius_gateway_join_wait, then fails; the gateway stays stopped.
+statement ok
+SET GLOBAL sirius_gateway_join_wait = 1;
+
 statement error
 FROM sirius_gateway_run('SELECT 1');
 ----
 the gateway starts once 2 ranks are registered (sirius_gateway_min_ranks); 1 are
+
+query T
+SELECT DISTINCT cluster FROM sirius_gateway_status();
+----
+stopped
 
 # A rank's node registers it itself, as a Quack client of the gateway, once the gateway allows it.
 statement ok
@@ -64,27 +76,42 @@ statement ok con2
 CONNECT gw;
 
 statement error con2
-FROM sirius_gateway_add_rank('127.0.0.1:19931', exchange_port := 27231, token := 'autotoken', name := 'b');
+FROM sirius_gateway_add_rank('127.0.0.1:19930', exchange_port := 27230, token := 'autotoken', name := 'b');
 ----
 can only be called on the gateway's console
 
 statement ok
-SET GLOBAL sirius_gateway_allow_remote_join = true;
-
-statement ok con2
-FROM sirius_gateway_add_rank('127.0.0.1:19931', exchange_port := 27231, token := 'autotoken', name := 'b');
+SET GLOBAL sirius_gateway_allow_join = true;
 
 statement error con2
 CALL quack_cancel('x');
 ----
 can only be called on the gateway's console
 
-# The first statement starts both ranks, each as a new process.
+statement ok
+FROM sirius_gateway_test_serve(19931, 'autotoken', 'CREATE TABLE boot AS SELECT ''a'' AS id');
+
+# The missing rank's node, here another stand-in, registers it 2 s later, having read the
+# gateway's status. The statement waits for it; both ranks then start, each as a new process.
+statement ok
+SET GLOBAL sirius_gateway_join_wait = 60;
+
+statement ok
+FROM sirius_gateway_test_serve(19933, 'autotoken', '.shell sleep 2
+CREATE TABLE seen AS FROM quack_query(''quack:127.0.0.1:19932'', ''SELECT DISTINCT cluster, error FROM sirius_gateway_status()'', token := ''gateway-token'');
+FROM quack_query(''quack:127.0.0.1:19932'', ''FROM sirius_gateway_add_rank(''''127.0.0.1:19931'''', exchange_port := 27231, token := ''''autotoken'''', name := ''''a'''')'', token := ''gateway-token'')');
+
 query T
 FROM sirius_gateway_run('SELECT id FROM boot');
 ----
 a+
 
+query TT
+FROM quack_query('quack:127.0.0.1:19933', 'FROM seen', token := 'autotoken');
+----
+stopped	waiting for 2 ranks (sirius_gateway_min_ranks); 1 are registered
+
+# Ranks are ordered by name, not by when they registered.
 query ITT
 SELECT rank, name, cluster FROM sirius_gateway_status() ORDER BY rank;
 ----
@@ -93,7 +120,7 @@ SELECT rank, name, cluster FROM sirius_gateway_status() ORDER BY rank;
 
 # The node registering its restarted rank again changes nothing: no restart.
 statement ok con2
-FROM sirius_gateway_add_rank('127.0.0.1:19931', exchange_port := 27231, token := 'autotoken', name := 'b');
+FROM sirius_gateway_add_rank('127.0.0.1:19930', exchange_port := 27230, token := 'autotoken', name := 'b');
 
 query T
 SELECT DISTINCT cluster FROM sirius_gateway_status();

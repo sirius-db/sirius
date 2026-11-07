@@ -1,0 +1,200 @@
+# name: test/sql/sirius_gateway_replay.test
+# description: a saved DDL entry that fails on replay is skipped, and sirius_gateway_start(replay_saved := true)
+# group: [sirius_gateway]
+
+require sirius_gateway
+
+require quack
+
+# Quack's errors mention HTTP, which the runner would otherwise take as a reason to skip the file.
+set ignore_error_messages
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_replay';
+
+statement ok
+SET GLOBAL sirius_gateway_state_dir = '{TEST_DIR}/sirius_gateway_replay/state';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_boot_id_sql = 'SELECT 1';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_joined_sql = 'SELECT false';
+
+statement ok
+FROM sirius_gateway_test_serve(19960, 'replaytoken', '');
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19960', exchange_port := 27260, token := 'replaytoken', name := 'a');
+
+# Views over files the ranks read: a view binds its file when it is created, and again on replay.
+statement ok
+COPY (SELECT 7 AS z) TO '{TEST_DIR}/sirius_gateway_replay/z.csv';
+
+statement ok
+COPY (SELECT 8 AS y) TO '{TEST_DIR}/sirius_gateway_replay/y.csv';
+
+statement ok
+FROM sirius_gateway_run('CREATE VIEW a AS SELECT 1 AS x');
+
+statement ok
+FROM sirius_gateway_run('CREATE VIEW vz AS SELECT z FROM read_csv(''{TEST_DIR}/sirius_gateway_replay/z.csv'')');
+
+statement ok
+FROM sirius_gateway_run('CREATE VIEW b AS SELECT 2 AS x');
+
+query I
+SELECT count(*) FROM sirius_gateway_log();
+----
+3
+
+# Between the runs, z.csv loses its column z: replaying vz now fails on every rank.
+restart
+
+statement ok
+COPY (SELECT 7 AS other) TO '{TEST_DIR}/sirius_gateway_replay/z.csv';
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_replay';
+
+statement ok
+SET GLOBAL sirius_gateway_state_dir = '{TEST_DIR}/sirius_gateway_replay/state';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_boot_id_sql = 'SELECT 1';
+
+statement ok
+SET GLOBAL sirius_gateway_rank_joined_sql = 'SELECT false';
+
+statement ok
+FROM sirius_gateway_test_serve(19961, 'replaytoken', '');
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19961', exchange_port := 27261, token := 'replaytoken', name := 'a');
+
+# The first statement starts the ranks and replays the saved log: the failing entry is skipped,
+# not a reason to fail this statement and every one after it.
+query II
+FROM sirius_gateway_run('SELECT (FROM a), (FROM b)');
+----
+1	2
+
+query TT
+SELECT cluster, error LIKE 'skipped saved DDL entry 2: %' FROM sirius_gateway_status();
+----
+ready	true
+
+# Dropped from the log and from the file.
+query T
+SELECT sql FROM sirius_gateway_log() ORDER BY entry;
+----
+CREATE VIEW a AS SELECT 1 AS x
+CREATE VIEW b AS SELECT 2 AS x
+
+query I
+SELECT content LIKE '%z.csv%' FROM read_text('{TEST_DIR}/sirius_gateway_replay/state/ddl.sql');
+----
+false
+
+statement error
+FROM sirius_gateway_run('FROM vz');
+----
+vz
+
+# The note stays until the next state change.
+query T
+SELECT error LIKE 'skipped saved DDL entry 2: %' FROM sirius_gateway_status();
+----
+true
+
+statement ok
+FROM sirius_gateway_run('CREATE VIEW vy AS SELECT y FROM read_csv(''{TEST_DIR}/sirius_gateway_replay/y.csv'')');
+
+query TT
+SELECT cluster, error FROM sirius_gateway_status();
+----
+ready	NULL
+
+# A gateway that spawns its ranks starts them with replay_saved := true, as sirius_gateway.sh
+# does: the saved log is replayed, with the same skip, and the file is kept.
+restart
+
+statement ok
+COPY (SELECT 8 AS other) TO '{TEST_DIR}/sirius_gateway_replay/y.csv';
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_replay';
+
+statement ok
+SET GLOBAL sirius_gateway_state_dir = '{TEST_DIR}/sirius_gateway_replay/state';
+
+query TTT
+SELECT state, cluster, error LIKE 'skipped saved DDL entry 3: %' FROM sirius_gateway_start(1, quack_base_port := 19965, replay_saved := true);
+----
+up	ready	true
+
+query II
+FROM sirius_gateway_run('SELECT (FROM a), (FROM b)');
+----
+1	2
+
+query I
+SELECT count(*) FROM sirius_gateway_log();
+----
+2
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/sirius_gateway_replay/state/ddl.sql');
+----
+1
+
+# A DDL log that cannot be saved does not fail a statement that ran on every rank; the status
+# says why.
+statement ok
+SET GLOBAL sirius_gateway_state_dir = '/proc/sirius_gateway_unwritable';
+
+statement ok
+FROM sirius_gateway_run('CREATE VIEW c AS SELECT 3 AS x');
+
+query TT
+SELECT cluster, error LIKE 'cannot save the DDL log: %' FROM sirius_gateway_status();
+----
+ready	true
+
+query II
+FROM sirius_gateway_run('SELECT (FROM c), getvariable(''sirius_query_id'') > 0');
+----
+3	true
+
+# Without replay_saved, a start still clears the log and the file.
+statement ok
+SET GLOBAL sirius_gateway_state_dir = '{TEST_DIR}/sirius_gateway_replay/state';
+
+statement ok
+FROM sirius_gateway_start(1, quack_base_port := 19965);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/sirius_gateway_replay/state/*');
+----
+0
+
+statement ok
+FROM sirius_gateway_stop();
