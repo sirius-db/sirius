@@ -443,10 +443,17 @@ void read_settings(ClientContext& context, start_options& options)
   options.duckdb_binary    = setting(context, "sirius_gateway_duckdb_binary", "");
   options.sirius_extension = setting(context, "sirius_gateway_sirius_extension", "");
   options.rank_init        = setting(context, "sirius_gateway_rank_init", "");
-  options.log_dir          = setting(context, "sirius_gateway_log_dir", "");
-  options.boot_id_sql      = setting(context, "sirius_gateway_rank_boot_id_sql", "");
-  options.joined_sql       = setting(context, "sirius_gateway_rank_joined_sql", "");
-  options.exit_sql         = setting(context, "sirius_gateway_rank_exit_sql", "");
+  options.mnnvl            = setting(context, "sirius_gateway_exchange_mnnvl", "auto");
+  options.frame_bytes =
+    std::stoull(setting(context, "sirius_gateway_exchange_frame_bytes", "16777216"));
+  options.send_frames = static_cast<uint32_t>(
+    std::stoull(setting(context, "sirius_gateway_exchange_send_frames", "32")));
+  options.recv_frames = static_cast<uint32_t>(
+    std::stoull(setting(context, "sirius_gateway_exchange_recv_frames_per_peer", "8")));
+  options.log_dir     = setting(context, "sirius_gateway_log_dir", "");
+  options.boot_id_sql = setting(context, "sirius_gateway_rank_boot_id_sql", "");
+  options.joined_sql  = setting(context, "sirius_gateway_rank_joined_sql", "");
+  options.exit_sql    = setting(context, "sirius_gateway_rank_exit_sql", "");
   if (options.log_dir.empty()) {
     options.log_dir =
       (std::filesystem::temp_directory_path() / ("sirius_gateway_" + std::to_string(getpid())))
@@ -716,6 +723,11 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
       if (!options_.sirius_extension.empty()) {
         sql.push_back("SET enable_duckdb_fallback = false");
         if (several_hosts) { sql.push_back("SET sirius_exchange_host_staging = 'never'"); }
+        sql.push_back("SET sirius_exchange_mnnvl = " + KeywordHelper::WriteQuoted(options_.mnnvl));
+        sql.push_back("SET sirius_exchange_frame_bytes = " + std::to_string(options_.frame_bytes));
+        sql.push_back("SET sirius_exchange_send_frames = " + std::to_string(options_.send_frames));
+        sql.push_back("SET sirius_exchange_recv_frames_per_peer = " +
+                      std::to_string(options_.recv_frames));
         sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(peers));
         sql.push_back("SET sirius_exchange_rank = " + std::to_string(r.index));
       }

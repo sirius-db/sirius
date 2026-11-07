@@ -2699,6 +2699,48 @@ static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value
     sirius::exchange::parse_host_staging(StringValue::Get(parameter));
 }
 
+static void SetExchangeMnnvl(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto value = StringValue::Get(parameter);
+  static_cast<void>(sirius::exchange::parse_mnnvl(value));
+  get_operator_params(context, scope)->exchange_mnnvl = std::move(value);
+}
+
+static void SetExchangeFrameBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0 || bytes % 256 != 0 || bytes > sirius::exchange::max_frame_bytes) {
+    throw InvalidInputException(
+      "sirius_exchange_frame_bytes must be a positive multiple of 256 up to %llu, not %llu",
+      static_cast<unsigned long long>(sirius::exchange::max_frame_bytes),
+      bytes);
+  }
+  get_operator_params(context, scope)->exchange_frame_bytes = bytes;
+}
+
+/// Parses a frame count setting @p name: 1 to max_ring_frames.
+static uint32_t ring_frames(char const* name, Value& parameter)
+{
+  auto const frames = UBigIntValue::Get(parameter);
+  if (frames == 0 || frames > sirius::exchange::max_ring_frames) {
+    throw InvalidInputException(
+      "%s must be 1 to %u, not %llu", name, sirius::exchange::max_ring_frames, frames);
+  }
+  return static_cast<uint32_t>(frames);
+}
+
+static void SetExchangeSendFrames(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->exchange_send_frames =
+    ring_frames("sirius_exchange_send_frames", parameter);
+}
+
+static void SetExchangeRecvFramesPerPeer(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->exchange_recv_frames_per_peer =
+    ring_frames("sirius_exchange_recv_frames_per_peer", parameter);
+}
+
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const rank = UBigIntValue::Get(parameter);
@@ -3565,6 +3607,36 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::VARCHAR,
     Value("auto"),
     SetExchangeHostStaging);
+  config.AddExtensionOption(
+    "sirius_exchange_mnnvl",
+    "Distributed execution: auto, require or off put the exchange's rings in fabric memory, so "
+    "that GPUs on other nodes of the NVLink domain write them over NVLink. auto falls back to "
+    "cudaMalloc with a warning; require fails instead. Same on every rank; set before "
+    "sirius_exchange_rank",
+    LogicalType::VARCHAR,
+    Value("auto"),
+    SetExchangeMnnvl);
+  config.AddExtensionOption(
+    "sirius_exchange_frame_bytes",
+    "Distributed execution: the exchange's frame size in bytes; one write covers up to half a "
+    "peer's receive frames. Same on every rank; set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(16ull << 20),
+    SetExchangeFrameBytes);
+  config.AddExtensionOption(
+    "sirius_exchange_send_frames",
+    "Distributed execution: send frames, shared by all peers; they bound the bytes in flight. "
+    "Same on every rank; set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(32),
+    SetExchangeSendFrames);
+  config.AddExtensionOption(
+    "sirius_exchange_recv_frames_per_peer",
+    "Distributed execution: receive frames (credits) each peer may fill; GPU memory grows with "
+    "it times the peers. Same on every rank; set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(8),
+    SetExchangeRecvFramesPerPeer);
   config.AddExtensionOption("sirius_distributed_query_id",
                             "Distributed execution: number of the next distributed query, set by "
                             "a gateway; must increase. 0 numbers queries per process",
