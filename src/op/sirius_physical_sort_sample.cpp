@@ -106,6 +106,21 @@ std::unique_ptr<cudf::table> evenly_spaced(cudf::table_view sorted,
 
 }  // namespace
 
+sirius_physical_sort_sample::boundaries sirius_physical_sort_sample::make_boundaries(
+  cudf::table_view sample_keys,
+  std::size_t sample_bytes,
+  std::size_t num_parts,
+  cucascade::memory::memory_space* space,
+  ::cuda::stream_ref stream)
+{
+  if (_distributed) { return distributed_boundaries(sample_keys, sample_bytes, num_parts, stream); }
+  auto const rows = sample_keys.num_rows();
+  // Single partition — no boundaries needed
+  if (num_parts <= 1 || rows == 0) { return {}; }
+  return {num_parts,
+          evenly_spaced(sample_keys, 0, rows, num_parts, stream, space->get_default_allocator())};
+}
+
 sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
                                                          uint64_t sort_sample_bytes,
                                                          uint64_t max_partition_bytes,
@@ -204,7 +219,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
   if (input_batch.empty()) {
     // Distributed: a rank with no input still joins the boundary exchange the others wait in.
     bool const upstream_finished = p->src_pipeline && p->src_pipeline->is_pipeline_finished();
-    if (!_distributed || !upstream_finished) { return nullptr; }
+    if (!runs_without_input() || !upstream_finished) { return nullptr; }
   }
 
   _boundary_state.store(BoundaryState::SCHEDULED, std::memory_order_release);
@@ -230,25 +245,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                    _sort_sample_bytes);
   auto start = std::chrono::high_resolution_clock::now();
 
-  // 1. Build cudf order vectors from BoundOrderByNode
-  std::vector<int> order_key_idx;
-  std::vector<cudf::order> column_order;
-  std::vector<cudf::null_order> null_precedence;
-  order_key_idx.reserve(orders.size());
-  column_order.reserve(orders.size());
-  null_precedence.reserve(orders.size());
-
-  for (auto const& ord : orders) {
-    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-      throw not_implemented_exception("Sort sample only supports bound reference expressions");
-    }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
-    order_key_idx.push_back(idx);
-    column_order.push_back(to_cudf_order(ord.type));
-    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
-  }
-
-  // 2. Collect valid batches and find memory space
+  // 1. Collect valid batches and find memory space
   std::vector<::cucascade::read_only_data_batch> valid_batches;
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
@@ -257,9 +254,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   }
 
   if (valid_batches.empty() || !space) {
-    if (_distributed) {
-      compute_distributed_boundaries({}, 0, 1, column_order, null_precedence, stream);
-    }
+    auto made             = make_boundaries({}, 0, 1, nullptr, stream);
+    _num_partitions       = made.num_partitions;
+    _partition_boundaries = std::move(made.table);
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -271,6 +268,24 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
       total_sample_bytes += batch.get_data()->get_size_in_bytes();
+    }
+
+    // 2. Build cudf order vectors from BoundOrderByNode
+    std::vector<int> order_key_idx;
+    std::vector<cudf::order> column_order;
+    std::vector<cudf::null_order> null_precedence;
+    order_key_idx.reserve(orders.size());
+    column_order.reserve(orders.size());
+    null_precedence.reserve(orders.size());
+
+    for (auto const& ord : orders) {
+      if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        throw not_implemented_exception("Sort sample only supports bound reference expressions");
+      }
+      auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
+      order_key_idx.push_back(idx);
+      column_order.push_back(to_cudf_order(ord.type));
+      null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
     // 3. Merge pre-sorted sample batches (ORDER_BY sorts each batch locally).
@@ -352,22 +367,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       sort_key_cols.push_back(merged_sample_view.column(idx));
     }
     cudf::table_view const sort_keys_view(sort_key_cols);
-    if (_distributed) {
-      compute_distributed_boundaries(
-        sort_keys_view, total_sample_bytes, num_parts, column_order, null_precedence, stream);
-    } else if (num_parts <= 1 || total_rows == 0) {
-      // Single partition — no boundaries needed
-      _num_partitions = 1;
-      _partition_boundaries.reset();
-    } else {
-      _partition_boundaries = evenly_spaced(sort_keys_view,
-                                            0,
-                                            static_cast<cudf::size_type>(total_rows),
-                                            num_parts,
-                                            stream,
-                                            space->get_default_allocator());
-      _num_partitions       = num_parts;
-    }
+    auto made       = make_boundaries(sort_keys_view, total_sample_bytes, num_parts, space, stream);
+    _num_partitions = made.num_partitions;
+    _partition_boundaries = std::move(made.table);
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this
     // execute() returns, so _partition_boundaries is visible before partition runs.
@@ -389,14 +391,18 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
 }
 
-void sirius_physical_sort_sample::compute_distributed_boundaries(
+sirius_physical_sort_sample::boundaries sirius_physical_sort_sample::distributed_boundaries(
   cudf::table_view sample_keys,
   std::size_t sample_bytes,
   std::size_t num_parts,
-  std::vector<cudf::order> const& column_order,
-  std::vector<cudf::null_order> const& null_precedence,
   ::cuda::stream_ref stream)
 {
+  std::vector<cudf::order> column_order;
+  std::vector<cudf::null_order> null_precedence;
+  for (auto const& ord : orders) {
+    column_order.push_back(to_cudf_order(ord.type));
+    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
+  }
   auto& d          = *_distributed;
   auto& gpu        = *d.gpu;
   auto const mr    = gpu.get_default_allocator();
@@ -449,9 +455,7 @@ void sirius_physical_sort_sample::compute_distributed_boundaries(
   for (auto const& g : gathered) {
     if (g) { parts.push_back(g->to_read_only()); }
   }
-  _num_partitions = 1;
-  _partition_boundaries.reset();
-  if (parts.empty()) { return; }
+  if (parts.empty()) { return {}; }
   std::vector<int> keys(column_order.size());
   std::iota(keys.begin(), keys.end(), 0);
   std::shared_ptr<::cucascade::data_batch> merged;
@@ -487,9 +491,8 @@ void sirius_physical_sort_sample::compute_distributed_boundaries(
 
   // 4. This rank's partition boundaries, from the part of the global sample inside its range.
   auto const parts_here = std::min<std::size_t>(num_parts, std::max<cudf::size_type>(1, hi - lo));
-  if (parts_here <= 1) { return; }
-  _partition_boundaries = evenly_spaced(global, lo, hi - lo, parts_here, stream, mr);
-  _num_partitions       = parts_here;
+  if (parts_here <= 1) { return {}; }
+  return {parts_here, evenly_spaced(global, lo, hi - lo, parts_here, stream, mr)};
 }
 
 }  // namespace op
