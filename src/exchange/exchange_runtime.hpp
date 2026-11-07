@@ -38,6 +38,8 @@ class exchange_service;
 constexpr std::uint32_t max_ring_frames = 1024;
 /// The largest frame: 1 GiB.
 constexpr std::size_t max_frame_bytes = std::size_t{1} << 30;
+/// The most TCP lanes a rank may have.
+constexpr std::uint32_t max_tcp_lanes = 64;
 
 /// Ring sizing: @p send_frames staging frames shared by all peers, and @p recv_frames_per_peer
 /// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. A write covers
@@ -46,11 +48,15 @@ constexpr std::size_t max_frame_bytes = std::size_t{1} << 30;
 /// keep two 128 MiB writes to a peer in flight. The sizing is fixed until credits are granted on
 /// demand (#2371).
 struct nixl_exchange_options {
-  std::size_t frame_bytes            = std::size_t{16} * 1024 * 1024;  // 16 MiB
-  std::uint32_t send_frames          = 32;
+  std::size_t frame_bytes   = std::size_t{16} * 1024 * 1024;  // 16 MiB
+  std::uint32_t send_frames = 32;
+  /// The frames a peer may have in flight to this rank. Over TCP lanes a write is one frame and a
+  /// peer keeps one frame per lane in flight, so fewer frames than lanes leave lanes idle.
   std::uint32_t recv_frames_per_peer = 16;
   host_staging staging               = host_staging::automatic;
   mnnvl_mode mnnvl                   = mnnvl_mode::automatic;
+  /// TCP lanes per rank (at most max_tcp_lanes); 0 shares 16 among the ranks on this host.
+  std::uint32_t tcp_lanes = 0;
   transport::options transport_options;
 };
 

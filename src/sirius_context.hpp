@@ -1079,6 +1079,7 @@ class SiriusContext : public ClientContextState {
   uint64_t exchange_frame_bytes_          = 0;
   uint32_t exchange_send_frames_          = 0;
   uint32_t exchange_recv_frames_per_peer_ = 0;
+  uint32_t exchange_tcp_lanes_            = 0;
   std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
   uint64_t distributed_queries_{0};
   /// Numbers skipped before the exchange connected (first, last), retired once it does.

@@ -1451,10 +1451,11 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
         params.exchange_mnnvl != exchange_mnnvl_ ||
         params.exchange_frame_bytes != exchange_frame_bytes_ ||
         params.exchange_send_frames != exchange_send_frames_ ||
+        params.exchange_tcp_lanes != exchange_tcp_lanes_ ||
         params.exchange_recv_frames_per_peer != exchange_recv_frames_per_peer_) {
       throw sirius::invalid_input_exception(
-        "sirius_exchange_peers, _rank, _host_staging, _mnnvl, _frame_bytes, _send_frames and "
-        "_recv_frames_per_peer cannot change once connected");
+        "sirius_exchange_peers, _rank, _host_staging, _mnnvl, _frame_bytes, _send_frames, "
+        "_recv_frames_per_peer and _tcp_lanes cannot change once connected");
     }
     return exchange_service_;
   }
@@ -1470,6 +1471,7 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   opts.mnnvl                = sirius::exchange::parse_mnnvl(params.exchange_mnnvl);
   opts.frame_bytes          = params.exchange_frame_bytes;
   opts.send_frames          = params.exchange_send_frames;
+  opts.tcp_lanes            = params.exchange_tcp_lanes;
   opts.recv_frames_per_peer = params.exchange_recv_frames_per_peer;
   // A batch with no room asks the GPU's downgrade executor for it, as a task would. terminate()
   // shuts the exchange down before the executors go.
@@ -1487,6 +1489,7 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   exchange_mnnvl_                = params.exchange_mnnvl;
   exchange_frame_bytes_          = params.exchange_frame_bytes;
   exchange_send_frames_          = params.exchange_send_frames;
+  exchange_tcp_lanes_            = params.exchange_tcp_lanes;
   exchange_recv_frames_per_peer_ = params.exchange_recv_frames_per_peer;
   for (auto const& [first, last] : std::exchange(skipped_before_connect_, {})) {
     exchange_service_->forget_range(first, last);

@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -119,6 +120,12 @@ class fabric {
    */
   [[nodiscard]] virtual std::uint64_t write(
     rank_t peer, std::size_t src, std::size_t dst, std::size_t bytes, std::string notification) = 0;
+
+  /// The most bytes one write to @p peer may carry, at least a frame. The engine thread calls it.
+  [[nodiscard]] virtual std::size_t max_write_bytes(rank_t /*peer*/) const
+  {
+    return std::numeric_limits<std::size_t>::max();
+  }
 
   /// Where write @p id stands; done or failed forgets it. The send-ring bytes may be reused
   /// once it is done.
