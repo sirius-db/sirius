@@ -66,10 +66,12 @@ sirius:
       quack_port: 9500          # rank i: 9500 + i
       exchange_port: 27000      # rank i: 27000 + i
     exchange:                   # the gateway gives every rank these
+      host_staging: auto        # auto: TCP lanes to ranks on other hosts
+      tcp_lanes: 0              # 0: 16 shared by the ranks of a host
       mnnvl: auto               # auto | require | off: NVLink between nodes (fabric memory)
       frame_bytes: 16777216
       send_frames: 32
-      recv_frames_per_peer: 16
+      recv_frames_per_peer: 16  # over TCP lanes, one frame in flight per lane
     ucx:                        # default: every transport on the GPU rail NICs, if any
       # tls: cuda_copy,cuda_ipc,tcp,self
       # net_devices: bond0      # without rail NICs: the interface that holds the rank's address
@@ -93,10 +95,12 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |
+| `exchange.host_staging` | `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` | `auto` | `sirius_gateway_exchange_host_staging`, which the gateway sets as `sirius_exchange_host_staging` on every rank. `auto` reaches ranks on other hosts over TCP lanes |
+| `exchange.tcp_lanes` | `SIRIUS_GATEWAY_EXCHANGE_TCP_LANES` | 0 | `sirius_gateway_exchange_tcp_lanes`: TCP lanes per rank, at most 64. 0 shares 16 among the ranks of a host, at least 2 each |
 | `exchange.mnnvl` | `SIRIUS_GATEWAY_EXCHANGE_MNNVL` | `auto` | `sirius_gateway_exchange_mnnvl`, which the gateway sets as `sirius_exchange_mnnvl` on every rank: ranks on other nodes of the NVLink domain exchange over NVLink |
 | `exchange.frame_bytes` | `SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES` | 16777216 | `sirius_gateway_exchange_frame_bytes`: the exchange's frame size |
 | `exchange.send_frames` | `SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES` | 32 | `sirius_gateway_exchange_send_frames`: send frames shared by a rank's peers |
-| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 16 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill |
+| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 16 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill; over TCP lanes, one frame in flight per lane |
 | `ucx.tls` | `UCX_TLS` | `all` on a host with GPU rail NICs, else `cuda_copy,cuda_ipc,tcp,self` | UCX transports; the default is `scripts/nixl_env.sh`'s |
 | `ucx.net_devices` | `UCX_NET_DEVICES` | the GPU rail NICs, else the interface of the rank's address | UCX devices, for example `mlx5_0:1`; `rails` asks for the rail NICs. The rail NICs are the active RDMA ports in no bond at the highest link speed (on GB200 nodes `mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1`). Notifications over RC on them let the exchange over NVLink reach full speed. Never list bond0 with them: UCX then hangs reaching a peer's bond0 address from a rail NIC |
 
