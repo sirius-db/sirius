@@ -6,14 +6,13 @@
 #   SLURM_CONF=... scripts/distributed_test_nixl_pairs.sh <node1>,<node2> [out dir]
 # Environment:
 #   RANKS_PER_NODE   ranks (GPUs) per node, default 4
+#   TEST             the Catch2 tag, default [nixl_pairs]; [nixl_bandwidth] runs an all-to-all
 #   PARTITION        Slurm partition, default nvidia-part
 #   SECONDS_PER_PHASE  default 1.5
 #   SIRIUS_EXCHANGE_MNNVL, SIRIUS_EXCHANGE_FRAME_BYTES, SIRIUS_EXCHANGE_SEND_FRAMES,
-#   SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER   passed to every rank (defaults: require, 16 MiB, 32, 8)
-#   UCX_TLS, UCX_NET_DEVICES  default: what a gateway's ranks use, scripts/nixl_env.sh's UCX_TLS
-#                    (cuda_ipc carries the data, tcp the notifications) on bond0. With UCX_TLS=all,
-#                    give the rail NICs (mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1): UCX otherwise tries
-#                    to reach the peer's bond0 address from a rail NIC and hangs.
+#   SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER   passed to every rank (defaults: require, 16 MiB, 32, 16)
+#   UCX_TLS, UCX_NET_DEVICES  default: scripts/nixl_env.sh's, as a gateway's ranks: UCX_TLS=all on
+#                    the node's GPU rail NICs; without rail NICs, tcp for notifications on bond0.
 # Needs a build configured with -DSIRIUS_WITH_NIXL=ON. Never run it on nodes you use outside Slurm.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -28,8 +27,10 @@ if [[ ${1:-} == --rank ]]; then
   # Sirius writes its log to ./log: one folder per rank.
   mkdir -p "$out/rank$rank" && cd "$out/rank$rank"
   source "$here/nixl_env.sh"
+  export UCX_NET_DEVICES=${UCX_NET_DEVICES:-bond0}
+  echo "rank $rank on $(hostname): UCX_TLS=$UCX_TLS UCX_NET_DEVICES=$UCX_NET_DEVICES" >> "$out/ucx.txt"
   exec timeout -s KILL "${RANK_TIMEOUT:-900}" "$root/build/release/test/cpp/sirius_unittest" \
-    "[nixl_pairs]" > "$out/rank$rank.log" 2>&1
+    "${TEST:-[nixl_pairs]}" > "$out/rank$rank.log" 2>&1
 fi
 
 nodes=${1:?usage: distributed_test_nixl_pairs.sh <node1>,<node2> [out dir]}
@@ -48,9 +49,7 @@ mkdir -p "$out"
 export SIRIUS_EXCHANGE_PEERS=$peers
 export SIRIUS_EXCHANGE_PAIRS_SECONDS=${SECONDS_PER_PHASE:-1.5}
 export SIRIUS_EXCHANGE_MNNVL=${SIRIUS_EXCHANGE_MNNVL:-require}
-export UCX_NET_DEVICES=${UCX_NET_DEVICES:-bond0}
 export UCX_PROTO_INFO=y
-source "$here/nixl_env.sh"
 {
   echo "nodes: $nodes, $per_node ranks per node, build $(git -C "$root" rev-parse --short HEAD)"
   env | grep -E '^(SIRIUS_EXCHANGE|UCX_)' | sort
