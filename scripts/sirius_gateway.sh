@@ -31,6 +31,9 @@ Environment:
   SIRIUS_GATEWAY_JOIN_WAIT          sets sirius_gateway_join_wait
   SIRIUS_GATEWAY_ALLOW_JOIN         1 lets ranks register themselves (default: 1 with 0 ranks)
   SIRIUS_GATEWAY_GPUS               with N ranks, each rank's GPU (e.g. 0,0)
+  SIRIUS_GATEWAY_EXCHANGE_MNNVL, SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES,
+  SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES, SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER
+                                    set sirius_gateway_exchange_*, which every rank takes
 
 Needs the gateway build (make -C gateway release) and a Sirius build with NIXL.
 USAGE
@@ -62,6 +65,14 @@ fi
 if ! [[ ${SIRIUS_GATEWAY_MIN_RANKS:-1} =~ ^[0-9]+$ && ${SIRIUS_GATEWAY_JOIN_WAIT:-0} =~ ^[0-9]+$ &&
   ${SIRIUS_GATEWAY_GPUS:-} =~ ^[0-9,]*$ ]]; then
   echo "SIRIUS_GATEWAY_MIN_RANKS and SIRIUS_GATEWAY_JOIN_WAIT take a number, SIRIUS_GATEWAY_GPUS a list such as 0,1" >&2
+  exit 2
+fi
+
+if ! [[ ${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-auto} =~ ^(auto|require|off)$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES:-16777216} =~ ^[0-9]+$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES:-32} =~ ^[0-9]+$ &&
+  ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-8} =~ ^[0-9]+$ ]]; then
+  echo "SIRIUS_GATEWAY_EXCHANGE_MNNVL takes auto, require or off; _FRAME_BYTES, _SEND_FRAMES and _RECV_FRAMES_PER_PEER a number" >&2
   exit 2
 fi
 
@@ -153,6 +164,10 @@ init="$logs/gateway.init.sql"
   echo "SET GLOBAL sirius_gateway_log_dir = '$logs';"
   echo "SET GLOBAL sirius_gateway_state_dir = '$state';"
   echo "SET GLOBAL sirius_gateway_min_ranks = ${SIRIUS_GATEWAY_MIN_RANKS:-1};"
+  echo "SET GLOBAL sirius_gateway_exchange_mnnvl = '${SIRIUS_GATEWAY_EXCHANGE_MNNVL:-auto}';"
+  echo "SET GLOBAL sirius_gateway_exchange_frame_bytes = ${SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES:-16777216};"
+  echo "SET GLOBAL sirius_gateway_exchange_send_frames = ${SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES:-32};"
+  echo "SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-8};"
   echo "SET GLOBAL sirius_gateway_allow_join = $([ "$allow_join" = 1 ] && echo true || echo false);"
   [ -z "${SIRIUS_GATEWAY_JOIN_WAIT:-}" ] || echo "SET GLOBAL sirius_gateway_join_wait = $SIRIUS_GATEWAY_JOIN_WAIT;"
   # replay_saved: a restarted gateway replays the DDL saved in the state dir, instead of

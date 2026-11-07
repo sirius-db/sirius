@@ -1441,10 +1441,14 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   std::lock_guard lock{exchange_mutex_};
   if (exchange_service_) {
     if (params.exchange_peers != exchange_peers_ || params.exchange_rank != exchange_rank_ ||
-        params.exchange_host_staging != exchange_host_staging_) {
+        params.exchange_host_staging != exchange_host_staging_ ||
+        params.exchange_mnnvl != exchange_mnnvl_ ||
+        params.exchange_frame_bytes != exchange_frame_bytes_ ||
+        params.exchange_send_frames != exchange_send_frames_ ||
+        params.exchange_recv_frames_per_peer != exchange_recv_frames_per_peer_) {
       throw sirius::invalid_input_exception(
-        "sirius_exchange_peers, sirius_exchange_rank and sirius_exchange_host_staging cannot "
-        "change once connected");
+        "sirius_exchange_peers, _rank, _host_staging, _mnnvl, _frame_bytes, _send_frames and "
+        "_recv_frames_per_peer cannot change once connected");
     }
     return exchange_service_;
   }
@@ -1456,7 +1460,11 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   auto* gpu    = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
   auto* host   = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
   sirius::exchange::nixl_exchange_options opts;
-  opts.staging = sirius::exchange::parse_host_staging(params.exchange_host_staging);
+  opts.staging              = sirius::exchange::parse_host_staging(params.exchange_host_staging);
+  opts.mnnvl                = sirius::exchange::parse_mnnvl(params.exchange_mnnvl);
+  opts.frame_bytes          = params.exchange_frame_bytes;
+  opts.send_frames          = params.exchange_send_frames;
+  opts.recv_frames_per_peer = params.exchange_recv_frames_per_peer;
   // A batch with no room asks the GPU's downgrade executor for it, as a task would. terminate()
   // shuts the exchange down before the executors go.
   opts.transport_options.request_room = [&downgrade = get_downgrade_executor(gpu->get_id()),
@@ -1467,9 +1475,13 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   exchange_service_ = sirius::exchange::make_nixl_exchange(
     params.exchange_rank, params.exchange_peers, *gpu, host, opts);
   sirius::exchange::note_exchange_joined();
-  exchange_peers_        = params.exchange_peers;
-  exchange_rank_         = params.exchange_rank;
-  exchange_host_staging_ = params.exchange_host_staging;
+  exchange_peers_                = params.exchange_peers;
+  exchange_rank_                 = params.exchange_rank;
+  exchange_host_staging_         = params.exchange_host_staging;
+  exchange_mnnvl_                = params.exchange_mnnvl;
+  exchange_frame_bytes_          = params.exchange_frame_bytes;
+  exchange_send_frames_          = params.exchange_send_frames;
+  exchange_recv_frames_per_peer_ = params.exchange_recv_frames_per_peer;
   for (auto const& [first, last] : std::exchange(skipped_before_connect_, {})) {
     exchange_service_->forget_range(first, last);
   }

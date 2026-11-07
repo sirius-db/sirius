@@ -234,6 +234,15 @@ struct operator_params {
   uint32_t exchange_rank = 0;
   /// Distributed execution: "auto", "always" or "never" host-stage the exchange's writes to peers.
   std::string exchange_host_staging = "auto";
+  /// Distributed execution: "auto", "require" or "off" put the exchange's rings in fabric memory,
+  /// so that GPUs on other nodes of the NVLink domain write them over NVLink.
+  std::string exchange_mnnvl = "auto";
+  /// Distributed execution: the exchange's frame size; a positive multiple of 256.
+  uint64_t exchange_frame_bytes = 16ull << 20;
+  /// Distributed execution: send frames, shared by all peers.
+  uint32_t exchange_send_frames = 32;
+  /// Distributed execution: receive frames (credits) each peer may fill.
+  uint32_t exchange_recv_frames_per_peer = 8;
 
   /// Nonzero: the number of the next distributed query, set by a gateway that numbers every
   /// rank's queries. Must increase; zero numbers queries per process.
