@@ -380,9 +380,11 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   A lost peer or a failed transport is fail-stop: every later distributed query fails, saying
   the transport failed earlier, and nothing reconnects. To recover, restart every rank: a
   restarted rank alone cannot reconnect to peers whose transport failed, and its
-  `SET sirius_exchange_rank` fails after the 2-minute connect timeout (#2373).
-- **Hosts:** every run so far used one host. Ranks on several hosts, and networks without RDMA,
-  are untested (#2372).
+  `SET sirius_exchange_rank` fails after the 2-minute connect timeout (#2373). The
+  [gateway](distributed-gateway.md) does this restart.
+- **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX pinned
+  to TCP by hand (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface).
+  More than two hosts, and RDMA between hosts, are untested (#2372).
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
 - **Ring memory:** the rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU (192 MiB at 2 ranks,
