@@ -8,5 +8,6 @@ target_sources(
           fabric.cpp
           messages.cpp
           nixl_fabric.cpp
+          rank_control.cpp
           transport.cpp
           wire.cpp)
