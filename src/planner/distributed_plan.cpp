@@ -22,6 +22,7 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/wire.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/distributed/bloom_all_gather_merge.hpp"
 #include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/scan_plan.hpp"
@@ -219,10 +220,9 @@ struct rewriter {
     auto const first = exchange::make_stream_id(query, next_stream);
     next_stream += static_cast<std::uint32_t>(join.dynamic_filter_plan().admitted_keys().size());
     install_filter_merge(join,
-                         {.service      = service,
-                          .first_stream = first,
-                          .gpu          = gpu,
-                          .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
+                         std::make_shared<op::bloom_all_gather_merge>(
+                           service, first, join.dynamic_filter_plan().admitted_keys().size(), *gpu),
+                         std::clamp(build_rows, min_bloom_keys, max_bloom_keys));
     shape += "F";
   }
 
@@ -635,9 +635,11 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
 }
 
 void install_filter_merge(op::sirius_physical_hash_join& join,
-                          op::dynamic_filter_publish_plan::distributed_merge merge)
+                          std::shared_ptr<op::cross_rank_filter_merge> merge,
+                          std::size_t bloom_keys)
 {
-  join.set_distributed_dynamic_filters(std::move(merge));
+  join.dynamic_filter_session().set_cross_rank_merge(
+    std::move(merge), op::merged_bloom_policy(join.dynamic_filter_plan().policy(), bloom_keys));
   // finish_input() never waits: a publication not yet started leaves each key's merge, and one
   // already running completes on its own.
   join.children[1]->add_finalize_listener(

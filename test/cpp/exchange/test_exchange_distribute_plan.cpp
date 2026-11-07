@@ -359,8 +359,9 @@ TEST_CASE("distribute_plan has a merged join's build CONCAT close its publicatio
     for (auto& p : plans) {
       auto* join = find(*p, T::HASH_JOIN);
       REQUIRE(join);
-      REQUIRE(
-        join->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().distributed());
+      REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>()
+                .dynamic_filter_plan()
+                .cross_rank_merge());
       CHECK(closed_by_build_finalize(*join));
     }
   }
@@ -413,7 +414,7 @@ TEST_CASE("distribute_plan drops a right semi or anti join's early build publica
     REQUIRE(join);
     auto& hash_join = join->Cast<sirius::op::sirius_physical_hash_join>();
     // Nothing merges this join's filters, and its targets expect none before it runs.
-    CHECK(hash_join.dynamic_filter_plan().distributed() == nullptr);
+    CHECK(hash_join.dynamic_filter_plan().cross_rank_merge() == nullptr);
     auto const& targets = hash_join.dynamic_filter_plan().probe_targets();
     REQUIRE_FALSE(targets.empty());
     for (auto const& target : targets) {

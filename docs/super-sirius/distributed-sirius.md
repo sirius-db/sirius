@@ -241,7 +241,8 @@ Running such an operator on each rank's share would return a wrong answer.
 
 After a join's exchange, a rank's build holds only its share of the keys, so a filter from it
 alone would drop rows another rank's build matches. In distributed mode a publishing join
-carries a `distributed_merge`. Every rank then:
+carries a `cross_rank_filter_merge` (`bloom_all_gather_merge` in `src/op/distributed/`) and a
+publication policy every rank shares (`merged_bloom_policy`). Every rank then:
 
 1. builds a Bloom of one size for each key, from the plan's build estimate clamped to
    [2^16, 2^30] keys;
@@ -263,6 +264,11 @@ that key at once instead of waiting out the timeout. It does so as soon as its b
 (a finalize listener on the build `CONCAT` closes the join's publication), before its probe side runs, and without
 waiting (`leave_all_gather`): a rank holding build rows holds its probe side until the merge
 completes, and that probe side may be what the other rank's probe waits on.
+
+These rules are the publication policy that `merged_bloom_policy()` gives a merged join:
+`bloom_only` (no IN-lists), `fixed_bloom_keys` (every rank's Bloom has the same size, uncapped) and
+`publish_when_empty_or_drained` (an empty build or drained targets still take part). With one
+rank, all three keep their defaults and the publisher behaves as on one GPU.
 
 A join whose build is broadcast publishes from its whole build, as on one GPU, with nothing to
 merge. A join that hashes both sides and whose estimated build is under 2^14 rows publishes no
@@ -380,5 +386,5 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/op/sirius_physical_exchange_{sink,source}.*` | The operators |
 | `src/op/distributed/sirius_physical_distributed_sort_sample.*` | Distributed sampling |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check; each rank's share of a table's files, and the scans no rank can split |
-| `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | Bloom merge across ranks |
+| `src/op/dynamic_filter/cross_rank_filter_merge.hpp`, `src/op/distributed/bloom_all_gather_merge.*` | The publisher's merge interface; the Bloom merge across ranks |
 | `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers |
