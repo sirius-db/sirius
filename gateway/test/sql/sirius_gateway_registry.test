@@ -45,10 +45,14 @@ SELECT name, state, cluster FROM sirius_gateway_add_rank('127.0.0.1:19910', exch
 statement ok
 FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27211, token := 'regtoken', name := 'b');
 
-statement error
+# A node registers its rank again after each restart: the same rank again changes nothing.
+statement ok
 FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27211, token := 'regtoken', name := 'b');
+
+statement error
+FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27299, token := 'regtoken', name := 'b');
 ----
-already registered
+a different rank named b is already registered
 
 # Every rank joins as a new process: the one seen when it was added is asked to exit first.
 query ITTT

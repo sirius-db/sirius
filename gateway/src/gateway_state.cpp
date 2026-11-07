@@ -11,6 +11,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <signal.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -73,8 +74,9 @@ bool changes_state(std::string const& sql)
 
 /// Whether @p sql only reads the catalog: SELECTs whose every table, at any depth, is a
 /// `duckdb_*()`, `pragma_*()` or `sirius_rank_info()` table function or one of the statement's
-/// top-level CTEs. Quack sends such reads on every client's ATTACH.
-bool reads_only_catalog(std::string const& sql)
+/// top-level CTEs. Quack sends such reads on every client's ATTACH. @p touches is set when one of
+/// those functions is read, which `SELECT 1` does not.
+bool reads_only_catalog(std::string const& sql, bool* touches = nullptr)
 {
   using namespace duckdb;
   Parser parser{ParserOptions::Builtin()};
@@ -105,8 +107,11 @@ bool reads_only_catalog(std::string const& sql)
             f.GetExpressionClass() == ExpressionClass::FUNCTION
               ? StringUtil::Lower(f.Cast<FunctionExpression>().FunctionName().GetIdentifierName())
               : std::string{};
-          only = only && (StringUtil::StartsWith(name, "duckdb_") ||
-                          StringUtil::StartsWith(name, "pragma_") || name == "sirius_rank_info");
+          bool const catalog = StringUtil::StartsWith(name, "duckdb_") ||
+                               StringUtil::StartsWith(name, "pragma_") ||
+                               name == "sirius_rank_info";
+          only = only && catalog;
+          if (catalog && touches) { *touches = true; }
           break;
         }
         case TableReferenceType::JOIN:
@@ -132,6 +137,19 @@ bool reads_only_catalog(std::string const& sql)
     if (!only) { return false; }
   }
   return true;
+}
+
+std::shared_ptr<rank_result> collect(duckdb::QueryResult& query)
+{
+  auto result   = std::make_shared<rank_result>();
+  result->types = query.GetTypes();
+  for (auto const& name : query.GetNames()) {
+    result->names.push_back(name.GetIdentifierName());
+  }
+  while (auto chunk = query.Fetch()) {
+    if (chunk->size() > 0) { result->chunks.push_back(std::move(chunk)); }
+  }
+  return result;
 }
 
 /// The rank another rank's error names as the one that failed first, if any: peers see a rank's
@@ -287,6 +305,22 @@ char const* to_string(cluster_state state)
   return "unknown";
 }
 
+void read_settings(ClientContext& context, start_options& options)
+{
+  options.duckdb_binary    = setting(context, "sirius_gateway_duckdb_binary", "");
+  options.sirius_extension = setting(context, "sirius_gateway_sirius_extension", "");
+  options.rank_init        = setting(context, "sirius_gateway_rank_init", "");
+  options.rank_launcher    = setting(context, "sirius_gateway_rank_launcher", "");
+  options.log_dir          = setting(context, "sirius_gateway_log_dir", "");
+  options.boot_id_sql      = setting(context, "sirius_gateway_rank_boot_id_sql", "");
+  options.exit_sql         = setting(context, "sirius_gateway_rank_exit_sql", "");
+  if (options.log_dir.empty()) {
+    options.log_dir =
+      (std::filesystem::temp_directory_path() / ("sirius_gateway_" + std::to_string(getpid())))
+        .string();
+  }
+}
+
 void gateway_state::fail_locked(std::string reason)
 {
   if (state_ == cluster_state::failed) { return; }
@@ -335,6 +369,7 @@ void gateway_state::start(ClientContext& context, start_options options)
   {
     std::lock_guard lock{state_mutex_};
     ddl_log_.clear();
+    auto_start_ = false;
   }
   start_locked(context, std::move(options));
 }
@@ -344,8 +379,9 @@ void gateway_state::stop(ClientContext& context)
   turn t{*this, context};
   stop_locked();
   std::lock_guard lock{state_mutex_};
-  state_  = cluster_state::stopped;
-  reason_ = "stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()";
+  state_      = cluster_state::stopped;
+  reason_     = "stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()";
+  auto_start_ = false;
 }
 
 void gateway_state::restart(ClientContext& context)
@@ -581,8 +617,15 @@ void gateway_state::add_rank(ClientContext& context, rank_spec spec)
   turn t{*this, context};
   {
     std::lock_guard lock{state_mutex_};
-    if (find_registered(spec.name)) {
-      throw InvalidInputException("a rank named %s is already registered", spec.name);
+    if (auto const* known = find_registered(spec.name)) {
+      // A node registers its rank again after every restart: the same rank is no change.
+      if (known->quack_host == spec.quack_host && known->quack_port == spec.quack_port &&
+          known->exchange_host == spec.exchange_host &&
+          known->exchange_port == spec.exchange_port && known->token == spec.token &&
+          known->fingerprint == spec.fingerprint) {
+        return;
+      }
+      throw InvalidInputException("a different rank named %s is already registered", spec.name);
     }
     registered_.push_back(spec);
   }
@@ -658,14 +701,52 @@ void gateway_state::recover_locked(ClientContext& context)
   }
 }
 
+void gateway_state::auto_start_locked(ClientContext& context)
+{
+  std::size_t registered = 0;
+  {
+    std::lock_guard lock{state_mutex_};
+    if (!auto_start_) { return; }
+    registered = registered_.size();
+  }
+  if (registered == 0) { return; }
+  // Fail rather than wait: the rank that is missing registers through this same turn.
+  uint64_t const min_ranks = std::stoull(setting(context, "sirius_gateway_min_ranks", "1"));
+  if (registered < min_ranks) {
+    throw IOException(
+      "the gateway starts once %d ranks are registered (sirius_gateway_min_ranks); %d are",
+      min_ranks,
+      static_cast<uint64_t>(registered));
+  }
+  start_options options;
+  read_settings(context, options);
+  {
+    std::lock_guard lock{state_mutex_};
+    options_ = std::move(options);
+  }
+  // Also after a start that failed, which leaves no ranks: replay what ran before it.
+  recover_locked(context);
+}
+
 std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
                                                        std::string const& sql,
                                                        bool replay)
 {
+  bool touches = false;
+  if (ranks_.empty() && !replay && reads_only_catalog(sql, &touches) && touches) {
+    // No ranks run: the gateway answers a client's ATTACH from its own catalog, so that a node
+    // can attach to register its rank, and attaching starts no ranks.
+    Connection local{db_};
+    auto read = local.Query(sql);
+    if (read->HasError()) { read->ThrowError(); }
+    return collect(*read);
+  }
+  if (ranks_.empty() && !replay) { auto_start_locked(context); }
   if (ranks_.empty()) {
     std::lock_guard lock{state_mutex_};
     throw IOException(reason_.empty()
-                        ? "the gateway has no ranks: CALL sirius_gateway_start(<ranks>) first"
+                        ? "the gateway has no ranks: CALL sirius_gateway_start(<ranks>), "
+                          "or register ranks with sirius_gateway_add_rank"
                         : reason_);
   }
   bool failed = false;
@@ -795,16 +876,7 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     if (!replay && changes_state(sql)) { ddl_log_.push_back(sql); }
   }
 
-  auto result   = std::make_shared<rank_result>();
-  auto& rank0   = *outcomes[0].result;
-  result->types = rank0.GetTypes();
-  for (auto const& name : rank0.GetNames()) {
-    result->names.push_back(name.GetIdentifierName());
-  }
-  while (auto chunk = rank0.Fetch()) {
-    if (chunk->size() > 0) { result->chunks.push_back(std::move(chunk)); }
-  }
-  return result;
+  return collect(*outcomes[0].result);
 }
 
 gateway_state::fan_out_policy gateway_state::client_policy(ClientContext& context)
