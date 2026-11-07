@@ -130,6 +130,14 @@ class exchange_service {
   std::map<stream_id, std::vector<held>> _held;
   std::set<stream_id> _detached;
   std::map<distributed_query_id, std::exception_ptr> _aborted;
+  /// What each live query sent to and received from peers; logged when it retires.
+  struct traffic {
+    std::uint64_t sent_bytes{0};
+    std::uint64_t sent_batches{0};
+    std::uint64_t received_bytes{0};
+    std::uint64_t received_batches{0};
+  };
+  std::map<distributed_query_id, traffic> _traffic;
   /// Every query from 1 to this one has retired here, and so has each range in _retired_above.
   distributed_query_id _retired{0};
   /// Disjoint, non-adjacent ranges above _retired + 1: first query to last query, both retired.
