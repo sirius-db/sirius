@@ -75,6 +75,7 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                         "state",
                         "cluster",
                         "error",
+                        "last_error",
                         "last_query_id",
                         "running_query_id",
                         "queued"};
@@ -82,6 +83,7 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                         LogicalType::VARCHAR,
                         LogicalType::BOOLEAN,
                         LogicalType::BIGINT,
+                        LogicalType::VARCHAR,
                         LogicalType::VARCHAR,
                         LogicalType::VARCHAR,
                         LogicalType::VARCHAR,
@@ -106,6 +108,7 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                           Value(r.state),
                           Value(sirius_gateway::to_string(r.cluster)),
                           r.error.empty() ? Value(LogicalType::VARCHAR) : Value(r.error),
+                          r.last_error.empty() ? Value(LogicalType::VARCHAR) : Value(r.last_error),
                           last,
                           running,
                           queued});
@@ -119,8 +122,9 @@ unique_ptr<FunctionData> start_bind(ClientContext& context,
                                     vector<Identifier>& names)
 {
   sirius_gateway::start_options options;
-  options.ranks = input.inputs[0].GetValue<uint32_t>();
-  auto list     = [](Value const& value) {
+  options.ranks     = input.inputs[0].GetValue<uint32_t>();
+  bool replay_saved = false;
+  auto list         = [](Value const& value) {
     std::vector<std::string> items;
     if (value.IsNull() || value.ToString().empty()) { return items; }
     for (auto item : StringUtil::Split(value.ToString(), ',')) {
@@ -133,17 +137,17 @@ unique_ptr<FunctionData> start_bind(ClientContext& context,
     auto const key = StringUtil::Lower(name.GetIdentifierName());
     if (key == "gpus") {
       options.gpus = list(value);
-    } else if (key == "hosts") {
-      options.hosts = list(value);
     } else if (key == "exchange_base_port") {
       options.exchange_base_port = value.GetValue<uint32_t>();
     } else if (key == "quack_base_port") {
       options.quack_base_port = value.GetValue<uint32_t>();
+    } else if (key == "replay_saved") {
+      replay_saved = !value.IsNull() && value.GetValue<bool>();
     }
   }
   sirius_gateway::read_settings(context, options);
   auto& gateway = gateway_of(input);
-  gateway.start(context, std::move(options));
+  gateway.start(context, std::move(options), replay_saved);
   return status_rows(gateway, types, names);
 }
 
@@ -301,7 +305,7 @@ void route_function(DataChunk& args, ExpressionState& state, Vector& result)
 {
   Value allow;
   auto const allow_join =
-    state.GetContext().TryGetCurrentSetting("sirius_gateway_allow_remote_join", allow) &&
+    state.GetContext().TryGetCurrentSetting("sirius_gateway_allow_join", allow) &&
     !allow.IsNull() && allow.GetValue<bool>();
   BinaryExecutor::Execute<string_t, string_t, string_t>(
     args.data[0], args.data[1], result, args.size(), [&](string_t, string_t sql) {
@@ -325,11 +329,12 @@ void LoadInternal(ExtensionLoader& loader)
   auto start = add("sirius_gateway_start", {}, scan_rows, start_bind);
   start.GetSignature().AddParameter("ranks", LogicalType::INTEGER);
   start.GetSignature().AddKeywordOnly("gpus", LogicalType::VARCHAR, Value(""));
-  start.GetSignature().AddKeywordOnly("hosts", LogicalType::VARCHAR, Value(""));
   start.GetSignature().AddKeywordOnly(
     "exchange_base_port", LogicalType::INTEGER, Value::INTEGER(27000));
   start.GetSignature().AddKeywordOnly(
     "quack_base_port", LogicalType::INTEGER, Value::INTEGER(9500));
+  // Replay the DDL log saved in sirius_gateway_state_dir instead of discarding it.
+  start.GetSignature().AddKeywordOnly("replay_saved", LogicalType::BOOLEAN, Value::BOOLEAN(false));
   loader.RegisterFunction(start);
   auto add_rank = add("sirius_gateway_add_rank", {LogicalType::VARCHAR}, scan_rows, add_rank_bind);
   add_rank.GetSignature().AddKeywordOnly("exchange_port", LogicalType::INTEGER, Value::INTEGER(0));
@@ -377,11 +382,6 @@ void LoadInternal(ExtensionLoader& loader)
                             "SQL each rank's session runs after the exchange settings",
                             LogicalType::VARCHAR,
                             Value(""));
-  config.AddExtensionOption(
-    "sirius_gateway_rank_launcher",
-    "Program that starts a rank on another host: <host> <gpu> <quack port> <duckdb> <init file>",
-    LogicalType::VARCHAR,
-    Value(""));
   config.AddExtensionOption("sirius_gateway_log_dir",
                             "Directory for rank init files and logs; empty uses a temporary one",
                             LogicalType::VARCHAR,
@@ -395,16 +395,26 @@ void LoadInternal(ExtensionLoader& loader)
     LogicalType::UBIGINT,
     Value::UBIGINT(3600));
   config.AddExtensionOption(
-    "sirius_gateway_allow_remote_join",
+    "sirius_gateway_allow_join",
     "Let clients call sirius_gateway_add_rank and sirius_gateway_drop_rank, "
     "so that ranks register themselves",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(false));
   config.AddExtensionOption("sirius_gateway_min_ranks",
                             "Registered ranks the gateway waits for before the first statement "
-                            "starts them; until then statements fail",
+                            "starts them",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(1));
+  config.AddExtensionOption("sirius_gateway_join_wait",
+                            "Seconds a statement waits for sirius_gateway_min_ranks ranks to "
+                            "register before it fails; 0 fails at once",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(600));
+  config.AddExtensionOption("sirius_gateway_state_dir",
+                            "Directory where the gateway keeps its DDL log (ddl.sql) across its "
+                            "own restarts; empty keeps it in memory only",
+                            LogicalType::VARCHAR,
+                            Value(""));
   config.AddExtensionOption("sirius_gateway_cancel_grace",
                             "Seconds a cancelled statement may keep running on a rank before the "
                             "gateway kills the rank and restarts every rank",
@@ -415,6 +425,11 @@ void LoadInternal(ExtensionLoader& loader)
                             "rank restarts",
                             LogicalType::VARCHAR,
                             Value("SELECT boot_id FROM sirius_rank_info()"));
+  config.AddExtensionOption("sirius_gateway_rank_joined_sql",
+                            "Query that says whether a registered rank's process has joined a set "
+                            "of ranks, so must restart to join another; empty restarts every time",
+                            LogicalType::VARCHAR,
+                            Value("SELECT joined FROM sirius_rank_info()"));
   config.AddExtensionOption("sirius_gateway_rank_exit_sql",
                             "Statement that ends a registered rank's process, for its launcher to "
                             "start it again",

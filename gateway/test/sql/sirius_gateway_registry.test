@@ -26,6 +26,11 @@ SET GLOBAL sirius_gateway_rank_boot_id_sql = 'SELECT id FROM boot';
 statement ok
 SET GLOBAL sirius_gateway_rank_exit_sql = 'UPDATE boot SET id = id || ''+''';
 
+# Every process counts as joined, so every join restarts it; sirius_gateway_join.test covers
+# processes that never joined.
+statement ok
+SET GLOBAL sirius_gateway_rank_joined_sql = '';
+
 statement ok
 FROM sirius_gateway_test_serve(19910, 'regtoken', 'CREATE TABLE boot AS SELECT ''a'' AS id');
 
@@ -49,10 +54,24 @@ FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27211, token :=
 statement ok
 FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27211, token := 'regtoken', name := 'b');
 
+# Another rank under the same name replaces it, once the new one answers.
 statement error
-FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27299, token := 'regtoken', name := 'b');
+FROM sirius_gateway_add_rank('127.0.0.1:19919', exchange_port := 27211, token := 'regtoken', name := 'b');
 ----
-a different rank named b is already registered
+did not answer
+
+query T
+SELECT uri FROM sirius_gateway_status() WHERE name = 'b';
+----
+quack:127.0.0.1:19911
+
+query TI
+SELECT state, count(*) FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27299, token := 'regtoken', name := 'b') GROUP BY ALL;
+----
+registered	2
+
+statement ok
+FROM sirius_gateway_add_rank('127.0.0.1:19911', exchange_port := 27211, token := 'regtoken', name := 'b');
 
 # Every rank joins as a new process: the one seen when it was added is asked to exit first.
 query ITTT

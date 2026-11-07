@@ -19,6 +19,10 @@ SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
 statement ok
 SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway';
 
+# With no ranks, a statement waits sirius_gateway_join_wait seconds for some to register.
+statement ok
+SET GLOBAL sirius_gateway_join_wait = 0;
+
 statement error
 FROM sirius_gateway_run('SELECT 1');
 ----
