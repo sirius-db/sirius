@@ -25,8 +25,9 @@ host_staging parse_host_staging(std::string_view value)
   if (value == "auto") { return host_staging::automatic; }
   if (value == "always") { return host_staging::always; }
   if (value == "never") { return host_staging::never; }
+  if (value == "remote") { return host_staging::remote; }
   throw sirius::invalid_input_exception(
-    "sirius_exchange_host_staging must be auto, always or never, not '{}'", value);
+    "sirius_exchange_host_staging must be auto, always, never or remote, not '{}'", value);
 }
 
 mnnvl_mode parse_mnnvl(std::string_view value)
@@ -54,6 +55,7 @@ char const* describe(path p) noexcept
     case path::nixl: return "NIXL";
     case path::nvlink_fabric: return "NIXL over the NVLink fabric";
     case path::shared_memory: return "host-staged through pinned shared memory";
+    case path::tcp_lanes: return "host-staged over TCP lanes";
   }
   return "?";
 }
@@ -77,9 +79,13 @@ path choose_path(endpoint const& me,
       me.domain.to_string(),
       peer.domain.to_string());
   }
-  if (staging == host_staging::always) { return path::shared_memory; }
+  bool const same_host = me.boot_id == peer.boot_id;
+  if (staging == host_staging::remote) { return path::tcp_lanes; }
+  // Shared memory reaches only this host.
+  if (staging == host_staging::always) { return same_host ? path::shared_memory : path::tcp_lanes; }
   if (fabric) { return path::nvlink_fabric; }
   if (staging == host_staging::never) { return path::nixl; }
+  if (!same_host) { return path::tcp_lanes; }
   return peer_access ? path::nixl : path::shared_memory;
 }
 

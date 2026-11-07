@@ -180,6 +180,15 @@ TEST_CASE("one write per frame when a peer has one credit", "[exchange][transpor
   CHECK(c.hub.largest_write() == 64 * KiB);
 }
 
+TEST_CASE("one write per frame to a peer whose fabric takes a frame at a time",
+          "[exchange][transport]")
+{
+  // As over TCP lanes: 8 credits per peer would allow writes of 4 frames.
+  cluster c(2, 16, 8, {.max_write_bytes = 64 * KiB}, env().host);
+  all_to_all(c, {1, 2}, 3, 30'000);
+  CHECK(c.hub.largest_write() == 64 * KiB);
+}
+
 TEST_CASE("a write past the frames a peer holds fails the receiver", "[exchange][transport]")
 {
   // Rank 1 holds rank 0's receive frames 0 to 3; frames 2 to 4 are not all its own.
@@ -613,13 +622,15 @@ TEST_CASE("a malformed notification from a peer fails the receiver", "[exchange]
   }
 }
 
-TEST_CASE("sirius_exchange_host_staging takes auto, always or never", "[exchange][transport]")
+TEST_CASE("sirius_exchange_host_staging takes auto, always, never or remote",
+          "[exchange][transport]")
 {
   using sirius::exchange::host_staging;
   using sirius::exchange::parse_host_staging;
   CHECK(parse_host_staging("auto") == host_staging::automatic);
   CHECK(parse_host_staging("always") == host_staging::always);
   CHECK(parse_host_staging("never") == host_staging::never);
+  CHECK(parse_host_staging("remote") == host_staging::remote);
   CHECK_THROWS_AS(parse_host_staging(""), sirius::invalid_input_exception);
   CHECK_THROWS_AS(parse_host_staging("Always"), sirius::invalid_input_exception);
 }
