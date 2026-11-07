@@ -1070,6 +1070,7 @@ TEST_CASE_METHOD(ducklake_fixture,
     auto cancelled = static_cast<size_t>(sirius::transparent::late_failure_condition::cancelled);
     CHECK(after.late_failure_no_replay[cancelled] == before.late_failure_no_replay[cancelled] + 1);
   }
+  CHECK(after.executions - before.executions == (explicit_entry ? 0 : 1));
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (replayed ? 1 : 0));
   counters->parquet_phase_for_testing  = {};
   runtime->cpu_replay_hook_for_testing = {};
@@ -2028,7 +2029,6 @@ TEST_CASE("Production DuckLake mixed scans execute and recover across two GPUs",
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit',0)");
   auto use_dv = GENERATE(false, true);
-  INFO(use_dv);
   run(std::string("CALL lake.set_option('write_deletion_vectors',") + (use_dv ? "true" : "false") +
       ")");
   run("CREATE TABLE lake.q(id BIGINT,value BIGINT)");
@@ -2070,9 +2070,8 @@ TEST_CASE("Production DuckLake mixed scans execute and recover across two GPUs",
   REQUIRE(hosts.size() == 1);
   auto reserved = hosts[0]->get_total_reserved_memory();
   for (bool explicit_entry : {false, true}) {
-    INFO(explicit_entry);
     for (bool fail : {false, true, false}) {
-      INFO(fail);
+      CAPTURE(use_dv, explicit_entry, fail);
       devices.clear();
       inject = fail;
       fired  = false;
@@ -2086,10 +2085,9 @@ TEST_CASE("Production DuckLake mixed scans execute and recover across two GPUs",
       CHECK(devices.size() == 2);
       CHECK(fired == fail);
       auto after = runtime->get_transparent_execution_stats();
-      if (!explicit_entry) {
-        CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (fail ? 1 : 0));
-        CHECK(after.executions == before.executions + (fail ? 0 : 1));
-      }
+      CAPTURE(before.executions, after.executions);
+      CHECK(after.executions - before.executions == (explicit_entry ? 0 : 1));
+      CHECK(after.runtime_fallbacks - before.runtime_fallbacks == (fail ? 1 : 0));
       if (!fail) CHECK(counters->arrow_rows_imported.load() > imported);
       CHECK(hosts[0]->get_total_reserved_memory() == reserved);
     }
