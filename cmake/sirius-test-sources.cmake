@@ -61,6 +61,7 @@ set(TEST_SOURCES
     test/cpp/exchange/test_exchange_distribute_plan.cpp
     test/cpp/exchange/test_exchange_nixl.cpp
     test/cpp/exchange/test_exchange_operators.cpp
+    test/cpp/exchange/test_exchange_path.cpp
     test/cpp/exchange/test_exchange_plan_reuse.cpp
     test/cpp/exchange/test_exchange_query_windows.cpp
     test/cpp/exchange/test_exchange_transport.cpp
