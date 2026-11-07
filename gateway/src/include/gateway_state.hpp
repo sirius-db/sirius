@@ -41,7 +41,7 @@ struct start_options {
   std::string mnnvl    = "auto";
   uint64_t frame_bytes = 16ull << 20;
   uint32_t send_frames = 32;
-  uint32_t recv_frames = 8;
+  uint32_t recv_frames = 16;
   std::string log_dir;
   /// How a registered rank names its process, whether that process already joined a set of
   /// ranks, and how it is asked to exit for its launcher to restart it
