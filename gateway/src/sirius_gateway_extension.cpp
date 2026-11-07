@@ -468,7 +468,7 @@ void LoadInternal(ExtensionLoader& loader)
   option("sirius_gateway_exchange_recv_frames_per_peer",
          "sirius_exchange_recv_frames_per_peer for every rank",
          LogicalType::UBIGINT,
-         Value::UBIGINT(8),
+         Value::UBIGINT(16),
          check_frames);
   option("sirius_gateway_log_dir",
          "Directory for rank init files and logs; empty uses a temporary one",

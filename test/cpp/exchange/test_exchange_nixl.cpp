@@ -340,7 +340,7 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
 {
   // Every rank sends the same number of large batches to every other rank at once, as a shuffle
   // does, through the transport with the runtime's ring sizes, and reports what it received per
-  // second. SIRIUS_EXCHANGE_HOST_STAGING picks the path.
+  // second. SIRIUS_EXCHANGE_HOST_STAGING and SIRIUS_EXCHANGE_MNNVL (default auto) pick the path.
   auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
   auto const* peers = std::getenv("SIRIUS_EXCHANGE_PEERS");
   REQUIRE(rank != nullptr);
@@ -351,11 +351,14 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   for (std::string peer; std::getline(list, peer, ',');) {
     cfg.peers.push_back(peer);
   }
-  cfg.staging      = staging_from_env();
-  auto const world = static_cast<rank_t>(cfg.peers.size());
+  cfg.staging       = staging_from_env();
+  auto const* mnnvl = std::getenv("SIRIUS_EXCHANGE_MNNVL");
+  cfg.mnnvl         = sirius::exchange::parse_mnnvl(mnnvl != nullptr ? mnnvl : "auto");
+  auto const world  = static_cast<rank_t>(cfg.peers.size());
   sirius::exchange::nixl_exchange_options const ring_opts{};
-  frame_ring send(ring_opts.send_frames, ring_opts.frame_bytes);
-  frame_ring recv(ring_opts.recv_frames_per_peer * (world - 1), ring_opts.frame_bytes);
+  auto const memory = sirius::exchange::ring_memory_for(cfg.mnnvl);
+  frame_ring send(ring_opts.send_frames, ring_opts.frame_bytes, memory);
+  frame_ring recv(ring_opts.recv_frames_per_peer * (world - 1), ring_opts.frame_bytes, memory);
   nixl_fabric fab(cfg, send, recv);
 
   std::mutex mutex;
@@ -429,7 +432,7 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
               world - 1,
               seconds,
               gb / seconds,
-              fab.host_staged((cfg.rank + 1) % world) ? "host-staged" : "NIXL");
+              sirius::exchange::describe(fab.path_to((cfg.rank + 1) % world)));
   // Every rank must have taken its batches before any tears down its fabric.
   for (rank_t to = 0; to < world; ++to) {
     t.close(99, to);
@@ -548,7 +551,7 @@ TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_
   opts.send_frames =
     static_cast<std::uint32_t>(std::stoul(env_or("SIRIUS_EXCHANGE_SEND_FRAMES", "32")));
   opts.recv_frames_per_peer =
-    static_cast<std::uint32_t>(std::stoul(env_or("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER", "8")));
+    static_cast<std::uint32_t>(std::stoul(env_or("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER", "16")));
   cfg.staging        = staging_from_env();
   cfg.mnnvl          = opts.mnnvl;
   auto const seconds = std::stod(env_or("SIRIUS_EXCHANGE_PAIRS_SECONDS", "1.5"));
