@@ -46,12 +46,12 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
-#include "util/env_guard.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/scoped_sirius_setting.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -124,7 +124,11 @@ class scoped_temp_db_path {
 /// rolling back and restoring the optimizer settings) so a planner regression fails the
 /// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
-  Connection& con, const std::string& query, const std::vector<OptimizerType>& also_disabled = {})
+  Connection& con,
+  const std::string& query,
+  const std::vector<OptimizerType>& also_disabled = {},
+  bool pre_resolve                                = true,
+  std::string* logical_plan_text                  = nullptr)
 {
   auto& context = *con.context;
 
@@ -158,13 +162,17 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    plan->ResolveOperatorTypes();
+    // Production hands the generator an unresolved plan; the MARK-join conversion needs that.
+    if (pre_resolve) {
+      plan->ResolveOperatorTypes();
 
-    ColumnBindingResolver resolver;
-    duckdb::ColumnBindingResolver verifier(true);
-    verifier.VisitOperator(*plan);
-    resolver.VisitOperator(*plan);
+      ColumnBindingResolver resolver;
+      duckdb::ColumnBindingResolver verifier(true);
+      verifier.VisitOperator(*plan);
+      resolver.VisitOperator(*plan);
+    }
 
+    if (logical_plan_text) { *logical_plan_text = plan->ToString(); }
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));
   } catch (...) {
@@ -1037,6 +1045,128 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
   REQUIRE(dedup_builds > 0);
   require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - an IN subquery under a delim CTE plans as a SEMI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // TPC-H Q20 shape: an IN predicate inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  for (auto* node : joins) {
+    CHECK(node->Cast<sirius::op::sirius_physical_hash_join>().join_type != duckdb::JoinType::MARK);
+  }
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a NOT EXISTS subquery under a delim CTE plans as an ANTI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // A NOT EXISTS predicate (null-safe keys) inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE NOT EXISTS (SELECT 1 FROM parts q WHERE q.pk = i.fk "
+    "  AND q.pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  bool has_anti = false;
+  for (auto* node : joins) {
+    auto const type = node->Cast<sirius::op::sirius_physical_hash_join>().join_type;
+    CHECK(type != duckdb::JoinType::MARK);
+    has_anti = has_anti || type == duckdb::JoinType::ANTI || type == duckdb::JoinType::RIGHT_ANTI;
+  }
+  CHECK(has_anti);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a join above a delim CTE publishes to scans in the CTE body",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][cte_body]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  // TPC-H Q20 shape: the outer `parts` join sits above the CTE node that holds the correlated
+  // subquery's outer rows.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pname = 'p1' AND p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p2') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  std::size_t joins_above_cte  = 0;
+  std::size_t body_scan_routes = 0;
+  for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
+    auto& join = node->Cast<sirius::op::sirius_physical_hash_join>();
+    REQUIRE(join.children.size() == 2);
+    if (find_first(join.children[0].get(), SiriusPhysicalOperatorType::CTE) == nullptr) {
+      continue;
+    }
+    ++joins_above_cte;
+    for (auto const& target : join.dynamic_filter_plan().probe_targets()) {
+      if (target.route_class == sirius::op::dynamic_filter_route_class::scan) {
+        ++body_scan_routes;
+      }
+    }
+  }
+  REQUIRE(joins_above_cte > 0);
+  CHECK(body_scan_routes > 0);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - MARK joins DuckDB keeps are not converted under a delim CTE",
+                 "[plan_tree_shape][isolated_context][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // Each query holds a delim CTE (so the conversion pass is active) and a MARK join whose mark
+  // is not a bare filter: it is projected, or negated over keys that are not null-safe.
+  auto const sql =
+    GENERATE(std::string("SELECT p.pk, p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
+                         "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk)) FROM parts p"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pk NOT IN (SELECT i.fk FROM items i "
+                         "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"));
+  INFO(sql);
+  auto plan = generate_sirius_plan(*con, sql, /*also_disabled=*/{}, /*pre_resolve=*/false);
+  INFO(tree_to_string(plan.get()));
+
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  CHECK(std::any_of(joins.begin(), joins.end(), [](auto* node) {
+    return node->template Cast<sirius::op::sirius_physical_hash_join>().join_type ==
+           duckdb::JoinType::MARK;
+  }));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -2659,86 +2789,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   auto rollback = con->Query("ROLLBACK");
   REQUIRE(rollback);
   REQUIRE_FALSE(rollback->HasError());
-}
-
-namespace {
-
-bool delim_join_as_cte(Connection& con)
-{
-  auto result = con.Query("SELECT current_setting('delim_join_as_cte')");
-  REQUIRE_FALSE(result->HasError());
-  return result->Collection().GetValue(0, 0).GetValue<bool>();
-}
-
-std::size_t count_delim_joins(sirius_physical_operator* plan)
-{
-  return collect(plan, SiriusPhysicalOperatorType::LEFT_DELIM_JOIN).size() +
-         collect(plan, SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN).size();
-}
-
-}  // namespace
-
-TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - Sirius defaults decorrelation to explicit delim joins",
-                 "[plan_tree_shape][isolated_context][delim_join]")
-{
-  // The fixture pins the session value; drop it so the database default Sirius installs applies.
-  REQUIRE_FALSE(con->Query("RESET delim_join_as_cte")->HasError());
-  REQUIRE_FALSE(delim_join_as_cte(*con));
-  // A connection opened after LOAD sees the same default without any SET.
-  Connection fresh(*db);
-  REQUIRE_FALSE(delim_join_as_cte(fresh));
-
-  std::string const correlated_aggregate =
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";
-  // The TPC-H Q21 pattern: correlated EXISTS and NOT EXISTS with an inequality on a second key.
-  std::string const correlated_exists =
-    "SELECT COUNT(*) FROM items i1, parts p WHERE p.pk = i1.fk AND p.pname = 'p1' "
-    "AND EXISTS (SELECT 1 FROM items i2 WHERE i2.fk = i1.fk AND i2.qty <> i1.qty) "
-    "AND NOT EXISTS (SELECT 1 FROM items i3 WHERE i3.fk = i1.fk AND i3.qty <> i1.qty "
-    "AND i3.qty > 20)";
-
-  SECTION("default: delim joins and no CTE")
-  {
-    for (auto const& query : {correlated_aggregate, correlated_exists}) {
-      auto plan = generate_sirius_plan(*con, query);
-      INFO(query << "\n" << tree_to_string(plan.get()));
-      CHECK(count_delim_joins(plan.get()) > 0);
-      CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) == nullptr);
-    }
-  }
-
-  SECTION("an explicit session SET restores DuckDB's CTE rewrite")
-  {
-    sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
-    REQUIRE(delim_join_as_cte(*con));
-    // The other session keeps the database default.
-    REQUIRE_FALSE(delim_join_as_cte(fresh));
-    for (auto const& query : {correlated_aggregate, correlated_exists}) {
-      auto plan = generate_sirius_plan(*con, query);
-      INFO(query << "\n" << tree_to_string(plan.get()));
-      CHECK(count_delim_joins(plan.get()) == 0);
-    }
-    auto plan = generate_sirius_plan(*con, correlated_aggregate);
-    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
-  }
-}
-
-TEST_CASE("plan tree shape - an explicit global delim_join_as_cte survives loading Sirius",
-          "[plan_tree_shape][isolated_context][delim_join]")
-{
-  scoped_temp_db_path db_path;
-  auto const cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
-                   "minimal.yaml";
-  sirius::util::env_guard const config("SIRIUS_CONFIG_FILE", cfg.string());
-  sirius::util::env_guard const enabled("SIRIUS_DISABLE", std::nullopt);
-  DBConfig db_config;
-  db_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
-  db_config.SetOptionByName("delim_join_as_cte", Value::BOOLEAN(true));
-  DuckDB db(db_path.path().c_str(), &db_config);
-  Connection con(db);
-  CHECK(delim_join_as_cte(con));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

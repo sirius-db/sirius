@@ -41,6 +41,7 @@
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
@@ -128,6 +129,20 @@ static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
     }
   }
   return {};
+}
+
+/// Whether @p node's subtree reads the CTE with @p cte_table_index.
+static bool subtree_reads_cte(sirius::op::sirius_physical_operator const& node,
+                              std::size_t cte_table_index)
+{
+  if (node.type == sirius::op::SiriusPhysicalOperatorType::CTE_SCAN &&
+      node.Cast<sirius::op::sirius_physical_column_data_scan>().cte_index == cte_table_index) {
+    return true;
+  }
+  for (auto const& child : node.children) {
+    if (child && subtree_reads_cte(*child, cte_table_index)) { return true; }
+  }
+  return false;
 }
 
 /// Returns a set of output column indices proven to form a unique key for the
@@ -621,6 +636,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
               terminal.node->type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
             continue;
           }
+          // The body is complete before a build that reads it finishes, so a filter would arrive
+          // after the body's scans are done.
+          if (terminal.in_cte_body && subtree_reads_cte(*right, terminal.cte_table_index)) {
+            continue;
+          }
           auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
           if (terminal.ordinal >= scan.types.size()) {
             SIRIUS_LOG_WARN(
@@ -651,7 +671,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
              .channel_push_ordinal = terminal.ordinal,
              .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
-          scan_bound = true;
+          // A body scan is an addition to the reader's endpoint, not a replacement for it.
+          scan_bound = scan_bound || !terminal.in_cte_body;
         }
         if (scan_bound) { continue; }
         // Admission proves build-block safety; placement preserves the reported site ordinal.

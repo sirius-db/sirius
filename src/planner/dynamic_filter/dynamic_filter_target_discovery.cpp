@@ -15,6 +15,8 @@
  */
 
 #include <expression/ast/node.hpp>
+#include <op/sirius_physical_column_data_scan.hpp>
+#include <op/sirius_physical_cte.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
 #include <op/sirius_physical_hash_join.hpp>
@@ -23,7 +25,9 @@
 #include <op/sirius_physical_projection.hpp>
 #include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
 
+#include <algorithm>
 #include <cassert>
+#include <string_view>
 #include <variant>
 
 namespace sirius::planner {
@@ -172,6 +176,10 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     }
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER:
       return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
+    // The node's output is its second child's; the first child is the shared body.
+    case SiriusPhysicalOperatorType::CTE:
+      if (node.children.size() != 2 || output_ordinal >= node.types.size()) { return {}; }
+      return {descent_step{.child_index = 1, .child_ordinal = output_ordinal}};
     // Copies rows without changing values. Output k is input k; the trailing copy count is not an
     // output, so descent never reaches it.
     case SiriusPhysicalOperatorType::REPLICATE:
@@ -219,7 +227,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::ASOF_JOIN:
     case SiriusPhysicalOperatorType::RECURSIVE_CTE:
     case SiriusPhysicalOperatorType::RECURSIVE_KEY_CTE:
-    case SiriusPhysicalOperatorType::CTE:
     case SiriusPhysicalOperatorType::INSERT:
     case SiriusPhysicalOperatorType::BATCH_INSERT:
     case SiriusPhysicalOperatorType::DELETE_OPERATOR:
@@ -293,19 +300,107 @@ bool steps_are_followable(sirius::op::sirius_physical_operator const& node,
   return true;
 }
 
+bool is_aggregate(sirius::op::SiriusPhysicalOperatorType type) noexcept
+{
+  using sirius::op::SiriusPhysicalOperatorType;
+  return type == SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+         type == SiriusPhysicalOperatorType::PERFECT_HASH_GROUP_BY ||
+         type == SiriusPhysicalOperatorType::PARTITIONED_AGGREGATE ||
+         type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
+         type == SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
+         type == SiriusPhysicalOperatorType::MERGE_AGGREGATE;
+}
+
+struct reader_site {
+  sirius::op::sirius_physical_operator const* scan = nullptr;
+  bool under_aggregate                             = false;
+};
+
+void collect_readers(sirius::op::sirius_physical_operator const& node,
+                     std::size_t cte_table_index,
+                     bool under_aggregate,
+                     std::vector<reader_site>& readers)
+{
+  if (node.type == sirius::op::SiriusPhysicalOperatorType::CTE_SCAN) {
+    if (node.Cast<sirius::op::sirius_physical_column_data_scan>().cte_index == cte_table_index) {
+      readers.push_back({.scan = &node, .under_aggregate = under_aggregate});
+    }
+    return;
+  }
+  bool const below = under_aggregate || is_aggregate(node.type);
+  for (auto const& child : node.children) {
+    if (child) { collect_readers(*child, cte_table_index, below, readers); }
+  }
+}
+
+// A delim CTE has two readers: the outer rows, and their distinct keys feeding the subquery.
+// A filter on the outer-row reader only drops outer rows the join would drop anyway, and the
+// key reader then loses only keys of dropped rows. A filter on the key reader would instead
+// drop outer rows the rest of the plan still needs, so the reader must be provably the first.
+bool is_delim_outer_row_reader(sirius::op::sirius_physical_cte const& cte,
+                               sirius::op::sirius_physical_operator const& scan)
+{
+  constexpr std::string_view delim_prefix = "__duckdb_delim_";
+  constexpr std::string_view dedup_prefix = "__duckdb_delim_dedup_";
+  std::string_view const name             = cte.ctename;
+  if (name.substr(0, delim_prefix.size()) != delim_prefix ||
+      name.substr(0, dedup_prefix.size()) == dedup_prefix || cte.children.size() != 2 ||
+      !cte.children[1]) {
+    return false;
+  }
+  std::vector<reader_site> readers;
+  collect_readers(*cte.children[1], cte.table_index, /*under_aggregate=*/false, readers);
+  if (readers.size() != 2) { return false; }
+  for (std::size_t i = 0; i < 2; ++i) {
+    if (readers[i].scan == &scan) {
+      return !readers[i].under_aggregate && readers[1 - i].under_aggregate;
+    }
+  }
+  return false;
+}
+
+using cte_stack = std::vector<sirius::op::sirius_physical_cte const*>;
+
 void trace_probe_key_into(sirius::op::sirius_physical_operator& node,
                           std::size_t ordinal,
                           descent_policy policy,
+                          cte_stack& ctes,
                           std::vector<route_terminal>& terminals)
 {
   auto const steps = descent_steps(node, ordinal, policy);
   if (!steps_are_followable(node, steps)) {
     terminals.push_back(route_terminal{.node = &node, .ordinal = ordinal});
+    if (node.type != sirius::op::SiriusPhysicalOperatorType::CTE_SCAN) { return; }
+    auto const table_index = node.Cast<sirius::op::sirius_physical_column_data_scan>().cte_index;
+    auto const owner       = std::find_if(
+      ctes.begin(), ctes.end(), [&](auto const* cte) { return cte->table_index == table_index; });
+    if (owner == ctes.end() || !is_delim_outer_row_reader(**owner, node) ||
+        ordinal >= (*owner)->children[0]->types.size()) {
+      return;
+    }
+    // Only scans are registered: a filter on a body that ends in anything else gains nothing.
+    cte_stack body_ctes;
+    std::vector<route_terminal> body;
+    trace_probe_key_into(*(*owner)->children[0], ordinal, policy, body_ctes, body);
+    bool const all_scans =
+      !body.empty() && std::all_of(body.begin(), body.end(), [](auto const& t) {
+        return t.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN;
+      });
+    if (!all_scans) { return; }
+    for (auto& terminal : body) {
+      terminal.in_cte_body     = true;
+      terminal.cte_table_index = table_index;
+      terminals.push_back(terminal);
+    }
     return;
   }
+  bool const is_cte = node.type == sirius::op::SiriusPhysicalOperatorType::CTE;
+  if (is_cte) { ctes.push_back(&node.Cast<sirius::op::sirius_physical_cte>()); }
   for (auto const& step : steps) {
-    trace_probe_key_into(*node.children[step.child_index], step.child_ordinal, policy, terminals);
+    trace_probe_key_into(
+      *node.children[step.child_index], step.child_ordinal, policy, ctes, terminals);
   }
+  if (is_cte) { ctes.pop_back(); }
 }
 
 }  // namespace
@@ -315,7 +410,8 @@ std::vector<route_terminal> trace_probe_key(sirius::op::sirius_physical_operator
                                             descent_policy policy)
 {
   std::vector<route_terminal> terminals;
-  trace_probe_key_into(root, a0, policy, terminals);
+  cte_stack ctes;
+  trace_probe_key_into(root, a0, policy, ctes, terminals);
   return terminals;
 }
 
