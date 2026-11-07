@@ -551,7 +551,8 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
 namespace {
 
 struct topology {
-  /// 0 = auto: use every GPU visible to topology discovery (CUDA_VISIBLE_DEVICES-aware).
+  /// 0 (`num_gpus: all`, the default): every GPU visible to topology discovery
+  /// (CUDA_VISIBLE_DEVICES-aware).
   std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{0}};
   /// 0 = all active GPUs per query (default). Positive value limits each query to the first
   /// N entries of the sorted active-GPU list, reserving the rest for future concurrent queries.
@@ -577,11 +578,24 @@ struct topology {
         throw std::runtime_error("topology.gpu_ids must not contain duplicate device ids");
       }
       opt.num_gpus_or_gpu_ids = std::move(ids);
-    } else {
-      long long n = 0;
-      r.optional("num_gpus", n);
-      if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
-      opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
+    } else if (auto n = r.optional_node("num_gpus")) {
+      // `all` is spelled out: a count of 0 read as "every GPU" was easy to misread.
+      if (n->IsScalar() && n->Scalar() == "all") {
+        opt.num_gpus_or_gpu_ids = size_t{0};
+      } else {
+        long long count = 0;
+        try {
+          count = n->as<long long>();
+        } catch (YAML::Exception const&) {
+          count = 0;
+        }
+        if (count <= 0) {
+          throw std::runtime_error(
+            "topology.num_gpus must be all or a positive count; use num_gpus: all for every "
+            "visible GPU");
+        }
+        opt.num_gpus_or_gpu_ids = static_cast<size_t>(count);
+      }
     }
     // greater_than{-1} is >= 0: a negative count would otherwise silently read as "use all",
     // since the admission path treats any non-positive value as unset.
@@ -903,6 +917,8 @@ try {
   if (!sirius_node) { throw std::runtime_error("missing top-level 'sirius' key"); }
 
   yaml::reader r(*sirius_node, "sirius");
+  // The launch scripts read sirius.distributed (scripts/sirius_distributed_config.py).
+  static_cast<void>(r.optional_node("distributed"));
 
   // Topology
   r.optional("topology", topo);

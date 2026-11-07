@@ -816,7 +816,7 @@ TEST_CASE("Sirius configuration rejects invalid GPU topology selections", "[siri
     {"invalid_topology_negative_gpu_id.yaml", "only non-negative device ids"},
     {"invalid_topology_duplicate_gpu_ids.yaml", "duplicate device ids"},
     {"invalid_topology_gpu_ids_and_num_gpus.yaml", "mutually exclusive"},
-    {"invalid_topology_negative_num_gpus.yaml", "num_gpus must be non-negative"},
+    {"invalid_topology_negative_num_gpus.yaml", "num_gpus must be all or a positive count"},
   };
 
   std::source_location loc = std::source_location::current();

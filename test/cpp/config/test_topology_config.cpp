@@ -155,3 +155,33 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
 }
+
+TEST_CASE("sirius_config accepts num_gpus: all and refuses 0", "[topology_config][config]")
+{
+  scoped_yaml all("sirius_num_gpus_all.yaml", "sirius:\n  topology: { num_gpus: all }\n");
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(all.path));
+
+  // 0 fails, and the error names the word to use.
+  scoped_yaml zero("sirius_num_gpus_zero.yaml", "sirius:\n  topology: { num_gpus: 0 }\n");
+  sirius::sirius_config zero_cfg;
+  CHECK_THROWS_WITH(zero_cfg.load_from_file(zero.path),
+                    Catch::Matchers::ContainsSubstring("num_gpus: all"));
+
+  scoped_yaml word("sirius_num_gpus_word.yaml", "sirius:\n  topology: { num_gpus: some }\n");
+  sirius::sirius_config word_cfg;
+  CHECK_THROWS(word_cfg.load_from_file(word.path));
+}
+
+TEST_CASE("sirius_config skips the distributed section", "[topology_config][config]")
+{
+  // The launch scripts read sirius.distributed; Sirius itself must not refuse the file.
+  scoped_yaml yaml("sirius_distributed_section.yaml",
+                   "sirius:\n"
+                   "  topology: { num_gpus: all }\n"
+                   "  distributed:\n"
+                   "    cluster: default\n"
+                   "    node: { gpus: [0, 1], quack_port: 9500 }\n");
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+}
