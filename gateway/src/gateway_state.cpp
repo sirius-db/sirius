@@ -10,12 +10,16 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
+#include <signal.h>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <functional>
 #include <future>
 #include <random>
+#include <regex>
 #include <set>
 #include <thread>
 
@@ -130,18 +134,80 @@ bool reads_only_catalog(std::string const& sql)
   return true;
 }
 
-/// The error to report when every rank failed: the first one not caused by a peer's abort.
-duckdb::ErrorData const& root_cause(std::vector<std::optional<duckdb::ErrorData>> const& errors)
+/// The rank another rank's error names as the one that failed first, if any: peers see a rank's
+/// failure as "exchange: query K failed on rank R: ..." or "exchange: rank R failed: ...".
+std::optional<uint32_t> blamed_rank(std::string const& message)
 {
-  for (auto const& error : errors) {
-    if (!duckdb::StringUtil::Contains(duckdb::StringUtil::Lower(error->RawMessage()), "abort")) {
-      return *error;
-    }
+  static std::regex const query_failed{R"(failed on rank (\d+))"};
+  static std::regex const rank_failed{R"(exchange: rank (\d+) failed)"};
+  std::smatch match;
+  if (std::regex_search(message, match, query_failed) ||
+      std::regex_search(message, match, rank_failed)) {
+    return static_cast<uint32_t>(std::stoul(match[1].str()));
   }
-  return *errors.front();
+  return std::nullopt;
+}
+
+/// The error to report, prefixed with its rank: following each error's "failed on rank R" to
+/// the rank whose own error does not blame another one. @p errors has one entry per rank.
+duckdb::ErrorData root_cause(std::vector<std::optional<duckdb::ErrorData>> const& errors)
+{
+  uint32_t at = 0;
+  while (at < errors.size() && !errors[at]) {
+    ++at;
+  }
+  for (std::size_t hops = 0; hops < errors.size(); ++hops) {
+    auto const blamed = blamed_rank(errors[at]->RawMessage());
+    if (!blamed || *blamed == at || *blamed >= errors.size() || !errors[*blamed]) { break; }
+    at = *blamed;
+  }
+  return duckdb::ErrorData(errors[at]->Type(),
+                           "rank " + std::to_string(at) + ": " + errors[at]->RawMessage());
+}
+
+/// Whether @p message reports that the exchange itself failed on a rank: its transport is gone
+/// for every later query, so the ranks must restart.
+bool transport_failed(std::string const& message)
+{
+  static constexpr std::array<char const*, 4> markers{
+    "exchange: the transport to the other ranks failed",
+    "exchange: no progress for",
+    "exchange: a write to a peer failed",
+    "exchange: shut down with the Sirius context"};
+  static std::regex const rank_failed{R"(exchange: rank \d+ failed:)"};
+  return std::any_of(
+           markers.begin(),
+           markers.end(),
+           [&](char const* marker) { return message.find(marker) != std::string::npos; }) ||
+         std::regex_search(message, rank_failed);
+}
+
+/// Whether @p message says the gateway could not reach the rank at all: its process or its
+/// forwarded port is gone, so the rank is lost.
+bool rank_unreachable(std::string const& message)
+{
+  return message.find("Failed to send message") != std::string::npos;
 }
 
 }  // namespace
+
+char const* to_string(cluster_state state)
+{
+  switch (state) {
+    case cluster_state::stopped: return "stopped";
+    case cluster_state::starting: return "starting";
+    case cluster_state::ready: return "ready";
+    case cluster_state::failed: return "failed";
+  }
+  return "unknown";
+}
+
+void gateway_state::fail_locked(std::string reason)
+{
+  if (state_ == cluster_state::failed) { return; }
+  state_  = cluster_state::failed;
+  reason_ = std::move(reason);
+}
 
 /// A place in the FIFO of statements; the holder runs alone. Leaving the line on interrupt
 /// keeps a cancelled client from blocking those behind it.
@@ -193,7 +259,8 @@ void gateway_state::stop(ClientContext& context)
   turn t{*this, context};
   stop_locked();
   std::lock_guard lock{state_mutex_};
-  broken_ = "stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()";
+  state_  = cluster_state::stopped;
+  reason_ = "stopped: CALL sirius_gateway_start(<ranks>) or sirius_gateway_restart()";
 }
 
 void gateway_state::restart(ClientContext& context)
@@ -211,6 +278,11 @@ std::shared_ptr<rank_result> gateway_state::run(ClientContext& context, std::str
 void gateway_state::start_locked(ClientContext& context, start_options options)
 {
   stop_locked();
+  {
+    std::lock_guard lock{state_mutex_};
+    state_ = cluster_state::starting;
+    reason_.clear();
+  }
   if (options.ranks == 0) {
     throw InvalidInputException("sirius_gateway_start needs at least one rank");
   }
@@ -254,7 +326,6 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
       std::lock_guard lock{state_mutex_};
       ranks_   = std::move(ranks);
       options_ = options;
-      broken_.clear();
       for (auto& r : ranks_) {
         spawn_rank(options_, token, r);
       }
@@ -280,18 +351,20 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
       }
       if (!options_.rank_init.empty()) { sql.push_back(options_.rank_init); }
     }
-    std::string cancelled;
-    auto const outcomes = fan_out(context, setup, cancelled);
-    for (uint32_t i = 0; i < outcomes.size(); ++i) {
-      if (outcomes[i].error) {
+    auto const setup_done = fan_out(context, setup, client_policy(context));
+    for (uint32_t i = 0; i < setup_done.outcomes.size(); ++i) {
+      if (setup_done.outcomes[i].error) {
         throw IOException(
-          "rank %d failed its session setup: %s", i, outcomes[i].error->RawMessage());
+          "rank %d failed its session setup: %s", i, setup_done.outcomes[i].error->RawMessage());
       }
     }
+    std::lock_guard lock{state_mutex_};
+    state_ = cluster_state::ready;
   } catch (std::exception& e) {
     stop_locked();
     std::lock_guard lock{state_mutex_};
-    broken_ = duckdb::ErrorData(e).RawMessage();
+    state_  = cluster_state::failed;
+    reason_ = duckdb::ErrorData(e).RawMessage();
     throw;
   }
 }
@@ -357,8 +430,9 @@ void gateway_state::recover_locked(ClientContext& context)
       run_locked(context, entry, true);
     } catch (std::exception& e) {
       std::lock_guard lock{state_mutex_};
-      broken_ = "replaying \"" + entry + "\" failed: " + duckdb::ErrorData(e).RawMessage();
-      throw IOException(broken_);
+      state_  = cluster_state::failed;
+      reason_ = "replaying \"" + entry + "\" failed: " + duckdb::ErrorData(e).RawMessage();
+      throw IOException(reason_);
     }
   }
 }
@@ -368,27 +442,43 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
                                                        bool replay)
 {
   if (ranks_.empty()) {
-    throw IOException(broken_.empty()
+    std::lock_guard lock{state_mutex_};
+    throw IOException(reason_.empty()
                         ? "the gateway has no ranks: CALL sirius_gateway_start(<ranks>) first"
-                        : broken_);
+                        : reason_);
   }
+  bool failed = false;
   {
     std::lock_guard lock{state_mutex_};
     for (auto& r : ranks_) {
-      if (rank_exited(r) && broken_.empty()) {
-        broken_ = "rank " + std::to_string(r.index) + " exited; see " + log_path(options_, r.index);
+      if (rank_exited(r)) {
+        fail_locked("rank " + std::to_string(r.index) + " exited; see " +
+                    log_path(options_, r.index));
       }
     }
+    failed = state_ == cluster_state::failed;
   }
-  if (!broken_.empty()) {
-    if (replay) { throw IOException(broken_); }
+  if (failed) {
+    if (replay) {
+      std::lock_guard lock{state_mutex_};
+      throw IOException(reason_);
+    }
     recover_locked(context);
   }
   uint64_t query = 0;
   {
     std::lock_guard lock{state_mutex_};
-    query = ++query_id_;
+    query             = ++query_id_;
+    running_query_id_ = query;
   }
+  struct not_running {
+    gateway_state& gateway;
+    ~not_running()
+    {
+      std::lock_guard lock{gateway.state_mutex_};
+      gateway.running_query_id_ = 0;
+    }
+  } clear_running{*this};
 
   // Catalog reads run on DuckDB alone: Sirius cannot plan some of them, and with fallback off
   // that would fail every client's ATTACH. The ranks' catalogs are the same, so rank 0's answer
@@ -404,45 +494,77 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     if (on_cpu) { sql_of_rank.push_back("SET gpu_execution = false"); }
     sql_of_rank.push_back(sql);
   }
-  std::string cancelled;
-  auto outcomes = fan_out(context, statements, cancelled);
+  auto const policy   = client_policy(context);
+  auto ran            = fan_out(context, statements, policy);
+  auto const prefix   = "query " + std::to_string(query) + ": ";
+  auto const restarts = ", so the gateway restarts the ranks before the next statement";
   if (on_cpu) {
-    std::string ignored;
+    // Runs even after a cancel: the client's interrupt must not leave GPU execution off.
     auto const restored =
       fan_out(context,
               std::vector<std::vector<std::string>>(ranks_.size(), {"SET gpu_execution = true"}),
-              ignored);
-    for (uint32_t i = 0; i < restored.size(); ++i) {
-      if (!restored[i].error) { continue; }
+              fan_out_policy{false, 0});
+    for (uint32_t i = 0; i < restored.outcomes.size(); ++i) {
+      if (!restored.outcomes[i].error) { continue; }
       std::lock_guard lock{state_mutex_};
-      if (broken_.empty()) {
-        broken_ = "rank " + std::to_string(i) +
-                  " could not turn gpu_execution back on: " + restored[i].error->RawMessage();
-      }
+      fail_locked("rank " + std::to_string(i) + " could not turn gpu_execution back on: " +
+                  restored.outcomes[i].error->RawMessage());
     }
   }
 
-  std::vector<std::optional<duckdb::ErrorData>> errors;
+  auto& outcomes = ran.outcomes;
+  std::vector<std::optional<duckdb::ErrorData>> errors(outcomes.size());
+  std::size_t failures = 0;
   std::string failed_ranks;
+  std::set<uint32_t> lost;
+  bool transport = false;
   for (uint32_t i = 0; i < outcomes.size(); ++i) {
     if (!outcomes[i].error) { continue; }
-    errors.push_back(outcomes[i].error);
+    errors[i] = outcomes[i].error;
+    ++failures;
+    auto const& message = outcomes[i].error->RawMessage();
+    transport           = transport || transport_failed(message);
+    if (rank_unreachable(message)) { lost.insert(i); }
     failed_ranks += (failed_ranks.empty() ? "" : "; ") + std::string("rank ") + std::to_string(i) +
-                    ": " + outcomes[i].error->RawMessage();
+                    ": " + message;
   }
-  if (errors.size() == outcomes.size()) {
-    if (!cancelled.empty()) { throw IOException("%s; cancelled on every rank", cancelled); }
-    root_cause(errors).Throw();
-  }
-  if (!errors.empty()) {
+  {
     std::lock_guard lock{state_mutex_};
-    broken_ = "the ranks disagree on query " + std::to_string(query) +
-              ", so the gateway restarts them before the next statement (" + failed_ranks + ")";
-    throw IOException(broken_);
+    for (auto& r : ranks_) {
+      if (rank_exited(r)) { lost.insert(r.index); }
+    }
   }
-  if (!replay && changes_state(sql)) {
+  // Fail-stop, in order: a lost rank, a broken exchange, then a state change only some ranks
+  // made. Each leaves the ranks out of step.
+  std::string fatal;
+  if (!lost.empty()) {
+    std::string names;
+    for (auto const i : lost) {
+      names += (names.empty() ? "" : ", ") + std::to_string(i);
+    }
+    fatal = prefix + "lost rank " + names + " (" + failed_ranks + ")";
+  } else if (transport) {
+    fatal = prefix + "the exchange between the ranks failed (" + failed_ranks + ")";
+  } else if (failures != 0 && failures != outcomes.size() && (replay || changes_state(sql))) {
+    fatal = prefix + "the ranks disagree on a statement that changes state (" + failed_ranks + ")";
+  }
+  if (!fatal.empty()) {
     std::lock_guard lock{state_mutex_};
-    ddl_log_.push_back(sql);
+    fail_locked(fatal + restarts);
+    throw IOException(reason_);
+  }
+  if (!ran.cancelled.empty() && failures != 0) {
+    throw IOException("%s; cancelled on every rank", ran.cancelled);
+  }
+  if (failures == outcomes.size()) { root_cause(errors).Throw(); }
+  if (failures != 0) {
+    // A read changes nothing, and every rank has retired the query: the ranks keep serving.
+    throw IOException("%sthe ranks disagree (%s)", prefix, failed_ranks);
+  }
+  {
+    std::lock_guard lock{state_mutex_};
+    if (state_ == cluster_state::failed) { throw IOException(reason_); }
+    if (!replay && changes_state(sql)) { ddl_log_.push_back(sql); }
   }
 
   auto result   = std::make_shared<rank_result>();
@@ -457,45 +579,52 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
   return result;
 }
 
-std::vector<gateway_state::outcome> gateway_state::fan_out(
+gateway_state::fan_out_policy gateway_state::client_policy(ClientContext& context)
+{
+  return fan_out_policy{true,
+                        std::stoull(setting(context, "sirius_gateway_statement_timeout", "0"))};
+}
+
+gateway_state::fan_out_result gateway_state::fan_out(
   ClientContext& context,
   std::vector<std::vector<std::string>> const& statements,
-  std::string& cancelled)
+  fan_out_policy policy)
 {
-  std::vector<outcome> outcomes(ranks_.size());
+  fan_out_result out;
+  out.outcomes.resize(ranks_.size());
   std::vector<std::future<void>> done;
   for (uint32_t i = 0; i < ranks_.size(); ++i) {
-    done.push_back(std::async(std::launch::async, [this, &statements, &outcomes, i] {
-      auto& out = outcomes[i];
+    done.push_back(std::async(std::launch::async, [this, &statements, &out, i] {
+      auto& outcome = out.outcomes[i];
       try {
         for (auto const& sql : statements[i]) {
-          out.result = ranks_[i].channel->Query(sql);
-          if (out.result->HasError()) {
-            out.error = out.result->GetErrorObject();
+          outcome.result = ranks_[i].channel->Query(sql);
+          if (outcome.result->HasError()) {
+            outcome.error = outcome.result->GetErrorObject();
             return;
           }
         }
       } catch (std::exception& e) {
-        out.error = duckdb::ErrorData(e);
+        outcome.error = duckdb::ErrorData(e);
       }
     }));
   }
-  auto const timeout = std::stoull(setting(context, "sirius_gateway_statement_timeout", "0"));
   auto const started = steady_clock::now();
   for (auto& f : done) {
     while (f.wait_for(100ms) != std::future_status::ready) {
-      if (!cancelled.empty()) { continue; }
-      if (context.IsInterrupted()) {
-        cancelled = "interrupted";
-      } else if (timeout != 0 && steady_clock::now() - started > std::chrono::seconds(timeout)) {
-        cancelled = "timed out after " + std::to_string(timeout) + " s";
+      if (!out.cancelled.empty()) { continue; }
+      if (policy.watch_client && context.IsInterrupted()) {
+        out.cancelled = "interrupted";
+      } else if (policy.timeout_s != 0 &&
+                 steady_clock::now() - started > std::chrono::seconds(policy.timeout_s)) {
+        out.cancelled = "timed out after " + std::to_string(policy.timeout_s) + " s";
       } else {
         continue;
       }
       cancel_all();
     }
   }
-  return outcomes;
+  return out;
 }
 
 void gateway_state::cancel_all()
@@ -507,15 +636,36 @@ void gateway_state::cancel_all()
   }
 }
 
+void gateway_state::signal_rank(uint32_t index, int signal)
+{
+  std::lock_guard lock{state_mutex_};
+  if (index >= ranks_.size() || ranks_[index].pid <= 0) {
+    throw InvalidInputException("no running rank %d", index);
+  }
+  kill(ranks_[index].pid, signal);
+  // A killed rank is gone before this returns, so the next statement finds it gone.
+  for (int i = 0; signal == SIGKILL && i < 500 && !rank_exited(ranks_[index]); ++i) {
+    std::this_thread::sleep_for(10ms);
+  }
+}
+
+uint64_t gateway_state::running_query_id()
+{
+  std::lock_guard lock{state_mutex_};
+  return running_query_id_;
+}
+
 std::vector<gateway_state::rank_status> gateway_state::status()
 {
   std::lock_guard lock{state_mutex_};
   std::vector<rank_status> rows;
   for (auto const& r : ranks_) {
-    auto const state = r.pid < 0 ? "exited" : !broken_.empty() ? "broken" : "up";
-    rows.push_back({r.index, r.pid, r.gpu, r.host, r.uri, state, broken_});
+    rows.push_back(
+      {r.index, r.pid, r.gpu, r.host, r.uri, r.pid < 0 ? "exited" : "up", state_, reason_});
   }
-  if (rows.empty() && !broken_.empty()) { rows.push_back({0, -1, "", "", "", "stopped", broken_}); }
+  if (rows.empty() && state_ != cluster_state::ready) {
+    rows.push_back({0, -1, "", "", "", to_string(state_), state_, reason_});
+  }
   return rows;
 }
 

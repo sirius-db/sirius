@@ -65,19 +65,32 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                                      vector<LogicalType>& types,
                                      vector<Identifier>& names)
 {
-  names     = {"rank", "pid", "gpu", "host", "uri", "state", "error", "last_query_id", "queued"};
-  types     = {LogicalType::UINTEGER,
-               LogicalType::BIGINT,
-               LogicalType::VARCHAR,
-               LogicalType::VARCHAR,
-               LogicalType::VARCHAR,
-               LogicalType::VARCHAR,
-               LogicalType::VARCHAR,
-               LogicalType::UBIGINT,
-               LogicalType::UBIGINT};
-  auto data = make_uniq<rows_data>();
-  auto const last   = Value::UBIGINT(gateway.last_query_id());
-  auto const queued = Value::UBIGINT(gateway.waiting());
+  names              = {"rank",
+                        "pid",
+                        "gpu",
+                        "host",
+                        "uri",
+                        "state",
+                        "cluster",
+                        "error",
+                        "last_query_id",
+                        "running_query_id",
+                        "queued"};
+  types              = {LogicalType::UINTEGER,
+                        LogicalType::BIGINT,
+                        LogicalType::VARCHAR,
+                        LogicalType::VARCHAR,
+                        LogicalType::VARCHAR,
+                        LogicalType::VARCHAR,
+                        LogicalType::VARCHAR,
+                        LogicalType::VARCHAR,
+                        LogicalType::UBIGINT,
+                        LogicalType::UBIGINT,
+                        LogicalType::UBIGINT};
+  auto data          = make_uniq<rows_data>();
+  auto const last    = Value::UBIGINT(gateway.last_query_id());
+  auto const running = Value::UBIGINT(gateway.running_query_id());
+  auto const queued  = Value::UBIGINT(gateway.waiting());
   for (auto const& r : gateway.status()) {
     data->rows.push_back({Value::UINTEGER(r.index),
                           Value::BIGINT(r.pid),
@@ -85,8 +98,10 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                           Value(r.host),
                           Value(r.uri),
                           Value(r.state),
+                          Value(sirius_gateway::to_string(r.cluster)),
                           r.error.empty() ? Value(LogicalType::VARCHAR) : Value(r.error),
                           last,
+                          running,
                           queued});
   }
   return std::move(data);
@@ -165,6 +180,18 @@ unique_ptr<FunctionData> status_bind(ClientContext&,
                                      vector<LogicalType>& types,
                                      vector<Identifier>& names)
 {
+  return status_rows(gateway_of(input), types, names);
+}
+
+/// Test hook: sends a signal to one rank's process, to stand in for a crash (SIGKILL) or a rank
+/// that stops answering (SIGSTOP). Console only, like every sirius_gateway_* function.
+unique_ptr<FunctionData> test_signal_bind(ClientContext&,
+                                          TableFunctionBindInput& input,
+                                          vector<LogicalType>& types,
+                                          vector<Identifier>& names)
+{
+  gateway_of(input).signal_rank(input.inputs[0].GetValue<uint32_t>(),
+                                input.inputs[1].GetValue<int32_t>());
   return status_rows(gateway_of(input), types, names);
 }
 
@@ -248,6 +275,10 @@ void LoadInternal(ExtensionLoader& loader)
   loader.RegisterFunction(add("sirius_gateway_restart", {}, scan_rows, restart_bind));
   loader.RegisterFunction(add("sirius_gateway_status", {}, scan_rows, status_bind));
   loader.RegisterFunction(add("sirius_gateway_log", {}, scan_rows, log_bind));
+  loader.RegisterFunction(add("sirius_gateway_test_signal",
+                              {LogicalType::INTEGER, LogicalType::INTEGER},
+                              scan_rows,
+                              test_signal_bind));
   loader.RegisterFunction(add("sirius_gateway_run", {LogicalType::VARCHAR}, scan_run, run_bind));
 
   // The Quack callback that routes each client statement:

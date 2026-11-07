@@ -6,6 +6,9 @@ require sirius_gateway
 
 require quack
 
+# Quack's errors mention HTTP, which the runner would otherwise take as a reason to skip the file.
+set ignore_error_messages
+
 statement ok
 SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
 
