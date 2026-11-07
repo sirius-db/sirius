@@ -36,6 +36,9 @@ namespace {
 
 using namespace duckdb;
 
+/// Set once this process's exchange connects: its peers are then fixed for its life.
+std::atomic<bool> exchange_joined{false};
+
 std::string const& boot_id()
 {
   static std::string const id = [] {
@@ -60,8 +63,8 @@ unique_ptr<FunctionData> info_bind(ClientContext&,
                                    vector<LogicalType>& types,
                                    vector<Identifier>& names)
 {
-  types = {LogicalType::BIGINT, LogicalType::VARCHAR};
-  names = {"pid", "boot_id"};
+  types = {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+  names = {"pid", "boot_id", "joined"};
   return make_uniq<one_row>();
 }
 
@@ -71,6 +74,7 @@ void info_scan(ClientContext&, TableFunctionInput& input, DataChunk& output)
   if (data.done) { return; }
   output.data[0].Append(Value::BIGINT(getpid()));
   output.data[1].Append(Value(boot_id()));
+  output.data[2].Append(Value::BOOLEAN(exchange_joined.load()));
   output.CheckCardinality(1);
   data.done = true;
 }
@@ -124,6 +128,8 @@ void exit_scan(ClientContext& context, TableFunctionInput& input, DataChunk& out
 }
 
 }  // namespace
+
+void note_exchange_joined() noexcept { exchange_joined = true; }
 
 void register_rank_control_functions(DatabaseInstance& instance)
 {

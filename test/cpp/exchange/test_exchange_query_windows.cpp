@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "exchange/rank_control.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
@@ -23,6 +24,7 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <memory>
+#include <tuple>
 
 using window = duckdb::SiriusContext::StandaloneQueryScope;
 
@@ -87,22 +89,30 @@ TEST_CASE("a gateway-assigned query number is used and must increase", "[exchang
   CHECK(ctx->next_distributed_query(*conn.context) == last + 11);
 }
 
-TEST_CASE("sirius_rank_info names this process and one boot id for its life",
+TEST_CASE("sirius_rank_info names this process, one boot id for its life, and whether it joined",
           "[exchange][query_windows]")
 {
   REQUIRE(sirius::test::g_integration_env != nullptr);
   if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
   auto conn       = sirius::test::g_integration_env->make_connection();
   auto const info = [&] {
-    auto result = conn.Query("SELECT pid, boot_id FROM sirius_rank_info()");
+    auto result = conn.Query("SELECT pid, boot_id, joined FROM sirius_rank_info()");
     REQUIRE_FALSE(result->HasError());
     auto chunk = result->Fetch();
     REQUIRE(chunk);
     REQUIRE(chunk->size() == 1);
-    return std::pair{chunk->GetValue(0, 0).GetValue<int64_t>(), chunk->GetValue(1, 0).ToString()};
+    return std::tuple{chunk->GetValue(0, 0).GetValue<int64_t>(),
+                      chunk->GetValue(1, 0).ToString(),
+                      chunk->GetValue(2, 0).GetValue<bool>()};
   };
-  auto const [pid, boot_id] = info();
+  auto const [pid, boot_id, joined] = info();
   CHECK(pid == static_cast<int64_t>(getpid()));
   CHECK(boot_id.size() == 32);
-  CHECK(info().second == boot_id);
+  // No unit test connects a real exchange.
+  CHECK_FALSE(joined);
+  // A gateway reuses a process that never joined; one that has must restart to join again.
+  sirius::exchange::note_exchange_joined();
+  auto const after = info();
+  CHECK(std::get<1>(after) == boot_id);
+  CHECK(std::get<2>(after));
 }

@@ -30,6 +30,7 @@
 #include "exchange/distributed_session.hpp"
 #include "exchange/exchange_runtime.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/rank_control.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
@@ -1365,8 +1366,10 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
         static_cast<void>(downgrade.request_downgrade(
           [gpu, bytes] { return gpu->get_available_memory() >= bytes; }));
       };
-      return sirius::exchange::make_nixl_exchange(
+      auto exchange = sirius::exchange::make_nixl_exchange(
         params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+      sirius::exchange::note_exchange_joined();
+      return exchange;
     });
 }
 
