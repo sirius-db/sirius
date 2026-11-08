@@ -1,0 +1,11 @@
+# R5 first runner increment
+
+Requirements: [public #2213](https://github.com/sirius-db/sirius/issues/2213), roadmap D1–D4 and the sole [acceptance mapping](../../docs/paimon-e2e-acceptance.md). This file describes implementation only, not another acceptance/result table.
+
+Implement `run_e2e.py` as a bounded launcher for the first two dedicated C++ E2E tests. It pins actual executable bytes, selects `[paimon_e2e]`, and requires the complete Catch2 XML report with the exact GPU-positive and forced-CPU-rejection case identities, no failures/expected failures/skips and positive assertion count. Preserve process status separately from logs, kill the owned process group on timeout/interrupt, and retain each attempt in a fresh directory. Missing test implementation must fail discovery. Do not parse console listings or add unsupported runner options.
+
+`test_e2e_runner.py` exercises this real CLI with disposable child executables: status0 with complete report, zero discovery, missing/truncated report, wrong/duplicate identities, skipped/expected-failure cases, contradictory aggregates, crash with successful-looking output, timeout partial output, binary drift and hash rejection before launch. Fixtures test launcher decisions only; no fixture certifies Paimon/GPU execution. Source/SDK/module/build receipts remain a separate pending acceptance gate.
+
+The runner's PASS means the declared test binary passed this selected pair, not general E2E support or independent build provenance. The C++ tests must execute ordinary Paimon SQL, compare independent literal expectations and inspect query-associated existing production evidence. Their implementation waits only for the actual owner API/source deliveries, not merges. A signal schema is not invented here. Adapter owns common CMake registration; R5 owns new test/runner files. Existing CPU conformance semantics stay intact.
+
+Sequence: write CLI tests and record RED; implement launcher and record GREEN; update closure DRIs in the one mapping; freeze commit; obtain fresh-context checker/delivery review and close findings; deliver the fixed foundation to coordinator. Add the dedicated cheap CI job after the checked launcher interface stabilizes. Actual GPU execution and final-main qualification remain pending and version-bound.
