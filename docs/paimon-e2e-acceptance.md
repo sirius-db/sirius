@@ -13,7 +13,7 @@ All final E2E acceptance below is **NOT RUN**. Source audit and CPU harness chec
 | Producer #150 public | `ad0a1b94776d064424a3673195593fd4203e645c` (Draft) | Does not qualify local revision |
 | Producer #150 local candidate | `cb37bb1d26a1e3ba09fc13402cd426a4cf993efb`, tree `6cf5cffbc1f2c8f7ffececb544bb409b90e66390` | Owner bundle retrieved and verified; build/joint qualification NOT RUN; new `paimon.predicate_pruning` contract |
 | Native source component | `817b9bff` historical owner head; full SHA/status in raw snapshot | Not an integrated production source; dirty files excluded |
-| Metadata R2 / SQL adapter | No delivered candidate pair | Owners supply immutable commits, APIs, profile and route evidence |
+| Metadata R2 / SQL adapter | Source-only P1 `621934acfb2fcc107162ef17688b4248edfe6549` recorded; next D8 combined candidate pending | Frozen source is not a runtime release; qualification and actual GPU route evidence remain NOT RUN |
 | Cleanup #2220 public | `f65f67316bdbfcaf8bc980801640f9ff4c568aa2` | Reuse only guarantees still needed after base audit; no automatic whole-diff inclusion |
 | Native SDK | #462 merged as `914d1cfcbe8ffa32a947aaa26e02ee70989557d8` | This is not the selected SDK pin/artifact; planning drain is not complete resource admission |
 | Final SDK/modules/Arrow/toolchain/GPU | Not selected | Need retrievable dependency bytes, actual loader maps and build receipts, GPU UUID/driver/CUDA/cuDF/RMM/config |
@@ -96,6 +96,10 @@ Run a forced-CPU counterpart with `SET gpu_execution=false` and identical expect
 The empty-table and historical A cases follow this first pair; multi-batch and live mutation/failure cases require the additional orchestration in the matrix. M1 is append-only; no M1 result closes Q15 or the full #2181 target.
 
 ## Execution and delivery sequence
+
+Roadmap D8 selects one combined R2/R4 delivery PR for this round. C owns overall #2212 delivery; A retains sole R2 implementation/review and #2321 migration ownership. There is no independently delivered useful comparator prerequisite PR: do not copy its helper, add a temporary API or construct a circular stack to split this work. The actual replacement PR URL remains pending; neither a source bundle nor local CPU wiring closes #2212 or authorizes closing #2321. The next input is C's fixed composition of `621` + A `c17587b2aa692819a7818be001a5a79ec888af7c` + C-authored D6 v2, after necessary integration source review. Do not wait for that same candidate's runtime qualification before freezing its source/build inputs; execution establishes that qualification. E2E will record the new unqualified tuple once the combined head and reviewed fixed R1 recipe arrive, retaining `621` and null qualified release until actual evidence exists.
+
+The planned private host recipe uses `DUCKDB_EXPLICIT_VERSION=v2.0.0-dev1` plus the actual ffb source hash consistently across host/provider/consumer, including the wrapper's `SIRIUS_DUCKDB_EXPLICIT_VERSION`. This is a recipe/profile selection, not observed normalized footer/version or binary provenance. Before qualification, bind both actual DuckDB source/header trees, host library/CLI, provider footer and any explicit source override separately from cb37's unchanged d54 gitlink. Do not combine new labels with old artifacts or transfer old results. No configure/build/GPU authorization follows from D8.
 
 1. Finish baseline audit/CPU harness regression and record missing APIs, without rewriting the corpus or common runner. E2E owns this mapping and new E2E-specific files. Confirm the unique writer before touching shared runner/build/CI facilities.
 2. Owners deliver immutable R2/R3/R4, producer and necessary cleanup inputs. Integrate in this worktree, record SHAs/conflict resolutions, fix selected SDK/modules and qualified host. Product bugs return to their owner; do not patch their branch.
