@@ -5,11 +5,13 @@ on:
     paths:
       - .github/workflows/paimon-e2e-harness.yml
       - test/paimon_e2e/**
+      - test/cpp/integration/data/paimon_conformance/*.py
   push:
     branches: [main]
     paths:
       - .github/workflows/paimon-e2e-harness.yml
       - test/paimon_e2e/**
+      - test/cpp/integration/data/paimon_conformance/*.py
   workflow_dispatch:
 
 permissions:
@@ -31,5 +33,5 @@ jobs:
           manifest-path: test/paimon_e2e/pixi.toml
           locked: true
           cache: false
-      - name: Exercise launcher acceptance and rejection paths (CPU only)
+      - name: Exercise launcher and offline checker paths (CPU only)
         run: pixi run --locked --manifest-path test/paimon_e2e/pixi.toml test
