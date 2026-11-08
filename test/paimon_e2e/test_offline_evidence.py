@@ -363,6 +363,30 @@ class OfflineEvidenceTests(unittest.TestCase):
             lambda e, o: o["native_origin"]["batch_owners"].append("unvalidated-batch")
         )
 
+    def test_malformed_row_containers_widths_and_deep_json_reject(self):
+        for rows in ("aaaa", {"a": 0}, ["a"], [["a", "extra"]], [None]):
+            with self.subTest(expected_rows=rows):
+
+                def malformed(e, o):
+                    e["result"].update(columns=[["v", "VARCHAR"]], rows=rows)
+                    o["result"].update(
+                        columns=[["v", "VARCHAR"]],
+                        rows=[{"v": "a"}] * (4 if rows == "aaaa" else 1),
+                    )
+
+                self.check(malformed)
+        for rows in (
+            {},
+            "rows",
+            [None],
+            [[1, "10.00"]],
+            [{"id": 1}],
+            [{"id": 1, "amount": "10.00", "extra": 2}],
+        ):
+            with self.subTest(observed_rows=rows):
+                self.check(lambda e, o: o["result"].update(rows=rows))
+        self.check(raw="[" * 2000 + "0" + "]" * 2000)
+
     def test_output_cannot_replace_inputs_or_previous_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

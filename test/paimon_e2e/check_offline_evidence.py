@@ -98,8 +98,16 @@ def check_model(expected, trace):
             decimal and 0 <= int(decimal[2]) <= int(decimal[1]) <= 38
         ):
             reject("invalid_oracle_columns")
-    if not expected["result"]["rows"]:
-        reject("nonempty_first_slice_required")
+    expected_rows = expected["result"]["rows"]
+    if (
+        not isinstance(expected_rows, list)
+        or not expected_rows
+        or any(
+            not isinstance(row, list) or len(row) != len(columns)
+            for row in expected_rows
+        )
+    ):
+        reject("invalid_oracle_rows")
     if not same(trace["scope"], scope):
         reject("execution_identity")
     query = trace["query"]
@@ -254,6 +262,10 @@ def check_model(expected, trace):
         },
         "result_terminal",
     )
+    if not isinstance(result["rows"], list) or any(
+        not isinstance(row, dict) or len(row) != len(columns) for row in result["rows"]
+    ):
+        reject("invalid_result_rows")
     try:
         compare_rows(expected["result"], result["rows"])
     except (AssertionError, ValueError, TypeError, KeyError, DecimalException):
@@ -315,7 +327,7 @@ def main(argv=None):
             report["decision"] = "CONSISTENT_OFFLINE_MODEL"
         except EvidenceError as error:
             report["reason"] = str(error)
-        except (OSError, ValueError, TypeError, KeyError, IndexError):
+        except (OSError, ValueError, TypeError, KeyError, IndexError, RecursionError):
             report["reason"] = "malformed_or_missing_evidence"
         report["checker_sha256"] = hashlib.sha256(
             Path(__file__).read_bytes()
