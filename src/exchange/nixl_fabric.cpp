@@ -642,6 +642,9 @@ double nixl_fabric::timed_write(rank_t peer, std::size_t dst, std::size_t bytes)
   auto const deadline       = start + std::chrono::seconds{10};
   auto s                    = _writer->postXferReq(req);
   while (s == NIXL_IN_PROG && std::chrono::steady_clock::now() < deadline) {
+    // A peer probing this rank at the same time writes into this rank's main agent, whose
+    // worker must make progress for that write's endpoint to wire up.
+    receive();
     s = _writer->getXferStatus(req);
   }
   auto const seconds =
