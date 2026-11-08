@@ -57,15 +57,12 @@ and creates the eight TPC-H views with exact metadata paths and pinned snapshots
 
 ```sql
 .read test_datasets/tpch_iceberg_sf1/create_views.sql
-SET gpu_execution = true;
-SET enable_duckdb_fallback = false;
 SELECT sum(l_extendedprice * l_discount) FROM lineitem;
 ```
 
 Use this in the DuckDB shell after loading Sirius; `iceberg` must already be installed
 for that DuckDB build. Generated paths are absolute: regenerate if the warehouse moves.
-Creating a dataset does not certify that the current engine runs all 22 Iceberg queries
-on the GPU. The performance runner below currently accepts Parquet and DuckDB sources.
+Use the Iceberg benchmark below to compare results and timings.
 
 ## Running Benchmarks
 
@@ -97,9 +94,27 @@ All commands run from the **project root** directory.
 ./test/tpch_performance/benchmark_and_validate.sh --report runs/<run_dir>
 ```
 
+Run the same benchmark on local Iceberg tables with:
+
+```bash
+pixi run bash test/tpch_performance/benchmark_and_validate.sh --data-source iceberg 1
+```
+
+This uses `test_datasets/tpch_iceberg_sf1` by default. Pass `--iceberg-dir` to reuse
+a different generated warehouse. If the warehouse does not exist, the benchmark
+prepares the source Parquet and generates Iceberg once before running either engine.
+`--parquet-dir` selects the source Parquet for generation. Use a fresh output path
+if a previous generation left an incomplete warehouse.
+
+Both engines use the same saved `create_views.sql` with fixed snapshot IDs. As with
+Parquet, each engine uses one session by default and Sirius allows CPU fallback.
+The DuckDB Iceberg extension must already be installed for that build.
+
 Options:
 - `--config <path>` — Sirius config file (default: `~/.sirius/sirius.yaml`)
+- `--data-source <source>` — `parquet` (default), `iceberg`, `duckdb`, or `duckdb-native`
 - `--parquet-dir <path>` — parquet dataset directory (default: `test_datasets/tpch_parquet_sf<SF>`)
+- `--iceberg-dir <path>` — Iceberg warehouse directory (default: `test_datasets/tpch_iceberg_sf<SF>`)
 - `--engines <list>` — space-separated engine list (default: `"sirius duckdb"`)
 - `--pinning-mode none|per-query|pinned-hot` — Sirius-only parquet pinning mode. `per-query` pins each query's referenced columns around that query block; `pinned-hot` pins the union of referenced columns once before the single-session run and unpins after all queries.
 
