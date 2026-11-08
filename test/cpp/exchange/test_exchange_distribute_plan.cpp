@@ -23,6 +23,7 @@
 #include "exec/query_lifecycle_registry.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -148,6 +149,31 @@ struct fixture {
     }
   }
 
+  /// Adds table @p name, the rows of @p select written to Parquet in row groups of
+  /// @p row_group_size rows.
+  void add_table(std::string const& name, std::string const& select, int row_group_size)
+  {
+    {
+      sirius::test::scoped_sirius_disable disable_sirius;
+      duckdb::DuckDB db(nullptr);
+      duckdb::Connection gen(db);
+      auto r =
+        gen.Query("COPY (" + select + ") TO " + path(name) + " (FORMAT PARQUET, ROW_GROUP_SIZE " +
+                  std::to_string(row_group_size) + ")");
+      REQUIRE_FALSE(r->HasError());
+    }
+    REQUIRE_FALSE(
+      con->Query("CREATE VIEW " + name + " AS SELECT * FROM read_parquet(" + path(name) + ")")
+        ->HasError());
+  }
+
+  /// Reads Parquet footers through the scan manager, as the plan generator does.
+  [[nodiscard]] sirius::planner::parquet_footer_reader footers() const
+  {
+    auto ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    return [ctx](std::string const& file) { return ctx->get_scan_manager().parquet_footer(file); };
+  }
+
   [[nodiscard]] std::string path(std::string const& name) const
   {
     return sirius::test::sql_literal((scratch.path() / (name + ".parquet")).string());
@@ -204,7 +230,8 @@ struct ranks {
 std::vector<std::string> distribute(std::vector<plan>& plans,
                                     ranks& c,
                                     fixture& f,
-                                    std::uint64_t query = 7)
+                                    sirius::planner::parquet_footer_reader const& footers = {},
+                                    std::uint64_t query                                   = 7)
 {
   auto const world = static_cast<rank_t>(plans.size());
   std::vector<std::string> errors(world);
@@ -212,7 +239,8 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
   for (rank_t r = 0; r < world; ++r) {
     threads.emplace_back([&, r] {
       try {
-        sirius::planner::distribute_plan(plans[r], c.all[r].service, f.gpu(), query, c.lifecycle);
+        sirius::planner::distribute_plan(
+          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers);
       } catch (std::exception const& e) {
         errors[r] = e.what();
       }
@@ -551,7 +579,7 @@ TEST_CASE("a rank whose rewrite fails aborts the query on every rank, and the ne
   }
   // The next query plans on both ranks.
   auto plans = plan_on_every_rank(f, "SELECT k FROM big", 2);
-  CHECK(distribute(plans, c, f, 8) == std::vector<std::string>(2));
+  CHECK(distribute(plans, c, f, {}, 8) == std::vector<std::string>(2));
 }
 
 TEST_CASE("distribute_plan fails on every rank when the ranks planned differently",
@@ -565,5 +593,57 @@ TEST_CASE("distribute_plan fails on every rank when the ranks planned differentl
   auto const errors = distribute(plans, c, f);
   for (auto const& error : errors) {
     CHECK_THAT(error, Catch::Matchers::ContainsSubstring("planned this query differently"));
+  }
+}
+
+TEST_CASE("distribute_plan drops failing partial groups when the footers prove them whole",
+          "[exchange][planner]")
+{
+  fixture f;
+  // 4 row groups of 10,000 rows. In `sorted` each holds its own key range; in `shuffled` every
+  // row group spans almost all keys.
+  f.add_table("sorted", "SELECT range AS k, range % 7 AS v FROM range(40000)", 10'000);
+  f.add_table(
+    "shuffled", "SELECT (range * 7919) % 40000 AS k, range % 7 AS v FROM range(40000)", 10'000);
+  auto const having = [](std::string const& table) {
+    return "SELECT k, count(*) FROM " + table + " GROUP BY k HAVING count(*) > 1";
+  };
+  auto const partial =
+    [](sirius_physical_operator& root) -> sirius::op::sirius_physical_grouped_aggregate& {
+    auto* grouped = find(root, T::HASH_GROUP_BY);
+    REQUIRE(grouped);
+    return grouped->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  };
+
+  SECTION("disjoint row-group key ranges: every rank's partial gets the HAVING")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, having("sorted"), 2);
+    REQUIRE(distribute(plans, c, f, f.footers()) == std::vector<std::string>(2));
+    for (auto& p : plans) {
+      auto const& groups = partial(*p).complete_groups;
+      REQUIRE(groups);
+      CHECK(groups->key == 0);
+      // Each row group's min and max: 0, 9999, 10000, ..., 39999.
+      CHECK(groups->row_group_bounds->size() == 8);
+    }
+  }
+
+  SECTION("overlapping row-group key ranges prove nothing")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, having("shuffled"), 2);
+    REQUIRE(distribute(plans, c, f, f.footers()) == std::vector<std::string>(2));
+    for (auto& p : plans) {
+      CHECK_FALSE(partial(*p).complete_groups);
+    }
+  }
+
+  SECTION("without a footer reader nothing is pushed")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, having("sorted"), 2);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(2));
+    CHECK_FALSE(partial(*plans[0]).complete_groups);
   }
 }

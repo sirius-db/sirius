@@ -928,6 +928,7 @@ SET enable_compressed_materialization = false;
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
+| `enable_complete_group_having` | true | Distributed execution: when the Parquet footers prove a GROUP BY key never spans two row groups (apart from row-group boundary values), apply the HAVING above the merge to each scan batch's partial groups before the exchange (TPC-H Q18). |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see

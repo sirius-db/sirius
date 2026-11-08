@@ -1495,6 +1495,23 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   return result;
 }
 
+std::shared_ptr<cudf::io::parquet::FileMetaData const> sirius_scan_manager::parquet_footer(
+  std::string const& uri)
+{
+  auto const io_ctx        = ioctx_for_path(uri);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(normalize_path(uri));
+  auto datasource =
+    create_datasource(uri,
+                      footer_cached ? cucascade::io::open_hint::generic
+                                    : cucascade::io::open_hint::parquet_footer_probe);
+  if (!datasource) { return nullptr; }
+  auto const reader_options = cudf::io::parquet_reader_options::builder().build();
+  auto const resolution =
+    op::scan::resolve_parquet_metadata_with_identity(*datasource, 0, uri, reader_options);
+  if (resolution.identity != datasource->get_io_object().identity_cache_key()) { return nullptr; }
+  return resolution.artifact->file_metadata();
+}
+
 void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
   bool enable_pinned_zone_map_pruning,

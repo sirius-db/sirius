@@ -69,7 +69,8 @@ void pipelineable_operator_data::adopt_row_identity(pipelineable_operator_data c
       "pipelineable_operator_data: a row-preserving replacement must replace each batch in place");
   }
   if (auto const device = source.get_preferred_device_id()) { set_preferred_device_id(*device); }
-  _position = source._position;
+  _position         = source._position;
+  _whole_row_groups = source._whole_row_groups;
   _replaced_batch_ids.clear();
   for (std::size_t position = 0; position < _data_batches.size(); ++position) {
     if (!_data_batches[position]) { continue; }

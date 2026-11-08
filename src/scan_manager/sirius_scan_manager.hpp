@@ -848,6 +848,11 @@ class sirius_scan_manager {
 
   parquet_bind_result describe_parquet(std::string const& uri);
 
+  /// The parsed footer of the Parquet file @p uri, parked in the metadata store like
+  /// describe_parquet's, so the scan of the file reuses it.
+  [[nodiscard]] std::shared_ptr<cudf::io::parquet::FileMetaData const> parquet_footer(
+    std::string const& uri);
+
   /// \brief Pin @p file_paths' column-chunk bytes into the prefetching cache.
   ///
   /// The pin is the cache itself: the selected columns' chunks are inserted,

@@ -21,20 +21,26 @@
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exchange/wire.hpp"
+#include "expression/ast/utils.hpp"
+#include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
 #include "op/distributed/sample_all_gather_boundaries.hpp"
 #include "op/scan/parquet_scan_types.hpp"
+#include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_plan.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
@@ -43,6 +49,7 @@
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 
@@ -52,13 +59,21 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::planner {
@@ -107,6 +122,88 @@ std::vector<cudf::data_type> physical_types_of(duckdb::vector<sirius::logical_ty
   return out;
 }
 
+/// The scan output column that column @p column of @p node is, through projections and filters.
+std::optional<std::pair<op::scan::sirius_gpu_scan_operator const*, std::size_t>> scan_column(
+  op::sirius_physical_operator const& node, std::size_t column)
+{
+  switch (node.type) {
+    case T::GPU_SCAN: return std::pair{&node.Cast<op::scan::sirius_gpu_scan_operator>(), column};
+    case T::PROJECTION: {
+      auto const& list = node.Cast<op::sirius_physical_projection>().select_list;
+      if (column >= list.size() || !list[column]->is_reference()) { return std::nullopt; }
+      return scan_column(*node.children[0], list[column]->as_reference().column_index);
+    }
+    case T::FILTER: {
+      auto const& filter = node.Cast<op::sirius_physical_filter>();
+      auto const* kept   = std::get_if<std::vector<cudf::size_type>>(&filter.output_columns);
+      if (kept == nullptr) { return scan_column(*node.children[0], column); }
+      if (column >= kept->size()) { return std::nullopt; }
+      return scan_column(*node.children[0], static_cast<std::size_t>((*kept)[column]));
+    }
+    default: return std::nullopt;
+  }
+}
+
+/// A row group's [min, max] of one integer column; min > max when the row group has no
+/// statistics for it.
+using key_range = std::pair<std::int64_t, std::int64_t>;
+
+std::optional<std::int64_t> decode_integer(std::optional<std::vector<std::uint8_t>> const& bytes,
+                                           cudf::io::parquet::Type type)
+{
+  if (!bytes) { return std::nullopt; }
+  if (type == cudf::io::parquet::Type::INT64 && bytes->size() == sizeof(std::int64_t)) {
+    std::int64_t value = 0;
+    std::memcpy(&value, bytes->data(), sizeof(value));
+    return value;
+  }
+  if (type == cudf::io::parquet::Type::INT32 && bytes->size() == sizeof(std::int32_t)) {
+    std::int32_t value = 0;
+    std::memcpy(&value, bytes->data(), sizeof(value));
+    return value;
+  }
+  return std::nullopt;
+}
+
+/// The key ranges of @p column over the row groups of @p file that hold a non-NULL value of it,
+/// in file order; nullopt when one of them has no exact min and max.
+std::optional<std::vector<key_range>> row_group_key_ranges(
+  cudf::io::parquet::FileMetaData const& file, std::string const& column)
+{
+  if (file.row_groups.empty()) { return std::vector<key_range>{}; }
+  auto const leaves = op::scan::detail::leaf_indices_for_column(file, column);
+  if (leaves.size() != 1) { return std::nullopt; }
+  std::vector<key_range> ranges;
+  ranges.reserve(file.row_groups.size());
+  for (auto const& row_group : file.row_groups) {
+    if (leaves[0] >= row_group.columns.size()) { return std::nullopt; }
+    auto const& meta  = row_group.columns[leaves[0]].meta_data;
+    auto const& stats = meta.statistics;
+    if (row_group.num_rows == 0 || (stats.null_count && *stats.null_count == row_group.num_rows)) {
+      continue;
+    }
+    if (stats.is_min_value_exact == false || stats.is_max_value_exact == false) {
+      return std::nullopt;
+    }
+    auto const lo = decode_integer(stats.min_value ? stats.min_value : stats.min, meta.type);
+    auto const hi = decode_integer(stats.max_value ? stats.max_value : stats.max, meta.type);
+    if (!lo || !hi || *lo > *hi) { return std::nullopt; }
+    ranges.emplace_back(*lo, *hi);
+  }
+  return ranges;
+}
+
+/// Whether @p ranges, sorted, each end at or before the next one starts. A value strictly inside
+/// one of them is then in no other.
+bool meet_at_most_at_ends(std::vector<key_range>& ranges)
+{
+  std::sort(ranges.begin(), ranges.end());
+  for (std::size_t i = 1; i < ranges.size(); ++i) {
+    if (ranges[i - 1].second > ranges[i].first) { return false; }
+  }
+  return true;
+}
+
 /// Join types that never emit a build row without a probe match, so a build seen by every rank
 /// yields each output row on one rank only.
 bool emits_build_rows_only_with_probe(duckdb::JoinType type)
@@ -125,8 +222,219 @@ struct rewriter {
   std::string shape;
   /// Each CTE_SCAN's rows are where its CTE's materialization put them.
   std::map<op::sirius_physical_operator const*, placement> cte_scans;
+  parquet_footer_reader footers;
 
   exchange::stream_id stream() { return exchange::make_stream_id(query, next_stream++); }
+
+  /// Gives the partial aggregate under @p merge the HAVING @p having above it, when the
+  /// condition of complete_group_having holds on every rank for one of its group keys.
+  void push_having_to_partials(op::sirius_physical_filter const& having,
+                               op::sirius_physical_operator const& merge)
+  {
+    if (!footers) { return; }  // turned off (operator_params.enable_complete_group_having)
+    auto const skip = [](std::string_view why) {
+      SIRIUS_LOG_INFO("[complete-group HAVING] not applied: {}", why);
+    };
+    auto* below = merge.children[0]->children[0].get();
+    while (below->type == T::EXCHANGE_SOURCE || below->type == T::EXCHANGE_SINK) {
+      below = below->children[0].get();
+    }
+    if (below->type != T::HASH_GROUP_BY) { return skip("no partial aggregate"); }
+    auto& grouped = below->Cast<op::sirius_physical_grouped_aggregate>();
+    // A whole group's partial must be its merged value, in the merge's types.
+    using K               = cudf::aggregation::Kind;
+    bool const final_kind = std::ranges::all_of(grouped.cudf_aggregates, [](K kind) {
+      return kind == K::SUM || kind == K::MIN || kind == K::MAX || kind == K::COUNT_VALID ||
+             kind == K::COUNT_ALL;
+    });
+    bool refs_in_output   = true;
+    sirius::ast::visit_references(*having.expression, [&](sirius::ast::reference const& ref) {
+      refs_in_output = refs_in_output && ref.column_index < grouped.types.size();
+    });
+    if (!final_kind || !refs_in_output || grouped.has_grouping_sets() || grouped.has_avg ||
+        grouped.has_count_distinct || grouped.has_stddev_samp() ||
+        std::ranges::any_of(grouped.cudf_aggregate_is_wide_integer_sum, std::identity{})) {
+      return skip("an aggregate whose partial is not its final value");
+    }
+    if (grouped.has_physical_overrides() || merge.has_physical_overrides() ||
+        grouped.types != merge.types) {
+      return skip("partial and merged types differ");
+    }
+    for (std::size_t k = 0; k < grouped.group_idx.size(); ++k) {
+      auto const type = grouped.types[k].id();
+      if (type != sirius::type_id::BIGINT && type != sirius::type_id::INTEGER) { continue; }
+      auto const source =
+        scan_column(*grouped.children[0], static_cast<std::size_t>(grouped.group_idx[k]));
+      if (!source || source->first->types[source->second] != grouped.types[k]) {
+        skip("group key not read unchanged from a scan");
+        continue;
+      }
+      auto const* info = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+        &source->first->get_ingestible().table_info());
+      if (info == nullptr || !info->partition_indices.empty() || info->field_mapping_requirements ||
+          info->physical_schema) {
+        skip("group key not from a plain Parquet scan");
+        continue;
+      }
+      auto const index = info->projection_ids.empty()
+                           ? source->second
+                           : (source->second < info->projection_ids.size()
+                                ? static_cast<std::size_t>(info->projection_ids[source->second])
+                                : info->column_ids.size());
+      if (index >= info->column_ids.size()) {
+        skip("group key not a scan column");
+        continue;
+      }
+      auto const& column = info->column_ids[index];
+      if (column.IsRowIdColumn() || column.IsVirtualColumn() || column.HasChildren() ||
+          column.GetPrimaryIndex() >= info->names.size()) {
+        skip("group key not a stored column");
+        continue;
+      }
+      auto bounds =
+        row_group_bounds(info->resolved_file_paths, info->names[column.GetPrimaryIndex()]);
+      if (!bounds) { return; }
+      auto filter              = std::make_shared<op::complete_group_having>();
+      filter->predicate        = sirius::ast::clone(*having.expression);
+      filter->key              = static_cast<cudf::size_type>(k);
+      filter->row_group_bounds = device_column(
+        *bounds, type == sirius::type_id::BIGINT ? cudf::type_id::INT64 : cudf::type_id::INT32);
+      grouped.complete_groups = std::move(filter);
+      shape += "H";
+      return;
+    }
+    skip("no integer group key");
+  }
+
+  /// The sorted mins and maxes of @p column over the row groups of @p files, when on every rank
+  /// the row groups of every file of the scan meet at most at the ends of their key ranges.
+  std::optional<std::vector<std::int64_t>> row_group_bounds(std::vector<std::string> const& files,
+                                                            std::string const& column)
+  {
+    auto const began = std::chrono::steady_clock::now();
+    std::vector<std::optional<std::vector<key_range>>> ranges(files.size());
+    std::atomic<std::size_t> next{0};
+    auto const read = [&] {
+      for (auto i = next++; i < files.size(); i = next++) {
+        try {
+          if (auto const file = footers(files[i])) {
+            ranges[i] = row_group_key_ranges(*file, column);
+          }
+        } catch (...) {
+          ranges[i].reset();
+        }
+      }
+    };
+    {
+      std::vector<std::jthread> readers(std::min<std::size_t>(16, files.size()));
+      for (auto& reader : readers) {
+        reader = std::jthread(read);
+      }
+    }
+    // One row per file: its name's hash and its key range. A rank that cannot prove its files
+    // sends the empty range (1, 0).
+    std::vector<std::array<std::int64_t, 3>> mine;
+    std::vector<std::int64_t> bounds;
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      if (!ranges[i] || !meet_at_most_at_ends(*ranges[i])) {
+        mine   = {{0, 1, 0}};
+        bounds = {};
+        break;
+      }
+      if (ranges[i]->empty()) { continue; }
+      mine.push_back({static_cast<std::int64_t>(std::hash<std::string>{}(files[i])),
+                      ranges[i]->front().first,
+                      ranges[i]->back().second});
+      for (auto const& [lo, hi] : *ranges[i]) {
+        bounds.push_back(lo);
+        bounds.push_back(hi);
+      }
+    }
+    auto files_ranges = gather_rows(mine);
+    bool proven =
+      std::ranges::none_of(files_ranges, [](auto const& row) { return row[1] > row[2]; });
+    std::sort(files_ranges.begin(), files_ranges.end());
+    files_ranges.erase(std::unique(files_ranges.begin(), files_ranges.end()), files_ranges.end());
+    std::vector<key_range> hulls;
+    for (auto const& row : files_ranges) {
+      hulls.emplace_back(row[1], row[2]);
+    }
+    proven = proven && meet_at_most_at_ends(hulls);
+    std::sort(bounds.begin(), bounds.end());
+    bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
+    SIRIUS_LOG_INFO(
+      "[complete-group HAVING] {}: {} over {} files of {} ranks, {} row-group bounds here, {} ms",
+      column,
+      proven ? "proven" : "not proven",
+      hulls.size(),
+      service->world_size(),
+      bounds.size(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                            began)
+        .count());
+    if (!proven) { return std::nullopt; }
+    return bounds;
+  }
+
+  /// Every rank's @p rows, in rank order.
+  std::vector<std::array<std::int64_t, 3>> gather_rows(
+    std::vector<std::array<std::int64_t, 3>> const& rows)
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    for (std::size_t c = 0; c < 3; ++c) {
+      std::vector<std::int64_t> values;
+      values.reserve(rows.size());
+      for (auto const& row : rows) {
+        values.push_back(row[c]);
+      }
+      columns.push_back(device_column(values, cudf::type_id::INT64));
+    }
+    auto mine = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                        *gpu,
+                                        cudf::get_default_stream(),
+                                        telemetry::batch_telemetry_info{});
+    auto const all =
+      exchange::all_gather(*service, stream(), mine, *gpu, cudf::get_default_stream());
+    std::vector<std::array<std::int64_t, 3>> out;
+    for (auto const& theirs : all) {
+      if (!theirs) { continue; }
+      auto ro         = theirs->to_read_only();
+      auto const view = get_cudf_table_view(ro);
+      auto const n    = static_cast<std::size_t>(view.num_rows());
+      std::vector<std::int64_t> values(3 * n);
+      for (cudf::size_type c = 0; c < 3 && n != 0; ++c) {
+        RMM_CUDA_TRY(cudaMemcpy(values.data() + c * n,
+                                view.column(c).data<std::int64_t>(),
+                                n * sizeof(std::int64_t),
+                                cudaMemcpyDeviceToHost));
+      }
+      for (std::size_t i = 0; i < n; ++i) {
+        out.push_back({values[i], values[n + i], values[2 * n + i]});
+      }
+    }
+    return out;
+  }
+
+  static std::unique_ptr<cudf::column> device_column(std::vector<std::int64_t> const& values,
+                                                     cudf::type_id type)
+  {
+    auto const n = static_cast<cudf::size_type>(values.size());
+    auto column  = cudf::make_numeric_column(cudf::data_type{type}, n);
+    if (n == 0) { return column; }
+    if (type == cudf::type_id::INT64) {
+      RMM_CUDA_TRY(cudaMemcpy(column->mutable_view().data<std::int64_t>(),
+                              values.data(),
+                              values.size() * sizeof(std::int64_t),
+                              cudaMemcpyHostToDevice));
+    } else {
+      std::vector<std::int32_t> narrow(values.begin(), values.end());
+      RMM_CUDA_TRY(cudaMemcpy(column->mutable_view().data<std::int32_t>(),
+                              narrow.data(),
+                              narrow.size() * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
+    }
+    return column;
+  }
 
   op::sirius_physical_operator& expect(op::sirius_physical_operator& node, T type)
   {
@@ -235,7 +543,13 @@ struct rewriter {
     };
     switch (node.type) {
       case T::GPU_SCAN: return done(placement::spread);
-      case T::FILTER:
+      case T::FILTER: {
+        auto const where = visit(node.children[0]);
+        if (node.children[0]->type == T::MERGE_GROUP_BY) {
+          push_having_to_partials(node.Cast<op::sirius_physical_filter>(), *node.children[0]);
+        }
+        return done(where);
+      }
       case T::PROJECTION:
       // A join-edge dynamic filter: its filter holds every rank's keys (see HASH_JOIN).
       case T::DYNAMIC_FILTER:
@@ -497,9 +811,11 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,
                      cucascade::memory::memory_space& gpu,
                      std::uint64_t query,
-                     exec::query_lifecycle_registry& lifecycle)
+                     exec::query_lifecycle_registry& lifecycle,
+                     parquet_footer_reader footers)
 {
   rewriter r{service, &gpu, query, &lifecycle};
+  r.footers = std::move(footers);
   try {
     auto const where = r.visit(plan);
     if (where != placement::rank0) {

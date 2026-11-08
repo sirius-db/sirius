@@ -2380,7 +2380,13 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
       sirius_ctx->get_exchange_service(op_params),
       *gpu,
       sirius_ctx->next_distributed_query(context, op_params.distributed_query_id),
-      sirius_ctx->get_query_lifecycle_registry());
+      sirius_ctx->get_query_lifecycle_registry(),
+      op_params.enable_complete_group_having
+        ? planner::parquet_footer_reader{[&scans = sirius_ctx->get_scan_manager()](
+                                           std::string const& path) {
+            return scans.parquet_footer(path);
+          }}
+        : planner::parquet_footer_reader{});
   }
 }
 

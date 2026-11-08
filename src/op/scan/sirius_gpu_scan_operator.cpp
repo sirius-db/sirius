@@ -24,6 +24,7 @@
 #include <memory/size_arithmetic.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/parquet_scan_types.hpp>
 #include <op/scan/scan_output_operator_data.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -849,6 +850,10 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     output = std::make_unique<pipelineable_operator_data>(std::move(batches));
   }
   detail::check_read_checkpoint(detail::read_checkpoint::PAYLOAD);
+  // A cached chunk can cut a row group; a Parquet split reads only whole ones.
+  static_cast<pipelineable_operator_data&>(*output).set_whole_row_groups(
+    scan_input->has_scan_metadata() &&
+    dynamic_cast<parquet_split_info const*>(&scan_input->get_scan_info()) != nullptr);
   {
     std::lock_guard<std::mutex> guard(_emitted_mutex);
     _emitted_rows += emitted_rows;
