@@ -845,7 +845,7 @@ remote-DV gates. Schema evolution is limited to the qualified flat profile descr
 
 ## DuckLake scans
 
-Enable `SIRIUS_BUILD_DUCKLAKE_BRIDGE` and load the matching provider to use DuckLake through ordinary SQL or `CALL gpu_execution(...)`. The build option is off by default. Local Parquet and inline data use the original statement binding and the shared scan and recovery paths.
+Load the DuckLake extension shipped with Sirius to use ordinary SQL or `CALL gpu_execution(...)`. It is installed under `<libdir>/sirius/ducklake.duckdb_extension` and can be loaded by its full path. A prebuilt provider can be supplied at configure time by setting both `SIRIUS_DUCKLAKE_SOURCE_DIR` and `SIRIUS_DUCKLAKE_LIBRARY`. Local Parquet and inline data use the original statement binding and the shared scan and recovery paths.
 
 See [DuckLake support and limits](scan-contracts-design.md#ducklake-private-binding-boundary) for supported inputs, schema evolution, memory ownership and failure behavior.
 

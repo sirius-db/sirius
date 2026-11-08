@@ -16,32 +16,26 @@
 
 #include "ducklake/binding_bridge.hpp"
 
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/multi_file/multi_file_function.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/storage/external_file_cache/caching_file_system.hpp"
 #include "ducklake/dv_visibility.hpp"
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_reader.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "op/scan/parquet_delete_reader.hpp"
-#include "planner/connector_registry.hpp"
-
-#include <cucascade/io/io_errors.hpp>
-#include <cucascade/io/object_identity.hpp>
-
-#include <stdexcept>
-#include <thread>
-
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
-#include "duckdb/common/file_system.hpp"
-#include "duckdb/common/multi_file/multi_file_function.hpp"
-#include "duckdb/planner/filter/table_filter_functions.hpp"
-#include "duckdb/storage/external_file_cache/caching_file_system.hpp"
 #include "parquet_multi_file_info.hpp"
+#include "planner/connector_registry.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/object_identity.hpp>
 #include <dlfcn.h>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/multi_file/table_function_multi_file.hpp>
@@ -49,19 +43,11 @@
 #include <duckdb/transaction/meta_transaction.hpp>
 
 #include <filesystem>
-#endif
+#include <stdexcept>
+#include <thread>
 
 namespace sirius::ducklake {
 using namespace duckdb;
-bool bridge_available() noexcept
-{
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
-  return true;
-#else
-  return false;
-#endif
-}
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
 namespace {
 // Verify the *loaded* provider, not just its source directory or function name.
 bool qualified_provider(DatabaseInstance& db)
@@ -232,47 +218,22 @@ struct binding_handle::impl {
       throw std::runtime_error("DuckLake binding is outside its captured statement/transaction");
   }
 };
-#else
-struct binding_handle::impl {
-  op::scan::bound_read_view captured;
-};
-duckdb::vector<TableFunction> trusted_scan_functions(DatabaseInstance&, TableFunction const&)
-{
-  return {};
-}
-bool binding_matches(BaseTableFunction const&, FunctionData const*, ClientContext&)
-{
-  return false;
-}
-#endif
 binding_handle::binding_handle(std::unique_ptr<impl> p) : impl_(std::move(p)) {}
 binding_handle::~binding_handle() = default;
 std::shared_ptr<binding_handle> binding_handle::capture(BoundTableFunction const& function,
                                                         FunctionData const* data,
                                                         ClientContext& context)
 {
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto const* source = planner::lookup_connector(function, data, context);
   if (!source || source->function_name != "ducklake_scan")
     throw std::invalid_argument("DuckLake capture requires verified source callbacks");
   return std::shared_ptr<binding_handle>(
     new binding_handle(std::make_unique<impl>(function, data, context)));
-#else
-  throw std::runtime_error("DuckLake private binding bridge is not built");
-#endif
 }
 op::scan::bound_read_view const& binding_handle::view() const noexcept { return impl_->captured; }
-void binding_handle::validate_statement() const
-{
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
-  impl_->validate();
-#else
-  throw std::runtime_error("DuckLake private binding bridge is not built");
-#endif
-}
+void binding_handle::validate_statement() const { impl_->validate(); }
 void binding_handle::bind_execution_owner()
 {
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   if (impl_->execution_bound || impl_->discovery_started) {
     impl_->validate();
     return;
@@ -280,14 +241,10 @@ void binding_handle::bind_execution_owner()
   impl_->validate_context();
   impl_->owner           = std::this_thread::get_id();
   impl_->execution_bound = true;
-#else
-  throw std::runtime_error("DuckLake private binding bridge is not built");
-#endif
 }
 void binding_handle::configure_scan(std::vector<size_t> const& selected, TableFilterSet* filters)
 {
   validate_statement();
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   if (impl_->discovery_started)
     throw std::logic_error("DuckLake filters must be configured before unit discovery");
   duckdb::vector<duckdb::ColumnIndex> columns;
@@ -308,13 +265,11 @@ void binding_handle::configure_scan(std::vector<size_t> const& selected, TableFi
   // Publish the projection before discovery, not only when opening its reader.
   auto& schema = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
   dynamic_cast<DuckLakeMultiFileList&>(*impl_->files).SetScanColumns(schema, columns);
-#endif
 }
 
 bool binding_handle::can_prune_unit(uint64_t index) const
 {
   validate_statement();
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto& list       = dynamic_cast<DuckLakeMultiFileList&>(*impl_->files);
   auto const& file = list.GetFileEntry(index);
   auto filters     = list.GetFilterInfo();
@@ -355,14 +310,12 @@ bool binding_handle::can_prune_unit(uint64_t index) const
         !DynamicFilterData::CompareValue(comparison, *constant, *value))
       return true;
   }
-#endif
   return false;
 }
 
 std::optional<unit_descriptor> binding_handle::unit_at(uint64_t index) const
 {
   validate_statement();
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   impl_->discovery_started = true;
   auto& list               = dynamic_cast<DuckLakeMultiFileList&>(*impl_->files);
   auto const& entries      = list.GetFiles();
@@ -429,16 +382,12 @@ std::optional<unit_descriptor> binding_handle::unit_at(uint64_t index) const
       (result.kind == unit_kind::inline_table && !result.inline_schema_version))
     throw std::runtime_error("DuckLake typed entry lacks matching inline/schema/local evidence");
   return result;
-#else
-  return std::nullopt;
-#endif
 }
 position_page binding_handle::inline_delete_positions(uint64_t index,
                                                       std::span<uint64_t> destination,
                                                       std::optional<uint64_t> after) const
 {
   validate_statement();
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   if (destination.empty()) throw std::invalid_argument("DuckLake delete page needs storage");
   auto& list = dynamic_cast<DuckLakeMultiFileList&>(*impl_->files);
   if (index >= list.GetFiles().size()) throw std::out_of_range("DuckLake original file index");
@@ -449,9 +398,6 @@ position_page binding_handle::inline_delete_positions(uint64_t index,
     destination[result.size++] = *next++;
   result.more = next != positions.end();
   return result;
-#else
-  return {};
-#endif
 }
 std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   uint64_t index,
@@ -459,7 +405,6 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   scan_manager::preparation_stop_token stop)
 {
   validate_statement();
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto unit = unit_at(index);
   if (!unit || unit->deletes != delete_format::parquet)
     throw std::invalid_argument("DuckLake ordinary delete reader requires a local original unit");
@@ -533,9 +478,6 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   result->positions         = positions;
   result->parquet_validated = true;
   return result;
-#else
-  throw std::runtime_error("DuckLake private binding bridge is not built");
-#endif
 }
 std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
   uint64_t index,
@@ -551,7 +493,6 @@ std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
       "DuckLake count-only cannot request user columns or a filter projection");
   auto unit = unit_at(index);
   if (!unit) throw std::out_of_range("DuckLake original file index");
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto const& info = dynamic_cast<DuckLakeFunctionInfo const&>(*impl_->function_info);
   std::vector<op::scan::field_requirement> fields;
   auto const& schema = info.table.GetFieldData().GetFieldIds();
@@ -579,11 +520,7 @@ std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
                                 std::move(admission),
                                 count_only,
                                 std::move(options)));
-#else
-  throw std::runtime_error("DuckLake private binding bridge is not built");
-#endif
 }
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
 struct inline_reader::impl {
   std::shared_ptr<binding_handle> handle;
   ClientContext& context;
@@ -676,19 +613,9 @@ struct inline_reader::impl {
     return &output;
   }
 };
-#else
-struct inline_reader::impl {};
-#endif
 inline_reader::inline_reader(std::unique_ptr<impl> value) : impl_(std::move(value)) {}
 inline_reader::~inline_reader() = default;
-duckdb::DataChunk const* inline_reader::next()
-{
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
-  return impl_->next();
-#else
-  throw std::runtime_error("DuckLake private binding bridge is not built");
-#endif
-}
+duckdb::DataChunk const* inline_reader::next() { return impl_->next(); }
 std::unique_ptr<inline_reader> binding_handle::open_inline_unit(uint64_t index,
                                                                 std::vector<size_t> const& selected)
 {
@@ -696,14 +623,10 @@ std::unique_ptr<inline_reader> binding_handle::open_inline_unit(uint64_t index,
   if (!unit || unit->kind == unit_kind::parquet || !assess_local_scope(*unit).reasons.empty() ||
       unit->inline_delete_count || unit->transaction_local_delete)
     throw std::invalid_argument("DuckLake inline unit has unqualified dependencies");
-#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto context = impl_->context.lock();
   if (!context) throw std::runtime_error("DuckLake inline statement expired");
   return std::unique_ptr<inline_reader>(new inline_reader(std::make_unique<inline_reader::impl>(
     shared_from_this(), *context, copy_reader_binding(*impl_->reader_binding), *unit, selected)));
-#else
-  throw std::runtime_error("DuckLake private binding bridge is not built");
-#endif
 }
 std::shared_ptr<op::scan::arrow_import_ingestible> binding_handle::make_inline_unit(
   uint64_t index,

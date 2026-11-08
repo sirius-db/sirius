@@ -667,9 +667,7 @@ void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
 
 void initialize_ducklake_callbacks(duckdb::DatabaseInstance& db)
 {
-  if (!sirius::ducklake::bridge_available() ||
-      !duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("ducklake"))
-    return;
+  if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("ducklake")) return;
   auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
   for (std::size_t i = 0; i < entries.size(); ++i) {
     if (entries[i].function_name != "ducklake_scan") continue;

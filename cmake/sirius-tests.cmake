@@ -1,5 +1,11 @@
 find_package(Catch2 3 REQUIRED CONFIG)
 
+set_property(
+  SOURCE test/cpp/integration/test_ducklake_connector.cpp
+  APPEND
+  PROPERTY COMPILE_DEFINITIONS
+           "SIRIUS_TEST_DUCKLAKE_PATH=\"${_ducklake_library}\"")
+
 add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                test/cpp/utils/sirius_extension_loader.cpp)
 # Export DuckDB's host API for third-party extensions such as Iceberg.

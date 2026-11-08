@@ -79,8 +79,6 @@ std::optional<scan_manager::preparation_request> prepare_scan(op::sirius_physica
                                                               operator_params const& params,
                                                               duckdb::ClientContext& context)
 {
-  if (!bridge_available())
-    throw duckdb::NotImplementedException("DuckLake private binding bridge is disabled");
   auto binding = binding_handle::capture(scan.function, scan.bind_data.get(), context);
   if (binding->view().identity->fingerprint != scan.bound_view->identity->fingerprint)
     throw std::invalid_argument("DuckLake prepared binding differs from the certified read view");
@@ -121,21 +119,11 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_scan(
   duckdb::ClientContext& context,
   op::scan::dynamic_filter_apply_mode mode)
 {
-  if (!bridge_available())
-    throw duckdb::NotImplementedException("DuckLake private binding bridge is disabled");
   if (!scan.prepared_ingestible)
     throw scan_manager::preparation_resource_error(
       "DuckLake statement preparation was not admitted", false);
   return planner::lower_prepared_scan(
     std::move(scan.prepared_ingestible), scan, params, context, mode);
-}
-op::scan::certification_result bridge_unavailable()
-{
-  op::scan::certification_result result;
-  result.verdict     = op::scan::eligibility_verdict::incomplete;
-  result.reason      = op::scan::verdict_reason::interface_unavailable;
-  result.reason_text = "DuckLake private binding bridge is disabled";
-  return result;
 }
 }  // namespace
 planner::connector scan_connector()
@@ -152,14 +140,6 @@ planner::connector scan_connector()
           .byte_source                = transparent::byte_source_class::unclassified,
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = false,
-          .decline_reason =
-            [](duckdb::LogicalGet&, duckdb::ClientContext&, planner::scan_contract_provenance&) {
-              if (bridge_available()) return op::scan::pre_capture_result{};
-              auto r = bridge_unavailable();
-              op::scan::pre_capture_result result;
-              result.decline = op::scan::pre_decline{r.verdict, r.reason, r.reason_text};
-              return result;
-            },
           .provider =
             planner::provider_profile{"ducklake", "417a9117f5", "ducklake.original-statement.v1"},
           .certify =
@@ -167,7 +147,6 @@ planner::connector scan_connector()
                op::sirius_physical_table_scan const& scan,
                duckdb::ClientContext&,
                planner::scan_contract_provenance&) {
-              if (!bridge_available()) return bridge_unavailable();
               op::scan::certification_result result;
               try {
                 (void)layout(scan);

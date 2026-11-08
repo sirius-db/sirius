@@ -33,9 +33,6 @@ namespace sirius::ducklake {
 class parquet_unit_ingestible;
 class inline_reader;
 struct dv_visibility;
-// Only the implementation may include provider-private headers. Availability
-// permits source verification; each scan still requires contract certification.
-bool bridge_available() noexcept;
 duckdb::vector<duckdb::TableFunction> trusted_scan_functions(
   duckdb::DatabaseInstance&, duckdb::TableFunction const& trusted_parquet);
 bool binding_matches(duckdb::BaseTableFunction const&,

@@ -67,25 +67,16 @@ using sirius::test::query;
 using sirius::transparent::connection_provenance;
 using sirius::transparent::decline_reason;
 
-bool load_ducklake(duckdb::Connection& con)
+void load_ducklake(duckdb::Connection& con)
 {
   auto path = std::getenv("SIRIUS_TEST_DUCKLAKE_EXTENSION");
-  auto result =
-    con.Query(path && *path ? "LOAD " + duckdb::Value(path).ToSQLString() : "LOAD ducklake");
-  if (!result || result->HasError()) {
-    auto required = std::getenv("SIRIUS_TEST_REQUIRE_DUCKLAKE");
-    if (required && std::string(required) == "1") {
-      FAIL("required DuckLake LOAD failed: " << (result ? result->GetError() : "no result"));
-    }
-    WARN("DuckLake not covered");
-    return false;
-  }
+  if (!path || !*path) path = SIRIUS_TEST_DUCKLAKE_PATH;
+  query(con, "LOAD " + duckdb::Value(path).ToSQLString());
   auto version = query(con,
                        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = "
                        "'ducklake' AND loaded");
   REQUIRE(version->RowCount() == 1);
   REQUIRE(version->Collection().GetValue(0, 0).ToString() == "417a9117f5");
-  return true;
 }
 
 void attach_lake(duckdb::Connection& con, std::string const& directory)
@@ -464,10 +455,7 @@ struct ducklake_fixture {
   sirius::test::shared_test_env env{lake_config()};
   duckdb::Connection con{env.make_connection()};
 
-  ducklake_fixture()
-  {
-    if (!load_ducklake(con)) SKIP("DuckLake extension is unavailable");
-  }
+  ducklake_fixture() { load_ducklake(con); }
 
   auto run(std::string const& sql) { return query(con, sql); }
 
@@ -550,7 +538,7 @@ TEST_CASE("DuckLake provider SQL declines while ordinary user SQL remains GPU el
   sirius::test::scoped_temp_directory disk;
   sirius::test::shared_test_env env(lake_config());
   auto con = env.make_connection();
-  if (!load_ducklake(con)) { return; }
+  load_ducklake(con);
   query(con, "SET GLOBAL gpu_execution = true");
   auto before = get_transparent_execution_stats(con);
   attach_lake(con, disk.directory);
@@ -558,9 +546,8 @@ TEST_CASE("DuckLake provider SQL declines while ordinary user SQL remains GPU el
   query(con, "SELECT id, extra FROM lake.t ORDER BY id");
   auto after = get_transparent_execution_stats(con);
   REQUIRE(after.provider_internal_skips > before.provider_internal_skips);
-  auto expected_executions = sirius::ducklake::bridge_available() ? 1 : 0;
-  REQUIRE(after.successful_rebinds == before.successful_rebinds + expected_executions);
-  REQUIRE(after.executions == before.executions + expected_executions);
+  REQUIRE(after.successful_rebinds == before.successful_rebinds + 1);
+  REQUIRE(after.executions == before.executions + 1);
   REQUIRE(after.classification_failures == before.classification_failures);
   before = after;
   query(con, "SELECT 42::INTEGER");
@@ -576,7 +563,7 @@ TEST_CASE("DuckLake flush preserves rows and file paths after closing every conn
   {
     sirius::test::shared_test_env env(lake_config());
     auto con = env.make_connection();
-    if (!load_ducklake(con)) { return; }
+    load_ducklake(con);
     query(con, "SET GLOBAL gpu_execution = true");
     attach_lake(con, disk.directory);
     populate_lake(con);
@@ -586,7 +573,7 @@ TEST_CASE("DuckLake flush preserves rows and file paths after closing every conn
   {
     sirius::test::shared_test_env env(lake_config());
     auto con = env.make_connection();
-    REQUIRE(load_ducklake(con));
+    load_ducklake(con);
     query(con, "SET GLOBAL gpu_execution = true");
     attach_lake(con, disk.directory);
     check_lake_rows(con);
@@ -631,7 +618,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto end = GENERATE(std::string("statement"), std::string("rollback"), std::string("context"));
   CAPTURE(end);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CREATE TABLE lake.q AS SELECT 42::BIGINT id");
@@ -690,7 +676,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto discovered = GENERATE(false, true);
   CAPTURE(discovered);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CREATE TABLE lake.q AS SELECT 42::BIGINT id");
@@ -746,7 +731,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake bound deletion locality follows the selected read view",
                  "[isolated_context][ducklake][ducklake_delete_locality]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit',10)");
@@ -851,10 +835,9 @@ TEST_CASE_METHOD(ducklake_fixture,
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->Collection().GetValue(0, 0).GetValue<int64_t>() == (threshold == 2 ? 9 : 7));
   }
-  auto after               = get_transparent_execution_stats(con);
-  auto expected_executions = sirius::ducklake::bridge_available() ? 5 : 0;
-  REQUIRE(after.executions == before.executions + expected_executions);
-  REQUIRE(after.successful_rebinds == before.successful_rebinds + expected_executions);
+  auto after = get_transparent_execution_stats(con);
+  REQUIRE(after.executions == before.executions + 5);
+  REQUIRE(after.successful_rebinds == before.successful_rebinds + 5);
   query(con, "ROLLBACK");
   auto committed = query(con, "SELECT sum(id)::BIGINT FROM lake.t");
   REQUIRE(committed->Collection().GetValue(0, 0).GetValue<int64_t>() == 6);
@@ -884,7 +867,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 TEST_CASE("DuckLake Parquet scans honor the configured batch target",
           "[isolated_context][ducklake][ducklake_sql]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   auto target = GENERATE(uint64_t{1}, uint64_t{64 * 1024 * 1024});
   INFO(target);
   sirius::test::scoped_temp_directory disk;
@@ -893,7 +875,7 @@ TEST_CASE("DuckLake Parquet scans honor the configured batch target",
   });
   sirius::test::shared_test_env env(path);
   auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
+  load_ducklake(con);
   attach_lake(con, disk.directory);
   query(con, "SET gpu_execution=false");
   query(con, "CALL lake.set_option('data_inlining_row_limit', 0)");
@@ -929,7 +911,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto shape = GENERATE(std::string("parquet"), std::string("mixed"), std::string("inline"));
   INFO(shape);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit', 100)");
@@ -1013,7 +994,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                        std::string("replay_failure"),
                        std::string("interrupted"));
   INFO(mode);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   create_recovery_table(4);
   std::string sql = "SELECT id,value FROM lake.q WHERE id%3<>0";
   auto expected   = ducklake_result_bag(*run(sql));
@@ -1088,7 +1068,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto mode = GENERATE(std::string("commit"), std::string("flush"));
   INFO(mode);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit', 100)");
@@ -1142,7 +1121,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto footer = GENERATE(false, true);
   INFO(footer);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit', 100)");
@@ -1205,7 +1183,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                                                                     {"inline", "inline"}}));
   INFO(shape);
   INFO(deletes);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit'," +
@@ -1269,7 +1246,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto fallback = GENERATE(false, true);
   INFO(fallback);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit', 100)");
@@ -1317,7 +1293,7 @@ TEST_CASE("DuckLake reserves optional preparation permits for discovered files",
   });
   sirius::test::shared_test_env env(path);
   auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
+  load_ducklake(con);
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit',0)");
@@ -1398,14 +1374,13 @@ TEST_CASE("DuckLake reserves optional preparation permits for discovered files",
 TEST_CASE("DuckLake joins refuse an insufficient preparation permit ceiling before data work",
           "[isolated_context][ducklake][ducklake_admission_minimum]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   sirius::test::scoped_temp_directory disk;
   auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
     config["sirius"]["executor"]["scan_manager"]["preparation"]["max_permits"] = 1;
   });
   sirius::test::shared_test_env env(config_path);
   auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
+  load_ducklake(con);
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CREATE TABLE lake.q AS SELECT 42::BIGINT id");
@@ -1434,7 +1409,6 @@ TEST_CASE("DuckLake joins refuse an insufficient preparation permit ceiling befo
 TEST_CASE("Production DuckLake SQL isolates concurrent prepared executions",
           "[isolated_context][ducklake][ducklake_concurrency]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   sirius::test::scoped_temp_directory disk;
   auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
     config["sirius"]["max_concurrent_queries"] = 2;
@@ -1443,7 +1417,7 @@ TEST_CASE("Production DuckLake SQL isolates concurrent prepared executions",
   });
   sirius::test::shared_test_env env(config_path);
   auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
+  load_ducklake(con);
   auto run = [&](std::string const& sql) { return query(con, sql); };
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
@@ -1533,7 +1507,6 @@ TEST_CASE("Production DuckLake SQL isolates concurrent prepared executions",
 TEST_CASE("Concurrent DuckLake scans release input budgets while GPU outputs remain retained",
           "[isolated_context][ducklake][ducklake_budget_retention]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   auto deletion = GENERATE(std::string("inline"), std::string("parquet"), std::string("puffin"));
   auto join     = GENERATE(false, true);
   CAPTURE(deletion, join);
@@ -1545,7 +1518,7 @@ TEST_CASE("Concurrent DuckLake scans release input budgets while GPU outputs rem
   });
   sirius::test::shared_test_env env(config_path);
   auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
+  load_ducklake(con);
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
@@ -1741,7 +1714,6 @@ TEST_CASE_METHOD(
   "Production DuckLake SQL preserves transaction local changes and new statement identities",
   "[isolated_context][ducklake][ducklake_transaction]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit', 100)");
@@ -1780,7 +1752,6 @@ TEST_CASE_METHOD(ducklake_fixture,
   auto hold_batch     = GENERATE(false, true);
   auto fallback       = GENERATE(false, true);
   CAPTURE(explicit_entry, hold_batch, fallback);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   create_recovery_table(3);
   std::string sql = "SELECT value,COUNT(*),SUM(id) FROM lake.q WHERE id%3<>0 GROUP BY value";
   auto expected   = ducklake_result_bag(*run(sql));
@@ -1847,7 +1818,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto explicit_entry = GENERATE(false, true);
   CAPTURE(explicit_entry);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   create_recovery_table(4, /*flush_after_insert=*/false);
   run("ATTACH '" + (std::filesystem::path(disk.directory) / "keys.db").string() +
       "' AS native_store");
@@ -1891,7 +1861,6 @@ TEST_CASE_METHOD(
   "Production DuckLake SQL does not reuse rows after replacing a file at the same path",
   "[isolated_context][ducklake][ducklake_object_identity]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit',0)");
@@ -1944,7 +1913,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "Production DuckLake SQL cancellation waits for its blocked provider query",
                  "[isolated_context][ducklake][ducklake_provider_cancel]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit',20000)");
@@ -2016,14 +1984,13 @@ TEST_CASE_METHOD(ducklake_fixture,
 TEST_CASE("Production DuckLake mixed scans execute and recover across two GPUs",
           "[isolated_context][ducklake_multi_gpu][multi_gpu]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   if (!sirius::test::has_gpus(2)) SKIP("DuckLake device placement requires two GPUs");
   sirius::test::scoped_temp_directory disk;
   auto config_path = write_lake_config(
     disk.directory, [](YAML::Node& config) { config["sirius"]["topology"]["num_gpus"] = 2; });
   sirius::test::shared_test_env env(config_path);
   auto con = env.make_connection();
-  if (!load_ducklake(con)) return;
+  load_ducklake(con);
   auto run = [&](std::string const& sql) { return query(con, sql); };
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
@@ -2100,7 +2067,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto width = GENERATE(2, 5, 32);
   INFO(width);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit',20000)");
@@ -2138,7 +2104,6 @@ TEST_CASE_METHOD(ducklake_fixture,
   auto mixed             = GENERATE(false, true);
   auto transaction_local = GENERATE(false, true);
   CAPTURE(mixed, transaction_local);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
@@ -2180,7 +2145,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                         std::string("failed_parquet"));
   bool fail_decode = shape == "failed_parquet";
   INFO(shape);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
@@ -2256,7 +2220,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "[isolated_context][ducklake][ducklake_scalar_subqueries]")
 {
   auto parquet = GENERATE(false, true);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
@@ -2324,7 +2287,6 @@ TEST_CASE_METHOD(ducklake_fixture,
 {
   auto files = GENERATE(1, 2, 8);
   INFO(files);
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CALL lake.set_option('data_inlining_row_limit',10)");
@@ -2400,7 +2362,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake empty scans preserve scalar aggregate results",
                  "[isolated_context][ducklake][ducklake_empty_aggregate]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   auto shape = GENERATE(
     std::string("empty"), std::string("inline"), std::string("parquet"), std::string("mixed"));
   INFO(shape);
@@ -2431,7 +2392,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake inline projection reads only required columns",
                  "[isolated_context][ducklake][ducklake_projection]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   auto local = GENERATE(false, true);
   CAPTURE(local);
   query(con, "SET gpu_execution=false");
@@ -2476,7 +2436,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake validates local Parquet deletes across parallel row group boundaries",
                  "[ducklake][ducklake_parallel_deletes][isolated_context]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   run("SET gpu_execution=false");
   run("SET threads=1");
   attach_lake(con, disk.directory);
@@ -2524,7 +2483,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "Interrupting a DuckLake Parquet delete read preserves cancellation",
                  "[isolated_context][ducklake][ducklake_delete_interrupt]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CALL lake.set_option('data_inlining_row_limit',0)");
@@ -2621,7 +2579,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake lookup rejects foreign transaction and reader bindings",
                  "[ducklake][ducklake_binding_lookup][isolated_context]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CREATE TABLE lake.q(i INTEGER)");
@@ -2662,7 +2619,6 @@ TEST_CASE_METHOD(ducklake_fixture,
   namespace dl   = sirius::ducklake;
   namespace sm   = sirius::scan_manager;
   namespace prep = sirius::test::preparation;
-  if (!dl::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   run("SET gpu_execution=false");
   attach_lake(con, disk.directory);
   run("CALL lake.set_option('data_inlining_row_limit',0)");
@@ -2730,7 +2686,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake decimals preserve precision across inline Parquet and mixed scans",
                  "[ducklake][ducklake_decimal][isolated_context]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake bridge is disabled");
   auto mode       = GENERATE(std::string("inline"), std::string("parquet"), std::string("mixed"));
   auto precision  = GENERATE(5, 9, 10, 18, 19, 38);
   auto scale_mode = GENERATE(0, 1, 2);
@@ -2777,7 +2732,6 @@ TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake wide decimal inline batches fit their preparation envelope",
                  "[ducklake][ducklake_decimal][isolated_context]")
 {
-  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake bridge is disabled");
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   run("CALL lake.set_option('data_inlining_row_limit',10000)");
