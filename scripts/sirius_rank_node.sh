@@ -21,6 +21,9 @@
 # retrying until it succeeds, and again whenever gateway.conf names a new gateway_id; the gateway
 # must SET sirius_gateway_allow_join = true. Without one, it prints the call, for the gateway's
 # console.
+# SIRIUS_RANK_LOG_ROOT: each rank's Sirius log goes to <root>/<short hostname>-<quack port>/
+# (SIRIUS_LOG_DIR). Without it, ranks started from one directory share its log/ folder, and
+# ranks of several nodes on a shared file system lose lines appending to one file.
 # SIRIUS_RANK_TOKEN sets the rank's token; otherwise a random one is kept in <dir>/token. On a
 # listen host other than this machine's loopback, Quack serves TLS with a key pair kept in
 # <dir>/tls, whose fingerprint the gateway pins.
@@ -218,6 +221,10 @@ stop()
   fi
   exit 0
 }
+if [ -n "${SIRIUS_RANK_LOG_ROOT:-}" ]; then
+  export SIRIUS_LOG_DIR=$SIRIUS_RANK_LOG_ROOT/$(hostname -s)-$port
+  mkdir -p "$SIRIUS_LOG_DIR"
+fi
 trap stop TERM INT
 backoff=1
 first=1
