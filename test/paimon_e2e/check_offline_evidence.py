@@ -80,6 +80,24 @@ def check_model(expected, trace):
         number(binding[name])
     for name in ("read_owner", "producer", "certified_view", "pipeline"):
         token(binding[name])
+    columns = expected["result"]["columns"]
+    if not isinstance(columns, list) or not columns:
+        reject("invalid_oracle_columns")
+    for column in columns:
+        if (
+            not isinstance(column, list)
+            or len(column) != 2
+            or not isinstance(column[0], str)
+            or not column[0]
+            or not isinstance(column[1], str)
+        ):
+            reject("invalid_oracle_columns")
+        type_name = column[1]
+        decimal = re.fullmatch(r"DECIMAL\(([1-9][0-9]?),([0-9]+)\)", type_name)
+        if type_name not in ("BIGINT", "VARCHAR", "DATE") and not (
+            decimal and 0 <= int(decimal[2]) <= int(decimal[1]) <= 38
+        ):
+            reject("invalid_oracle_columns")
     if not expected["result"]["rows"]:
         reject("nonempty_first_slice_required")
     if not same(trace["scope"], scope):
@@ -88,9 +106,10 @@ def check_model(expected, trace):
     uuid, plan = token(query["uuid"]), token(query["plan"])
     fields(
         query,
-        {"label": scope["statement"], "window": window, "finalize_generation": 0},
+        {"label": scope["statement"], "window": window},
         "execution_window",
     )
+    number(query["finalize_generation"])
     fields(trace["mapping"], {"uuid": uuid, "window": window}, "window_uuid_mapping")
     if not same(
         trace["runtime"],
@@ -142,7 +161,7 @@ def check_model(expected, trace):
         or len(set(owners)) != len(owners)
     ):
         reject("native_batch_ownership")
-    units = {}
+    units, batch_units = {}, {}
     validations = trace["validations"]
     if not isinstance(validations, list) or not validations:
         reject("missing_actual_input")
@@ -169,24 +188,28 @@ def check_model(expected, trace):
                 reject("rootless_rows")
         elif owner not in owners:
             reject("unattributed_batch")
+        else:
+            # Private model identity denotes one immutable batch, not a pool or
+            # lifetime shared by several batches. No production ID API implied.
+            if owner in batch_units and batch_units[owner] != unit:
+                reject("ambiguous_batch_unit")
+            batch_units[owner] = unit
         canonical = (rows, item["rootless"], owner)
         if unit in units and not same(units[unit], canonical):
             reject("contradictory_unit")
         units[unit] = canonical
+    if set(batch_units) != set(owners):
+        reject("unvalidated_native_batch")
     data = [value for value in units.values() if not value[1]]
     if not data or sum(value[0] for value in data) <= 0:
         reject("no_nonrootless_data")
     before, after = trace["imports"]["before"], trace["imports"]["after"]
     batches = number(after["batches"]) - number(before["batches"])
     rows = number(after["rows"]) - number(before["rows"])
-    # Strict first full single-scan model: every deduplicated data unit is
-    # imported once. This is not a general limit/retry/multi-scan lineage API.
-    if (
-        batches <= 0
-        or rows <= 0
-        or batches != len(data)
-        or rows != sum(v[0] for v in data)
-    ):
+    # Under independently established whole-runtime/source/scan premises, this
+    # establishes only some import activity. Same-unit OOM retries can count
+    # again; aggregate deltas cannot establish per-unit successful consumption.
+    if batches <= 0 or rows <= 0:
         reject("import_delta")
     tasks = trace["scan_tasks"]
     if not isinstance(tasks, list) or not tasks:

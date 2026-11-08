@@ -267,9 +267,13 @@ class OfflineEvidenceTests(unittest.TestCase):
         self.check(lambda e, o: o["scan_tasks"][0].update(operator=11))
         self.check(lambda e, o: o["scan_tasks"][0].update(pipeline="other-pipeline"))
 
-    def test_execution_finalize_zero_is_valid_but_arrow_generation_is_distinct(self):
+    def test_reused_finalize_plan_and_retry_import_do_not_lose_current_execution(self):
         self.check(accepted=True)
-        self.check(lambda e, o: o["query"].update(finalize_generation=9))
+        self.check(lambda e, o: o["query"].update(finalize_generation=9), accepted=True)
+        self.check(
+            lambda e, o: o["imports"]["after"].update(batches=2, rows=8), accepted=True
+        )
+        self.check(lambda e, o: o["query"].update(finalize_generation=-1))
 
     def test_multiscan_cannot_pass_using_one_source_receipt(self):
         self.check(lambda e, o: o["sources"].append(copy.deepcopy(o["sources"][0])))
@@ -318,6 +322,46 @@ class OfflineEvidenceTests(unittest.TestCase):
                 )
                 self.assertEqual(report["reason"], "result_oracle")
                 self.assertNotIn("credential-sentinel", json.dumps(report))
+
+    def test_malformed_oracle_columns_produce_structured_rejection(self):
+        for value in (None, 123, [], ["id"], [["id", None]], [[None, "BIGINT"]]):
+            with self.subTest(columns=value):
+
+                def malformed(e, o):
+                    e["result"]["columns"] = value
+                    o["result"]["columns"] = value
+
+                self.check(malformed)
+        for type_name in (None, "NOT_A_DUCKDB_TYPE", "DECIMAL(garbage)"):
+            with self.subTest(all_null_type=type_name):
+
+                def nulls(e, o):
+                    e["result"]["columns"][1][1] = type_name
+                    o["result"]["columns"][1][1] = type_name
+                    for row in e["result"]["rows"]:
+                        row[1] = None
+                    for row in o["result"]["rows"]:
+                        row["amount"] = None
+
+                self.check(nulls)
+
+        def empty_schema(e, o):
+            e["result"].update(columns=[], rows=[[]])
+            o["result"].update(columns=[], rows=[{}])
+
+        self.check(empty_schema)
+
+    def test_immutable_batch_owner_cannot_name_two_units_or_remain_unvalidated(self):
+        def contradictory(e, o):
+            other = copy.deepcopy(o["validations"][0])
+            other.update(unit=1, rows=2)
+            o["validations"].append(other)
+            o["imports"]["after"].update(batches=2, rows=6)
+
+        self.check(contradictory)
+        self.check(
+            lambda e, o: o["native_origin"]["batch_owners"].append("unvalidated-batch")
+        )
 
     def test_output_cannot_replace_inputs_or_previous_attempt(self):
         with tempfile.TemporaryDirectory() as directory:

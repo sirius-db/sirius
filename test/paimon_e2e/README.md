@@ -61,10 +61,22 @@ proof of an actual SDK read. No production ID or observer API is introduced.
 The model joins run/runtime/process/statement and artifact/input/oracle identity,
 execution window, one nonempty source's contract and deduplicated owned units,
 isolated import deltas, the mapped GPU scan's Computing and successful
-Finalizing, fully consumed results and same-runtime cleanup/liveness. This first
-full-scan model requires every data unit to be imported once. It does not cover
-LIMIT/retry/multiple scans, empty tables or all M1/M2 behavior. Execution
-`finalize_generation=0` is separate from nonzero Arrow materialization generation.
+Finalizing, fully consumed results and same-runtime cleanup/liveness. Positive
+aggregate import deltas establish only conditional single-source existence,
+never a per-unit successful-import ledger. It does not cover LIMIT/multiple
+scans, empty tables or all M1/M2 behavior. Execution `finalize_generation=0` and
+retained nonzero plan generations are both legal and separate from nonzero Arrow
+materialization generation.
+The fixture's batch identity denotes one immutable batch and must map to one
+unit; every listed native batch must have validation. These are private model
+relationships, not a claim that production has such a receipt ledger. OOM retry
+can count the same unit repeatedly; the CLI accepts larger positive deltas. A
+reused finalized plan can retain a nonzero registry generation without a fresh
+window entry. The model's execution window/UUID association is independent of
+registry creation; its source query identity denotes the current scan manager
+query token. Real collection must obtain that association and actual contract/
+scan mapping. Zero registry generation, a fresh registry window and aggregate
+count equality with deduplicated validation are not requirements.
 
 All tests, including the complete synthetic positive and correct-row forced-CPU
 negative, run in the locked CPU command above. Every successful offline decision
