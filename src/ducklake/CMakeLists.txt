@@ -6,6 +6,7 @@ target_sources(
           inline_batch_producer.cpp
           inline_varchar.cpp
           parquet_unit_ingestible.cpp
+          provider_api.cpp
           scan_ingestible.cpp
           source_registration.cpp
           unit_descriptor.cpp)

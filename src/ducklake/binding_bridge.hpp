@@ -33,8 +33,11 @@ namespace sirius::ducklake {
 class parquet_unit_ingestible;
 class inline_reader;
 struct dv_visibility;
+struct provider_api;
 duckdb::vector<duckdb::TableFunction> trusted_scan_functions(
-  duckdb::DatabaseInstance&, duckdb::TableFunction const& trusted_parquet);
+  duckdb::DatabaseInstance&,
+  duckdb::TableFunction const& trusted_parquet,
+  std::shared_ptr<const provider_api>& owner);
 bool binding_matches(duckdb::BaseTableFunction const&,
                      duckdb::FunctionData const*,
                      duckdb::ClientContext&);

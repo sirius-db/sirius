@@ -12,20 +12,22 @@ endif()
 
 set(SIRIUS_DUCKLAKE_SOURCE_DIR
     ""
-    CACHE PATH "Pinned, host-patched DuckLake source for a prebuilt provider")
+    CACHE PATH "Pinned, host-patched DuckLake source for the private bridge")
 set(SIRIUS_DUCKLAKE_LIBRARY
     ""
-    CACHE FILEPATH "DuckLake extension built from SIRIUS_DUCKLAKE_SOURCE_DIR")
+    CACHE FILEPATH "Optional matching DuckLake extension for offline tests")
 
 function(sirius_add_duckdb_source)
   # Keep DuckDB options scoped to its dependency build.
-  if(SIRIUS_DUCKLAKE_SOURCE_DIR OR SIRIUS_DUCKLAKE_LIBRARY)
+  if(SIRIUS_DUCKLAKE_LIBRARY AND (NOT EXISTS "${SIRIUS_DUCKLAKE_LIBRARY}"
+                                  OR IS_DIRECTORY "${SIRIUS_DUCKLAKE_LIBRARY}"))
+    message(FATAL_ERROR "The configured DuckLake test extension does not exist")
+  endif()
+  if(SIRIUS_DUCKLAKE_SOURCE_DIR)
     if(NOT EXISTS
-       "${SIRIUS_DUCKLAKE_SOURCE_DIR}/src/include/storage/ducklake_scan.hpp"
-       OR NOT EXISTS "${SIRIUS_DUCKLAKE_LIBRARY}")
+       "${SIRIUS_DUCKLAKE_SOURCE_DIR}/src/include/storage/ducklake_scan.hpp")
       message(
-        FATAL_ERROR
-          "Supply both the pinned DuckLake source and its matching library")
+        FATAL_ERROR "Supply the pinned DuckLake source for the private bridge")
     endif()
     set(DUCKDB_EXTENSION_CONFIGS "")
   else()

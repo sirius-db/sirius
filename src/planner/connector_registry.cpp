@@ -48,6 +48,7 @@
 #include <duckdb/parser/tableref/table_function_ref.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/storage/object_cache.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <parquet_extension.hpp>
@@ -665,6 +666,16 @@ void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
   }
 }
 
+// Provider callbacks and their module belong to the database that loaded them.
+struct ducklake_reference final : duckdb::ObjectCacheEntry {
+  static constexpr char const* key = "sirius.ducklake.scan_reference";
+  static std::string ObjectType() { return key; }
+  std::string GetObjectType() override { return key; }
+  duckdb::optional_idx GetEstimatedCacheMemory() const override { return {}; }
+  std::shared_ptr<const sirius::ducklake::provider_api> module;
+  detail::connector_reference_cache reference;
+};
+
 void initialize_ducklake_callbacks(duckdb::DatabaseInstance& db)
 {
   if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("ducklake")) return;
@@ -673,12 +684,18 @@ void initialize_ducklake_callbacks(duckdb::DatabaseInstance& db)
     if (entries[i].function_name != "ducklake_scan") continue;
     auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
-    if (cache.reference.has_verified_functions(host)) return;
+    auto& db_cache = db.GetObjectCache();
+    if (db_cache.Get<ducklake_reference>(ducklake_reference::key)) return;
     try {
       auto parquet = parquet_reference_functions(db, "parquet_scan");
       if (parquet.empty()) return;
-      auto references = sirius::ducklake::trusted_scan_functions(db, parquet.front());
-      if (!references.empty()) cache.reference.publish(host, std::move(references));
+      std::shared_ptr<const sirius::ducklake::provider_api> module;
+      auto references = sirius::ducklake::trusted_scan_functions(db, parquet.front(), module);
+      if (references.empty()) return;
+      auto lake    = duckdb::make_shared_ptr<ducklake_reference>();
+      lake->module = std::move(module);
+      lake->reference.publish(host, std::move(references));
+      db_cache.Put(ducklake_reference::key, std::move(lake));
     } catch (std::exception const& error) {
       SIRIUS_LOG_WARN("DuckLake scan source verification failed during extension load: {}",
                       error.what());
@@ -723,6 +740,13 @@ connector const* override_for(std::vector<connector> const* overrides, std::stri
 }
 #endif
 }  // namespace
+
+std::shared_ptr<const ducklake::provider_api> registered_ducklake_provider(
+  duckdb::DatabaseInstance& db)
+{
+  auto entry = db.GetObjectCache().Get<ducklake_reference>(ducklake_reference::key);
+  return entry ? entry->module : nullptr;
+}
 
 bool verified_parquet_interface(duckdb::FunctionData const* data, duckdb::ClientContext& context)
 {
@@ -818,7 +842,11 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
         duckdb::OnEntryNotFound::RETURN_NULL);
     if (!catalog_entry) return {nullptr, lookup_decline::catalog_entry_missing};
     // A mutable catalog can confirm registration, but must never grant trust.
-    auto const& references = cache.reference.get_or_resolve(
+    auto lake              = registered.function_name == "ducklake_scan"
+                               ? context.db->GetObjectCache().Get<ducklake_reference>(ducklake_reference::key)
+                               : nullptr;
+    auto& reference_cache  = lake ? lake->reference : cache.reference;
+    auto const& references = reference_cache.get_or_resolve(
       host, [&] { return reference_functions(entry.function_name, context); });
     if (references.empty()) {
       if (cache.missing_reference_reported.insert(host).second) {

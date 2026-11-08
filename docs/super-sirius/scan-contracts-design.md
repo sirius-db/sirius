@@ -41,7 +41,7 @@ If a trusted definition is unavailable, Sirius warns once per source and decline
 
 ### DuckLake private binding boundary
 
-Sirius builds the DuckLake provider from the revision and patches pinned by its DuckDB host. Private provider headers stay inside `binding_bridge.cpp`. Installed packages include the matching provider library.
+Sirius compiles the bridge against the DuckLake headers pinned by its DuckDB host. DuckDB loads the extension and applies its usual signature policy. Each database uses callback definitions from its own loaded provider.
 
 The connector verifies the provider callbacks and reads the original binding's snapshot, schema and transaction-local state. Each execution owns its readers and cursors; the saved CPU reader remains available for replay. Parquet and inline units share the existing preparation coordinator, split validation and query recovery. Discovery is lazy and must cover every unit in the binding. Inline readers supply detached batches to the shared Arrow driver; DuckLake retains transaction and provenance checks, while the driver handles admission, import and batch retirement.
 
@@ -177,6 +177,8 @@ Adapters using this driver must also handle the following integration responsibi
 | Stopping discovery | Report token-driven stops as `std::errc::operation_canceled` so normal EOS can finish successfully. Propagate discovery errors unchanged. |
 
 ### Execution and ownership
+
+At a shareable file boundary, the coordinator checks its ready queue under the gate lock and passes the coalescer a boolean indicating whether a shareable successor is ready. The coalescer may retain its tail for that input. When no successor is ready, it emits the tail without waiting for another worker. Calls that advance or finish the same coalescer must be serialized.
 
 The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
 

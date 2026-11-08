@@ -1,14 +1,8 @@
 # DuckDB configures the pinned provider and applies its host patches.
 if(SIRIUS_DUCKLAKE_SOURCE_DIR)
   set(_ducklake_source "${SIRIUS_DUCKLAKE_SOURCE_DIR}")
-  set(_ducklake_library "${SIRIUS_DUCKLAKE_LIBRARY}")
-  get_filename_component(_ducklake_library_dir "${_ducklake_library}" DIRECTORY)
 else()
   get_target_property(_ducklake_source ducklake_loadable_extension SOURCE_DIR)
-  set(_ducklake_library "$<TARGET_FILE:ducklake_loadable_extension>")
-  set(_ducklake_library_dir "$<TARGET_FILE_DIR:ducklake_loadable_extension>")
-  add_dependencies(sirius_shared ducklake_loadable_extension)
-  add_dependencies(sirius_core ducklake_loadable_extension)
 endif()
 find_package(Git REQUIRED)
 execute_process(
@@ -35,36 +29,14 @@ execute_process(
           ${_ducklake_patches} COMMAND_ERROR_IS_FATAL ANY)
 set_property(
   SOURCE "${PROJECT_SOURCE_DIR}/src/ducklake/binding_bridge.cpp"
-         TARGET_DIRECTORY sirius_objects
+         "${PROJECT_SOURCE_DIR}/src/ducklake/provider_api.cpp" TARGET_DIRECTORY
+         sirius_objects
   APPEND
   PROPERTY INCLUDE_DIRECTORIES "${_ducklake_source}/src/include")
-target_link_libraries(sirius_shared PRIVATE "${_ducklake_library}")
-target_link_libraries(
-  sirius_core PRIVATE "$<BUILD_INTERFACE:${_ducklake_library}>"
-                      "$<INSTALL_INTERFACE:sirius::ducklake_provider>")
+target_link_libraries(sirius_shared PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(sirius_core PRIVATE ${CMAKE_DL_LIBS})
 
-# The private bridge and provider must travel together. Use the provider's
-# stable loadable-extension name so an installed package never depends on a
-# build path.
-install(
-  FILES "${_ducklake_library}"
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/sirius"
-  RENAME ducklake.duckdb_extension
-  COMPONENT sirius_library)
 install(
   FILES "${_ducklake_source}/LICENSE"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/sirius/ducklake"
   COMPONENT sirius_library)
-set_property(
-  TARGET sirius_shared
-  APPEND
-  PROPERTY INSTALL_RPATH "$ORIGIN/sirius")
-
-# The .duckdb_extension suffix does not produce an automatic library RPATH.
-# Build-tree consumers need the provider at startup; do not export this path.
-target_link_options(sirius_core INTERFACE
-                    "$<BUILD_INTERFACE:LINKER:-rpath,${_ducklake_library_dir}>")
-set_property(
-  TARGET sirius_shared
-  APPEND
-  PROPERTY BUILD_RPATH "${_ducklake_library_dir}")

@@ -4,7 +4,7 @@ set_property(
   SOURCE test/cpp/integration/test_ducklake_connector.cpp
   APPEND
   PROPERTY COMPILE_DEFINITIONS
-           "SIRIUS_TEST_DUCKLAKE_PATH=\"${_ducklake_library}\"")
+           "SIRIUS_TEST_DUCKLAKE_PATH=\"${SIRIUS_DUCKLAKE_LIBRARY}\"")
 
 add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                test/cpp/utils/sirius_extension_loader.cpp)

@@ -1113,22 +1113,26 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
     source.active_result = index;
     auto* coalescer      = source.hooks.coalescer.get();
     auto* sharing        = dynamic_cast<op::scan::ready_input_coalescer*>(coalescer);
-    auto successor_ready = [&] {
-      std::lock_guard guard(gate->mutex);
-      if (gate->closed) return false;
-      for (auto candidate : ready_results) {
-        auto const& next = slots[candidate];
-        if (next.source_id == slot.source_id && next.input && !next.unit)
-          return sharing->can_share(*next.input);
-      }
-      return false;
-    };
     lock.unlock();
     op::scan::batch_coalescer::cursor_step step{nullptr, true};
     if (slot.input) {
-      step = sharing ? sharing->advance_ready(
-                         *slot.input, slot.cursor, options.drain_quantum, successor_ready)
+      step = sharing ? sharing->advance_input(*slot.input, slot.cursor, options.drain_quantum)
                      : coalescer->advance(*slot.input, slot.cursor, options.drain_quantum);
+      if (sharing && step.finished && sharing->can_share(*slot.input)) {
+        bool successor_ready = false;
+        lock.lock();
+        if (!gate->closed) {
+          for (auto candidate : ready_results) {
+            auto const& next = slots[candidate];
+            if (next.source_id == slot.source_id && next.input && !next.unit) {
+              successor_ready = sharing->can_share(*next.input);
+              break;
+            }
+          }
+        }
+        lock.unlock();
+        sharing->finish_input(step, successor_ready);
+      }
     }
     lock.lock();
     bool const emitted = static_cast<bool>(step.batch);

@@ -175,10 +175,17 @@ class unit_coalescer final : public scan::ready_input_coalescer {
     return split && split->owner == owner_ && !split->coalesced && split->input &&
            split->unit->share_batches && split->unit->share_batches(*split->input);
   }
-  cursor_step advance_ready(scan::scan_info& input,
-                            size_t& cursor,
-                            size_t quantum,
-                            absl::FunctionRef<bool()> successor_ready) override
+  void finish_input(cursor_step& step, bool successor_ready) override
+  {
+    if (successor_ready) return;
+    if (step.batch && inner_->first_retained_time()) {
+      step.finished = false;  // Return the tail in the next bounded step.
+      return;
+    }
+    if (!step.batch) step.batch = partial_emit();
+    finish_shared();
+  }
+  cursor_step advance_input(scan::scan_info& input, size_t& cursor, size_t quantum) override
   {
     auto& split = dynamic_cast<unit_split&>(input);
     if (split.owner != owner_ || split.coalesced || !split.coalescer)
@@ -190,14 +197,7 @@ class unit_coalescer final : public scan::ready_input_coalescer {
       auto step            = split.input_finished ? cursor_step{nullptr, true}
                                                   : inner_->advance(*split.input, cursor, quantum);
       split.input_finished = step.finished;
-      if (step.finished && !successor_ready()) {
-        if (step.batch && inner_->first_retained_time()) {
-          step.finished = false;  // Return the tail in the next bounded step.
-        } else {
-          if (!step.batch) step.batch = inner_->partial_emit();
-          finish_shared();
-        }
-      } else if (inner_->retained_bytes()) {
+      if (inner_->retained_bytes()) {
         note_retained();
       } else {
         clear_retained();

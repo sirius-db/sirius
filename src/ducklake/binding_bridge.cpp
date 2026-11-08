@@ -25,57 +25,38 @@
 #include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_reader.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
+#include "ducklake/provider_api.hpp"
 #include "op/scan/parquet_delete_reader.hpp"
 #include "parquet_multi_file_info.hpp"
 #include "planner/connector_registry.hpp"
-#include "storage/ducklake_multi_file_list.hpp"
-#include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_table_entry.hpp"
-#include "storage/ducklake_transaction.hpp"
 
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/object_identity.hpp>
-#include <dlfcn.h>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/main/extension_manager.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
 
-#include <filesystem>
 #include <stdexcept>
 #include <thread>
 
 namespace sirius::ducklake {
 using namespace duckdb;
 namespace {
-// Verify the *loaded* provider, not just its source directory or function name.
-bool qualified_provider(DatabaseInstance& db)
+DuckLakeFunctionInfo const* read_info(provider_api const& api,
+                                      BaseTableFunction const& function,
+                                      FunctionData const* data)
 {
-  auto& manager = ExtensionManager::Get(db);
-  if (!manager.ExtensionIsLoaded("ducklake")) return false;
-  auto info = manager.GetExtensionInfo("ducklake");
-  if (!info || !info->install_info || info->install_info->version != "417a9117f5" ||
-      info->install_info->full_path.empty())
-    return false;
-  Dl_info code{};
-  if (!::dladdr(reinterpret_cast<void*>(&DuckLakeFunctions::GetDuckLakeScanFunction), &code) ||
-      !code.dli_fname)
-    return false;
-  std::error_code error;
-  return std::filesystem::equivalent(info->install_info->full_path, code.dli_fname, error) &&
-         !error;
-}
-DuckLakeFunctionInfo const* read_info(BaseTableFunction const& function, FunctionData const* data)
-{
+  if (function.get_multi_file_reader != api.create_reader) return nullptr;
   auto bind = dynamic_cast<MultiFileBindData const*>(data);
-  auto info = dynamic_cast<DuckLakeFunctionInfo const*>(function.function_info.get());
+  auto info = api.function_info(function.function_info.get());
   if (!bind || !info || !bind->file_list ||
       !dynamic_cast<TableFunctionMultiFileWrapper const*>(bind->interface.get()))
     return nullptr;
-  auto reader = dynamic_cast<DuckLakeMultiFileReader const*>(bind->multi_file_reader.get());
-  if (!reader || !dynamic_cast<DuckLakeMultiFileList const*>(bind->file_list.get()) ||
-      &reader->read_info != info)
+  auto reader = api.reader(bind->multi_file_reader.get());
+  if (!reader || !api.file_list(bind->file_list.get()) || &reader->read_info != info)
     return nullptr;
   return info;
 }
@@ -85,11 +66,13 @@ void field(std::string& out, std::string const& value)
 }
 }  // namespace
 duckdb::vector<TableFunction> trusted_scan_functions(DatabaseInstance& db,
-                                                     TableFunction const& parquet)
+                                                     TableFunction const& parquet,
+                                                     std::shared_ptr<const provider_api>& api)
 {
-  if (!qualified_provider(db) || !ExtensionManager::Get(db).ExtensionIsLoaded("parquet")) return {};
-  auto provider = DuckLakeFunctions::GetDuckLakeScanFunction(db);
-  if (provider.get_multi_file_reader != &DuckLakeMultiFileReader::CreateInstance) return {};
+  api = provider_api::resolve(db);
+  if (!api || !ExtensionManager::Get(db).ExtensionIsLoaded("parquet")) return {};
+  auto provider = api->scan_function(db);
+  if (provider.get_multi_file_reader != api->create_reader) return {};
   // The provider factory inherits mutable catalog Parquet callbacks. Start from
   // the host-verified definition instead and copy only provider-owned overrides.
   auto trusted = parquet;
@@ -105,20 +88,30 @@ duckdb::vector<TableFunction> trusted_scan_functions(DatabaseInstance& db,
   trusted.deserialize           = provider.deserialize;
   return {std::move(trusted)};
 }
+namespace {
+DuckLakeFunctionInfo const* verified_info(std::shared_ptr<const provider_api> const& api,
+                                          BaseTableFunction const& function,
+                                          FunctionData const* data,
+                                          ClientContext& context)
+{
+  if (!api || !api->matches_loaded_file() || !context.transaction.HasActiveTransaction())
+    return nullptr;
+  auto info = read_info(*api, function, data);
+  if (!info || !planner::verified_parquet_interface(data, context)) return nullptr;
+  auto transaction = info->transaction.lock();
+  if (!transaction) return nullptr;
+  // Observe only an existing provider transaction in the same connection.
+  auto existing = context.transaction.ActiveTransaction().TryGetTransaction(
+    info->table.ParentCatalog().GetAttached());
+  return existing && existing.get() == transaction.get() ? info : nullptr;
+}
+}  // namespace
 bool binding_matches(BaseTableFunction const& function,
                      FunctionData const* data,
                      ClientContext& context)
 {
-  if (!qualified_provider(*context.db) || !context.transaction.HasActiveTransaction()) return false;
-  auto info = read_info(function, data);
-  if (!info || !planner::verified_parquet_interface(data, context)) return false;
-  auto transaction = info->transaction.lock();
-  if (!transaction) return false;
-  // TryGetTransaction observes an existing provider transaction; it must not
-  // start one to make a foreign binding appear valid in this connection.
-  auto existing = context.transaction.ActiveTransaction().TryGetTransaction(
-    info->table.ParentCatalog().GetAttached());
-  return existing && existing.get() == transaction.get();
+  return verified_info(
+           planner::registered_ducklake_provider(*context.db), function, data, context) != nullptr;
 }
 namespace {
 // MultiFileBindData::Copy also copies the file inventory. Retain the original
@@ -142,6 +135,7 @@ unique_ptr<MultiFileBindData> copy_reader_binding(MultiFileBindData const& origi
 }
 }  // namespace
 struct binding_handle::impl {
+  std::shared_ptr<const provider_api> api;
   duckdb::weak_ptr<ClientContext> context;
   duckdb::weak_ptr<DuckLakeTransaction> transaction;
   uint64_t statement, transaction_id;
@@ -150,17 +144,18 @@ struct binding_handle::impl {
   mutable bool discovery_started = false;
   // Keep only original binding metadata and a separate provider factory. The
   // transaction/context remain weak; no CPU global/local/initial reader is held.
-  duckdb::shared_ptr<TableFunctionInfo> function_info;
-  duckdb::shared_ptr<MultiFileList> files;
+  duckdb::shared_ptr<const DuckLakeFunctionInfo> function_info;
+  // reader_binding owns the list, including any replacement from filter pushdown.
+  DuckLakeMultiFileList const* list;
   duckdb::unique_ptr<MultiFileBindData> reader_binding;
   op::scan::bound_read_view captured;
   impl(BaseTableFunction const& function, FunctionData const* data, ClientContext& c)
-    : context(c.shared_from_this())
+    : api(planner::registered_ducklake_provider(*c.db)), context(c.shared_from_this())
   {
-    if (!binding_matches(function, data, c) || !c.transaction.HasActiveTransaction() ||
-        c.transaction.GetActiveQuery() == MAXIMUM_QUERY_ID)
+    auto verified = verified_info(api, function, data, c);
+    if (!verified || c.transaction.GetActiveQuery() == MAXIMUM_QUERY_ID)
       throw std::invalid_argument("DuckLake binding requires a verified active statement");
-    auto const& info = *read_info(function, data);
+    auto const& info = *verified;
     if (info.scan_type != DuckLakeScanType::SCAN_TABLE || info.start_snapshot)
       throw std::invalid_argument("DuckLake scan mode is not ordinary table scan");
     auto active = info.transaction.lock();
@@ -169,8 +164,9 @@ struct binding_handle::impl {
         info.table.GetTableUUID().empty())
       throw std::invalid_argument("DuckLake original binding lacks snapshot or table evidence");
     auto const& bind = *dynamic_cast<MultiFileBindData const*>(data);
-    function_info    = function.function_info;
-    files            = bind.file_list;
+    function_info =
+      duckdb::shared_ptr<const DuckLakeFunctionInfo>(function.function_info, verified);
+    list = api->file_list(bind.file_list.get());
     // DuckLake's verified Copy preserves transaction_local_data and read_info,
     // and creates fresh factory state without opening a physical file reader.
     reader_binding = copy_reader_binding(bind);
@@ -255,23 +251,26 @@ void binding_handle::configure_scan(std::vector<size_t> const& selected, TableFi
   if (filters) {
     MultiFileDynamicPushdownInfo info(
       *context, bind.file_options, bind.names, bind.types, columns, *filters);
-    auto filtered = bind.multi_file_reader->DynamicFilterPushdown(*impl_->files, info);
+    auto filtered = bind.multi_file_reader->DynamicFilterPushdown(*bind.file_list, info);
     if (filtered) {
-      impl_->files   = shared_ptr<MultiFileList>(std::move(filtered));
-      bind.file_list = impl_->files;
+      auto* list = impl_->api->file_list(filtered.get());
+      if (!list)
+        throw std::invalid_argument("DuckLake filter pushdown returned a foreign file list");
+      bind.file_list = shared_ptr<MultiFileList>(std::move(filtered));
+      impl_->list    = list;
     }
   }
   // Committed inline rows may be read while expanding the file list.
   // Publish the projection before discovery, not only when opening its reader.
   auto& schema = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
-  dynamic_cast<DuckLakeMultiFileList&>(*impl_->files).SetScanColumns(schema, columns);
+  (impl_->list->*impl_->api->set_scan_columns)(schema, columns);
 }
 
 bool binding_handle::can_prune_unit(uint64_t index) const
 {
   validate_statement();
-  auto& list       = dynamic_cast<DuckLakeMultiFileList&>(*impl_->files);
-  auto const& file = list.GetFileEntry(index);
+  auto& list       = *impl_->list;
+  auto const& file = (list.*impl_->api->get_files)()[index];
   auto filters     = list.GetFilterInfo();
   if (!filters || file.data_type != DuckLakeDataType::DATA_FILE) return false;
   for (auto const& entry : filters->column_filters) {
@@ -317,11 +316,11 @@ std::optional<unit_descriptor> binding_handle::unit_at(uint64_t index) const
 {
   validate_statement();
   impl_->discovery_started = true;
-  auto& list               = dynamic_cast<DuckLakeMultiFileList&>(*impl_->files);
-  auto const& entries      = list.GetFiles();
+  auto& list               = *impl_->list;
+  auto const& entries      = (list.*impl_->api->get_files)();
   if (index >= entries.size()) return std::nullopt;
-  auto const& entry = list.GetFileEntry(index);
-  auto const& info  = dynamic_cast<DuckLakeFunctionInfo const&>(*impl_->function_info);
+  auto const& entry = entries[index];
+  auto const& info  = *impl_->function_info;
   unit_descriptor result;
   result.original_file_index = index;
   result.read_view           = impl_->captured.identity;
@@ -368,7 +367,7 @@ std::optional<unit_descriptor> binding_handle::unit_at(uint64_t index) const
   if (!transaction) throw std::runtime_error("DuckLake transaction expired during discovery");
   result.transaction_local_delete =
     info.include_local_changes &&
-    transaction->HasLocalDeleteForFile(info.table_id, entry.file.path);
+    ((*transaction).*impl_->api->has_local_delete)(info.table_id, entry.file.path);
   bool inlined = false, local = false;
   uint64_t schema_version;
   if (result.input.extended_info) {
@@ -389,9 +388,10 @@ position_page binding_handle::inline_delete_positions(uint64_t index,
 {
   validate_statement();
   if (destination.empty()) throw std::invalid_argument("DuckLake delete page needs storage");
-  auto& list = dynamic_cast<DuckLakeMultiFileList&>(*impl_->files);
-  if (index >= list.GetFiles().size()) throw std::out_of_range("DuckLake original file index");
-  auto const& positions = list.GetFileEntry(index).inlined_file_deletions;
+  auto& list          = *impl_->list;
+  auto const& entries = (list.*impl_->api->get_files)();
+  if (index >= entries.size()) throw std::out_of_range("DuckLake original file index");
+  auto const& positions = entries[index].inlined_file_deletions;
   auto next             = after ? positions.upper_bound(*after) : positions.begin();
   position_page result;
   while (next != positions.end() && result.size < destination.size())
@@ -493,7 +493,7 @@ std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
       "DuckLake count-only cannot request user columns or a filter projection");
   auto unit = unit_at(index);
   if (!unit) throw std::out_of_range("DuckLake original file index");
-  auto const& info = dynamic_cast<DuckLakeFunctionInfo const&>(*impl_->function_info);
+  auto const& info = *impl_->function_info;
   std::vector<op::scan::field_requirement> fields;
   auto const& schema = info.table.GetFieldData().GetFieldIds();
   if (schema.size() != info.column_types.size())

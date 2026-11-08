@@ -845,7 +845,9 @@ remote-DV gates. Schema evolution is limited to the qualified flat profile descr
 
 ## DuckLake scans
 
-Load the DuckLake extension shipped with Sirius to use ordinary SQL or `CALL gpu_execution(...)`. It is installed under `<libdir>/sirius/ducklake.duckdb_extension` and can be loaded by its full path. A prebuilt provider can be supplied at configure time by setting both `SIRIUS_DUCKLAKE_SOURCE_DIR` and `SIRIUS_DUCKLAKE_LIBRARY`. Local Parquet and inline data use the original statement binding and the shared scan and recovery paths.
+Load Sirius from its installation path. Use `INSTALL ducklake FROM core;` followed by `LOAD ducklake;`, or load a compatible local DuckLake build by its full path. The extensions can live in separate directories and load in either order. DuckDB applies its extension-signature policy. Sirius checks the supported provider version, resolves its private entry points and type information from the loaded module, and verifies the bound scan callbacks before GPU execution. These checks identify the loaded module. If you supply a prebuilt DuckLake extension, you are responsible for verifying its origin and compatibility with the pinned source and host patches.
+
+Building the bridge needs the pinned DuckLake headers and the host patches from `duckdb/.github/patches/extensions/ducklake`. The default build gets them through DuckDB's extension configuration. For an offline build, set `SIRIUS_DUCKLAKE_SOURCE_DIR` to a cached, patched Git checkout. Tests load the installed DuckLake extension by name unless `SIRIUS_TEST_DUCKLAKE_EXTENSION` or the CMake setting `SIRIUS_DUCKLAKE_LIBRARY` specifies a local file. The static vcpkg build can use a checkout of the pinned commit via `DUCKDB_DUCKLAKE_DIRECTORY`; it applies the host patches in its own build directory. For offline CI, cache the provider checkout alongside the matching DuckDB submodule, or populate the vcpkg downloads cache while online before building with downloads disabled.
 
 See [DuckLake support and limits](scan-contracts-design.md#ducklake-private-binding-boundary) for supported inputs, schema evolution, memory ownership and failure behavior.
 

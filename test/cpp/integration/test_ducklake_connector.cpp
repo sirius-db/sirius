@@ -42,6 +42,7 @@
 #include <duckdb/main/client_context_state.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database_manager.hpp>
+#include <duckdb/main/extension_helper.hpp>
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <yaml-cpp/yaml.h>
@@ -67,16 +68,18 @@ using sirius::test::query;
 using sirius::transparent::connection_provenance;
 using sirius::transparent::decline_reason;
 
-void load_ducklake(duckdb::Connection& con)
+std::string load_ducklake(duckdb::Connection& con)
 {
-  auto path = std::getenv("SIRIUS_TEST_DUCKLAKE_EXTENSION");
+  char const* path = std::getenv("SIRIUS_TEST_DUCKLAKE_EXTENSION");
   if (!path || !*path) path = SIRIUS_TEST_DUCKLAKE_PATH;
-  query(con, "LOAD " + duckdb::Value(path).ToSQLString());
-  auto version = query(con,
-                       "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = "
-                       "'ducklake' AND loaded");
+  query(con, path && *path ? "LOAD " + duckdb::Value(path).ToSQLString() : "LOAD ducklake");
+  auto version =
+    query(con,
+          "SELECT extension_version, install_path FROM duckdb_extensions() WHERE extension_name = "
+          "'ducklake' AND loaded");
   REQUIRE(version->RowCount() == 1);
   REQUIRE(version->Collection().GetValue(0, 0).ToString() == "417a9117f5");
+  return path && *path ? path : version->Collection().GetValue(1, 0).ToString();
 }
 
 void attach_lake(duckdb::Connection& con, std::string const& directory)
@@ -293,7 +296,8 @@ struct observed_host_reservations : sirius::scan_manager::reservation_provider {
 // Drive the real file jobs to completion before advancing the coalescer. This
 // makes readiness deterministic without relying on worker timing or debug logs.
 void check_ready_parquet_files(std::shared_ptr<sirius::ducklake::binding_handle> binding,
-                               cucascade::memory::memory_reservation_manager& manager)
+                               cucascade::memory::memory_reservation_manager& manager,
+                               bool successor_ready)
 {
   namespace dl                              = sirius::ducklake;
   namespace sm                              = sirius::scan_manager;
@@ -338,11 +342,11 @@ void check_ready_parquet_files(std::shared_ptr<sirius::ducklake::binding_handle>
   for (size_t i = 0; i < files; ++i) {
     size_t cursor = 0;
     for (;;) {
-      size_t probes = 0;
-      auto step     = coalescer.advance_ready(*inputs[i], cursor, 1, [&] {
-        ++probes;
-        return i + 1 < files;
-      });
+      auto step = coalescer.advance_input(*inputs[i], cursor, 1);
+      if (step.finished) {
+        REQUIRE(coalescer.can_share(*inputs[i]));
+        coalescer.finish_input(step, successor_ready && i + 1 < files);
+      }
       if (step.batch) {
         auto evidence = source.materializer().validator->inspect({contract, {}, {}}, *step.batch);
         CHECK(evidence.generation == generation);
@@ -355,14 +359,14 @@ void check_ready_parquet_files(std::shared_ptr<sirius::ducklake::binding_handle>
           group.push_back((*input)->certificates().front().split_id);
         }
       }
-      CHECK(probes == (step.finished ? 1 : 0));
       if (step.finished) break;
       ++partial_steps;
     }
   }
   CHECK(partial_steps >= files);
   // The first two files share a schema. The third was written after adding a column.
-  const std::vector<std::vector<size_t>> expected{{0, 1}, {2}};
+  using file_groups   = std::vector<std::vector<size_t>>;
+  const auto expected = successor_ready ? file_groups{{0, 1}, {2}} : file_groups{{0}, {1}, {2}};
   CHECK(groups == expected);
   for (auto& lane : lanes)
     lane.close();
@@ -531,6 +535,58 @@ struct ducklake_fixture {
 };
 
 }  // namespace
+
+TEST_CASE("DuckLake verifies the loaded provider independently of its directory",
+          "[isolated_context][ducklake]")
+{
+  const bool replace = GENERATE(false, true);
+  sirius::test::scoped_temp_directory disk;
+  std::string original;
+  {
+    sirius::test::shared_test_env first(lake_config());
+    auto con = first.make_connection();
+    original = load_ducklake(con);
+  }
+  sirius::test::shared_test_env env(lake_config());
+  auto con        = env.make_connection();
+  const auto root = std::filesystem::path(disk.directory);
+  auto loaded     = root / "ducklake.duckdb_extension";
+  std::filesystem::path shadow;
+  if (replace) {
+    std::filesystem::copy_file(original, loaded);
+    query(con, "LOAD " + duckdb::Value(loaded.string()).ToSQLString());
+  } else {
+    query(con,
+          "SET extension_directories=[" + duckdb::Value((root / "first").string()).ToSQLString() +
+            "," + duckdb::Value((root / "second").string()).ToSQLString() + "]");
+    const auto dirs = duckdb::ExtensionHelper::GetExtensionDirectoryPath(*con.context);
+    REQUIRE(dirs.size() == 2);
+    shadow = std::filesystem::path(dirs[0]) / loaded.filename();
+    loaded = std::filesystem::path(dirs[1]) / loaded.filename();
+    std::filesystem::create_directories(loaded.parent_path());
+    std::filesystem::copy_file(original, loaded);
+    query(con, "LOAD ducklake");
+  }
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CREATE TABLE lake.t AS SELECT 42 AS id");
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  const std::string sql = "CALL gpu_execution('SELECT id FROM lake.t')";
+  const std::vector<std::string> expected{"42|"};
+  REQUIRE(ducklake_result_bag(*query(con, sql)) == expected);
+  if (replace) {
+    std::filesystem::rename(loaded, root / "loaded-provider");
+    std::filesystem::create_symlink(std::filesystem::canonical(original), loaded);
+    auto result = con.Query(sql);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("unverified callbacks") != std::string::npos);
+  } else {
+    std::filesystem::create_directories(shadow.parent_path());
+    std::filesystem::copy_file(original, shadow);
+    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  }
+}
 
 TEST_CASE("DuckLake provider SQL declines while ordinary user SQL remains GPU eligible",
           "[transparent][provenance][ducklake][isolated_context]")
@@ -1317,10 +1373,14 @@ TEST_CASE("DuckLake reserves optional preparation permits for discovered files",
       auto* get = ducklake_get(plan);
       if (!get) return;
       checked_batches = true;
-      auto binding =
-        sirius::ducklake::binding_handle::capture(get->function, get->bind_data.get(), context);
-      REQUIRE(binding);
-      check_ready_parquet_files(std::move(binding), runtime->get_memory_manager());
+      for (bool successor_ready : {false, true}) {
+        CAPTURE(successor_ready);
+        auto binding =
+          sirius::ducklake::binding_handle::capture(get->function, get->bind_data.get(), context);
+        REQUIRE(binding);
+        check_ready_parquet_files(
+          std::move(binding), runtime->get_memory_manager(), successor_ready);
+      }
     };
     duckdb::OptimizerExtension ext;
     ext.optimizer_info    = observer;
@@ -1933,7 +1993,7 @@ TEST_CASE_METHOD(ducklake_fixture,
   runtime->cpu_replay_hook_for_testing = [&] { ++replay_checks; };
   query_pause pause;
   std::atomic<bool> first{true};
-  std::thread::id execution_owner, provider_owner;
+  std::thread::id provider_owner;
   auto observer     = duckdb::make_shared_ptr<provider_query_observer>();
   observer->observe = [&](duckdb::ClientContext& provider) {
     auto state = duckdb::get_sirius_connection_state(provider);
@@ -1953,10 +2013,7 @@ TEST_CASE_METHOD(ducklake_fixture,
     runtime->cpu_replay_hook_for_testing = {};
   });
   auto before  = runtime->get_transparent_execution_stats();
-  auto active  = std::async(std::launch::async, [&] {
-    execution_owner = std::this_thread::get_id();
-    return con.Query(sql);
-  });
+  auto active  = std::async(std::launch::async, [&] { return con.Query(sql); });
   bool reached = pause.wait_until_arrived();
   con.Interrupt();
   auto while_blocked    = active.wait_for(std::chrono::milliseconds(50));
@@ -1965,13 +2022,19 @@ TEST_CASE_METHOD(ducklake_fixture,
   pause.release();
   auto result = active.get();
   REQUIRE(reached);
-  CHECK(provider_owner == execution_owner);
+  auto after = runtime->get_transparent_execution_stats();
+  REQUIRE(after.publications_by_query.size() == before.publications_by_query.size() + 1);
+  for (const auto& [token, observation] : after.publications_by_query) {
+    if (before.publications_by_query.contains(token)) continue;
+    CHECK(provider_owner == observation.execute_owner);
+    CHECK(provider_owner == observation.preparation_owner);
+  }
   CHECK(while_blocked == std::future_status::timeout);
   CHECK(held_reservation > reserved);
   CHECK(held_scans > 0);
   REQUIRE(result->HasError());
   CHECK(replay_checks == 0);
-  CHECK(runtime->get_transparent_execution_stats().runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   result.reset();
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
   observer->observe = {};
@@ -1986,8 +2049,10 @@ TEST_CASE("Production DuckLake mixed scans execute and recover across two GPUs",
 {
   if (!sirius::test::has_gpus(2)) SKIP("DuckLake device placement requires two GPUs");
   sirius::test::scoped_temp_directory disk;
-  auto config_path = write_lake_config(
-    disk.directory, [](YAML::Node& config) { config["sirius"]["topology"]["num_gpus"] = 2; });
+  auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
+    config["sirius"]["topology"]["num_gpus"]                    = 2;
+    config["sirius"]["operator_params"]["scan_task_batch_size"] = 128 * 1024;
+  });
   sirius::test::shared_test_env env(config_path);
   auto con = env.make_connection();
   load_ducklake(con);
