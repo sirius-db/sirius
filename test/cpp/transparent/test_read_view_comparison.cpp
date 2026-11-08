@@ -55,7 +55,145 @@ read_view_fingerprint fingerprint(std::shared_ptr<bound_read_view const> const& 
 {
   return value->identity->fingerprint;
 }
+
+std::shared_ptr<bound_read_view const> iceberg_view(
+  iceberg_bound_selection selection,
+  std::string path                    = "shared.parquet",
+  std::optional<std::string> selector = "stable-options")
+{
+  bound_read_identity identity;
+  identity.source      = {"iceberg_scan", source_kind::parquet_local, "test.iceberg.v1"};
+  identity.data_view   = file_inventory{1};
+  identity.bound_types = {duckdb::LogicalType::INTEGER};
+  identity.bound_names = {"id"};
+  identity.selection   = std::move(selection);
+  bound_read_view result;
+  std::vector<std::string> paths{std::move(path)};
+  result.identity                   = make_bound_read_identity(std::move(identity), paths);
+  result.selector_evidence_required = true;
+  result.logical_selector_evidence  = std::move(selector);
+  return std::make_shared<bound_read_view const>(std::move(result));
+}
 }  // namespace
+
+TEST_CASE("Iceberg drift requires a changed same-table selection and preserved other pairs",
+          "[transparent][read_view][iceberg][iceberg_bound_selection]")
+{
+  auto const origin        = GENERATE(candidate_origin::copy, candidate_origin::replan);
+  auto const mixed         = GENERATE(false, true);
+  std::string const change = GENERATE(
+    "snapshot", "schema", "metadata", "uuid", "inventory", "other_identity", "other_selector");
+  CAPTURE(static_cast<int>(origin), mixed, change);
+  iceberg_bound_selection selection{"U", 101, 7, "m1.json"};
+  auto original = iceberg_view(selection);
+  auto other    = mixed ? view("other.parquet", "other-options", true)
+                        : iceberg_view({"V", 201, 8, "v.json"}, "other.parquet", "other-options");
+  auto changed  = selection;
+  if (change == "schema") {
+    ++changed.bound_schema_id;
+  } else if (change == "metadata") {
+    changed.metadata_file_path = "m2.json";
+  } else if (change == "uuid") {
+    changed.table_uuid = "replacement-U";
+  } else if (change != "inventory") {
+    ++changed.snapshot_id;
+  }
+  auto candidate = iceberg_view(changed, change == "inventory" ? "new.parquet" : "shared.parquet");
+  auto other_candidate = std::make_shared<bound_read_view>(*other);
+  if (change == "other_identity") {
+    other_candidate = std::make_shared<bound_read_view>(*view("unrelated.parquet"));
+  } else if (change == "other_selector") {
+    other_candidate->logical_selector_evidence.reset();
+  }
+  std::vector<original_binding> logical{{10, original}, {20, other}};
+  std::vector<read_view_fingerprint> physical{fingerprint(original), fingerprint(other)};
+  std::vector<candidate_binding> planned{{10, candidate}, {20, other_candidate}};
+  auto const comparison = compare_read_views(origin, logical, physical, planned);
+  CHECK_FALSE(comparison.equal);
+  bool const drift = change == "snapshot" || change == "schema" || change == "metadata";
+  CHECK(comparison.reason == (drift ? "iceberg_snapshot_drift" : "fingerprint_mismatch"));
+  CHECK(comparison.correspondence ==
+        (origin == candidate_origin::copy ? "table_index" : "table_index_replan"));
+  CHECK(comparison.original_count == 2);
+  CHECK(comparison.candidate_count == 2);
+}
+
+TEST_CASE("Iceberg drift refuses incomplete occurrence and physical count proofs",
+          "[transparent][read_view][iceberg][iceberg_bound_selection]")
+{
+  auto const origin        = GENERATE(candidate_origin::copy, candidate_origin::replan);
+  std::string const change = GENERATE(
+    "duplicate_index", "missing_index", "missing_original", "physical_count", "candidate_count");
+  CAPTURE(static_cast<int>(origin), change);
+  auto a = iceberg_view({"U", 101, 7, "m1.json"});
+  auto b = iceberg_view({"U", 101, 7, "m1.json"});
+  REQUIRE(a->identity != b->identity);
+  auto next = iceberg_view({"U", 102, 7, "m2.json"});
+  std::vector<original_binding> logical{{10, a}, {20, b}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(b)};
+  std::vector<candidate_binding> candidate{{10, next}, {20, b}};
+  auto const before = compare_read_views(origin, logical, physical, candidate);
+  REQUIRE_FALSE(before.equal);
+  REQUIRE(before.reason == "iceberg_snapshot_drift");
+  if (change == "duplicate_index") candidate[1].table_index = 10;
+  if (change == "missing_index") candidate[1].table_index = 30;
+  if (change == "missing_original") logical.pop_back();
+  if (change == "physical_count") physical.push_back(fingerprint(a));
+  if (change == "candidate_count") candidate.push_back({30, b});
+  auto const comparison = compare_read_views(origin, logical, physical, candidate);
+  CHECK_FALSE(comparison.equal);
+  CHECK(comparison.reason == "fingerprint_mismatch");
+  CHECK(comparison.correspondence ==
+        (origin == candidate_origin::copy ? "table_index" : "table_index_replan"));
+}
+
+TEST_CASE("Iceberg snapshot swaps refine per-index failure after equal multisets",
+          "[transparent][read_view][iceberg][iceberg_bound_selection]")
+{
+  auto const origin = GENERATE(candidate_origin::copy, candidate_origin::replan);
+  auto first        = iceberg_view({"U", 101, 7, "m1.json"});
+  auto second       = iceberg_view({"U", 102, 7, "m2.json"});
+  std::vector<original_binding> logical{{10, first}, {20, second}};
+  std::vector<read_view_fingerprint> physical{fingerprint(first), fingerprint(second)};
+  std::vector<candidate_binding> candidate{{10, second}, {20, first}};
+  auto const comparison = compare_read_views(origin, logical, physical, candidate);
+  CHECK_FALSE(comparison.equal);
+  CHECK(comparison.reason == "iceberg_snapshot_drift");
+  // Pairing failed after equal multisets. Drift refines only the reason:
+  // copy keeps "table_index"; multi-replan has already changed to "none".
+  CHECK(comparison.correspondence == (origin == candidate_origin::copy ? "table_index" : "none"));
+  CHECK(comparison.only_original.empty());
+  CHECK(comparison.only_candidate.empty());
+}
+
+TEST_CASE("Single Iceberg replan drift cannot hide a changed skipped definition",
+          "[transparent][read_view][iceberg][iceberg_bound_selection]")
+{
+  auto original = iceberg_view({"U", 101, 7, "m1.json"});
+  auto next     = iceberg_view({"U", 102, 7, "m2.json"});
+  std::vector<original_binding> logical{{10, original}};
+  std::vector<read_view_fingerprint> physical{fingerprint(original)};
+  std::vector<candidate_binding> planned{{20, next}};
+  auto comparison = compare_read_views(candidate_origin::replan, logical, physical, planned);
+  REQUIRE(comparison.reason == "iceberg_snapshot_drift");
+  REQUIRE_FALSE(comparison.equal);
+  REQUIRE(comparison.correspondence == "single");
+
+  physical.push_back(fingerprint(view("P.parquet")));
+  std::vector<candidate_binding> skipped{{30, view("Q.parquet")}};
+  comparison = compare_read_views(candidate_origin::replan, logical, physical, planned, skipped);
+  CHECK_FALSE(comparison.equal);
+  CHECK(comparison.reason == "fingerprint_mismatch");
+  CHECK(comparison.correspondence == "single");
+  CHECK(comparison.original_count == comparison.candidate_count);
+
+  comparison = compare_read_views(candidate_origin::replan, logical, physical, planned);
+  CHECK_FALSE(comparison.equal);
+  CHECK(comparison.reason == "fingerprint_mismatch");
+  CHECK(comparison.correspondence == "single");
+  CHECK(comparison.original_count == 2);
+  CHECK(comparison.candidate_count == 1);
+}
 
 TEST_CASE("Copy-origin read views require table-index correspondence", "[transparent][read_view]")
 {

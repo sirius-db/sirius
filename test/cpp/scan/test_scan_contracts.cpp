@@ -43,7 +43,9 @@
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/table_function_multi_file.hpp>
+#include <duckdb/common/types/hash.hpp>
 #include <duckdb/function/table/table_scan.hpp>
+#include <duckdb/function/table_function.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/extension_helper.hpp>
@@ -136,7 +138,137 @@ struct registry_test_generator : sirius::planner::sirius_physical_plan_generator
   using sirius_physical_plan_generator::create_plan;
   using sirius_physical_plan_generator::sirius_physical_plan_generator;
 };
+
+struct selection_bind_data : duckdb::TableFunctionData {
+  duckdb::BindInfo info{duckdb::ScanType::EXTERNAL};
+  unsigned calls                          = 0;
+  duckdb::ClientContext* observed_context = nullptr;
+
+  selection_bind_data()
+  {
+    info.InsertOption("table_uuid", duckdb::Value("table-U"));
+    info.InsertOption("snapshot_id", duckdb::Value::BIGINT(101));
+    info.InsertOption("schema_id", duckdb::Value::INTEGER(7));
+    info.InsertOption("metadata_file_path", duckdb::Value("metadata/'bound'\n.json"));
+  }
+
+  duckdb::unique_ptr<duckdb::FunctionData> Copy() const override
+  {
+    auto result  = duckdb::make_uniq<selection_bind_data>();
+    result->info = info;
+    return result;
+  }
+
+  bool Equals(duckdb::FunctionData const& other) const override { return this == &other; }
+};
+
+duckdb::BindInfo scripted_selection(duckdb::TableFunctionGetBindInfoInput& input)
+{
+  auto& data = input.bind_data->Cast<selection_bind_data>();
+  ++data.calls;
+  data.observed_context = &input.context;
+  return data.info;
+}
 }  // namespace
+
+TEST_CASE("Iceberg selection capture requires each typed binding field",
+          "[scan][contracts][read_view][iceberg][iceberg_bound_selection]")
+{
+  auto const field    = GENERATE("table_uuid", "snapshot_id", "schema_id", "metadata_file_path");
+  auto const mutation = GENERATE("complete", "missing", "null", "wrong_type", "empty");
+  CAPTURE(field, mutation);
+  duckdb::DuckDB database(nullptr);
+  duckdb::Connection connection(database);
+  selection_bind_data data;
+  duckdb::BoundTableFunction function;
+  function.get_bind_info = scripted_selection;
+
+  std::string const change = mutation;
+  auto& options            = data.info.options;
+  if (change == "missing") {
+    options.erase(field);
+    // Neither SQL-like arguments nor alternate metadata keys repair missing binding evidence.
+    options.emplace("snapshot_from_id", duckdb::Value::BIGINT(101));
+    options.emplace("metadata_path", duckdb::Value("metadata/guessed.json"));
+  } else if (change == "null") {
+    options.at(field) = duckdb::Value(options.at(field).type());
+  } else if (change == "wrong_type") {
+    options.at(field) =
+      std::string(field) == "schema_id" ? duckdb::Value::BIGINT(7) : duckdb::Value::INTEGER(101);
+  } else if (change == "empty") {
+    options.at(field) = duckdb::Value("");
+  }
+
+  auto const selection = capture_iceberg_bound_selection(function, &data, *connection.context);
+  CHECK(data.calls == 1);
+  CHECK(data.observed_context == connection.context.get());
+  if (change == "complete") {
+    REQUIRE(selection);
+    CHECK(selection->table_uuid == "table-U");
+    CHECK(selection->snapshot_id == 101);
+    CHECK(selection->bound_schema_id == 7);
+    CHECK(selection->metadata_file_path == "metadata/'bound'\n.json");
+  } else {
+    CHECK_FALSE(selection);
+  }
+}
+
+TEST_CASE("Iceberg selection capture distinguishes zero values from absent callbacks",
+          "[scan][contracts][read_view][iceberg][iceberg_bound_selection]")
+{
+  duckdb::DuckDB database(nullptr);
+  duckdb::Connection connection(database);
+  selection_bind_data data;
+  data.info.options.at("snapshot_id") = duckdb::Value::BIGINT(0);
+  data.info.options.at("schema_id")   = duckdb::Value::INTEGER(0);
+  duckdb::BoundTableFunction function;
+  CHECK_FALSE(capture_iceberg_bound_selection(function, &data, *connection.context));
+  CHECK(data.calls == 0);
+  function.get_bind_info = scripted_selection;
+  CHECK_FALSE(capture_iceberg_bound_selection(function, nullptr, *connection.context));
+  CHECK(data.calls == 0);
+  auto const selection = capture_iceberg_bound_selection(function, &data, *connection.context);
+  REQUIRE(selection);
+  CHECK(selection->snapshot_id == 0);
+  CHECK(selection->bound_schema_id == 0);
+  CHECK(data.calls == 1);
+}
+
+TEST_CASE("Iceberg selection extends canonical identity between inventory and schema",
+          "[scan][contracts][read_view][iceberg][iceberg_bound_selection]")
+{
+  bound_read_identity identity;
+  identity.source    = {"iceberg_scan", source_kind::parquet_local, "test.iceberg.v1"};
+  identity.data_view = file_inventory{1};
+  identity.selector  = "opts";
+  std::vector<std::string> paths{"a.parquet"};
+  // Golden bytes for the legacy identity with an empty bound schema, before selection export.
+  std::string const prefix =
+    "v18:sirius.read-view.1s12:iceberg_scanu1:1s15:test.iceberg.v1u1:1u1:1p9:a.parquet";
+  std::string const tail = "u1:0o4:opts";
+  auto const legacy      = make_bound_read_identity(identity, paths);
+  CHECK(legacy->fingerprint.canonical == prefix + tail);
+  CHECK(legacy->fingerprint.canonical.find("iceberg-bound-selection") == std::string::npos);
+
+  identity.selection      = iceberg_bound_selection{"U", 101, 7, "m1.json"};
+  auto const selected     = make_bound_read_identity(identity, paths);
+  std::string const block = "i60:v32:sirius.iceberg-bound-selection.1s1:Us3:101s1:7s7:m1.json";
+  CHECK(selected->fingerprint.canonical == prefix + block + tail);
+  CHECK(selected->fingerprint.hash == duckdb::Hash(selected->fingerprint.canonical.data(),
+                                                   selected->fingerprint.canonical.size()));
+  CHECK_FALSE(selected->fingerprint == legacy->fingerprint);
+
+  // The same insertion must precede a real serialized type/name tail too.
+  identity.bound_types = {duckdb::LogicalType::INTEGER};
+  identity.bound_names = {"id"};
+  auto const typed     = make_bound_read_identity(identity, paths);
+  identity.selection.reset();
+  auto const typed_legacy = make_bound_read_identity(identity, paths);
+  REQUIRE(typed_legacy->fingerprint.canonical.starts_with(prefix));
+  CHECK(typed->fingerprint.canonical ==
+        prefix + block + typed_legacy->fingerprint.canonical.substr(prefix.size()));
+  CHECK(legacy->fingerprint.canonical == prefix + tail);
+}
 
 TEST_CASE("Read-view equality ignores independent evidence", "[scan][contracts]")
 {

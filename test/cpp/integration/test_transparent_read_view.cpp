@@ -9,6 +9,7 @@
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
+#include "utils/read_view_test_observer.hpp"
 
 #include <catch.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
@@ -93,94 +94,7 @@ void make_tables(duckdb::Connection& con)
   query_ok(con, "SET enable_duckdb_fallback = true");
 }
 
-struct observed_read_view_map {
-  bool internal;
-  uint64_t generation;
-  std::vector<sirius::op::scan::logical_bound_read_view> views;
-};
-
-struct read_view_observer_info : duckdb::OptimizerExtensionInfo {
-  std::atomic<duckdb::ClientContext*> target{nullptr};
-  bool discard_copy = false;
-  std::mutex mutex;
-  std::vector<observed_read_view_map> maps;
-};
-
-void observe_read_view_map(duckdb::OptimizerExtensionInput& input,
-                           duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
-{
-  auto& info = static_cast<read_view_observer_info&>(*input.info);
-  if (info.target.load() != &input.context) return;
-  auto state = duckdb::get_sirius_connection_state(input.context);
-  if (!state) return;
-  auto views = sirius::op::scan::capture_bound_read_views(*plan, input.context);
-  if (views.empty()) return;
-  auto const internal = state->is_internal_query_active();
-  {
-    std::lock_guard lock(info.mutex);
-    info.maps.push_back({internal, state->planning_generation(), std::move(views)});
-  }
-  if (info.discard_copy && !internal) {
-    // Exercise finalize's SQL replan without discarding the original binding evidence.
-    auto original = state->take_captured_original_views_if_current();
-    state->clear_captured_plan();
-    if (original) state->set_captured_original_views(std::move(original->views));
-  }
-}
-
-class read_view_map_observer {
- public:
-  explicit read_view_map_observer(duckdb::Connection& con, bool discard_copy = false)
-    : info(duckdb::make_shared_ptr<read_view_observer_info>())
-  {
-    info->target       = con.context.get();
-    info->discard_copy = discard_copy;
-    duckdb::OptimizerExtension extension;
-    extension.optimizer_info    = info;
-    extension.optimize_function = observe_read_view_map;
-    duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context),
-                                         std::move(extension));
-  }
-
-  ~read_view_map_observer()
-  {
-    info->target = nullptr;
-    std::lock_guard lock(info->mutex);
-    info->maps.clear();
-  }
-
-  void require_equal_replan_map(std::size_t scans) const
-  {
-    std::lock_guard lock(info->mutex);
-    REQUIRE(info->maps.size() == 2);
-    auto const& original  = info->maps[0];
-    auto const& candidate = info->maps[1];
-    REQUIRE_FALSE(original.internal);
-    REQUIRE(candidate.internal);
-    CHECK(original.generation == candidate.generation);
-    REQUIRE(original.views.size() == scans);
-    REQUIRE(candidate.views.size() == scans);
-    std::set<duckdb::idx_t> matched;
-    for (auto const& rebound : candidate.views) {
-      CAPTURE(rebound.table_index);
-      REQUIRE(matched.insert(rebound.table_index).second);
-      auto const found =
-        std::find_if(original.views.begin(), original.views.end(), [&](auto const& bound) {
-          return bound.table_index == rebound.table_index;
-        });
-      REQUIRE(found != original.views.end());
-      REQUIRE(found->view.identity);
-      REQUIRE(rebound.view.identity);
-      CHECK(found->view.identity->fingerprint.canonical ==
-            rebound.view.identity->fingerprint.canonical);
-      CHECK(found->view.selector_evidence_required == rebound.view.selector_evidence_required);
-      CHECK(found->view.logical_selector_evidence == rebound.view.logical_selector_evidence);
-    }
-  }
-
- private:
-  duckdb::shared_ptr<read_view_observer_info> info;
-};
+using sirius::test::read_view_map_observer;
 }  // namespace
 
 TEST_CASE_METHOD(ReadViewFixture,
