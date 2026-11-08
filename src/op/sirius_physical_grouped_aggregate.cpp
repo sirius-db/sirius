@@ -16,11 +16,20 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
+#include "cudf/cudf_utils.hpp"
+#include "data/data_batch_utils.hpp"
 #include "duckdb/common/assert.hpp"
+#include "expression_evaluator/expression_evaluator.hpp"
+#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
 #include "telemetry/nvtx.hpp"
+
+#include <cudf/binaryop.hpp>
+#include <cudf/search.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/unary.hpp>
 
 #include <algorithm>
 #include <variant>
@@ -209,9 +218,72 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               split_wide_sums,
                                                               &num_groups);
     _last_batch_groups.store(num_groups, std::memory_order_relaxed);
+    if (complete_groups && input.whole_row_groups()) {
+      result = drop_failed_complete_groups(std::move(result), stream, *space);
+    }
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);
+}
+
+std::shared_ptr<::cucascade::data_batch>
+sirius_physical_grouped_aggregate::drop_failed_complete_groups(
+  std::shared_ptr<::cucascade::data_batch> partial,
+  ::cuda::stream_ref stream,
+  ::cucascade::memory::memory_space& space)
+{
+  auto const& filter = *complete_groups;
+  auto const ro      = partial->to_read_only();
+  auto const view    = get_cudf_table_view(ro);
+  auto const keys    = view.column(filter.key);
+  if (keys.type() != filter.row_group_bounds->type() || view.num_rows() == 0) { return partial; }
+  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+    // The predicate was bound to the merge's output, which has the declared types.
+    if (view.column(i).type() != require_cudf_type(types[i])) { return partial; }
+  }
+  auto const mr = space.get_default_allocator();
+  sirius::expression_evaluator evaluator(*filter.predicate,
+                                         mr,
+                                         stream,
+                                         expression_policy(),
+                                         expression_evaluator::default_min_ast_size,
+                                         like_swar_fastpath_enabled(),
+                                         like_cache());
+  auto const passes = std::move(evaluator.evaluate(view)->release()[0]);
+  auto const bound  = cudf::contains(filter.row_group_bounds->view(), keys, stream, mr);
+  auto keep         = cudf::binary_operation(passes->view(),
+                                     bound->view(),
+                                     cudf::binary_operator::NULL_LOGICAL_OR,
+                                     cudf::data_type{cudf::type_id::BOOL8},
+                                     stream,
+                                     mr);
+  if (keys.has_nulls()) {
+    // A NULL key's group gathers the NULLs of every row group.
+    auto const null_key = cudf::is_null(keys, stream, mr);
+    keep                = cudf::binary_operation(keep->view(),
+                                  null_key->view(),
+                                  cudf::binary_operator::NULL_LOGICAL_OR,
+                                  cudf::data_type{cudf::type_id::BOOL8},
+                                  stream,
+                                  mr);
+  }
+  auto kept = sirius::apply_retention_mask(view, keep->view(), stream, mr);
+  filter.groups_seen.fetch_add(static_cast<std::uint64_t>(view.num_rows()),
+                               std::memory_order_relaxed);
+  filter.groups_kept.fetch_add(static_cast<std::uint64_t>(kept->num_rows()),
+                               std::memory_order_relaxed);
+  if (kept->num_rows() == view.num_rows()) { return partial; }
+  return make_data_batch(std::move(kept), space, stream, batch_telemetry());
+}
+
+complete_group_having::~complete_group_having()
+{
+  auto const seen = groups_seen.load(std::memory_order_relaxed);
+  if (seen != 0) {
+    SIRIUS_LOG_INFO("[complete-group HAVING] kept {} of {} partial groups",
+                    groups_kept.load(std::memory_order_relaxed),
+                    seen);
+  }
 }
 }  // namespace op
 }  // namespace sirius

@@ -180,7 +180,9 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     output_batches.push_back(sirius::make_data_batch_from_view(
       out_view, std::move(owner), referenced_bytes, mem, stream, batch_telemetry()));
   }
-  return std::make_unique<pipelineable_operator_data>(output_batches, input.get_position());
+  auto output = std::make_unique<pipelineable_operator_data>(output_batches, input.get_position());
+  output->set_whole_row_groups(input.whole_row_groups());
+  return output;
 }
 
 }  // namespace op

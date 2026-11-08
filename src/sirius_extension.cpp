@@ -3026,6 +3026,14 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
 
+static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_complete_group_having = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_COMPLETE_GROUP_HAVING to {}",
+                   params->enable_complete_group_having);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3508,6 +3516,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_complete_group_having",
+                    "distributed: drop partial groups proven whole that fail the HAVING",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_complete_group_having),
+                    SetEnableCompleteGroupHaving);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

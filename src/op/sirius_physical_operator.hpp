@@ -275,6 +275,15 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
 
   /**
+   * @brief Whether every row of each Parquet row group behind these batches is in one batch.
+   *
+   * Set by a Parquet scan, whose batches hold whole row groups, and kept by operators that drop
+   * rows or columns but never move a row to another batch. A row-preserving replacement keeps it.
+   */
+  [[nodiscard]] bool whole_row_groups() const noexcept { return _whole_row_groups; }
+  void set_whole_row_groups(bool whole) noexcept { _whole_row_groups = whole; }
+
+  /**
    * @brief Returns a new task input of the same type that holds @p batches in place of this one's
    * batches.
    *
@@ -398,6 +407,7 @@ class pipelineable_operator_data : public operator_data {
   /// with another ID; usually empty.
   std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  bool _whole_row_groups{false};
 };
 
 /// Output of a row router. Each batch has its own destination; omitted empty slices retain IDs.

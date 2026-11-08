@@ -18,8 +18,11 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/io/parquet_schema.hpp>
+
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -47,6 +50,9 @@ struct operator_params;
 
 namespace sirius::planner {
 
+using parquet_footer_reader =
+  std::function<std::shared_ptr<cudf::io::parquet::FileMetaData const>(std::string const& path)>;
+
 /**
  * @brief Rewrites a plan, after insert_gpu_pipeline_operators, to run on every rank of
  * @p service, each over its own share of the scanned files.
@@ -55,11 +61,16 @@ namespace sirius::planner {
  * docs/super-sirius/distributed-sirius.md lists every plan shape and its exchange. Rank 0's
  * result is the query's; the other ranks' are empty, or meaningless after a gather.
  *
+ * A HAVING over a grouped aggregate whose group key a Parquet scan reads also drops, before the
+ * exchange, the partial groups already whole and failing it, when @p footers shows that no key
+ * strictly inside a row group's key range is in another row group (see complete_group_having).
+ *
  * Every rank must plan the same query: before returning, this blocks until every rank of
  * @p service has planned it, comparing the plans' shapes in an all-gather.
  *
  * @param query This query's number, the same on every rank: its exchanges' stream ids.
  * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
+ * @param footers Reads a Parquet file's footer; may be empty.
  * @throws sirius::not_implemented_exception on an operator distributed execution does not
  *         support, rather than a wrong answer; this rank throws before the all-gather.
  * @throws sirius::invalid_input_exception when another rank planned a different shape, on every
@@ -69,7 +80,8 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,
                      cucascade::memory::memory_space& gpu,
                      std::uint64_t query,
-                     exec::query_lifecycle_registry& lifecycle);
+                     exec::query_lifecycle_registry& lifecycle,
+                     parquet_footer_reader footers = {});
 
 /// Bytes `[start, start + length)` of file `file` (an index into the table's files).
 struct file_byte_range {

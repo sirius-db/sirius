@@ -89,7 +89,9 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
     output_batches.push_back(sirius::make_data_batch(
       std::move(filtered_table), *batch.get_memory_space(), stream, batch_telemetry()));
   }
-  return std::make_unique<pipelineable_operator_data>(output_batches, input.get_position());
+  auto output = std::make_unique<pipelineable_operator_data>(output_batches, input.get_position());
+  output->set_whole_row_groups(input.whole_row_groups());
+  return output;
 }
 
 }  // namespace op
