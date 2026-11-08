@@ -3757,20 +3757,13 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "SQL multi-Iceberg replan retains the read-view correspondence refusal",
-                 "[integration][iceberg][verdict]")
+                 "SQL multi-Iceberg replan runs on the GPU",
+                 "[integration][iceberg][verdict][iceberg_multiscan]")
 {
   auto query = "SELECT a.count, b.count FROM " + pinned_scan(v1_path) + " a JOIN " +
                pinned_scan(v2_path) + " b ON a.count=b.count";
-  auto before = sirius::test::get_transparent_execution_stats(*con);
-  sirius::test::scoped_recording_log_sink logs;
-  expect_iceberg_rows(query, gpu_route::plan_fallback, {{"1", "1"}, {"3", "3"}});
-  auto after = sirius::test::get_transparent_execution_stats(*con);
-  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
-  bool seen = false;
-  for (auto const& record : logs.records())
-    if (record.message.find("no_correspondence") != std::string::npos) seen = true;
-  CHECK(seen);
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  expect_iceberg_rows(query, gpu_route::gpu, {{"1", "1"}, {"3", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
