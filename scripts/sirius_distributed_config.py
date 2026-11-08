@@ -20,6 +20,7 @@ KEYS = {
     ("gateway", "networks"): "SIRIUS_GATEWAY_PRIORITY_NETWORKS",
     ("gateway", "min_ranks"): "SIRIUS_GATEWAY_MIN_RANKS",
     ("gateway", "join_wait"): "SIRIUS_GATEWAY_JOIN_WAIT",
+    ("gateway", "statement_timeout"): "SIRIUS_GATEWAY_STATEMENT_TIMEOUT",
     ("node", "gpus"): "SIRIUS_NODE_GPUS",
     ("node", "networks"): "SIRIUS_NODE_NETWORKS",
     ("node", "quack_port"): "SIRIUS_NODE_QUACK_PORT",
