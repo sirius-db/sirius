@@ -379,6 +379,9 @@ class SiriusContext : public ClientContextState {
     uint64_t hidden_catalog_skips             = 0;
     uint64_t classification_failures          = 0;
     uint64_t read_view_mismatches             = 0;
+    // Read-view mismatches in which every paired scan either kept its identity or, for the same
+    // Iceberg table, bound a different selection (snapshot, bound schema or metadata file).
+    uint64_t iceberg_snapshot_drift_refusals  = 0;
     uint64_t certificate_mismatches           = 0;
     uint64_t certificate_incompletes          = 0;
     uint64_t execution_rebuilds               = 0;
@@ -834,6 +837,7 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record a CPU/candidate bound read-view comparison failure.
   void record_transparent_read_view_mismatch() noexcept;
+  void record_transparent_iceberg_snapshot_drift() noexcept;
 
   /// \brief Record rebuilding a Sirius plan inside an execution window.
   void record_transparent_execution_rebuild() noexcept;
@@ -999,6 +1003,7 @@ class SiriusContext : public ClientContextState {
   transparent_execution_stats certification_stats_;
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
   std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_iceberg_snapshot_drift_count_{0};
   std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
   std::atomic<uint64_t> transparent_certificate_incomplete_count_{0};
   std::atomic<uint64_t> transparent_execution_rebuild_count_{0};

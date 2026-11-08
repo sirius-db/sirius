@@ -29,8 +29,10 @@
 #include <vector>
 
 namespace duckdb {
+class BoundTableFunction;
 class ClientContext;
 class DataTable;
+class FunctionData;
 class LogicalGet;
 class LogicalOperator;
 class PhysicalOperator;
@@ -116,6 +118,17 @@ struct read_view_capture_metrics {
 struct provider_read_identity {
   std::string key;
 };
+/// The snapshot a verified iceberg_scan was bound to, as the extension published it through
+/// get_bind_info: table UUID, snapshot id, the schema the bind chose, and the metadata file that
+/// binding parsed. Present only when every field was published; a scan bound from a catalog
+/// entry, an empty table or a transaction-local overlay has none.
+struct iceberg_bound_selection {
+  std::string table_uuid;
+  int64_t snapshot_id = 0;
+  int32_t bound_schema_id = 0;
+  std::string metadata_file_path;
+  bool operator==(iceberg_bound_selection const&) const = default;
+};
 /// Stable read identity shared after an equal comparison; evidence remains capture-specific.
 struct bound_read_identity {
   verified_source_identity source;
@@ -125,8 +138,16 @@ struct bound_read_identity {
   duckdb::vector<std::string> bound_names;
   /// Canonical bound reader options participating in stable identity.
   std::string selector;
+  /// Iceberg bound snapshot selection participating in stable identity when published.
+  std::optional<iceberg_bound_selection> selection;
   read_view_fingerprint fingerprint;
 };
+/// Reads the published Iceberg bound selection of a verified iceberg_scan; nullopt unless the
+/// table UUID, snapshot id, schema id and metadata file path are all present and well typed.
+std::optional<iceberg_bound_selection> capture_iceberg_bound_selection(
+  duckdb::BoundTableFunction const& function,
+  duckdb::FunctionData const* bind_data,
+  duckdb::ClientContext& context);
 /// One captured read identity with its evidence, provider context, and replay policy.
 struct bound_read_view {
   /// Captured replay permission, excluded from stable read identity.

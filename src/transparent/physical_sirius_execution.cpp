@@ -346,6 +346,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           auto message = describe_read_view_mismatch(comparison);
           if (state.sirius_context) {
             state.sirius_context->record_transparent_read_view_mismatch();
+            if (comparison.reason == "iceberg_snapshot_drift") {
+              state.sirius_context->record_transparent_iceberg_snapshot_drift();
+            }
           }
           SIRIUS_LOG_INFO("Transparent execution read-view comparison failed ({}): {}",
                           rebuild_origin == candidate_origin::copy ? "copy" : "replan",

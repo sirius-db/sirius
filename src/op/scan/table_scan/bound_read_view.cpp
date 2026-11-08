@@ -34,6 +34,7 @@
 #include <duckdb/common/types/hash.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/function/table/table_scan.hpp>
+#include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/storage/storage_manager.hpp>
@@ -458,6 +459,9 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     identity.bound_names = duckdb::IdentifiersToStrings(typed->names);
     identity.selector    = parquet_selector(*typed, context);
     identity.data_view   = file_inventory{static_cast<uint32_t>(paths.size())};
+    if (source->function_name == "iceberg_scan") {
+      identity.selection = capture_iceberg_bound_selection(input.function, input.bind_data, context);
+    }
 
     if (input.collect_evidence) {
       std::vector<std::size_t> order;
@@ -658,11 +662,58 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
       throw std::invalid_argument("Invalid provider read identity");
     append(text, 'b', provider.key);
   }
+  if (identity.selection) {
+    // Iceberg only: the bound snapshot selection distinguishes two bindings of the same files
+    // whose deletes differ. Legacy identities without a published selection keep their bytes.
+    std::string selection;
+    append(selection, 'v', "sirius.iceberg-bound-selection.1");
+    append(selection, 's', identity.selection->table_uuid);
+    append(selection, 's', std::to_string(identity.selection->snapshot_id));
+    append(selection, 's', std::to_string(identity.selection->bound_schema_id));
+    append(selection, 's', identity.selection->metadata_file_path);
+    append(text, 'i', selection);
+  }
   text += tail;
   identity.fingerprint.hash = duckdb::Hash(text.data(), text.size());
   return std::make_shared<bound_read_identity const>(std::move(identity));
 }
 }  // namespace
+
+std::optional<iceberg_bound_selection> capture_iceberg_bound_selection(
+  duckdb::BoundTableFunction const& function,
+  duckdb::FunctionData const* bind_data,
+  duckdb::ClientContext& context)
+{
+  if (!function.get_bind_info || !bind_data) return std::nullopt;
+  duckdb::TableFunctionGetBindInfoInput input(context, const_cast<duckdb::FunctionData*>(bind_data));
+  auto const info = function.get_bind_info(input);
+  auto const text = [&](char const* name) -> std::optional<std::string> {
+    auto const found = info.options.find(name);
+    if (found == info.options.end() || found->second.IsNull() ||
+        found->second.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+      return std::nullopt;
+    }
+    auto value = duckdb::StringValue::Get(found->second);
+    if (value.empty()) return std::nullopt;
+    return value;
+  };
+  auto const integer = [&](char const* name, duckdb::LogicalTypeId type) -> std::optional<int64_t> {
+    auto const found = info.options.find(name);
+    if (found == info.options.end() || found->second.IsNull() || found->second.type().id() != type) {
+      return std::nullopt;
+    }
+    return found->second.GetValue<int64_t>();
+  };
+  auto const table_uuid    = text("table_uuid");
+  auto const snapshot_id   = integer("snapshot_id", duckdb::LogicalTypeId::BIGINT);
+  auto const schema_id     = integer("schema_id", duckdb::LogicalTypeId::INTEGER);
+  auto const metadata_file = text("metadata_file_path");
+  if (!table_uuid || !snapshot_id || !schema_id || !metadata_file) return std::nullopt;
+  return iceberg_bound_selection{*table_uuid,
+                                 *snapshot_id,
+                                 static_cast<int32_t>(*schema_id),
+                                 *metadata_file};
+}
 
 std::shared_ptr<bound_read_identity const> make_bound_read_identity(
   bound_read_identity identity,

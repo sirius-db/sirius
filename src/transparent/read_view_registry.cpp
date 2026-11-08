@@ -172,6 +172,52 @@ struct original_binding_ref {
   op::scan::bound_read_view const* view;
 };
 
+// Refines a failed comparison only. Pairs original and candidate scans by the rule this origin
+// uses -- the single scan of a one-scan replan, otherwise table_index with unique indices and a
+// complete mapping -- and reports drift when at least one pair is the SAME Iceberg table
+// (equal published UUID) bound to a different selection while every other pair keeps its
+// identity and required selector proof. Different UUIDs are table replacement, mixed-source
+// changes and unprovable maps keep the original reason.
+bool iceberg_selection_drift(candidate_origin origin,
+                             std::span<original_binding_ref const> logical_original,
+                             std::span<candidate_binding const> planned,
+                             std::span<candidate_binding const> candidate)
+{
+  auto drift_pair = [](op::scan::bound_read_view const* original,
+                       std::shared_ptr<op::scan::bound_read_view const> const& view) {
+    if (!original || !view || !original->identity || !view->identity) return false;
+    auto const& left  = original->identity->selection;
+    auto const& right = view->identity->selection;
+    return left && right && left->table_uuid == right->table_uuid && *left != *right &&
+           original->identity->source.function_name == view->identity->source.function_name;
+  };
+  auto kept_pair = [](op::scan::bound_read_view const* original,
+                      std::shared_ptr<op::scan::bound_read_view const> const& view) {
+    return same_identity(original, view) && view && selector_proven(*view, original);
+  };
+  if (origin == candidate_origin::replan && planned.size() <= 1) {
+    return logical_original.size() == 1 && planned.size() == 1 && candidate.size() == 1 &&
+           drift_pair(logical_original.front().view, planned.front().view);
+  }
+  if (logical_original.size() != candidate.size() || candidate.empty()) return false;
+  std::unordered_set<duckdb::idx_t> matched;
+  bool any_drift = false;
+  for (auto const& binding : candidate) {
+    if (!matched.insert(binding.table_index).second) return false;
+    auto const found =
+      std::find_if(logical_original.begin(), logical_original.end(), [&](auto const& original) {
+        return original.table_index == binding.table_index;
+      });
+    if (found == logical_original.end()) return false;
+    if (drift_pair(found->view, binding.view)) {
+      any_drift = true;
+    } else if (!kept_pair(found->view, binding.view)) {
+      return false;
+    }
+  }
+  return any_drift;
+}
+
 read_view_comparison compare_read_views_impl(
   candidate_origin origin,
   std::span<original_binding_ref const> logical_original,
@@ -207,7 +253,17 @@ read_view_comparison compare_read_views_impl(
   } else {
     result.correspondence = "table_index";
   }
-  if (!compare_multiset(physical_original, candidate, result)) return result;
+  auto refine_drift = [&] {
+    if (result.original_count != result.candidate_count) return result;
+    if (result.reason == "fingerprint_mismatch" || result.reason == "binding_mismatch" ||
+        result.reason == "no_correspondence") {
+      if (iceberg_selection_drift(origin, logical_original, planned, candidate)) {
+        result.reason = "iceberg_snapshot_drift";
+      }
+    }
+    return result;
+  };
+  if (!compare_multiset(physical_original, candidate, result)) return refine_drift();
 
   if (origin == candidate_origin::replan && !multi_replan) {
     if (planned.empty()) {
@@ -241,8 +297,11 @@ read_view_comparison compare_read_views_impl(
       std::find_if(logical_original.begin(), logical_original.end(), [&](auto const& original) {
         return original.table_index == candidate_binding.table_index;
       });
-    if (found == logical_original.end() || !same_identity(found->view, candidate_binding.view))
-      return pairing_failed();
+    if (found == logical_original.end()) return pairing_failed();
+    if (!same_identity(found->view, candidate_binding.view)) {
+      pairing_failed();
+      return refine_drift();
+    }
     if (!selector_proven(*candidate_binding.view, found->view)) {
       result.reason = "selector_unproven";
       return result;

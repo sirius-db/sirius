@@ -44,6 +44,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
@@ -160,18 +161,18 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     }
   }
 
-  // "current" is resolved independently by DuckDB's bind, by Sirius's rebind of the serialized
-  // plan, and by delete discovery; nothing makes the three agree, so a commit landing between any
-  // two pairs one snapshot's data files with another's deletes. The id DuckDB bound is not
-  // reachable -- it lives in types the iceberg extension compiles privately.
-  //
-  // Do NOT resolve it here instead. Highest sequence number is not the current snapshot under
-  // rollback, branches or staged WAP commits, and comparing data-file sets cannot separate two
-  // snapshots that differ only in deletes. Lifting this needs serializable iceberg bind data
-  // upstream, or Sirius not planning twice.
+  // Bind, replan and delete discovery must refer to the same selected snapshot.
+  // Do not infer missing proof from current metadata, sequence order or data-file sets:
+  // branches and rollback affect selection, and snapshots can differ only in deletes.
+  // A verified extension that publishes the bound selection (table UUID, snapshot, schema and
+  // the metadata file it parsed) supplies that proof itself. Without a snapshot argument, delete
+  // discovery names that file and snapshot instead of resolving the table path again; with one,
+  // the established argument path below is unchanged.
+  auto const selection =
+    op::scan::capture_iceberg_bound_selection(op.function, op.bind_data.get(), context);
   {
     auto const it = op.named_parameters.find("snapshot_from_id");
-    if (it == op.named_parameters.end() || it->second.IsNull()) {
+    if ((it == op.named_parameters.end() || it->second.IsNull()) && !selection) {
       return iceberg_decline(
         scan_reason::iceberg_no_snapshot_id,
         "iceberg_scan was called without 'snapshot_from_id', so the snapshot DuckDB bound "
@@ -188,6 +189,7 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   }
 
   std::optional<int64_t> snapshot_id;
+  std::string inventory_source = table_path;
   // Inspect the same snapshot the scan will read.
   auto sid_it = op.named_parameters.find("snapshot_from_id");
   if (sid_it != op.named_parameters.end() && !sid_it->second.IsNull()) {
@@ -199,6 +201,9 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
         "iceberg_scan snapshot_from_id is not an integer, so the snapshot the scan will read "
         "cannot be inspected for delete files");
     }
+  } else {
+    snapshot_id      = selection->snapshot_id;
+    inventory_source = selection->metadata_file_path;
   }
   try {
     // Opening a second Connection to the same database re-registers the SAME SiriusContext, so
@@ -237,7 +242,8 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       }
       ~probe_timer() { stop(); }
     } timer{delete_time_us};
-    auto result = op::scan::read_delete_inventory(context, table_path, snapshot_id, injection);
+    auto result =
+      op::scan::read_delete_inventory(context, inventory_source, snapshot_id, injection);
     auto const n_delete_files = result.equality_count;
     timer.stop();
     if (n_delete_files > 0) {

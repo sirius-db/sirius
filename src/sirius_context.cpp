@@ -1449,6 +1449,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .classification_failures =
       transparent_classification_failure_count_.load(std::memory_order_relaxed),
     .read_view_mismatches = transparent_read_view_mismatch_count_.load(std::memory_order_relaxed),
+    .iceberg_snapshot_drift_refusals =
+      transparent_iceberg_snapshot_drift_count_.load(std::memory_order_relaxed),
     .certificate_mismatches =
       transparent_certificate_mismatch_count_.load(std::memory_order_relaxed),
     .certificate_incompletes =
@@ -1660,6 +1662,11 @@ void SiriusContext::record_transparent_certificate_mismatch() noexcept
 void SiriusContext::record_transparent_read_view_mismatch() noexcept
 {
   transparent_read_view_mismatch_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_iceberg_snapshot_drift() noexcept
+{
+  transparent_iceberg_snapshot_drift_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SiriusContext::record_transparent_execution_rebuild() noexcept
@@ -1952,6 +1959,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     if (!comparison.equal) {
       auto message = sirius::transparent::describe_read_view_mismatch(comparison);
       record_transparent_read_view_mismatch();
+      if (comparison.reason == "iceberg_snapshot_drift") record_transparent_iceberg_snapshot_drift();
       SIRIUS_LOG_INFO(
         "Transparent execution read-view comparison failed ({}): {}",
         candidate_source == sirius::transparent::candidate_origin::copy ? "copy" : "replan",

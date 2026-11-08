@@ -32,19 +32,20 @@ namespace sirius::op::scan {
  * Iceberg metadata lives behind `duckdb-iceberg`'s table functions. Sirius does not link against
  * that extension, and the facts it needs are not readable from the bound plan: `MultiFileBindData`
  * exposes no snapshot, and `OpenFileInfo::extended_info` carries only file_size/etag/last_modified/
- * first_row_id/sequence_number. duckdb-iceberg DOES install a `get_bind_info` hook
- * (`IcebergBindInfo`), and it holds the resolved `IcebergMultiFileList` when it runs, but it
- * publishes only the catalog entry -- the snapshot identity it has in hand never reaches
- * `BindInfo::options`. So the delete files, the manifest entries and the data-file footers are
- * reachable only by asking DuckDB for them.
+ * first_row_id/sequence_number. duckdb-iceberg's `get_bind_info` hook (`IcebergBindInfo`)
+ * publishes the table UUID, the bound schema id, the snapshot id and -- from the Sirius-qualified
+ * build onwards -- the metadata file the bind parsed; see `capture_iceberg_bound_selection`. It
+ * does not publish delete files, manifest entries or data-file footers, so those are reachable
+ * only by asking DuckDB for them.
  *
  * ## Why a SECOND connection cannot see a different table than the bind did
  *
- * This was the reviewers' hazard, and it is closed by construction rather than by agreement: an
- * `iceberg_scan` with no `snapshot_from_id` is declined at plan time, so every query issued
- * through this connection names the SAME snapshot id the outer scan was bound to. A commit landing
- * mid-plan moves `current`; it does not move a pinned id. Callers that read Iceberg metadata must
- * therefore pass `snapshot_from_id` through, and there is no path here that resolves "current".
+ * Planning's inventory query supplies the selected snapshot ID. With a non-null
+ * `snapshot_from_id` argument it uses the supplied table locator, even when the binding also
+ * publishes a selection; this legacy route assumes that the locator still names the same table.
+ * Otherwise a complete published selection supplies the captured metadata file and snapshot ID.
+ * Later manifest and delete reads follow the selected inventory's paths. A failed selected
+ * read never switches to the current snapshot.
  *
  * ## What it deliberately does NOT do
  *
