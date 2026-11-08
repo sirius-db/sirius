@@ -27,24 +27,9 @@ namespace sirius::op::scan {
 /**
  * @brief The one place Sirius opens a DuckDB connection to read Iceberg metadata while planning.
  *
- * ## Why a connection at all
- *
- * Iceberg metadata lives behind `duckdb-iceberg`'s table functions. Sirius does not link against
- * that extension, and the facts it needs are not readable from the bound plan: `MultiFileBindData`
- * exposes no snapshot, and `OpenFileInfo::extended_info` carries only file_size/etag/last_modified/
- * first_row_id/sequence_number. duckdb-iceberg DOES install a `get_bind_info` hook
- * (`IcebergBindInfo`), and it holds the resolved `IcebergMultiFileList` when it runs, but it
- * publishes only the catalog entry -- the snapshot identity it has in hand never reaches
- * `BindInfo::options`. So the delete files, the manifest entries and the data-file footers are
- * reachable only by asking DuckDB for them.
- *
- * ## Why a SECOND connection cannot see a different table than the bind did
- *
- * This was the reviewers' hazard, and it is closed by construction rather than by agreement: an
- * `iceberg_scan` with no `snapshot_from_id` is declined at plan time, so every query issued
- * through this connection names the SAME snapshot id the outer scan was bound to. A commit landing
- * mid-plan moves `current`; it does not move a pinned id. Callers that read Iceberg metadata must
- * therefore pass `snapshot_from_id` through, and there is no path here that resolves "current".
+ * Iceberg's bind callback identifies the selected snapshot. The separate metadata
+ * query reads its manifests by that ID, using the same table path. If the snapshot
+ * was expired before the metadata query, Iceberg reports the missing ID.
  *
  * ## What it deliberately does NOT do
  *

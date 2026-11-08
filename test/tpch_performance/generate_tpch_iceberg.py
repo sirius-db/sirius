@@ -7,8 +7,8 @@ Run from the project root:
         test_datasets/tpch_parquet_sf1 test_datasets/tpch_iceberg_sf1
 
 PyIceberg rewrites the data with field IDs and creates the manifests and snapshots.
-The output owns its data files and contains create_views.sql with exact metadata
-paths and snapshot IDs. Input files are read in batches, never a whole table at once.
+The output owns its data files and contains create_views.sql over the table
+directories. Input files are read in batches, never a whole table at once.
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ def generate(parquet_dir: Path, output_dir: Path, batch_rows: int = DEFAULT_BATC
         "tables": {},
     }
     views = [
-        "-- Generated local Iceberg views; metadata paths and snapshots are fixed.",
+        "-- Generated local Iceberg views over the committed table directories.",
         "LOAD iceberg;",
     ]
     try:
@@ -141,10 +141,11 @@ def generate(parquet_dir: Path, output_dir: Path, batch_rows: int = DEFAULT_BATC
                 f"Writing {name}: {data.rows:,} rows from {len(data.files)} file(s)",
                 flush=True,
             )
+            table_dir = output / name
             table = catalog.create_table(
                 ("tpch", name),
                 schema=data.schema,
-                location=str(output / name),
+                location=str(table_dir),
                 properties={"format-version": "2"},
             )
             written = 0
@@ -198,9 +199,11 @@ def generate(parquet_dir: Path, output_dir: Path, batch_rows: int = DEFAULT_BATC
                 "data_files": sorted(data_files),
                 "field_ids": field_ids,
             }
+            metadata = Path(table.metadata_location)
+            version = metadata.name.removesuffix(".metadata.json")
+            (metadata.parent / "version-hint.text").write_text(version)
             views.append(
-                f"CREATE VIEW {name} AS SELECT * FROM iceberg_scan("
-                f"{sql_literal(table.metadata_location)}, snapshot_from_id={snapshot.snapshot_id});"
+                f"CREATE VIEW {name} AS SELECT * FROM iceberg_scan({sql_literal(str(table_dir))});"
             )
     finally:
         catalog.engine.dispose()

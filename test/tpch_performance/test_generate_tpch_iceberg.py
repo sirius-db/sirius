@@ -57,8 +57,18 @@ class IcebergGenerationTests(unittest.TestCase):
         self.assertEqual(
             json.loads((self.output / "dataset.json").read_text()), manifest
         )
+        views = (self.output / "create_views.sql").read_text()
+        self.assertNotIn("snapshot_from_id", views)
         for name, entry in manifest["tables"].items():
             with self.subTest(table=name):
+                directory = self.output / name
+                quoted = str(directory).replace("'", "''")
+                self.assertIn(f"iceberg_scan('{quoted}');", views)
+                hint = (directory / "metadata/version-hint.text").read_text()
+                self.assertEqual(
+                    directory / "metadata" / f"{hint}.metadata.json",
+                    Path(entry["metadata_file"]),
+                )
                 table = StaticTable.from_metadata(entry["metadata_file"])
                 actual = table.scan(snapshot_id=entry["snapshot_id"]).to_arrow()
                 self.assertEqual(actual.column_names, self.expected[name].column_names)

@@ -53,7 +53,8 @@ each batch is appended as a snapshot. The final snapshot includes all batches.
 
 `dataset.json` records the source files, row counts, writer versions, metadata
 paths and final snapshot IDs. `create_views.sql` loads the DuckDB Iceberg extension
-and creates the eight TPC-H views with exact metadata paths and pinned snapshots:
+and creates the eight TPC-H views over their table directories. Each directory's
+`metadata/version-hint.text` points to the committed metadata.
 
 ```sql
 .read test_datasets/tpch_iceberg_sf1/create_views.sql
@@ -106,8 +107,8 @@ prepares the source Parquet and generates Iceberg once before running either eng
 `--parquet-dir` selects the source Parquet for generation. Use a fresh output path
 if a previous generation left an incomplete warehouse.
 
-Both engines use the same saved `create_views.sql` with fixed snapshot IDs. As with
-Parquet, each engine uses one session by default and Sirius allows CPU fallback.
+Both engines use the same saved `create_views.sql`. Keep the warehouse unchanged
+between runs. Each engine uses one session by default and Sirius allows CPU fallback.
 The DuckDB Iceberg extension must already be installed for that build.
 
 Options:
