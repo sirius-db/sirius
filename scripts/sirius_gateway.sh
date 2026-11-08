@@ -29,6 +29,8 @@ Environment:
   SIRIUS_GATEWAY_TOKEN              the client token (default: one made once and kept)
   SIRIUS_GATEWAY_MIN_RANKS          ranks the first statement waits for (default 1)
   SIRIUS_GATEWAY_JOIN_WAIT          sets sirius_gateway_join_wait
+  SIRIUS_GATEWAY_STATEMENT_TIMEOUT  sets sirius_gateway_statement_timeout (default 3600 s; 0 is
+                                    none): a client cannot set it
   SIRIUS_GATEWAY_ALLOW_JOIN         1 lets ranks register themselves (default: 1 with 0 ranks)
   SIRIUS_GATEWAY_GPUS               with N ranks, each rank's GPU (e.g. 0,0)
   SIRIUS_GATEWAY_EXCHANGE_MNNVL, SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES,
@@ -63,8 +65,8 @@ if ! [[ $ranks =~ ^[0-9]+$ && $port =~ ^[0-9]+$ && $cluster =~ ^[A-Za-z0-9._-]+$
 fi
 # These go into the gateway's init SQL as they are.
 if ! [[ ${SIRIUS_GATEWAY_MIN_RANKS:-1} =~ ^[0-9]+$ && ${SIRIUS_GATEWAY_JOIN_WAIT:-0} =~ ^[0-9]+$ &&
-  ${SIRIUS_GATEWAY_GPUS:-} =~ ^[0-9,]*$ ]]; then
-  echo "SIRIUS_GATEWAY_MIN_RANKS and SIRIUS_GATEWAY_JOIN_WAIT take a number, SIRIUS_GATEWAY_GPUS a list such as 0,1" >&2
+  ${SIRIUS_GATEWAY_STATEMENT_TIMEOUT:-0} =~ ^[0-9]+$ && ${SIRIUS_GATEWAY_GPUS:-} =~ ^[0-9,]*$ ]]; then
+  echo "SIRIUS_GATEWAY_MIN_RANKS, SIRIUS_GATEWAY_JOIN_WAIT and SIRIUS_GATEWAY_STATEMENT_TIMEOUT take a number, SIRIUS_GATEWAY_GPUS a list such as 0,1" >&2
   exit 2
 fi
 
@@ -170,6 +172,8 @@ init="$logs/gateway.init.sql"
   echo "SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = ${SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER:-16};"
   echo "SET GLOBAL sirius_gateway_allow_join = $([ "$allow_join" = 1 ] && echo true || echo false);"
   [ -z "${SIRIUS_GATEWAY_JOIN_WAIT:-}" ] || echo "SET GLOBAL sirius_gateway_join_wait = $SIRIUS_GATEWAY_JOIN_WAIT;"
+  [ -z "${SIRIUS_GATEWAY_STATEMENT_TIMEOUT:-}" ] ||
+    echo "SET GLOBAL sirius_gateway_statement_timeout = $SIRIUS_GATEWAY_STATEMENT_TIMEOUT;"
   # replay_saved: a restarted gateway replays the DDL saved in the state dir, instead of
   # deleting it as an explicit start from the console does.
   [ "$ranks" -eq 0 ] ||

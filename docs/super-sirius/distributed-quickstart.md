@@ -77,8 +77,8 @@ sirius:
 
 Each key sets an environment variable that the scripts read. A variable you export wins over
 the file. Any error in the section, such as an unknown key or a value that is not a string,
-number or list, stops the scripts before they apply any of it. `gateway.min_ranks` and
-`gateway.join_wait` must be whole numbers.
+number or list, stops the scripts before they apply any of it. `gateway.min_ranks`,
+`gateway.join_wait` and `gateway.statement_timeout` must be whole numbers.
 
 | Key | Variable | Default | What |
 |---|---|---|---|
@@ -86,6 +86,7 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `gateway.port` | `SIRIUS_GATEWAY_PORT` | 9494 | The gateway's client port. The gateway script's second argument wins over it |
 | `gateway.min_ranks` | `SIRIUS_GATEWAY_MIN_RANKS` | 1 | `sirius_gateway_min_ranks`: registered ranks the first statement waits for |
 | `gateway.join_wait` | `SIRIUS_GATEWAY_JOIN_WAIT` | 600 | `sirius_gateway_join_wait`: seconds a statement waits for them before it fails, at most a year |
+| `gateway.statement_timeout` | `SIRIUS_GATEWAY_STATEMENT_TIMEOUT` | 3600 | `sirius_gateway_statement_timeout`: seconds a statement runs before the gateway cancels it on every rank; 0 is none. Clients cannot set it |
 | `gateway.host` | `SIRIUS_GATEWAY_HOST` | | The address the gateway listens on |
 | `gateway.networks` | `SIRIUS_GATEWAY_PRIORITY_NETWORKS` | | Or this host's first address in these CIDRs (`;` or `,` between them). Without either, the address of the default route's interface; with ranks spawned on this host, 127.0.0.1 |
 | `node.gpus` | `SIRIUS_NODE_GPUS` | `all` | The GPUs that get a rank: `all`, a list, or `slurm` (the GPU Slurm gave the task) |
@@ -226,7 +227,7 @@ and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with
 | `FAIL no ~/.sirius/gateways/<cluster>/gateway.conf`, `no ... gateway.conf: start the gateway first` | Start the gateway on a host that shares `$HOME`, with the same cluster name; or pass `--gateway` and `--token-file` to `sirius-node` |
 | `--token would show the token to every user in ps` | `sirius-node` has no `--token`: use `--token-file FILE`, or export `SIRIUS_GATEWAY_TOKEN` |
 | `bad --gateway HOST:PORT, token ...`, `bad gateway token`, `bad rank token` | Tokens are letters, digits, `_` and `-` only |
-| `SIRIUS_GATEWAY_MIN_RANKS and SIRIUS_GATEWAY_JOIN_WAIT take a number` | Give whole numbers for `gateway.min_ranks` and `gateway.join_wait` |
+| `SIRIUS_GATEWAY_MIN_RANKS, SIRIUS_GATEWAY_JOIN_WAIT and SIRIUS_GATEWAY_STATEMENT_TIMEOUT take a number` | Give whole numbers for `gateway.min_ranks`, `gateway.join_wait` and `gateway.statement_timeout` |
 | `FAIL cannot reach the gateway at <host>:<port>` | Start the gateway, or open its TCP port between the two machines |
 | `FAIL no address of this node is in <CIDRs>`, `no address of this host is in priority_networks <CIDRs>` | The node has no address in the gateway's subnet, or in `node.networks`. Set `node.networks` (or `--networks`) to the CIDR of the address the other machines reach |
 | `gateway <cluster> already runs (lock ...)` | One gateway per name: stop the other one, or set another `SIRIUS_CLUSTER` |
