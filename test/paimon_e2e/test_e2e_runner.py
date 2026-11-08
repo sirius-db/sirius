@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -148,6 +149,64 @@ class E2ERunnerTests(unittest.TestCase):
             expected=1,
         )
         self.assertIn("changed", self.report["error"])
+
+    def test_sigterm_cleans_child_and_records_terminal_report(self):
+        self.binary.write_text(
+            f"#!{sys.executable}\n"
+            "import os, pathlib, time\n"
+            "pathlib.Path('child.pid').write_text(str(os.getpid()))\n"
+            "time.sleep(30)\n"
+        )
+        self.binary.chmod(0o755)
+        digest = hashlib.sha256(self.binary.read_bytes()).hexdigest()
+        output = self.root / "signal-attempts"
+        launcher = subprocess.Popen(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--binary",
+                str(self.binary),
+                "--sha256",
+                digest,
+                "--output",
+                str(output),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                pids = list(output.glob("run-*/child.pid"))
+                if pids:
+                    child_pid = int(pids[0].read_text())
+                    break
+                if launcher.poll() is not None:
+                    self.fail("launcher exited before child started")
+                time.sleep(0.01)
+            self.assertIsNotNone(child_pid, "child failed to start")
+            launcher.terminate()
+            stdout, stderr = launcher.communicate(timeout=5)
+            self.assertEqual(launcher.returncode, 143, stdout + stderr)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            reports = list(output.glob("run-*/report.json"))
+            self.assertEqual(len(reports), 1)
+            report = json.loads(reports[0].read_text())
+            self.assertEqual(report["state"], "FAIL")
+            self.assertEqual(report["process"]["termination"], "terminated")
+            self.assertEqual(report["process"]["exit_status"], -signal.SIGKILL)
+        finally:
+            if launcher.poll() is None:
+                launcher.kill()
+            launcher.communicate()
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 if __name__ == "__main__":

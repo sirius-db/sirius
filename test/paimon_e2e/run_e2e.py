@@ -23,6 +23,16 @@ CASES = {
 }
 
 
+class TerminationRequested(BaseException):
+    """Route SIGTERM through the owned-child cleanup and retained report."""
+
+
+def request_termination(signum, frame):
+    # A repeated cancellation must not interrupt cleanup of the first one.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise TerminationRequested()
+
+
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -133,6 +143,7 @@ def main(argv=None):
         "process": {"termination": "not_started", "exit_status": None},
     }
     status = 1
+    previous_sigterm = signal.signal(signal.SIGTERM, request_termination)
     try:
         binary = args.binary.resolve(strict=True)
         observed = digest(binary)
@@ -160,11 +171,18 @@ def main(argv=None):
     except KeyboardInterrupt:
         report.update(state="FAIL", error="Interrupted", error_type="KeyboardInterrupt")
         status = 130
+    except TerminationRequested:
+        report["process"]["termination"] = "terminated"
+        report.update(
+            state="FAIL", error="SIGTERM received", error_type="TerminationRequested"
+        )
+        status = 143
     except Exception as error:
         report.update(state="FAIL", error=str(error), error_type=type(error).__name__)
     finally:
         (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"{report['state']}: {directory / 'report.json'}", flush=True)
+        signal.signal(signal.SIGTERM, previous_sigterm)
     return status
 
 
