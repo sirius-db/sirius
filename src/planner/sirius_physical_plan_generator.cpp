@@ -47,10 +47,10 @@
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
-#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -449,7 +449,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   // snapshot argument nor a published bound selection: a caller reaching here with neither must
   // fail loudly rather than read "current" a third time. Deriving one here is not a fallback --
   // see that gate for why every derivation is unsound.
-  auto const sid_it = scan_op.named_parameters.find("snapshot_from_id");
+  auto const sid_it    = scan_op.named_parameters.find("snapshot_from_id");
   auto const selection = sirius::op::scan::capture_iceberg_bound_selection(
     scan_op.function, scan_op.bind_data.get(), context);
   if ((sid_it == scan_op.named_parameters.end() || sid_it->second.IsNull()) && !selection) {
@@ -746,14 +746,13 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started = std::chrono::steady_clock::now();
-      auto const sid_it = c.scan->named_parameters.find("snapshot_from_id");
-      auto sid =
-        sid_it != c.scan->named_parameters.end() && !sid_it->second.IsNull()
-          ? static_cast<uint64_t>(sid_it->second.GetValue<int64_t>())
-          : static_cast<uint64_t>(sirius::op::scan::capture_iceberg_bound_selection(
-                                    c.scan->function, c.scan->bind_data.get(), context)
-                                    ->snapshot_id);
+      auto started        = std::chrono::steady_clock::now();
+      auto const sid_it   = c.scan->named_parameters.find("snapshot_from_id");
+      auto sid            = sid_it != c.scan->named_parameters.end() && !sid_it->second.IsNull()
+                              ? static_cast<uint64_t>(sid_it->second.GetValue<int64_t>())
+                              : static_cast<uint64_t>(sirius::op::scan::capture_iceberg_bound_selection(
+                                             c.scan->function, c.scan->bind_data.get(), context)
+                                             ->snapshot_id);
       c.info->delete_data = load_delete_payload(context,
                                                 c.info->table_path,
                                                 sirius_ctx->get_scan_manager().shared_io_ctx(),

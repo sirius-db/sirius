@@ -644,8 +644,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
     }
     if (identity && identity->selection) {
       auto const& selection = *identity->selection;
-      out << " iceberg_selection=sirius.iceberg-bound-selection.1 table_uuid=" << selection.table_uuid
-          << " snapshot_id=" << selection.snapshot_id
+      out << " iceberg_selection=sirius.iceberg-bound-selection.1 table_uuid="
+          << selection.table_uuid << " snapshot_id=" << selection.snapshot_id
           << " bound_schema_id=" << selection.bound_schema_id << " metadata_file=\""
           << selection.metadata_file_path << "\"";
     }

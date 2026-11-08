@@ -249,7 +249,9 @@ read_view_comparison compare_read_views_impl(
   if (origin == candidate_origin::replan) {
     // For multi-scan replans, table indexes propose pairs; the checks below
     // must still prove identity and required selector equality.
-    result.correspondence = planned.empty() ? "none" : multi_replan ? "table_index_replan" : "single";
+    result.correspondence = planned.empty() ? "none"
+                            : multi_replan  ? "table_index_replan"
+                                            : "single";
   } else {
     result.correspondence = "table_index";
   }
@@ -292,7 +294,8 @@ read_view_comparison compare_read_views_impl(
   std::unordered_set<duckdb::idx_t> matched_table_indexes;
   matched_table_indexes.reserve(candidate.size());
   for (auto const& candidate_binding : candidate) {
-    if (!matched_table_indexes.insert(candidate_binding.table_index).second) return pairing_failed();
+    if (!matched_table_indexes.insert(candidate_binding.table_index).second)
+      return pairing_failed();
     auto const found =
       std::find_if(logical_original.begin(), logical_original.end(), [&](auto const& original) {
         return original.table_index == candidate_binding.table_index;

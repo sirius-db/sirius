@@ -124,7 +124,7 @@ struct provider_read_identity {
 /// entry, an empty table or a transaction-local overlay has none.
 struct iceberg_bound_selection {
   std::string table_uuid;
-  int64_t snapshot_id = 0;
+  int64_t snapshot_id     = 0;
   int32_t bound_schema_id = 0;
   std::string metadata_file_path;
   bool operator==(iceberg_bound_selection const&) const = default;

@@ -1959,7 +1959,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     if (!comparison.equal) {
       auto message = sirius::transparent::describe_read_view_mismatch(comparison);
       record_transparent_read_view_mismatch();
-      if (comparison.reason == "iceberg_snapshot_drift") record_transparent_iceberg_snapshot_drift();
+      if (comparison.reason == "iceberg_snapshot_drift")
+        record_transparent_iceberg_snapshot_drift();
       SIRIUS_LOG_INFO(
         "Transparent execution read-view comparison failed ({}): {}",
         candidate_source == sirius::transparent::candidate_origin::copy ? "copy" : "replan",

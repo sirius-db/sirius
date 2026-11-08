@@ -460,7 +460,8 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     identity.selector    = parquet_selector(*typed, context);
     identity.data_view   = file_inventory{static_cast<uint32_t>(paths.size())};
     if (source->function_name == "iceberg_scan") {
-      identity.selection = capture_iceberg_bound_selection(input.function, input.bind_data, context);
+      identity.selection =
+        capture_iceberg_bound_selection(input.function, input.bind_data, context);
     }
 
     if (input.collect_evidence) {
@@ -685,7 +686,8 @@ std::optional<iceberg_bound_selection> capture_iceberg_bound_selection(
   duckdb::ClientContext& context)
 {
   if (!function.get_bind_info || !bind_data) return std::nullopt;
-  duckdb::TableFunctionGetBindInfoInput input(context, const_cast<duckdb::FunctionData*>(bind_data));
+  duckdb::TableFunctionGetBindInfoInput input(context,
+                                              const_cast<duckdb::FunctionData*>(bind_data));
   auto const info = function.get_bind_info(input);
   auto const text = [&](char const* name) -> std::optional<std::string> {
     auto const found = info.options.find(name);
@@ -699,7 +701,8 @@ std::optional<iceberg_bound_selection> capture_iceberg_bound_selection(
   };
   auto const integer = [&](char const* name, duckdb::LogicalTypeId type) -> std::optional<int64_t> {
     auto const found = info.options.find(name);
-    if (found == info.options.end() || found->second.IsNull() || found->second.type().id() != type) {
+    if (found == info.options.end() || found->second.IsNull() ||
+        found->second.type().id() != type) {
       return std::nullopt;
     }
     return found->second.GetValue<int64_t>();
@@ -709,10 +712,8 @@ std::optional<iceberg_bound_selection> capture_iceberg_bound_selection(
   auto const schema_id     = integer("schema_id", duckdb::LogicalTypeId::INTEGER);
   auto const metadata_file = text("metadata_file_path");
   if (!table_uuid || !snapshot_id || !schema_id || !metadata_file) return std::nullopt;
-  return iceberg_bound_selection{*table_uuid,
-                                 *snapshot_id,
-                                 static_cast<int32_t>(*schema_id),
-                                 *metadata_file};
+  return iceberg_bound_selection{
+    *table_uuid, *snapshot_id, static_cast<int32_t>(*schema_id), *metadata_file};
 }
 
 std::shared_ptr<bound_read_identity const> make_bound_read_identity(

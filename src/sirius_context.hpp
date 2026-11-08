@@ -375,10 +375,10 @@ class SiriusContext : public ClientContextState {
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
-    uint64_t provider_internal_skips          = 0;
-    uint64_t hidden_catalog_skips             = 0;
-    uint64_t classification_failures          = 0;
-    uint64_t read_view_mismatches             = 0;
+    uint64_t provider_internal_skips = 0;
+    uint64_t hidden_catalog_skips    = 0;
+    uint64_t classification_failures = 0;
+    uint64_t read_view_mismatches    = 0;
     // Read-view mismatches in which every paired scan either kept its identity or, for the same
     // Iceberg table, bound a different selection (snapshot, bound schema or metadata file).
     uint64_t iceberg_snapshot_drift_refusals  = 0;
