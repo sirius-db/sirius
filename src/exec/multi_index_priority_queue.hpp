@@ -305,6 +305,23 @@ class multi_index_priority_queue {
     return pop_from_device(idx.id, /*front=*/true);
   }
 
+  /// Removes and returns the first task preferring `dev` or no device at all, ordered by
+  /// priority across both buckets (the preferred one wins ties), or nullopt. Non-blocking.
+  [[nodiscard]] std::optional<task_ptr> try_pop_for_device(device_key dev)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto const front = [this](device_key key) -> std::optional<queue_priority> {
+      auto const it = _by_device.find(key);
+      if (it == _by_device.end() || it->second.empty()) { return std::nullopt; }
+      return it->second.begin()->first;
+    };
+    auto const preferred = front(dev);
+    auto const any       = front(no_preferred_device);
+    if (!preferred && !any) { return std::nullopt; }
+    bool const take_any = any && (!preferred || *any < *preferred);
+    return pop_from_device(take_any ? no_preferred_device : dev, /*front=*/true);
+  }
+
   /// Removes and returns the last (highest-priority, then most-recent) task with
   /// the given index key, or nullopt. Non-blocking.
   [[nodiscard]] std::optional<task_ptr> try_pop_back_from(const operator_index& idx)

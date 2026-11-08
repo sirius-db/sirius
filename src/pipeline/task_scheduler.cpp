@@ -313,15 +313,11 @@ void task_scheduler::management_eventloop()
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;
 
-      // Exact preference match: the device index returns the highest-priority
-      // (lowest value) task preferring exactly this device.
-      task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
-      if (!task) {
-        // Pick a task with no preference (any device will do). Which GPU gets it is decided by
-        // whichever executor signalled ready first, not by any counter.
-        task =
-          _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
-      }
+      // The highest-priority task preferring this device or none. Taking preferred tasks first
+      // would starve unpinned ones (e.g. a join build) behind an endless stream of pinned scan
+      // splits. Which GPU gets an unpinned task is decided by whichever executor signalled
+      // ready first, not by any counter.
+      task = _task_queue.try_pop_for_device(device_id).value_or(nullptr);
       if (!task) {
         // No dispatchable task for this device. Leave device in _ready_devices
         // and move on — it will match when an appropriate task arrives.
