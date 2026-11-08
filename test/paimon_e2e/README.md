@@ -48,3 +48,33 @@ actual CI discovery/execution and merged-main validation. Production resource
 admission and source-query association remain owner blockers, not launcher
 exceptions. `.github/workflows/paimon-e2e-harness.yml` runs only cheap CPU launcher
 tests; it schedules no GPU job and cannot close #2213 or #137.
+
+## D9 offline checker preparation
+
+`check_offline_evidence.py` exercises fail-closed causal checks through a real
+CLI, reusing the conformance runner's typed multiset comparison. Its expected
+and trace JSON are a **private synthetic normalized test model**, not Quent wire,
+a production collector format or actual runtime evidence. The fixture's native
+ownership/view tokens model required relationships; they provide no independent
+proof of an actual SDK read. No production ID or observer API is introduced.
+
+The model joins run/runtime/process/statement and artifact/input/oracle identity,
+execution window, one nonempty source's contract and deduplicated owned units,
+isolated import deltas, the mapped GPU scan's Computing and successful
+Finalizing, fully consumed results and same-runtime cleanup/liveness. This first
+full-scan model requires every data unit to be imported once. It does not cover
+LIMIT/retry/multiple scans, empty tables or all M1/M2 behavior. Execution
+`finalize_generation=0` is separate from nonzero Arrow materialization generation.
+
+All tests, including the complete synthetic positive and correct-row forced-CPU
+negative, run in the locked CPU command above. Every successful offline decision
+is `CONSISTENT_OFFLINE_MODEL`, with `actual_gpu_qualified: false`. Failure returns
+nonzero and writes a fixed diagnostic without row payloads. Input bytes and
+checker hashes accompany the decision; output must be a new file. Original
+inputs remain caller-retained artifacts.
+
+Actual collection is pending C/B: the current generic driver's post-production
+input stamp does not establish factory-to-native-read-to-owned-batch origin,
+and validation precedes import. Existing hooks plus whole-runtime isolation
+require a bounded causal sufficiency proof before they can qualify execution.
+No real C++ pair, P1/P2 runtime or GPU PASS follows from these offline tests.
