@@ -24,6 +24,49 @@ at SF10,738, customer keys at SF14,317, and supplier keys at SF214,749. Nation a
 region keys stay `INTEGER`. Clustered DuckDB datasets use the same widths.
 Regenerate existing datasets to apply the new types.
 
+## Generating local Iceberg tables
+
+Generate the reference TPC-H Parquet data first, then write an Iceberg V2 warehouse:
+
+```bash
+pixi run bash test/tpch_performance/generate_tpch_data.sh 1 --format parquet
+pixi run python test/tpch_performance/generate_tpch_iceberg.py \
+  test_datasets/tpch_parquet_sf1 test_datasets/tpch_iceberg_sf1
+```
+
+An existing Parquet dataset can be passed directly to the second command. All eight
+tables are required. Supported layouts are `table.parquet`, `table/*.parquet`,
+`table_*.parquet`, or `table.N.parquet`; mixing layouts for one table is rejected.
+The output must be a new directory. An interrupted run leaves partial output for
+inspection; use a fresh directory when retrying.
+
+The writer uses the existing Python and PyArrow in the Pixi development
+environment. PyIceberg's `sql-sqlite` extra supplies SQLAlchemy for the local
+SQLite catalog. Writing the tables needs no GPU or Sirius build.
+
+Each table gets its own `data/` and `metadata/` directories. PyIceberg rewrites
+the input into Parquet with Iceberg field IDs, preserving the source column types
+and values, including dates, decimals and adaptive key widths. The warehouse owns
+the new files. Source Parquet files are unchanged and are no longer needed to read
+the Iceberg tables. `--batch-rows` (default 1,000,000) controls rows per write batch;
+each batch is appended as a snapshot. The final snapshot includes all batches.
+
+`dataset.json` records the source files, row counts, writer versions, metadata
+paths and final snapshot IDs. `create_views.sql` loads the DuckDB Iceberg extension
+and creates the eight TPC-H views with exact metadata paths and pinned snapshots:
+
+```sql
+.read test_datasets/tpch_iceberg_sf1/create_views.sql
+SET gpu_execution = true;
+SET enable_duckdb_fallback = false;
+SELECT sum(l_extendedprice * l_discount) FROM lineitem;
+```
+
+Use this in the DuckDB shell after loading Sirius; `iceberg` must already be installed
+for that DuckDB build. Generated paths are absolute: regenerate if the warehouse moves.
+Creating a dataset does not certify that the current engine runs all 22 Iceberg queries
+on the GPU. The performance runner below currently accepts Parquet and DuckDB sources.
+
 ## Running Benchmarks
 
 All commands run from the **project root** directory.

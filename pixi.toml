@@ -73,6 +73,10 @@ jansson = "*"
 snappy = "*"
 fastavro = "1.*"
 
+[feature.dev-libs.pypi-dependencies]
+# Local TPC-H Iceberg dataset writer; reuses the existing Python and PyArrow.
+pyiceberg = { version = "==0.12.0", extras = ["sql-sqlite"] }
+
 [tasks]
 # Differential fuzzer; see test/fuzz/README.md. Drives the DuckDB shell from the build.
 fuzz = { cmd = "PYTHONPATH=$PIXI_PROJECT_ROOT/test/fuzz python -m siriusfuzz", description = "Sirius fuzzer: run|doctor|replay|recheck|show-config|selftest (paths resolve from the current directory)" }
