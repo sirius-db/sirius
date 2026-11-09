@@ -197,6 +197,8 @@ including an opened-object version change, are terminal `reader_io` at the charg
 the version-change counter is recorded before that classification. Cancellation, allocation
 failures, and typed planning refusals retain their own outcomes.
 
+**Current limitation: table replacement at the same URI.** Delete discovery reuses the data scan's table URI and selected snapshot ID, but `iceberg_metadata()` does not expose the UUID of the table it resolves. UUID checks between data bindings do not validate this separate lookup. The URI must continue to identify the same Iceberg table throughout the query; replacing it with another table containing the same snapshot ID can mix data and deletes from different tables. Validation of this lookup is deferred until the Iceberg extension exposes its bound table identity or resolved immutable metadata URI. No additional UUID query is issued.
+
 Known unsupported bindings **decline at plan time** (`sirius_plan_get.cpp`); file-schema checks and admitted deletion-vector reads run during metadata preparation. Execution-time failures stop and drain the query before the [CPU replay policy](scan-contracts-design.md#cpu-replay-policy) is applied.
 
 Currently declined:

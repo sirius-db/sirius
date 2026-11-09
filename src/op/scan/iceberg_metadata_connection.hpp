@@ -30,6 +30,10 @@ namespace sirius::op::scan {
  * Iceberg's bind callback identifies the selected snapshot. The separate metadata
  * query reads its manifests by that ID, using the same table path. If the snapshot
  * was expired before the metadata query, Iceberg reports the missing ID.
+ * The path must keep identifying the same table during the query: iceberg_metadata()
+ * does not expose its bound UUID, so replacement by another table with the same snapshot
+ * ID is not detected. TODO: validate this lookup when the Iceberg extension exposes its
+ * bound table identity or resolved immutable metadata URI.
  *
  * ## What it deliberately does NOT do
  *

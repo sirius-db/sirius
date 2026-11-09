@@ -37,6 +37,8 @@
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/string_util.hpp>
 #include <duckdb/common/types/blob.hpp>
+#include <duckdb/main/config.hpp>
+#include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
@@ -2218,6 +2220,85 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   }
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = true")->HasError());
   REQUIRE_FALSE(con->Query("DROP SEQUENCE read_view_selector")->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "iceberg implicit snapshot drift preserves the original CPU result",
+                 "[integration][iceberg][transparent][read_view][iceberg_implicit_drift]")
+{
+  auto const fallback = GENERATE(true, false);
+  sirius::test::scratch_dir scratch{"iceberg_implicit_drift"};
+  auto const directory = scratch.path() / "metadata";
+  auto const source =
+    get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes/metadata";
+  fs::create_directories(directory);
+  fs::copy_file(source / "v1.metadata.json", directory / "v1.metadata.json");
+  fs::copy_file(source / "version-hint.text", directory / "version-hint.text");
+
+  // Both snapshots use the same data files; snapshot 2 deletes two rows. Only the
+  // default selection changes: the SQL has no snapshot argument and the UUID stays fixed.
+  using namespace duckdb_yyjson;
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> original(
+    yyjson_read_file((source / "v1.metadata.json").c_str(), 0, nullptr, nullptr), yyjson_doc_free);
+  REQUIRE(original);
+  std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> metadata(
+    yyjson_doc_mut_copy(original.get(), nullptr), yyjson_mut_doc_free);
+  REQUIRE(metadata);
+  auto* root = yyjson_mut_doc_get_root(metadata.get());
+  REQUIRE(yyjson_mut_obj_put(root,
+                             yyjson_mut_str(metadata.get(), "current-snapshot-id"),
+                             yyjson_mut_sint(metadata.get(), 9400000000000001LL)));
+  auto* main = yyjson_mut_obj_get(yyjson_mut_obj_get(root, "refs"), "main");
+  REQUIRE(yyjson_mut_obj_put(main,
+                             yyjson_mut_str(metadata.get(), "snapshot-id"),
+                             yyjson_mut_sint(metadata.get(), 9400000000000001LL)));
+  REQUIRE(yyjson_mut_write_file(
+    (directory / "v2.metadata.json").c_str(), metadata.get(), 0, nullptr, nullptr));
+  REQUIRE_FALSE(
+    con->Query(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"))
+      ->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+
+  struct hint_switch : duckdb::OptimizerExtensionInfo {
+    std::atomic<duckdb::ClientContext*> target{nullptr};
+    fs::path hint;
+    unsigned binds = 0;
+  };
+  auto state    = duckdb::make_shared_ptr<hint_switch>();
+  state->target = con->context.get();
+  state->hint   = directory / "version-hint.text";
+  auto reset    = reset_after_test(state->target);
+  duckdb::OptimizerExtension observer;
+  observer.optimizer_info    = state;
+  observer.optimize_function = [](duckdb::OptimizerExtensionInput& input,
+                                  duckdb::unique_ptr<duckdb::LogicalOperator>&) {
+    auto& state = static_cast<hint_switch&>(*input.info);
+    if (state.target.load() != &input.context || ++state.binds != 1) return;
+    // The original scan has bound snapshot 2; the SQL replan will bind snapshot 1.
+    std::ofstream hint(state.hint);
+    hint << "2";
+    hint.close();
+    REQUIRE(hint.good());
+  };
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con->context),
+                                       std::move(observer));
+  auto result   = con->Query("SELECT fruit, count FROM iceberg_scan(" + scratch.file_literal("") +
+                           ") ORDER BY count");
+  state->target = nullptr;
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : "query succeeded"));
+  CHECK(state->binds == 2);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+  sirius::test::require_transparent_execution_delta(before, after, 0, fallback ? 1 : 0, 0);
+  if (fallback) {
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) == std::vector<std::vector<std::string>>{
+                                     {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  } else {
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("selector_unproven") != std::string::npos);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
