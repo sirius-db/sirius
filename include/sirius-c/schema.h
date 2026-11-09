@@ -30,8 +30,9 @@ typedef struct sirius_field {
  *
  * Factories borrow arguments, copy or retain their contents, and clear required output slots
  * before work. Inputs survive failure. Output slots must not alias inputs or contain unreleased
- * references. Invalid pointers, descriptors, types, scopes, or limits return
+ * references. Missing required pointers, invalid descriptors, types, scopes, or limits return
  * SIRIUS_INVALID_ARGUMENT; allocation and unexpected failures use the common error codes.
+ * Non-NULL pointers must refer to live handles or accessible storage of the stated size.
  * Optional diagnostics follow sirius_error's ownership contract. No exceptions cross the ABI.
  *
  * @par Thread safety

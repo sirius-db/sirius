@@ -15,9 +15,13 @@
 
 namespace {
 using namespace sirius::c_api::plan;
+class plan_input_error : public std::invalid_argument {
+ public:
+  using std::invalid_argument::invalid_argument;
+};
 void require(bool condition, const char* message)
 {
-  if (!condition) { throw std::invalid_argument(message); }
+  if (!condition) { throw plan_input_error(message); }
 }
 template <class F>
 sirius_status checked(sirius_error** error, F&& operation) noexcept
@@ -26,7 +30,7 @@ sirius_status checked(sirius_error** error, F&& operation) noexcept
     try {
       operation();
       return sirius_status{SIRIUS_SUCCESS};
-    } catch (const std::invalid_argument& e) {
+    } catch (const plan_input_error& e) {
       return sirius::c_api::fail(SIRIUS_INVALID_ARGUMENT, e.what(), error);
     }
   });

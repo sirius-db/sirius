@@ -95,7 +95,7 @@ from a filter's output when constructing another filter.
 
 Inspect the tree structure and output schemas through sirius_plan_root(), sirius_plan_node_get_kind(),
 sirius_plan_node_input(), sirius_plan_node_schema(), and sirius_schema_field().
-These functions expose the physical node structure; construction neither combines
+These functions expose node kinds, input links, and schemas; construction neither combines
 filters nor changes the chosen operators. sirius_plan_describe() provides a readable
 explanation with shared expression definitions. Its text is diagnostic, not a
 serialization format. Full expression-tree accessors are a separate addition.
@@ -114,16 +114,20 @@ these same C primitives in subsequent additions.
 
 Status values 1–3 report configuration errors.
 
-- Each returned handle owns a reference. Retain a builder or configuration to acquire
-  another reference; release each reference exactly once. Retaining does not allocate.
+- Factories return owning handles. Builders, configurations, schemas, expressions, plan nodes,
+  and plans support retain/release: retain acquires another reference without allocating;
+  release each owning reference exactly once. Inspection returns borrowed handles unless
+  documented otherwise; retain one before using it independently of its owner.
+- Destroy engine context handles with sirius_context_destroy().
 - Destroy error diagnostics with sirius_error_destroy(). Never use `free()` on Sirius handles.
 - Fallible operations return a status, clear their output slots, and optionally provide
   an owned diagnostic. Release previous results before reusing their output slots.
 - Diagnostics are best effort. A nonzero status is a failure even if no message is available.
 - No C++ exception crosses the C interface. Treat unknown nonzero status codes as failures.
 - Keep every borrowed handle alive throughout each call; do not release it concurrently with
-  its use. Immutable builders and configurations support concurrent reads, builds, and ownership
-  transfer between threads. Give output slots exclusive access.
+  its use. Immutable builders, configurations, schemas, expressions, plan nodes, and plans support
+  concurrent reads, construction, and ownership transfer between threads. Give output slots
+  exclusive access.
 
 ### Diagnostic output convention
 
