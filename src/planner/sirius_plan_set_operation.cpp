@@ -113,10 +113,18 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   }
 
   if (op.setop_all) { return union_op; }
-  // Group on every column with no aggregates, as DuckDB's own planner does for `!setop_all`.
-  duckdb::vector<duckdb::idx_t> key_columns(declared_types.size());
+  // DuckDB's own planner also deduplicates a distinct UNION by grouping on every column.
+  return plan_full_row_dedup(std::move(union_op), op.estimated_cardinality);
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::plan_full_row_dedup(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+  duckdb::idx_t estimated_cardinality)
+{
+  duckdb::vector<duckdb::idx_t> key_columns(child->get_types().size());
   std::iota(key_columns.begin(), key_columns.end(), duckdb::idx_t{0});
-  return plan_dedup(std::move(union_op), key_columns, {}, op.estimated_cardinality);
+  return plan_dedup(std::move(child), key_columns, {}, estimated_cardinality);
 }
 
 namespace {
@@ -374,22 +382,19 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
     D_ASSERT(child->types.size() == op.types.size());
   }
 
-  // Either child can retain the comparison collation; op.types follows the left child.
-  auto reject_collated_keys = [&](duckdb::vector<duckdb::LogicalType> const& types) {
-    for (duckdb::idx_t i = 0; i < types.size(); ++i) {
-      if (key_needs_collation(context, types[i], i)) {
+  // Either child can retain the comparison collation. op.types is the left child's, so checking
+  // both children covers it.
+  for (auto const& child : op.children) {
+    for (duckdb::idx_t i = 0; i < child->types.size(); ++i) {
+      if (key_needs_collation(context, child->types[i], i)) {
         throw sirius::not_implemented_exception(
           "{} on column {} ({}): keys DuckDB compares through a collation or normalization not "
           "supported on the GPU path",
           name,
           i,
-          types[i].ToString());
+          child->types[i].ToString());
       }
     }
-  };
-  reject_collated_keys(op.types);
-  for (auto const& child : op.children) {
-    reject_collated_keys(child->types);
   }
 
   auto const op_params = current_operator_params(context);
@@ -398,7 +403,7 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
     // The ALL plan is typed from these, so each arm must actually produce them.
     for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
       require_planned_schema(
-        arms[arm]->get_output_types(), op.types, name + " input " + std::to_string(arm));
+        arms[arm]->get_types(), op.types, name + " input " + std::to_string(arm));
     }
     auto const key_types = sirius::from_duckdb_vec(op.types);
     // concat_batch_bytes = 0 leaves batches whole, as in CONCAT: no byte cap, only the row cap.
@@ -412,8 +417,6 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
       op.estimated_cardinality,
       {.max_rows = std::numeric_limits<cudf::size_type>::max(), .max_bytes = max_bytes});
   }
-
-  auto const output_types = sirius::from_duckdb_vec(op.types);
 
   auto conditions = sirius::wrap_join_conditions(null_safe_column_conditions(op.types));
   if (!sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions,
@@ -431,9 +434,7 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   // Default options retain all columns and publish no dynamic filters for NULL-equal keys.
   auto join = make_hash_join(
     op, std::move(left), std::move(right), std::move(conditions), set_op.join_type, op_params);
-  duckdb::vector<duckdb::idx_t> key_columns(output_types.size());
-  std::iota(key_columns.begin(), key_columns.end(), duckdb::idx_t{0});
-  return plan_dedup(std::move(join), key_columns, {}, op.estimated_cardinality);
+  return plan_full_row_dedup(std::move(join), op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner

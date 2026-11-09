@@ -23,9 +23,10 @@
 // would pass whether or not the operator existed. Distinct EXCEPT and INTERSECT also use this
 // comparator to verify that their hash join and DISTINCT execute on the GPU.
 //
-// NOT covered here (needs a fixture with a small scan_task_batch_size; the shared integration
-// config uses 100 MB, so these fixtures are one batch per arm): multi-batch streaming,
-// unequal-length arms across many batches, and multi-GPU device placement.
+// The shared integration config uses a 100 MB scan_task_batch_size, so the fixture tables are one
+// batch per arm. Only the many-batch distinct EXCEPT / INTERSECT case lowers it. NOT covered here:
+// multi-batch UNION streaming, unequal-length arms across many batches, and multi-GPU device
+// placement.
 
 #include <catch.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -33,8 +34,10 @@
 #include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -280,6 +283,62 @@ TEST_CASE_METHOD(UnionFixture,
   compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM setop_right");
   compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM uempty");
   compare_gpu_vs_cpu("SELECT k, v FROM uempty " + keyword + " SELECT k, v FROM setop_right");
+}
+
+// The fixture tables above fit in one batch and take the whole-build BUILD_PROBE join. Here both
+// inputs span many batches and hash partitions, and a zero hash-table cap moves the join to its
+// partitioned STANDARD path. Two keys carry NULLs and the DOUBLE column mixes -0.0, 0.0 and NaN.
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution distinct EXCEPT and INTERSECT over many batches and partitions",
+                 "[integration][gpu_execution][set_operation][setop_distinct]")
+{
+  bool const standard_join = GENERATE(false, true);
+  INFO("STANDARD join path: " << standard_join);
+
+  run_ok(
+    "CREATE TABLE sdl AS SELECT "
+    "  CASE WHEN i % 97 = 0 THEN NULL ELSE i % 500 END AS k1, "
+    "  CASE WHEN i % 89 = 0 THEN NULL ELSE i % 7 END AS k2, "
+    "  CASE i % 11 WHEN 0 THEN -(0.0::DOUBLE) WHEN 1 THEN 0.0::DOUBLE "
+    "    WHEN 2 THEN 'NaN'::DOUBLE ELSE (i % 11)::DOUBLE END AS d "
+    "FROM range(200000) t(i);");
+  run_ok(
+    "CREATE TABLE sdr AS SELECT "
+    "  CASE WHEN i % 83 = 0 THEN NULL ELSE (i * 3) % 400 END AS k1, "
+    "  CASE WHEN i % 79 = 0 THEN NULL ELSE i % 5 END AS k2, "
+    "  CASE i % 13 WHEN 0 THEN 0.0::DOUBLE WHEN 1 THEN 'NaN'::DOUBLE "
+    "    WHEN 2 THEN -(0.0::DOUBLE) ELSE (i % 13)::DOUBLE END AS d "
+    "FROM range(150000) t(i);");
+  run_ok("CREATE TABLE sdk AS SELECT i AS k1 FROM range(0, 500, 3) t(i);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_sirius_setting const scan_batches{
+    *con, "scan_task_batch_size", std::uint64_t{65536}};
+  sirius::test::scoped_sirius_setting const partitions{
+    *con, "hash_partition_bytes", std::uint64_t{65536}};
+  sirius::test::scoped_sirius_setting const build_cap{
+    *con, "max_build_hash_table_bytes", standard_join ? std::uint64_t{0} : std::uint64_t{1} << 30};
+
+  std::string const left  = "SELECT k1, k2, d FROM sdl";
+  std::string const right = "SELECT k1, k2, d FROM sdr";
+  for (auto const& keywords :
+       std::array{std::pair{"EXCEPT", "INTERSECT"}, std::pair{"INTERSECT", "EXCEPT"}}) {
+    std::string const keyword = keywords.first;
+    std::string const other   = keywords.second;
+    CAPTURE(keyword);
+    auto const setop = [&](std::string const& lhs, std::string const& rhs) {
+      return lhs + " " + keyword + " " + rhs;
+    };
+    compare_gpu_vs_cpu_canonical(setop(left, right));
+    compare_gpu_vs_cpu_canonical(setop(right, left));
+    compare_gpu_vs_cpu_canonical(setop(left, right + " WHERE false"));
+    // A join above the set operation consumes its partitioned output.
+    compare_gpu_vs_cpu("SELECT s.k2, count(*), count(s.d) FROM (" + setop(left, right) +
+                       ") s JOIN sdk ON s.k1 = sdk.k1 GROUP BY s.k2");
+    // A set operation as the left input of the other one.
+    compare_gpu_vs_cpu_canonical("(" + setop(left, right) + ") " + other + " " + left +
+                                 " WHERE k2 < 4");
+  }
 }
 
 TEST_CASE_METHOD(UnionFixture,

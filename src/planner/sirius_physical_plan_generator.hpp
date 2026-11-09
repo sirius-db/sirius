@@ -259,6 +259,12 @@ class sirius_physical_plan_generator {
     std::span<duckdb::idx_t const> carried_columns,
     duckdb::idx_t estimated_cardinality);
 
+  //! `plan_dedup` keyed on every column of @p child, in order, with nothing carried: the
+  //! deduplication a distinct `UNION`, `EXCEPT` or `INTERSECT` applies to its result.
+  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_full_row_dedup(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+    duckdb::idx_t estimated_cardinality);
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
 
