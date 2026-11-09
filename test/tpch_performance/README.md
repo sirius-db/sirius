@@ -7,7 +7,7 @@ This directory contains benchmarking, profiling, and performance testing tools f
 - Sirius must be built: `pixi run make -j12` (from project root)
 - Binary: `sirius-duckdb/build/release/duckdb` with Sirius extension at `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`
 - Sirius config: `test/cpp/integration/integration.yaml` (set `SIRIUS_CONFIG_FILE` env var)
-- Parquet data must exist in `test_datasets/tpch_parquet_sf<N>/` (auto-generated if missing)
+- Parquet data must exist in `test_datasets/tpch_parquet_sf<N>/` (`performance_test.py` exits if missing; legacy shell runners may generate it)
 
 ## Generating Test Data
 
@@ -133,7 +133,7 @@ All commands run from the **project root** directory.
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
-# Both engines, 2 iterations, hot cache (the default)
+# Both engines, 2 iterations, supplied cache configuration
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
     --scale-factor 100 \
@@ -142,6 +142,7 @@ pixi run python test/tpch_performance/performance_test.py \
 # Parquet data on S3 (on EC2, attach an IAM role with ListBucket/GetObject access)
 pixi run python test/tpch_performance/performance_test.py \
     --input s3://my-bucket/tpch_parquet_sf100/ \
+    --scale-factor 100 \
     --engine gpu --iterations 2
 
 # Sirius vs DuckDB result validation, queries 1/3/6 only
@@ -178,6 +179,7 @@ pixi run python test/tpch_performance/performance_test.py \
 # Warm-but-contended: caches fill and stay filled, LRU retention, round-robin
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
+    --scale-factor 10 \
     --engine gpu --iterations 2 --profile lukewarm
 
 # nsys profiling (one .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/)
@@ -249,8 +251,8 @@ is kept beside it as `config.yml`.
 | `lukewarm` | `cucs` | `lru` | round-robin | nothing |
 | `hot` | `cucs` | `lru` | back-to-back per query | nothing |
 
-**The config is only rewritten when `--profile` is passed.** Omit it and your YAML is used
-exactly as written — no `effective_config.yml` is produced and no sanity check runs.
+**Config overrides come from `--profile` and `--pin parquet`.** With neither, the supplied
+YAML is used unchanged; otherwise the runner can write `effective_config.yml`.
 
 The runner requests dataset-file eviction once at startup, even when `--profile` is omitted. `cold` keeps the
 *connection* (and so the GPU context and compiled plans) — it targets caches, not the process.
@@ -372,6 +374,10 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 # Use custom parquet directory
 ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
 ```
+
+### Output layout
+
+```text
 <bench>/                              # tpch_<ts>_<profile-or-precmd>_<engine>_iter<N>[_<name>]
   metadata.json                       # commit, branch, scale_factor, profile, precmd, engine, queries, pin
   queries/q<N>.sql                    # effective SQL after scale-aware rendering

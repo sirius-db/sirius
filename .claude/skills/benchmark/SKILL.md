@@ -31,12 +31,13 @@ The engine, GPU compatibility, and fallback sections below apply to both.
 
 | Engine | Entry Point | Config | TPC-H Runner |
 |--------|-------------|--------|--------------|
-| **Super Sirius** | Normal SQL with `gpu_execution=true` | **Requires** `SIRIUS_CONFIG_FILE` | `performance_test.py --engine gpu` (or `both`) |
-| **DuckDB CPU** | Raw SQL (no GPU wrapping) | Unsets `SIRIUS_CONFIG_FILE` | `performance_test.py --engine cpu` (or `both`) |
+| **Super Sirius** | Normal SQL with `gpu_execution=true` | Optional for regular runs | `performance_test.py --engine gpu` (or `both`) |
+| **DuckDB CPU** | Raw SQL (no GPU wrapping) | No explicit `LOAD` | `performance_test.py --engine cpu` (or `both`) |
 
 **Config file behavior:**
-- Super Sirius: `SIRIUS_CONFIG_FILE` must be set and point to a valid file — the script errors if not
-- DuckDB CPU: `SIRIUS_CONFIG_FILE` is automatically unset — pure CPU baseline
+- Regular runner: uses `SIRIUS_CONFIG_FILE` when supplied, otherwise Sirius defaults.
+- Official power/throughput runner: requires `SIRIUS_CONFIG_FILE` pointing to a valid file.
+- DuckDB CPU: the runner does not issue an explicit extension `LOAD`.
 
 ## Working Directory
 
@@ -72,7 +73,7 @@ These messages land in the post-split per-query Sirius logs at `<benchmark_dir>/
 
 ```bash
 # Queries that fell back to DuckDB CPU
-grep -l "fallback to DuckDB" <benchmark_dir>/sirius/q*/sirius.log
+rg -l "Transparent execution fallback|fallback to DuckDB|falling back to DuckDB" <benchmark_dir>/sirius/q*/sirius.log
 
 # Sirius-level plan / execution errors
 grep -l "Error in SiriusGeneratePhysicalPlan" <benchmark_dir>/sirius/q*/sirius.log
@@ -191,7 +192,7 @@ when interpreting cold timings.
 
 ### Output Layout
 
-A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<output>/<NAME>/`) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/README.md` for the full layout.
+A timestamped benchmark dir `<output>/tpch_<ts>_<profile>_<engine>_iter<N>[_<NAME>]/` (`default` profile when unset) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/README.md` for the full layout.
 
 ---
 
@@ -229,13 +230,13 @@ run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
 # One-time per SF: generate refresh sets (num_sets >= streams + 1)
 ./test/tpch_performance/generate_tpch_refresh.sh <SF> <num_sets>   # -> test_datasets/tpch_refresh_sf<SF>/
 
-# Only for varied predicates: per-stream query sets from qgen (streams 0..N)
+# Required for an official/spec run: per-stream query sets from qgen (streams 0..N)
 ./test/tpch_performance/generate_tpch_queries.sh <SF> <streams>    # -> test_datasets/tpch_queries_sf<SF>/
 
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 pixi run python test/tpch_performance/tpch_power_throughput.py \
     --sf <SF> --input <base.duckdb> --refresh-dir <refresh_dir> \
-    --mode both --pin gpu|host [--streams N] [--vary-predicates --query-dir <dir>]
+    --mode both --pin gpu|host [--streams N] --vary-predicates --query-dir <dir>
 ```
 
 **Flags** (full reference in `test/tpch_performance/README.md`): `--mode power|throughput|both`
@@ -269,7 +270,7 @@ considering generation (Workflow H-A).
 
 Choose the requested execution profile, pin tier, compression plan, iteration count, queries,
 validation, and output location. Preserve the runner's constraints: CPU-only runs cannot pin;
-compression requires a GPU or host pin; validation requires both engines; nsys and gdb external
+compression requires a GPU or host pin; validation requires both engines or supplied `--duckdb-results`; nsys and gdb external
 runners reject `--profile`. Verify that the extension is built for GPU runs. For comparisons, match the dataset, scale factor, queries, config, cache and
 pin settings, and execution shape unless the difference is the subject of the comparison.
 Report the exact invocation and the effective config path (or the source config path if no
@@ -282,6 +283,10 @@ file alone does not establish GPU execution.
 ---
 
 # Before Running the Official Run (`tpch_power_throughput.py`)
+
+For an explicit official/spec run, use `--vary-predicates` with qgen-generated query streams;
+the runner's fixed-predicate default is not spec-compliant. If streams are missing, resolve
+generation authorization before running. For diagnostic runs, honor the requested predicate mode.
 
 Use supplied parameters and applicable runner defaults. Verify the base input is a file-backed
 DuckDB dataset at the requested scale factor, and use a valid supplied config or

@@ -82,7 +82,7 @@ Arguments:
 
 ## Before Running
 
-- Check whether the build is suitable for the requested comparison; rebuild when needed with `pixi run make release`.
+- Check whether the build is suitable for the requested comparison; rebuild when needed with `pixi run make` (installs Sirius and rebuilds the wrapper).
 - Ensure `SIRIUS_CONFIG_FILE` is set and points to a valid config file
 
 ## Output
