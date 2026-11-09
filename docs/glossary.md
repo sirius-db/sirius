@@ -2,6 +2,8 @@
 
 This document contains definitions of key terms and concepts used throughout the Sirius project.
 
+Dynamic-filter terms live in their own glossary, [`src/op/dynamic_filter/GLOSSARY.md`](../src/op/dynamic_filter/GLOSSARY.md).
+
 ## Navigation
 
 [A](#a) | [B](#b) | [C](#c) | [D](#d) | [E](#e) | [F](#f) | [G](#g) | [H](#h) | [I](#i) | [J](#j) | [K](#k) | [L](#l) | [M](#m) | [N](#n) | [O](#o) | [P](#p) | [Q](#q) | [R](#r) | [S](#s) | [T](#t) | [U](#u) | [V](#v) | [W](#w) | [X](#x) | [Y](#y) | [Z](#z)

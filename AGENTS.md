@@ -74,6 +74,9 @@ re-export `cucascade::exec`; `thread_pool.hpp` and `scoped_dispatcher.hpp` retai
 priority queues and dispatch-failure handling. The io internals are
 documented in the doc comments of cuCascade's headers under `cucascade/include/cucascade/io/`.
 
+**Dynamic filters** have a binding glossary, `src/op/dynamic_filter/GLOSSARY.md`: write code,
+comments, docs, and PRs about them in its terms.
+
 All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.
 
