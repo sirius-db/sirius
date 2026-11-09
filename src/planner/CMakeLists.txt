@@ -13,6 +13,7 @@ target_sources(
           join_key_nullability.cpp
           query.cpp
           query_index.cpp
+          scan_reuse_rewrites.cpp
           scan_column_origin.cpp
           sirius_physical_plan_generator.cpp
           substrait_scan_ranges.cpp

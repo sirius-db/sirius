@@ -50,6 +50,7 @@
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -79,6 +80,7 @@
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
+#include "planner/scan_reuse_rewrites.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
@@ -2395,6 +2397,20 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
+  {
+    // Plans that read the same rows twice read them once (Sirius's copy of DuckDB's plan only;
+    // DuckDB's own plan, which a CPU fallback runs, is untouched).
+    auto const sirius_ctx = context.registered_state
+                              ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                              : nullptr;
+    if (!sirius_ctx || duckdb::query_operator_options(context)->enable_scan_reuse_rewrites) {
+      sirius::planner::rewrite_repeated_scans(
+        context, op, [&](duckdb::LogicalOperator const& dropped) {
+          read_views->record_skipped_scans(
+            sirius::op::scan::capture_bound_read_views(dropped, context));
+        });
+    }
+  }
   {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();
     op->ResolveOperatorTypes();
