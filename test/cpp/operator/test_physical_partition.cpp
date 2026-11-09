@@ -774,10 +774,12 @@ TEST_CASE("build PARTITION declines inputs it cannot account for",
     REQUIRE(
       sirius::planner::install_deferral(scan, *fixture.tree.build_partition, std::move(pair)));
     REQUIRE_FALSE(fixture.tree.build_partition->port_directive().empty());
+    // Certification declines the directive before any partial array is allocated.
     REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
-    REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+    REQUIRE(fixture.stats.snapshot().accumulations_started == 0);
+    REQUIRE(fixture.stats.snapshot().accumulations_declined_port_directive == 1);
     fixture.contribute(pipelineable_operator_data({first}));
-    REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+    REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 0);
     REQUIRE(fixture.stats.snapshot().accumulation_completed_contributions == 0);
   }
   SECTION("an extra repository partition")
@@ -1013,7 +1015,8 @@ TEST_CASE("a non-FULL build input never accumulates and never blocks",
   fixture.push({1, 3});
   auto input = fixture.tree.build_partition->get_next_task_input_data();
   REQUIRE(input);
-  REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+  REQUIRE(fixture.stats.snapshot().accumulations_declined_pipeline_barrier == 1);
+  REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 0);
   REQUIRE(fixture.stats.snapshot().accumulations_started == 0);
   fixture.contribute(*input);
   REQUIRE(fixture.stats.snapshot().accumulation_completed_contributions == 0);

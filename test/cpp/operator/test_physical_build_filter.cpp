@@ -149,9 +149,15 @@ TEST_CASE("declined build filter forwards input and preserves the later publicat
   auto const batch         = fixture.push(0);
   fixture.source->finished = true;
 
+  auto counter = &op::dynamic_filter_stats_snapshot::accumulations_skipped_inventory;
   SECTION("the input barrier cannot certify completeness")
   {
     fixture.filter->get_port("default")->type = op::MemoryBarrierType::PARTIAL;
+  }
+  SECTION("an ORDER BY input never holds its complete build at once")
+  {
+    fixture.filter->get_port("default")->type = op::MemoryBarrierType::PIPELINE;
+    counter = &op::dynamic_filter_stats_snapshot::accumulations_declined_pipeline_barrier;
   }
   SECTION("the arrival ledger does not cover every input batch")
   {
@@ -161,14 +167,18 @@ TEST_CASE("declined build filter forwards input and preserves the later publicat
   {
     fixture.filter->get_port("default")->src_pipeline.reset();
   }
-  SECTION("the stage must materialize deferred columns") { install_stage_materialization(fixture); }
+  SECTION("the stage must materialize deferred columns")
+  {
+    install_stage_materialization(fixture);
+    counter = &op::dynamic_filter_stats_snapshot::accumulations_declined_port_directive;
+  }
 
   auto input = fixture.filter->get_next_task_input_data();
   REQUIRE(input);
   fixture.execute(*input, batch);
   REQUIRE_FALSE(fixture.gpu.session->accumulation_claimed());
   REQUIRE(fixture.gpu.channel->filter_count() == 0);
-  REQUIRE(fixture.gpu.stats.snapshot().accumulations_skipped_inventory == 1);
+  REQUIRE(fixture.gpu.stats.snapshot().*counter == 1);
   fixture.filter->finalize_operator();
   REQUIRE_FALSE(fixture.gpu.channel->snapshot().terminal());
   fixture.gpu.session->finish_input();

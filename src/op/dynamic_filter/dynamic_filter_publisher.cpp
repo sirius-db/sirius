@@ -127,6 +127,27 @@ constexpr std::string_view publications_failed = "publications_failed";
 }
 
 /**
+ * @brief The counter a certification decline of @p reason sets
+ */
+[[nodiscard]] constexpr counter_field decline_counter(construction_decline reason) noexcept
+{
+  using counts = dynamic_filter_stats_snapshot;
+  switch (reason) {
+    case construction_decline::input_shape:
+    case construction_decline::inventory_mismatch: return &counts::accumulations_skipped_inventory;
+    case construction_decline::pipeline_barrier:
+      return &counts::accumulations_declined_pipeline_barrier;
+    case construction_decline::port_directive:
+      return &counts::accumulations_declined_port_directive;
+    case construction_decline::unreadable_arrival:
+      return &counts::accumulations_declined_unreadable_arrival;
+    case construction_decline::compressed_arrival:
+      return &counts::accumulations_declined_compressed_arrival;
+  }
+  return &counts::accumulations_skipped_inventory;
+}
+
+/**
  * @brief The key reason for an attempt that ended with @p result before its filters reached the
  * fan-out
  */
@@ -461,10 +482,10 @@ struct dynamic_filter_publication_session::state {
     for (auto& line : key_lines) {
       auto& outcome = line.outcome;
       if (outcome.reason != dynamic_filter_key_reason::not_constructed) { continue; }
-      outcome = {.rows            = outcome.rows,
-                 .valid_rows      = outcome.valid_rows,
-                 .reason          = reason,
-                 .attempt_counter = counter};
+      outcome = {.rows          = outcome.rows,
+                 .valid_rows    = outcome.valid_rows,
+                 .reason        = reason,
+                 .reason_detail = counter};
     }
   }
 
@@ -826,8 +847,7 @@ void dynamic_filter_publication_session::seal_plan() noexcept
   _state->seal();
 }
 
-bool dynamic_filter_publication_session::try_begin_accumulation(
-  std::optional<complete_build_inventory> inventory)
+bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_input input)
 {
   auto& operation = *_state;
   nvtx_scoped_range range{"dynfilter::accum::begin"};
@@ -848,8 +868,8 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
                                           dynamic_filter_key_reason reason,
                                           std::string_view counter = {}) {
     for (auto const index : active_keys) {
-      decided[index].reason          = reason;
-      decided[index].attempt_counter = counter;
+      decided[index].reason        = reason;
+      decided[index].reason_detail = counter;
     }
   };
   try {
@@ -865,16 +885,16 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     auto const& plan          = operation.plan;
     auto const& admitted_keys = plan.admitted_keys();
     decided.resize(admitted_keys.size());
-    if (!inventory) {
-      selection.accumulations_skipped_inventory = 1;
+    if (auto const* decline = std::get_if<construction_decline>(&input)) {
+      selection.*decline_counter(*decline) = 1;
       for (auto& key : decided) {
-        key = {.reason          = dynamic_filter_key_reason::attempt_skip,
-               .attempt_counter = attempt_counters::skipped_inventory.name};
+        key = {.reason = dynamic_filter_key_reason::declined, .reason_detail = to_string(*decline)};
       }
       return false;
     }
+    auto& inventory        = std::get<complete_build_inventory>(input);
     auto const probe_types = binding_probe_types(plan);
-    auto const rows        = inventory->total_rows();
+    auto const rows        = inventory.total_rows();
     std::vector<detail::accumulated_bloom_builder::key> keys;
     std::vector<std::size_t> active_keys;
     for (std::size_t index = 0; index < probe_types.size(); ++index) {
@@ -883,7 +903,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       auto const& key = admitted_keys[index];
       bool const type_matches =
         key.build_key_ordinal >= 0 &&
-        inventory->consistent_type_at(static_cast<std::size_t>(key.build_key_ordinal)) ==
+        inventory.consistent_type_at(static_cast<std::size_t>(key.build_key_ordinal)) ==
           key.storage_type;
       bool const supported = detail::accumulated_bloom_builder::supports(key.storage_type);
       // The fan-out's rule, applied before any array is allocated: a key whose domain can read
@@ -966,7 +986,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
                       attempt_counters::skipped_admission.name);
       return false;
     }
-    auto const expected = inventory->batches().size();
+    auto const expected = inventory.batches().size();
     std::vector<bool> claimed(expected, false);
     {
       std::scoped_lock lock(operation.mutex);
@@ -978,7 +998,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       started                           = true;
       operation.accumulated_bloom_bytes = geometry->raw_bytes;
       operation.claimed                 = std::move(claimed);
-      operation.inventory.emplace(std::move(*inventory));
+      operation.inventory.emplace(std::move(inventory));
       operation.active_keys = std::move(active_keys);
       operation.builder     = std::move(built);
       operation.current     = state::phase::COLLECTING;
@@ -1006,9 +1026,9 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     count_failure(selection, kind);
     for (auto& key : decided) {
       if (key.reason != dynamic_filter_key_reason::not_constructed) { continue; }
-      key.reason          = recoverable(kind) ? dynamic_filter_key_reason::attempt_skip
-                                              : dynamic_filter_key_reason::attempt_fail;
-      key.attempt_counter = failure_counter_name(kind);
+      key.reason        = recoverable(kind) ? dynamic_filter_key_reason::attempt_skip
+                                            : dynamic_filter_key_reason::attempt_fail;
+      key.reason_detail = failure_counter_name(kind);
     }
     if (!recoverable(kind)) { std::rethrow_exception(error); }
     return false;
@@ -1145,8 +1165,8 @@ void dynamic_filter_publication_session::observe_whole_build(
     post_unlock_actions actions;
     {
       std::scoped_lock lock(operation.mutex);
-      operation.set_key_lines({.reason          = dynamic_filter_key_reason::attempt_fail,
-                               .attempt_counter = attempt_counters::publications_failed});
+      operation.set_key_lines({.reason        = dynamic_filter_key_reason::attempt_fail,
+                               .reason_detail = attempt_counters::publications_failed});
       actions.append(operation.complete(completion::FAILED, true));
     }
     std::move(actions).dispatch();
@@ -1177,8 +1197,8 @@ void dynamic_filter_publication_session::observe_whole_build(
             1, std::memory_order_relaxed);
         }
         // A sibling delivery that claims the reopened window replaces these outcomes.
-        operation.set_key_lines({.reason          = dynamic_filter_key_reason::attempt_skip,
-                                 .attempt_counter = attempt_counters::source_not_resident.name});
+        operation.set_key_lines({.reason        = dynamic_filter_key_reason::attempt_skip,
+                                 .reason_detail = attempt_counters::source_not_resident.name});
         if (operation.input_closed) {
           actions.append(
             operation.complete(operation.cancelled ? completion::CANCELLED : completion::SKIPPED));
@@ -1317,8 +1337,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
     outcome.publications_skipped_targets_drained = 1;
     for (auto& key : outcome.keys) {
-      key = {.reason          = dynamic_filter_key_reason::attempt_skip,
-             .attempt_counter = attempt_counters::targets_drained.name};
+      key = {.reason        = dynamic_filter_key_reason::attempt_skip,
+             .reason_detail = attempt_counters::targets_drained.name};
     }
     return outcome;
   }
