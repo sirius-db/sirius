@@ -278,6 +278,48 @@ duckdb::Value merged_statistics(duckdb::MultiFileBindData const& bind,
     text, duckdb::LogicalType::MAP(text, text), std::move(keys), std::move(values));
 }
 
+/// The merged, verified statistics a scan was last given. An entry holds the very statistics objects
+/// it was merged from, so it matches only while every file's cache entry is unchanged: a rewritten
+/// file is read into a new object, and keeping the old one alive means its address cannot be reused.
+struct merge_entry {
+  std::vector<std::shared_ptr<file_statistics const>> files;
+  decltype(duckdb::MultiFileBindData::names) names;
+  decltype(duckdb::MultiFileBindData::types) types;
+  duckdb::Value statistics;
+};
+
+std::mutex merge_mutex;
+std::unordered_map<std::string, merge_entry> merges;
+
+/// Scans of the same files share a key; the entry itself says whether it fits the scan at hand.
+std::string merge_cache_key(std::vector<duckdb::OpenFileInfo> const& files)
+{
+  return files.front().path + '\0' + std::to_string(files.size());
+}
+
+std::optional<duckdb::Value> cached_merge(
+  std::string const& key,
+  std::vector<std::shared_ptr<file_statistics const>> const& files,
+  duckdb::MultiFileBindData const& bind)
+{
+  std::lock_guard guard(merge_mutex);
+  auto const found = merges.find(key);
+  if (found == merges.end() || found->second.files != files || found->second.names != bind.names ||
+      found->second.types != bind.types) {
+    return std::nullopt;
+  }
+  return found->second.statistics;
+}
+
+void remember_merge(std::string const& key,
+                    std::vector<std::shared_ptr<file_statistics const>> const& files,
+                    duckdb::MultiFileBindData const& bind,
+                    duckdb::Value const& statistics)
+{
+  std::lock_guard guard(merge_mutex);
+  merges[key] = merge_entry{files, bind.names, bind.types, statistics};
+}
+
 bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
 {
   auto const& name = get.function.GetName().GetIdentifierName();
@@ -298,10 +340,16 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   auto const& parquet_options = duckdb::ParquetScanFunction::GetFileOptions(*reader->bind_data);
   auto const all_files        = bind->file_list->GetAllFiles();
   auto const files            = statistics_of_all(context, all_files, parquet_options);
-  auto statistics             = merged_statistics(*bind, files);
-  if (statistics.IsNull()) { return false; }
-  options.column_statistics = std::move(statistics);
-  options.VerifyColumnStatistics(bind->names, bind->types);
+  auto const merge_key        = merge_cache_key(all_files);
+  if (auto const hit = cached_merge(merge_key, files, *bind)) {
+    options.column_statistics = *hit;
+  } else {
+    auto statistics = merged_statistics(*bind, files);
+    if (statistics.IsNull()) { return false; }
+    options.column_statistics = std::move(statistics);
+    options.VerifyColumnStatistics(bind->names, bind->types);
+    remember_merge(merge_key, files, *bind, options.column_statistics);
+  }
   return true;
 }
 

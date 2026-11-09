@@ -236,3 +236,31 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   REQUIRE_FALSE(after->HasError());
   CHECK(collect_rows(*after)[0][0] == "100");
 }
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - statistics reused across queries follow a file that "
+                 "changes",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  // Files not modified for a while are trusted by the cache, so the second plan reuses the merged
+  // statistics of the first instead of reading the footers again.
+  auto const age = [&](char const* name, int hours) {
+    fs::last_write_time(dir / (std::string(name) + ".parquet"),
+                        fs::file_time_type::clock::now() - std::chrono::hours(hours));
+  };
+  age("f0", 3);
+  age("f1", 3);
+
+  constexpr char const* query = "SELECT count(*) FROM v WHERE x >= 1000";
+  REQUIRE(cpu_plan(query, true).find("Empty Result") != std::string::npos);
+  CHECK(cpu_plan(query, true).find("Empty Result") != std::string::npos);
+
+  // A rewritten file is described by its new footer, not by the merge made from the old one.
+  write_file("f1", 1000, 1100);
+  age("f1", 2);
+  CHECK(cpu_plan(query, true).find("Empty Result") == std::string::npos);
+  compare_gpu_vs_cpu(query);
+  auto rewritten = con->Query(query);
+  REQUIRE_FALSE(rewritten->HasError());
+  CHECK(collect_rows(*rewritten)[0][0] == "100");
+}
