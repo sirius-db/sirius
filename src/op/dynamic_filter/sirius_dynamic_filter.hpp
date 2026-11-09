@@ -300,6 +300,20 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                 ::cuda::stream_ref stream,
                                 rmm::device_async_resource_ref mr);
 
+  /**
+   * @brief Builds a persistent set from keys already prepared at @p domain's rep (see
+   * `prepare_build_keys`)
+   *
+   * @pre The storage for @p prepared remains valid until work enqueued on @p stream completes.
+   * @throw std::invalid_argument if @p prepared is not a non-null column of
+   * `membership_rep_type(domain)`
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   */
+  sirius_dynamic_in_list_filter(membership_key_domain const& domain,
+                                cudf::column_view const& prepared,
+                                ::cuda::stream_ref stream,
+                                rmm::device_async_resource_ref mr);
+
   ~sirius_dynamic_in_list_filter() override;
 
   [[nodiscard]] sirius_dynamic_filter_kind kind() const override
@@ -349,6 +363,12 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const;
 
+  /// Builds the set from @p prepared at @p domain's rep; shared by both constructors.
+  void construct(membership_key_domain const& domain,
+                 cudf::column_view const& prepared,
+                 ::cuda::stream_ref stream,
+                 rmm::device_async_resource_ref mr);
+
   membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
@@ -378,6 +398,20 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
    * @throw std::runtime_error if the current CUDA device cannot be identified
    */
   sirius_dynamic_small_in_list_filter(cudf::column_view const& keys,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr);
+
+  /**
+   * @brief Copies 1 to `k_max_keys` keys already prepared at @p domain's rep (see
+   * `prepare_build_keys`) into device-local storage
+   *
+   * @pre The storage for @p prepared remains valid until the copy on @p stream completes.
+   * @throw std::invalid_argument if @p prepared is not a non-null column of
+   * `membership_rep_type(domain)` with 1 to `k_max_keys` rows
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   */
+  sirius_dynamic_small_in_list_filter(membership_key_domain const& domain,
+                                      cudf::column_view const& prepared,
                                       ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr);
 
@@ -432,6 +466,12 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const;
 
+  /// Copies @p prepared into the needle store; shared by both constructors.
+  void construct(membership_key_domain const& domain,
+                 cudf::column_view const& prepared,
+                 ::cuda::stream_ref stream,
+                 rmm::device_async_resource_ref mr);
+
   membership_key_domain _domain{};
 
   struct needle_store;
@@ -451,12 +491,32 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * @brief Builds a Bloom filter from keys of a supported type (see `membership_key_supported`),
    * excluding nulls
    *
+   * Unlike the IN-list column constructors, this one compacts nulls itself rather than through
+   * `prepare_build_keys`, so it stays an independent reference for the prepared and accumulated
+   * Bloom paths.
+   *
    * @pre Key storage remains valid until work enqueued on @p stream completes.
    * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
    * @throw std::runtime_error if the current CUDA device cannot be identified
    * @throw std::logic_error if the validated key type changes during construction
    */
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
+                              ::cuda::stream_ref stream,
+                              rmm::device_async_resource_ref mr);
+
+  /**
+   * @brief Builds a Bloom filter from keys already prepared at @p domain's rep (see
+   * `prepare_build_keys`), sized for their count
+   *
+   * Sets the same bits the column constructor sets for the same valid keys.
+   *
+   * @pre The storage for @p prepared remains valid until work enqueued on @p stream completes.
+   * @throw std::invalid_argument if @p prepared is not a non-null column of
+   * `membership_rep_type(domain)`
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   */
+  sirius_dynamic_bloom_filter(membership_key_domain const& domain,
+                              cudf::column_view const& prepared,
                               ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref mr);
   ~sirius_dynamic_bloom_filter() override;

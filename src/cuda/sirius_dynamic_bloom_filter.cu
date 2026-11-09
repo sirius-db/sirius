@@ -165,6 +165,21 @@ struct bloom_replica {
 
 namespace {
 template <class KeyT>
+std::unique_ptr<bloom_replica> build_prepared_bloom_replica(int device_id,
+                                                            cudf::column_view const& prepared,
+                                                            std::size_t num_blocks,
+                                                            rmm::device_async_resource_ref mr,
+                                                            ::cuda::stream_ref stream)
+{
+  auto filter = make_bloom<sirius_bloom<KeyT>>(num_blocks, mr, stream);
+  if (prepared.size() > 0) {
+    auto const* first = prepared.data<KeyT>();
+    filter->add_async(first, first + prepared.size(), stream);
+  }
+  return std::make_unique<bloom_replica>(device_id, std::move(filter));
+}
+
+template <class KeyT>
 std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
                                                    membership_key_domain const& domain,
                                                    cudf::column_view const& keys,
@@ -414,6 +429,25 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     using key_type = decltype(key_tag);
     return build_bloom_replica<key_type>(
       _impl->source_device, _domain, build.keys, num_blocks, mr, s);
+  });
+  _impl->replicas.push_back(std::move(source));
+}
+
+sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(membership_key_domain const& domain,
+                                                         cudf::column_view const& prepared,
+                                                         ::cuda::stream_ref stream,
+                                                         rmm::device_async_resource_ref mr)
+  : _domain{domain}
+{
+  detail::require_prepared("[sirius_dynamic_bloom_filter]", domain, prepared);
+  // Sized like the column constructor, on the valid keys, so both set the same bits.
+  auto const num_blocks = bloom_blocks_for(static_cast<std::size_t>(prepared.size()));
+  _impl                 = std::make_unique<impl>();
+  _impl->source_device  = detail::current_device("[sirius_dynamic_bloom_filter]");
+  auto source           = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+    using key_type = decltype(key_tag);
+    return build_prepared_bloom_replica<key_type>(
+      _impl->source_device, prepared, num_blocks, mr, ::cuda::stream_ref{stream.get()});
   });
   _impl->replicas.push_back(std::move(source));
 }

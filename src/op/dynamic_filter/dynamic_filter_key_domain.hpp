@@ -197,7 +197,10 @@ struct membership_build_keys {
 };
 
 /**
- * @brief Shared constructor prologue of the three membership filters
+ * @brief The Bloom column constructor's prologue, kept as the reference for prepared keys
+ *
+ * The IN-list column constructors use `prepare_build_column` instead, which writes the valid rows
+ * at the rep without reading a count back.
  *
  * Classifies @p keys, verifies its values fit the rep (`membership_build_fits_rep`), drops null
  * build keys (they match nothing under the join's `null_equality::UNEQUAL`, so the drop is exact),
