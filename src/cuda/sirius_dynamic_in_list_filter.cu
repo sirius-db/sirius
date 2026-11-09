@@ -223,7 +223,13 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
 bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noexcept
 {
   // Nullable keys are accepted: null build slots are compacted out at construction.
-  return membership_key_supported(keys.type());
+  return supports(keys.type(), static_cast<std::size_t>(keys.size() - keys.null_count()));
+}
+
+bool sirius_dynamic_in_list_filter::supports(cudf::data_type key_type,
+                                             std::size_t /*valid_rows*/) noexcept
+{
+  return membership_key_supported(key_type);
 }
 
 sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;

@@ -130,8 +130,13 @@ bool sirius_dynamic_small_in_list_filter::supports(cudf::column_view const& keys
 {
   // The size gate counts the keys that will actually be stored: null build slots are compacted
   // out at construction, so a nullable column qualifies on its valid rows.
-  auto const num_keys = static_cast<std::size_t>(keys.size() - keys.null_count());
-  return num_keys >= 1 && num_keys <= k_max_keys && membership_key_supported(keys.type());
+  return supports(keys.type(), static_cast<std::size_t>(keys.size() - keys.null_count()));
+}
+
+bool sirius_dynamic_small_in_list_filter::supports(cudf::data_type key_type,
+                                                   std::size_t valid_rows) noexcept
+{
+  return valid_rows >= 1 && valid_rows <= k_max_keys && membership_key_supported(key_type);
 }
 
 sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
