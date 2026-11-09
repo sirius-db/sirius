@@ -19,6 +19,7 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -35,6 +36,7 @@
 
 #include <dlfcn.h>
 
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <string>
@@ -322,12 +324,48 @@ class sirius_loader {
       }
       duckdb::ExtensionInstallOptions options;
       options.repository = repository;
-      duckdb::ExtensionHelper::InstallExtension(
-        db, duckdb::FileSystem::GetLocal(db), backend, options);
+      auto& fs           = duckdb::FileSystem::GetLocal(db);
+      // Mirrors core's check: install is a no-op when the file exists.
+      auto directory = duckdb::ExtensionHelper::ExtensionDirectory(db, fs);
+      if (repository.type == duckdb::ExtensionRepositoryType::USER_PROVIDED) {
+        directory = fs.JoinPath(fs.JoinPath(directory, "repositories"), repository.name);
+      }
+      auto const installed = fs.FileExists(fs.JoinPath(directory, backend + ".duckdb_extension"));
+      if (installed) {
+        duckdb::ExtensionHelper::InstallExtension(db, fs, backend, options);
+      } else {
+        install_with_status(backend, options);
+      }
     }
     auto connection = duckdb::Connection::CreateInternal(db);
     connection.Query(duckdb::StringUtil::Format("LOAD %s", duckdb::SQLString(backend)))
       ->ThrowIfError();
+  }
+
+  /// Installs a backend that is not installed yet, telling the user on stderr since the
+  /// download is large and core DuckDB installs silently.
+  void install_with_status(std::string const& backend, duckdb::ExtensionInstallOptions& options)
+  {
+    auto& db = loader_.GetDatabaseInstance();
+    report(duckdb::StringUtil::Format(
+      "Sirius: installing %s from %s. This one-time download is large and may take a few "
+      "minutes.",
+      backend,
+      options.repository->path));
+    auto const start = std::chrono::steady_clock::now();
+    duckdb::ExtensionHelper::InstallExtension(
+      db, duckdb::FileSystem::GetLocal(db), backend, options);
+    std::chrono::duration<double> const elapsed = std::chrono::steady_clock::now() - start;
+    report(duckdb::StringUtil::Format("Sirius: installed %s in %.1f s.", backend, elapsed.count()));
+  }
+
+  void report(std::string const& message)
+  {
+    duckdb::Printer::Print(duckdb::OutputStream::STREAM_STDERR, message);
+    duckdb::Printer::Flush(duckdb::OutputStream::STREAM_STDERR);
+    auto& db = loader_.GetDatabaseInstance();
+    using namespace duckdb;  // The logging macros use unqualified DuckDB names.
+    DUCKDB_LOG_INFO(db, message);
   }
 
   /// Leaves DuckDB's CPU execution untouched and makes explicit GPU requests fail.

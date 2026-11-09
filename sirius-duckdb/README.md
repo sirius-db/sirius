@@ -98,7 +98,9 @@ Versions 12080–12999 select `sirius_cuda12`; 13000 and newer select `sirius_cu
 When `autoinstall_known_extensions` is enabled and the selected backend is not
 installed yet, `LOAD sirius` downloads it from DuckDB's community repository (or
 the configured auto-install repository); without a usable driver it does no
-network I/O. The loader does not retry with the other CUDA version.
+network I/O. Because the backend is large, the loader prints a line to
+stderr (and logs it at `INFO` level) when this one-time install starts and when it
+finishes. The loader does not retry with the other CUDA version.
 
 If the driver is missing, supports a CUDA version below 12.8, or cannot report its
 version, or the selected backend is not installed, cannot be installed, or its

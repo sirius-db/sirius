@@ -5,6 +5,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -332,9 +333,22 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [{"backend": 13}])
+        self.assertRegex(
+            result.stderr,
+            rf"^Sirius: installing sirius_cuda13 from {re.escape(str(repository))}\. .*\n"
+            r"Sirius: installed sirius_cuda13 in \d+\.\d s\.\n$",
+        )
         self.assertTrue(
             list((self.root / "installed").rglob("sirius_cuda13.duckdb_extension"))
         )
+        # Installed backends load without a message.
+        result = self.query(
+            f"SET autoinstall_extension_repository={quote(repository)};"
+            f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;",
+            autoinstall=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_loader_has_no_cuda_or_engine_dependency(self):
         result = subprocess.run(
