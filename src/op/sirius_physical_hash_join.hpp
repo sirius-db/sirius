@@ -316,6 +316,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! planning time. 0 disables BUILD_PROBE for all joins including MARK.
   uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
 
+  //! `dynamic_filter_join_signature` of this join's type and conditions, which names the join in
+  //! its `[dynamic_filter_key]` lines independently of operator IDs. Set at planning time;
+  //! `sirius_pipeline_converter` passes it to the session with the join's occurrence and ID.
+  std::uint64_t dynamic_filter_signature = 0;
+
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {
     _dynamic_filter_session.restrict_replicas_to(admitted_gpu_ids);
