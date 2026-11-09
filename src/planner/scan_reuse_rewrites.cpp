@@ -19,6 +19,7 @@
 #include <duckdb/function/builtin_function_lookup.hpp>
 #include <duckdb/function/function_binder.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/optimizer/column_binding_replacer.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
@@ -26,13 +27,19 @@
 #include <duckdb/planner/logical_operator_visitor.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_cteref.hpp>
+#include <duckdb/planner/operator/logical_delim_get.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_materialized_cte.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
 #include <log/logging.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -76,6 +83,12 @@ std::optional<std::size_t> position_of(std::vector<ColumnBinding> const& binding
   auto const it = std::find(bindings.begin(), bindings.end(), binding);
   if (it == bindings.end()) { return std::nullopt; }
   return static_cast<std::size_t>(it - bindings.begin());
+}
+
+/// Why a rule left a plan alone, for the debug log.
+void not_applied(char const* rule, std::string const& why)
+{
+  SIRIUS_LOG_DEBUG("[scan reuse] {} not applied: {}", rule, why);
 }
 
 bool produces(LogicalOperator& op, ColumnBinding binding)
@@ -431,6 +444,515 @@ bool reuse_semi_join_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
+//===----------------------------------------------------------------------===//
+// Inner-join regions
+//===----------------------------------------------------------------------===//
+
+/// A column of a join region by what it is, not where: its scan's identity (source and filters)
+/// and the table column. A DELIM_GET column is {"", i}.
+struct region_column {
+  std::string leaf;
+  duckdb::idx_t column;
+  auto operator<=>(region_column const&) const = default;
+};
+
+/**
+ * @brief A subtree of scans, INNER equality joins, filters and projections of plain references,
+ * with at most one DELIM_GET: a set of rows that does not depend on its join order.
+ */
+struct join_region {
+  LogicalOperator* root = nullptr;
+  /// Each scan's identity, and the scan. A region with two scans of one identity is refused.
+  std::map<std::string, duckdb::LogicalGet*> leaves;
+  /// Each scan's identity by its table index.
+  std::map<duckdb::idx_t, std::string> by_table;
+  duckdb::LogicalDelimGet* delim = nullptr;
+  /// Join equalities, by column.
+  std::vector<std::pair<region_column, region_column>> equalities;
+  /// Comparison of each equality with the DELIM_GET, by its column.
+  std::map<duckdb::idx_t, duckdb::ExpressionType> delim_comparisons;
+  /// FILTER predicates: the predicate's text with columns named by region_column, and the leaves
+  /// it reads.
+  std::vector<std::pair<std::string, std::set<std::string>>> filters;
+};
+
+std::string scan_identity(duckdb::LogicalGet const& get)
+{
+  std::string id = get.function.GetName().GetIdentifierName() + "|";
+  if (auto const table = get.GetTable()) {
+    id += "table@" + std::to_string(reinterpret_cast<std::uintptr_t>(table.get()));
+  } else {
+    if (get.parameters.empty()) { return {}; }
+    for (auto const& value : get.parameters) {
+      id += value.ToString() + ",";
+    }
+    for (auto const& [name, value] : get.named_parameters) {
+      id += name + "=" + value.ToString() + ",";
+    }
+  }
+  for (auto const& filter : required_filters(get)) {
+    id += "|" + filter;
+  }
+  return id;
+}
+
+class region_builder {
+ public:
+  explicit region_builder(join_region& region) : _region(region) {}
+
+  bool collect(LogicalOperator& op)
+  {
+    switch (op.type) {
+      case LogicalOperatorType::LOGICAL_GET: {
+        auto& get = op.Cast<duckdb::LogicalGet>();
+        auto id   = scan_identity(get);
+        if (id.empty() || !get.children.empty() || _region.leaves.contains(id)) { return false; }
+        _region.by_table[get.table_index.index] = id;
+        _region.leaves.emplace(std::move(id), &get);
+        return true;
+      }
+      case LogicalOperatorType::LOGICAL_DELIM_GET:
+        if (_region.delim != nullptr) { return false; }
+        _region.delim = &op.Cast<duckdb::LogicalDelimGet>();
+        return true;
+      case LogicalOperatorType::LOGICAL_PROJECTION:
+        return std::ranges::all_of(op.expressions,
+                                   [](auto const& e) { return column_ref(*e).has_value(); }) &&
+               collect(*op.children[0]);
+      case LogicalOperatorType::LOGICAL_FILTER:
+        if (!collect(*op.children[0])) { return false; }
+        for (auto const& expression : op.expressions) {
+          _filters.push_back({&op, expression.get()});
+        }
+        return true;
+      case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
+        auto& join = op.Cast<duckdb::LogicalComparisonJoin>();
+        if (join.join_type != duckdb::JoinType::INNER || !collect(*op.children[0]) ||
+            !collect(*op.children[1])) {
+          return false;
+        }
+        for (auto const& condition : join.conditions) {
+          if (!condition.IsComparison()) { return false; }
+          auto const type = condition.GetComparisonType();
+          auto const l    = column_ref(condition.GetLHS());
+          auto const r    = column_ref(condition.GetRHS());
+          if (!l || !r) { return false; }
+          if (type != duckdb::ExpressionType::COMPARE_EQUAL &&
+              type != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+            return false;
+          }
+          _joins.push_back({&op, *l, *r, type});
+        }
+        return true;
+      }
+      default: return false;
+    }
+  }
+
+  /// Resolves the collected joins and filters; false when one reads a computed column.
+  bool finish(LogicalOperator& root)
+  {
+    _region.root = &root;
+    for (auto const& [op, l, r, type] : _joins) {
+      auto const a = column(*op, l);
+      auto const b = column(*op, r);
+      if (!a || !b) { return false; }
+      bool const delim_a = a->leaf.empty(), delim_b = b->leaf.empty();
+      if (delim_a && delim_b) { return false; }
+      if (delim_a || delim_b) {
+        _region.delim_comparisons[delim_a ? a->column : b->column] = type;
+      } else if (type != duckdb::ExpressionType::COMPARE_EQUAL) {
+        return false;
+      }
+      _region.equalities.emplace_back(*a, *b);
+    }
+    for (auto const& [op, expression] : _filters) {
+      std::set<std::string> leaves;
+      bool ok   = true;
+      auto copy = expression->Copy();
+      rename(*op, copy, leaves, ok);
+      if (!ok) { return false; }
+      _region.filters.emplace_back(copy->ToString(), std::move(leaves));
+    }
+    return true;
+  }
+
+  /// The region column that @p binding, read at @p op, holds.
+  std::optional<region_column> column(LogicalOperator& op, ColumnBinding binding)
+  {
+    if (_region.delim != nullptr && binding.table_index == _region.delim->table_index) {
+      return region_column{"", binding.column_index.GetIndex()};
+    }
+    auto const origin = trace(op, binding);
+    if (!origin) { return std::nullopt; }
+    auto const it = _region.by_table.find(origin->get->table_index.index);
+    if (it == _region.by_table.end()) { return std::nullopt; }
+    return region_column{it->second, origin->column};
+  }
+
+ private:
+  /// Names every column @p expression reads by its region_column, so that equal predicates over
+  /// equal columns print alike in two regions.
+  void rename(LogicalOperator& op,
+              unique_ptr<Expression>& expression,
+              std::set<std::string>& leaves,
+              bool& ok)
+  {
+    if (auto const ref = column_ref(*expression)) {
+      auto const c = column(op, *ref);
+      if (!c || c->leaf.empty()) {
+        ok = false;
+        return;
+      }
+      leaves.insert(c->leaf);
+      expression = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+        duckdb::Identifier("[" + c->leaf + "]." + std::to_string(c->column)),
+        expression->GetReturnType(),
+        ColumnBinding(duckdb::TableIndex(0), ProjectionIndex(0)));
+      return;
+    }
+    duckdb::ExpressionIterator::EnumerateChildren(
+      *expression, [&](unique_ptr<Expression>& child) { rename(op, child, leaves, ok); });
+  }
+
+  struct join_entry {
+    LogicalOperator* op;
+    ColumnBinding left, right;
+    duckdb::ExpressionType type;
+  };
+  join_region& _region;
+  std::vector<join_entry> _joins;
+  std::vector<std::pair<LogicalOperator*, Expression*>> _filters;
+};
+
+std::optional<join_region> region_of(LogicalOperator& root)
+{
+  join_region region;
+  region_builder builder(region);
+  if (!builder.collect(root) || region.leaves.empty() || !builder.finish(root)) {
+    return std::nullopt;
+  }
+  return region;
+}
+
+/// Union-find over region columns.
+class column_classes {
+ public:
+  void join(region_column const& a, region_column const& b) { _parent[find(a)] = find(b); }
+  bool same(region_column const& a, region_column const& b) { return find(a) == find(b); }
+  region_column find(region_column const& c)
+  {
+    auto it = _parent.find(c);
+    if (it == _parent.end()) {
+      _parent.emplace(c, c);
+      return c;
+    }
+    if (it->second == c) { return c; }
+    auto root  = find(it->second);
+    _parent[c] = root;
+    return root;
+  }
+
+ private:
+  std::map<region_column, region_column> _parent;
+};
+
+/// Every column binding read by an expression of an operator under @p op, outside @p skip.
+void collect_plan_references(LogicalOperator& op,
+                             LogicalOperator const* skip,
+                             std::vector<ColumnBinding>& out)
+{
+  if (&op == skip) { return; }
+  duckdb::LogicalOperatorVisitor::EnumerateExpressions(
+    op, [&](unique_ptr<Expression>* e) { collect_references(**e, out); });
+  for (auto& child : op.children) {
+    collect_plan_references(*child, skip, out);
+  }
+}
+
+duckdb::idx_t next_table_index(LogicalOperator& op)
+{
+  duckdb::idx_t next = 0;
+  for (auto const& index : op.GetTableIndex()) {
+    if (index.IsValid()) { next = std::max(next, index.index + 1); }
+  }
+  if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+    next = std::max(next, op.Cast<duckdb::LogicalCTERef>().cte_index.index + 1);
+  }
+  for (auto& child : op.children) {
+    next = std::max(next, next_table_index(*child));
+  }
+  return next;
+}
+
+/// Finds the slot holding @p target under @p op.
+unique_ptr<LogicalOperator>* slot_of(unique_ptr<LogicalOperator>& op, LogicalOperator const* target)
+{
+  if (op.get() == target) { return &op; }
+  for (auto& child : op->children) {
+    if (auto* found = slot_of(child, target)) { return found; }
+  }
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Rule: a correlated MIN/MAX/AVG over the outer query's own rows (TPC-H Q17, Q2)
+//===----------------------------------------------------------------------===//
+
+struct correlated_match {
+  std::size_t outer_side;
+  /// The subquery's join region (with the DELIM_GET) and the outer region.
+  join_region inner;
+  join_region outer;
+  /// For each DELIM_GET column, the outer column it was taken from (a binding of the outer).
+  std::vector<ColumnBinding> delim_sources;
+  /// The outer's join equalities: columns in one class hold equal values on every outer row.
+  column_classes outer_classes;
+};
+
+std::optional<correlated_match> match_correlated_aggregate(duckdb::LogicalComparisonJoin& delim)
+{
+  auto const skip = [](char const* why) -> std::optional<correlated_match> {
+    not_applied("correlated aggregate over the outer rows", why);
+    return std::nullopt;
+  };
+  if (delim.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) { return std::nullopt; }
+  auto const outer_side = delim.delim_flipped ? std::size_t{1} : std::size_t{0};
+  auto& outer_root      = *delim.children[outer_side];
+  auto& subquery        = *delim.children[1 - outer_side];
+
+  // The subquery: projections and filters over one aggregate of MIN, MAX and AVG only (they keep
+  // their value when every row of a group repeats the same number of times), over its join region.
+  LogicalOperator* at = &subquery;
+  while (at->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+         at->type == LogicalOperatorType::LOGICAL_FILTER) {
+    at = at->children[0].get();
+  }
+  if (at->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+    return skip("no aggregate under the subquery's projections and filters");
+  }
+  auto& aggregate = at->Cast<duckdb::LogicalAggregate>();
+  if (aggregate.grouping_sets.size() > 1 || !aggregate.grouping_functions.empty()) {
+    return skip("grouping sets");
+  }
+  for (auto const& expression : aggregate.expressions) {
+    if (expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) {
+      return skip("an aggregate expression that is not an aggregate");
+    }
+    auto const& a    = expression->Cast<duckdb::BoundAggregateExpression>();
+    auto const& name = a.Function().GetName();
+    if (!(name == "min" || name == "max" || name == "avg") || a.IsDistinct() || a.GetFilter() ||
+        a.GetOrderBys()) {
+      return skip("an aggregate other than a plain MIN, MAX or AVG");
+    }
+  }
+  auto inner = region_of(*aggregate.children[0]);
+  auto outer = region_of(outer_root);
+  if (!inner) { return skip("the subquery's input is not a join region"); }
+  if (!outer) { return skip("the outer side is not a join region"); }
+  if (inner->delim == nullptr || outer->delim != nullptr) {
+    return skip("the DELIM_GET is not in the subquery's region");
+  }
+  correlated_match match{.outer_side = outer_side, .inner = *inner, .outer = *outer};
+
+  // Each DELIM_GET column comes from an outer column, and its equality in the subquery.
+  region_builder outer_columns(match.outer);
+  std::map<duckdb::idx_t, region_column> delim_column;
+  for (std::size_t i = 0; i < delim.duplicate_eliminated_columns.size(); ++i) {
+    auto const ref = column_ref(*delim.duplicate_eliminated_columns[i]);
+    auto const c   = ref ? outer_columns.column(outer_root, *ref) : std::nullopt;
+    if (!c) { return skip("a delim column that is not an outer scan column"); }
+    delim_column[i] = *c;
+    match.delim_sources.push_back(*ref);
+  }
+  if (match.inner.delim_comparisons.size() != delim_column.size()) {
+    return skip("a delim column the subquery does not join");
+  }
+
+  // The subquery's scans (R) are outer scans; the outer's other scans (E) join R only within the
+  // equality classes of the delim columns.
+  std::set<std::string> inner_leaves;
+  for (auto const& [id, get] : match.inner.leaves) {
+    if (!match.outer.leaves.contains(id)) { return skip("a subquery scan the outer side lacks"); }
+    inner_leaves.insert(id);
+  }
+  auto const delim_as_outer = [&](region_column c) {
+    return c.leaf.empty() ? delim_column.at(c.column) : c;
+  };
+  column_classes inner_classes, outer_classes;
+  for (auto const& [a, b] : match.inner.equalities) {
+    inner_classes.join(delim_as_outer(a), delim_as_outer(b));
+  }
+  for (auto const& [a, b] : match.outer.equalities) {
+    outer_classes.join(a, b);
+  }
+  for (auto const& [a, b] : match.inner.equalities) {
+    if (!outer_classes.same(delim_as_outer(a), delim_as_outer(b))) {
+      return skip("a subquery join the outer side lacks");
+    }
+  }
+  for (auto const& [a, b] : match.outer.equalities) {
+    bool const ra = inner_leaves.contains(a.leaf), rb = inner_leaves.contains(b.leaf);
+    if (!ra && !rb) { continue; }  // within E
+    if (ra && rb) {
+      if (!inner_classes.same(a, b)) { return skip("an outer join the subquery lacks"); }
+      continue;
+    }
+    // R to E: only through a delim column's class, which the subquery joins to that R column.
+    auto const& r            = ra ? a : b;
+    auto const& e            = ra ? b : a;
+    bool const through_delim = std::ranges::any_of(delim_column, [&](auto const& entry) {
+      return outer_classes.same(e, entry.second) && inner_classes.same(r, entry.second);
+    });
+    if (!through_delim) { return skip("an outer join to R that is not on a delim column"); }
+  }
+  // Filters: the outer's filters on inner scans only are the subquery's; none reads both sides.
+  std::multiset<std::string> outer_filters, inner_filters;
+  for (auto const& [text, leaves] : match.outer.filters) {
+    auto const on_inner =
+      std::ranges::count_if(leaves, [&](auto const& l) { return inner_leaves.contains(l); });
+    if (on_inner == 0) { continue; }
+    if (static_cast<std::size_t>(on_inner) != leaves.size()) {
+      return skip("an outer filter across both sides");
+    }
+    outer_filters.insert(text);
+  }
+  for (auto const& [text, leaves] : match.inner.filters) {
+    inner_filters.insert(text);
+  }
+  if (outer_filters != inner_filters) { return skip("different filters"); }
+  match.outer_classes = outer_classes;
+  return match;
+}
+
+bool reuse_outer_rows(unique_ptr<LogicalOperator>& root,
+                      unique_ptr<LogicalOperator>& slot,
+                      scan_reuse_counts const& counts,
+                      removed_subtree_callback const& removed)
+{
+  auto& delim = slot->Cast<duckdb::LogicalComparisonJoin>();
+  auto match  = match_correlated_aggregate(delim);
+  if (!match) { return false; }
+  auto& outer_slot = delim.children[match->outer_side];
+  auto* inner_root = match->inner.root;
+  outer_slot->ResolveOperatorTypes();
+  auto const outer_bindings = outer_slot->GetColumnBindings();
+  auto const outer_types    = outer_slot->types;
+
+  // Where each outer output column comes from, to find the subquery's columns among them.
+  region_builder outer_columns(match->outer);
+  std::vector<std::optional<region_column>> outer_output;
+  for (auto const& binding : outer_bindings) {
+    outer_output.push_back(outer_columns.column(*outer_slot, binding));
+  }
+  region_builder inner_columns(match->inner);
+  std::vector<ColumnBinding> referenced;
+  collect_plan_references(*root, inner_root, referenced);
+
+  auto const tables = next_table_index(*root);
+  duckdb::TableIndex const cte_index(tables), outer_ref(tables + 1), inner_ref(tables + 2);
+  inner_root->ResolveOperatorTypes();
+  auto const inner_bindings = inner_root->GetColumnBindings();
+  // The outer output column holding @p c: c itself, else a column of its equality class (equal on
+  // every outer row) of the same type.
+  auto const position_in_outer =
+    [&](region_column const& c, duckdb::LogicalType const& type) -> std::optional<std::size_t> {
+    for (std::size_t j = 0; j < outer_output.size(); ++j) {
+      if (outer_output[j] == c) { return j; }
+    }
+    for (std::size_t j = 0; j < outer_output.size(); ++j) {
+      if (outer_output[j] && outer_types[j] == type &&
+          match->outer_classes.same(*outer_output[j], c)) {
+        return j;
+      }
+    }
+    return std::nullopt;
+  };
+  // The subquery's columns read above its region, as the CTE's or the DELIM_GET's.
+  std::vector<duckdb::ReplacementBinding> replacements;
+  for (std::size_t k = 0; k < inner_bindings.size(); ++k) {
+    auto const& binding = inner_bindings[k];
+    if (std::find(referenced.begin(), referenced.end(), binding) == referenced.end()) { continue; }
+    auto const c = inner_columns.column(*inner_root, binding);
+    if (!c) {
+      not_applied("correlated aggregate over the outer rows", "a subquery output not from a scan");
+      return false;
+    }
+    if (c->leaf.empty()) {
+      replacements.emplace_back(
+        binding, ColumnBinding(match->inner.delim->table_index, ProjectionIndex(c->column)));
+      continue;
+    }
+    auto const at = position_in_outer(*c, inner_root->types[k]);
+    if (!at) {
+      not_applied("correlated aggregate over the outer rows",
+                  "a subquery column the outer side does not output: [" + c->leaf + "]." +
+                    std::to_string(c->column));
+      return false;
+    }
+    replacements.emplace_back(binding, ColumnBinding(inner_ref, ProjectionIndex(*at)));
+  }
+  // The delim keys, as CTE columns.
+  std::vector<std::size_t> delim_positions;
+  for (auto const& source : match->delim_sources) {
+    auto const at = position_of(outer_bindings, source);
+    if (!at) { return false; }
+    delim_positions.push_back(*at);
+  }
+
+  // Nothing fails from here on.
+  duckdb::vector<duckdb::Identifier> names;
+  for (std::size_t j = 0; j < outer_types.size(); ++j) {
+    names.emplace_back("c" + std::to_string(j));
+  }
+  auto* inner_slot = slot_of(slot, inner_root);
+  if (removed) { removed(**inner_slot); }
+  auto* delim_slot = slot_of(*inner_slot, match->inner.delim);
+  auto delim_get   = std::move(*delim_slot);
+  auto& delim_ref  = delim_get->Cast<duckdb::LogicalDelimGet>();
+  auto joined      = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
+  for (std::size_t i = 0; i < delim_positions.size(); ++i) {
+    auto const at = delim_positions[i];
+    joined->conditions.emplace_back(
+      duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+        outer_types[at], ColumnBinding(inner_ref, ProjectionIndex(at))),
+      duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+        delim_ref.chunk_types[i], ColumnBinding(delim_ref.table_index, ProjectionIndex(i))),
+      match->inner.delim_comparisons.at(i));
+  }
+  joined->children.push_back(
+    duckdb::make_uniq<duckdb::LogicalCTERef>(inner_ref, cte_index, outer_types, names));
+  joined->children.push_back(std::move(delim_get));
+  joined->estimated_cardinality     = inner_root->estimated_cardinality;
+  joined->has_estimated_cardinality = inner_root->has_estimated_cardinality;
+  *inner_slot                       = std::move(joined);
+
+  auto outer = std::move(outer_slot);
+  outer_slot = duckdb::make_uniq<duckdb::LogicalCTERef>(outer_ref, cte_index, outer_types, names);
+  outer_slot->estimated_cardinality     = outer->estimated_cardinality;
+  outer_slot->has_estimated_cardinality = outer->has_estimated_cardinality;
+  for (std::size_t j = 0; j < outer_bindings.size(); ++j) {
+    replacements.emplace_back(outer_bindings[j], ColumnBinding(outer_ref, ProjectionIndex(j)));
+  }
+  auto* outer_raw = outer.get();
+  auto cte        = duckdb::make_uniq<duckdb::LogicalMaterializedCTE>(
+    duckdb::Identifier("scan_reuse_" + std::to_string(counts.total())),
+    cte_index,
+    outer_types.size(),
+    std::move(outer),
+    std::move(slot),
+    duckdb::CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+  cte->estimated_cardinality     = cte->children[1]->estimated_cardinality;
+  cte->has_estimated_cardinality = cte->children[1]->has_estimated_cardinality;
+  slot                           = std::move(cte);
+
+  duckdb::ColumnBindingReplacer replacer;
+  replacer.replacement_bindings = std::move(replacements);
+  replacer.stop_operator        = outer_raw;
+  replacer.VisitOperator(*root);
+  return true;
+}
+
 void rewrite(duckdb::ClientContext& context,
              unique_ptr<LogicalOperator>& root,
              unique_ptr<LogicalOperator>& op,
@@ -443,6 +965,9 @@ void rewrite(duckdb::ClientContext& context,
   if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
       reuse_semi_join_aggregate(context, op->Cast<duckdb::LogicalAggregate>(), removed)) {
     ++counts.semi_join_aggregates;
+  } else if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN &&
+             reuse_outer_rows(root, op, counts, removed)) {
+    ++counts.correlated_aggregates;
   }
 }
 
@@ -456,8 +981,11 @@ scan_reuse_counts rewrite_repeated_scans(duckdb::ClientContext& context,
   if (!plan) { return counts; }
   rewrite(context, plan, plan, counts, removed);
   if (counts.total() != 0) {
-    SIRIUS_LOG_INFO("[scan reuse] rewrote the plan: {} IN-subquery aggregate(s) reused",
-                    counts.semi_join_aggregates);
+    SIRIUS_LOG_INFO(
+      "[scan reuse] rewrote the plan: {} IN-subquery aggregate(s) reused, {} correlated "
+      "aggregate(s) over the outer rows",
+      counts.semi_join_aggregates,
+      counts.correlated_aggregates);
   }
   return counts;
 }

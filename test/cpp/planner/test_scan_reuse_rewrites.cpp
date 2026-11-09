@@ -220,3 +220,101 @@ TEST_CASE_METHOD(scan_reuse_fixture,
     CHECK(scans_of(*plan, "lineitem") == 2);
   }
 }
+
+namespace {
+
+/// TPC-H Q17 with its parameters matched to the fixture, and variants of it.
+std::string q17(std::string const& aggregate      = "0.2 * avg(l2.l_quantity)",
+                std::string const& outer_where    = "",
+                std::string const& subquery_where = "")
+{
+  return "select sum(l.l_extendedprice) / 7.0 as avg_yearly from lineitem l, part p where "
+         "p.p_partkey = l.l_partkey and p.p_brand = 'Brand#1' and p.p_container = 'JUMBO CAN' "
+         "and l.l_quantity < (select " +
+         aggregate + " from lineitem l2 where l2.l_partkey = p.p_partkey" + subquery_where + ")" +
+         outer_where;
+}
+
+/// TPC-H Q2, parameters matched to the fixture.
+std::string q2(std::string const& subquery_region = "EUROPE")
+{
+  return "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, s.s_address, s.s_phone, "
+         "s.s_comment from part p, supplier s, partsupp ps, nation n, region r where p.p_partkey "
+         "= ps.ps_partkey and s.s_suppkey = ps.ps_suppkey and p.p_size = 1 and p.p_type like "
+         "'%NICKEL' and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey and "
+         "r.r_name = 'EUROPE' and ps.ps_supplycost = (select min(ps.ps_supplycost) from partsupp "
+         "ps, supplier s, nation n, region r where p.p_partkey = ps.ps_partkey and s.s_suppkey = "
+         "ps.ps_suppkey and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey and "
+         "r.r_name = '" +
+         subquery_region +
+         "') order by s.s_acctbal desc, n.n_name, s.s_name, p.p_partkey limit 100";
+}
+
+std::size_t materialized_ctes(duckdb::LogicalOperator& op)
+{
+  std::size_t n = op.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ? 1 : 0;
+  for (auto& child : op.children) {
+    n += materialized_ctes(*child);
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(scan_reuse_fixture,
+                 "TPC-H Q17 reads lineitem once, from a CTE of the outer join",
+                 "[planner][scan_reuse]")
+{
+  sirius::planner::scan_reuse_counts counts;
+  auto plan = rewritten(q17(), counts);
+  CHECK(counts.correlated_aggregates == 1);
+  CHECK(scans_of(*plan, "lineitem") == 1);
+  CHECK(materialized_ctes(*plan) == 1);
+}
+
+TEST_CASE_METHOD(scan_reuse_fixture,
+                 "TPC-H Q2 reads partsupp, supplier, nation and region once",
+                 "[planner][scan_reuse]")
+{
+  sirius::planner::scan_reuse_counts counts;
+  auto plan = rewritten(q2(), counts);
+  CHECK(counts.correlated_aggregates == 1);
+  for (auto const* table : {"partsupp", "supplier", "nation", "region", "part"}) {
+    INFO(table);
+    CHECK(scans_of(*plan, table) == 1);
+  }
+}
+
+TEST_CASE_METHOD(scan_reuse_fixture,
+                 "correlated subqueries that the outer rows cannot answer are left alone",
+                 "[planner][scan_reuse]")
+{
+  struct variant {
+    char const* why;
+    std::string sql;
+    char const* table;
+    std::size_t scans;
+  };
+  for (auto const& [why, sql, table, scans] : {
+         variant{"a SUM, which repeated outer rows change",
+                 q17("0.2 * sum(l2.l_quantity)"),
+                 "lineitem",
+                 2},
+         variant{"a COUNT", q17("count(*)"), "lineitem", 2},
+         variant{"a filter on the outer lineitem only",
+                 q17("0.2 * avg(l2.l_quantity)", " and l.l_linenumber > 2"),
+                 "lineitem",
+                 2},
+         variant{"a filter in the subquery only",
+                 q17("0.2 * avg(l2.l_quantity)", "", " and l2.l_linenumber > 2"),
+                 "lineitem",
+                 2},
+         variant{"a different region in the subquery", q2("ASIA"), "partsupp", 2},
+       }) {
+    INFO(why);
+    sirius::planner::scan_reuse_counts counts;
+    auto plan = rewritten(sql, counts);
+    CHECK(counts.correlated_aggregates == 0);
+    CHECK(scans_of(*plan, table) == scans);
+  }
+}

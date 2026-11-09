@@ -117,3 +117,40 @@ TEST_CASE_METHOD(ScanReuseFixture,
     "l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 120) and o_orderkey = "
     "l_orderkey and l_linenumber > 2 group by o_orderkey");
 }
+
+TEST_CASE_METHOD(ScanReuseFixture,
+                 "gpu_execution Q17 shape: the correlated AVG over the outer rows' CTE",
+                 "[integration][gpu_execution][scan_reuse]")
+{
+  // Part keys 0..5 appear twice in part, so the outer join repeats their lineitems.
+  for (auto const* brand : {"Brand#0", "Brand#1"}) {
+    INFO(brand);
+    compare_gpu_vs_cpu_approx(
+      std::string("select sum(l.l_extendedprice) / 7.0 as avg_yearly, count(*) from lineitem l, "
+                  "part p where p.p_partkey = l.l_partkey and p.p_brand = '") +
+        brand +
+        "' and p.p_container = 'JUMBO CAN' and l.l_quantity < (select 0.2 * avg(l2.l_quantity) "
+        "from lineitem l2 where l2.l_partkey = p.p_partkey)",
+      {0},
+      1e-9);
+  }
+  // MIN and MAX, grouped output.
+  compare_gpu_vs_cpu(
+    "select p.p_partkey, l.l_quantity from lineitem l, part p where p.p_partkey = l.l_partkey and "
+    "p.p_container = 'JUMBO CAN' and l.l_quantity = (select max(l2.l_quantity) from lineitem l2 "
+    "where l2.l_partkey = p.p_partkey)");
+}
+
+TEST_CASE_METHOD(ScanReuseFixture,
+                 "gpu_execution Q2 shape: the correlated MIN over the outer rows' CTE",
+                 "[integration][gpu_execution][scan_reuse]")
+{
+  compare_gpu_vs_cpu(
+    "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, s.s_address, s.s_phone, "
+    "s.s_comment from part p, supplier s, partsupp ps, nation n, region r where p.p_partkey = "
+    "ps.ps_partkey and s.s_suppkey = ps.ps_suppkey and p.p_size = 1 and p.p_type like '%NICKEL' "
+    "and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey and r.r_name = 'EUROPE' "
+    "and ps.ps_supplycost = (select min(ps.ps_supplycost) from partsupp ps, supplier s, nation n, "
+    "region r where p.p_partkey = ps.ps_partkey and s.s_suppkey = ps.ps_suppkey and "
+    "s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey and r.r_name = 'EUROPE')");
+}
