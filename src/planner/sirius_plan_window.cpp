@@ -119,8 +119,7 @@ void decline_unsupported_modifiers(duckdb::BoundWindowExpression const& expressi
  * `PARTITION BY`, and without `DISTINCT`, `FILTER`, `EXCLUDE`, `IGNORE NULLS`, arguments or frame
  * offsets.
  */
-std::optional<op::ranking_function> validate_ranking(
-  duckdb::BoundWindowExpression const& expression)
+std::optional<op::ranking_function> build_ranking(duckdb::BoundWindowExpression const& expression)
 {
   std::optional<op::ranking_function> function;
   switch (expression.GetExpressionType()) {
@@ -188,7 +187,7 @@ void plan_ranking_order(window_plan& plan,
  * window `ORDER BY`. `SUM` and `AVG` take a numeric argument. `COUNT`, `MIN` and `MAX` also take
  * the types allowed as partition keys, and `MIN` and `MAX` keep the argument type.
  */
-aggregate_id validate(duckdb::BoundWindowExpression const& expression)
+aggregate_id build_aggregate(duckdb::BoundWindowExpression const& expression)
 {
   using duckdb::WindowBoundary;
   if (expression.GetExpressionType() != duckdb::ExpressionType::WINDOW_AGGREGATE ||
@@ -260,7 +259,7 @@ struct classified_expression {
  *
  * @return One entry for each expression of @p window, in order.
  * @throws duckdb::NotImplementedException if an expression is not a bound window expression or is
- * not a ranking function or aggregate that `validate_ranking` or `validate` accepts.
+ * not a ranking function or aggregate that `build_ranking` or `build_aggregate` accepts.
  */
 std::vector<classified_expression> classify_window_expressions(duckdb::LogicalWindow const& window)
 {
@@ -273,10 +272,10 @@ std::vector<classified_expression> classify_window_expressions(duckdb::LogicalWi
     }
     auto const& expression = bound.Cast<duckdb::BoundWindowExpression>();
     std::variant<aggregate_id, op::ranking_function> function;
-    if (auto const ranking = validate_ranking(expression)) {
+    if (auto const ranking = build_ranking(expression)) {
       function = *ranking;
     } else {
-      function = validate(expression);
+      function = build_aggregate(expression);
     }
     result.push_back({i, &expression, function});
   }
