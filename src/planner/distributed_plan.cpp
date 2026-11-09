@@ -90,10 +90,6 @@ enum class placement {
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
 };
 
-/// A join's Bloom filters are sized for its estimated build rows, within these bounds: the same
-/// size on every rank, since every rank plans the same estimate.
-constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
-constexpr std::size_t max_bloom_keys = std::size_t{1} << 30;
 /// A hash join whose estimated build has fewer rows publishes no merged Bloom filters.
 constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
 /// A join's build side is broadcast, and its probe side stays where it is, when the whole build
@@ -529,7 +525,7 @@ struct rewriter {
     install_filter_merge(join,
                          std::make_shared<op::bloom_all_gather_merge>(
                            service, first, join.dynamic_filter_plan().admitted_keys().size(), *gpu),
-                         std::clamp(build_rows, min_bloom_keys, max_bloom_keys));
+                         service->world_size());
     shape += "F";
   }
 
@@ -945,10 +941,10 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
 
 void install_filter_merge(op::sirius_physical_hash_join& join,
                           std::shared_ptr<op::cross_rank_filter_merge> merge,
-                          std::size_t bloom_keys)
+                          std::size_t ranks)
 {
   join.dynamic_filter_session().set_cross_rank_merge(
-    std::move(merge), op::merged_bloom_policy(join.dynamic_filter_plan().policy(), bloom_keys));
+    std::move(merge), op::merged_bloom_policy(join.dynamic_filter_plan().policy(), ranks));
   // finish_input() never waits: a publication not yet started leaves each key's merge, and one
   // already running completes on its own.
   join.children[1]->add_finalize_listener(

@@ -37,10 +37,11 @@ namespace sirius::op {
 /**
  * @brief Merges a join's Blooms across the ranks of an exchange, one all-gather per admitted key.
  *
- * After an exchange a rank's build holds only its share of the keys. Each rank builds a Bloom of
- * one size per key (see merged_bloom_policy()), all-gathers it with a header (key rep, family,
- * scale, size), and ORs the others into its own. A key whose filters cannot all be merged
- * publishes nothing: a rank sent none, a header differs, or a rank missed the timeout.
+ * After an exchange a rank's build holds only its share of the keys. Each rank builds a Bloom
+ * per key, sized from its own rows (see merged_bloom_policy()), all-gathers it with a header (key
+ * rep, family, scale, size), folds its own onto the smallest size any rank sent, and ORs the
+ * others into it. A key whose filters cannot all be merged publishes nothing: a rank sent none, a
+ * header's kind differs, a size does not fold onto the smallest, or a rank missed the timeout.
  */
 class bloom_all_gather_merge final : public cross_rank_filter_merge {
  public:
@@ -74,16 +75,28 @@ class bloom_all_gather_merge final : public cross_rank_filter_merge {
   std::chrono::milliseconds _timeout;
 };
 
+/// The bounds of a merged Bloom's size in keys, until the streaming OR (#2375).
+inline constexpr std::size_t merged_bloom_min_keys = std::size_t{1} << 16;
+inline constexpr std::size_t merged_bloom_max_keys = std::size_t{1} << 30;
+
 /**
- * @brief @p policy, changed so that every rank's filters merge: Blooms only, each sized for
- * @p bloom_keys keys whatever this rank's build, no zone maps, and no skipping an empty build or
- * drained targets, since the other ranks wait on this rank's part.
+ * @brief @p policy, changed so that every rank's filters merge: Blooms only, no zone maps, and no
+ * skipping an empty build or drained targets, since the other ranks wait on this rank's part.
  *
- * max_bloom_bytes_per_gpu does not cut the size: the merged Bloom holds every rank's keys, and
- * Q05 at SF3000 on 2 GPUs, cut to 256 MiB, got ~1.5 bits per key, filtered almost nothing and ran
- * 3.5x slower. The planner's clamp bounds it until the streaming OR (#2375).
+ * Each rank sizes its Bloom for its own build rows times @p ranks (a hash-exchanged build holds
+ * about one part in @p ranks of the keys), within [@p min_keys, @p max_keys], as a power-of-two
+ * number of blocks, so that Blooms of different sizes fold onto the smallest. The planner's
+ * estimate does not size it: TPC-H Q21 at SF10000 estimated 120 M keys for a build of about 1 B,
+ * and its merged Bloom kept 98% of lineitem.
+ *
+ * max_bloom_bytes_per_gpu does not cut the size either: the merged Bloom holds every rank's keys,
+ * and Q05 at SF3000 on 2 GPUs, cut to 256 MiB, got ~1.5 bits per key, filtered almost nothing and
+ * ran 3.5x slower.
  */
 [[nodiscard]] dynamic_filter_publication_policy merged_bloom_policy(
-  dynamic_filter_publication_policy policy, std::size_t bloom_keys) noexcept;
+  dynamic_filter_publication_policy policy,
+  std::size_t ranks,
+  std::size_t min_keys = merged_bloom_min_keys,
+  std::size_t max_keys = merged_bloom_max_keys) noexcept;
 
 }  // namespace sirius::op

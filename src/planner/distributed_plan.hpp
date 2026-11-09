@@ -151,13 +151,14 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
                             connector const& source,
                             duckdb::ClientContext& context);
 
-/// Has @p join merge its dynamic filters across ranks with @p merge, its Blooms sized for
-/// @p bloom_keys keys, and close its publication when its build CONCAT (`children[1]`) finalizes:
+/// Has @p join merge its dynamic filters across ranks with @p merge, each of the @p ranks ranks
+/// sizing its Blooms from its own build rows (op::merged_bloom_policy), and close its publication
+/// when its build CONCAT (`children[1]`) finalizes:
 /// a peer's merge waits on this rank's part, and that peer's probe may be what this rank's probe
 /// waits on, so the join's own finalize is too late.
 void install_filter_merge(op::sirius_physical_hash_join& join,
                           std::shared_ptr<op::cross_rank_filter_merge> merge,
-                          std::size_t bloom_keys);
+                          std::size_t ranks);
 
 /// Has @p sample take its boundaries from every rank's sample, all-gathered on @p stream, and
 /// give the range exchange's boundaries to @p sink, the EXCHANGE_SINK after it, in whose order

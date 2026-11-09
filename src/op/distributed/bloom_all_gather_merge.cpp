@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <exception>
 #include <utility>
@@ -111,7 +112,11 @@ void bloom_all_gather_merge::merge(std::span<std::shared_ptr<sirius_dynamic_filt
         return;
       }
       if (!bloom) { continue; }
-      std::vector<std::uint32_t const*> others;
+      // Each rank sized its Bloom from its own rows (scaled_bloom_keys), so the sizes may differ
+      // by powers of two; every rank folds them all onto the smallest, the same on every rank
+      // since every rank reads every header.
+      std::vector<std::pair<std::uint32_t const*, std::size_t>> others;
+      std::size_t smallest = head[3];
       bool mergeable =
         std::all_of(all.begin(), all.end(), [](auto const& t) { return t != nullptr; });
       if (mergeable) {
@@ -121,23 +126,46 @@ void bloom_all_gather_merge::merge(std::span<std::shared_ptr<sirius_dynamic_filt
           auto const* theirs = sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>();
           RMM_CUDA_TRY(cudaMemcpyAsync(
             heads[r].data(), theirs, sizeof(heads[r]), cudaMemcpyDeviceToHost, stream.get()));
-          if (r != _service->rank()) { others.push_back(theirs + header); }
         }
         stream.sync();
-        mergeable =
-          std::all_of(heads.begin(), heads.end(), [&](auto const& h) { return h == head; });
+        for (auto const& h : heads) {
+          smallest = std::min<std::size_t>(smallest, h[3]);
+        }
+        auto const foldable = [&](std::size_t bytes) {
+          return smallest != 0 && bytes % smallest == 0 && std::has_single_bit(bytes / smallest);
+        };
+        mergeable = std::all_of(heads.begin(), heads.end(), [&](auto const& h) {
+          return h[0] == head[0] && h[1] == head[1] && h[2] == head[2] && foldable(h[3]);
+        });
+        for (exchange::rank_t r = 0; r < all.size(); ++r) {
+          if (r == _service->rank()) { continue; }
+          others.emplace_back(
+            sirius::get_cudf_table_view(*all[r]).column(0).data<std::uint32_t>() + header,
+            heads[r][3]);
+        }
       }
       if (!mergeable) {
         SIRIUS_LOG_DEBUG(
-          "[publish_dynamic_filters] key {}: a rank sent no filter or another kind; "
-          "nothing published for it.",
+          "[publish_dynamic_filters] key {}: a rank sent no filter, another kind, or a size that "
+          "does not fold; nothing published for it.",
           k);
         membership[k].reset();
         continue;
       }
       try {
-        for (auto const* words : others) {
-          bloom->merge_from(words, bloom->storage_bytes(), stream);
+        if (bloom->storage_bytes() != smallest) {
+          SIRIUS_LOG_INFO(
+            "[publish_dynamic_filters] key {}: folding this rank's {}-byte Bloom onto the "
+            "smallest rank's {} bytes.",
+            k,
+            bloom->storage_bytes(),
+            smallest);
+          auto folded   = bloom->folded_to(smallest, stream, mr);
+          bloom         = folded.get();
+          membership[k] = std::move(folded);
+        }
+        for (auto const& [words, bytes] : others) {
+          bloom->merge_from(words, bytes, stream);
         }
       } catch (...) {
         // `all` and this Bloom must outlive every OR already queued on `stream`.
@@ -169,11 +197,15 @@ void bloom_all_gather_merge::leave_merges(std::size_t first, std::size_t count) 
 }
 
 dynamic_filter_publication_policy merged_bloom_policy(dynamic_filter_publication_policy policy,
-                                                      std::size_t bloom_keys) noexcept
+                                                      std::size_t ranks,
+                                                      std::size_t min_keys,
+                                                      std::size_t max_keys) noexcept
 {
   policy.emit_zone_map_filters         = false;
   policy.bloom_only                    = true;
-  policy.fixed_bloom_keys              = bloom_keys;
+  policy.bloom_rows_scale              = std::max<std::size_t>(ranks, 1);
+  policy.scaled_bloom_min_keys         = min_keys;
+  policy.scaled_bloom_max_keys         = max_keys;
   policy.publish_when_empty_or_drained = true;
   return policy;
 }

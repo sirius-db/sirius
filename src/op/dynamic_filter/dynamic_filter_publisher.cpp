@@ -209,6 +209,15 @@ void merge_across_ranks(cross_rank_filter_merge& merge,
                         ::cuda::stream_ref stream);
 void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
 
+/// Keys a Bloom over @p rows build rows is sized for under @p policy's scaled sizing; 0 when the
+/// policy sizes Blooms from the build.
+std::size_t scaled_keys(dynamic_filter_publication_policy const& policy, std::size_t rows) noexcept
+{
+  if (policy.bloom_rows_scale == 0) { return 0; }
+  return scaled_bloom_keys(
+    rows, policy.bloom_rows_scale, policy.scaled_bloom_min_keys, policy.scaled_bloom_max_keys);
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -671,11 +680,11 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    // A fixed size (dynamic_filter_publication_policy::fixed_bloom_keys) is uncapped.
-    auto const fixed = plan.policy().fixed_bloom_keys;
+    // A scaled size (dynamic_filter_publication_policy::bloom_rows_scale) is uncapped.
+    auto const scaled = scaled_keys(plan.policy(), rows);
     auto const cap =
-      fixed != 0 ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
-    auto const sized_for = fixed != 0 ? fixed : rows;
+      scaled != 0 ? std::numeric_limits<std::uint64_t>::max() : plan.max_bloom_bytes_per_gpu();
+    auto const sized_for = scaled != 0 ? scaled : rows;
     auto const geometry =
       detail::accumulated_bloom_geometry::try_create(sized_for, keys.size(), cap);
     if (!geometry) {
@@ -1094,7 +1103,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
-  auto const bloom_keys    = policy.fixed_bloom_keys;
+  auto const bloom_keys    = scaled_keys(policy, build_rows);
 
   std::vector<key_filters> per_key(admitted_keys.size());
   // Build columns restored from a narrowed carrier; filters copy from them asynchronously on

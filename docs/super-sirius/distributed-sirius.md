@@ -333,16 +333,23 @@ alone would drop rows another rank's build matches. In distributed mode a publis
 carries a `cross_rank_filter_merge` (`bloom_all_gather_merge` in `src/op/distributed/`) and a
 publication policy every rank shares (`merged_bloom_policy`). Every rank then:
 
-1. builds a Bloom of one size for each key, from the plan's build estimate clamped to
-   [2^16, 2^30] keys;
+1. builds a Bloom for each key, sized for its own build rows times the number of ranks (a
+   hash-exchanged build holds about one part in that many of the keys), within [2^16, 2^30]
+   keys, as a power-of-two number of blocks;
 2. all-gathers it with a header (key rep, family, scale, size);
-3. ORs the others into its own, and publishes it.
+3. folds its own onto the smallest size any rank sent, ORs the others into it, and publishes it.
 
-A key whose filters cannot all be merged publishes nothing: a rank sent none, a header differs,
-or a rank missed the 2-minute wait. IN-lists and zone maps are not published in distributed mode.
+The plan's build estimate does not size the Bloom: TPC-H Q21 at SF10000 estimated 120 M keys for
+a build of about 1 B, and its merged Bloom kept 98% of `lineitem`. Ranks with nearby row counts
+pick the same size; when a power of two lies between them, each run of blocks of a larger Bloom
+is ORed into one block of the smallest, which gives the smaller Bloom over the same keys.
+
+A key whose filters cannot all be merged publishes nothing: a rank sent none, a header's kind
+differs, a size does not fold onto the smallest, or a rank missed the 2-minute wait. IN-lists and
+zone maps are not published in distributed mode.
 
 A build split into several partitions accumulates its Bloom from every batch instead, and merges
-it the same way, at the same size, so a rank on either path merges with the others.
+it the same way, sized by the same rule, so a rank on either path merges with the others.
 `max_dynamic_filter_bloom_bytes_per_gpu` does not cut a distributed Bloom: the merged filter holds
 every rank's keys, and one cut far below them passes almost every probe row. Right semi and anti joins plan no
 BUILD_FILTER stage in distributed mode (`distribute_plan()` removes it), so they publish nothing.
@@ -355,7 +362,8 @@ waiting (`leave_all_gather`): a rank holding build rows holds its probe side unt
 completes, and that probe side may be what the other rank's probe waits on.
 
 These rules are the publication policy that `merged_bloom_policy()` gives a merged join:
-`bloom_only` (no IN-lists), `fixed_bloom_keys` (every rank's Bloom has the same size, uncapped) and
+`bloom_only` (no IN-lists), `bloom_rows_scale` (each rank's Bloom is sized for its rows times the
+ranks, uncapped) and
 `publish_when_empty_or_drained` (an empty build or drained targets still take part). With one
 rank, all three keep their defaults and the publisher behaves as on one GPU.
 

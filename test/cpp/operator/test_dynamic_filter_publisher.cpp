@@ -2125,11 +2125,14 @@ struct recording_merge final : sirius::op::cross_rank_filter_merge {
 };
 
 /// The policy a cross-rank merge needs: Blooms only, of one size, no shortcuts, no zone maps.
+/// @p bloom_keys is a power-of-two number of blocks, so the floor and the cap give exactly it.
 sirius::op::dynamic_filter_publication_policy merged_policy(std::size_t bloom_keys)
 {
   return {.emit_zone_map_filters         = false,
           .bloom_only                    = true,
-          .fixed_bloom_keys              = bloom_keys,
+          .bloom_rows_scale              = 1,
+          .scaled_bloom_min_keys         = bloom_keys,
+          .scaled_bloom_max_keys         = bloom_keys,
           .publish_when_empty_or_drained = true};
 }
 
