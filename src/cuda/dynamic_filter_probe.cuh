@@ -72,6 +72,8 @@
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace sirius::op::detail {
@@ -356,6 +358,29 @@ template <class KeyT, class Lookup>
 //===----------------------------------------------------------------------===//
 // Build side
 //===----------------------------------------------------------------------===//
+
+/// Rejects @p prepared unless it is a non-null column of @p domain's rep type, as
+/// `prepare_build_keys` writes it.
+inline void require_prepared(std::string_view filter_name,
+                             membership_key_domain const& domain,
+                             cudf::column_view const& prepared)
+{
+  if (prepared.type() != membership_rep_type(domain) || prepared.null_count() != 0) {
+    throw std::invalid_argument(std::string{filter_name} +
+                                " prepared keys must be a non-null column of the domain's rep "
+                                "type.");
+  }
+}
+
+/// The current CUDA device, which holds a filter's source replica.
+[[nodiscard]] inline int current_device(std::string_view filter_name)
+{
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    throw std::runtime_error(std::string{filter_name} + " failed to identify source device.");
+  }
+  return device;
+}
 
 template <class KeyT>
 struct convert_to_rep {

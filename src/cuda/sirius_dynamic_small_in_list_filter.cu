@@ -22,6 +22,7 @@
 #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_space.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/prepared_build_keys.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 // cudf
@@ -33,7 +34,6 @@
 
 // cccl
 #include <cuda/dynamic_filter_fused_probe.cuh>
-#include <thrust/copy.h>
 
 // cucascade
 #include <cucascade/error.hpp>
@@ -42,7 +42,6 @@
 // rmm
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
-#include <rmm/exec_policy.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
@@ -147,31 +146,45 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
       "[sirius_dynamic_small_in_list_filter] unsupported key column (1..k_max_keys valid keys of "
       "a membership_key_supported type required).");
   }
-  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
-  // device; `build.compacted` stays alive until the needle copy is queued on `stream`.
-  auto const build =
-    prepare_membership_build("[sirius_dynamic_small_in_list_filter]", keys, stream, mr);
-  _domain               = build.domain;
-  _store                = std::make_unique<needle_store>();
-  _store->source_device = build.source_device;
-  _store->num_keys      = static_cast<std::size_t>(build.keys.size());
+  // The prepared column frees stream-ordered after the needle copy is queued on `stream`.
+  auto const prepared =
+    prepare_build_column("[sirius_dynamic_small_in_list_filter]", keys, stream, mr);
+  construct(prepared.domain, prepared.keys->view(), stream, mr);
+}
 
-  // Needles are stored at the rep so one kernel per (adapter, rep) serves every build carrier;
-  // a build carrier other than the rep converts per element on the way in.
-  auto const bytes = _store->num_keys * membership_rep_bytes(_domain.rep);
-  rmm::device_buffer needles{bytes, stream, mr};
-  bool const copied = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
-    using key_type = decltype(key_tag);
-    return detail::with_build_key_iterator<key_type>(
-      _domain, build.keys, stream, mr, [&](auto first, auto last) {
-        thrust::copy(
-          rmm::exec_policy_nosync(stream, mr), first, last, static_cast<key_type*>(needles.data()));
-      });
-  });
-  if (!copied) {
-    throw std::logic_error(
-      "[sirius_dynamic_small_in_list_filter] build carrier does not fit its rep.");
+sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
+  membership_key_domain const& domain,
+  cudf::column_view const& prepared,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  detail::require_prepared("[sirius_dynamic_small_in_list_filter]", domain, prepared);
+  auto const keys = static_cast<std::size_t>(prepared.size());
+  if (keys < 1 || keys > k_max_keys) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_small_in_list_filter] 1..k_max_keys prepared keys required.");
   }
+  construct(domain, prepared, stream, mr);
+}
+
+void sirius_dynamic_small_in_list_filter::construct(membership_key_domain const& domain,
+                                                    cudf::column_view const& prepared,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  _domain               = domain;
+  _store                = std::make_unique<needle_store>();
+  _store->source_device = detail::current_device("[sirius_dynamic_small_in_list_filter]");
+  _store->num_keys      = static_cast<std::size_t>(prepared.size());
+
+  // Needles are stored at the rep so one kernel per (adapter, rep) serves every build carrier.
+  auto const bytes = _store->num_keys * membership_rep_bytes(_domain.rep);
+  rmm::device_buffer needles{
+    prepared.head<std::byte>() +
+      static_cast<std::size_t>(prepared.offset()) * membership_rep_bytes(_domain.rep),
+    bytes,
+    stream,
+    mr};
   _store->replicas.push_back(
     std::make_unique<needle_store::needle_replica>(_store->source_device, std::move(needles)));
 }
