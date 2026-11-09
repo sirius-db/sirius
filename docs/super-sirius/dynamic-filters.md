@@ -1,5 +1,7 @@
 # Dynamic Filters
 
+Terms are defined in the dynamic-filter glossary, [`src/op/dynamic_filter/GLOSSARY.md`](../../src/op/dynamic_filter/GLOSSARY.md).
+
 A **dynamic filter** is a runtime predicate built by one operator and applied by another to avoid work. Sirius currently builds filters from an eligible hash join's complete build side and applies them to:
 
 - a GPU scan reached through the join's probe subtree; or
