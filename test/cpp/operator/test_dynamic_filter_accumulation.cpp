@@ -330,7 +330,8 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
   {
     fixture.session = std::make_unique<op::dynamic_filter_publication_session>(
       fixture.make_plan(256 * mib), &fixture.stats);
-    REQUIRE_FALSE(fixture.session->try_begin_accumulation(std::nullopt));
+    REQUIRE_FALSE(
+      fixture.session->try_begin_accumulation(op::construction_decline::inventory_mismatch));
     REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
   }
   REQUIRE_FALSE(fixture.session->accumulation_claimed());
