@@ -69,12 +69,31 @@ struct window_plan {
   op::ranking_order ranking_order;
 };
 
-// Admit at most one window operator in a plan. Throws NotImplementedException otherwise.
-void validate_window_stages(duckdb::LogicalOperator const& plan);
-
-// Requires resolved column references. Throws NotImplementedException for unsupported
-// combinations, even on empty input. Hidden columns must survive through reduction/expansion and be
-// removed when the visible output is published.
+/**
+ * @brief Plan all expressions of a window as one stage.
+ *
+ * A stage holds either aggregates over the whole partition or ranking functions. Its expressions
+ * must have equivalent `PARTITION BY` keys and, for ranking functions, the same `ORDER BY`. The
+ * physical plan generator splits a window that does not fit one stage and plans each stage with
+ * this rule. The tests use this function to check the plan of a single stage.
+ *
+ * A key or an argument that is not a column reference becomes a hidden column of the prepared
+ * input. Each distinct expression is evaluated once for the stage, and the hidden columns are
+ * removed when the visible output is published.
+ *
+ * The plan is refused, even when the input is empty, if:
+ * - an expression is not a form the window evaluators run, such as a frame that is not the whole
+ *   partition, `DISTINCT`, `FILTER`, or an unsupported function or result type
+ * - the expressions mix aggregates and ranking functions, or do not share one specification
+ * - a key or an argument is volatile, cannot be translated, or has an unsupported type
+ *
+ * @param window The window to plan. Its column references must be resolved. It must have one child
+ * and at least one expression.
+ * @return The plan: the prepared input schema, the partition key slots, the aggregate expressions
+ * or the ranking functions with their order keys, and the output schema.
+ * @throws duckdb::NotImplementedException if the window is refused. The query then falls back to
+ * the CPU.
+ */
 window_plan plan_window(duckdb::LogicalWindow const& window);
 
 /**
