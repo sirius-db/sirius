@@ -66,6 +66,9 @@ interception before a bounded run. CLI details live in [test/fuzz/README.md](tes
 `src/cuda/` (GPU kernels). **Read `docs/super-sirius/` before modifying Super Sirius code** —
 see its [README](docs/super-sirius/README.md) for reading order.
 
+**Dynamic filters** have a binding glossary, `src/op/dynamic_filter/GLOSSARY.md`: write code,
+comments, docs, and PRs about them in its terms.
+
 All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.
 
