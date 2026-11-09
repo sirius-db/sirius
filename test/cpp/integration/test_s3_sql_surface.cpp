@@ -2927,7 +2927,7 @@ TEST_CASE("transparent S3 eligibility covers copy and SQL-replan correspondence"
   }
 }
 
-TEST_CASE("transparent S3 execution rebuild preserves template origin and source veto",
+TEST_CASE("transparent S3 execution rebuild preserves read-view correspondence",
           "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
@@ -2974,18 +2974,11 @@ TEST_CASE("transparent S3 execution rebuild preserves template origin and source
                           : "SELECT sum(n_nationkey) FROM v_s3_rebuild");
         REQUIRE(result);
         INFO((result->HasError() ? result->GetError() : "success"));
-        if (multi) {
-          REQUIRE(result->HasError());
-          CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
-          CHECK(result->GetError().find("reason=no_correspondence") != std::string::npos);
-          CHECK(result->GetError().find("correspondence=none") != std::string::npos);
-        } else {
-          REQUIRE_FALSE(result->HasError());
-          CHECK(result->Collection().GetValue(0, 0).ToString() == "300");
-        }
+        REQUIRE_FALSE(result->HasError());
+        CHECK(result->Collection().GetValue(0, 0).ToString() == (multi ? "600" : "300"));
         auto const after = sirius::test::get_transparent_execution_stats(con);
         CHECK(after.execution_rebuilds == before.execution_rebuilds + 1);
-        CHECK(after.read_view_mismatches == before.read_view_mismatches + (multi ? 1 : 0));
+        CHECK(after.read_view_mismatches == before.read_view_mismatches);
         sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
       }
     }
