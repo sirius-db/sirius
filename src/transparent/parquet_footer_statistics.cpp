@@ -139,8 +139,10 @@ std::shared_ptr<file_statistics const> statistics_of(
 {
   auto version = listed ? version_of(file.path, *listed) : std::nullopt;
   if (!listed) {
-    auto& fs = duckdb::FileSystem::GetFileSystem(context);
-    version = version_of(file.path, fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ)->Stats());
+    // A local file's metadata is one stat; opening it would cost an open and a close.
+    auto& fs            = duckdb::FileSystem::GetFileSystem(context);
+    auto const metadata = fs.GetStatsIfExists(file);
+    if (metadata) { version = version_of(file.path, *metadata); }
     if (auto hit = cached(key, version)) { return hit; }
   }
   auto result = std::make_shared<file_statistics>();
@@ -183,10 +185,19 @@ std::vector<std::shared_ptr<file_statistics const>> statistics_of_all(
   std::vector<std::size_t> unresolved;
   std::vector<std::string> keys(files.size());
   std::vector<std::optional<duckdb::FileMetadata>> listed(files.size());
+  auto& fs = duckdb::FileSystem::GetFileSystem(context);
   for (std::size_t i = 0; i < files.size(); ++i) {
     keys[i]   = cache_key(options_identity, files[i].path);
     listed[i] = listed_metadata(files[i]);
-    if (listed[i]) { result[i] = cached(keys[i], version_of(files[i].path, *listed[i])); }
+    if (listed[i]) {
+      result[i] = cached(keys[i], version_of(files[i].path, *listed[i]));
+    } else if (!duckdb::FileSystem::IsRemoteFile(files[i].path)) {
+      // A local file costs one stat to check, less than scheduling a task for it; only a miss,
+      // which reads a footer, goes to the executor.
+      if (auto const metadata = fs.GetStatsIfExists(files[i])) {
+        result[i] = cached(keys[i], version_of(files[i].path, *metadata));
+      }
+    }
     if (!result[i]) { unresolved.push_back(i); }
   }
   auto read = [&](std::size_t i) {
