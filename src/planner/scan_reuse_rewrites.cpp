@@ -36,6 +36,7 @@
 #include <log/logging.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -953,6 +954,155 @@ bool reuse_outer_rows(unique_ptr<LogicalOperator>& root,
   return true;
 }
 
+//===----------------------------------------------------------------------===//
+// Rule: one CTE for two equal join regions (TPC-H Q11)
+//===----------------------------------------------------------------------===//
+
+/// Whether two regions hold the same rows: the same scans, the same join equalities (as classes,
+/// whatever the join order) and the same filters.
+bool same_region(join_region& a, join_region& b)
+{
+  if (a.delim != nullptr || b.delim != nullptr || a.leaves.size() != b.leaves.size()) {
+    return false;
+  }
+  for (auto const& [id, get] : a.leaves) {
+    if (!b.leaves.contains(id)) { return false; }
+  }
+  column_classes ca, cb;
+  for (auto const& [x, y] : a.equalities) {
+    ca.join(x, y);
+  }
+  for (auto const& [x, y] : b.equalities) {
+    cb.join(x, y);
+  }
+  for (auto const& [x, y] : a.equalities) {
+    if (!cb.same(x, y)) { return false; }
+  }
+  for (auto const& [x, y] : b.equalities) {
+    if (!ca.same(x, y)) { return false; }
+  }
+  std::multiset<std::string> fa, fb;
+  for (auto const& f : a.filters) {
+    fa.insert(f.first);
+  }
+  for (auto const& f : b.filters) {
+    fb.insert(f.first);
+  }
+  return fa == fb;
+}
+
+/// The first region with a join under @p op, through operators with one child.
+LogicalOperator* region_below(LogicalOperator& op)
+{
+  LogicalOperator* at = &op;
+  while (true) {
+    if (at->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+      auto region = region_of(*at);
+      return region && region->leaves.size() >= 2 && region->delim == nullptr ? at : nullptr;
+    }
+    if (at->children.size() != 1) { return nullptr; }
+    at = at->children[0].get();
+  }
+}
+
+/// Shares the regions under @p slot's two children when they are equal: one becomes a CTE read in
+/// both places.
+bool share_equal_regions(unique_ptr<LogicalOperator>& root,
+                         unique_ptr<LogicalOperator>& slot,
+                         scan_reuse_counts const& counts,
+                         removed_subtree_callback const& removed)
+{
+  if (slot->children.size() != 2 || slot->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+      slot->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+      slot->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+    return false;
+  }
+  LogicalOperator* roots[2] = {region_below(*slot->children[0]), region_below(*slot->children[1])};
+  if (roots[0] == nullptr || roots[1] == nullptr) { return false; }
+  auto regions = std::array{region_of(*roots[0]), region_of(*roots[1])};
+  if (!same_region(*regions[0], *regions[1])) {
+    not_applied("shared join", "the two joins differ");
+    return false;
+  }
+
+  std::vector<ColumnBinding> referenced;
+  for (auto const definition : {0, 1}) {
+    auto const other = 1 - definition;
+    auto& kept       = *roots[definition];
+    auto& dropped    = *roots[other];
+    kept.ResolveOperatorTypes();
+    auto const kept_bindings = kept.GetColumnBindings();
+    auto const kept_types    = kept.types;
+    region_builder kept_columns(*regions[definition]);
+    region_builder dropped_columns(*regions[other]);
+    std::vector<std::optional<region_column>> kept_output;
+    for (auto const& binding : kept_bindings) {
+      kept_output.push_back(kept_columns.column(kept, binding));
+    }
+    referenced.clear();
+    collect_plan_references(*root, &dropped, referenced);
+    auto const tables = next_table_index(*root);
+    duckdb::TableIndex const cte_index(tables), kept_ref(tables + 1), dropped_ref(tables + 2);
+    std::vector<duckdb::ReplacementBinding> replacements;
+    bool complete = true;
+    for (auto const& binding : dropped.GetColumnBindings()) {
+      if (std::find(referenced.begin(), referenced.end(), binding) == referenced.end()) {
+        continue;
+      }
+      auto const c  = dropped_columns.column(dropped, binding);
+      auto const at = c ? std::find(kept_output.begin(), kept_output.end(), c) : kept_output.end();
+      if (at == kept_output.end()) {
+        complete = false;
+        break;
+      }
+      replacements.emplace_back(
+        binding, ColumnBinding(dropped_ref, ProjectionIndex(at - kept_output.begin())));
+    }
+    if (!complete) { continue; }
+
+    // Nothing fails from here on.
+    duckdb::vector<duckdb::Identifier> names;
+    for (std::size_t j = 0; j < kept_types.size(); ++j) {
+      names.emplace_back("c" + std::to_string(j));
+    }
+    for (std::size_t j = 0; j < kept_bindings.size(); ++j) {
+      replacements.emplace_back(kept_bindings[j], ColumnBinding(kept_ref, ProjectionIndex(j)));
+    }
+    auto* kept_slot    = slot_of(slot, &kept);
+    auto* dropped_slot = slot_of(slot, &dropped);
+    if (removed) { removed(**dropped_slot); }
+    auto dropped_ref_op =
+      duckdb::make_uniq<duckdb::LogicalCTERef>(dropped_ref, cte_index, kept_types, names);
+    dropped_ref_op->estimated_cardinality     = dropped.estimated_cardinality;
+    dropped_ref_op->has_estimated_cardinality = dropped.has_estimated_cardinality;
+    *dropped_slot                             = std::move(dropped_ref_op);
+    auto definition_op                        = std::move(*kept_slot);
+    auto kept_ref_op =
+      duckdb::make_uniq<duckdb::LogicalCTERef>(kept_ref, cte_index, kept_types, names);
+    kept_ref_op->estimated_cardinality     = definition_op->estimated_cardinality;
+    kept_ref_op->has_estimated_cardinality = definition_op->has_estimated_cardinality;
+    *kept_slot                             = std::move(kept_ref_op);
+    auto* definition_raw                   = definition_op.get();
+    auto cte                               = duckdb::make_uniq<duckdb::LogicalMaterializedCTE>(
+      duckdb::Identifier("scan_reuse_" + std::to_string(counts.total())),
+      cte_index,
+      kept_types.size(),
+      std::move(definition_op),
+      std::move(slot),
+      duckdb::CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+    cte->estimated_cardinality     = cte->children[1]->estimated_cardinality;
+    cte->has_estimated_cardinality = cte->children[1]->has_estimated_cardinality;
+    slot                           = std::move(cte);
+    duckdb::ColumnBindingReplacer replacer;
+    replacer.replacement_bindings = std::move(replacements);
+    replacer.stop_operator        = definition_raw;
+    replacer.VisitOperator(*root);
+    return true;
+  }
+  not_applied("shared join", "neither join outputs every column read from the other");
+  return false;
+}
+
 void rewrite(duckdb::ClientContext& context,
              unique_ptr<LogicalOperator>& root,
              unique_ptr<LogicalOperator>& op,
@@ -968,6 +1118,8 @@ void rewrite(duckdb::ClientContext& context,
   } else if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN &&
              reuse_outer_rows(root, op, counts, removed)) {
     ++counts.correlated_aggregates;
+  } else if (share_equal_regions(root, op, counts, removed)) {
+    ++counts.shared_regions;
   }
 }
 
@@ -983,9 +1135,10 @@ scan_reuse_counts rewrite_repeated_scans(duckdb::ClientContext& context,
   if (counts.total() != 0) {
     SIRIUS_LOG_INFO(
       "[scan reuse] rewrote the plan: {} IN-subquery aggregate(s) reused, {} correlated "
-      "aggregate(s) over the outer rows",
+      "aggregate(s) over the outer rows, {} join(s) shared",
       counts.semi_join_aggregates,
-      counts.correlated_aggregates);
+      counts.correlated_aggregates,
+      counts.shared_regions);
   }
   return counts;
 }

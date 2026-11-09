@@ -44,10 +44,12 @@ struct scan_reuse_counts {
   std::size_t semi_join_aggregates = 0;
   /// A correlated MIN/MAX/AVG subquery that read the outer query's rows again (TPC-H Q17, Q2).
   std::size_t correlated_aggregates = 0;
+  /// Two equal joins computed once (TPC-H Q11).
+  std::size_t shared_regions = 0;
 
   [[nodiscard]] std::size_t total() const noexcept
   {
-    return semi_join_aggregates + correlated_aggregates;
+    return semi_join_aggregates + correlated_aggregates + shared_regions;
   }
 };
 
@@ -80,6 +82,12 @@ using removed_subtree_callback = std::function<void(duckdb::LogicalOperator cons
  * the number of E rows with key k, and those aggregates do not change. Rewritten: O is materialized
  * once as a CTE, the DELIM JOIN reads it, and the subquery's R becomes the CTE (still joined with
  * the DELIM_GET).
+ *
+ * Compute two equal joins once (TPC-H Q11). Shape: an operator with two children, each leading
+ * through operators with one child to an inner-join region of at least two scans, the two regions
+ * equal (the same scans, equalities and filters, in any join order). Rewritten: one region is
+ * materialized as a CTE and both places read it, when every column read from the other region is
+ * one the first outputs.
  */
 scan_reuse_counts rewrite_repeated_scans(duckdb::ClientContext& context,
                                          duckdb::unique_ptr<duckdb::LogicalOperator>& plan,

@@ -318,3 +318,49 @@ TEST_CASE_METHOD(scan_reuse_fixture,
     CHECK(scans_of(*plan, table) == scans);
   }
 }
+
+namespace {
+
+/// TPC-H Q11 (fraction 0.0001), and variants of its subquery.
+std::string q11(std::string const& subquery_nation = "GERMANY", std::string const& extra = "")
+{
+  return "select ps.ps_partkey, sum(ps.ps_supplycost * ps.ps_availqty) as value from partsupp ps, "
+         "supplier s, nation n where ps.ps_suppkey = s.s_suppkey and s.s_nationkey = "
+         "n.n_nationkey and n.n_name = 'GERMANY' group by ps.ps_partkey having "
+         "sum(ps.ps_supplycost * ps.ps_availqty) > (select sum(ps.ps_supplycost * ps.ps_availqty) "
+         "* 0.0001 from partsupp ps, supplier s, nation n" +
+         std::string(extra.empty() ? "" : ", region r") +
+         " where ps.ps_suppkey = s.s_suppkey and s.s_nationkey = n.n_nationkey and n.n_name = '" +
+         subquery_nation + "'" + extra + ") order by value desc";
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(scan_reuse_fixture,
+                 "TPC-H Q11 computes its partsupp join once",
+                 "[planner][scan_reuse]")
+{
+  sirius::planner::scan_reuse_counts counts;
+  auto plan = rewritten(q11(), counts);
+  CHECK(counts.shared_regions == 1);
+  CHECK(materialized_ctes(*plan) == 1);
+  for (auto const* table : {"partsupp", "supplier", "nation"}) {
+    INFO(table);
+    CHECK(scans_of(*plan, table) == 1);
+  }
+}
+
+TEST_CASE_METHOD(scan_reuse_fixture, "joins that differ are not shared", "[planner][scan_reuse]")
+{
+  for (auto const& [why, sql] : {
+         std::pair<char const*, std::string>{"another nation", q11("N2")},
+         std::pair<char const*, std::string>{"an extra join on one side",
+                                             q11("GERMANY", " and n.n_regionkey = r.r_regionkey")},
+       }) {
+    INFO(why);
+    sirius::planner::scan_reuse_counts counts;
+    auto plan = rewritten(sql, counts);
+    CHECK(counts.shared_regions == 0);
+    CHECK(scans_of(*plan, "partsupp") == 2);
+  }
+}
