@@ -11,8 +11,9 @@ disable-model-invocation: true
 # Commit Comparison / Bisect Tool
 
 Find which commit introduced a regression using an isolated checkout and a repeatable test. For
-build and query details, consult `.claude/skills/_shared/build-and-query.md`. Do not create commits
-or modify the user's checkout for this investigation.
+build presets and SQL invocation, consult `.claude/skills/_shared/build-and-query.md`, adapting
+paths to the isolated worktree. Do not follow its checkout or checkpoint instructions, create
+commits, or modify the user's checkout for this investigation.
 
 ## Prepare
 
@@ -25,7 +26,7 @@ measurement procedure and threshold that distinguish the endpoints, accounting f
 variation.
 
 Create a unique working directory under a user-selected parent if provided, otherwise choose a
-writable location with sufficient space for a full build; it need not be under `/tmp`. Create a
+writable location with sufficient space for a full build and its Pixi environment; it need not be under `/tmp`. Create a
 detached Git worktree inside it. Resolve dataset, database and configuration paths to absolute paths
 before switching checkouts. Run all checkouts, builds, tests and `git bisect` commands in that
 worktree. Keep the original checkout, including staged, unstaged and untracked files, untouched;
@@ -34,7 +35,12 @@ clean or overwrite the original build. Use the requested build preset if specifi
 the appropriate default rather than requiring a prompt. Keep scripts, baseline and logs outside the
 worktree so checkouts cannot overwrite them.
 
-For SQL, run the same query and data against DuckDB CPU once to capture a baseline. Preserve types,
+For SQL, preserve the source dataset. Use read-only access when possible; for state-changing
+tests, use a disposable copy or resettable fixture restored to identical initial state before the
+CPU baseline and each revision test. Never run mutations against the user's database.
+Run the same query and initial data against DuckDB CPU once to capture a baseline, explicitly
+using `SIRIUS_DISABLE=1` for the CPU process. The wrapper's DuckDB CLI has the Sirius
+extension built in regardless of `SIRIUS_DUCKDB_LINKAGE`; omitting `LOAD` is insufficient. Preserve types,
 NULLs, duplicates and any meaningful order; normalize row order only when SQL semantics permit it.
 Use bounded, repeatable inputs and runs, and record the command, data, baseline and comparison
 method. Establish that the good endpoint passes and the bad endpoint reproduces the reported
@@ -51,7 +57,9 @@ cannot be established or the test cannot distinguish them.
 
 Write a test script in the working directory. At every bisect step it must update the worktree's
 required submodules to the checked-out revision before building, then run the selected test and
-classify the result deliberately. A submodule update failure that prevents testing is a skip:
+classify the result deliberately. Use `pixi run --locked` to preserve each revision's lockfile;
+an unrelated environment-install or submodule-update failure that prevents testing is a skip.
+If a broken dependency pin is the target regression, matching evidence is bad, not a skip:
 
 - `0`: good; `1`: the specified regression is reproduced; `125`: untestable, including build
   failures or inconclusive evidence that prevents evaluating the target predicate. A reproduced
@@ -64,7 +72,8 @@ For example, the build step must explicitly classify failure before running the 
 predicate below checks captured build evidence and is false unless that failure is the target:
 
 ```bash
-if ! <build-command>; then
+build_log="<absolute-log-dir>/build-$(git rev-parse HEAD).log"
+if ! <build-command> >"$build_log" 2>&1; then
   if <target-build-failure-predicate>; then
     exit 1
   fi
@@ -91,5 +100,5 @@ predicate to failures and GPU execution; report unrelated or inconclusive observ
 
 On completion, failure or interruption, reset an active bisect in the isolated worktree and remove
 the worktree with `git worktree remove` before deleting the working directory. Preserve any
-requested logs or results outside it first; use `--force` if the isolated build leaves untracked
-files behind. If cleanup cannot finish, report the worktree path and cleanup commands. The original checkout remains on its original branch and retains its changes.
+requested logs or results outside it first. Initialized submodules or leftover build files may
+require `--force`; use it only for this investigation's disposable worktree after preserving evidence. If cleanup cannot finish, report the worktree path and cleanup commands. The original checkout remains on its original branch and retains its changes.

@@ -112,14 +112,18 @@ and base object IDs again. If either moved, discard the captured metadata and di
 Step 2 so the file list, hunks, and revisions describe the same PR state. If the PR keeps moving,
 stop and report that a consistent snapshot could not be obtained. Use the captured GitHub file
 list and diff as the authority for scope; a local three-dot diff can include unrelated changes.
-Resolve the comparison's merge base from GitHub's compare API for the recorded base and head
+The compare API's merge base is only a candidate for the PR's diff base
 (`gh api repos/<owner>/<repo>/compare/<base-oid>...<head-oid> --jq .merge_base_commit.sha`).
-Record it separately from the base tip, and check that old-side context matches the captured PR
-diff. If it cannot be resolved or does not match, report the limitation rather than assigning old
-lines to an unverified revision.
+[GitHub can use different bases for compare and PR diffs](https://docs.github.com/en/pull-requests/reference/pull-requests#differences-between-commits-on-compare-and-pull-request-pages).
+Verify the complete captured patch against the candidate-to-head diff, including changed paths,
+old/new blobs, modes and hunks; matching a few context lines is insufficient. If it differs,
+use the captured patch's old blob IDs and the PR/base history to locate an earlier candidate
+containing those blobs at their old paths, then verify the whole patch again. Record the verified
+PR diff-base commit separately from the base tip. If none can be verified, report the limitation
+and omit unverified old-side source links rather than substituting the compare diff.
 
 Inspect the exact recorded commits to resolve source context and line numbers. Use locally available
-Git objects (`git show <head-oid>:<path>` and `git show <merge-base-oid>:<path>`). If needed,
+Git objects (`git show <head-oid>:<path>` and `git show <diff-base-oid>:<path>`). If needed,
 fetch the PR head from the base repository's URL using `refs/pull/<n>/head` (not an assumed
 `origin` or fork):
 
@@ -127,7 +131,7 @@ fetch the PR head from the base repository's URL using `refs/pull/<n>/head` (not
 git fetch --no-tags --no-write-fetch-head https://github.com/<owner>/<repo>.git refs/pull/<n>/head
 ```
 
-Fetch the base branch or required objects from the same repository if needed. Verify the recorded head, base, and merge-base objects exist as
+Fetch the base branch or required objects from the same repository if needed. Verify the recorded head, base, and diff-base objects exist as
 commits; a moving ref may fetch a different head, so do not substitute it for the recorded SHA.
 If a checkout is useful, create a separate detached temporary worktree at the pinned head, and
 remove it when finished. Do not checkout, stash, commit,
@@ -278,7 +282,7 @@ safe, which means you have to check rather than assume.
 
 Detect moves from the diff: `gh pr diff` marks pure renames as `rename from` / `rename to` with no
 hunks, but a move plus edits usually appears as a separate delete + add pair with near-identical
-content. `gh pr view --json files` paths compared against the pinned merge-base tree will surface the
+content. `gh pr view --json files` paths compared against the pinned diff-base tree will surface the
 latter. For each moved file or function, diff old content against new content and classify it:
 
 - **Logically intact** — content is byte-identical apart from things that can't change behavior:
@@ -313,13 +317,13 @@ what keeps it honest instead of silently confident.
 ## Link rules (all of this exists so the digest is actually navigable, not just readable)
 
 - Every file mention is a Markdown link. Use GitHub permalinks to the pinned head commit for
-  current code and to the pinned merge-base commit for removed or old diff code, for example
+  current code and to the verified PR diff-base commit for removed or old diff code, for example
   `[foo.cpp](https://github.com/<owner>/<repo>/blob/<head-oid>/src/foo.cpp#L123)`. Encode paths
   as needed for URLs. These links remain accurate even if the user's checkout is dirty or on a
-  different branch. Link moved files to their respective merge-base and head revisions.
+  different branch. Link moved files to their respective diff-base and head revisions.
 - Never use `foo.{hpp,cpp}` shorthand for a header/source pair — link each file separately.
 - Get line numbers by reading the file at its pinned revision, not from memory or diff hunk headers
-  alone. Near the top of the digest, identify the head, base tip and merge-base commit IDs used; note that a later
+  alone. Near the top of the digest, identify the head, base tip and diff-base commit IDs used; note that a later
   PR update may differ from this snapshot.
 
 ## Output
@@ -337,7 +341,7 @@ what keeps it honest instead of silently confident.
   1. Title + a one-line note that this digest explains what the PR does and where it lives, and
      is not a critique or approval recommendation — so nobody mistakes "no concerns listed" for
      "no concerns found."
-  2. A one-line snapshot note with the pinned head, base tip and merge-base commits (see Link rules).
+  2. A one-line snapshot note with the pinned head, base tip and diff-base commits (see Link rules).
   3. Header table: PR number/link, title, author, branch (head → base), scope (commit/file
      count), closes, supersedes.
   4. The PR description, quoted.
@@ -358,21 +362,19 @@ what keeps it honest instead of silently confident.
 After the Markdown is complete, render its companion preview with the repository-local script:
 
 ```sh
-pixi run python .agents/skills/pr-digest/scripts/render_digest_html.py \
+python3 -I .agents/skills/pr-digest/scripts/render_digest_html.py \
   PR_digests/PR_digest_<PR_NUMBER>.md \
   PR_digests/PR_digest_<PR_NUMBER>.html
 ```
 
-If `pixi` is unavailable, run the same script with `python3`; it uses only the Python standard
-library. Treat a renderer failure as an incomplete digest, not an optional preview. Check the
+The renderer uses only the Python standard library. Treat a renderer failure as an incomplete digest, not an optional preview. Check the
 reported counts against the Markdown's `diff` and Mermaid fences, confirm the HTML contains no
 remote assets, and open the HTML in Codex when a preview facility is available.
 
 In the final response, link both files and identify Markdown as the editable source and HTML as
-the rendered preview. Also identify the pinned head, base tip and merge-base commits used for the digest.
+the rendered preview. Also identify the pinned head, base tip and diff-base commits used for the digest.
 
 See `references/example_digest.md` in this skill directory for a full worked example (PR #1277 —
 sirius-db/sirius, "dynamic filters: SIP") showing the expected structure, link density, trimming
-style, and tagging. Its historical relative source links and line-number caveat predate the pinned
-snapshot rules above; do not copy them for a new digest. Use `references/plain_language.md` as the
+style, and tagging. Use `references/plain_language.md` as the
 authority for prose style when the worked example uses denser technical language.
