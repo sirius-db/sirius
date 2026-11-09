@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/dynamic_filter/complete_build_inventory.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_outcome.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -31,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace cucascade {
 class data_batch;
@@ -86,6 +88,15 @@ class dynamic_filter_publication_session final {
 
   [[nodiscard]] dynamic_filter_publish_plan const& plan() const noexcept;
   void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
+
+  /**
+   * @brief Names the join in this session's `[dynamic_filter_key]` lines
+   *
+   * The session emits one such DEBUG line per admitted key with a binding when it becomes terminal,
+   * after releasing its mutex (see `dynamic_filter_key_outcome.hpp`). `sirius_pipeline_converter`
+   * sets the identity once operators are numbered; until then the lines carry an empty identity.
+   */
+  void set_join_identity(dynamic_filter_join_identity identity) noexcept;
 
   /**
    * @brief Starts accumulating against @p inventory. Call on an untracked thread (the task
@@ -216,6 +227,9 @@ class dynamic_filter_publication_session final {
  */
 struct dynamic_filter_publication_outcome : dynamic_filter_stats_snapshot {
   std::size_t active_targets = 0;
+  /// One outcome per admitted key of the plan, by admitted-key index; keys without a binding keep
+  /// the default.
+  std::vector<dynamic_filter_key_outcome> keys;
 };
 
 /**

@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -39,6 +40,7 @@
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_outcome.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_filter.hpp"
@@ -57,6 +59,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -557,6 +560,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     sirius::op::sirius_physical_nested_loop_join::is_join_type_supported(op.join_type);
   const bool nlj_is_supported = nlj_conditions_supported && nlj_join_type_supported;
 
+  // Spelled before wrapping drains the conditions: the spelling names a hash join in its
+  // dynamic-filter key lines, as the join's EXPLAIN text does.
+  std::vector<std::string> condition_spellings;
+  condition_spellings.reserve(op.conditions.size());
+  for (auto const& condition : op.conditions) {
+    if (!condition.IsComparison()) { continue; }  // Wrapping rejects the join.
+    condition_spellings.push_back(condition.GetLHS().ToString() + " " +
+                                  duckdb::ExpressionTypeToOperator(condition.GetComparisonType()) +
+                                  " " + condition.GetRHS().ToString());
+  }
+
   // Wrap once — subsequent checks and ctors consume from the wrapped vector.
   duckdb::vector<sirius::join_condition> conditions =
     sirius::wrap_join_conditions(std::move(op.conditions));
@@ -781,6 +795,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     hj.mark_join_build_switch_ratio   = op_params.mark_join_build_switch_ratio;
     hj.runtime_distinct_build_probe   = op_params.enable_runtime_distinct_build_probe;
     hj.max_build_probe_resident_bytes = op_params.max_build_probe_resident_bytes;
+    hj.dynamic_filter_signature       = sirius::op::dynamic_filter_join_signature(
+      duckdb::JoinTypeToString(op.join_type), condition_spellings);
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 

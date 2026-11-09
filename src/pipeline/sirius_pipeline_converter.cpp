@@ -17,6 +17,7 @@
 #include "pipeline/sirius_pipeline_converter.hpp"
 
 #include "log/logging.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_outcome.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"  // IWYU pragma: keep
@@ -36,6 +37,7 @@
 #include <duckdb/common/types/blob.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <sstream>
@@ -87,6 +89,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   // the one point every caller shares — the engine, and the plan-inspection paths that convert
   // without building an engine — so no consumer can observe an unnumbered plan.
   assign_operator_ids(scheduled_);
+  identify_dynamic_filter_joins();
 
   return {std::move(scheduled_), std::move(repository_wirings_), meta_pipeline_count_};
 }
@@ -372,15 +375,15 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
   }
 }
 
-void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
+std::vector<op::sirius_physical_hash_join*> sirius_pipeline_converter::scheduled_hash_joins() const
 {
-  auto const& admitted = build_ctx_.active_gpu_ids();
-  std::unordered_set<op::sirius_physical_hash_join*> joins;
-
+  std::vector<op::sirius_physical_hash_join*> joins;
+  std::unordered_set<op::sirius_physical_hash_join*> seen;
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) { joins.insert(join); }
+    auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op);
+    if (join != nullptr && seen.insert(join).second) { joins.push_back(join); }
   };
-  for (auto& pipe : scheduled_) {
+  for (auto const& pipe : scheduled_) {
     if (!pipe) continue;
     auto sink   = pipe->get_sink();
     auto source = pipe->get_source();
@@ -391,6 +394,31 @@ void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
       apply_to_op(&op_ref.get());
     }
   }
+  return joins;
+}
+
+void sirius_pipeline_converter::identify_dynamic_filter_joins()
+{
+  auto joins = scheduled_hash_joins();
+  std::ranges::sort(joins, {}, [](auto const* join) { return join->get_operator_id(); });
+  std::vector<std::uint64_t> signatures;
+  signatures.reserve(joins.size());
+  for (auto const* join : joins) {
+    signatures.push_back(join->dynamic_filter_signature);
+  }
+  auto const occurrences = op::dynamic_filter_join_occurrences(signatures);
+  for (std::size_t index = 0; index < joins.size(); ++index) {
+    joins[index]->dynamic_filter_session().set_join_identity(
+      {.signature   = signatures[index],
+       .occurrence  = occurrences[index],
+       .operator_id = joins[index]->get_operator_id()});
+  }
+}
+
+void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
+{
+  auto const& admitted = build_ctx_.active_gpu_ids();
+  auto const joins     = scheduled_hash_joins();
   for (auto* join : joins) {
     join->restrict_dynamic_filter_replicas(admitted);
   }

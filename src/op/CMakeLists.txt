@@ -59,6 +59,8 @@ target_sources(
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/complete_build_inventory.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
+          dynamic_filter/dynamic_filter_key_outcome.cpp
+          dynamic_filter/post_unlock_actions.cpp
           dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp
