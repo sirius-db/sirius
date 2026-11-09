@@ -22,6 +22,7 @@
  */
 
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
+#include "operator/dynamic_filter_column_test_utils.hpp"
 #include "operator/operator_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -57,51 +58,8 @@ namespace {
 
 namespace op  = sirius::op;
 namespace acc = sirius::test::accumulation;
-
-/// A column of @p type holding @p values bit-for-bit, with row `i` null iff `valid[i]` is false.
-template <class T>
-std::unique_ptr<cudf::column> make_column(cudf::data_type type,
-                                          std::vector<T> const& values,
-                                          ::cuda::stream_ref stream,
-                                          std::vector<bool> const& valid = {})
-{
-  auto column = cudf::make_fixed_width_column(
-    type, static_cast<cudf::size_type>(values.size()), cudf::mask_state::UNALLOCATED, stream);
-  REQUIRE(cudaMemcpyAsync(column->mutable_view().head(),
-                          values.data(),
-                          values.size() * sizeof(T),
-                          cudaMemcpyHostToDevice,
-                          stream.get()) == cudaSuccess);
-  if (!valid.empty()) {
-    auto mask = cudf::create_null_mask(column->size(), cudf::mask_state::ALL_VALID, stream);
-    cudf::size_type nulls = 0;
-    for (std::size_t row = 0; row < valid.size(); ++row) {
-      if (valid[row]) { continue; }
-      cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()),
-                          static_cast<cudf::size_type>(row),
-                          static_cast<cudf::size_type>(row + 1),
-                          false,
-                          stream);
-      ++nulls;
-    }
-    column->set_null_mask(std::move(mask), nulls);
-  }
-  stream.sync();
-  return column;
-}
-
-template <class T>
-std::vector<T> to_host(cudf::column_view const& column, ::cuda::stream_ref stream)
-{
-  std::vector<T> values(static_cast<std::size_t>(column.size()));
-  REQUIRE(cudaMemcpyAsync(values.data(),
-                          column.head<std::byte>() + column.offset() * sizeof(T),
-                          values.size() * sizeof(T),
-                          cudaMemcpyDeviceToHost,
-                          stream.get()) == cudaSuccess);
-  stream.sync();
-  return values;
-}
+using sirius::test::columns::make_column;
+using sirius::test::columns::to_host;
 
 /// Prepares @p keys at the domain of @p domain_type into an exactly sized column.
 std::unique_ptr<cudf::column> prepare(cudf::data_type domain_type,
