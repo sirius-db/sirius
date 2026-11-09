@@ -15,7 +15,6 @@
  */
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 
@@ -33,7 +32,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 
 namespace sirius::op {
 
@@ -77,22 +75,6 @@ struct bounded_compacting_write {
     } else if (overflow != nullptr) {
       atomicOr(overflow, 1u);
     }
-  }
-};
-
-/// The fingerprint the string probes compute for row `row`, read from the column's offsets and
-/// bytes so no device view (and no host copy of one) is needed.
-template <class OffsetT>
-struct string_fingerprint_at {
-  char const* chars;
-  OffsetT const* offsets;  // Already advanced to the column's first row
-
-  __device__ std::uint64_t operator()(cudf::size_type row) const
-  {
-    auto const begin = offsets[row];
-    auto const bytes = static_cast<cudf::size_type>(offsets[row + 1] - begin);
-    return detail::string_fingerprint_hasher{detail::string_fingerprint_seed}(
-      cudf::string_view{chars + begin, bytes});
   }
 };
 
@@ -156,23 +138,10 @@ void prepare_build_keys(membership_key_domain const& domain,
       throw std::logic_error(
         "[prepare_build_keys] the build column is not a carrier of its domain");
     }
-    if (keys.size() == 0) { return; }
-    cudf::strings_column_view const strings{keys};
-    auto const chars   = strings.chars_begin(stream);
-    auto const offsets = strings.offsets();
-    auto const write   = [&](auto const* first_offset) {
-      using offset_type       = std::remove_cv_t<std::remove_pointer_t<decltype(first_offset)>>;
-      auto const fingerprints = thrust::make_transform_iterator(
-        thrust::counting_iterator<cudf::size_type>(0),
-        string_fingerprint_at<offset_type>{chars, first_offset + keys.offset()});
+    detail::with_string_fingerprint_iterator(keys, stream, [&](auto fingerprints) {
       compact_bounded<std::uint64_t>(
         fingerprints, keys, out.data<std::uint64_t>(), out.size(), overflow, stream, scratch);
-    };
-    if (offsets.type().id() == cudf::type_id::INT64) {
-      write(offsets.data<std::int64_t>());
-    } else {
-      write(offsets.data<std::int32_t>());
-    }
+    });
     return;
   }
   bool const prepared = detail::dispatch_key_rep(domain.rep, [&](auto key_tag) {
