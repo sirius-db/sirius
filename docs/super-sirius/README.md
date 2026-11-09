@@ -37,6 +37,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
 | [Distributed Quick Start](distributed-quickstart.md) | Sirius on several machines in three commands: `sirius-gateway`, `sirius-node` and `sirius-client`, the `sirius.distributed` config section, recovery, Slurm and troubleshooting |
+| [Distributed Experiments](distributed-experiments.md) | Notes for agents running benchmarks on NVL4 and NVL72 nodes under Slurm: rules, preflight, configs, one arm end to end, validating answers, dataset layout, reference numbers and known failures |
 | [Distributed Gateway](distributed-gateway.md) | One SQL endpoint over Quack for every rank: routing, query numbers, the DDL log, spawned and registered ranks, fail-stop and the cancel ladder |
 | [Distributed Execution](distributed-sirius.md) | One query across processes and GPUs: `EXCHANGE_SINK`/`EXCHANGE_SOURCE`, the NIXL transport with per-peer credits, the plan rewrite, Bloom filters merged across ranks, and running TPC-H Q12 on 4 GPUs |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |
