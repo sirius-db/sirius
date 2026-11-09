@@ -334,6 +334,8 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] bool has_persistent_set() const noexcept;
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
+  /// Whether @p valid_rows valid keys of @p key_type can be stored; any count can.
+  [[nodiscard]] static bool supports(cudf::data_type key_type, std::size_t valid_rows) noexcept;
   /// Baseline footprint of a set over @p num_keys keys of @p key_type, sized at the key's rep.
   [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
                                                        cudf::data_type key_type) noexcept;
@@ -418,6 +420,8 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
+  /// Whether @p valid_rows valid keys of @p key_type fit: 1 to `k_max_keys` of a supported type.
+  [[nodiscard]] static bool supports(cudf::data_type key_type, std::size_t valid_rows) noexcept;
 
  private:
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
