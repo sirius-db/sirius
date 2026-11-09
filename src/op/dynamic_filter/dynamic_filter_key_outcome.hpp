@@ -50,8 +50,9 @@ namespace sirius::op {
  * @brief Why a key ended with the filters its line reports
  *
  * The three `attempt_*` reasons mean the whole publication attempt ended before this key's filters
- * reached the fan-out; `dynamic_filter_key_outcome::attempt_counter` names the counter that
- * recorded the attempt's end.
+ * reached the fan-out, and `declined` means the construction site declined its build input before
+ * any attempt (`construction_decline`); `dynamic_filter_key_outcome::reason_detail` names the
+ * counter that recorded the attempt's end or the decline reason.
  */
 enum class dynamic_filter_key_reason : std::uint8_t {
   published,         ///< Printed `-`: the key's filters reached the fan-out
@@ -64,6 +65,7 @@ enum class dynamic_filter_key_reason : std::uint8_t {
   attempt_skip,      ///< The attempt ended without a filter
   attempt_fail,      ///< The attempt failed
   attempt_cancel,    ///< The attempt was cancelled
+  declined,          ///< The construction site declined its build input
   not_constructed    ///< No attempt constructed this key's filters, for example an empty build
 };
 
@@ -85,8 +87,9 @@ struct dynamic_filter_key_outcome {
   std::size_t pushed = 0;
   /** @brief Why the key ended this way */
   dynamic_filter_key_reason reason = dynamic_filter_key_reason::not_constructed;
-  /** @brief For an `attempt_*` reason, the `dynamic_filter_stats` counter that ended the attempt */
-  std::string_view attempt_counter{};
+  /** @brief The counter that ended an `attempt_*` reason's attempt, or a `declined` reason's
+   * `construction_decline` */
+  std::string_view reason_detail{};
 };
 
 /**
@@ -122,8 +125,8 @@ struct dynamic_filter_key_line {
  *
  * The message is `[dynamic_filter_key] v=1 sig=<16 hex> occ=<n> join=<id|-> condition=<n>
  * build_ordinal=<n> rows=<n> valid=<n|unknown> kind=<none|bloom|small_in_list|hash_in_list>
- * size=<n> zone_map=<0|1> pushed=<n> reason=<token>`, where an `attempt_*` reason is followed by
- * `_<counter>`. A change to this form must bump `v`.
+ * size=<n> zone_map=<0|1> pushed=<n> reason=<token>`, where an `attempt_*` or `declined` reason is
+ * followed by `_<detail>`. A change to this form must bump `v`.
  */
 [[nodiscard]] std::string to_string(dynamic_filter_key_line const& line);
 

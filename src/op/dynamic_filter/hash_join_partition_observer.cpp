@@ -17,6 +17,7 @@
 #include "op/dynamic_filter/hash_join_partition_observer.hpp"
 
 #include "log/logging.hpp"
+#include "op/dynamic_filter/build_input_certification.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
@@ -44,38 +45,20 @@ bool hash_join_partition_observer::before_claim()
   std::lock_guard guard(_mutex);
   if (_decided) { return true; }
   if (eligible()) {
-    auto& session                               = _join.dynamic_filter_session();
-    sirius_physical_operator::port const* input = nullptr;
-    std::size_t data_ports                      = 0;
-    for (auto const& candidate : _input.get_ports()) {
-      if (candidate->repo) {
-        ++data_ports;
-        input = candidate.get();
-      }
-    }
-    std::string_view declined;
-    if (data_ports != 1 || _input.try_get_port("default") != input ||
-        input->repo->num_partitions() != 1) {
-      declined = "the build input is not one single-partition default port";
-    } else if (input->type != MemoryBarrierType::FULL) {
-      declined = "the build input is not a FULL barrier";
-    } else if (!input->src_pipeline) {
-      declined = "the build input has no source pipeline";
-    } else if (!input->src_pipeline->is_pipeline_finished()) {
-      return false;
-    } else if (auto inventory =
-                 _arrival_ledger.certify({.repository_batches = input->repo->size(0)});
-               !inventory) {
-      declined = "the arrival ledger does not match the build input";
-    } else if (session.try_begin_accumulation(std::move(inventory))) {
-      _accumulating.store(true, std::memory_order_release);
-    }
-    if (!declined.empty()) {
-      (void)session.try_begin_accumulation(std::nullopt);
+    auto const facts    = read_build_port_facts(_input);
+    auto const decision = certify_decision(facts);
+    if (std::holds_alternative<certification_pending>(decision)) { return false; }
+    auto certified = std::holds_alternative<certification_proceed>(decision)
+                       ? _arrival_ledger.certify({.repository_batches = facts.repository_batches})
+                       : certified_build_input{std::get<construction_decline>(decision)};
+    if (auto const* decline = std::get_if<construction_decline>(&certified)) {
       SIRIUS_LOG_INFO(
         "[hash_join_partition_observer] input (id={}) has no accumulated dynamic filter: {}.",
         _input.get_operator_id(),
-        declined);
+        to_string(*decline));
+    }
+    if (_join.dynamic_filter_session().try_begin_accumulation(std::move(certified))) {
+      _accumulating.store(true, std::memory_order_release);
     }
   }
   if (!_accumulating.load(std::memory_order_relaxed)) { _arrival_ledger.abandon(); }

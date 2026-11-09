@@ -99,19 +99,19 @@ class dynamic_filter_publication_session final {
   void set_join_identity(dynamic_filter_join_identity identity) noexcept;
 
   /**
-   * @brief Starts accumulating against @p inventory. Call on an untracked thread (the task
-   * creator).
+   * @brief Starts accumulating against @p input's inventory, or records why its construction site
+   * declined. Call on an untracked thread (the task creator).
    *
    * Selects the active keys, sizes their shared geometry, requires working peer DMA between every
    * pair of replica GPUs, and allocates zeroed per-GPU partial arrays under per-GPU leases. When it
-   * returns false, the session behaves exactly as with accumulation disabled. Transitions the
-   * session OPEN -> COLLECTING.
+   * returns false, the session behaves exactly as with accumulation disabled, so a later path may
+   * still publish. Transitions the session OPEN -> COLLECTING.
    *
-   * @return true iff accumulation started; false when there is no inventory, no active key, a zero
-   * or over-cap geometry, no peer DMA, a refused lease, a recoverable failure, or the session is
-   * not open. The reason is counted.
+   * @return true iff accumulation started; false when @p input is a `construction_decline`, no
+   * active key, a zero or over-cap geometry, no peer DMA, a refused lease, a recoverable failure,
+   * or the session is not open. The reason is counted.
    */
-  [[nodiscard]] bool try_begin_accumulation(std::optional<complete_build_inventory> inventory);
+  [[nodiscard]] bool try_begin_accumulation(certified_build_input input);
 
   /**
    * @brief Whether accumulation has started, whatever its outcome.
