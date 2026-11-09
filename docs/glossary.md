@@ -10,7 +10,11 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## B
 
+**Build Layout Completion** - The point at which a hash join's build-side PARTITION has routed every build row into its final partitions. Distinct from the earlier choice of the partition layout itself. _Avoid_: layout stable, layout resolved.
+
 ## C
+
+**Complete Build Inventory** - The frozen, exact record of every batch, row count, and key type entering a hash join's build-side PARTITION, certified once the build input has finished. It is the single proof that the build is complete. Dynamic filters accumulated across build batches are chosen and sized from it alone; filters built in one shot from the whole build table read that table instead. _Avoid_: whole build, build snapshot.
 
 ## D
 
@@ -29,6 +33,8 @@ This document contains definitions of key terms and concepts used throughout the
 **Downgrade Thread Pool** - A pool of threads that exist in downgrade executor and are used to copy Data Batch from GPU to CPU.
 
 ## E
+
+**Early Probe Activation** - Starting a hash join's probe-side work after Build Layout Completion, once all Relevant Producers are Terminal and memory is admitted, but before the build data is deposited. Hash probing itself still waits for each partition's built hash table. _Avoid_: early probe start, early production, subtrees-b.
 
 ## F
 
@@ -64,6 +70,8 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## O
 
+**Ordinary Probe Activation** - Starting a hash join's probe-side work only after its build data has been deposited; the rule that always remains available alongside Early Probe Activation. _Avoid_: normal activation, normal build-deposit readiness.
+
 **Operators** - Parts of the physical plan that are used to build a pipeline. Operators that can be pipelined are used to create a pipeline that then gets wrapped into a task and executed.
 
 ## P
@@ -82,6 +90,8 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## R
 
+**Relevant Producers** - Every dynamic-filter producer registered on a channel that a given hash join publishes to, including producers that belong to other joins. _Avoid_: target producers, endpoint producers.
+
 ## S
 
 **Scan Executor** - A module that uses DuckDB to scan data from sources and push into the Data Repository.
@@ -91,6 +101,8 @@ This document contains definitions of key terms and concepts used throughout the
 **Scan Task Queue** - A Task Queue which uses the regular DuckDB execution model for storing tasks related to scanning data into the system.
 
 ## T
+
+**Terminal (producer)** - A dynamic-filter producer that can publish nothing further, whatever its outcome (published, skipped, failed, or cancelled). Terminal says nothing about whether a filter exists or is useful. _Avoid_: done, complete, finished.
 
 **Task Creator** - A thread that (1) poll the task completion message queue, (1) create Scan Tasks and pushed them into the Scan Task Queue, (2) iterates through Data Repository and creates Pipeline Tasks and pushed them into the Pipeline Task Queue. The Task Creator also keep tracks of when the query has finished.
 
