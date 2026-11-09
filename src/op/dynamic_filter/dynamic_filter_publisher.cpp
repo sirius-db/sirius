@@ -23,6 +23,7 @@
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/detail/domain_gate.hpp"
+#include "op/dynamic_filter/detail/restore_scalar.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_outcome.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
@@ -1241,17 +1242,6 @@ std::size_t device_l2_cache_bytes(
   return minimum == std::numeric_limits<std::size_t>::max() ? 0 : minimum;
 }
 
-// Converts a zone-map bound to the recorded storage type through a one-row column, so DATE bounds
-// take the same INT32 tunnel (cast_through_rep) the build column would.
-std::unique_ptr<cudf::scalar> restore_scalar(cudf::scalar const& bound,
-                                             cudf::data_type target,
-                                             ::cuda::stream_ref stream,
-                                             rmm::device_async_resource_ref mr)
-{
-  auto const one      = cudf::make_column_from_scalar(bound, 1, stream, mr);
-  auto const restored = sirius::cast_through_rep(one->view(), target, stream, mr);
-  return cudf::get_element(restored->view(), 0, stream, mr);
-}
 }  // namespace
 
 // 4. Whole-build publication: build the filters from one complete build, publish them to the
@@ -1416,8 +1406,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
                                   allocator_ref);
         if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
           if (col.type() != admitted_key.storage_type) {
-            min_s = restore_scalar(*min_s, admitted_key.storage_type, stream, allocator_ref);
-            max_s = restore_scalar(*max_s, admitted_key.storage_type, stream, allocator_ref);
+            min_s =
+              detail::restore_scalar(*min_s, admitted_key.storage_type, stream, allocator_ref);
+            max_s =
+              detail::restore_scalar(*max_s, admitted_key.storage_type, stream, allocator_ref);
           }
           std::vector<sirius::op::zone_map_entry> zones;
           zones.push_back({std::move(min_s), std::move(max_s)});

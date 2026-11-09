@@ -30,6 +30,7 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policy.cuh>
 #include <cuco/bloom_filter_ref.cuh>
+#include <cuda/accumulation_partial.cuh>
 #include <cuda/dynamic_filter_fused_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
@@ -201,33 +202,9 @@ using raw_bloom_ref = cuco::bloom_filter_ref<Key,
                                              ::cuda::thread_scope_device,
                                              cuco::bloom_filter_policy<Key>>;
 
-/**
- * @brief Throws `detail::accumulation_cuda_error` for a failed CUDA call after clearing the error.
- *
- * @param status The result of the CUDA call
- * @param call The name of the CUDA call, used in the error message
- * @param kernel_launch Whether @p status comes from a kernel launch
- * @throws detail::accumulation_cuda_error if @p status is not `cudaSuccess`
- */
-void check_cuda(cudaError_t status, char const* call, bool kernel_launch = false)
-{
-  if (status == cudaSuccess) { return; }
-  (void)cudaGetLastError();
-  throw detail::accumulation_cuda_error{status, kernel_launch, call};
-}
-
-using cucascade::cuda::cuda_event;
-
-/**
- * @brief Creates a timing-free event on @p device, restoring the current device afterwards.
- *
- * @param device The GPU the event belongs to
- */
-[[nodiscard]] cuda_event make_event_on(int device)
-{
-  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-  return cuda_event{};
-}
+using detail::check_cuda;
+using detail::cuda_event;
+using detail::make_event_on;
 
 /**
  * @brief One published replica of an accumulated key: the array and the partial stream that frees
@@ -668,54 +645,7 @@ namespace detail {
 // accumulated_bloom_builder::impl
 //===----------------------------------------------------------------------===//
 struct accumulated_bloom_builder::impl {
-  /**
-   * @brief One GPU's private arrays and the exclusive stream that orders their use and release.
-   */
-  struct partial {
-    cucascade::memory::memory_space* space;
-    cucascade::memory::memory_space const* host_space;
-    int device_id;
-    std::shared_ptr<rmm::cuda_stream> stream;
-    std::vector<std::unique_ptr<rmm::device_buffer>> arrays;
-    std::optional<cuda_event> init;  // Recorded after the zero fill; every insert waits on it.
-    std::atomic<bool> contributed{false};
-    std::atomic<bool> const* leak_storage;
-
-    partial(cucascade::memory::memory_space& owner,
-            cucascade::memory::memory_space const& host,
-            std::atomic<bool> const& leak)
-      : space{&owner},
-        host_space{&host},
-        device_id{owner.get_device_id()},
-        stream{std::make_shared<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking)},
-        leak_storage{&leak}
-    {
-    }
-
-    ~partial()
-    {
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      if (leak_storage->load()) {
-        // A failed host join left work that may still touch these arrays: never free them.
-        for (auto& array : arrays) {
-          (void)array.release();
-        }
-      }
-      init.reset();
-      arrays.clear();
-      stream.reset();
-    }
-
-    partial(partial const&)            = delete;
-    partial& operator=(partial const&) = delete;
-    partial(partial&&)                 = delete;
-    partial& operator=(partial&&)      = delete;
-
-    [[nodiscard]] ::cuda::stream_ref stream_ref() const noexcept
-    {
-      return ::cuda::stream_ref{stream->value()};
-    }
-  };
+  using partial = accumulation_partial;
 
   /**
    * @brief One key's array: its Bloom blocks, its bytes, and its transfer chunk.
@@ -746,9 +676,7 @@ struct accumulated_bloom_builder::impl {
 
   [[nodiscard]] partial* find(int device_id) const noexcept
   {
-    auto const found =
-      std::ranges::find(partials, device_id, [](auto const& entry) { return entry->device_id; });
-    return found == partials.end() ? nullptr : found->get();
+    return find_partial(partials, device_id);
   }
 
   std::vector<key> keys;
@@ -1062,34 +990,14 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
 std::optional<accumulated_bloom_builder> accumulated_bloom_builder::create(
   std::unique_ptr<impl> state, std::span<dynamic_filter_replica_space const> targets)
 {
-  std::size_t lease_bytes = 0;
+  std::vector<std::size_t> array_bytes;
+  array_bytes.reserve(state->shapes.size());
   for (auto const& shape : state->shapes) {
-    lease_bytes += tracked_replica_allocation_bytes(shape.raw_bytes);
+    array_bytes.push_back(shape.raw_bytes);
   }
-  for (auto const& target : targets) {
-    auto& space = target.get_gpu_space();
-    if (state->find(space.get_device_id()) != nullptr) { continue; }
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{space.get_device_id()}};
-    auto owned =
-      std::make_unique<impl::partial>(space, target.get_host_staging_space(), state->leak_storage);
-    {
-      // Detach the lease before `owned` can be destroyed, so its frees cannot credit that tracker.
-      auto lease = scoped_replica_reservation::try_acquire(space, lease_bytes, owned->stream_ref());
-      if (!lease) { return std::nullopt; }
-      owned->arrays.reserve(state->keys.size());
-      for (auto const& shape : state->shapes) {
-        owned->arrays.push_back(std::make_unique<rmm::device_buffer>(
-          shape.raw_bytes, owned->stream_ref(), lease->allocator()));
-        check_cuda(
-          cudaMemsetAsync(owned->arrays.back()->data(), 0, shape.raw_bytes, owned->stream->value()),
-          "cudaMemsetAsync(accumulated Bloom)");
-      }
-    }
-    owned->init.emplace();
-    check_cuda(cudaEventRecord(owned->init->get(), owned->stream->value()),
-               "cudaEventRecord(accumulated Bloom init)");
-    state->partials.push_back(std::move(owned));
-  }
+  auto partials = lease_partials(targets, array_bytes, /*zero_fill=*/true, state->leak_storage);
+  if (!partials) { return std::nullopt; }
+  state->partials = std::move(*partials);
   return accumulated_bloom_builder{std::move(state)};
 }
 
