@@ -47,6 +47,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/strings/string_view.cuh>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -63,6 +64,7 @@
 #include <cub/device/device_for.cuh>
 #include <cuda/std/cstddef>
 #include <cuda/std/type_traits>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
 // cucascade
@@ -399,6 +401,49 @@ struct convert_to_rep {
   cudf::column_view const& keys, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   return cudf::hashing::xxhash_64(cudf::table_view{{keys}}, string_fingerprint_seed, stream, mr);
+}
+
+/// The fingerprint the string probes compute for row `row`, read from the column's offsets and
+/// bytes so no device view (and no host copy of one) is needed.
+template <class OffsetT>
+struct string_fingerprint_at {
+  char const* chars;
+  OffsetT const* offsets;  // Already advanced to the column's first row
+
+  __device__ std::uint64_t operator()(cudf::size_type row) const
+  {
+    auto const begin = offsets[row];
+    auto const bytes = static_cast<cudf::size_type>(offsets[row + 1] - begin);
+    return string_fingerprint_hasher{string_fingerprint_seed}(
+      cudf::string_view{chars + begin, bytes});
+  }
+};
+
+/// Invokes @p fn(first) with a device iterator over the fingerprints of @p keys' rows, null rows
+/// included, computed in-kernel from the column's offsets and bytes. Unlike
+/// `materialize_string_fingerprints` it allocates nothing and never waits on the host. Does
+/// nothing for an empty column.
+template <class Fn>
+void with_string_fingerprint_iterator(cudf::column_view const& keys,
+                                      ::cuda::stream_ref stream,
+                                      Fn&& fn)
+{
+  if (keys.size() == 0) { return; }
+  cudf::strings_column_view const strings{keys};
+  auto const chars   = strings.chars_begin(stream);
+  auto const offsets = strings.offsets();
+  auto const invoke  = [&](auto const* first_offset) {
+    using offset_type =
+      ::cuda::std::remove_cv_t<::cuda::std::remove_pointer_t<decltype(first_offset)>>;
+    fn(thrust::make_transform_iterator(
+      thrust::counting_iterator<cudf::size_type>(0),
+      string_fingerprint_at<offset_type>{chars, first_offset + keys.offset()}));
+  };
+  if (offsets.type().id() == cudf::type_id::INT64) {
+    invoke(offsets.data<std::int64_t>());
+  } else {
+    invoke(offsets.data<std::int32_t>());
+  }
 }
 
 /// Invokes @p fn(first, last) with a device iterator range yielding the build keys as KeyT,

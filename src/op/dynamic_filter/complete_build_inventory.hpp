@@ -297,5 +297,14 @@ struct accumulated_bloom_geometry {
     std::size_t total_rows, std::size_t active_keys, std::uint64_t cap) noexcept;
 };
 
+/**
+ * @brief The transfer chunk for one array of @p raw_bytes: an eighth of the array, clamped to
+ * `accumulated_bloom_geometry`'s chunk bounds, rounded up to the allocation alignment, and at most
+ * the aligned array.
+ *
+ * @pre @p raw_bytes rounded up to the allocation alignment does not overflow
+ */
+[[nodiscard]] std::size_t accumulated_bloom_chunk_bytes(std::size_t raw_bytes) noexcept;
+
 }  // namespace detail
 }  // namespace sirius::op
