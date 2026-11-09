@@ -21,6 +21,7 @@
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/prepared_build_keys.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 // cudf
@@ -114,23 +115,15 @@ set_owner<KeyT> make_set(std::size_t capacity,
 }
 
 template <class KeyT>
-set_owner<KeyT> build_set(membership_key_domain const& domain,
-                          cudf::column_view const& keys,
+set_owner<KeyT> build_set(cudf::column_view const& prepared,
                           std::size_t capacity,
                           rmm::device_async_resource_ref mr,
                           cuda::stream_ref stream)
 {
   auto set = make_set<KeyT>(capacity, mr, stream);
-  if (keys.size() > 0) {
-    // The build column may sit at a same-family carrier other than the rep; the iterator converts
-    // per element instead of materializing a rep-typed copy.
-    bool const inserted =
-      detail::with_build_key_iterator<KeyT>(domain, keys, stream, mr, [&](auto first, auto last) {
-        set->insert_async(first, last, stream);
-      });
-    if (!inserted) {
-      throw std::logic_error("[sirius_dynamic_in_list_filter] build carrier does not fit its rep.");
-    }
+  if (prepared.size() > 0) {
+    auto const* first = prepared.data<KeyT>();
+    set->insert_async(first, first + prepared.size(), stream);
   }
   return set;
 }
@@ -192,22 +185,38 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
                                                              ::cuda::stream_ref stream,
                                                              rmm::device_async_resource_ref mr)
 {
-  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
-  // device; `build.compacted` stays alive until insert_async is queued on `stream`.
-  auto const build = prepare_membership_build("[sirius_dynamic_in_list_filter]", keys, stream, mr);
-  _domain          = build.domain;
-  _num_keys        = static_cast<std::size_t>(build.keys.size());
+  // The prepared column frees stream-ordered after the insert is queued on `stream`.
+  auto const prepared = prepare_build_column("[sirius_dynamic_in_list_filter]", keys, stream, mr);
+  construct(prepared.domain, prepared.keys->view(), stream, mr);
+}
+
+sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(membership_key_domain const& domain,
+                                                             cudf::column_view const& prepared,
+                                                             ::cuda::stream_ref stream,
+                                                             rmm::device_async_resource_ref mr)
+{
+  detail::require_prepared("[sirius_dynamic_in_list_filter]", domain, prepared);
+  construct(domain, prepared, stream, mr);
+}
+
+void sirius_dynamic_in_list_filter::construct(membership_key_domain const& domain,
+                                              cudf::column_view const& prepared,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  _domain   = domain;
+  _num_keys = static_cast<std::size_t>(prepared.size());
 
   cuda::stream_ref const s{stream.get()};
   auto const rep_bytes = membership_rep_bytes(_domain.rep);
   auto const factor    = capacity_factor_for(_num_keys, rep_bytes);
   auto const capacity  = std::max<std::size_t>(factor * _num_keys, kMinCapacity);
   _set                 = std::make_unique<set_impl>();
-  _set->source_device  = build.source_device;
+  _set->source_device  = detail::current_device("[sirius_dynamic_in_list_filter]");
   auto source          = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
     return std::make_unique<set_replica>(_set->source_device,
-                                         build_set<key_type>(_domain, build.keys, capacity, mr, s));
+                                         build_set<key_type>(prepared, capacity, mr, s));
   });
   SIRIUS_LOG_DEBUG(
     "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
