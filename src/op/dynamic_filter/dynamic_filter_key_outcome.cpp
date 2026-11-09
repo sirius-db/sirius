@@ -70,16 +70,18 @@ constexpr void fnv1a(std::uint64_t& hash, std::string_view bytes) noexcept
     case dynamic_filter_key_reason::attempt_skip: return "attempt_skip_";
     case dynamic_filter_key_reason::attempt_fail: return "attempt_fail_";
     case dynamic_filter_key_reason::attempt_cancel: return "attempt_cancel_";
+    case dynamic_filter_key_reason::declined: return "declined_";
     case dynamic_filter_key_reason::not_constructed: return "not_constructed";
   }
   return "invalid";
 }
 
-[[nodiscard]] constexpr bool ends_attempt(dynamic_filter_key_reason reason) noexcept
+[[nodiscard]] constexpr bool has_detail(dynamic_filter_key_reason reason) noexcept
 {
   return reason == dynamic_filter_key_reason::attempt_skip ||
          reason == dynamic_filter_key_reason::attempt_fail ||
-         reason == dynamic_filter_key_reason::attempt_cancel;
+         reason == dynamic_filter_key_reason::attempt_cancel ||
+         reason == dynamic_filter_key_reason::declined;
 }
 
 }  // namespace
@@ -112,7 +114,7 @@ std::string to_string(dynamic_filter_key_line const& line)
                  outcome.zone_map ? 1 : 0,
                  outcome.pushed,
                  to_token(outcome.reason),
-                 ends_attempt(outcome.reason) ? outcome.attempt_counter : std::string_view{});
+                 has_detail(outcome.reason) ? outcome.reason_detail : std::string_view{});
   return text;
 }
 

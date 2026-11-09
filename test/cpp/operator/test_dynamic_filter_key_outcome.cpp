@@ -84,8 +84,8 @@ TEST_CASE("a key line spells unknown values and attempt reasons", "[dynamic_filt
 {
   dynamic_filter_key_line line{.planner_condition_index = 0,
                                .build_key_ordinal       = 0,
-                               .outcome = {.reason = dynamic_filter_key_reason::attempt_skip,
-                                           .attempt_counter = "accumulations_incomplete"}};
+                               .outcome = {.reason        = dynamic_filter_key_reason::attempt_skip,
+                                           .reason_detail = "accumulations_incomplete"}};
   CHECK(op::to_string(line) ==
         "[dynamic_filter_key] v=1 sig=0000000000000000 occ=0 join=- condition=0 build_ordinal=0 "
         "rows=0 valid=unknown kind=none size=0 zone_map=0 pushed=0 "
@@ -93,9 +93,9 @@ TEST_CASE("a key line spells unknown values and attempt reasons", "[dynamic_filt
 
   using enum dynamic_filter_key_reason;
   auto const reason_of = [&](dynamic_filter_key_reason reason, std::string_view counter = {}) {
-    line.outcome.reason          = reason;
-    line.outcome.attempt_counter = counter;
-    auto const text              = op::to_string(line);
+    line.outcome.reason        = reason;
+    line.outcome.reason_detail = counter;
+    auto const text            = op::to_string(line);
     return text.substr(text.rfind("reason=") + 7);
   };
   CHECK(reason_of(domain_gate) == "domain_gate");
@@ -342,12 +342,13 @@ TEST_CASE("an accumulation that ends without publishing logs why per key",
                                                    cudf::data_type{cudf::type_id::INT32}})));
     reason = "type_mismatch";
   }
-  SECTION("no certified inventory")
+  SECTION("a ledger that disagrees with its repository")
   {
     fixture.session = std::make_unique<op::dynamic_filter_publication_session>(
       fixture.make_plan(256 * acc::mib), &fixture.stats);
-    REQUIRE_FALSE(fixture.session->try_begin_accumulation(std::nullopt));
-    reason = "attempt_skip_accumulations_skipped_inventory";
+    REQUIRE_FALSE(
+      fixture.session->try_begin_accumulation(op::construction_decline::inventory_mismatch));
+    reason = "declined_inventory_mismatch";
     rows   = "0";
   }
   CHECK(key_lines(sink).empty());

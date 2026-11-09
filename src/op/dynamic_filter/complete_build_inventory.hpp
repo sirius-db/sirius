@@ -16,15 +16,20 @@
 
 #pragma once
 
+#include "op/dynamic_filter/build_input_certification.hpp"
+
 #include <cudf/types.hpp>
 
 #include <cuda/cmath>
+
+#include <cucascade/memory/common.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <variant>
 #include <vector>
 
 namespace cucascade {
@@ -36,13 +41,65 @@ namespace sirius::op {
 class build_arrival_ledger;
 
 /**
+ * @brief One top-level column of one arriving build batch
+ */
+struct column_facts {
+  cudf::data_type carrier;                ///< The type the column arrived at
+  std::optional<std::size_t> null_count;  ///< Its null rows, when its representation records them
+
+  [[nodiscard]] bool operator==(column_facts const&) const = default;
+};
+
+/**
+ * @brief What `build_arrival_ledger` reads from one arriving batch without touching device data
+ */
+struct arrival_facts {
+  std::uint64_t rows;                 ///< The batch's rows
+  std::vector<column_facts> columns;  ///< Its top-level columns, by ordinal
+  cucascade::memory::Tier tier;       ///< The tier the batch was read from
+};
+
+/**
+ * @brief Reads @p batch's rows and per-column carriers and null counts, without waiting for its
+ * data lock
+ *
+ * A GPU table is read through its column views, whose null counts are already on the host. A host
+ * or disk table is read from its column metadata, where a negative null count means unknown.
+ *
+ * @return The facts, `construction_decline::compressed_arrival` for a compressed representation, or
+ * `construction_decline::unreadable_arrival` for a batch that is locked, empty of data, or of any
+ * other representation
+ */
+[[nodiscard]] std::variant<arrival_facts, construction_decline> read_arrival(
+  cucascade::data_batch& batch);
+
+/**
+ * @brief What one build column looks like across every batch of an inventory
+ */
+struct key_column_facts {
+  /** @brief Distinct carriers in batch-ID order; empty when the column is absent from some batch */
+  std::vector<cudf::data_type> carriers;
+  /** @brief Total null rows; empty when the column is absent or some batch's count is unknown */
+  std::optional<std::size_t> null_rows;
+};
+
+/**
+ * @brief What an inventory's batches look like as a whole
+ */
+struct build_input_facts {
+  std::size_t total_rows;                 ///< Rows across every batch
+  std::size_t max_batch_rows;             ///< Rows of the largest batch
+  std::vector<key_column_facts> columns;  ///< By build ordinal; as wide as the widest batch
+};
+
+/**
  * @brief The certified set of original batches received through one complete build input.
  *
  * `dynamic_filter_publication_session` accumulates a Bloom filter against this inventory: every
  * listed batch must contribute exactly once before the filter can be published. Batch IDs are
- * sorted and unique and carry their exact row counts; types are observed for each ordinal. Only
- * `build_arrival_ledger::certify` creates an inventory, and neither construction nor inspection
- * performs GPU work.
+ * sorted and unique and carry their exact row counts and, per top-level column, the carrier and
+ * null count they arrived with. Only `build_arrival_ledger::certify` creates an inventory, and
+ * neither construction nor inspection performs GPU work.
  */
 class complete_build_inventory final {
  public:
@@ -51,6 +108,14 @@ class complete_build_inventory final {
     std::uint64_t rows;
 
     [[nodiscard]] bool operator==(batch_entry const&) const = default;
+  };
+
+  /**
+   * @brief One recorded batch: its entry and its columns
+   */
+  struct recorded_batch {
+    batch_entry entry;
+    std::vector<column_facts> columns;
   };
 
   complete_build_inventory(complete_build_inventory const&)                = delete;
@@ -68,25 +133,42 @@ class complete_build_inventory final {
   [[nodiscard]] std::size_t total_rows() const noexcept { return _total_rows; }
   [[nodiscard]] batch_entry const* find(std::uint64_t batch_id) const noexcept;
 
+  /**
+   * @brief The columns the batch at @p batch_index of `batches()` arrived with
+   */
+  [[nodiscard]] std::span<column_facts const> batch_columns(std::size_t batch_index) const noexcept;
+
+  /**
+   * @brief Summarizes every column across the batches, for construction policy
+   */
+  [[nodiscard]] build_input_facts facts() const;
+
  private:
   friend class build_arrival_ledger;
 
   /**
-   * @brief Sorts @p batches and builds the inventory.
+   * @brief Sorts @p batches by ID and builds the inventory.
    *
    * @return nullopt for no batches, duplicate IDs, or a row total that overflows
    */
   [[nodiscard]] static std::optional<complete_build_inventory> try_create(
-    std::vector<batch_entry> batches, std::vector<std::optional<cudf::data_type>> schema);
+    std::vector<recorded_batch> batches);
 
   complete_build_inventory(std::vector<batch_entry> batches,
+                           std::vector<std::vector<column_facts>> batch_columns,
                            std::vector<std::optional<cudf::data_type>> schema,
                            std::size_t total_rows);
 
   std::vector<batch_entry> _batches;
-  std::vector<std::optional<cudf::data_type>> _schema;
+  std::vector<std::vector<column_facts>> _batch_columns;  // Parallel to _batches
+  std::vector<std::optional<cudf::data_type>> _schema;    // The consistent carrier per ordinal
   std::size_t _total_rows;
 };
+
+/**
+ * @brief A certified inventory, or why the input could not be certified
+ */
+using certified_build_input = std::variant<complete_build_inventory, construction_decline>;
 
 /**
  * @brief Records the metadata of every batch pushed into one build publication boundary's FULL
@@ -94,10 +176,11 @@ class complete_build_inventory final {
  *
  * PARTITION or BUILD_FILTER records each arrival from `on_input_batch_pushed`, before the batch
  * becomes poppable, and certifies the ledger once its source pipeline has finished. The ledger
- * records `(id, rows)` and consistent top-level column types. An unreadable or non-GPU arrival
- * closes the ledger, which then cannot certify; a missing or changed column only makes that ordinal
- * unavailable to key admission. Payload child layouts do not affect certification. After such an
- * arrival, `abandon()`, or a failed `certify()`, arrivals are ignored.
+ * records `(id, rows)` and each top-level column's carrier and null count (`read_arrival`). A
+ * compressed, unreadable, or non-GPU arrival closes the ledger with that reason, and it then cannot
+ * certify; a missing or changed column only makes that ordinal unavailable to key admission.
+ * Payload child layouts do not affect certification. After such an arrival, `abandon()`, or a
+ * failed `certify()`, arrivals are ignored.
  *
  * After `certify()` succeeded, an arrival that could add keys throws `std::logic_error`: a FULL
  * barrier received a batch after its source pipeline finished. A readable GPU arrival without rows
@@ -128,9 +211,10 @@ class build_arrival_ledger final {
    *
    * @pre No further batch can arrive: the input port is FULL and its source pipeline has finished.
    * @return The inventory iff the ledger is still recording and recorded exactly
-   * `facts.repository_batches` batches; otherwise nullopt, after which arrivals are ignored
+   * `facts.repository_batches` batches; otherwise the arrival's reason that closed the ledger, or
+   * `construction_decline::inventory_mismatch`. Arrivals are ignored afterwards.
    */
-  [[nodiscard]] std::optional<complete_build_inventory> certify(certification facts) noexcept;
+  [[nodiscard]] certified_build_input certify(certification facts) noexcept;
 
   /**
    * @brief Stops recording and frees the entries; later arrivals are ignored. Transitions RECORDING
@@ -153,9 +237,14 @@ class build_arrival_ledger final {
    */
   void close() noexcept;
 
+  /**
+   * @brief Closes the ledger because of an arrival it cannot accept. The caller holds `_mutex`.
+   */
+  void close(construction_decline reason) noexcept;
+
   std::mutex _mutex;
-  std::vector<complete_build_inventory::batch_entry> _entries;
-  std::optional<std::vector<std::optional<cudf::data_type>>> _schema;
+  std::vector<complete_build_inventory::recorded_batch> _entries;
+  std::optional<construction_decline> _closed_by;  // The arrival that closed the ledger, if any
   status _status{status::RECORDING};
 };
 

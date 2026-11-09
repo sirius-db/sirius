@@ -18,6 +18,7 @@
 
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/dynamic_filter/build_input_certification.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -66,42 +67,29 @@ bool sirius_physical_build_filter::decide_accumulation()
   std::scoped_lock guard(_decision_mutex);
   if (_decided) { return true; }
 
-  port const* input      = nullptr;
-  std::size_t data_ports = 0;
-  for (auto const& candidate : _ports_list) {
-    if (candidate->repo != nullptr) {
-      input = candidate.get();
-      ++data_ports;
+  if (!_session.plan().multi_partition_enabled()) {
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_build_filter] operator (id={}) early publication declined: accumulation "
+      "disabled.",
+      has_operator_id() ? get_operator_id() : invalid_operator_id);
+  } else {
+    auto const facts    = read_build_port_facts(*this);
+    auto const decision = certify_decision(facts);
+    if (std::holds_alternative<certification_pending>(decision)) { return false; }
+    auto certified = std::holds_alternative<certification_proceed>(decision)
+                       ? _arrival_ledger.certify({.repository_batches = facts.repository_batches})
+                       : certified_build_input{std::get<construction_decline>(decision)};
+    if (auto const* decline = std::get_if<construction_decline>(&certified)) {
+      SIRIUS_LOG_INFO(
+        "[sirius_physical_build_filter] operator (id={}) early publication declined: {}.",
+        has_operator_id() ? get_operator_id() : invalid_operator_id,
+        op::to_string(*decline));
+    }
+    if (_session.try_begin_accumulation(std::move(certified))) {
+      _accumulating.store(true, std::memory_order_release);
     }
   }
-
-  std::string_view declined;
-  if (!_session.plan().multi_partition_enabled()) {
-    declined = "accumulation disabled";
-  } else if (!port_directive().empty()) {
-    declined = "the input has a late-materialization directive";
-  } else if (data_ports != 1 || try_get_port("default") != input ||
-             input->repo->num_partitions() != 1) {
-    declined = "the build input is not one single-partition default port";
-  } else if (input->type != MemoryBarrierType::FULL || !input->src_pipeline) {
-    declined = "the build input has no FULL source pipeline";
-  } else if (!input->src_pipeline->is_pipeline_finished()) {
-    return false;
-  } else if (auto inventory = _arrival_ledger.certify({.repository_batches = input->repo->size(0)});
-             !inventory) {
-    declined = "the arrival ledger does not match the complete build input";
-  } else if (_session.try_begin_accumulation(std::move(inventory))) {
-    _accumulating.store(true, std::memory_order_release);
-  }
-
   if (!_accumulating.load(std::memory_order_relaxed)) { _arrival_ledger.abandon(); }
-  if (!declined.empty()) {
-    (void)_session.try_begin_accumulation(std::nullopt);
-    SIRIUS_LOG_INFO(
-      "[sirius_physical_build_filter] operator (id={}) early publication declined: {}.",
-      has_operator_id() ? get_operator_id() : invalid_operator_id,
-      declined);
-  }
   _decided = true;
   return true;
 }
