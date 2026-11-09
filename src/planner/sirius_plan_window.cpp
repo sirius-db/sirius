@@ -38,7 +38,9 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
+#include <variant>
 
 namespace sirius::planner {
 namespace {
@@ -250,10 +252,7 @@ aggregate_id validate(duckdb::BoundWindowExpression const& expression)
 struct classified_expression {
   duckdb::idx_t index;
   duckdb::BoundWindowExpression const* expression;
-  // The ranking function, or `std::nullopt` for an aggregate.
-  std::optional<op::ranking_function> ranking;
-  // The aggregate. Only set when `ranking` is empty.
-  aggregate_id aggregate;
+  std::variant<aggregate_id, op::ranking_function> function;
 };
 
 /**
@@ -273,9 +272,13 @@ std::vector<classified_expression> classify_window_expressions(duckdb::LogicalWi
       decline("expected a bound window expression");
     }
     auto const& expression = bound.Cast<duckdb::BoundWindowExpression>();
-    auto const ranking     = validate_ranking(expression);
-    result.push_back(
-      {i, &expression, ranking, ranking ? aggregate_id::count_star : validate(expression)});
+    std::variant<aggregate_id, op::ranking_function> function;
+    if (auto const ranking = validate_ranking(expression)) {
+      function = *ranking;
+    } else {
+      function = validate(expression);
+    }
+    result.push_back({i, &expression, function});
   }
   return result;
 }
@@ -295,17 +298,17 @@ std::vector<classified_expression> classify_window_expressions(duckdb::LogicalWi
  * @return The expressions of each stage. Every expression is in exactly one stage.
  */
 std::vector<std::vector<classified_expression>> split_window_into_stages(
-  std::vector<classified_expression> const& expressions)
+  std::span<classified_expression const> expressions)
 {
   std::vector<std::vector<classified_expression>> stages;
   for (auto const& entry : expressions) {
     auto const& expression = *entry.expression;
-    bool const ranking     = entry.ranking.has_value();
+    bool const is_ranking  = std::holds_alternative<op::ranking_function>(entry.function);
     auto const match       = std::ranges::find_if(stages, [&](auto const& stage) {
       auto const& first = *stage.front().expression;
-      return stage.front().ranking.has_value() == ranking &&
+      return std::holds_alternative<op::ranking_function>(stage.front().function) == is_ranking &&
              first.PartitionsAreEquivalent(expression) &&
-             (!ranking || same_order(first, expression));
+             (!is_ranking || same_order(first, expression));
     });
     if (match == stages.end()) {
       stages.push_back({entry});
@@ -321,7 +324,7 @@ std::vector<std::vector<classified_expression>> split_window_into_stages(
 // input starts with the window child's columns, and a later stage of the same window also holds the
 // results of the stages below it. The output is the input followed by the results of `stage`.
 window_plan plan_window_stage(duckdb::LogicalWindow const& window,
-                              std::vector<classified_expression> const& stage,
+                              std::span<classified_expression const> stage,
                               duckdb::vector<duckdb::LogicalType> const& input_types)
 {
   if (window.children.size() != 1 || stage.empty()) {
@@ -380,7 +383,9 @@ window_plan plan_window_stage(duckdb::LogicalWindow const& window,
     }
     plan.partition_slots.push_back(prepare(*key));
   }
-  if (stage.front().ranking) { plan_ranking_order(plan, first, prepare); }
+  if (std::holds_alternative<op::ranking_function>(stage.front().function)) {
+    plan_ranking_order(plan, first, prepare);
+  }
 
   for (duckdb::idx_t i = 0; i < stage.size(); ++i) {
     auto const& entry      = stage[i];
@@ -389,15 +394,16 @@ window_plan plan_window_stage(duckdb::LogicalWindow const& window,
     if (window.types[child_width + entry.index] != expression.GetReturnType()) {
       decline("result column mapping");
     }
-    if (entry.ranking) {
-      plan.rankings.push_back({*entry.ranking, expression.GetReturnType(), output_slot});
+    if (auto const* ranking = std::get_if<op::ranking_function>(&entry.function)) {
+      plan.rankings.push_back({*ranking, expression.GetReturnType(), output_slot});
       continue;
     }
-    auto const& argument     = entry.aggregate == aggregate_id::count_star
+    auto const aggregate     = std::get<aggregate_id>(entry.function);
+    auto const& argument     = aggregate == aggregate_id::count_star
                                  ? static_cast<duckdb::Expression const&>(count_all_argument)
                                  : *expression.GetChildren()[0];
     auto const argument_slot = prepare(argument);
-    plan.expressions.push_back({entry.aggregate,
+    plan.expressions.push_back({aggregate,
                                 argument_slot,
                                 plan.prepared_types[argument_slot],
                                 expression.GetReturnType(),
