@@ -9,6 +9,8 @@ target_sources(
           device_transfer.cpp
           dynamic_filter_mask_ops.cu
           dynamic_filter_prepared_keys.cu
+          bounds_accumulator.cu
+          exact_key_stager.cu
           dynamic_filter_replica_transfer.cu
           sirius_dynamic_bloom_filter.cu
           sirius_dynamic_in_list_filter.cu
