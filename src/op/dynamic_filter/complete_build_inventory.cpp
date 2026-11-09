@@ -322,13 +322,18 @@ std::optional<detail::accumulated_bloom_geometry> detail::accumulated_bloom_geom
   if (active_keys > maximum / aligned_bytes) { return std::nullopt; }
   auto const arrays_bytes = aligned_bytes * active_keys;
   if (arrays_bytes > cap) { return std::nullopt; }
-  auto const chunk_bytes =
-    std::min(rmm::align_up(std::clamp(raw_bytes / 8,
-                                      accumulated_bloom_geometry::k_min_transfer_chunk_bytes,
-                                      accumulated_bloom_geometry::k_max_transfer_chunk_bytes),
-                           alignment),
-             aligned_bytes);
-  return accumulated_bloom_geometry{blocks, raw_bytes, arrays_bytes, chunk_bytes};
+  return accumulated_bloom_geometry{
+    blocks, raw_bytes, arrays_bytes, accumulated_bloom_chunk_bytes(raw_bytes)};
+}
+
+std::size_t detail::accumulated_bloom_chunk_bytes(std::size_t raw_bytes) noexcept
+{
+  auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
+  return std::min(rmm::align_up(std::clamp(raw_bytes / 8,
+                                           accumulated_bloom_geometry::k_min_transfer_chunk_bytes,
+                                           accumulated_bloom_geometry::k_max_transfer_chunk_bytes),
+                                alignment),
+                  rmm::align_up(raw_bytes, alignment));
 }
 
 }  // namespace sirius::op

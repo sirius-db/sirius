@@ -282,6 +282,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_construction_plan.cpp
     test/cpp/operator/test_physical_build_filter.cpp
     test/cpp/operator/test_dynamic_filter_accumulation.cpp
+    test/cpp/operator/test_accumulated_bloom_key_types.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp

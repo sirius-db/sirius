@@ -158,18 +158,26 @@ decltype(auto) join_on_failure(std::span<::cuda::stream_ref const> streams, Body
 class accumulated_bloom_builder final {
  public:
   /**
-   * @brief One key column: its ordinal in the build table and its storage type.
+   * @brief One key column: its ordinal in the build table, the type its filter is built over, and
+   * its array size.
    */
   struct key {
+    /** @brief The key's column in every contributed table */
     cudf::size_type ordinal;
+    /** @brief The construction type: the published filter's domain is classified from it, and each
+     * contribution's column must be one of its carriers (`membership_probe_compatible`) */
     cudf::data_type type;
+    /** @brief Bloom blocks of the key's array, `bloom_blocks_for` the rows it is sized for; ignored
+     * by the shared-geometry `try_create` */
+    std::size_t blocks = 0;
   };
 
   /**
-   * @brief Whether keys of type @p type can be accumulated: INT32 and INT64 only.
+   * @brief Whether `dynamic_filter_publication_session` admits keys of type @p type for
+   * accumulation today: INT32 and INT64 only.
    *
-   * Narrower than `sirius_dynamic_bloom_filter::supports`: every other key type publishes only from
-   * a whole build.
+   * The builder itself accepts every `membership_key_supported` type; this narrower rule is the
+   * session's and the planner's until they construct every key type from the build PARTITION.
    *
    * @param type The storage type of a build key column
    * @return True if @p type is INT32 or INT64
@@ -197,6 +205,18 @@ class accumulated_bloom_builder final {
     accumulated_bloom_geometry geometry,
     std::span<dynamic_filter_replica_space const> targets);
 
+  /**
+   * @brief Like the shared-geometry form, but each key's array has its own `key::blocks` and its
+   * own transfer chunk (`accumulated_bloom_chunk_bytes`).
+   *
+   * @throw accumulation_invariant_error if a key has no blocks, an unsupported type, or sizes that
+   * overflow
+   * @return The builder, or nullopt iff a lease was refused, after releasing everything built so
+   * far
+   */
+  [[nodiscard]] static std::optional<accumulated_bloom_builder> try_create(
+    std::vector<key> keys, std::span<dynamic_filter_replica_space const> targets);
+
   ~accumulated_bloom_builder();
   accumulated_bloom_builder(accumulated_bloom_builder const&)            = delete;
   accumulated_bloom_builder& operator=(accumulated_bloom_builder const&) = delete;
@@ -210,10 +230,15 @@ class accumulated_bloom_builder final {
    * Thread-safe. @p stream first waits for the partial's zero fill; the partial's stream then waits
    * for the inserts, so every later use or free of the arrays follows them.
    *
-   * @pre @p input holds every key column at its ordinal with its type, and the caller retires the
-   * stream before releasing @p input
+   * Each key's values are read at the column's carrier and converted per element to the key
+   * domain's rep, with the null rows skipped; a STRING key is fingerprinted in-kernel. A DECIMAL128
+   * value narrows to the int64 rep unchecked: the caller must not publish that key unless the
+   * build's bounds fit int64.
+   *
+   * @pre @p input holds every key column at its ordinal at a carrier of the key's type, and the
+   * caller retires the stream before releasing @p input
    * @throw accumulation_invariant_error if @p stream belongs to another GPU, before anything is
-   * enqueued
+   * enqueued, or if a key column is not a carrier of its key's type
    * @throw accumulation_cuda_error if a CUDA call fails, or `cucascade::cuda_error` if creating its
    * completion event fails; work already enqueued is joined first
    * @param input A build batch with the admitted key types
@@ -317,12 +342,27 @@ class accumulated_bloom_builder final {
    * on the replica's stream.
    *
    * @pre @p filter was published: the `finish` call that returned it has returned
-   * @param filter An accumulated filter returned by `finish`
+   * @param filter A filter returned by `finish`
    * @param device The GPU whose replica is copied
    * @return The replica's contents, or nullopt if @p filter has no accumulated replica on @p device
    */
   [[nodiscard]] static std::optional<replica_contents> inspect_replica(
     sirius_dynamic_bloom_filter const& filter, rmm::cuda_device_id device);
+
+  /**
+   * @brief Copies @p filter's bit array on @p device to the host, whether `finish` returned it or
+   * it was built from a column, so tests can compare the two bit for bit.
+   *
+   * A filter built from a column has no accumulated replica; its own array is copied on @p stream,
+   * after the work queued there, so the copy follows the array's stream-ordered allocation.
+   *
+   * @pre For a filter built from a column, @p stream is the stream it was built on, or follows it
+   * @return The contents, or nullopt if @p filter has no array on @p device
+   */
+  [[nodiscard]] static std::optional<replica_contents> inspect_replica(
+    sirius_dynamic_bloom_filter const& filter,
+    rmm::cuda_device_id device,
+    ::cuda::stream_ref stream);
 
  private:
   /**
@@ -348,6 +388,10 @@ class accumulated_bloom_builder final {
 
   struct impl;
   explicit accumulated_bloom_builder(std::unique_ptr<impl> state) noexcept;
+
+  /// Allocates and zeroes @p state's arrays on every GPU of @p targets; both `try_create` forms.
+  [[nodiscard]] static std::optional<accumulated_bloom_builder> create(
+    std::unique_ptr<impl> state, std::span<dynamic_filter_replica_space const> targets);
 
   void make_filters(int root_device);
 
