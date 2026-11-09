@@ -22,7 +22,8 @@ remove temporary diagnostic instrumentation introduced during the investigation.
 
 ## CPU races
 
-ThreadSanitizer reports CPU data races and lock-order issues. TSan and ASan cannot
+The documented ThreadSanitizer options check CPU data races with deadlock detection disabled.
+Use thread backtraces for deadlock investigations. TSan and ASan cannot
 be combined; the `clang-tsan` preset is separate. TSan may produce false positives for GPU
 memory operations. It can impose 5–15x slowdown.
 

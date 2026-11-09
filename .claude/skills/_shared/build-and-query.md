@@ -17,8 +17,9 @@ pixi run cmake --install build/clang-debug --prefix "$PWD/build/clang-debug/inst
 pixi run make -C sirius-duckdb debug SIRIUS_DUCKDB_LINKAGE=shared SIRIUS_INSTALL_DIR="$PWD/build/clang-debug/install"
 ```
 
-This example uses the wrapper under `sirius-duckdb/build/debug`; choose the
-actual wrapper directory for other targets. Take care with existing wrapper build
+Use wrapper target `debug` for `debug`/`clang-debug` libraries, and `reldebug` for
+`relwithdebinfo`/`clang-relwithdebinfo`. Wrapper outputs are under
+`sirius-duckdb/build/debug` or `sirius-duckdb/build/reldebug`, respectively. Take care with existing wrapper build
 directories and CMake caches when changing the library or toolchain.
 
 For host sanitizers, use the separate `clang-asan` and `clang-tsan` presets. Their
@@ -41,8 +42,9 @@ SQL after loading the extension; Sirius transparently intercepts supported queri
 pixi run sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <database_path>
 ```
 
-For CPU comparison, run the same SQL with `SET gpu_execution = false` or without
-the extension. Compare results with ordering and query semantics in mind. Repeated
+For CPU comparison, use `SET gpu_execution = false` or start the process with
+`SIRIUS_DISABLE=1`. The wrapper's DuckDB CLI has the Sirius extension built in
+regardless of `SIRIUS_DUCKDB_LINKAGE`, so omitting `LOAD` is insufficient. Compare results with ordering and query semantics in mind. Repeated
 runs can expose inconsistent results, but a difference alone does not prove a race.
 
 ## Changes and logs

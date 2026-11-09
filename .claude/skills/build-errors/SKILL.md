@@ -16,6 +16,10 @@ sanitizer details. Run commands through `pixi run`:
 pixi run make <preset>
 ```
 
+For wrapper failures, use `pixi run make` for the release build or the shared
+reference's install-and-wrapper steps for other presets. `make <preset>` alone
+builds only Sirius and its C++ tests.
+
 Read the relevant diagnostics and source context, including earlier errors that
 may cause later failures. Consult `error-patterns.md` for known Sirius failures.
 Check submodule state or sccache when the error suggests a problem there. Preserve

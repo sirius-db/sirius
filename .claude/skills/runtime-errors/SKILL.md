@@ -12,7 +12,7 @@ disable-model-invocation: true
 
 Diagnose runtime errors (crashes, segfaults, exceptions, hangs, fallback triggers) by analyzing log files, inserting targeted debug logs, using cuda-gdb and NVIDIA Compute Sanitizer, and re-running queries.
 
-**Reference:** See `.claude/skills/_shared/build-and-query.md` for shared infrastructure (build modes, query execution, change tracking, debug log conventions).
+**Reference:** See `.claude/skills/_shared/build-and-query.md` for shared infrastructure (build modes, query execution, changes and logs).
 
 ## Triage
 
@@ -102,6 +102,9 @@ For deadlocks and thread-level hangs where log analysis is insufficient:
      -ex "info threads" \
      -ex quit
    ```
+
+   If attaching is unavailable, launch the reproduction under `cuda-gdb --args`
+   and interrupt it after it hangs to collect the backtraces.
 
 3. Analyze the thread backtraces:
    - Identify threads blocked in `pthread_mutex_lock`, `pthread_cond_wait`, `futex`, or CUDA sync calls
