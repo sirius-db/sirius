@@ -113,8 +113,9 @@ void decline_unsupported_modifiers(duckdb::BoundWindowExpression const& expressi
 /**
  * @brief Return the ranking function of @p expression, or `std::nullopt` when it is not one.
  *
- * Valid is `rank`, `dense_rank` or `row_number` with a `PARTITION BY` and a window `ORDER BY`, and
- * without `DISTINCT`, `FILTER`, `EXCLUDE`, `IGNORE NULLS`, arguments or frame offsets.
+ * Valid is `rank`, `dense_rank` or `row_number` with a window `ORDER BY`, with or without a
+ * `PARTITION BY`, and without `DISTINCT`, `FILTER`, `EXCLUDE`, `IGNORE NULLS`, arguments or frame
+ * offsets.
  */
 std::optional<op::ranking_function> validate_ranking(
   duckdb::BoundWindowExpression const& expression)
@@ -133,7 +134,6 @@ std::optional<op::ranking_function> validate_ranking(
   decline_unsupported_modifiers(expression);
   if (!expression.GetChildren().empty()) { decline("ranking arguments"); }
   if (expression.GetReturnType() != duckdb::LogicalType::BIGINT) { decline("ranking result type"); }
-  if (expression.Partitions().empty()) { decline("ranking without PARTITION BY"); }
   if (expression.OrderBy().empty()) { decline("ranking without ORDER BY"); }
   return function;
 }

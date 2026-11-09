@@ -272,6 +272,16 @@ TEST_CASE_METHOD(WindowFixture,
   compare_window(
     "SELECT id,rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST,q ASC NULLS FIRST),"
     "dense_rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST,q ASC NULLS FIRST) FROM w");
+  compare_window("SELECT id,rank() OVER (ORDER BY v),dense_rank() OVER (ORDER BY v) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (ORDER BY v DESC NULLS LAST,q ASC NULLS FIRST),"
+    "dense_rank() OVER (ORDER BY v DESC NULLS LAST,q ASC NULLS FIRST) FROM w");
+  compare_window("SELECT id,row_number() OVER (ORDER BY v,id) FROM w");
+  compare_window("SELECT id,rank() OVER (ORDER BY s,d,id) FROM w");
+  compare_window(
+    "SELECT p,total,rnk FROM (SELECT p,total,rank() OVER (ORDER BY total DESC) rnk FROM "
+    "(SELECT p,sum(v) total FROM w GROUP BY p) t) u WHERE rnk<4");
+  compare_gpu_vs_cpu("SELECT id,rank() OVER (ORDER BY v) FROM w WHERE id<0");
   compare_window("SELECT id,row_number() OVER (PARTITION BY p ORDER BY v,id) FROM w");
   compare_window("SELECT id,row_number() OVER (PARTITION BY p,q ORDER BY d DESC,id DESC) FROM w");
   compare_window(
@@ -333,6 +343,9 @@ TEST_CASE_METHOD(WindowFixture,
   compare_window(
     "SELECT id,rank() OVER (PARTITION BY p ORDER BY r) FROM "
     "(SELECT id,p,rank() OVER (PARTITION BY q ORDER BY v) r FROM w) t");
+  // Ranking without PARTITION BY next to an aggregate or another ORDER BY.
+  compare_window("SELECT id,rank() OVER (ORDER BY v),sum(v) OVER () FROM w");
+  compare_window("SELECT id,rank() OVER (ORDER BY v),rank() OVER (ORDER BY q) FROM w");
 }
 
 TEST_CASE_METHOD(WindowFixture,
@@ -340,7 +353,6 @@ TEST_CASE_METHOD(WindowFixture,
                  "[integration][gpu_execution][window_sql]")
 {
   expect_plan_fallback_matches_cpu("SELECT id,sum(v) OVER (ORDER BY id) FROM w");
-  expect_plan_fallback_matches_cpu("SELECT id,rank() OVER (ORDER BY v) FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT id,percent_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");
@@ -474,6 +486,7 @@ TEST_CASE("SQL windows on two GPUs", "[integration][window_sql][multi_gpu]")
         "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),"
         "dense_rank() OVER (PARTITION BY p ORDER BY v) FROM w",
         "SELECT id,row_number() OVER (PARTITION BY p ORDER BY id DESC) FROM w",
+        "SELECT id,rank() OVER (ORDER BY v),dense_rank() OVER (ORDER BY v) FROM w",
         "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),sum(v) OVER (PARTITION BY id%5) FROM "
         "w"}) {
     INFO(sql);

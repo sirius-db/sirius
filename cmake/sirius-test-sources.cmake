@@ -2,10 +2,7 @@
 set(TEST_SOURCES
     test/cpp/scan/test_parquet_delete_reader.cpp
     test/cpp/scan/bench_parquet_footer_cache.cpp
-    test/cpp/io/cache/bench_metadata_store.cpp
     test/cpp/io/test_parquet_metadata_retention.cpp
-    test/cpp/io/cache/test_metadata_store.cpp
-    test/cpp/io/test_object_identity.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp
     test/cpp/scan_manager/test_preparation_parquet.cpp
     test/cpp/scan_manager/test_coordinator_pool.cpp
@@ -61,8 +58,8 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_query_lifecycle_registry.cpp
-  test/cpp/exec/test_query_admission.cpp
-  test/cpp/exec/test_scoped_dispatcher.cpp
+    test/cpp/exec/test_query_admission.cpp
+    test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/event/test_query_event_publisher.cpp
@@ -188,28 +185,18 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_pin_handle_lifecycle.cpp
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/cuda/test_device_copy_batch.cpp
-    test/cpp/io/s3/test_sigv4.cpp
-    test/cpp/io/s3/test_sigv4_authorizer.cpp
-    test/cpp/io/s3/test_static_credentials.cpp
-    test/cpp/io/cache/test_cache_read_arbitration.cpp
-    test/cpp/io/cache/test_chunk_state.cpp
-    test/cpp/io/cache/test_dispose_eviction.cpp
-    test/cpp/io/cache/test_explicit_eviction.cpp
-    test/cpp/io/cache/test_stage_machines.cpp
-    test/cpp/io/kvikio/test_kvikio_remote.cpp
-    test/cpp/io/test_io_request.cpp
     test/cpp/io/test_parquet_helpers.cpp
-    test/cpp/io/test_templated_ioctx.cpp
-    test/cpp/io/test_uri_parser.cpp
-    test/cpp/io/uring/test_uring_readv.cpp
-    test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/io/test_path_utils.cpp
+    test/cpp/io/rest/test_rest_datasource_integration.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_s3_config_scopes.cpp
+    test/cpp/scan_manager/test_scan_input_prefetch.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
-  test/cpp/scan_manager/test_shared_scan_budget.cpp
+    test/cpp/scan_manager/test_readahead_tickets.cpp
+    test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
@@ -219,6 +206,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
+    test/cpp/scan_manager/test_uring_gauges_sampler.cpp
     test/cpp/scan_manager/test_pin_registry_epoch_mutations.cpp
     test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
     test/cpp/scan_manager/test_split_connector.cpp
@@ -402,9 +390,8 @@ set(TEST_SOURCES
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/s3/test_duckdb_secret_config.cpp
-    test/cpp/io/rest/test_rest_ioctx_integration.cpp
-    test/cpp/io/cache/test_cache_object_identity.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
+    test/cpp/scan_manager/test_describe_parquet_overwrite_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
 # cmake-format: on

@@ -23,8 +23,8 @@ git submodule update --init --recursive
 make test
 
 # Run a specific tag or test name
-build/release/test/cpp/sirius_unittest "[uri_parser]"
-build/release/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
+build/release/test/cpp/sirius_unittest "[path_utils]"
+build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
 
 `make test` builds the release build and runs `scripts/run_unit_tests.py`, which CI also runs.

@@ -40,6 +40,7 @@
 #include "expression/ast/node.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/path_utils.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"

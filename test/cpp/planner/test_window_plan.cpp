@@ -179,7 +179,6 @@ TEST_CASE("whole-partition window planning rejects unsupported bound semantics",
     "sum(v) FILTER (WHERE v > 0) OVER ()",
     "sum(v ORDER BY p) OVER ()",
     "row_number() OVER ()",
-    "rank() OVER (ORDER BY p)",
     "lag(v) OVER ()",
     "sum(v::HUGEINT) OVER ()",
     "sum(v::DECIMAL(4,0)) OVER ()",
@@ -354,6 +353,19 @@ TEST_CASE("ranking window planning evaluates order expressions once and keeps se
         std::vector<cudf::order>{cudf::order::ASCENDING, cudf::order::ASCENDING});
 }
 
+TEST_CASE("ranking window planning accepts a window without PARTITION BY", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto logical = fixture.bind(
+    "SELECT rank() OVER (ORDER BY v DESC),dense_rank() OVER (ORDER BY v DESC),"
+    "row_number() OVER (ORDER BY v DESC) FROM w");
+  auto plan = plan_window(find_window(*logical));
+  CHECK(plan.partition_slots.empty());
+  CHECK(plan.expressions.empty());
+  CHECK(plan.rankings.size() == 3);
+  CHECK(plan.ranking_order.columns.size() == 1);
+}
+
 TEST_CASE("ranking window planning keeps the direction and NULL placement of each key",
           "[planner][window_plan]")
 {
@@ -376,8 +388,7 @@ TEST_CASE("ranking window planning rejects unsupported shapes", "[planner][windo
 {
   window_fixture fixture;
   auto const expression =
-    GENERATE("rank() OVER (ORDER BY v)",
-             "row_number() OVER (PARTITION BY p)",
+    GENERATE("row_number() OVER (PARTITION BY p)",
              "rank() OVER (PARTITION BY p ORDER BY v::DECIMAL(4,0))",
              "rank() OVER (PARTITION BY p ORDER BY s COLLATE nocase)",
              "rank() OVER (PARTITION BY p ORDER BY [v])",
@@ -700,9 +711,9 @@ TEST_CASE("ranking window adapter rejects invalid construction", "[window_adapte
   {
     CHECK_THROWS_AS(build(output, 3, {0}, order, {}), std::invalid_argument);
   }
-  SECTION("no partition columns")
+  SECTION("no partition columns, for a window without PARTITION BY")
   {
-    CHECK_THROWS_AS(build(output, 3, {}, order, rank), std::invalid_argument);
+    CHECK_NOTHROW(build(output, 3, {}, order, rank));
   }
   SECTION("no order keys")
   {

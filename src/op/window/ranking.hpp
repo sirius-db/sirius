@@ -63,11 +63,11 @@ struct ranking_order {
  *
  * The rows are ordered by the partition columns and then by the order keys. Rows with equal
  * partition column values form one partition, and NULL partition values are equal to each other.
- * The input is one complete hash bucket, which can hold several `PARTITION BY` groups. It is
- * evaluated as one cuDF table, so it must fit in GPU memory and hold fewer than 2^31 rows. A
- * partition is never split across calls. The result columns are scattered back to the row order of
- * @p input, so the input columns are neither copied nor reordered and the caller appends the
- * result columns to them.
+ * The input is one complete hash bucket, which can hold several `PARTITION BY` groups, or the whole
+ * input when the window has no `PARTITION BY`. It is evaluated as one cuDF table, so it must fit in
+ * GPU memory and hold fewer than 2^31 rows. A partition is never split across calls. The result
+ * columns are scattered back to the row order of @p input, so the input columns are neither copied
+ * nor reordered and the caller appends the result columns to them.
  *
  * Partition columns and order keys refer to columns of @p input. A key may be in an exact
  * narrower carrier of its logical type, which sorts and compares like the type itself. Decimal
@@ -75,7 +75,8 @@ struct ranking_order {
  * `-0.0` equals `0.0`. Strings order by their bytes.
  *
  * @param input Table holding the partition columns and the order keys.
- * @param partition_columns Indices of the partition columns in @p input. Must not be empty.
+ * @param partition_columns Indices of the partition columns in @p input. Empty for a window without
+ * `PARTITION BY`, which makes the whole input one partition.
  * @param order The window ORDER BY.
  * @param functions The ranking functions to evaluate. Must not be empty.
  * @param stream CUDA stream used for all device work.
@@ -86,8 +87,8 @@ struct ranking_order {
  * `input.num_rows()` rows in the row order of @p input and without NULLs. An empty input gives
  * empty columns.
  *
- * @throws std::invalid_argument if @p functions, @p partition_columns or `order.columns` is empty
- * or a column index is outside @p input.
+ * @throws std::invalid_argument if @p functions or `order.columns` is empty or a column index is
+ * outside @p input.
  */
 std::unique_ptr<cudf::table> evaluate_ranking_window(
   cudf::table_view input,
