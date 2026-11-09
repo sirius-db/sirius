@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
+#include "expression/ast/case_expr.hpp"
+#include "expression/ast/node.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/scoped_sirius_setting.hpp"
@@ -211,6 +214,24 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
 }
 
 TEST_CASE_METHOD(exists_rewrite_fixture,
+                 "exists rewrite computes a filtered subquery value once for MIN and MAX",
+                 "[exists_rewrite][plan]")
+{
+  auto const query = siblings("g.k = f.k AND g.v <> f.v", "g.k = f.k AND g.v <> f.v AND g.late");
+  REQUIRE(rewrites(query) == 2);
+  auto plan = physical_plan(query);
+  // Only the NOT EXISTS has a filter of its own: one masked `v` feeds both its MIN and MAX.
+  std::size_t masked = 0;
+  for (auto* projection : collect(plan.get(), T::PROJECTION)) {
+    for (auto const& entry :
+         projection->Cast<sirius::op::sirius_physical_projection>().select_list) {
+      if (entry && entry->holds<sirius::ast::case_expr>()) { ++masked; }
+    }
+  }
+  CHECK(masked == 1);
+}
+
+TEST_CASE_METHOD(exists_rewrite_fixture,
                  "exists rewrite covers null-safe comparisons and temporal values",
                  "[exists_rewrite][plan]")
 {
@@ -277,5 +298,20 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
   }
   // Delim joins are merged regardless.
   CHECK(rewrites(q21_shape_query, fits) == 2);
+  REQUIRE_FALSE(con->Query("CALL unpin_table('fact')")->HasError());
+}
+
+TEST_CASE_METHOD(exists_rewrite_fixture,
+                 "exists rewrite merges plain joins over a GPU pin missing a column they read",
+                 "[exists_rewrite][plan]")
+{
+  sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
+  REQUIRE_FALSE(con->Query("CHECKPOINT")->HasError());
+  // Both subqueries also compare `v`, which the pin lacks, so their scans read storage.
+  auto const pin =
+    con->Query("CALL pin_table(format='duckdb', name='fact', tier='gpu', cols=['k'])");
+  INFO(pin->GetError());
+  REQUIRE_FALSE(pin->HasError());
+  CHECK(rewrites(q21_shape_query, std::uint64_t{1} << 20) == 2);
   REQUIRE_FALSE(con->Query("CALL unpin_table('fact')")->HasError());
 }

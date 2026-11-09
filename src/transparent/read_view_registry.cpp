@@ -263,12 +263,14 @@ read_view_comparison compare_read_views_impl(
     }
   }
   // Every logical scan the candidate does not read must be a duplicate of one it does: the same
-  // view read once instead of twice. A scan of any other view going missing is a mismatch.
+  // view, selecting the same rows, read once instead of twice. A scan of any other view going
+  // missing is a mismatch.
   for (auto const& original : logical_original) {
     if (matched_table_indexes.contains(original.table_index)) { continue; }
     bool const duplicates_a_read_view =
       std::any_of(candidate.begin(), candidate.end(), [&](auto const& candidate_binding) {
-        return same_identity(original.view, candidate_binding.view);
+        return same_identity(original.view, candidate_binding.view) &&
+               op::scan::same_selector(*original.view, *candidate_binding.view);
       });
     if (!duplicates_a_read_view) {
       result.reason = "binding_mismatch";

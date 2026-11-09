@@ -391,7 +391,8 @@ std::optional<duckdb::vector<ProjectionIndex>> output_map(LogicalOperator& repla
 unique_ptr<duckdb::BoundAggregateExpression> bind_extremum(duckdb::ClientContext& context,
                                                            char const* name,
                                                            LogicalType const& type,
-                                                           unique_ptr<Expression> argument)
+                                                           unique_ptr<Expression> argument,
+                                                           unique_ptr<Expression> filter = nullptr)
 {
   auto& entry =
     duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
@@ -400,7 +401,7 @@ unique_ptr<duckdb::BoundAggregateExpression> bind_extremum(duckdb::ClientContext
   duckdb::vector<unique_ptr<Expression>> children;
   children.push_back(std::move(argument));
   duckdb::FunctionBinder binder(context);
-  return binder.BindAggregateFunction(std::move(function), std::move(children));
+  return binder.BindAggregateFunction(std::move(function), std::move(children), std::move(filter));
 }
 
 /// One subquery answered by the shared aggregate.
@@ -445,7 +446,7 @@ unique_ptr<Expression> compare(ExpressionType type,
 /// `outer.x`, with NULL comparisons never counting as different; NOT EXISTS keeps the rest,
 /// including rows with no group. For `IS DISTINCT FROM`, the aggregate also records whether a NULL
 /// `t.x` was seen: a NULL `outer.x` differs from any non-NULL `t.x`, and a non-NULL one from a
-/// NULL `t.x` or from MIN or MAX. A subquery's own filters move into its aggregates as a CASE.
+/// NULL `t.x` or from MIN or MAX. A subquery's own filters move into its aggregates as FILTERs.
 /// The filter's projection map restores exactly the columns the replaced node emitted.
 unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
                                   duckdb::Binder& binder,
@@ -492,15 +493,11 @@ unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(0)));
       aggregates.push_back(bind_extremum(context, "max", LogicalType::INTEGER, std::move(seen)));
     }
-    auto argument = std::move(sub.value);
-    if (sub.predicate) {
-      argument = duckdb::make_uniq<duckdb::BoundCaseExpression>(
-        std::move(sub.predicate),
-        std::move(argument),
-        duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(type)));
-    }
-    aggregates.push_back(bind_extremum(context, "min", type, argument->Copy()));
-    aggregates.push_back(bind_extremum(context, "max", type, std::move(argument)));
+    // As FILTERs, MIN and MAX share one filtered input column in the physical plan.
+    aggregates.push_back(bind_extremum(
+      context, "min", type, sub.value->Copy(), sub.predicate ? sub.predicate->Copy() : nullptr));
+    aggregates.push_back(
+      bind_extremum(context, "max", type, std::move(sub.value), std::move(sub.predicate)));
   }
   auto const group_index     = binder.GenerateTableIndex();
   auto const aggregate_index = binder.GenerateTableIndex();
@@ -640,7 +637,8 @@ std::optional<peeled_scan> peel_scan(unique_ptr<LogicalOperator>& root)
 /// Whether two scans read the same view of the same source. This is the identity the transparent
 /// execution path itself compares between plans (`capture_bound_read_view`), which a table
 /// function's own bind-data equality does not reliably provide (parquet's does not, even for a
-/// scan against itself).
+/// scan against itself). Reads of the same files can still select different rows, such as two
+/// Iceberg snapshots with different deletes, so their selector evidence must match too.
 bool same_source(duckdb::ClientContext& context,
                  duckdb::LogicalGet const& a,
                  duckdb::LogicalGet const& b)
@@ -653,7 +651,8 @@ bool same_source(duckdb::ClientContext& context,
     auto const view_a = sirius::op::scan::capture_bound_read_view(a, context);
     auto const view_b = sirius::op::scan::capture_bound_read_view(b, context);
     return view_a.identity && view_b.identity &&
-           view_a.identity->fingerprint == view_b.identity->fingerprint;
+           view_a.identity->fingerprint == view_b.identity->fingerprint &&
+           sirius::op::scan::same_selector(view_a, view_b);
   } catch (std::exception const&) {
     return false;
   }
@@ -676,7 +675,7 @@ duckdb::idx_t widen(duckdb::LogicalGet& get, duckdb::idx_t base)
   return slot;
 }
 
-/// Whether @p get is served from a table pinned in GPU memory.
+/// Whether @p get is served from a table pinned in GPU memory that holds every column it reads.
 bool served_from_gpu_pin(duckdb::ClientContext& context, duckdb::LogicalGet const& get)
 {
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -698,7 +697,8 @@ bool served_from_gpu_pin(duckdb::ClientContext& context, duckdb::LogicalGet cons
     if (files.empty()) { return false; }
     entry = scan_manager.find_pinned_entry_for_parquet_files(files);
   }
-  return entry && entry->tier == cucascade::memory::Tier::GPU;
+  return entry && entry->tier == cucascade::memory::Tier::GPU &&
+         !entry->cache_info.column_projection_for(get.GetColumnIds()).empty();
 }
 
 /// Whether every column @p expression reads is a plain base column of @p get.

@@ -145,6 +145,15 @@ struct bound_read_view {
   std::optional<std::string> logical_selector_evidence;
 };
 
+/// Whether two reads select the same logical rows: when either requires selector evidence, both
+/// carry it and it is equal. Physical identity alone does not prove this.
+inline bool same_selector(bound_read_view const& a, bound_read_view const& b)
+{
+  if (!a.selector_evidence_required && !b.selector_evidence_required) { return true; }
+  return a.logical_selector_evidence && b.logical_selector_evidence &&
+         *a.logical_selector_evidence == *b.logical_selector_evidence;
+}
+
 /// Logical scan binding paired with its captured read view.
 struct logical_bound_read_view {
   /// DuckDB logical binding index used to match scans across a copied plan.

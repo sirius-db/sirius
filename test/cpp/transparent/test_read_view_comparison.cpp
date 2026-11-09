@@ -120,6 +120,33 @@ TEST_CASE("Copy-origin read views admit a merged scan of an identical view",
   CHECK_FALSE(other.equal);
 }
 
+TEST_CASE("Copy-origin read views merge identical files only for the same selector",
+          "[transparent][read_view]")
+{
+  // Two snapshots over the same data files, as with Iceberg deletes: equal physical identity,
+  // different selected rows.
+  auto snapshot_1 = view("a.parquet", "snapshot=1", true);
+  auto snapshot_2 = view("a.parquet", "snapshot=2", true);
+  REQUIRE(fingerprint(snapshot_1) == fingerprint(snapshot_2));
+  CHECK_FALSE(same_selector(*snapshot_1, *snapshot_2));
+
+  std::vector<original_binding> logical{{10, snapshot_1}, {20, snapshot_2}};
+  std::vector<read_view_fingerprint> physical{fingerprint(snapshot_1), fingerprint(snapshot_2)};
+  std::vector<candidate_binding> merged{{10, snapshot_1}};
+  auto different = compare_read_views(candidate_origin::copy, logical, physical, merged);
+  CHECK_FALSE(different.equal);
+  CHECK(different.reason == "binding_mismatch");
+
+  // Missing evidence proves nothing either.
+  auto unproven = view("a.parquet", std::nullopt, true);
+  CHECK_FALSE(same_selector(*unproven, *unproven));
+
+  auto same = view("a.parquet", "snapshot=1", true);
+  std::vector<original_binding> logical_same{{10, snapshot_1}, {20, same}};
+  auto equal = compare_read_views(candidate_origin::copy, logical_same, physical, merged);
+  CHECK(equal.equal);
+}
+
 TEST_CASE("Replan-origin read views admit only a single corresponding scan",
           "[transparent][read_view]")
 {
