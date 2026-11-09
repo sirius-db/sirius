@@ -1,206 +1,65 @@
 # Shared Infrastructure for Sirius Debugging Skills
 
-This document defines common patterns used across all debugging skills.
+## Builds and sanitizers
 
-## Build Modes
+Run builds through `pixi run make <preset>`. The `release` preset is optimized;
+`relwithdebinfo` and `clang-relwithdebinfo` include host debug symbols;
+`debug` and `clang-debug` include device line information. Root presets build Sirius and its
+C++ tests. `pixi run make` also installs the release library and builds the wrapper;
+see [sirius-duckdb/README.md](../../../sirius-duckdb/README.md) for shared wrapper
+builds. Other root presets build only Sirius and tests. For SQL debugging, install
+the selected library and rebuild the wrapper against that prefix with compatible
+toolchains. For example, from the repository root:
 
-All skills support three build presets:
-- `release` -- optimized build, no debug symbols. Default for performance testing and general use.
-- `relwithdebinfo` -- optimized build **with** debug symbols. Best for profiling (nsys), cuda-gdb crash debugging, and getting meaningful stack traces at near-production speed. Also available as `clang-relwithdebinfo`.
-- `clang-debug` -- clang compiler, unoptimized with full debug symbols. Required for sanitizers (ASan/TSan). Slowest but most debuggable.
-
-**When to use which preset:**
-| Preset | Speed | Debug symbols | Sanitizers | Use for |
-|--------|-------|---------------|------------|---------|
-| `release` | Fastest | No | No | Performance benchmarks, general queries |
-| `relwithdebinfo` | Fast | Yes | No | Profiling (nsys), crash backtraces, cuda-gdb |
-| `clang-debug` | Slow | Yes | Yes (ASan/TSan) | Race detection, memory error detection |
-
-**Build command pattern (always use pixi):**
 ```bash
-cd /home/bwyogatama/sirius
-pixi run -e clang make release
-# or
-pixi run -e clang make relwithdebinfo
-# or
-pixi run -e clang make clang-debug
+pixi run make clang-debug
+pixi run cmake --install build/clang-debug --prefix "$PWD/build/clang-debug/install" --component sirius_library
+pixi run make -C sirius-duckdb debug SIRIUS_DUCKDB_LINKAGE=shared SIRIUS_INSTALL_DIR="$PWD/build/clang-debug/install"
 ```
 
-**Important:** Always build inside a pixi environment. Pixi manages all dependencies (CUDA toolkit, cuDF, clang, sccache, etc.) via `pixi.toml`.
+This example uses the wrapper under `sirius-duckdb/build/debug`; choose the
+actual wrapper directory for other targets. Take care with existing wrapper build
+directories and CMake caches when changing the library or toolchain.
 
-## AddressSanitizer (ASan)
+For host sanitizers, use the separate `clang-asan` and `clang-tsan` presets. Their
+outputs are in `build/clang-asan` and `build/clang-tsan`; they cannot be combined.
+`docs/super-sirius/debugging.md` documents required ASan CUDA options, TSan
+suppressions and runtime options, and Compute Sanitizer limitations. In particular,
+pooled GPU allocations can hide sub-allocation overruns from memcheck. Compute
+Sanitizer does not require an instrumented build; `clang-debug` provides device
+line information. Compute Sanitizer and cuda-gdb may not be installed or on
+`PATH`; check availability before selecting either tool.
 
-ASan detects CPU-side memory errors: heap/stack buffer overflows, use-after-free, double-free, and memory leaks. It does **not** detect GPU memory errors (use NVIDIA Compute Sanitizer `memcheck` for that).
+## SQL and results
 
-**How ASan is configured:**
-DuckDB's CMake has `ENABLE_SANITIZER=TRUE` by default, which adds `-fsanitize=address` to Debug builds only (via `CXX_EXTRA_DEBUG`). This means:
-- **`clang-debug`**: ASan is **on by default** -- no extra flags needed
-- **`release` / `relwithdebinfo`**: ASan is **not active** (the flag only applies to Debug build types)
+Use the supplied query, database, Parquet paths, and setup statements when available.
+Ask only for information needed to reproduce the issue that cannot be inferred.
+Avoid rerunning mutating SQL against user data without authorization. Run normal
+SQL after loading the extension; Sirius transparently intercepts supported queries:
 
-**To explicitly disable ASan in debug builds** (e.g., when using TSan instead):
 ```bash
-pixi run -e clang make clang-debug EXTRA_CMAKE_FLAGS="-DENABLE_SANITIZER=0"
+pixi run sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <database_path>
 ```
 
-**ASan vs TSan -- mutually exclusive:**
-ASan and TSan cannot be used simultaneously. DuckDB will warn and disable ASan if both are enabled. Use separate builds:
-- ASan build: `clang-debug` (default, no extra flags)
-- TSan build: `clang-debug` with `EXTRA_CMAKE_FLAGS="-DENABLE_TSAN=ON -DENABLE_SANITIZER=0"`
+For CPU comparison, run the same SQL with `SET gpu_execution = false` or without
+the extension. Compare results with ordering and query semantics in mind. Repeated
+runs can expose inconsistent results, but a difference alone does not prove a race.
 
-**ASan runtime options:**
-```bash
-ASAN_OPTIONS="detect_leaks=1:halt_on_error=0:print_legend=1" sirius-duckdb/build/debug/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/debug/extension/sirius/sirius.duckdb_extension';" ...
-```
-- `detect_leaks=1`: Also report memory leaks at exit
-- `halt_on_error=0`: Continue after first error (collect multiple reports)
-- `halt_on_error=1` (default): Stop on first error (better for interactive debugging)
+## Changes and logs
 
-**ASan overhead:** ~2x slowdown, ~2-3x memory increase. Much lighter than Valgrind.
+Respect the requested scope: diagnose and propose fixes for an analysis request;
+apply and verify fixes when the request covers them. Preserve existing user changes
+and remove temporary instrumentation introduced for the investigation when finished.
+Do not stage or commit changes unless requested. Consider the cost of sanitizer
+builds and repeated runs alongside the user's resource constraints.
 
-**What ASan catches (CPU-side only):**
-- Heap buffer overflow / underflow
-- Stack buffer overflow
-- Use-after-free / use-after-return
-- Double-free
-- Memory leaks (with `detect_leaks=1`)
-- Stack use after scope (with `-fsanitize-address-use-after-scope`)
-
-## SQL Query Execution
-
-Root presets build Sirius and its C++ tests. Install the matching library and
-build the separate wrapper as described in [sirius-duckdb/README.md](../../../sirius-duckdb/README.md)
-before running SQL. The wrapper uses `build/release` or `build/debug` even when
-Sirius was built with a `clang-` preset.
-
-All skills accept an optional SQL query from the user. Follow this pattern:
-
-1. Ask the user whether their data is in **DuckDB format** or **Parquet format**
-2. Run the query once with `SIRIUS_LOG_LEVEL=trace` to generate detailed logs
-3. Read the log from `build/<preset>/log/sirius_<date>.log`
-4. Use the log to identify the code path (which operators, pipelines, memory regions were hit)
-5. Scope subsequent analysis only to relevant source files
-
-**Query execution -- DuckDB format:**
-```bash
-export SIRIUS_LOG_LEVEL=trace
-sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <path_to_database.duckdb>
-```
-Then inside the DuckDB CLI:
-```sql
-CALL gpu_execution('<USER_SQL_QUERY>');
-```
-
-**Query execution -- Parquet format:**
-Ask the user for the parquet directory path, then:
-```bash
-export SIRIUS_LOG_LEVEL=trace
-sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';"
-```
-Then inside the DuckDB CLI, create views for each table from parquet files:
-```sql
-CREATE OR REPLACE VIEW lineitem AS SELECT * FROM '/path/to/parquet_dir/lineitem/*.parquet';
-CREATE OR REPLACE VIEW orders AS SELECT * FROM '/path/to/parquet_dir/orders/*.parquet';
--- ... repeat for each table
-CALL gpu_execution('<USER_SQL_QUERY>');
-```
-
-## Result Comparison Against DuckDB (CPU Baseline)
-
-All skills that run SQL queries offer the option to compare Sirius GPU results against DuckDB's native CPU execution.
-
-**Pattern:**
-1. Run the query via DuckDB CPU (no Sirius extension): `sirius-duckdb/build/release/duckdb <db_path>` then `SELECT ...;`
-2. Run the same query via Sirius GPU: `sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path>` then `CALL gpu_execution('SELECT ...');`
-3. Diff the results row-by-row (sort both outputs first to handle ordering differences)
-4. Report any mismatches: missing rows, extra rows, wrong values, type differences
-
-**Multi-Run Consistency Check:**
-For detecting non-deterministic behavior (e.g., race conditions):
-1. Run the query N times (default: 3), saving each result set
-2. Compare all results pairwise
-3. If any differ, report which runs diverged and flag as potential race condition
-4. This can automatically trigger the `/race-check` skill if inconsistency is detected
-
-## Code Scope
+For file logging, set `SIRIUS_LOG_BACKEND=spdlog`, `SIRIUS_LOG_LEVEL=trace`, and a
+per-run `SIRIUS_LOG_DIR` as appropriate. The owning sink writes date-stamped
+`sirius*.log` files with daily rotation and periodic best-effort flushing; trace level does not guarantee
+all entries reach disk before a crash. See `src/log/spdlog_owning_sink.cpp` and
+`src/log/logging.hpp`. Test logs live under `build/<preset>/test/cpp/log/`.
+Temporary trace statements can use a `[SIRIUS_DIAG]` tag to make them easy to find.
 
 The active engine includes code in both `namespace sirius` and `namespace duckdb`.
-Search the relevant `src/` paths and follow call sites; namespace alone does not
+Search relevant `src/` paths and follow call sites; namespace alone does not
 identify whether code participates in execution.
-
-## Autonomy Mode
-
-All skills support an **autonomy mode** that controls interactivity:
-
-| Mode | Behavior |
-|------|----------|
-| `interactive` (default) | Pause after each diagnosis/fix suggestion. Wait for user approval. |
-| `autonomous` | Apply fixes, rebuild, re-run, and iterate automatically until resolved or max iterations reached. |
-| `semi-autonomous` | Iterate automatically, but pause at key decision points (e.g., choosing between fixes, modifying >3 files). |
-
-In `autonomous` and `semi-autonomous` modes:
-- All changes tracked via git commits
-- Max iteration limit (default: 5) prevents infinite loops
-- Summary of all attempted fixes presented at the end
-- End-of-session cleanup prompts user to keep, revert, or cherry-pick changes
-
-**Phase transitions:** All skills with multiple phases must **ask the user before proceeding to the next phase**. Summarize findings, explain the next phase, and ask for confirmation.
-
-## Change Tracking & Easy Revert
-
-All skills must make changes fully reversible.
-
-**Git checkpoint (before any changes):**
-```bash
-git add -A && git commit -m "SIRIUS_DEBUG_CHECKPOINT: pre-skill state" --allow-empty
-```
-
-**Per-iteration snapshots:**
-```bash
-git add -A && git commit -m "SIRIUS_DEBUG_ITER_<N>: <brief description>"
-```
-
-**End-of-session cleanup options:**
-1. **Keep all changes** -- squash debug commits into a single clean commit
-2. **Keep only the fix** -- revert diagnostic logs, keep the bug fix
-3. **Revert everything** -- return to pre-skill checkpoint
-4. **Cherry-pick** -- user chooses which iterations to keep
-
-## Debug Log Insertion & Cleanup
-
-Skills can insert `SIRIUS_LOG_TRACE(...)` statements for diagnosis. All use the `[SIRIUS_DIAG]` tag:
-
-```cpp
-SIRIUS_LOG_TRACE("[SIRIUS_DIAG] <context>: var={}", var);
-```
-
-**Finding and removing diagnostic logs:**
-```bash
-grep -rn "SIRIUS_DIAG" src/
-```
-
-**Log lifecycle:**
-1. **Insert** -- add `[SIRIUS_DIAG]` logs during diagnosis
-2. **Rebuild & run** -- logs appear in `build/<preset>/log/sirius_<date>.log`
-3. **Analyze** -- read logs to narrow down the issue
-4. **Iterate** -- add more targeted logs if needed
-5. **Cleanup** -- categorize each log:
-   - **Promote**: Useful long-term -> change to proper log message with appropriate level
-   - **Remove**: Only useful for this investigation -> delete entirely
-
-## Log Analysis
-
-- Logs live in `build/<preset>/log/sirius_<date>.log`
-- Unit test logs in `build/<preset>/test/cpp/log/`
-- Log format: `[YYYY-MM-DD HH:MM:SS.mmm] [level] [source_file:line] message`
-- Controlled by `SIRIUS_LOG_LEVEL` env var -- **always use `trace`** for maximum detail
-- Logging macros: `SIRIUS_LOG_TRACE`, `SIRIUS_LOG_DEBUG`, `SIRIUS_LOG_INFO`, `SIRIUS_LOG_WARN`, `SIRIUS_LOG_ERROR`, `SIRIUS_LOG_FATAL` (defined in `src/include/log/logging.hpp`)
-
-**Per-run log files:**
-Create separate log directories per run:
-```bash
-export SIRIUS_LOG_DIR=build/release/log/run_$(date +%s)
-mkdir -p $SIRIUS_LOG_DIR
-```
-
-**Immediate flush for crash debugging:**
-When `SIRIUS_LOG_LEVEL` is explicitly set, the logger calls `spdlog::flush_on(log_level)` which flushes after every log entry. This ensures no entries are lost before a crash. See `src/include/log/logging.hpp:94-98`.
