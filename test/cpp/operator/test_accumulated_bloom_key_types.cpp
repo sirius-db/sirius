@@ -53,103 +53,13 @@ namespace {
 namespace op  = sirius::op;
 namespace acc = sirius::test::accumulation;
 using builder = op::detail::accumulated_bloom_builder;
+using sirius::test::columns::families;
+using sirius::test::columns::family;
+using sirius::test::columns::k_rows;
 using sirius::test::columns::make_column;
-
-constexpr std::size_t k_rows = 600;
-
-/// Whether row @p row of a test build is valid: every fifth row is null.
-bool valid_row(std::size_t row) { return row % 5 != 2; }
-
-std::vector<bool> validity(std::size_t rows)
-{
-  std::vector<bool> valid(rows);
-  for (std::size_t row = 0; row < rows; ++row) {
-    valid[row] = valid_row(row);
-  }
-  return valid;
-}
-
-std::size_t valid_rows(std::size_t rows)
-{
-  std::size_t count = 0;
-  for (std::size_t row = 0; row < rows; ++row) {
-    count += valid_row(row) ? 1 : 0;
-  }
-  return count;
-}
-
-/// Distinct values that fit INT16, so every carrier below can hold them.
-template <class T>
-std::vector<T> values(std::size_t rows)
-{
-  std::vector<T> out(rows);
-  for (std::size_t row = 0; row < rows; ++row) {
-    out[row] = static_cast<T>((static_cast<std::int64_t>(row) * 37) % 30'011 - 15'000);
-  }
-  return out;
-}
-
-/// A key family: the type the filter is built over, the build column at its carrier, and the
-/// same keys as a column of the construction type for the column constructor.
-struct family {
-  std::string name;
-  cudf::data_type construction;
-  std::function<std::unique_ptr<cudf::column>(::cuda::stream_ref)> carrier;
-  std::function<std::unique_ptr<cudf::column>(::cuda::stream_ref)> oracle;
-};
-
-family numeric_family(std::string name, cudf::data_type construction, cudf::data_type carrier)
-{
-  auto const make = [](cudf::data_type type, ::cuda::stream_ref stream) {
-    auto const valid = validity(k_rows);
-    switch (cudf::size_of(type)) {
-      case 2: return make_column(type, values<std::int16_t>(k_rows), stream, valid);
-      case 4: return make_column(type, values<std::int32_t>(k_rows), stream, valid);
-      case 8: return make_column(type, values<std::int64_t>(k_rows), stream, valid);
-      default: return make_column(type, values<__int128_t>(k_rows), stream, valid);
-    }
-  };
-  return {std::move(name),
-          construction,
-          [=](::cuda::stream_ref stream) { return make(carrier, stream); },
-          [=](::cuda::stream_ref stream) { return make(construction, stream); }};
-}
-
-family string_family()
-{
-  auto const make = [](::cuda::stream_ref stream) {
-    auto const integers = make_column(cudf::data_type{cudf::type_id::INT32},
-                                      values<std::int32_t>(k_rows),
-                                      stream,
-                                      validity(k_rows));
-    return cudf::strings::from_integers(integers->view(), stream);
-  };
-  return {"STRING", cudf::data_type{cudf::type_id::STRING}, make, make};
-}
-
-std::vector<family> families()
-{
-  using cudf::type_id;
-  return {
-    numeric_family("INT32", cudf::data_type{type_id::INT32}, cudf::data_type{type_id::INT32}),
-    numeric_family("INT64", cudf::data_type{type_id::INT64}, cudf::data_type{type_id::INT64}),
-    numeric_family(
-      "INT16 carrier of INT64", cudf::data_type{type_id::INT64}, cudf::data_type{type_id::INT16}),
-    numeric_family("UINT16", cudf::data_type{type_id::UINT16}, cudf::data_type{type_id::UINT16}),
-    numeric_family("INT16 carrier of DATE",
-                   cudf::data_type{type_id::TIMESTAMP_DAYS},
-                   cudf::data_type{type_id::INT16}),
-    numeric_family("TIMESTAMP_MILLISECONDS",
-                   cudf::data_type{type_id::TIMESTAMP_MILLISECONDS},
-                   cudf::data_type{type_id::TIMESTAMP_MILLISECONDS}),
-    numeric_family("DECIMAL32 carrier of DECIMAL64",
-                   cudf::data_type{type_id::DECIMAL64, -2},
-                   cudf::data_type{type_id::DECIMAL32, -2}),
-    numeric_family("DECIMAL128",
-                   cudf::data_type{type_id::DECIMAL128, -2},
-                   cudf::data_type{type_id::DECIMAL128, -2}),
-    string_family()};
-}
+using sirius::test::columns::string_family;
+using sirius::test::columns::valid_rows;
+using sirius::test::columns::values;
 
 /// The bits the Bloom column constructor sets for @p keys on GPU 0.
 std::vector<std::byte> column_bits(cudf::column_view const& keys, ::cuda::stream_ref stream)
