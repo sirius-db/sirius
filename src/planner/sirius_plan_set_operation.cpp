@@ -112,9 +112,15 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     union_op->children.push_back(std::move(arm));
   }
 
-  if (op.setop_all) { return union_op; }
+  if (!set_operation_deduplicates(op)) { return union_op; }
   // DuckDB's own planner also deduplicates a distinct UNION by grouping on every column.
   return plan_full_row_dedup(std::move(union_op), op.estimated_cardinality);
+}
+
+bool sirius_physical_plan_generator::set_operation_deduplicates(
+  duckdb::LogicalSetOperation const& op) noexcept
+{
+  return !op.setop_all;
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -434,6 +440,7 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   // Default options retain all columns and publish no dynamic filters for NULL-equal keys.
   auto join = make_hash_join(
     op, std::move(left), std::move(right), std::move(conditions), set_op.join_type, op_params);
+  D_ASSERT(set_operation_deduplicates(op));
   return plan_full_row_dedup(std::move(join), op.estimated_cardinality);
 }
 

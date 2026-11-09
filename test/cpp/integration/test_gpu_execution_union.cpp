@@ -285,6 +285,37 @@ TEST_CASE_METHOD(UnionFixture,
   compare_gpu_vs_cpu("SELECT k, v FROM uempty " + keyword + " SELECT k, v FROM setop_right");
 }
 
+// The DISTINCT over a distinct set operation plans no aggregate of its own, so the set operation's
+// deduplication alone must remove the duplicates. DISTINCTs that can still remove rows keep theirs.
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution DISTINCT over set operations removes every duplicate",
+                 "[integration][gpu_execution][set_operation][setop_distinct]")
+{
+  run_ok("CREATE TABLE dup_left (k INTEGER, v VARCHAR);");
+  run_ok("CREATE TABLE dup_right (k INTEGER, v VARCHAR);");
+  run_ok(
+    "INSERT INTO dup_left VALUES (1, 'a'), (1, 'a'), (1, 'b'), (2, 'a'), (2, 'a'), "
+    "(NULL, 'n'), (NULL, 'n'), (3, NULL), (3, NULL), (4, 'x');");
+  run_ok("INSERT INTO dup_right VALUES (1, 'b'), (4, 'x'), (4, 'x'), (5, 'y');");
+  run_ok("CHECKPOINT;");
+
+  for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
+    CAPTURE(keyword);
+    std::string const setop =
+      "SELECT k, v FROM dup_left " + keyword + " SELECT k, v FROM dup_right";
+    compare_gpu_vs_cpu(setop);
+    compare_gpu_vs_cpu("SELECT count(*) FROM (" + setop + ")");
+    compare_gpu_vs_cpu_ordered(setop + " ORDER BY k NULLS FIRST, v NULLS FIRST");
+    compare_gpu_vs_cpu("SELECT v, k FROM (" + setop + ")");
+    compare_gpu_vs_cpu("SELECT DISTINCT k FROM (" + setop + ")");
+    compare_gpu_vs_cpu("SELECT DISTINCT * FROM (SELECT k, v FROM dup_left " + keyword +
+                       " ALL SELECT k, v FROM dup_right)");
+  }
+  compare_gpu_vs_cpu(
+    "(SELECT k, v FROM dup_left EXCEPT SELECT k, v FROM dup_right) "
+    "INTERSECT SELECT k, v FROM dup_left");
+}
+
 // The fixture tables above fit in one batch and take the whole-build BUILD_PROBE join. Here both
 // inputs span many batches and hash partitions, and a zero hash-table cap moves the join to its
 // partitioned STANDARD path. Two keys carry NULLs and the DOUBLE column mixes -0.0, 0.0 and NaN.

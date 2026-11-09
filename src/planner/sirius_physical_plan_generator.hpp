@@ -265,6 +265,15 @@ class sirius_physical_plan_generator {
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
     duckdb::idx_t estimated_cardinality);
 
+  //! Whether `plan_union` / `plan_except_intersect` end the plan of @p op with
+  //! `plan_full_row_dedup`, so its rows are already distinct. A `LogicalDistinct` over such a set
+  //! operation emits no second deduplication.
+  static bool set_operation_deduplicates(duckdb::LogicalSetOperation const& op) noexcept;
+
+  //! Whether every row @p op produces is distinct because, below any identity projections, it is
+  //! a set operation for which `set_operation_deduplicates` holds.
+  static bool input_rows_are_distinct(duckdb::LogicalOperator const& op);
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
 
