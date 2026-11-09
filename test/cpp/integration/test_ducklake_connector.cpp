@@ -26,6 +26,7 @@
 #include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "util/env_guard.hpp"
 #include "utils/dynamic_filter_test_utils.hpp"
 #include "utils/scoped_temp_directory.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -33,6 +34,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -44,6 +46,7 @@
 #include <duckdb/main/database_manager.hpp>
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/optimizer/optimizer_extension.hpp>
+#include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <yaml-cpp/yaml.h>
 
@@ -534,6 +537,13 @@ struct ducklake_fixture {
   void check_gpu_query(std::string const& sql) { check_gpu_result(sql, cpu_result(sql)); }
 };
 
+std::string ducklake_test_provider()
+{
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  return load_ducklake(con);
+}
+
 }  // namespace
 
 TEST_CASE("DuckLake verifies the loaded provider independently of its directory",
@@ -541,12 +551,7 @@ TEST_CASE("DuckLake verifies the loaded provider independently of its directory"
 {
   const bool replace = GENERATE(false, true);
   sirius::test::scoped_temp_directory disk;
-  std::string original;
-  {
-    sirius::test::shared_test_env first(lake_config());
-    auto con = first.make_connection();
-    original = load_ducklake(con);
-  }
+  auto original = ducklake_test_provider();
   sirius::test::shared_test_env env(lake_config());
   auto con        = env.make_connection();
   const auto root = std::filesystem::path(disk.directory);
@@ -586,6 +591,81 @@ TEST_CASE("DuckLake verifies the loaded provider independently of its directory"
     std::filesystem::copy_file(original, shadow);
     CHECK(ducklake_result_bag(*query(con, sql)) == expected);
   }
+}
+
+TEST_CASE("DuckLake loaded before Sirius retains the original module across registration",
+          "[isolated_context][ducklake]")
+{
+  const bool during_load = GENERATE(false, true);
+  CAPTURE(during_load);
+  sirius::test::scoped_temp_directory disk;
+  auto original = ducklake_test_provider();
+  sirius::util::env_guard config_path("SIRIUS_CONFIG_FILE", lake_config().string());
+  sirius::util::env_guard enabled("SIRIUS_DISABLE", std::nullopt);
+  auto make_db = [] {
+    duckdb::DBConfig config;
+    config.options.load_extensions = false;
+    config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
+    auto db = std::make_unique<duckdb::DuckDB>(nullptr, &config);
+    duckdb::Connection con(*db);
+    query(con, "LOAD core_functions");
+    query(con, "LOAD parquet");
+    return db;
+  };
+  auto db = make_db();
+  duckdb::Connection loader(*db), registrar(*db);
+  const auto root = std::filesystem::path(disk.directory);
+  query(loader,
+        "SET extension_directories=[" + duckdb::Value((root / "first").string()).ToSQLString() +
+          "," + duckdb::Value((root / "second").string()).ToSQLString() + "]");
+  auto dirs = duckdb::ExtensionHelper::GetExtensionDirectoryPath(*loader.context);
+  REQUIRE(dirs.size() == 2);
+  auto shadow = std::filesystem::path(dirs[0]) / "ducklake.duckdb_extension";
+  auto loaded = std::filesystem::path(dirs[1]) / "ducklake.duckdb_extension";
+  std::filesystem::create_directories(loaded.parent_path());
+  std::filesystem::copy_file(original, loaded);
+
+  struct load_barrier final : duckdb::ExtensionCallback {
+    query_pause pause;
+    void OnExtensionLoaded(duckdb::DatabaseInstance&, const std::string& name) override
+    {
+      if (name == "ducklake") pause.arrive_and_wait();
+    }
+  };
+  auto barrier = duckdb::make_shared_ptr<load_barrier>();
+  if (during_load) duckdb::ExtensionCallback::Register(db->instance->config, barrier);
+  auto loading = std::async(std::launch::async, [&] { return loader.Query("LOAD ducklake"); });
+  absl::Cleanup release = [&] { barrier->pause.release(); };
+  if (during_load)
+    REQUIRE(barrier->pause.wait_until_arrived());
+  else
+    loading.get()->ThrowIfError();
+  std::filesystem::create_directories(shadow.parent_path());
+  std::filesystem::copy_file(original, shadow);
+  std::unique_ptr<duckdb::DuckDB> shadow_db;
+  if (during_load) {
+    // Both images are loaded in the process, each by a different database.
+    shadow_db = make_db();
+    duckdb::Connection other(*shadow_db);
+    query(other, "LOAD " + duckdb::Value(shadow.string()).ToSQLString());
+  }
+  query(registrar, "LOAD sirius");
+  if (during_load) {
+    // FinishLoad owns the native lock and has already taken its callback snapshot.
+    CHECK_FALSE(sirius::planner::registered_ducklake_provider(*db->instance));
+    barrier->pause.release();
+    loading.get()->ThrowIfError();
+  }
+  duckdb::Connection con(*db);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CREATE TABLE lake.t AS SELECT 42 AS id");
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  const std::vector<std::string> expected{"42|"};
+  REQUIRE(ducklake_result_bag(*query(con, "CALL gpu_execution('SELECT id FROM lake.t')")) ==
+          expected);
+  CHECK(sirius::planner::registered_ducklake_provider(*db->instance));
 }
 
 TEST_CASE("DuckLake provider SQL declines while ordinary user SQL remains GPU eligible",

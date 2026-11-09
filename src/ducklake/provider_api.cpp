@@ -16,13 +16,17 @@
 
 #include "ducklake/provider_api.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <dlfcn.h>
-#include <duckdb/common/file_system.hpp>
-#include <duckdb/main/extension_helper.hpp>
+#include <duckdb/main/config.hpp>
 #include <duckdb/main/extension_manager.hpp>
+#include <fcntl.h>
 #include <link.h>
+#include <pthread.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <unistd.h>
 
 #include <bit>
 #include <cinttypes>
@@ -30,31 +34,37 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace sirius::ducklake {
 namespace {
 using namespace duckdb;
 
-std::string provider_load_path(DatabaseInstance& db, ExtensionInstallInfo const& install)
+std::optional<ExtensionInstallInfo> install_snapshot(DatabaseInstance& db,
+                                                     bool in_ducklake_load_callback)
 {
-  if (install.mode == ExtensionInstallMode::NOT_INSTALLED) return install.full_path;
-  if (install.mode == ExtensionInstallMode::STATICALLY_LINKED) return {};
-  // Named LOAD searches the extension directories in order. install.full_path
-  // records the download URL or source file, which can differ from the loaded copy.
-  auto& fs = db.GetFileSystem();
-  for (auto const& dir : ExtensionHelper::GetExtensionDirectoryPath(db, fs)) {
-    auto path = fs.JoinPath(dir, "ducklake.duckdb_extension");
-    if (fs.FileExists(path)) return path;
-  }
-  return {};
+  auto info = ExtensionManager::Get(db).GetExtensionInfo("ducklake");
+  if (!info || !info->is_loaded) return {};
+  // DuckDB writes install_info under this lock, after publishing is_loaded. Its
+  // own FinishLoad callback already holds the lock and sees the completed write.
+  auto* lock = in_ducklake_load_callback ? nullptr : info->lock.native_handle();
+  // LOADs can nest. POSIX trylock also returns busy for this thread's own
+  // non-recursive lock. A later scan lookup retries after FinishLoad returns.
+  if (lock && pthread_mutex_trylock(lock) != 0) return {};
+  absl::Cleanup unlock = [&] {
+    if (lock) pthread_mutex_unlock(lock);
+  };
+  if (!info->install_info) return {};
+  return *info->install_info;
 }
 
-// link_map::l_name can be renamed after LOAD. The kernel records the backing
-// device and inode of each mapping independently of changes to that pathname.
-bool mapped_file_matches(link_map const& map, struct stat const& expected)
+using file_id = std::pair<dev_t, ino_t>;
+
+std::optional<file_id> mapped_file_id(void const* pointer)
 {
-  auto address = reinterpret_cast<std::uintptr_t>(map.l_ld);
+  auto address = reinterpret_cast<std::uintptr_t>(pointer);
   std::ifstream maps("/proc/self/maps");
   for (std::string line; std::getline(maps, line);) {
     std::uintptr_t first, last;
@@ -67,12 +77,24 @@ bool mapped_file_matches(link_map const& map, struct stat const& expected)
                     &major_device,
                     &minor_device,
                     &inode) == 5 &&
-        first <= address && address < last) {
-      return inode != 0 && inode == expected.st_ino &&
-             makedev(major_device, minor_device) == expected.st_dev;
+        first <= address && address < last && inode != 0) {
+      return file_id{makedev(major_device, minor_device), inode};
     }
   }
-  return false;
+  return {};
+}
+
+bool mapped_file_matches(link_map const& map, int fd, struct stat const& file)
+{
+  auto loaded = mapped_file_id(map.l_ld);
+  if (!loaded) return false;
+  if (*loaded == file_id{file.st_dev, file.st_ino}) return true;
+  // Overlayfs may expose a different device/inode through stat than through a VMA.
+  // Map the same open file so both identities come from the kernel's VMA view.
+  void* probe = mmap(nullptr, 1, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (probe == MAP_FAILED) return false;
+  absl::Cleanup unmap = [&] { munmap(probe, 1); };
+  return mapped_file_id(probe) == loaded;
 }
 
 struct symbols {
@@ -117,43 +139,57 @@ Derived const* checked_cast(Base const* value, __cxxabiv1::__class_type_info con
 }
 }  // namespace
 
-std::shared_ptr<const provider_api> provider_api::resolve(duckdb::DatabaseInstance& db)
+std::shared_ptr<const provider_api> resolve_provider(duckdb::DatabaseInstance& db,
+                                                     bool in_ducklake_load_callback)
 {
-  auto& manager = duckdb::ExtensionManager::Get(db);
-  if (!manager.ExtensionIsLoaded("ducklake")) return {};
-  auto info = manager.GetExtensionInfo("ducklake");
-  if (!info || !info->install_info || info->install_info->version != "417a9117f5") return {};
-  auto path = provider_load_path(db, *info->install_info);
+  auto install = install_snapshot(db, in_ducklake_load_callback);
+  if (!install || install->version != "417a9117f5" ||
+      install->mode == ExtensionInstallMode::STATICALLY_LINKED)
+    return {};
+  // The pinned provider registers this setter in this database. DuckDB copies the
+  // option under its settings lock. Its address only locates the candidate image.
+  ExtensionOption option;
+  Dl_info origin{};
+  if (!DBConfig::GetConfig(db).TryGetExtensionOption("ducklake_target_file_size", option) ||
+      !option.set_function || !dladdr(reinterpret_cast<void*>(option.set_function), &origin) ||
+      !origin.dli_fname || !*origin.dli_fname)
+    return {};
+  std::string path =
+    install->mode == ExtensionInstallMode::NOT_INSTALLED ? install->full_path : origin.dli_fname;
   if (path.empty()) return {};
-  path = std::filesystem::absolute(path).string();
+  path   = std::filesystem::absolute(path).string();
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+  if (fd < 0) return {};
+  absl::Cleanup close_fd = [&] { ::close(fd); };
   struct stat loaded{};
-  if (::stat(path.c_str(), &loaded) != 0 || !S_ISREG(loaded.st_mode)) return {};
+  if (fstat(fd, &loaded) != 0 || !S_ISREG(loaded.st_mode) || loaded.st_size == 0) return {};
 
-  // Retain the object DuckDB already loaded. Never load a candidate to inspect its exports.
-  std::shared_ptr<void> module(dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD),
+  std::shared_ptr<void> module(dlopen(origin.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD),
                                [](void* h) {
                                  if (h) dlclose(h);
                                });
   link_map* map = nullptr;
-  if (!module || dlinfo(module.get(), RTLD_DI_LINKMAP, &map) != 0 || !map) return {};
-  if (!mapped_file_matches(*map, loaded)) return {};
+  if (!module || dlinfo(module.get(), RTLD_DI_LINKMAP, &map) != 0 || !map ||
+      reinterpret_cast<void*>(map->l_addr) != origin.dli_fbase ||
+      !mapped_file_matches(*map, fd, loaded))
+    return {};
 
   auto api    = std::make_shared<provider_api>();
   api->module = std::move(module);
   api->device = loaded.st_dev;
   api->inode  = loaded.st_ino;
   symbols lookup{api->module.get(), map};
-  api->scan_function = reinterpret_cast<decltype(scan_function)>(
+  api->scan_function = reinterpret_cast<decltype(api->scan_function)>(
     lookup.find("_ZN6duckdb17DuckLakeFunctions23GetDuckLakeScanFunctionERNS_16DatabaseInstanceE"));
-  api->create_reader = reinterpret_cast<decltype(create_reader)>(
+  api->create_reader = reinterpret_cast<decltype(api->create_reader)>(
     lookup.find("_ZN6duckdb23DuckLakeMultiFileReader14CreateInstanceERKNS_18BoundTableFunctionE"));
   api->get_files =
-    lookup.member<decltype(get_files)>("_ZNK6duckdb21DuckLakeMultiFileList8GetFilesEv");
-  api->set_scan_columns = lookup.member<decltype(set_scan_columns)>(
+    lookup.member<decltype(api->get_files)>("_ZNK6duckdb21DuckLakeMultiFileList8GetFilesEv");
+  api->set_scan_columns = lookup.member<decltype(api->set_scan_columns)>(
     "_ZNK6duckdb21DuckLakeMultiFileList14SetScanColumnsERKNS_6vectorINS_"
     "25MultiFileColumnDefinitionELb1ESaIS2_EEERKNS1_INS_11ColumnIndexELb1ESaIS7_EEE");
 #if defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI
-  api->has_local_delete = lookup.member<decltype(has_local_delete)>(
+  api->has_local_delete = lookup.member<decltype(api->has_local_delete)>(
     "_ZNK6duckdb19DuckLakeTransaction21HasLocalDeleteForFileENS_10TableIndexERKNSt7__cxx1112basic_"
     "stringIcSt11char_traitsIcESaIcEEE");
 #else
@@ -161,11 +197,11 @@ std::shared_ptr<const provider_api> provider_api::resolve(duckdb::DatabaseInstan
   api->has_local_delete = nullptr;
 #endif
   api->info_type =
-    static_cast<decltype(info_type)>(lookup.find("_ZTIN6duckdb20DuckLakeFunctionInfoE"));
+    static_cast<decltype(api->info_type)>(lookup.find("_ZTIN6duckdb20DuckLakeFunctionInfoE"));
   api->reader_type =
-    static_cast<decltype(reader_type)>(lookup.find("_ZTIN6duckdb23DuckLakeMultiFileReaderE"));
+    static_cast<decltype(api->reader_type)>(lookup.find("_ZTIN6duckdb23DuckLakeMultiFileReaderE"));
   api->list_type =
-    static_cast<decltype(list_type)>(lookup.find("_ZTIN6duckdb21DuckLakeMultiFileListE"));
+    static_cast<decltype(api->list_type)>(lookup.find("_ZTIN6duckdb21DuckLakeMultiFileListE"));
   if (!api->scan_function || !api->create_reader || !api->get_files || !api->set_scan_columns ||
       !api->has_local_delete || !api->info_type || !api->reader_type || !api->list_type)
     return {};

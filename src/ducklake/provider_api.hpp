@@ -30,7 +30,6 @@ namespace sirius::ducklake {
 
 // Only the pinned Linux provider exports these private C++ types and operations.
 struct provider_api {
-  static std::shared_ptr<const provider_api> resolve(duckdb::DatabaseInstance& db);
   bool matches_loaded_file() const;
 
   duckdb::DuckLakeFunctionInfo const* function_info(duckdb::TableFunctionInfo const*) const;
@@ -44,6 +43,7 @@ struct provider_api {
   decltype(&duckdb::DuckLakeTransaction::HasLocalDeleteForFile) has_local_delete;
 
  private:
+  friend std::shared_ptr<const provider_api> resolve_provider(duckdb::DatabaseInstance&, bool);
   std::shared_ptr<void> module;
   std::string path;
   dev_t device;

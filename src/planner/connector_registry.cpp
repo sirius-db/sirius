@@ -676,7 +676,8 @@ struct ducklake_reference final : duckdb::ObjectCacheEntry {
   detail::connector_reference_cache reference;
 };
 
-void initialize_ducklake_callbacks(duckdb::DatabaseInstance& db)
+void initialize_ducklake_callbacks(duckdb::DatabaseInstance& db,
+                                   bool in_ducklake_load_callback = false)
 {
   if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("ducklake")) return;
   auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
@@ -687,10 +688,11 @@ void initialize_ducklake_callbacks(duckdb::DatabaseInstance& db)
     auto& db_cache = db.GetObjectCache();
     if (db_cache.Get<ducklake_reference>(ducklake_reference::key)) return;
     try {
+      auto module = sirius::ducklake::resolve_provider(db, in_ducklake_load_callback);
+      if (!module) return;
       auto parquet = parquet_reference_functions(db, "parquet_scan");
       if (parquet.empty()) return;
-      std::shared_ptr<const sirius::ducklake::provider_api> module;
-      auto references = sirius::ducklake::trusted_scan_functions(db, parquet.front(), module);
+      auto references = sirius::ducklake::trusted_scan_functions(db, parquet.front(), *module);
       if (references.empty()) return;
       auto lake    = duckdb::make_shared_ptr<ducklake_reference>();
       lake->module = std::move(module);
@@ -710,7 +712,8 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
   void OnExtensionLoaded(duckdb::DatabaseInstance& db, std::string const& name) override
   {
     if (name == "iceberg") initialize_iceberg_callbacks(db);
-    if (name == "ducklake" || name == "parquet") initialize_ducklake_callbacks(db);
+    if (name == "ducklake" || name == "parquet")
+      initialize_ducklake_callbacks(db, name == "ducklake");
   }
 };
 #ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
@@ -832,7 +835,17 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
     if (!entry.bind_data_matches(bind)) continue;
     // The catalog's destructor identifies its host without a loader lookup per scan.
     auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(context));
-    auto& cache      = accepted[i];
+    duckdb::shared_ptr<ducklake_reference> lake;
+    if (registered.function_name == "ducklake_scan") {
+      auto& db_cache = context.db->GetObjectCache();
+      lake           = db_cache.Get<ducklake_reference>(ducklake_reference::key);
+      if (!lake) {
+        // Registration can overlap FinishLoad. Retry outside the registry lock.
+        initialize_ducklake_callbacks(*context.db);
+        lake = db_cache.Get<ducklake_reference>(ducklake_reference::key);
+      }
+    }
+    auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
     auto catalog_entry =
       duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
@@ -842,9 +855,6 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
         duckdb::OnEntryNotFound::RETURN_NULL);
     if (!catalog_entry) return {nullptr, lookup_decline::catalog_entry_missing};
     // A mutable catalog can confirm registration, but must never grant trust.
-    auto lake              = registered.function_name == "ducklake_scan"
-                               ? context.db->GetObjectCache().Get<ducklake_reference>(ducklake_reference::key)
-                               : nullptr;
     auto& reference_cache  = lake ? lake->reference : cache.reference;
     auto const& references = reference_cache.get_or_resolve(
       host, [&] { return reference_functions(entry.function_name, context); });

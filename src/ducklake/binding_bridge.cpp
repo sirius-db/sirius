@@ -67,12 +67,11 @@ void field(std::string& out, std::string const& value)
 }  // namespace
 duckdb::vector<TableFunction> trusted_scan_functions(DatabaseInstance& db,
                                                      TableFunction const& parquet,
-                                                     std::shared_ptr<const provider_api>& api)
+                                                     provider_api const& api)
 {
-  api = provider_api::resolve(db);
-  if (!api || !ExtensionManager::Get(db).ExtensionIsLoaded("parquet")) return {};
-  auto provider = api->scan_function(db);
-  if (provider.get_multi_file_reader != api->create_reader) return {};
+  if (!ExtensionManager::Get(db).ExtensionIsLoaded("parquet")) return {};
+  auto provider = api.scan_function(db);
+  if (provider.get_multi_file_reader != api.create_reader) return {};
   // The provider factory inherits mutable catalog Parquet callbacks. Start from
   // the host-verified definition instead and copy only provider-owned overrides.
   auto trusted = parquet;
