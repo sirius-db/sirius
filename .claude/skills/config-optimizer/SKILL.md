@@ -28,9 +28,9 @@ Tune Sirius configuration parameters for optimal TPC-H performance at various sc
 ## Workflow
 
 1. **Gather context:**
-   - Ask the user for the baseline configuration file (or check `$SIRIUS_CONFIG_FILE`)
-   - Ask for target TPC-H scale factor and dataset location
-   - If the dataset doesn't exist, use the `/dataset-manager` skill to generate it
+   - Use the supplied baseline config or a valid `$SIRIUS_CONFIG_FILE`, target scale factor, and dataset location. Search shared dataset locations when needed; ask only for inputs that remain unclear.
+   - Dataset generation can take substantial time and disk. If no suitable data exists, use `/dataset-manager` only with explicit authorization, or ask before generating it.
+   - Respect the requested configurations and query scope. If a broader sweep would be costly and its extent is unclear, agree on its bounds before running it.
 
 2. **Establish baseline:**
    - Use the `/profile-analyzer` skill to evaluate baseline performance
@@ -67,7 +67,7 @@ Arguments:
 ```bash
 # Example 1: Tune for SF10
 # User: "Find the best config for TPC-H SF10"
-# 1. Generate data if needed
+# 1. Find an existing dataset or obtain authorization to generate one
 # 2. Run baseline with current config
 # 3. Sweep thread counts: 1, 2, 4, 6, 8
 # 4. Sweep cache modes: none, parquet, table_gpu
@@ -82,8 +82,7 @@ Arguments:
 
 ## Before Running
 
-- **Ask the user** if they want to rebuild the code if there are upstream changes
-- Build with pixi: `pixi run make release`
+- Check whether the build is suitable for the requested comparison; rebuild when needed with `pixi run make release`.
 - Ensure `SIRIUS_CONFIG_FILE` is set and points to a valid config file
 
 ## Output
