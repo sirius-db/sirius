@@ -278,9 +278,10 @@ duckdb::Value merged_statistics(duckdb::MultiFileBindData const& bind,
     text, duckdb::LogicalType::MAP(text, text), std::move(keys), std::move(values));
 }
 
-/// The merged, verified statistics a scan was last given. An entry holds the very statistics objects
-/// it was merged from, so it matches only while every file's cache entry is unchanged: a rewritten
-/// file is read into a new object, and keeping the old one alive means its address cannot be reused.
+/// The merged, verified statistics a scan was last given. An entry holds the very statistics
+/// objects it was merged from, so it matches only while every file's cache entry is unchanged: a
+/// rewritten file is read into a new object, and keeping the old one alive means its address cannot
+/// be reused.
 struct merge_entry {
   std::vector<std::shared_ptr<file_statistics const>> files;
   decltype(duckdb::MultiFileBindData::names) names;
