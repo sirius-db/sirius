@@ -850,7 +850,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
    */
   void load_iceberg_extension()
   {
-    auto load = con->Query("LOAD iceberg;");
+    // SIRIUS_TEST_ICEBERG_EXTENSION names an Iceberg build to load instead of the installed one.
+    auto const* build = std::getenv("SIRIUS_TEST_ICEBERG_EXTENSION");
+    auto load = con->Query(build && *build ? "LOAD " + sirius::test::sql_literal(build) + ";"
+                                           : std::string("LOAD iceberg;"));
     REQUIRE(load);
     if (load->HasError()) {
       FAIL("the iceberg extension is required by these tests but could not be loaded: "
@@ -2298,6 +2301,142 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   } else {
     REQUIRE(result->HasError());
     CHECK(result->GetError().find("selector_unproven") != std::string::npos);
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "iceberg table replacement at the same location",
+                 "[integration][iceberg][transparent][read_view][iceberg_table_replacement]")
+{
+  auto const fallback = GENERATE(true, false);
+  auto const pinned   = GENERATE(false, true);
+  // Optimizer call after which the table is replaced: 1 is the original bind, 2 the replan.
+  auto const replaced_after = GENERATE(0u, 1u, 2u);
+  sirius::test::scratch_dir scratch{"iceberg_table_replacement"};
+  auto const directory = scratch.path() / "metadata";
+  auto const source =
+    get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes/metadata";
+  fs::create_directories(directory);
+  fs::copy_file(source / "v1.metadata.json", directory / "v1.metadata.json");
+  fs::copy_file(source / "version-hint.text", directory / "version-hint.text");
+
+  // The replacement keeps the snapshot ID and data file; it has another table UUID and no deletes.
+  using namespace duckdb_yyjson;
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> original(
+    yyjson_read_file((source / "v1.metadata.json").c_str(), 0, nullptr, nullptr), yyjson_doc_free);
+  REQUIRE(original);
+  std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> replaced(
+    yyjson_doc_mut_copy(original.get(), nullptr), yyjson_mut_doc_free);
+  REQUIRE(replaced);
+  auto* root          = yyjson_mut_doc_get_root(replaced.get());
+  auto const selected = yyjson_mut_get_sint(yyjson_mut_obj_get(root, "current-snapshot-id"));
+  REQUIRE(
+    yyjson_mut_obj_put(root,
+                       yyjson_mut_str(replaced.get(), "table-uuid"),
+                       yyjson_mut_str(replaced.get(), "00000000-0000-4000-8000-0000000000ff")));
+  yyjson_mut_val* snapshot      = nullptr;
+  yyjson_mut_val* other_listing = nullptr;
+  size_t index, count;
+  yyjson_mut_val* entry;
+  yyjson_mut_arr_foreach(yyjson_mut_obj_get(root, "snapshots"), index, count, entry)
+  {
+    if (yyjson_mut_get_sint(yyjson_mut_obj_get(entry, "snapshot-id")) == selected) {
+      snapshot = entry;
+    } else {
+      other_listing = yyjson_mut_obj_get(entry, "manifest-list");
+    }
+  }
+  REQUIRE(snapshot);
+  REQUIRE(other_listing);
+  REQUIRE(yyjson_mut_obj_put(snapshot,
+                             yyjson_mut_str(replaced.get(), "manifest-list"),
+                             yyjson_mut_strcpy(replaced.get(), yyjson_mut_get_str(other_listing))));
+  REQUIRE(yyjson_mut_write_file(
+    (directory / "v2.metadata.json").c_str(), replaced.get(), 0, nullptr, nullptr));
+
+  auto probe = con->Query(
+    "SELECT count(*) FROM duckdb_functions() WHERE function_name = "
+    "'iceberg_metadata' AND list_contains(parameters, 'expected_table_uuid')");
+  REQUIRE(probe);
+  REQUIRE_FALSE(probe->HasError());
+  bool const verified = probe->Collection().GetValue(0, 0).GetValue<int64_t>() > 0;
+  CAPTURE(fallback, pinned, replaced_after, verified);
+
+  auto const query = "SELECT fruit, count FROM iceberg_scan(" + scratch.file_literal("") +
+                     (pinned ? ", snapshot_from_id = " + std::to_string(selected) : std::string()) +
+                     ") ORDER BY count";
+  std::vector<std::vector<std::string>> const original_rows{
+    {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}};
+  REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=false")->HasError());
+  auto oracle = con->Query(query);
+  REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=true")->HasError());
+  REQUIRE(oracle);
+  REQUIRE_FALSE(oracle->HasError());
+  REQUIRE(collect_rows(*oracle) == original_rows);
+
+  REQUIRE_FALSE(
+    con->Query(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"))
+      ->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+
+  struct hint_switch : duckdb::OptimizerExtensionInfo {
+    std::atomic<duckdb::ClientContext*> target{nullptr};
+    fs::path hint;
+    unsigned replace_after = 0;
+    unsigned binds         = 0;
+  };
+  auto state           = duckdb::make_shared_ptr<hint_switch>();
+  state->target        = con->context.get();
+  state->hint          = directory / "version-hint.text";
+  state->replace_after = replaced_after;
+  auto reset           = reset_after_test(state->target);
+  duckdb::OptimizerExtension observer;
+  observer.optimizer_info    = state;
+  observer.optimize_function = [](duckdb::OptimizerExtensionInput& input,
+                                  duckdb::unique_ptr<duckdb::LogicalOperator>&) {
+    auto& state = static_cast<hint_switch&>(*input.info);
+    if (state.target.load() != &input.context || ++state.binds != state.replace_after) return;
+    std::ofstream hint(state.hint);
+    hint << "2";
+    hint.close();
+    REQUIRE(hint.good());
+  };
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con->context),
+                                       std::move(observer));
+  auto result   = con->Query(query);
+  state->target = nullptr;
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : "query succeeded"));
+  CHECK(state->binds == 2);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  // Replaced before the replan, the two binds disagree; after it, only the delete lookup differs.
+  bool const rebind_differs = replaced_after == 1;
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + (rebind_differs ? 1 : 0));
+  if (replaced_after == 0) {
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) == original_rows);
+    return;
+  }
+  if (!rebind_differs && !verified) {
+    // Known limitation without expected_table_uuid: the delete lookup reads the replacement, so
+    // deleted rows come back.
+    WARN("iceberg_metadata() has no expected_table_uuid; the table replacement is not detected");
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) ==
+          std::vector<std::vector<std::string>>{
+            {"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
+    return;
+  }
+  sirius::test::require_transparent_execution_delta(before, after, 0, fallback ? 1 : 0, 0);
+  if (fallback) {
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) == original_rows);
+  } else {
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find(rebind_differs ? "selector_unproven" : "Table UUID mismatch") !=
+          std::string::npos);
   }
 }
 
