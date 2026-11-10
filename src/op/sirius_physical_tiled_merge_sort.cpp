@@ -166,6 +166,7 @@ std::optional<std::size_t> sirius_physical_merge_sort::actionable() const
       case phase::plan_ready: return id;
       case phase::sampling:
       case phase::cutting:
+      case phase::coalescing:
         if (n.cursor < n.parts.size()) { return id; }
         break;
       default: break;
@@ -183,25 +184,38 @@ void sirius_physical_merge_sort::retire(std::size_t id)
   n.parts.shrink_to_fit();
 }
 
-// Consecutive contributions up to chunk_bytes (at least one). Sampling borrows payload,
-// which stays queued for cutting; cutting takes ownership and borrows the splitters.
+// A group closes only when the next contribution would exceed chunk_bytes, so any two
+// adjacent groups together exceed it. After coalescing, regrouping the runs therefore
+// yields one run per group: sample and cut tasks each take a single run, and a further
+// coalescing pass would not reduce k. This assumes a merged run reports the bytes of its
+// inputs; cudf::merge can differ slightly (null masks, string offsets), which may let two
+// runs share a group but cannot affect correctness or termination.
+std::size_t sirius_physical_merge_sort::group_end(node const& n, std::size_t begin) const
+{
+  auto end       = begin + 1;
+  uint64_t bytes = n.parts[begin].bytes;
+  while (end < n.parts.size() && bytes + n.parts[end].bytes <= chunk_bytes) {
+    bytes += n.parts[end++].bytes;
+  }
+  return end;
+}
+
+// One greedy group (see group_end). Sampling borrows payload, which stays queued for
+// cutting; cutting and coalescing take ownership. Cutting also borrows the splitters.
 std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::claim_group(
   std::size_t id, step kind, bool pop)
 {
-  auto& n = _nodes[id];
+  auto& n  = _nodes[id];
+  auto end = group_end(n, n.cursor);
   batches values;
   std::vector<uint64_t> ordinals;
-  uint64_t bytes = 0;
-  while (n.cursor < n.parts.size()) {
+  for (; n.cursor < end; ++n.cursor) {
     auto const& part = n.parts[n.cursor];
-    if (!values.empty() && bytes + part.bytes > chunk_bytes) { break; }
-    auto batch = pop ? _parts->pop_data_batch_by_position(part.ordinal, id)
-                     : _parts->get_data_batch_by_position(part.ordinal, id);
+    auto batch       = pop ? _parts->pop_data_batch_by_position(part.ordinal, id)
+                           : _parts->get_data_batch_by_position(part.ordinal, id);
     if (!batch) { throw internal_exception("Sort refinement contribution disappeared"); }
     values.push_back(std::move(batch));
     ordinals.push_back(part.ordinal);
-    bytes += part.bytes;
-    ++n.cursor;
   }
   uint64_t parameter = n.stride;
   if (kind == step::cut) {
@@ -209,9 +223,51 @@ std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::cl
     if (!splitters) { throw internal_exception("Sort refinement splitters disappeared"); }
     values.push_back(std::move(splitters));
     parameter = n.first_child;
+  } else if (kind == step::coalesce) {
+    parameter = n.first_child;
   }
   ++n.outstanding;
   return std::make_unique<work>(std::move(values), kind, id, std::move(ordinals), parameter);
+}
+
+// A single contribution keeps its ordinal and moves to the replacement node without a
+// task or device work. Multi-contribution groups become coalesce tasks.
+std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::claim_coalesce(
+  std::size_t id)
+{
+  while (_nodes[id].cursor < _nodes[id].parts.size()) {
+    auto& n = _nodes[id];
+    if (group_end(n, n.cursor) > n.cursor + 1) { return claim_group(id, step::coalesce, true); }
+    auto part  = n.parts[n.cursor++];
+    auto batch = _parts->pop_data_batch_by_position(part.ordinal, id);
+    if (!batch) { throw internal_exception("Sort refinement contribution disappeared"); }
+    auto& replacement = _nodes[n.first_child];
+    _parts->add_data_batch_at_position(batch, part.ordinal, n.first_child);
+    replacement.parts.push_back(part);
+    replacement.rows += part.rows;
+    replacement.bytes += part.bytes;
+  }
+  finish_coalesce(id);
+  return nullptr;
+}
+
+// Once every group has moved or published, the replacement takes over the interval.
+void sirius_physical_merge_sort::finish_coalesce(std::size_t id)
+{
+  auto& n = _nodes[id];
+  if (n.cursor < n.parts.size() || n.outstanding) { return; }
+  auto replacement_id = n.first_child;
+  auto contributions  = n.parts.size();
+  retire(id);
+  auto& replacement = _nodes[replacement_id];
+  if (replacement.parts.size() >= contributions) {
+    throw internal_exception("Sort coalescing made no progress");
+  }
+  std::sort(replacement.parts.begin(), replacement.parts.end(), [](auto const& a, auto const& b) {
+    return a.ordinal < b.ordinal;
+  });
+  replacement.state = phase::ready;
+  _active.emplace(replacement.lo, replacement_id);
 }
 
 std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::claim(std::size_t id)
@@ -246,6 +302,25 @@ std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::cl
       for (auto const& part : n.parts) {
         sample_rows += part.rows / n.stride;
       }
+      // Many small contributions drive the stride toward one and the sample toward every
+      // row. Planning should not exceed a tile, so coalesce first if that reduces k.
+      if (sample_rows > limit) {
+        std::size_t groups = 0;
+        for (std::size_t begin = 0; begin < n.parts.size(); begin = group_end(n, begin)) {
+          ++groups;
+        }
+        if (groups < k) {
+          SIRIUS_LOG_DEBUG("Merge sort: coalescing contributions={}, groups={}", k, groups);
+          auto replacement = _nodes.size();
+          _nodes.push_back(node{.lo = n.lo, .hi = n.hi});
+          auto& parent       = _nodes[id];  // push_back invalidated n
+          parent.state       = phase::coalescing;
+          parent.cursor      = 0;
+          parent.first_child = replacement;
+          parent.child_count = 1;
+          return claim_coalesce(id);
+        }
+      }
       if (sample_rows > native_rows) {
         throw invalid_input_exception("Sort refinement samples exceed native row limit");
       }
@@ -254,6 +329,7 @@ std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::cl
       return claim_group(id, step::sample, false);
     }
     case phase::sampling: return claim_group(id, step::sample, false);
+    case phase::coalescing: return claim_coalesce(id);
     case phase::plan_ready: {
       batches values;
       if (id < _samples->num_partitions()) {
@@ -280,7 +356,13 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   {
     std::lock_guard guard(lock);
     if (!_ingested) { routed = ingest(); }
-    if (auto id = actionable()) { claimed = claim(*id); }
+    // A coalescing claim that only moves single contributions yields no task, but can
+    // make its replacement node actionable.
+    while (!claimed) {
+      auto id = actionable();
+      if (!id) { break; }
+      claimed = claim(*id);
+    }
   }
   if (routed) {
     SIRIUS_LOG_DEBUG("Merge sort: ranges={}, nonempty_ranges={}", routed->first, routed->second);
@@ -340,6 +422,15 @@ void sirius_physical_merge_sort::on_task_output_published(operator_data const& o
         n.cursor      = 0;
         break;
       }
+      case step::coalesce: {
+        auto const& p     = data.pieces.at(0);
+        auto& replacement = _nodes.at(p.child);
+        replacement.parts.push_back({p.ordinal, p.rows, p.bytes});
+        replacement.rows += p.rows;
+        replacement.bytes += p.bytes;
+        finish_coalesce(id);
+        break;
+      }
       case step::cut: {
         for (auto const& p : data.pieces) {
           auto& child = _nodes.at(p.child);
@@ -388,8 +479,40 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(operator_data
     case step::sample: return execute_sample(input, stream);
     case step::plan: return execute_plan(input, stream);
     case step::cut: return execute_cut(input, stream);
+    case step::coalesce: return execute_coalesce(input, stream);
   }
   throw internal_exception("Unknown sort refinement step");
+}
+
+// Merge one greedy group into a single sorted run, keeping every column: the final
+// projection applies only to output leaves.
+std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_coalesce(
+  work const& input, ::cuda::stream_ref stream)
+{
+  auto reads  = input.get_read_only_batches();
+  auto* space = reads.at(0).get_memory_space();
+  auto mr     = space->get_default_allocator();
+  std::vector<cudf::table_view> views;
+  views.reserve(reads.size());
+  for (auto const& read : reads) {
+    views.push_back(get_cudf_table_view(read));
+  }
+  auto run  = make_data_batch(cudf::merge(views,
+                                         comparison->key_columns,
+                                         comparison->directions,
+                                         comparison->null_precedence,
+                                         stream,
+                                         mr),
+                             *space,
+                             stream,
+                             batch_telemetry());
+  auto info = get_batch_rows_and_bytes(*run);
+  std::vector<piece> pieces{{input.parameter, input.ordinals.at(0), info.rows.value(), info.bytes}};
+  return std::make_unique<result>(batches{std::move(run)},
+                                  step::coalesce,
+                                  input.node,
+                                  std::vector<uint64_t>{},
+                                  std::move(pieces));
 }
 
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_sample(work const& input,
@@ -549,6 +672,7 @@ void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::strea
       return;
     case step::plan: _splitters->add_data_batch_at_position(values.at(0), 0, data.node); return;
     case step::cut:
+    case step::coalesce:
       for (std::size_t i = 0; i < values.size(); ++i) {
         auto const& p = data.pieces.at(i);
         _parts->add_data_batch_at_position(values[i], p.ordinal, p.child);

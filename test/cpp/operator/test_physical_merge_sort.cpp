@@ -634,6 +634,27 @@ TEST_CASE("merge sort refines all-equal keys using contribution coordinates",
   REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == std::vector<int64_t>(1500, 7));
 }
 
+TEST_CASE("merge sort coalesces many small contributions before refining", "[physical_merge_sort]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  std::mt19937_64 rng(11);
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  std::vector<int64_t> expected;
+  // 100 ten-row contributions against a 256-row target: sampling would take every row.
+  for (int i = 0; i < 100; ++i) {
+    auto values = sorted_values(rng, 10, 5000, false);
+    expected.insert(expected.end(), values.begin(), values.end());
+    inputs.push_back(make_1col_batch(*space, values));
+  }
+  std::sort(expected.begin(), expected.end());
+  std::size_t const chunk_bytes = 2048;
+  auto op                       = make_bigint_merge(duckdb::OrderType::ASCENDING, chunk_bytes);
+  auto chunks                   = run_ranges(*op, {inputs});
+  CHECK(chunks.size() > 1);
+  REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == expected);
+}
+
 TEST_CASE("merge sort keeps range order when only some ranges are refined", "[physical_merge_sort]")
 {
   auto* space = get_default_gpu_space();

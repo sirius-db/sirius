@@ -35,6 +35,11 @@ namespace sirius::op {
 //   ready -> sampling (bounded contribution groups) -> plan (one splitter task)
 //         -> cutting (bounded contribution groups) -> children ready
 //
+// If the sample would exceed one tile's rows (many small contributions), an oversized
+// node is first coalesced instead: greedy groups of contributions are merged into runs
+// of a replacement node with the same interval, which is then decided afresh. A pass is
+// taken only when it reduces the contribution count, so coalescing terminates.
+//
 // Children subdivide the parent's interval, so output order is independent of task
 // completion order and positions may have gaps. Every task is one bounded step; the
 // state machine advances only when a task's output is published.
@@ -43,11 +48,12 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   static constexpr auto TYPE = SiriusPhysicalOperatorType::MERGE_SORT;
   using batches              = std::vector<std::shared_ptr<cucascade::data_batch>>;
 
-  enum class step : uint8_t { merge, sample, plan, cut };
+  enum class step : uint8_t { merge, sample, plan, cut, coalesce };
 
-  // `ordinals` identify each payload batch within its node (merge/sample/cut). For a
-  // cut, the node's shared splitter table is the final batch. `parameter` is the
-  // sample stride (sample), splitter step (plan) or first child node (cut).
+  // `ordinals` identify each payload batch within its node (merge/sample/cut/coalesce).
+  // For a cut, the node's shared splitter table is the final batch. `parameter` is the
+  // sample stride (sample), splitter step (plan), first child node (cut) or replacement
+  // node (coalesce).
   struct work : pipelineable_operator_data {
     step kind;
     std::size_t node;
@@ -137,6 +143,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     plan_ready,
     planning,
     cutting,
+    coalescing,
     done
   };
   struct node {
@@ -146,6 +153,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     phase state{phase::collecting};
     std::size_t cursor{0}, outstanding{0};
     uint64_t stride{0}, sample_step{0};
+    // Cutting: the children. Coalescing: the replacement node (count one).
     std::size_t first_child{0}, child_count{0};
   };
 
@@ -155,12 +163,18 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   [[nodiscard]] std::optional<std::size_t> actionable() const;
   [[nodiscard]] std::unique_ptr<work> claim(std::size_t id);
   [[nodiscard]] std::unique_ptr<work> claim_group(std::size_t id, step kind, bool pop);
+  // Nullptr when only single contributions remained; they move without a task.
+  [[nodiscard]] std::unique_ptr<work> claim_coalesce(std::size_t id);
+  // End of the greedy group of n.parts starting at begin: at least one, up to chunk_bytes.
+  [[nodiscard]] std::size_t group_end(node const& n, std::size_t begin) const;
+  void finish_coalesce(std::size_t id);
   void retire(std::size_t id);
 
   std::unique_ptr<operator_data> execute_merge(work const&, ::cuda::stream_ref);
   std::unique_ptr<operator_data> execute_sample(work const&, ::cuda::stream_ref);
   std::unique_ptr<operator_data> execute_plan(work const&, ::cuda::stream_ref);
   std::unique_ptr<operator_data> execute_cut(work const&, ::cuda::stream_ref);
+  std::unique_ptr<operator_data> execute_coalesce(work const&, ::cuda::stream_ref);
 
   duckdb::vector<std::size_t> _final_projections;
   // Payload contributions by node, positioned by ordinal; samples likewise; one splitter
