@@ -138,9 +138,7 @@ right-delim join. Dense-count bindings wait for both producers before measuring 
 input. Grouped-merge bindings may use a projected size. A completed empty sizing input preserves
 the one-partition fallback. After resolution, normal port barriers determine readiness.
 
-The build-input observer certifies dynamic-filter inventory before the first claim, contributes
-before scatter, and publishes after successful scatter. That lifecycle belongs to the hash-join
-binding rather than the router's scheduling policy.
+The build-input observer (`hash_join_partition_observer`) certifies the dynamic-filter inventory before the first claim, contributes before each task builds its output on every layout, and publishes after that output is built, before deposit. That lifecycle belongs to the hash-join binding rather than the router's scheduling policy.
 
 ### CONCAT
 
@@ -165,13 +163,7 @@ and a common memory space before forwarding or concatenating them.
 Allocation failures use the executor's normal OOM handling and bounded
 retry path; CONCAT has no separate target-capacity precheck.
 
-Join wrapping selects the initial flag from join semantics. Its explicit input binding keeps
-the build CONCAT reference and configures runtime BUILD_PROBE or whole-build dynamic-filter
-folding inside the shared exchange decision, before either router can claim input. The routers
-carry no build/probe roles or CONCAT references. The converter preserves build-first dependencies. A later change to the
-CONCAT flag after its first successful claim throws, since already emitted partial groups cannot
-be combined retroactively. Normal producer completion and task retirement govern readiness;
-there is no separate repository completion protocol.
+Join wrapping selects the initial flag from join semantics. Its explicit input binding keeps the build CONCAT reference and configures runtime BUILD_PROBE folding, or the folding of a single-partition build whose join publishes dynamic filters, inside the shared exchange decision, before either router can claim input. The routers carry no build/probe roles or CONCAT references. The converter preserves build-first dependencies. A later change to the CONCAT flag after its first successful claim throws, since already emitted partial groups cannot be combined retroactively. Normal producer completion and task retirement govern readiness; there is no separate repository completion protocol.
 
 ### SORT_SAMPLE
 
