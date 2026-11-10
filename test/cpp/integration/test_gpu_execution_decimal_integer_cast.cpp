@@ -76,22 +76,13 @@ TEST_CASE_METHOD(DecimalIntegerCastFixture,
   sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
   compare_gpu_vs_cpu("SELECT id, TRY_CAST(v AS TINYINT), TRY_CAST(v AS UTINYINT) FROM dec_bounds;");
   run_ok("SET enable_duckdb_fallback = true;");
-  auto const out_of_range = "SELECT CAST(v AS TINYINT) FROM dec_bounds;";
-  if (strategy == "nvrtc_jit") {
-    // TODO(kevkrist/sirius#30): the NVRTC overflow error bypasses CPU Replay, so DuckDB's error
-    // never surfaces. Expect CPU Replay under every strategy once that ticket lands.
-    REQUIRE(run_on_path(out_of_range, sirius::test::execution_path::gpu)->HasError());
-  } else {
-    expect_error_matches_cpu(out_of_range, sirius::test::execution_path::cpu_replay);
-  }
-  // The cast's invalid rows belong to the unselected branch, so the query returns a value. The
-  // fused nvrtc_jit kernel skips those rows itself; the other strategies evaluate the cast over
-  // every row and rely on CPU Replay.
+  expect_error_matches_cpu("SELECT CAST(v AS TINYINT) FROM dec_bounds;",
+                           sirius::test::execution_path::cpu_replay);
+  // The cast's invalid rows belong to the unselected branch, so the query returns a value.
   expect_result_matches_cpu(
     "SELECT CASE WHEN v BETWEEN -128.49 AND 127.49 THEN CAST(v AS TINYINT) ELSE 0::TINYINT END "
     "FROM dec_bounds;",
-    strategy == "nvrtc_jit" ? sirius::test::execution_path::gpu
-                            : sirius::test::execution_path::cpu_replay);
+    sirius::test::guarded_error_path(strategy));
 }
 
 TEST_CASE_METHOD(DecimalIntegerCastFixture,

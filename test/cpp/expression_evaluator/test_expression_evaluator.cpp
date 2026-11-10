@@ -3530,7 +3530,7 @@ TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][
   {
     for (auto ticks : {min / scale - 1, max / scale + 1, min, -max + 1, max - 1}) {
       CAPTURE(ticks);
-      REQUIRE_THROWS_AS(run({0, ticks, max}), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(run({0, ticks, max}), sirius::invalid_input_exception);
     }
   }
   SECTION("null payloads do not cause overflow")
@@ -3545,7 +3545,7 @@ TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][
   }
 }
 
-TEST_CASE("DATE to TIMESTAMP casts check overflow with out_of_range_exception",
+TEST_CASE("DATE to TIMESTAMP casts check overflow with invalid_input_exception",
           "[expression_evaluator][timestamp_bounds]")
 {
   auto* space            = get_default_gpu_space();
@@ -3578,13 +3578,13 @@ TEST_CASE("DATE to TIMESTAMP casts check overflow with out_of_range_exception",
   auto view = cudf::bit_cast(col->view(), cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
 
   REQUIRE_THROWS_AS(run_native_ast(*space, &expr, cudf::table_view{{view}}, strategy),
-                    sirius::out_of_range_exception);
+                    sirius::invalid_input_exception);
 
   auto try_out = run_native_ast(*space, &try_expr, cudf::table_view{{view}}, strategy);
   REQUIRE(try_out->view().column(0).null_count() == 1);
 }
 
-TEST_CASE("abs on signed integer minimum throws out_of_range_exception",
+TEST_CASE("abs on signed integer minimum throws invalid_input_exception",
           "[expression_evaluator][abs]")
 {
   auto* space         = get_default_gpu_space();
@@ -3611,7 +3611,7 @@ TEST_CASE("abs on signed integer minimum throws out_of_range_exception",
                        cudaMemcpyHostToDevice) == cudaSuccess);
 
     REQUIRE_THROWS_AS(run_native_ast(*space, &expr, cudf::table_view{{col->view()}}, strategy),
-                      sirius::out_of_range_exception);
+                      sirius::invalid_input_exception);
   };
 
   check_signed_min.template operator()<int8_t>(sirius::type_id::TINYINT, cudf::type_id::INT8);
@@ -4348,7 +4348,7 @@ TEST_CASE("nvrtc_jit - division and modulo by zero produce NULL without trapping
 }
 
 TEST_CASE(
-  "nvrtc_jit - checked integer overflow throws out_of_range_exception and TRY suppresses it",
+  "nvrtc_jit - checked integer overflow throws invalid_input_exception and TRY suppresses it",
   "[expression_evaluator][nvrtc_jit][ticket6]")
 {
   auto* space = get_default_gpu_space();
@@ -4384,7 +4384,7 @@ TEST_CASE(
   {
     auto add_expr = make_bin(sirius::function_id::add);
     REQUIRE_THROWS_AS(eval_two_col({10, int_max}, {true, true}, {5, 1}, {true, true}, *add_expr),
-                      sirius::out_of_range_exception);
+                      sirius::invalid_input_exception);
 
     // When the overflowing row is NULL, no exception is thrown!
     auto null_out = eval_two_col({10, int_max}, {true, false}, {5, 1}, {true, true}, *add_expr);
@@ -4407,19 +4407,19 @@ TEST_CASE(
   {
     auto sub_expr = make_bin(sirius::function_id::sub);
     REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {1}, {true}, *sub_expr),
-                      sirius::out_of_range_exception);
+                      sirius::invalid_input_exception);
 
     auto mul_expr = make_bin(sirius::function_id::mul);
     REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *mul_expr),
-                      sirius::out_of_range_exception);
+                      sirius::invalid_input_exception);
 
     auto div_expr = make_bin(sirius::function_id::div);
     REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *div_expr),
-                      sirius::out_of_range_exception);
+                      sirius::invalid_input_exception);
 
     auto idiv_expr = make_bin(sirius::function_id::int_div);
     REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *idiv_expr),
-                      sirius::out_of_range_exception);
+                      sirius::invalid_input_exception);
 
     // INT_MIN % -1 must yield 0 without trapping hardware %
     auto mod_expr = make_bin(sirius::function_id::mod);
@@ -4432,7 +4432,7 @@ TEST_CASE(
     abs_args.push_back(make_ref_typed(0, int_t));
     auto abs_expr = make_func(sirius::function_id::abs, std::move(abs_args), int_t);
     REQUIRE_THROWS_AS(eval_two_col({-42, int_min}, {true, true}, {0, 0}, {true, true}, *abs_expr),
-                      sirius::out_of_range_exception);
+                      sirius::invalid_input_exception);
 
     std::vector<std::unique_ptr<ast_node>> try_abs_args;
     try_abs_args.push_back(make_ref_typed(0, int_t));
@@ -4473,13 +4473,13 @@ TEST_CASE(
     auto u_add = make_u64_bin(sirius::function_id::add);
     exp_executor exec_add(
       *u_add, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-    REQUIRE_THROWS_AS(exec_add.evaluate(tv), sirius::out_of_range_exception);
+    REQUIRE_THROWS_AS(exec_add.evaluate(tv), sirius::invalid_input_exception);
 
     // Sub underflow: 10 - 20 on unsigned!
     auto u_sub = make_u64_bin(sirius::function_id::sub);
     exp_executor exec_sub(
       *u_sub, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-    REQUIRE_THROWS_AS(exec_sub.evaluate(tv), sirius::out_of_range_exception);
+    REQUIRE_THROWS_AS(exec_sub.evaluate(tv), sirius::invalid_input_exception);
 
     auto try_sub =
       make_unary(sirius::ast::unary_op::kind::op_try, make_u64_bin(sirius::function_id::sub));
@@ -4500,7 +4500,7 @@ TEST_CASE(
     auto u_mul = make_u64_bin(sirius::function_id::mul);
     exp_executor exec_mul(
       *u_mul, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-    REQUIRE_THROWS_AS(exec_mul.evaluate(tv), sirius::out_of_range_exception);
+    REQUIRE_THROWS_AS(exec_mul.evaluate(tv), sirius::invalid_input_exception);
 
     auto try_mul =
       make_unary(sirius::ast::unary_op::kind::op_try, make_u64_bin(sirius::function_id::mul));
@@ -4536,7 +4536,7 @@ TEST_CASE(
       auto add_node = make_func(sirius::function_id::add, std::move(add_args), lt);
       exp_executor exec_a(
         *add_node, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(exec_a.evaluate(tv_t), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(exec_a.evaluate(tv_t), sirius::invalid_input_exception);
 
       std::vector<std::unique_ptr<ast_node>> try_add_args;
       try_add_args.push_back(make_ref_typed(0, lt));
@@ -4960,7 +4960,7 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       CHECK(copy_bool_column_to_host(out->view().column(0)) == std::vector<std::uint8_t>{1, 1});
     }
 
-    // 5. Undominated overflow: TRUE AND (col0 + INT_MAX > 0) throws out_of_range_exception!
+    // 5. Undominated overflow: TRUE AND (col0 + INT_MAX > 0) throws invalid_input_exception!
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(
@@ -4968,17 +4968,17 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       ch.push_back(make_ovf_bool());
       auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch));
       REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
-                        sirius::out_of_range_exception);
+                        sirius::invalid_input_exception);
     }
 
-    // 6. Undominated overflow: NULL AND (col0 + INT_MAX > 0) throws out_of_range_exception!
+    // 6. Undominated overflow: NULL AND (col0 + INT_MAX > 0) throws invalid_input_exception!
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(make_null_const(bool_t));
       ch.push_back(make_ovf_bool());
       auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch));
       REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
-                        sirius::out_of_range_exception);
+                        sirius::invalid_input_exception);
     }
   }
 
@@ -5025,7 +5025,7 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
             std::vector<std::int32_t>{100, 100});
     }
 
-    // 4. Overflow in SELECTED THEN branch throws out_of_range_exception (unless wrapped in TRY)!
+    // 4. Overflow in SELECTED THEN branch throws invalid_input_exception (unless wrapped in TRY)!
     {
       std::vector<sirius::ast::case_expr::when_then> cases;
       cases.push_back(
@@ -5034,7 +5034,7 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       auto expr = std::make_unique<ast_node>(
         sirius::ast::case_expr{std::move(cases), make_ref_typed(0, int_t), int_t});
       REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
-                        sirius::out_of_range_exception);
+                        sirius::invalid_input_exception);
 
       auto try_expr = make_unary(sirius::ast::unary_op::kind::op_try, std::move(expr));
       auto try_out  = eval_one_col({10, 20}, {true, true}, *try_expr);
@@ -5043,14 +5043,14 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       CHECK(copy_column_to_host<std::int32_t>(try_out->view().column(0))[0] == 10);
     }
 
-    // 5. Overflow in an evaluated WHEN condition before any match throws out_of_range_exception!
+    // 5. Overflow in an evaluated WHEN condition before any match throws invalid_input_exception!
     {
       std::vector<sirius::ast::case_expr::when_then> cases;
       cases.push_back({make_ovf_bool(), make_int_const(100)});
       auto expr = std::make_unique<ast_node>(
         sirius::ast::case_expr{std::move(cases), make_int_const(0), int_t});
       REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
-                        sirius::out_of_range_exception);
+                        sirius::invalid_input_exception);
     }
   }
 
@@ -5086,7 +5086,7 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
 
       exp_executor exec(
         *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
 
       // Wrapped in TRY -> row 0 is 10, row 1 becomes NULL!
       auto try_expr = make_unary(sirius::ast::unary_op::kind::op_try, std::move(expr));
@@ -5183,7 +5183,8 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       CHECK(copy_bool_column_to_host(out2->view().column(0)) == std::vector<std::uint8_t>{1, 1});
 
       // When x = 20 (does not match 10), the overflow is undominated and throws!
-      REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *in2), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *in2),
+                        sirius::invalid_input_exception);
     }
 
     // IN across DATE, TIMESTAMP, DECIMAL64, DOUBLE, and BOOL8 matching MATERIALIZE
@@ -5425,7 +5426,7 @@ TEST_CASE("nvrtc_jit - DECIMAL(32/64/128) arithmetic, scale alignment, and compa
     }
   }
 
-  SECTION("DECIMAL arithmetic overflow throws out_of_range_exception and TRY suppresses it")
+  SECTION("DECIMAL arithmetic overflow throws invalid_input_exception and TRY suppresses it")
   {
     auto const dec32_t = logical_type::make_decimal(9, 2);
     // Carrier max for DECIMAL32 (int32_t) is INT32_MAX (2,147,483,647)
@@ -5440,7 +5441,7 @@ TEST_CASE("nvrtc_jit - DECIMAL(32/64/128) arithmetic, scale alignment, and compa
 
     exp_executor exec(
       *add_expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-    REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+    REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
 
     auto try_add = make_unary(sirius::ast::unary_op::kind::op_try, std::move(add_expr));
     exp_executor try_exec(
@@ -5466,7 +5467,7 @@ TEST_CASE("nvrtc_jit - DECIMAL(32/64/128) arithmetic, scale alignment, and compa
 
     exp_executor exec128(
       *mul128_expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-    REQUIRE_THROWS_AS(exec128.evaluate(tv128), sirius::out_of_range_exception);
+    REQUIRE_THROWS_AS(exec128.evaluate(tv128), sirius::invalid_input_exception);
 
     auto try_mul128 = make_unary(sirius::ast::unary_op::kind::op_try, std::move(mul128_expr));
     exp_executor try_exec128(
@@ -5595,7 +5596,7 @@ TEST_CASE(
       auto expr = make_cast(make_ref_typed(0, int_t), tinyint_t, /*try_cast=*/false);
       exp_executor exec(
         *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
     }
 
     // 2. Strict CAST to UINTEGER throws on -5
@@ -5603,7 +5604,7 @@ TEST_CASE(
       auto expr = make_cast(make_ref_typed(0, int_t), uint_t, /*try_cast=*/false);
       exp_executor exec(
         *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
     }
 
     // 3. Strict CAST to DECIMAL(5, 2) throws on 1000
@@ -5611,7 +5612,7 @@ TEST_CASE(
       auto expr = make_cast(make_ref_typed(0, int_t), dec4_2, /*try_cast=*/false);
       exp_executor exec(
         *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
     }
 
     // 4. TRY_CAST converts out-of-range rows to NULL without throwing!
@@ -5669,24 +5670,24 @@ TEST_CASE(
       auto col_dbl = make_carrier_column(*space, cudf::data_type{cudf::type_id::FLOAT64}, d_vals);
       cudf::table_view d_tv{{col_dbl->view()}};
 
-      // Strict casts throw out_of_range_exception
+      // Strict casts throw invalid_input_exception
       {
         auto c_flt = make_cast(make_ref_typed(0, dbl_t), flt_t, false);
         exp_executor ex(
           *c_flt, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::out_of_range_exception);
+        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::invalid_input_exception);
       }
       {
         auto c_i64 = make_cast(make_ref_typed(0, dbl_t), i64_t, false);
         exp_executor ex(
           *c_i64, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::out_of_range_exception);
+        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::invalid_input_exception);
       }
       {
         auto c_u64 = make_cast(make_ref_typed(0, dbl_t), u64_t, false);
         exp_executor ex(
           *c_u64, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::out_of_range_exception);
+        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::invalid_input_exception);
       }
 
       // TRY_CAST succeeds and turns overflowing elements into NULL
@@ -5733,7 +5734,7 @@ TEST_CASE(
       auto strict_dec = make_cast(make_ref_typed(0, dec18_3), dec5_1, false);
       exp_executor ex_strict(
         *strict_dec, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(ex_strict.evaluate(dec_tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(ex_strict.evaluate(dec_tv), sirius::invalid_input_exception);
 
       duckdb::vector<std::unique_ptr<ast_node>> dec_exprs;
       dec_exprs.push_back(make_cast(make_ref_typed(0, dec18_3), dec5_1, true));
@@ -5824,7 +5825,7 @@ TEST_CASE(
       auto strict_cast = make_cast(make_ref_typed(0, date_t), ts_us_t, /*try_cast=*/false);
       exp_executor strict_exec(
         *strict_cast, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::invalid_input_exception);
 
       auto try_cast = make_cast(make_ref_typed(0, date_t), ts_us_t, /*try_cast=*/true);
       exp_executor try_exec(
@@ -5879,7 +5880,7 @@ TEST_CASE(
       auto strict_cast = make_cast(make_ref_typed(0, ts_s_t), ts_us_t, /*try_cast=*/false);
       exp_executor strict_exec(
         *strict_cast, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::invalid_input_exception);
 
       auto try_cast = make_cast(make_ref_typed(0, ts_s_t), ts_us_t, /*try_cast=*/true);
       exp_executor try_exec(
@@ -7702,7 +7703,7 @@ TEST_CASE("nvrtc_jit - FilterSink select and select_with_survivors across select
   }
 
   SECTION(
-    "overflow in filter predicate throws out_of_range_exception unless guarded by TRY or "
+    "overflow in filter predicate throws invalid_input_exception unless guarded by TRY or "
     "short-circuited")
   {
     std::vector<std::int32_t> vals = {10, std::numeric_limits<std::int32_t>::max(), 20};
@@ -7718,17 +7719,17 @@ TEST_CASE("nvrtc_jit - FilterSink select and select_with_survivors across select
       return make_func(sirius::function_id::add, std::move(add_args), int_t);
     };
 
-    // 1. Unguarded overflow in filter predicate (col0 + 1 > 0) -> throws out_of_range_exception
+    // 1. Unguarded overflow in filter predicate (col0 + 1 > 0) -> throws invalid_input_exception
     {
       auto pred = make_cmp(sirius::comparison_type::gt, make_ovf_add(), make_int_const(0));
       exp_executor jit_exec(
         *pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-      REQUIRE_THROWS_AS(jit_exec.select(tv), sirius::out_of_range_exception);
+      REQUIRE_THROWS_AS(jit_exec.select(tv), sirius::invalid_input_exception);
 
       std::array<cudf::size_type, 1> const idx{0};
       std::unique_ptr<cudf::column> surv;
       REQUIRE_THROWS_AS(jit_exec.select_with_survivors(tv, idx, surv),
-                        sirius::out_of_range_exception);
+                        sirius::invalid_input_exception);
     }
 
     // 2. Guarded by TRY: TRY(col0 + 1) > 15 -> row 1 overflows to NULL (filtered out), row 2 (21 >
@@ -8487,7 +8488,7 @@ TEST_CASE("nvrtc_jit - FLOAT/DOUBLE to integer casts round to nearest even like 
     auto strict = make_cast(make_ref_typed(0, dbl_t), int_t, false);
     exp_executor strict_exec(
       *strict, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-    REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::out_of_range_exception);
+    REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::invalid_input_exception);
   }
 }
 

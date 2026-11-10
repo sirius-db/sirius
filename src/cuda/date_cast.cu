@@ -82,7 +82,7 @@ std::unique_ptr<cudf::column> cast_date_to_timestamp(cudf::column_view const& in
                     });
   auto [mask, null_count] = cudf::bools_to_mask(validity->view(), stream, mr);
   if (!try_cast && null_count > input.null_count()) {
-    throw out_of_range_exception("DATE value is out of range for TIMESTAMP");
+    throw invalid_input_exception("DATE value is out of range for TIMESTAMP");
   }
   auto result =
     cudf::make_timestamp_column(target, input.size(), std::move(*mask), null_count, stream, mr);

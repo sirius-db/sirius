@@ -19,15 +19,16 @@
  * @brief GPU unary minus matches DuckDB.
  *
  * DuckDB binds `-x` as a one-argument "-" function. The GPU used to read a second argument that
- * does not exist and crashed the process. These cases run unary minus on every type the GPU
- * negates (signed integers, FLOAT, DOUBLE, DECIMAL of every width), with NULLs, in projections,
- * filters, aggregate arguments and nested expressions, and check that each query ran on the GPU.
- * Negating a signed integer's minimum raises like DuckDB, and types the GPU does not negate fall
- * back at plan time.
+ * does not exist and crashed the process. These cases run unary minus on every type the GPU negates
+ * (signed integers, FLOAT, DOUBLE, DECIMAL of every width), with NULLs, in projections, filters,
+ * aggregate arguments and nested expressions, and check that each query ran on the GPU. Negating a
+ * signed integer's minimum raises DuckDB's error after CPU Replay, and types the GPU does not
+ * negate fall back at plan time.
  */
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <filesystem>
@@ -137,6 +138,29 @@ TEST_CASE_METHOD(NegateFixture,
     REQUIRE(gpu->HasError());
     INFO(gpu->GetError());
     REQUIRE_THAT(gpu->GetError(), Catch::Matchers::ContainsSubstring("Overflow in negation"));
+  }
+}
+
+TEST_CASE_METHOD(NegateFixture,
+                 "gpu_execution unary minus of a signed integer minimum matches DuckDB through CPU "
+                 "Replay",
+                 "[integration][gpu_execution][projection][negate]")
+{
+  auto const strategy = GENERATE(sirius::test::each_expression_evaluator_strategy());
+  CAPTURE(strategy);
+  run_ok(
+    "CREATE TABLE neg_min AS SELECT * FROM (VALUES (1, 1::INTEGER, 1::BIGINT),"
+    " (2, (-2147483648)::INTEGER, (-9223372036854775808)::BIGINT), (3, NULL, NULL)) v(id, i, b);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
+  for (std::string const column : {"i", "b"}) {
+    CAPTURE(column);
+    expect_error_matches_cpu("SELECT id, -" + column + " FROM neg_min",
+                             sirius::test::execution_path::cpu_replay);
+    // CASE excludes the smallest value from the negation.
+    expect_result_matches_cpu(
+      "SELECT id, CASE WHEN id = 2 THEN 0 ELSE -" + column + " END FROM neg_min",
+      sirius::test::guarded_error_path(strategy));
   }
 }
 

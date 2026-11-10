@@ -157,6 +157,8 @@ class CastDatePredicateFixture : public sirius::test::GpuExecutionFixture {
     }
   }
 
+  /// Requires that @p query fails with DuckDB's Conversion Error, which CPU Replay surfaces in
+  /// place of the GPU's own error.
   void expect_cast_overflow(const std::string& query)
   {
     run_ok("SET gpu_execution = false;");
@@ -164,19 +166,8 @@ class CastDatePredicateFixture : public sirius::test::GpuExecutionFixture {
     run_ok("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE(cpu_result->HasError());
-    REQUIRE(cpu_result->GetError().find("Conversion Error") != std::string::npos);
-
-    auto const before = sirius::test::get_transparent_execution_stats(*con);
-    auto gpu_result   = con->Query(query);
-    auto const after  = sirius::test::get_transparent_execution_stats(*con);
-    REQUIRE(gpu_result);
-    REQUIRE(gpu_result->HasError());
-    INFO(gpu_result->GetError());
-    REQUIRE(gpu_result->GetErrorType() == duckdb::ExceptionType::OUT_OF_RANGE);
-    REQUIRE(gpu_result->GetError().find("Out of Range Error") != std::string::npos);
-    REQUIRE(gpu_result->GetError().find("DATE value is out of range for TIMESTAMP") !=
-            std::string::npos);
-    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+    REQUIRE(cpu_result->GetErrorType() == duckdb::ExceptionType::CONVERSION);
+    expect_error_matches_cpu(query, sirius::test::execution_path::cpu_replay);
   }
 
  private:

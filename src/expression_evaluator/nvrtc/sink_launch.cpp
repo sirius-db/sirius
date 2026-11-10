@@ -310,7 +310,8 @@ void read_status_words(std::span<std::uint32_t> host,
       "expression.");
   }
   if ((host[0] & abi::status_overflow_bit) != 0U) {
-    throw out_of_range_exception("[expression_evaluator]: Overflow in NVRTC evaluation");
+    // Overflow Poison reached the NVRTC Sink. CPU Replay decides whether DuckDB raises.
+    throw invalid_input_exception("[expression_evaluator]: Overflow in NVRTC evaluation");
   }
 }
 
