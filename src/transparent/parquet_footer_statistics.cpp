@@ -292,10 +292,16 @@ struct merge_entry {
 std::mutex merge_mutex;
 std::unordered_map<std::string, merge_entry> merges;
 
-/// Scans of the same files share a key; the entry itself says whether it fits the scan at hand.
-std::string merge_cache_key(std::vector<duckdb::OpenFileInfo> const& files)
+/// Keyed by the paths the scan was given, so a glob that gains files replaces its entry instead of
+/// adding one; the entry itself says whether it fits the scan at hand.
+std::string merge_cache_key(duckdb::LogicalGet const& get)
 {
-  return files.front().path + '\0' + std::to_string(files.size());
+  std::string key;
+  for (auto const& parameter : get.parameters) {
+    key += parameter.ToString();
+    key += '\0';
+  }
+  return key;
 }
 
 std::optional<duckdb::Value> cached_merge(
@@ -341,7 +347,7 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   auto const& parquet_options = duckdb::ParquetScanFunction::GetFileOptions(*reader->bind_data);
   auto const all_files        = bind->file_list->GetAllFiles();
   auto const files            = statistics_of_all(context, all_files, parquet_options);
-  auto const merge_key        = merge_cache_key(all_files);
+  auto const merge_key        = merge_cache_key(get);
   if (auto const hit = cached_merge(merge_key, files, *bind)) {
     options.column_statistics = *hit;
   } else {
@@ -388,6 +394,12 @@ std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
   duckdb::ParquetOptions const options(context);
   std::vector<duckdb::OpenFileInfo> const files(paths.begin(), paths.end());
   return statistics_of_all(context, files, options).size();
+}
+
+std::size_t detail::merged_statistics_cache_size()
+{
+  std::lock_guard guard(merge_mutex);
+  return merges.size();
 }
 
 }  // namespace sirius::transparent

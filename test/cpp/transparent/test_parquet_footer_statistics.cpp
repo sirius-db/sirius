@@ -22,6 +22,7 @@
  * filter matches nothing, drop an IS NOT NULL on a column without NULLs and estimate the rest.
  */
 
+#include "transparent/parquet_footer_statistics.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 
 #include <catch.hpp>
@@ -263,4 +264,22 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   auto rewritten = con->Query(query);
   REQUIRE_FALSE(rewritten->HasError());
   CHECK(collect_rows(*rewritten)[0][0] == "100");
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - a glob that gains files keeps one merged entry",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  using sirius::transparent::detail::merged_statistics_cache_size;
+  constexpr char const* query = "SELECT count(*) FROM v WHERE x >= 1000";
+  cpu_plan(query, true);
+  auto const entries = merged_statistics_cache_size();
+  for (int file = 2; file < 5; ++file) {
+    write_file("f" + std::to_string(file), 1000 * file, 1000 * file + 10);
+    cpu_plan(query, true);
+  }
+  CHECK(merged_statistics_cache_size() == entries);
+  auto grown = con->Query(query);
+  REQUIRE_FALSE(grown->HasError());
+  CHECK(collect_rows(*grown)[0][0] == "30");
 }

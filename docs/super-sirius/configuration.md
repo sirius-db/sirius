@@ -859,7 +859,8 @@ old (the rule DuckDB's own file caches use), and while an S3 object's size and s
 unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
 these, so checking costs no request; a local file listed without them (an explicit file list) costs
 one `stat`. A scan's merged statistics are kept with the per-file statistics they were made from and
-reused until one of those files changes; footers that must be read are read in parallel on DuckDB's
+reused until one of those files changes, one entry per set of paths a scan is given, so a glob that
+gains files replaces its entry; footers that must be read are read in parallel on DuckDB's
 worker threads. Scans with
 `union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes the
 `delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
