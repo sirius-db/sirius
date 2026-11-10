@@ -38,7 +38,7 @@ Tools:
 
 CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `kvikio`, `nvcomp`, `spdlog`,
 `yaml-cpp`, `roaring`, and `absl`, plus `OpenSSL`, `ZLIB`, and `CUDAToolkit`.
-`pkg-config` modules: `numa`, `liburing`, and `libcurl`. Use the RAPIDS versions
+`pkg-config` modules: `liburing` and `libcurl`. Use the RAPIDS versions
 pinned in `pixi.toml`.
 
 The `duckdb`, `substrait`, and `cucascade` submodules are built from source.

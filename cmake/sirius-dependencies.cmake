@@ -102,7 +102,6 @@ if(VCPKG_BUILD)
       "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/pkgconfig:${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/pkgconfig:$ENV{PKG_CONFIG_PATH}"
   )
 endif()
-pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 if(VCPKG_BUILD)
   # The CMake target includes curl's private static dependencies.

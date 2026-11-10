@@ -7,7 +7,6 @@
     "nvrtc",
     "yaml-cpp",
     "abseil",
-    "numactl",
     "liburing",
     "openssl",
     "xxhash",

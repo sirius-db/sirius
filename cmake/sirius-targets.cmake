@@ -51,7 +51,6 @@ set(SIRIUS_LINK_LIBRARIES
     telemetry_bridge
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
-    PkgConfig::NUMA
     PkgConfig::LIBURING
     ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
