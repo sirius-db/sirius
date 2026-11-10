@@ -110,8 +110,12 @@ DuckDB's CPU execution untouched: it registers no optimizer hook and
 `gpu_execution(...)` table function, then fail with the recorded reason, such as
 `Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: cannot open
 libcuda.so.1 (...)`. The fallback is logged once at `INFO` level to
-`duckdb_logs`, and the loader prints nothing. The result is cached per database:
-loading the backend after a fallback needs a new database instance.
+`duckdb_logs`. When the fallback follows a failed one-time install, the loader
+adds a status line to stderr saying that queries run on DuckDB's CPU engine and
+that `sirius_status()` shows why. Every other fallback, such as no usable driver or
+a backend that is not installed or cannot be loaded without an install attempt,
+prints nothing. The result is cached per database: loading the backend after a
+fallback needs a new database instance.
 
 `LOAD sirius` still fails if the database already has the other backend loaded,
 if the loader is loaded under a backend name, or if the backend fails once its
