@@ -273,6 +273,12 @@ class sirius_loader {
     loader_status_ptr result = std::move(status);
     if (!result->backend_loaded) { register_fallback(result); }
     loader_.RegisterFunction(status_function::create(result));
+    if (install_failed_) {
+      // Only now is the fallback certain; a FATAL error or a rejected gpu_execution throws.
+      print(
+        "Sirius: queries run on DuckDB's CPU engine; SELECT fallback_reason FROM sirius_status() "
+        "shows why.");
+    }
   }
 
  private:
@@ -359,10 +365,13 @@ class sirius_loader {
       duckdb::ExtensionHelper::InstallExtension(
         db, duckdb::FileSystem::GetLocal(db), backend, options);
     } catch (...) {
-      // The caller may fall back to the CPU, which is only logged; close the status line here.
       // The reason stays out of it: it can span lines and contain the URL with credentials.
-      report(duckdb::StringUtil::Format(
-        "Sirius: installing %s failed after %.1f s.", backend, elapsed()));
+      try {
+        report(duckdb::StringUtil::Format(
+          "Sirius: installing %s failed after %.1f s.", backend, elapsed()));
+      } catch (...) {
+      }
+      install_failed_ = true;
       throw;
     }
     report(duckdb::StringUtil::Format("Sirius: installed %s in %.1f s.", backend, elapsed()));
@@ -370,9 +379,14 @@ class sirius_loader {
 
   void report(std::string const& message)
   {
+    print(message);
+    log_info(message);
+  }
+
+  static void print(std::string const& message)
+  {
     duckdb::Printer::Print(duckdb::OutputStream::STREAM_STDERR, message);
     duckdb::Printer::Flush(duckdb::OutputStream::STREAM_STDERR);
-    log_info(message);
   }
 
   void log_info(std::string const& message)
@@ -409,6 +423,7 @@ class sirius_loader {
   }
 
   duckdb::ExtensionLoader& loader_;
+  bool install_failed_ = false;  ///< A backend install was reported as failed on stderr
 };
 
 }  // namespace

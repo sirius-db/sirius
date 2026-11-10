@@ -264,7 +264,8 @@ class LoaderTests(unittest.TestCase):
         self.assertRegex(
             result.stderr,
             r"^Sirius: installing sirius_cuda13\. .*\n"
-            r"Sirius: installing sirius_cuda13 failed after \d+\.\d s\.\n$",
+            r"Sirius: installing sirius_cuda13 failed after \d+\.\d s\.\n"
+            r"Sirius: queries run on DuckDB's CPU engine; .*sirius_status\(\).*\n$",
         )
 
     def test_selected_backend_already_loaded(self):
