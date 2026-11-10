@@ -35,6 +35,7 @@
 #include <cuvs/neighbors/brute_force.hpp>
 
 #include <cstdlib>
+#include <optional>
 #include <string_view>
 
 namespace sirius::vss {
@@ -244,6 +245,47 @@ knn_result brute_force_knn(raft::device_resources const& res,
 #endif
   auto const index = brute_force_build(res, dataset, metric);
   return brute_force_knn(res, index, queries, k, mr);
+}
+
+knn_result brute_force_f16_topk(raft::device_resources const& res,
+                                std::uint16_t const* x,
+                                float const* x_sq,
+                                int64_t n,
+                                std::uint16_t const* q,
+                                int64_t m,
+                                int64_t d,
+                                int64_t k,
+                                bool take_sqrt,
+                                rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(k >= 1 && k <= n, "VSS k must satisfy 1 <= k <= n_rows");
+  auto const metric   = take_sqrt ? cuvs::distance::DistanceType::L2SqrtExpanded
+                                  : cuvs::distance::DistanceType::L2Expanded;
+  auto const stream   = raft::resource::get_cuda_stream(res);
+  auto const out_size = column_size(m * k, "vector join top-k");
+  auto neighbors      = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto distances = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT32}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
+  if (m == 0) { return knn_result{std::move(neighbors), std::move(distances), m, k}; }
+
+  // Borrow the rows and their norms for this call. Unlike the FP32 search, no over-search to
+  // k = 65: since NVIDIA/cuvs#3041 cuVS sends half with k <= 64 to its tiled GEMM path rather
+  // than fusedL2Knn.
+  bf::index<half, float> const index{
+    res,
+    raft::make_device_matrix_view<const half, int64_t>(reinterpret_cast<half const*>(x), n, d),
+    std::make_optional(raft::make_device_vector_view<const float, int64_t>(x_sq, n)),
+    metric};
+  bf::search(
+    res,
+    bf::search_params{},
+    index,
+    raft::make_device_matrix_view<const half, int64_t>(reinterpret_cast<half const*>(q), m, d),
+    raft::make_device_matrix_view<int64_t, int64_t>(
+      neighbors->mutable_view().data<int64_t>(), m, k),
+    raft::make_device_matrix_view<float, int64_t>(distances->mutable_view().data<float>(), m, k));
+  return knn_result{std::move(neighbors), std::move(distances), m, k};
 }
 
 }  // namespace sirius::vss

@@ -38,10 +38,14 @@
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
+#include <cuda_fp16.h>
 #include <cuvs/distance/distance.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -211,5 +215,93 @@ TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
     auto bad_query = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
       q2_dev.data(), 1, dim + 1);
     REQUIRE_THROWS(brute_force_knn(res, dataset_view, bad_query, 1));
+  }
+}
+
+TEST_CASE("brute_force_f16_topk returns the exact L2 neighbors of half rows", "[vss][f16]")
+{
+  // Small integers are exact in half, and so are their norms and distances in FP32. Covers k <= 64
+  // (cuVS's fusedL2Knn before NVIDIA/cuvs#3041), k > 64, and k == n.
+  auto const shape          = GENERATE(std::array<int64_t, 4>{1, 1, 4, 1},
+                              std::array<int64_t, 4>{300, 33, 96, 10},
+                              std::array<int64_t, 4>{300, 5, 96, 100},
+                              std::array<int64_t, 4>{70, 3, 8, 70});
+  auto const [n, m, d, k]   = shape;
+  auto const take_sqrt      = GENERATE(false, true);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  raft::device_resources res{stream};
+
+  std::vector<float> x(n * d), q(m * d), x_sq(n, 0.f);
+  for (int64_t i = 0; i < n; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      x[i * d + j] = static_cast<float>((i * 13 + j * 19) % 17 - 8);
+      x_sq[i] += x[i * d + j] * x[i * d + j];
+    }
+  }
+  for (int64_t i = 0; i < m; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      q[i * d + j] = static_cast<float>((i + j * 7) % 17 - 8);
+    }
+  }
+  auto const to_half_bits = [](std::vector<float> const& v) {
+    std::vector<std::uint16_t> bits(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+      auto const h = __float2half(v[i]);
+      std::memcpy(&bits[i], &h, sizeof(bits[i]));
+    }
+    return bits;
+  };
+  auto const x_bits = to_half_bits(x);
+  auto const q_bits = to_half_bits(q);
+  rmm::device_uvector<std::uint16_t> x_dev(x_bits.size(), stream);
+  rmm::device_uvector<std::uint16_t> q_dev(q_bits.size(), stream);
+  rmm::device_uvector<float> x_sq_dev(x_sq.size(), stream);
+  cudaMemcpyAsync(x_dev.data(),
+                  x_bits.data(),
+                  sizeof(std::uint16_t) * x_bits.size(),
+                  cudaMemcpyHostToDevice,
+                  stream.get());
+  cudaMemcpyAsync(q_dev.data(),
+                  q_bits.data(),
+                  sizeof(std::uint16_t) * q_bits.size(),
+                  cudaMemcpyHostToDevice,
+                  stream.get());
+  cudaMemcpyAsync(x_sq_dev.data(),
+                  x_sq.data(),
+                  sizeof(float) * x_sq.size(),
+                  cudaMemcpyHostToDevice,
+                  stream.get());
+
+  auto result = sirius::vss::brute_force_f16_topk(
+    res, x_dev.data(), x_sq_dev.data(), n, q_dev.data(), m, d, k, take_sqrt);
+  stream.sync();
+  REQUIRE(result.n_queries == m);
+  REQUIRE(result.k == k);
+  auto const neighbors = to_host<int64_t>(result.neighbors->view());
+  auto const distances = to_host<float>(result.distances->view());
+  REQUIRE(neighbors.size() == m * k);
+  REQUIRE(distances.size() == m * k);
+  for (int64_t row = 0; row < m; ++row) {
+    std::vector<float> expected(n);
+    for (int64_t col = 0; col < n; ++col) {
+      double squared = 0;
+      for (int64_t j = 0; j < d; ++j) {
+        auto const delta = static_cast<double>(q[row * d + j]) - x[col * d + j];
+        squared += delta * delta;
+      }
+      expected[col] = static_cast<float>(take_sqrt ? std::sqrt(squared) : squared);
+    }
+    auto sorted = expected;
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<bool> seen(n, false);
+    for (int64_t col = 0; col < k; ++col) {
+      auto const id = neighbors[row * k + col];
+      REQUIRE(id >= 0);
+      REQUIRE(id < n);
+      REQUIRE_FALSE(seen[id]);
+      seen[id] = true;
+      REQUIRE(distances[row * k + col] == Approx(expected[id]));
+      REQUIRE(distances[row * k + col] == Approx(sorted[col]));
+    }
   }
 }

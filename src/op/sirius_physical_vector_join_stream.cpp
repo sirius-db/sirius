@@ -2612,11 +2612,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       return v == nullptr || std::string_view{v} != "0";
     }();
     std::optional<rmm::device_uvector<std::uint16_t>> routed_f16;
-    std::optional<rmm::device_uvector<float>> routed_sqf;
-    if (f16_sweep0) {
-      routed_f16.emplace(static_cast<std::size_t>(max_routed * dim), stream, mr);
-      routed_sqf.emplace(static_cast<std::size_t>(max_routed), stream, mr);
-    }
+    if (f16_sweep0) { routed_f16.emplace(static_cast<std::size_t>(max_routed * dim), stream, mr); }
     if (f16_bounded) {
       // The probe is rounded like the rows, with its rounded norms and its own rounding error.
       probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
@@ -3562,8 +3558,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             continue;
           }
 
-          // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
-          // per-call device synchronization, which is paid here once per slice.
+          // Search all routed queries together against this corpus slice.
           auto const knn = [&] {
             if (f16_sweep0) {
               vss::gather_bytes(probe_f16->data(),
@@ -3572,14 +3567,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 m,
                                 routed_f16->data(),
                                 stream);
-              vss::gather_rows(probe_sqf->data(), 1, rows_c, m, routed_sqf->data(), stream);
-              return vss::gemm_f16_topk(
+              return vss::brute_force_f16_topk(
                 res,
                 reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
                 reinterpret_cast<float const*>(chunk_norms) + slice.begin,
                 slice_rows,
                 routed_f16->data(),
-                routed_sqf->data(),
                 m,
                 dim,
                 k_eff,
