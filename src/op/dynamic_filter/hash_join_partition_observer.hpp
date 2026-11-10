@@ -16,37 +16,29 @@
 
 #pragma once
 
-#include "op/dynamic_filter/complete_build_inventory.hpp"
+#include "op/dynamic_filter/build_input_certifier.hpp"
 #include "op/partition/partition_input_observer.hpp"
-
-#include <atomic>
-#include <mutex>
 
 namespace sirius::op {
 class sirius_physical_hash_join;
 
-/// Hash-join-owned observation of its explicitly bound build input.
+/// Hash-join-owned observation of its explicitly bound build input: the join's dynamic-filter
+/// construction site on every layout.
 class hash_join_partition_observer final : public partition_input_observer {
  public:
-  hash_join_partition_observer(sirius_physical_hash_join& join, sirius_physical_partition& input)
-    : _join(join), _input(input)
-  {
-  }
+  hash_join_partition_observer(sirius_physical_hash_join& join, sirius_physical_partition& input);
   void on_arrival(std::string_view, cucascade::data_batch&) override;
   bool before_claim() override;
+  void on_hash_input(cucascade::read_only_data_batch const&) override;
   std::optional<uint64_t> before_transform(pipelineable_operator_data const&,
                                            cucascade::read_only_data_batch const&,
                                            ::cuda::stream_ref) override;
   void after_transform(uint64_t, cucascade::memory::memory_space&, ::cuda::stream_ref) override;
   void finalize_input() override;
+  [[nodiscard]] std::size_t task_scratch_bytes() const noexcept override;
 
  private:
-  bool eligible() const;
   sirius_physical_hash_join& _join;
-  sirius_physical_partition& _input;
-  build_arrival_ledger _arrival_ledger;
-  std::mutex _mutex;
-  bool _decided = false;
-  std::atomic<bool> _accumulating{false};
+  build_input_certifier _certifier;
 };
 }  // namespace sirius::op

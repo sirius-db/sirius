@@ -55,6 +55,8 @@ struct construction_limits {
   bool emit_zone_map_filters;             ///< Whether zone maps are enabled
   double domain_coverage_threshold;       ///< The domain gate's coverage threshold
   std::uint64_t max_bloom_bytes_per_gpu;  ///< Cap on the sum of every Bloom key's aligned array
+  bool bloom_only              = false;   ///< Membership filters are Bloom filters only
+  std::size_t fixed_bloom_keys = 0;       ///< Non-zero: every Bloom filter's key count, uncapped
 };
 
 /**
@@ -83,7 +85,8 @@ struct exact_membership {
  * @brief A Bloom filter.
  */
 struct bloom_membership {
-  std::size_t sized_rows;  ///< Rows the filter is sized for: valid rows, or every row when unknown
+  std::size_t rows;        ///< The build's keys: valid rows, or every row when unknown
+  std::size_t sized_rows;  ///< Rows the filter is sized for: `rows`, or a fixed key count
   std::size_t blocks;      ///< `bloom_blocks_for(sized_rows)`
 };
 

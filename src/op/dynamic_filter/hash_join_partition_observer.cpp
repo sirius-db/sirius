@@ -16,54 +16,30 @@
 
 #include "op/dynamic_filter/hash_join_partition_observer.hpp"
 
-#include "log/logging.hpp"
-#include "op/dynamic_filter/build_input_certification.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
-#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 
 namespace sirius::op {
 
-bool hash_join_partition_observer::eligible() const
+hash_join_partition_observer::hash_join_partition_observer(sirius_physical_hash_join& join,
+                                                           sirius_physical_partition& input)
+  : _join(join), _certifier(input, join.dynamic_filter_session())
 {
-  auto const layout = _input.layout();
-  return layout && layout->mode == partition_mode::hash &&
-         layout->placement->num_partitions() > 1 && !_input.partition_keys().empty() &&
-         _join.dynamic_filter_plan().multi_partition_enabled();
 }
 
 void hash_join_partition_observer::on_arrival(std::string_view port_id,
                                               cucascade::data_batch& batch)
 {
-  if (port_id != "default" || !_join.dynamic_filter_plan().multi_partition_enabled()) { return; }
-  auto const* port = _input.try_get_port(port_id);
-  if (port && port->type == MemoryBarrierType::FULL) { _arrival_ledger.record(batch); }
+  _certifier.on_arrival(port_id, batch);
 }
 
-bool hash_join_partition_observer::before_claim()
+bool hash_join_partition_observer::before_claim() { return _certifier.decide(); }
+
+void hash_join_partition_observer::on_hash_input(cucascade::read_only_data_batch const& batch)
 {
-  std::lock_guard guard(_mutex);
-  if (_decided) { return true; }
-  if (eligible()) {
-    auto const facts    = read_build_port_facts(_input);
-    auto const decision = certify_decision(facts);
-    if (std::holds_alternative<certification_pending>(decision)) { return false; }
-    auto certified = std::holds_alternative<certification_proceed>(decision)
-                       ? _arrival_ledger.certify({.repository_batches = facts.repository_batches})
-                       : certified_build_input{std::get<construction_decline>(decision)};
-    if (auto const* decline = std::get_if<construction_decline>(&certified)) {
-      SIRIUS_LOG_INFO(
-        "[hash_join_partition_observer] input (id={}) has no accumulated dynamic filter: {}.",
-        _input.get_operator_id(),
-        to_string(*decline));
-    }
-    if (_join.dynamic_filter_session().try_begin_accumulation(std::move(certified))) {
-      _accumulating.store(true, std::memory_order_release);
-    }
-  }
-  if (!_accumulating.load(std::memory_order_relaxed)) { _arrival_ledger.abandon(); }
-  _decided = true;
-  return true;
+  // Join-wide MARK build facts (any row, any NULL key) for a hash-partitioned build.
+  _join.observe_partitioned_build_batch(batch);
 }
 
 std::optional<uint64_t> hash_join_partition_observer::before_transform(
@@ -71,17 +47,7 @@ std::optional<uint64_t> hash_join_partition_observer::before_transform(
   cucascade::read_only_data_batch const& batch,
   ::cuda::stream_ref stream)
 {
-  // Join-wide MARK build facts (any row, any NULL key) for a hash-partitioned build.
-  _join.observe_partitioned_build_batch(batch);
-  if (!_accumulating.load(std::memory_order_acquire)) { return std::nullopt; }
-  auto& session  = _join.dynamic_filter_session();
-  auto const ids = input.original_batch_ids();
-  if (!_input.port_directive().empty() || input.get_data_batches().size() != 1 || ids.size() != 1) {
-    session.decline_accumulation();
-    return std::nullopt;
-  }
-  session.contribute(ids.front(), batch, stream);
-  return ids.front();
+  return _certifier.contribute(input, batch, stream);
 }
 
 void hash_join_partition_observer::after_transform(uint64_t id,
@@ -93,7 +59,14 @@ void hash_join_partition_observer::after_transform(uint64_t id,
 
 void hash_join_partition_observer::finalize_input()
 {
-  if (eligible()) { _join.dynamic_filter_session().finalize_input(); }
+  auto& session = _join.dynamic_filter_session();
+  session.finalize_input();
+  D_ASSERT(!session.plan().enabled() || session.terminal());
+}
+
+std::size_t hash_join_partition_observer::task_scratch_bytes() const noexcept
+{
+  return _join.dynamic_filter_session().task_scratch_bound();
 }
 
 }  // namespace sirius::op
