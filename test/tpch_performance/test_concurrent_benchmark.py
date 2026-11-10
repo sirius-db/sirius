@@ -489,6 +489,59 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
             self.assertNotIn("connection=2", log)
             self.assertNotIn("unattributed", log)
 
+    def test_keyed_logs_bound_open_files_and_preserve_evicted_destinations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "log_dir").mkdir()
+            folder = directory / "sirius" / "execution_logs"
+            folder.mkdir(parents=True)
+            expected = {}
+            lines = []
+            for stream in range(1, 41):
+                label = f"readonly_s{stream}_q1_i0"
+                query = (
+                    f"QueryBegin: instance=0xa connection={stream} query=2 "
+                    "SQL: SELECT 1\n"
+                )
+                lines.extend(
+                    [
+                        f"QueryBegin: instance=0xa connection={stream} query=1 "
+                        f"SQL: CALL sirius_set_query_label('{label}')\n",
+                        query,
+                    ]
+                )
+                expected[label] = query
+                # A fresh split must replace stale files, then append on reopen.
+                (folder / f"{label}.log").write_text("stale output\n")
+            for stream in range(1, 41):
+                label = f"readonly_s{stream}_q1_i0"
+                line = f"done instance=0xa connection={stream} query=2\n"
+                lines.append(line)
+                expected[label] += line
+            (directory / "log_dir" / "sirius.log").write_text("".join(lines))
+
+            opened = []
+            original_open = Path.open
+
+            def bounded_open(path, *args, **kwargs):
+                if path.parent == folder:
+                    if sum(not output.closed for output in opened) >= 32:
+                        raise OSError("too many open log destinations")
+                    output = original_open(path, *args, **kwargs)
+                    opened.append(output)
+                    return output
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", bounded_open):
+                cb.split_keyed_logs(directory)
+
+            self.assertTrue(all(output.closed for output in opened))
+            self.assertGreater(len(opened), len(expected))
+            for label, content in expected.items():
+                self.assertEqual((folder / f"{label}.log").read_text(), content)
+            index = json.loads((directory / "log_index.json").read_text())
+            self.assertEqual(len(index["queries"]), len(expected))
+
     def test_reference_provenance_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
