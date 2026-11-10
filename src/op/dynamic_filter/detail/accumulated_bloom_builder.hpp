@@ -163,7 +163,7 @@ class accumulated_bloom_builder final {
    *
    * The published filter's domain is classified from `type`, and each contribution's column must be
    * one of its carriers (`membership_probe_compatible`). `blocks` is `bloom_blocks_for` the rows
-   * the array is sized for; the shared-geometry `try_create` ignores it.
+   * the array is sized for.
    */
   struct key {
     cudf::size_type ordinal;  ///< The key's column in every contributed table
@@ -172,41 +172,13 @@ class accumulated_bloom_builder final {
   };
 
   /**
-   * @brief Whether `dynamic_filter_publication_session` admits keys of type `type` for
-   * accumulation today: INT32 and INT64 only.
-   *
-   * The builder itself accepts every `membership_key_supported` type; this narrower rule is the
-   * session's and the planner's until they construct every key type from the build PARTITION.
-   *
-   * @param type The storage type of a build key column
-   * @return True if `type` is INT32 or INT64
-   */
-  [[nodiscard]] static constexpr bool supports(cudf::data_type type) noexcept
-  {
-    return type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::INT64;
-  }
-
-  /**
-   * @brief Allocates zeroed arrays on every GPU of `targets` without waiting on the host.
+   * @brief Allocates zeroed arrays on every GPU of @p targets without waiting on the host. Each
+   * key's array has its own `key::blocks` and its own transfer chunk
+   * (`accumulated_bloom_chunk_bytes`).
    *
    * Each GPU's arrays are allocated under their own lease, attached to a new exclusive stream of
    * that GPU and sized to the exact allocation charge. The calling thread must hold no allocation
    * tracker for those GPUs; a tracked caller is refused like missing capacity.
-   *
-   * @param keys The active keys, in publication order
-   * @param geometry The shared array geometry
-   * @param targets The replica GPUs; each distinct GPU receives one partial
-   * @return The builder, or nullopt iff a lease was refused, after releasing everything built so
-   * far
-   */
-  [[nodiscard]] static std::optional<accumulated_bloom_builder> try_create(
-    std::vector<key> keys,
-    accumulated_bloom_geometry geometry,
-    std::span<dynamic_filter_replica_space const> targets);
-
-  /**
-   * @brief Like the shared-geometry form, but each key's array has its own `key::blocks` and its
-   * own transfer chunk (`accumulated_bloom_chunk_bytes`).
    *
    * @throw accumulation_invariant_error if a key has no blocks, an unsupported type, or sizes that
    * overflow
