@@ -5,9 +5,10 @@ standalone NVL4 node (4 GPUs), from an empty account to checked numbers. On a no
 schedules, follow [Distributed experiments](distributed-experiments.md) instead: a process
 started outside Slurm there can get the node drained.
 
-One script starts a gateway and one rank per GPU, sends the SQL through the client, and stops
-everything. CPU fallback is off: a query Sirius cannot run on the GPU fails. Every step below
-was run from an empty account on 2026-11-10.
+One script starts a gateway and one rank per GPU, on one machine or on several, sends the SQL
+through the client, and stops everything. CPU fallback is off: a query Sirius cannot run on the
+GPU fails. Every step below was run from an empty account on 2026-11-10, on one machine and on
+two (8 ranks).
 
 ## 1. Requirements
 
@@ -41,7 +42,7 @@ ss -ltn | grep -E ':(9494|950[0-9]|2700[0-9]) '                     # prints not
 
 The last two show that no process holds a GPU and that the ports are free: the gateway takes
 9494, and rank i takes 9500 + i and 27000 + i. If they print something, see
-[When it goes wrong](#when-it-goes-wrong).
+[When it goes wrong](#when-it-goes-wrong). With several machines, run the four checks on each.
 
 ## 4. Config and queries
 
@@ -112,7 +113,8 @@ Save this script as `$OUT/run.sh`. One run of it is one arm, with fresh ranks.
 
 ```bash
 : "${CHECKOUT:?} ${DATA:?} ${OUT:?}"                      # exported, absolute paths
-export SIRIUS_CLUSTER=bench SIRIUS_GATEWAY_MIN_RANKS=4    # the ranks of all nodes together
+NODES=""                                                  # other machines, as "node2 node3": see More machines
+export SIRIUS_CLUSTER=bench SIRIUS_GATEWAY_MIN_RANKS=4    # the ranks of all machines together
 export SIRIUS_CONFIG_FILE=$OUT/config.yaml SIRIUS_RANK_LOG_ROOT=$OUT/rank-logs
 export SIRIUS_PRIORITY_DOWNSTREAM_FIRST=1 SIRIUS_GATEWAY_STATEMENT_TIMEOUT=300
 export SIRIUS_GATEWAY_JOIN_WAIT=120                       # seconds the first statement waits for the ranks
@@ -122,8 +124,14 @@ if ss -ltn | grep -E ':(9494|950[0-9]|2700[0-9]) '; then   # an old gateway or r
 fi
 cd "$CHECKOUT" && git log -1 --oneline > "$OUT/env.txt"
 rm -rf "$state"                                           # or the gateway replays the last run's views
+on_node="cd $CHECKOUT && env $(env | grep '^SIRIUS_' | tr '\n' ' ') $(command -v pixi) run scripts/sirius_node.sh"
+stop()
+{
+  for n in $NODES; do ssh "$n" "pkill -u \$USER -f '$CHECKOUT/script[s]/'"; done
+  kill $(jobs -p) 2> /dev/null; wait; rm -rf "$state"
+}
 trap 'exit 1' INT TERM
-trap 'kill $(jobs -p) 2> /dev/null; wait; rm -rf "$state"' EXIT   # stops everything, also on Ctrl-C
+trap stop EXIT                                            # stops everything, also on Ctrl-C
 scripts/sirius_gateway.sh --serve > "$OUT/gateway.out" 2>&1 &
 gateway=$!
 until [ -s "$state/gateway.conf" ]; do
@@ -131,7 +139,9 @@ until [ -s "$state/gateway.conf" ]; do
   sleep 1
 done
 scripts/sirius_node.sh --check --data "$DATA" || exit 1
+for n in $NODES; do ssh "$n" "$on_node --check --data $DATA" || exit 1; done
 scripts/sirius_node.sh > "$OUT/node.out" 2>&1 &           # one rank per GPU
+for n in $NODES; do ssh "$n" "$on_node" > "$OUT/node-$n.out" 2>&1 & done
 scripts/sirius_client.sh -bail < "$OUT/run.sql" > "$OUT/client.txt" 2>&1 &
 wait $! || echo "the client failed: see $OUT/client.txt"  # waited for, so that Ctrl-C stops the script at once
 sleep 5                                                   # the ranks flush their logs every 3 s
@@ -153,7 +163,7 @@ ends a `pixi run` and leaves its gateway or client running.
 |---|---|
 | `client.txt` | For each run: the marker, the answer, then the query's `Run Time` (the second after the marker). Lines end in CR. Large when a query returns many rows: 423 MB with Q11 at SF10000 |
 | `rank-logs/<host>-<port>/` | One Sirius log per rank. They contain the gateway's token: remove it before sharing them |
-| `node.out`, `gateway.out` | Launch output: `registered with the gateway`, `rank exited` |
+| `node.out`, `node-<machine>.out`, `gateway.out` | Launch output: `registered with the gateway`, `rank exited` |
 | `env.txt` | The commit |
 
 Launch files also stay in `/tmp/sirius_node_<user>_bench` and `/tmp/sirius_gateway_<user>_bench`
@@ -179,7 +189,7 @@ started without Sirius, is a plain DuckDB on the CPU:
 
 ```bash
 sed '$d' "$OUT/run.sql" > "$OUT/ref.sql"                            # without the gateway status
-cd "$CHECKOUT" && pixi run sirius-duckdb/build/release/duckdb < "$OUT/ref.sql" > "$OUT/ref.txt" 2>&1
+cd "$CHECKOUT" && pixi run sirius-duckdb/build/release/duckdb -no-agent < "$OUT/ref.sql" > "$OUT/ref.txt" 2>&1
 python3 scripts/compare_answers.py "$OUT/client.txt" --ref-client "$OUT/ref.txt" \
   --ties 3:revenue,o_orderdate --ties 18:o_totalprice,o_orderdate
 ```
@@ -204,12 +214,12 @@ and what [Report](distributed-experiments.md#report) lists.
   `export SIRIUS_GATEWAY_PORT=19494 SIRIUS_NODE_QUACK_PORT=19500 SIRIUS_NODE_EXCHANGE_PORT=37000`
   to the top of `run.sh` (rank i adds i to the last two), and use
   `':(19494|1950[0-9]|3700[0-9]) '` in its `ss` line and in step 3.
-- **More nodes:** on each other node, export the script's `SIRIUS_*` variables and run
-  `scripts/sirius_node.sh` under `pixi run` from the same checkout path, with
-  `SIRIUS_GATEWAY_MIN_RANKS` at the total rank count. The nodes must share `$HOME`, or pass
-  `--gateway` and `--token-file` ([Quick Start](distributed-quickstart.md#prerequisites)). Stop
-  every node's ranks before the gateway. Not rerun across nodes at this commit; two
-  `sirius_node.sh` processes on one machine were.
+- **More machines:** in `run.sh`, set `NODES` to the other machines and
+  `SIRIUS_GATEWAY_MIN_RANKS` to the ranks of all machines together (8 for two machines with 4
+  GPUs each). The script then checks each machine, starts its ranks over `ssh`, and stops them
+  at the end. It needs `ssh` without a password, and on every machine the same `$HOME`, and the
+  checkout, the data, `$OUT` and Pixi at the same paths. A machine with another `$HOME` takes
+  `--gateway` and `--token-file` instead ([Quick Start](distributed-quickstart.md#prerequisites)).
 
 ## When it goes wrong
 
@@ -233,5 +243,5 @@ pkill -u "$USER" -f "$CHECKOUT/script[s]/"; sleep 5      # the gateway, the clie
 pkill -9 -u "$USER" -f "$CHECKOUT/script[s]/"            # a rank's wrapper can outlive the first
 ```
 
-Then repeat the last two checks of step 3. The `[s]` keeps the command from matching, and
-killing, the shell that runs it.
+Then repeat the last two checks of step 3; with several machines, do both on each. The `[s]`
+keeps the command from matching, and killing, the shell that runs it.
