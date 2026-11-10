@@ -1,11 +1,10 @@
 # Strips device code for GPU architectures outside VCPKG_CUDA_ARCHITECTURES from
 # NVIDIA's prebuilt static libraries using nvprune.
 #
-# Each real target X.y keeps every cubin a CC X.y device can load: sm_Xz for z
-# <= y (and their family variants) plus sm_Xya. Family targets (e.g. 100f) also
-# cover the higher minors of their major. PTX is kept for virtual entries (e.g.
-# a bare 120) and, as the libraries' JIT fallback, for archs up to the lowest
-# real target.
+# Each real target X.y keeps every cubin of major X: lower minors load on X.y,
+# and higher-minor devices run our X.y code, so the libraries' kernels for them
+# must stay. PTX is kept for virtual entries (e.g. a bare 120) and, as the
+# libraries' JIT fallback, for archs up to the lowest real target.
 
 # nvprune must match the CUDA major of the libraries it prunes; nvprune 13
 # rejects archs it does not know.
@@ -91,9 +90,6 @@ function(cuda_prune_gencode_args OUT_VAR)
       foreach(_other IN LISTS _known)
         math(EXPR _other_major "${_other} / 10")
         if(NOT _other_major EQUAL _major)
-          continue()
-        endif()
-        if(_other GREATER _arch AND NOT _variant STREQUAL "f")
           continue()
         endif()
         list(APPEND _codes "sm_${_other}")
