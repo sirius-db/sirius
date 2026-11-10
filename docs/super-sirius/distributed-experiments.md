@@ -1,8 +1,10 @@
 # Distributed experiments on NVL4 and NVL72 nodes
 
-How to run a distributed Sirius benchmark on GB200 NVLink nodes, with or without Slurm, and get
-numbers that can be trusted. Read [Distributed Quick Start](distributed-quickstart.md) first for
-the commands and the `sirius.distributed` settings.
+How to run a distributed Sirius benchmark on GB200 NVLink nodes under Slurm and get numbers
+that can be trusted. Without Slurm, follow
+[Distributed experiments without Slurm](distributed-experiments-no-slurm.md) instead. Read
+[Distributed Quick Start](distributed-quickstart.md) first for the commands and the
+`sirius.distributed` settings.
 
 | System | What it is | Ranks |
 |---|---|---|
@@ -10,12 +12,10 @@ the commands and the `sirius.distributed` settings.
 | NVL72 | One rack: 18 such nodes in one NVLink domain | 4 per node |
 
 Every run goes through the gateway, on one node as on several, so the numbers compare: a
-gateway, one rank per GPU, and `sirius-client` for the SQL. Under Slurm,
-`scripts/sirius_slurm.sbatch` starts the gateway and the ranks ([Run](#run)); elsewhere you
-start them yourself ([Run without Slurm](#run-without-slurm)). Ranks on different nodes exchange
-over NVLink (MNNVL). CPU fallback is off: a query Sirius cannot run on the GPU fails. Tested
-with 4, 8 and 16 ranks. Last followed from an empty account on 2026-11-10: clone, build, SF100
-without Slurm and SF10000 on one node under Slurm.
+gateway, one rank per GPU, and `sirius-client` for the SQL. `scripts/sirius_slurm.sbatch` starts
+the gateway and the ranks ([Run](#run)). Ranks on different nodes exchange over NVLink (MNNVL).
+CPU fallback is off: a query Sirius cannot run on the GPU fails. Tested with 4, 8 and 16 ranks.
+Last followed from an empty account on 2026-11-10: clone, build, and SF10000 on one node.
 
 ## Rules
 
@@ -61,8 +61,7 @@ mkdir -p "$OUT"
 The build takes 35 to 40 minutes on 144 cores and the checkout grows to 14 GB. `pixi run` may
 warn that its cache is on a network file system: ignore it.
 
-Before the first job on a set of nodes (without Slurm, run the two commands on each node
-instead of through `srun`):
+Before the first job on a set of nodes:
 
 ```bash
 for n in ${NODES//,/ }; do              # every node sees the build and the data
@@ -186,41 +185,10 @@ q=$CHECKOUT/test/tpch_performance/tpch_queries/orig
 
 ## Run without Slurm
 
-For a machine Slurm does not schedule, such as a standalone NVL4 node. The config, `run.sql`
-and the checks are the same; only the launch differs. On the node, as a script:
-
-```bash
-export SIRIUS_CLUSTER=bench SIRIUS_GATEWAY_MIN_RANKS=4    # the ranks of all nodes together
-export SIRIUS_CONFIG_FILE=$OUT/config.yaml SIRIUS_RANK_LOG_ROOT=$OUT/rank-logs
-export SIRIUS_PRIORITY_DOWNSTREAM_FIRST=1 SIRIUS_GATEWAY_STATEMENT_TIMEOUT=300
-state=$HOME/.sirius/gateways/$SIRIUS_CLUSTER
-cd "$CHECKOUT" && git log -1 --oneline > "$OUT/env.txt"
-rm -f "$state/gateway.conf"
-pixi run sirius-gateway --serve > "$OUT/gateway.out" 2>&1 &
-gateway=$!
-until [ -s "$state/gateway.conf" ]; do sleep 1; done
-pixi run sirius-node --check --data "$DATA" || { kill "$gateway"; exit 1; }
-pixi run sirius-node > "$OUT/node.out" 2>&1 &             # one rank per GPU
-node=$!
-pixi run sirius-client < "$OUT/run.sql" > "$OUT/client.txt" 2>&1
-sleep 5                                                   # the ranks flush their logs every 3 s
-kill "$node" "$gateway"; wait
-rm -rf "$state"                                           # or the next gateway replays these views
-```
-
-- **More nodes:** on each one, export the same variables and run `pixi run sirius-node` from
-  the same checkout path (for example over `ssh`), with `SIRIUS_GATEWAY_MIN_RANKS` at the total
-  rank count. The nodes must share `$HOME`, or pass `--gateway` and `--token-file`
-  ([Quick Start](distributed-quickstart.md#prerequisites)). Stop every `sirius-node` before the
-  gateway.
-- **Fewer GPUs:** `pixi run sirius-node --gpus 0,1`.
-- **A shared machine:** the gateway takes port 9494 and rank i takes 9500 + i and 27000 + i. If
-  someone else holds them, set `gateway.port`, `node.quack_port` and `node.exchange_port`. Pick
-  your own `SIRIUS_CLUSTER`: one gateway runs per name.
-- **Launch output** is in `node.out` (`registered with the gateway`, `rank exited`) and in
-  `/tmp/sirius_node_<user>_<cluster>/rank_<port>/rank.log`.
-- **Afterwards**, `nvidia-smi --query-compute-apps=pid --format=csv,noheader` must print
-  nothing: a rank left behind holds its GPU's memory for the next run.
+On a machine Slurm does not schedule, such as a standalone NVL4 node, follow
+[Distributed experiments without Slurm](distributed-experiments-no-slurm.md): the same config,
+`run.sql` and checks, from an empty account, with one script that starts the gateway and the
+ranks, and stops them.
 
 ## Check the run
 
@@ -230,7 +198,12 @@ plain DuckDB when started as `pixi run sirius-duckdb/build/release/duckdb < ref.
 `ref.sql` the same views and queries. Compare rows in any order, numbers within `1e-6` relative
 or `0.01` absolute. Q3 and Q18 end in `ORDER BY ... LIMIT` and may return different rows that
 tie at the cut: that is a tie, not an error, once the differing rows are shown to have the same
-order-column values.
+order-column values. `scripts/compare_answers.py` applies these rules:
+
+```bash
+python3 scripts/compare_answers.py "$OUT/client.txt" --ref-client "$OUT/ref.txt" \
+  --ties 3:revenue,o_orderdate --ties 18:o_totalprice,o_orderdate
+```
 
 **Logs.** In `client.txt` each run is its marker, the answer, then the query's `Run Time` (the
 second after the marker). Each rank's log in `rank-logs/<host>-<port>/` should show every peer
