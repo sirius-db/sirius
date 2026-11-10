@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "pipeline/repository_wiring.hpp"
@@ -76,6 +77,9 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
     wiring.source_op->add_next_port_after_sink({next_op, wiring.port_id});
     if (next_op->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
       next_op->Cast<op::sirius_physical_sort_sample>().register_boundaries(data_repo_manager);
+    }
+    if (next_op->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+      next_op->Cast<op::sirius_physical_merge_sort>().register_refinement(data_repo_manager);
     }
   }
 }

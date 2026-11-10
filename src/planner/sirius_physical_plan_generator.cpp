@@ -1522,9 +1522,8 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
-//! Replace an ORDER_BY slot with `MERGE_SORT → SORT_EXTRACT → SORT_CUTS →
-//! SORT_NORMALIZE → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
-//! original_input`. Destructive: ORDER_BY's
+//! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE →
+//! ORDER_BY → original_input`. Destructive: ORDER_BY's
 //! `projections`/`types` are overwritten with the identity over the input's types so every
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
@@ -1593,13 +1592,8 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       merge->set_final_projections(std::move(original_projections), std::move(output_types));
     }
 
-    auto normalize = duckdb::make_uniq<sirius::op::sirius_physical_sort_normalize>(order_ptr);
-    normalize->children.push_back(std::move(partition));
-    auto cuts = duckdb::make_uniq<sirius::op::sirius_physical_sort_cuts>(order_ptr);
-    cuts->children.push_back(std::move(normalize));
-    auto extract = duckdb::make_uniq<sirius::op::sirius_physical_sort_extract>(order_ptr);
-    extract->children.push_back(std::move(cuts));
-    merge->children.push_back(std::move(extract));
+    // MERGE_SORT refines oversized ranges internally; see sirius_physical_merge_sort.
+    merge->children.push_back(std::move(partition));
     return merge;
   });
 }
