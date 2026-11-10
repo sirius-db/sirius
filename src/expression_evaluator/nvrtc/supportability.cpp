@@ -27,8 +27,10 @@
 #include <helper/numeric_narrowing.hpp>
 
 #include <algorithm>
+#include <array>
+#include <optional>
+#include <span>
 #include <string>
-#include <type_traits>
 #include <variant>
 
 namespace sirius::nvrtc {
@@ -83,204 +85,18 @@ namespace {
   return true;
 }
 
-/** @brief Recursive function visitation of a node's children. */
-template <typename Fn>
-void for_each_child_node(sirius::ast::node const& expr, Fn&& fn)
-{
-  std::visit(
-    [&](auto const& alt) {
-      using T = std::decay_t<decltype(alt)>;
-      if constexpr (std::is_same_v<T, sirius::ast::comparison>) {
-        if (alt.left) { fn(*alt.left); }
-        if (alt.right) { fn(*alt.right); }
-      } else if constexpr (std::is_same_v<T, sirius::ast::between>) {
-        if (alt.input) { fn(*alt.input); }
-        if (alt.lower) { fn(*alt.lower); }
-        if (alt.upper) { fn(*alt.upper); }
-      } else if constexpr (std::is_same_v<T, sirius::ast::conjunction> ||
-                           std::is_same_v<T, sirius::ast::coalesce>) {
-        for (auto const& ch : alt.children) {
-          if (ch) { fn(*ch); }
-        }
-      } else if constexpr (std::is_same_v<T, sirius::ast::case_expr>) {
-        for (auto const& c : alt.cases) {
-          if (c.when_) { fn(*c.when_); }
-          if (c.then_) { fn(*c.then_); }
-        }
-        if (alt.else_) { fn(*alt.else_); }
-      } else if constexpr (std::is_same_v<T, sirius::ast::in_list>) {
-        if (alt.probe) { fn(*alt.probe); }
-        for (auto const& v : alt.values) {
-          if (v) { fn(*v); }
-        }
-      } else if constexpr (std::is_same_v<T, sirius::ast::cast> ||
-                           std::is_same_v<T, sirius::ast::unary_op>) {
-        if (alt.child) { fn(*alt.child); }
-      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
-        for (auto const& arg : alt.arguments()) {
-          if (arg) { fn(*arg); }
-        }
-      }
-    },
-    expr.v);
-}
-
-[[nodiscard]] bool is_function_call_supported(sirius::ast::function_call const& fc,
-                                              cudf::table_view const& input,
-                                              boundary_column_map const* boundary_map)
-{
-  auto const& args   = fc.arguments();
-  auto const opt_ret = sirius::get_cudf_type(fc.return_type());
-  if (!opt_ret || !is_supported_register_type(*opt_ret)) { return false; }
-  auto const ret_type = *opt_ret;
-
-  if (fc.function() == sirius::function_id::date_trunc) {
-    if (args.size() != 2) { return false; }
-    if (!args[0] || !args[0]->holds<sirius::ast::constant>()) { return false; }
-    auto const& freq_cst = args[0]->get<sirius::ast::constant>();
-    if (!std::holds_alternative<std::string>(freq_cst.payload)) { return false; }
-    auto const unit = sirius::parse_gpu_date_trunc_unit(std::get<std::string>(freq_cst.payload));
-    if (!unit) { return false; }
-    if (!args[1] || !is_node_supported(*args[1], input, boundary_map)) { return false; }
-    auto const ct = effective_node_cudf_type(*args[1], input, boundary_map);
-    return cudf::is_timestamp(ct) && cudf::is_timestamp(ret_type);
-  }
-
-  if (fc.function() == sirius::function_id::substring) {
-    if ((args.size() != 2 && args.size() != 3) || ret_type.id() != cudf::type_id::STRING) {
-      return false;
-    }
-    if (!args[0] || !is_node_supported(*args[0], input, boundary_map)) { return false; }
-    if (effective_node_cudf_type(*args[0], input, boundary_map).id() != cudf::type_id::STRING) {
-      return false;
-    }
-    auto const opt_offset = args[1] ? extract_constant_int64(*args[1]) : std::nullopt;
-    if (!opt_offset) { return false; }
-    std::int64_t length = sirius::substring_default_length;
-    if (args.size() == 3) {
-      auto const opt_len = args[2] ? extract_constant_int64(*args[2]) : std::nullopt;
-      if (!opt_len) { return false; }
-      length = *opt_len;
-    }
-    return sirius::gpu_substring_slice(*opt_offset, length).has_value();
-  }
-
-  for (auto const& arg : args) {
-    if (!arg || !is_node_supported(*arg, input, boundary_map)) { return false; }
-  }
-
-  switch (fc.function()) {
-    case sirius::function_id::add:
-    case sirius::function_id::sub:
-    case sirius::function_id::mul:
-    case sirius::function_id::div:
-    case sirius::function_id::int_div:
-    case sirius::function_id::mod: {
-      if (args.size() != 2) { return false; }
-      auto const lt = effective_node_cudf_type(*args[0], input, boundary_map);
-      auto const rt = effective_node_cudf_type(*args[1], input, boundary_map);
-      if (cudf::is_fixed_point(ret_type)) {
-        return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt);
-      }
-      return is_integer_or_float(ret_type) && is_integer_or_float(lt) && is_integer_or_float(rt);
-    }
-    case sirius::function_id::abs: {
-      if (args.size() != 1) { return false; }
-      auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
-      if (cudf::is_fixed_point(ret_type)) { return cudf::is_fixed_point(ct) && ct == ret_type; }
-      return is_integer_or_float(ret_type) && ct == ret_type;
-    }
-    case sirius::function_id::negate: {
-      if (args.size() != 1) { return false; }
-      auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
-      if (ct != ret_type) { return false; }
-      if (cudf::is_fixed_point(ret_type)) { return true; }
-      return is_integer_or_float(ret_type) && !cudf::is_unsigned(ret_type);
-    }
-    case sirius::function_id::round: {
-      if (args.size() != 1 && args.size() != 2) { return false; }
-      auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
-      if ((ct.id() != cudf::type_id::FLOAT32 && ct.id() != cudf::type_id::FLOAT64) ||
-          ret_type != ct) {
-        return false;
-      }
-      if (args.size() == 2) {
-        if (!args[1]->holds<sirius::ast::constant>()) { return false; }
-        auto const& prec_cst = args[1]->get<sirius::ast::constant>();
-        if (!std::holds_alternative<std::int32_t>(prec_cst.payload)) { return false; }
-      }
-      return true;
-    }
-    case sirius::function_id::constant_or_null: {
-      if (args.size() < 2) { return false; }
-      auto const v0_t = effective_node_cudf_type(*args[0], input, boundary_map);
-      if (ret_type.id() == cudf::type_id::STRING || v0_t.id() == cudf::type_id::STRING) {
-        return ret_type.id() == cudf::type_id::STRING && v0_t.id() == cudf::type_id::STRING;
-      }
-      return is_supported_fixed_width(v0_t);
-    }
-    case sirius::function_id::year:
-    case sirius::function_id::month:
-    case sirius::function_id::day:
-    case sirius::function_id::hour:
-    case sirius::function_id::minute:
-    case sirius::function_id::second:
-    case sirius::function_id::millisecond:
-    case sirius::function_id::microsecond: {
-      if (args.size() != 1) { return false; }
-      auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
-      return cudf::is_timestamp(ct) && cudf::is_integral(ret_type);
-    }
-    case sirius::function_id::strlen:
-    case sirius::function_id::length: {
-      if (args.size() != 1) { return false; }
-      auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
-      return ct.id() == cudf::type_id::STRING && cudf::is_integral(ret_type);
-    }
-    case sirius::function_id::prefix:
-    case sirius::function_id::suffix:
-    case sirius::function_id::contains:
-    case sirius::function_id::like:
-    case sirius::function_id::not_like: {
-      if (args.size() != 2 || ret_type.id() != cudf::type_id::BOOL8) { return false; }
-      auto const lt = effective_node_cudf_type(*args[0], input, boundary_map);
-      auto const rt = effective_node_cudf_type(*args[1], input, boundary_map);
-      return lt.id() == cudf::type_id::STRING && rt.id() == cudf::type_id::STRING;
-    }
-    default: return false;
-  }
-}
-
-}  // namespace
-
-std::int64_t timestamp_ticks_per_second(cudf::type_id id) noexcept
-{
-  switch (id) {
-    case cudf::type_id::TIMESTAMP_SECONDS: return 1LL;
-    case cudf::type_id::TIMESTAMP_MILLISECONDS: return 1'000LL;
-    case cudf::type_id::TIMESTAMP_MICROSECONDS: return 1'000'000LL;
-    case cudf::type_id::TIMESTAMP_NANOSECONDS: return 1'000'000'000LL;
-    default: return 0LL;
-  }
-}
+/// @brief The Materialization Boundaries a planning walk has met, in the order it met them.
+using boundary_list = std::vector<sirius::ast::node const*>;
 
 /**
- * @brief Computes the *effective* CUDF type of an AST node (e.g., the logical type of a narrowed
- *        column)
+ * @brief Returns the cuDF type a node evaluates to in registers: a reference's restored logical
+ *        type (or its physical carrier when it is not a narrowed numeric), otherwise the node's
+ *        declared return type, which is also the type of a Materialization Boundary's evaluated
+ *        column. `EMPTY` when it has none.
  */
-cudf::data_type effective_node_cudf_type(sirius::ast::node const& expr,
-                                         cudf::table_view const& input,
-                                         boundary_column_map const* boundary_map)
+[[nodiscard]] cudf::data_type effective_node_cudf_type(sirius::ast::node const& expr,
+                                                       cudf::table_view const& input)
 {
-  if (boundary_map != nullptr) {
-    if (auto const it = boundary_map->find(&expr); it != boundary_map->end()) {
-      if (it->second < static_cast<std::uint32_t>(input.num_columns())) {
-        return input.column(it->second).type();
-      }
-      auto const opt_cudf = sirius::get_cudf_type(expr.return_type());
-      return opt_cudf.value_or(cudf::data_type{cudf::type_id::EMPTY});
-    }
-  }
   if (expr.holds<sirius::ast::reference>()) {
     auto const& ref = expr.get<sirius::ast::reference>();
     if (ref.column_index >= static_cast<std::uint32_t>(input.num_columns())) {
@@ -300,36 +116,185 @@ cudf::data_type effective_node_cudf_type(sirius::ast::node const& expr,
   return opt_cudf.value_or(cudf::data_type{cudf::type_id::EMPTY});
 }
 
-std::optional<std::int64_t> extract_constant_int64(sirius::ast::node const& node) noexcept
+/** @brief Returns whether @p expr is a Materialization Boundary, as `compile_plan` defines one. */
+[[nodiscard]] bool is_materialization_boundary(sirius::ast::node const& expr,
+                                               cudf::table_view const& input)
 {
-  if (!node.holds<sirius::ast::constant>()) { return std::nullopt; }
-  auto const& payload = node.get<sirius::ast::constant>().payload;
-  if (std::holds_alternative<std::int64_t>(payload)) { return std::get<std::int64_t>(payload); }
-  if (std::holds_alternative<std::int32_t>(payload)) {
-    return static_cast<std::int64_t>(std::get<std::int32_t>(payload));
+  if (expr.holds<sirius::ast::reference>() || expr.holds<sirius::ast::constant>() ||
+      expr.holds<sirius::ast::aggregate>()) {
+    return false;
   }
-  return std::nullopt;
+  if (expr.holds<sirius::ast::function_call>()) {
+    auto const fid = expr.get<sirius::ast::function_call>().function();
+    return fid == sirius::function_id::concat || fid == sirius::function_id::concat_operator ||
+           fid == sirius::function_id::upper || fid == sirius::function_id::lower ||
+           fid == sirius::function_id::regexp_replace;
+  }
+  if (expr.holds<sirius::ast::cast>()) {
+    auto const& cst    = expr.get<sirius::ast::cast>();
+    auto const opt_dst = sirius::get_cudf_type(cst.target_type);
+    if (!opt_dst || !is_supported_register_type(*opt_dst)) { return false; }
+    if (!cst.child) { return false; }
+    auto const src_type = effective_node_cudf_type(*cst.child, input);
+    if (cst.kind == sirius::ast::cast_kind::carrier_restore) {
+      return !(src_type == *opt_dst || can_restore_to(src_type, *opt_dst));
+    }
+    return !is_semantic_cast_supported(src_type, *opt_dst);
+  }
+  return false;
 }
 
-/** @brief Checks if a node is supported for evaluation. */
-bool is_node_supported(sirius::ast::node const& expr,
-                       cudf::table_view const& input,
-                       boundary_column_map const* boundary_map)
+/**
+ * @brief Records @p boundary in @p boundaries and returns whether a kernel can read its evaluated
+ *        column, whose type is the boundary's declared return type.
+ */
+[[nodiscard]] bool bind_placeholder(sirius::ast::node const& boundary, boundary_list& boundaries)
 {
-  if (boundary_map != nullptr) {
-    if (auto const it = boundary_map->find(&expr); it != boundary_map->end()) {
-      if (it->second < static_cast<std::uint32_t>(input.num_columns())) {
-        auto const col_view = input.column(it->second);
-        if (col_view.type().id() == cudf::type_id::STRING) {
-          return has_supported_string_offsets(col_view);
-        }
-        return is_supported_fixed_width(col_view.type());
-      }
-      auto const opt_cudf = sirius::get_cudf_type(expr.return_type());
-      return opt_cudf.has_value() && is_supported_register_type(*opt_cudf);
-    }
+  auto const opt_cudf = sirius::get_cudf_type(boundary.return_type());
+  if (!opt_cudf || !is_supported_register_type(*opt_cudf)) { return false; }
+  if (std::ranges::find(boundaries, &boundary) == boundaries.end()) {
+    boundaries.push_back(&boundary);
+  }
+  return true;
+}
+
+[[nodiscard]] bool is_node_supported(sirius::ast::node const& expr,
+                                     cudf::table_view const& input,
+                                     boundary_list& boundaries);
+
+[[nodiscard]] bool is_function_call_supported(sirius::ast::function_call const& fc,
+                                              cudf::table_view const& input,
+                                              boundary_list& boundaries)
+{
+  auto const& args   = fc.arguments();
+  auto const opt_ret = sirius::get_cudf_type(fc.return_type());
+  if (!opt_ret || !is_supported_register_type(*opt_ret)) { return false; }
+  auto const ret_type = *opt_ret;
+
+  if (fc.function() == sirius::function_id::date_trunc) {
+    if (args.size() != 2) { return false; }
+    if (!args[0] || !args[0]->holds<sirius::ast::constant>()) { return false; }
+    auto const& freq_cst = args[0]->get<sirius::ast::constant>();
+    if (!std::holds_alternative<std::string>(freq_cst.payload)) { return false; }
+    auto const unit = sirius::parse_gpu_date_trunc_unit(std::get<std::string>(freq_cst.payload));
+    if (!unit) { return false; }
+    if (!args[1] || !is_node_supported(*args[1], input, boundaries)) { return false; }
+    auto const ct = effective_node_cudf_type(*args[1], input);
+    return cudf::is_timestamp(ct) && cudf::is_timestamp(ret_type);
   }
 
+  if (fc.function() == sirius::function_id::substring) {
+    if ((args.size() != 2 && args.size() != 3) || ret_type.id() != cudf::type_id::STRING) {
+      return false;
+    }
+    if (!args[0] || !is_node_supported(*args[0], input, boundaries)) { return false; }
+    if (effective_node_cudf_type(*args[0], input).id() != cudf::type_id::STRING) { return false; }
+    auto const opt_offset = args[1] ? extract_constant_int64(*args[1]) : std::nullopt;
+    if (!opt_offset) { return false; }
+    std::int64_t length = sirius::substring_default_length;
+    if (args.size() == 3) {
+      auto const opt_len = args[2] ? extract_constant_int64(*args[2]) : std::nullopt;
+      if (!opt_len) { return false; }
+      length = *opt_len;
+    }
+    return sirius::gpu_substring_slice(*opt_offset, length).has_value();
+  }
+
+  for (auto const& arg : args) {
+    if (!arg || !is_node_supported(*arg, input, boundaries)) { return false; }
+  }
+
+  switch (fc.function()) {
+    case sirius::function_id::add:
+    case sirius::function_id::sub:
+    case sirius::function_id::mul:
+    case sirius::function_id::div:
+    case sirius::function_id::int_div:
+    case sirius::function_id::mod: {
+      if (args.size() != 2) { return false; }
+      auto const lt = effective_node_cudf_type(*args[0], input);
+      auto const rt = effective_node_cudf_type(*args[1], input);
+      if (cudf::is_fixed_point(ret_type)) {
+        return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt);
+      }
+      return is_integer_or_float(ret_type) && is_integer_or_float(lt) && is_integer_or_float(rt);
+    }
+    case sirius::function_id::abs: {
+      if (args.size() != 1) { return false; }
+      auto const ct = effective_node_cudf_type(*args[0], input);
+      if (cudf::is_fixed_point(ret_type)) { return cudf::is_fixed_point(ct) && ct == ret_type; }
+      return is_integer_or_float(ret_type) && ct == ret_type;
+    }
+    case sirius::function_id::negate: {
+      if (args.size() != 1) { return false; }
+      auto const ct = effective_node_cudf_type(*args[0], input);
+      if (ct != ret_type) { return false; }
+      if (cudf::is_fixed_point(ret_type)) { return true; }
+      return is_integer_or_float(ret_type) && !cudf::is_unsigned(ret_type);
+    }
+    case sirius::function_id::round: {
+      if (args.size() != 1 && args.size() != 2) { return false; }
+      auto const ct = effective_node_cudf_type(*args[0], input);
+      if ((ct.id() != cudf::type_id::FLOAT32 && ct.id() != cudf::type_id::FLOAT64) ||
+          ret_type != ct) {
+        return false;
+      }
+      if (args.size() == 2) {
+        if (!args[1]->holds<sirius::ast::constant>()) { return false; }
+        auto const& prec_cst = args[1]->get<sirius::ast::constant>();
+        if (!std::holds_alternative<std::int32_t>(prec_cst.payload)) { return false; }
+      }
+      return true;
+    }
+    case sirius::function_id::constant_or_null: {
+      if (args.size() < 2) { return false; }
+      auto const v0_t = effective_node_cudf_type(*args[0], input);
+      if (ret_type.id() == cudf::type_id::STRING || v0_t.id() == cudf::type_id::STRING) {
+        return ret_type.id() == cudf::type_id::STRING && v0_t.id() == cudf::type_id::STRING;
+      }
+      return is_supported_fixed_width(v0_t);
+    }
+    case sirius::function_id::year:
+    case sirius::function_id::month:
+    case sirius::function_id::day:
+    case sirius::function_id::hour:
+    case sirius::function_id::minute:
+    case sirius::function_id::second:
+    case sirius::function_id::millisecond:
+    case sirius::function_id::microsecond: {
+      if (args.size() != 1) { return false; }
+      auto const ct = effective_node_cudf_type(*args[0], input);
+      return cudf::is_timestamp(ct) && cudf::is_integral(ret_type);
+    }
+    case sirius::function_id::strlen:
+    case sirius::function_id::length: {
+      if (args.size() != 1) { return false; }
+      auto const ct = effective_node_cudf_type(*args[0], input);
+      return ct.id() == cudf::type_id::STRING && cudf::is_integral(ret_type);
+    }
+    case sirius::function_id::prefix:
+    case sirius::function_id::suffix:
+    case sirius::function_id::contains:
+    case sirius::function_id::like:
+    case sirius::function_id::not_like: {
+      if (args.size() != 2 || ret_type.id() != cudf::type_id::BOOL8) { return false; }
+      auto const lt = effective_node_cudf_type(*args[0], input);
+      auto const rt = effective_node_cudf_type(*args[1], input);
+      return lt.id() == cudf::type_id::STRING && rt.id() == cudf::type_id::STRING;
+    }
+    default: return false;
+  }
+}
+
+/**
+ * @brief Returns whether `translation_context::produce` can translate @p expr over @p input once
+ *        every Materialization Boundary in it is read from an input column, recording those
+ *        boundaries in @p boundaries.
+ */
+bool is_node_supported(sirius::ast::node const& expr,
+                       cudf::table_view const& input,
+                       boundary_list& boundaries)
+{
   //===----------BOUND REFERENCE----------===//
   if (expr.holds<sirius::ast::reference>()) {
     auto const& ref = expr.get<sirius::ast::reference>();
@@ -364,12 +329,12 @@ bool is_node_supported(sirius::ast::node const& expr,
   if (expr.holds<sirius::ast::comparison>()) {
     auto const& cmp = expr.get<sirius::ast::comparison>();
     if (!cmp.left || !cmp.right) { return false; }
-    if (!is_node_supported(*cmp.left, input, boundary_map) ||
-        !is_node_supported(*cmp.right, input, boundary_map)) {
+    if (!is_node_supported(*cmp.left, input, boundaries) ||
+        !is_node_supported(*cmp.right, input, boundaries)) {
       return false;
     }
-    auto const lt = effective_node_cudf_type(*cmp.left, input, boundary_map);
-    auto const rt = effective_node_cudf_type(*cmp.right, input, boundary_map);
+    auto const lt = effective_node_cudf_type(*cmp.left, input);
+    auto const rt = effective_node_cudf_type(*cmp.right, input);
     return is_supported_register_type(lt) && is_supported_register_type(rt) &&
            types_compatible(lt, rt);
   }
@@ -378,14 +343,14 @@ bool is_node_supported(sirius::ast::node const& expr,
   if (expr.holds<sirius::ast::between>()) {
     auto const& btw = expr.get<sirius::ast::between>();
     if (!btw.input || !btw.lower || !btw.upper) { return false; }
-    if (!is_node_supported(*btw.input, input, boundary_map) ||
-        !is_node_supported(*btw.lower, input, boundary_map) ||
-        !is_node_supported(*btw.upper, input, boundary_map)) {
+    if (!is_node_supported(*btw.input, input, boundaries) ||
+        !is_node_supported(*btw.lower, input, boundaries) ||
+        !is_node_supported(*btw.upper, input, boundaries)) {
       return false;
     }
-    auto const it = effective_node_cudf_type(*btw.input, input, boundary_map);
-    auto const lt = effective_node_cudf_type(*btw.lower, input, boundary_map);
-    auto const ut = effective_node_cudf_type(*btw.upper, input, boundary_map);
+    auto const it = effective_node_cudf_type(*btw.input, input);
+    auto const lt = effective_node_cudf_type(*btw.lower, input);
+    auto const ut = effective_node_cudf_type(*btw.upper, input);
     return is_supported_register_type(it) && is_supported_register_type(lt) &&
            is_supported_register_type(ut) && types_compatible(it, lt) && types_compatible(it, ut);
   }
@@ -399,8 +364,8 @@ bool is_node_supported(sirius::ast::node const& expr,
       return false;
     }
     return std::ranges::all_of(conj.children, [&](auto const& ch) {
-      return ch && is_node_supported(*ch, input, boundary_map) &&
-             effective_node_cudf_type(*ch, input, boundary_map).id() == cudf::type_id::BOOL8;
+      return ch && is_node_supported(*ch, input, boundaries) &&
+             effective_node_cudf_type(*ch, input).id() == cudf::type_id::BOOL8;
     });
   }
 
@@ -413,23 +378,19 @@ bool is_node_supported(sirius::ast::node const& expr,
     auto const ret_type = *opt_ret;
     for (auto const& c : ce.cases) {
       if (!c.when_ || !c.then_) { return false; }
-      if (!is_node_supported(*c.when_, input, boundary_map)) { return false; }
-      if (effective_node_cudf_type(*c.when_, input, boundary_map).id() != cudf::type_id::BOOL8) {
-        return false;
-      }
+      if (!is_node_supported(*c.when_, input, boundaries)) { return false; }
+      if (effective_node_cudf_type(*c.when_, input).id() != cudf::type_id::BOOL8) { return false; }
       if (c.then_->holds<sirius::ast::function_call>() &&
           c.then_->get<sirius::ast::function_call>().function() == sirius::function_id::error) {
         continue;
       }
-      if (!is_node_supported(*c.then_, input, boundary_map)) { return false; }
-      if (!arm_compatible_with_result(ret_type,
-                                      effective_node_cudf_type(*c.then_, input, boundary_map))) {
+      if (!is_node_supported(*c.then_, input, boundaries)) { return false; }
+      if (!arm_compatible_with_result(ret_type, effective_node_cudf_type(*c.then_, input))) {
         return false;
       }
     }
-    if (!is_node_supported(*ce.else_, input, boundary_map)) { return false; }
-    return arm_compatible_with_result(ret_type,
-                                      effective_node_cudf_type(*ce.else_, input, boundary_map));
+    if (!is_node_supported(*ce.else_, input, boundaries)) { return false; }
+    return arm_compatible_with_result(ret_type, effective_node_cudf_type(*ce.else_, input));
   }
 
   //===----------COALESCE----------===//
@@ -440,9 +401,8 @@ bool is_node_supported(sirius::ast::node const& expr,
     if (!opt_ret || !is_supported_register_type(*opt_ret)) { return false; }
     auto const ret_type = *opt_ret;
     return std::ranges::all_of(coal.children, [&](auto const& ch) {
-      return ch && is_node_supported(*ch, input, boundary_map) &&
-             arm_compatible_with_result(ret_type,
-                                        effective_node_cudf_type(*ch, input, boundary_map));
+      return ch && is_node_supported(*ch, input, boundaries) &&
+             arm_compatible_with_result(ret_type, effective_node_cudf_type(*ch, input));
     });
   }
 
@@ -450,24 +410,25 @@ bool is_node_supported(sirius::ast::node const& expr,
   if (expr.holds<sirius::ast::in_list>()) {
     auto const& inl = expr.get<sirius::ast::in_list>();
     if (!inl.probe || inl.values.empty()) { return false; }
-    if (!is_node_supported(*inl.probe, input, boundary_map)) { return false; }
-    auto const pt = effective_node_cudf_type(*inl.probe, input, boundary_map);
+    if (!is_node_supported(*inl.probe, input, boundaries)) { return false; }
+    auto const pt = effective_node_cudf_type(*inl.probe, input);
     if (!is_supported_register_type(pt)) { return false; }
     return std::ranges::all_of(inl.values, [&](auto const& v) {
-      if (!v || !is_node_supported(*v, input, boundary_map)) { return false; }
-      auto const vt = effective_node_cudf_type(*v, input, boundary_map);
+      if (!v || !is_node_supported(*v, input, boundaries)) { return false; }
+      auto const vt = effective_node_cudf_type(*v, input);
       return is_supported_register_type(vt) && types_compatible(pt, vt);
     });
   }
 
   //===----------CAST----------===//
   if (expr.holds<sirius::ast::cast>()) {
+    if (is_materialization_boundary(expr, input)) { return bind_placeholder(expr, boundaries); }
     auto const& cst = expr.get<sirius::ast::cast>();
-    if (!cst.child || !is_node_supported(*cst.child, input, boundary_map)) { return false; }
+    if (!cst.child || !is_node_supported(*cst.child, input, boundaries)) { return false; }
     auto const opt_dst = sirius::get_cudf_type(cst.target_type);
     if (!opt_dst || !is_supported_fixed_width(*opt_dst)) { return false; }
     auto const dst_type = *opt_dst;
-    auto const src_type = effective_node_cudf_type(*cst.child, input, boundary_map);
+    auto const src_type = effective_node_cudf_type(*cst.child, input);
     if (!is_supported_fixed_width(src_type)) { return false; }
     if (cst.kind == sirius::ast::cast_kind::carrier_restore) {
       return src_type == dst_type || can_restore_to(src_type, dst_type);
@@ -478,81 +439,78 @@ bool is_node_supported(sirius::ast::node const& expr,
   //===----------UNARY_OP----------===//
   if (expr.holds<sirius::ast::unary_op>()) {
     auto const& uo = expr.get<sirius::ast::unary_op>();
-    if (!uo.child || !is_node_supported(*uo.child, input, boundary_map)) { return false; }
+    if (!uo.child || !is_node_supported(*uo.child, input, boundaries)) { return false; }
     switch (uo.op) {
       case sirius::ast::unary_op::kind::op_not:
-        return effective_node_cudf_type(*uo.child, input, boundary_map).id() ==
-               cudf::type_id::BOOL8;
+        return effective_node_cudf_type(*uo.child, input).id() == cudf::type_id::BOOL8;
       case sirius::ast::unary_op::kind::op_is_null:
       case sirius::ast::unary_op::kind::op_is_not_null: return true;
       case sirius::ast::unary_op::kind::op_try:
-        return is_supported_register_type(effective_node_cudf_type(*uo.child, input, boundary_map));
+        return is_supported_register_type(effective_node_cudf_type(*uo.child, input));
       default: return false;
     }
   }
 
   //===----------FUNCTION_CALL----------===//
   if (expr.holds<sirius::ast::function_call>()) {
-    return is_function_call_supported(expr.get<sirius::ast::function_call>(), input, boundary_map);
+    if (is_materialization_boundary(expr, input)) { return bind_placeholder(expr, boundaries); }
+    return is_function_call_supported(expr.get<sirius::ast::function_call>(), input, boundaries);
   }
 
   return false;
 }
 
-/// @brief Checks if a node is in a tree materialization boundary.
-bool is_in_tree_materialization_boundary(sirius::ast::node const& expr,
-                                         cudf::table_view const& input)
+/**
+ * @brief Plans one kernel whose outputs are @p roots; @p is_output_type tells which root types
+ *        the kernel can write.
+ */
+template <typename OutputTypePredicate>
+[[nodiscard]] std::optional<compile_plan> plan_sink(std::span<sirius::ast::node const* const> roots,
+                                                    cudf::table_view const& input,
+                                                    OutputTypePredicate is_output_type) noexcept
 {
-  if (expr.holds<sirius::ast::reference>() || expr.holds<sirius::ast::constant>() ||
-      expr.holds<sirius::ast::aggregate>()) {
-    return false;
-  }
-  if (expr.holds<sirius::ast::function_call>()) {
-    auto const fid = expr.get<sirius::ast::function_call>().function();
-    return fid == sirius::function_id::concat || fid == sirius::function_id::concat_operator ||
-           fid == sirius::function_id::upper || fid == sirius::function_id::lower ||
-           fid == sirius::function_id::regexp_replace;
-  }
-  if (expr.holds<sirius::ast::cast>()) {
-    auto const& cst    = expr.get<sirius::ast::cast>();
-    auto const opt_dst = sirius::get_cudf_type(cst.target_type);
-    if (!opt_dst || !is_supported_register_type(*opt_dst)) { return false; }
-    if (!cst.child) { return false; }
-    auto const src_type = effective_node_cudf_type(*cst.child, input, nullptr);
-    if (cst.kind == sirius::ast::cast_kind::carrier_restore) {
-      return !(src_type == *opt_dst || can_restore_to(src_type, *opt_dst));
+  try {
+    if (roots.empty()) { return std::nullopt; }
+    compile_plan plan;
+    for (auto const* root : roots) {
+      if (root == nullptr || !is_output_type(effective_node_cudf_type(*root, input))) {
+        return std::nullopt;
+      }
+      // A root that is itself a boundary stays on the caller's path: a kernel that only copied its
+      // evaluated column would gain nothing.
+      if (is_materialization_boundary(*root, input) ||
+          !is_node_supported(*root, input, plan.boundaries)) {
+        return std::nullopt;
+      }
     }
-    return !is_semantic_cast_supported(src_type, *opt_dst);
+    return plan;
+  } catch (...) {
+    return std::nullopt;
   }
-  return false;
 }
 
-void collect_boundaries_from_node(sirius::ast::node const& expr,
-                                  cudf::table_view const& input,
-                                  std::vector<sirius::ast::node const*>& out_boundaries)
+}  // namespace
+
+std::int64_t timestamp_ticks_per_second(cudf::type_id id) noexcept
 {
-  if (is_in_tree_materialization_boundary(expr, input)) {
-    if (std::ranges::find(out_boundaries, &expr) == out_boundaries.end()) {
-      out_boundaries.push_back(&expr);
-    }
-    return;
+  switch (id) {
+    case cudf::type_id::TIMESTAMP_SECONDS: return 1LL;
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: return 1'000LL;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: return 1'000'000LL;
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return 1'000'000'000LL;
+    default: return 0LL;
   }
-  for_each_child_node(expr, [&](sirius::ast::node const& child) {
-    collect_boundaries_from_node(child, input, out_boundaries);
-  });
 }
 
-void collect_materialization_boundaries(std::span<sirius::ast::node const* const> expressions,
-                                        cudf::table_view const& input,
-                                        std::vector<sirius::ast::node const*>& out_boundaries)
+std::optional<std::int64_t> extract_constant_int64(sirius::ast::node const& node) noexcept
 {
-  for (auto const* expr : expressions) {
-    if (expr == nullptr) { continue; }
-    // Only descend into root expressions whose children we might compile around a boundary; do not
-    // treat a top-level Materialization Boundary itself as an in-tree synthetic input column.
-    if (is_in_tree_materialization_boundary(*expr, input)) { continue; }
-    collect_boundaries_from_node(*expr, input, out_boundaries);
+  if (!node.holds<sirius::ast::constant>()) { return std::nullopt; }
+  auto const& payload = node.get<sirius::ast::constant>().payload;
+  if (std::holds_alternative<std::int64_t>(payload)) { return std::get<std::int64_t>(payload); }
+  if (std::holds_alternative<std::int32_t>(payload)) {
+    return static_cast<std::int64_t>(std::get<std::int32_t>(payload));
   }
+  return std::nullopt;
 }
 
 cudf::data_type resolve_output_cudf_type(sirius::ast::node const& expr,
@@ -574,6 +532,32 @@ cudf::data_type resolve_output_cudf_type(sirius::ast::node const& expr,
     return resolve_output_cudf_type(*expr.get<sirius::ast::unary_op>().child, input);
   }
   return sirius::require_cudf_type(expr.return_type());
+}
+
+std::optional<compile_plan> plan_project_sink(std::span<sirius::ast::node const* const> expressions,
+                                              cudf::table_view const& input) noexcept
+{
+  return plan_sink(
+    expressions, input, [](cudf::data_type t) { return is_supported_fixed_width(t); });
+}
+
+std::optional<compile_plan> plan_filter_sink(sirius::ast::node const& predicate,
+                                             cudf::table_view const& input) noexcept
+{
+  std::array<sirius::ast::node const*, 1> const roots{&predicate};
+  return plan_sink(roots, input, [](cudf::data_type t) { return t.id() == cudf::type_id::BOOL8; });
+}
+
+bool is_supported_boundary_column(cudf::column_view const& column) noexcept
+{
+  try {
+    if (column.type().id() == cudf::type_id::STRING) {
+      return has_supported_string_offsets(column);
+    }
+    return is_supported_fixed_width(column.type());
+  } catch (...) {
+    return false;
+  }
 }
 
 }  // namespace sirius::nvrtc

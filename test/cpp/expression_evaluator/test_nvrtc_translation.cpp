@@ -35,6 +35,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -313,7 +314,7 @@ TEST_CASE("nvrtc_codegen - the kernel ABI table drives the signature and the dev
   CHECK(ctx.body_code().find("in_0_chars_end") != std::string::npos);
 }
 
-TEST_CASE("nvrtc_codegen - every tree the supportability predicate accepts translates",
+TEST_CASE("nvrtc_codegen - every tree the compile planner accepts directly translates",
           "[expression_evaluator][nvrtc_codegen]")
 {
   fake_table table;
@@ -399,10 +400,13 @@ TEST_CASE("nvrtc_codegen - every tree the supportability predicate accepts trans
   for (std::size_t i = 0; i < corpus.size(); ++i) {
     CAPTURE(i);
     std::array<ast_node const*, 1> exprs{corpus[i].get()};
-    bool const as_projection = sirius::nvrtc::can_compile_project_sink(exprs, table.view);
-    bool const as_filter     = corpus[i]->return_type().id() == type_id::BOOLEAN &&
-                           sirius::nvrtc::can_compile_filter_sink(*corpus[i], table.view);
-    if (!as_projection && !as_filter) { continue; }
+    auto const as_projection = sirius::nvrtc::plan_project_sink(exprs, table.view);
+    auto const as_filter     = corpus[i]->return_type().id() == type_id::BOOLEAN
+                                 ? sirius::nvrtc::plan_filter_sink(*corpus[i], table.view)
+                                 : std::nullopt;
+    if (!(as_projection && as_projection->is_direct()) && !(as_filter && as_filter->is_direct())) {
+      continue;
+    }
     ++accepted;
     sirius::nvrtc::translation_context ctx(table.view, nullptr, sirius::nvrtc::like_policy{true});
     REQUIRE_NOTHROW((void)ctx.produce(*corpus[i]));
@@ -411,7 +415,7 @@ TEST_CASE("nvrtc_codegen - every tree the supportability predicate accepts trans
   CHECK(accepted == corpus.size());
 }
 
-TEST_CASE("nvrtc_codegen - the supportability predicate refuses malformed and foreign trees",
+TEST_CASE("nvrtc_codegen - the compile planner refuses malformed and foreign trees",
           "[expression_evaluator][nvrtc_codegen]")
 {
   fake_table table;
@@ -421,41 +425,121 @@ TEST_CASE("nvrtc_codegen - the supportability predicate refuses malformed and fo
     auto const cmp = std::make_unique<ast_node>(
       sirius::ast::comparison{sirius::comparison_type::lt, nullptr, nullptr});
     std::array<ast_node const*, 1> exprs{cmp.get()};
-    CHECK_FALSE(sirius::nvrtc::can_compile_project_sink(exprs, table.view));
-    CHECK_FALSE(sirius::nvrtc::can_compile_filter_sink(*cmp, table.view));
+    CHECK_FALSE(sirius::nvrtc::plan_project_sink(exprs, table.view));
+    CHECK_FALSE(sirius::nvrtc::plan_filter_sink(*cmp, table.view));
 
     std::vector<std::unique_ptr<ast_node>> children;
     children.push_back(make_ref_typed(8, bool_t));
     children.push_back(nullptr);
     auto const conj = std::make_unique<ast_node>(
       sirius::ast::conjunction{sirius::ast::conjunction::kind::op_and, std::move(children)});
-    CHECK_FALSE(sirius::nvrtc::can_compile_filter_sink(*conj, table.view));
+    CHECK_FALSE(sirius::nvrtc::plan_filter_sink(*conj, table.view));
   }
 
   SECTION("a reference past the input, a non-boolean filter, and a STRING projection are refused")
   {
     auto const ref = make_ref_typed(42, int_t);
     std::array<ast_node const*, 1> exprs{ref.get()};
-    CHECK_FALSE(sirius::nvrtc::can_compile_project_sink(exprs, table.view));
-    CHECK_FALSE(sirius::nvrtc::can_compile_filter_sink(*make_ref_typed(0, int_t), table.view));
+    CHECK_FALSE(sirius::nvrtc::plan_project_sink(exprs, table.view));
+    CHECK_FALSE(sirius::nvrtc::plan_filter_sink(*make_ref_typed(0, int_t), table.view));
     auto const str = make_ref_typed(3, varchar_t);
     std::array<ast_node const*, 1> str_exprs{str.get()};
-    CHECK_FALSE(sirius::nvrtc::can_compile_project_sink(str_exprs, table.view));
+    CHECK_FALSE(sirius::nvrtc::plan_project_sink(str_exprs, table.view));
+  }
+}
+
+TEST_CASE("nvrtc_codegen - compile planning names the Materialization Boundaries a kernel reads",
+          "[expression_evaluator][nvrtc_codegen][compile_planning]")
+{
+  fake_table table;
+  auto upper_s = [] {
+    return make_unary_func(sirius::function_id::upper, make_ref_typed(3, varchar_t), varchar_t);
+  };
+
+  SECTION("a tree without boundaries plans directly, and LIKE is not a boundary")
+  {
+    auto const like = make_like(sirius::function_id::like, 3, "%x%");
+    auto const plan = sirius::nvrtc::plan_filter_sink(*like, table.view);
+    REQUIRE(plan);
+    CHECK(plan->is_direct());
   }
 
-  SECTION("in-tree Materialization Boundaries are collected, LIKE is not one")
+  SECTION("upper(s) = 'X' AND a + b > c plans with upper(s) as its one boundary")
   {
-    std::vector<std::unique_ptr<ast_node>> up_args;
-    up_args.push_back(make_ref_typed(3, varchar_t));
-    auto upper            = make_func(sirius::function_id::upper, std::move(up_args), varchar_t);
+    auto upper            = upper_s();
     auto const* upper_ptr = upper.get();
-    auto const cmp =
-      make_cmp(sirius::comparison_type::equal, std::move(upper), make_str_const("X"));
-    auto const like = make_like(sirius::function_id::like, 3, "%x%");
-    std::array<ast_node const*, 2> exprs{cmp.get(), like.get()};
-    std::vector<ast_node const*> boundaries;
-    sirius::nvrtc::collect_materialization_boundaries(exprs, table.view, boundaries);
-    REQUIRE(boundaries.size() == 1);
-    CHECK(boundaries[0] == upper_ptr);
+    std::vector<std::unique_ptr<ast_node>> and_args;
+    and_args.push_back(
+      make_cmp(sirius::comparison_type::equal, std::move(upper), make_str_const("X")));
+    and_args.push_back(make_cmp(sirius::comparison_type::gt,
+                                make_binary(sirius::function_id::add,
+                                            make_ref_typed(1, bigint_t),
+                                            make_ref_typed(1, bigint_t),
+                                            bigint_t),
+                                make_bigint_const(5)));
+    auto const pred = make_conj(sirius::ast::conjunction::kind::op_and, std::move(and_args));
+
+    auto const plan = sirius::nvrtc::plan_filter_sink(*pred, table.view);
+    REQUIRE(plan);
+    REQUIRE(plan->boundaries.size() == 1);
+    CHECK(plan->boundaries[0] == upper_ptr);
+  }
+
+  SECTION("only the outermost boundary of nested boundaries is named, in root order")
+  {
+    auto lower_upper            = make_unary_func(sirius::function_id::lower, upper_s(), varchar_t);
+    auto const* lower_upper_ptr = lower_upper.get();
+    auto upper                  = upper_s();
+    auto const* upper_ptr       = upper.get();
+    auto const first =
+      make_unary_func(sirius::function_id::strlen, std::move(lower_upper), bigint_t);
+    auto const second = make_unary_func(sirius::function_id::strlen, std::move(upper), bigint_t);
+    std::array<ast_node const*, 2> exprs{first.get(), second.get()};
+
+    auto const plan = sirius::nvrtc::plan_project_sink(exprs, table.view);
+    REQUIRE(plan);
+    REQUIRE(plan->boundaries.size() == 2);
+    CHECK(plan->boundaries[0] == lower_upper_ptr);
+    CHECK(plan->boundaries[1] == upper_ptr);
+  }
+
+  SECTION("a boundary under an uncompilable ancestor yields no plan")
+  {
+    // The VARCHAR CASE cannot be a projection output; row() cannot be computed in a kernel.
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back({make_cmp(sirius::comparison_type::equal, upper_s(), make_str_const("X")),
+                     make_ref_typed(3, varchar_t)});
+    auto const case_expr = std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_str_const("none"), varchar_t});
+    std::array<ast_node const*, 1> case_exprs{case_expr.get()};
+    CHECK_FALSE(sirius::nvrtc::plan_project_sink(case_exprs, table.view));
+
+    auto const row_is_null = make_unary(
+      sirius::ast::unary_op::kind::op_is_null,
+      make_unary_func(sirius::function_id::row, upper_s(), logical_type::make(type_id::STRUCT)));
+    CHECK_FALSE(sirius::nvrtc::plan_filter_sink(*row_is_null, table.view));
+  }
+
+  SECTION("a root that is itself a boundary yields no plan")
+  {
+    auto const cast_root = make_cast(make_ref_typed(3, varchar_t), int_t, false);
+    std::array<ast_node const*, 1> exprs{cast_root.get()};
+    CHECK_FALSE(sirius::nvrtc::plan_project_sink(exprs, table.view));
+  }
+
+  SECTION("an evaluated boundary column is readable unless its string offsets are unsupported")
+  {
+    CHECK(sirius::nvrtc::is_supported_boundary_column(table.view.column(1)));
+    CHECK(sirius::nvrtc::is_supported_boundary_column(table.view.column(3)));
+    cudf::column_view const int16_offsets{
+      cudf::data_type{cudf::type_id::INT16}, fake_rows + 1, fake_offsets.data(), nullptr, 0};
+    cudf::column_view const odd_strings{cudf::data_type{cudf::type_id::STRING},
+                                        fake_rows,
+                                        fake_data.data(),
+                                        nullptr,
+                                        0,
+                                        0,
+                                        {int16_offsets}};
+    CHECK_FALSE(sirius::nvrtc::is_supported_boundary_column(odd_strings));
   }
 }

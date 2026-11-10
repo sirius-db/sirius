@@ -224,24 +224,6 @@ constexpr char const* project_entry = "sirius_nvrtc_project_kernel";
 
 }  // namespace
 
-bool can_compile_project_sink(std::span<sirius::ast::node const* const> expressions,
-                              cudf::table_view const& input,
-                              boundary_column_map const* boundary_map) noexcept
-{
-  try {
-    if (expressions.empty()) { return false; }
-    for (auto const* expr : expressions) {
-      if (expr == nullptr || !is_node_supported(*expr, input, boundary_map)) { return false; }
-      if (!is_supported_fixed_width(effective_node_cudf_type(*expr, input, boundary_map))) {
-        return false;
-      }
-    }
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
 project_sink_result evaluate_project_sink(std::span<sirius::ast::node const* const> expressions,
                                           cudf::table_view const& input,
                                           ::cuda::stream_ref stream,
