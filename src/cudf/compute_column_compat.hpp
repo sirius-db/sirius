@@ -80,7 +80,7 @@ std::unique_ptr<cudf::column> compute_column_jit(cudf::table_view const& input,
                                                  ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
-#if CUDF_VERSION_LT(26, 12, 0)
+#if !(CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12))
   constexpr cudf::size_type warp_size = 32;
   auto const rows                     = input.num_rows();
   auto const aligned_rows             = rows - rows % warp_size;

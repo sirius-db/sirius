@@ -4165,8 +4165,8 @@ TEST_CASE("AST_JIT keeps non-null inputs non-null on batches spanning several gr
   auto const rows = GENERATE(100, 4'000'000, 1'000'003, 2'000'029, 4'000'003);
   std::vector<int32_t> left(rows), right(rows);
   for (int i = 0; i < rows; ++i) {
-    left[i]  = (i * 7919) % 2000;
-    right[i] = (i * 104729) % 2000;
+    left[i]  = static_cast<int32_t>((int64_t{i} * 7919) % 2000);
+    right[i] = static_cast<int32_t>((int64_t{i} * 104729) % 2000);
   }
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(make_carrier_column(space, cudf::data_type{cudf::type_id::INT32}, left));
