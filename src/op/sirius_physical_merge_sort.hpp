@@ -149,7 +149,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     std::size_t first_child{0}, child_count{0};
   };
 
-  void ingest();
+  // Returns (ranges, nonempty ranges).
+  std::pair<std::size_t, std::size_t> ingest();
   [[nodiscard]] bool fits(node const& n) const;
   [[nodiscard]] std::optional<std::size_t> actionable() const;
   [[nodiscard]] std::unique_ptr<work> claim(std::size_t id);

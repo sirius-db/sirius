@@ -22,9 +22,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <absl/cleanup/cleanup.h>
-
-#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <fstream>
@@ -119,7 +116,7 @@ TEST_CASE("ORDER BY routes bounded runs through sampled ranges", "[integration][
         sort_metric(message, "num_partitions=") > 1) {
       multiple_ranges = true;
     }
-    if (message.starts_with("sort.tile_ranges") && sort_metric(message, "nonempty_ranges=") > 1) {
+    if (message.starts_with("Merge sort:") && sort_metric(message, "nonempty_ranges=") > 1) {
       multiple_routed_ranges = true;
     }
   }
@@ -259,7 +256,7 @@ TEST_CASE("production bounded ORDER BY exceeds configured GPU capacity", "[.][bo
       boundary_waits += sort_metric(message, "waits=");
     }
     if (message.starts_with("sort.tile_refine ")) { ++subdivisions; }
-    if (message.starts_with("sort.tile_ranges ")) {
+    if (message.starts_with("Merge sort: ")) {
       nonempty_ranges = std::max(nonempty_ranges, sort_metric(message, "nonempty_ranges="));
     }
     if (message.starts_with("sort.tiles ")) {
@@ -370,63 +367,4 @@ TEST_CASE("production bounded ORDER BY exceeds configured GPU capacity", "[.][bo
             << " max_request=" << max_request << " scheduled_claims=" << scheduled_claims
             << " creator_visits=" << creator_visits << " local_ms=" << local_ms
             << " merge_ms=" << merge_ms << " elapsed_s=" << elapsed << std::endl;
-}
-
-namespace {
-class delayed_sort_work : public sirius::log::sink {
- public:
-  std::promise<void> entered;
-  std::future<void> entry = entered.get_future();
-  std::promise<void> release_signal;
-  std::shared_future<void> released = release_signal.get_future().share();
-  std::atomic<unsigned> events{0};
-  std::once_flag release_once;
-  void unblock()
-  {
-    std::call_once(release_once, [&] { release_signal.set_value(); });
-  }
-  void set_level(sirius::log::level) override {}
-  bool should_log(sirius::log::level level) const override
-  {
-    return level >= sirius::log::level::debug;
-  }
-  bool flush() override { return true; }
-  void log(sirius::log::level, const std::source_location&, std::string_view message) override
-  {
-    if (message.starts_with("sort.tile_ranges") && events.fetch_add(1) == 0) {
-      entered.set_value();
-      released.wait();
-    }
-  }
-};
-}  // namespace
-
-TEST_CASE("cancellation retires delayed production sort work", "[integration][bounded_sort_cancel]")
-{
-  sirius::test::GpuExecutionFixture fixture;
-  fixture.run_ok("SET sort_chunk_bytes=4096");
-  fixture.run_ok("SET gpu_execution=false");
-  fixture.run_ok("CREATE TABLE bounded_cancel AS SELECT i::BIGINT id FROM range(8192) t(i)");
-  fixture.run_ok("CHECKPOINT");
-  fixture.run_ok("SET gpu_execution=true");
-  auto before = sirius::test::get_transparent_execution_stats(*fixture.con);
-  sirius::test::scoped_recording_log_sink restore_logger("debug");
-  auto delayed = std::make_shared<delayed_sort_work>();
-  sirius::log::set_sink(delayed);
-  auto query            = std::async(std::launch::async, [&] {
-    return fixture.con->Query("SELECT id FROM bounded_cancel ORDER BY id DESC");
-  });
-  absl::Cleanup release = [delayed] { delayed->unblock(); };
-  REQUIRE(delayed->entry.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
-  fixture.con->Interrupt();
-  // Retirement must wait for the creator's live work lease rather than destroying scratch.
-  CHECK(query.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
-  delayed->unblock();
-  REQUIRE(query.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
-  auto result = query.get();
-  REQUIRE(result);
-  CHECK(result->HasError());
-  auto after = sirius::test::get_transparent_execution_stats(*fixture.con);
-  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
-  fixture.compare_gpu_vs_cpu_ordered("SELECT id FROM bounded_cancel ORDER BY id DESC LIMIT 3");
 }

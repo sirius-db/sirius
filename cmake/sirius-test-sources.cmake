@@ -253,7 +253,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_bounded_order_by.cpp
     test/cpp/operator/test_bounded_sort.cpp
     test/cpp/operator/test_gpu_sampled_merge.cpp
-    test/cpp/operator/test_tiled_merge.cpp
+    test/cpp/operator/test_merge_refinement.cpp
     test/cpp/operator/test_physical_merge_sort.cpp
     test/cpp/operator/test_physical_order.cpp
     test/cpp/operator/test_physical_partition.cpp

@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/order/bounded_sort.hpp"
 #include "op/order/gpu_sampled_merge.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
@@ -118,11 +119,11 @@ void sirius_physical_merge_sort::register_refinement(
 
 // Called once, under the lock, after every range contribution has arrived. Reads row and
 // byte metadata only: nothing is restored to a device.
-void sirius_physical_merge_sort::ingest()
+std::pair<std::size_t, std::size_t> sirius_physical_merge_sort::ingest()
 {
   _ingested  = true;
   auto& repo = *get_port("default")->repo;
-  if (repo.all_empty()) { return; }
+  if (repo.all_empty()) { return {repo.num_partitions(), 0}; }
   if (!_parts || !_samples || !_splitters) {
     throw internal_exception("Merge sort refinement repositories are not registered");
   }
@@ -148,6 +149,7 @@ void sirius_physical_merge_sort::ingest()
     _active.emplace(n.lo, _nodes.size());
     _nodes.push_back(std::move(n));
   }
+  return {ranges, _nodes.size()};
 }
 
 bool sirius_physical_merge_sort::fits(node const& n) const
@@ -273,11 +275,17 @@ std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::cl
 std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_data()
 {
   if (!is_source_pipeline_finished()) { return nullptr; }
-  std::lock_guard guard(lock);
-  if (!_ingested) { ingest(); }
-  auto id = actionable();
-  if (!id) { return nullptr; }
-  return claim(*id);
+  std::optional<std::pair<std::size_t, std::size_t>> routed;
+  std::unique_ptr<work> claimed;
+  {
+    std::lock_guard guard(lock);
+    if (!_ingested) { routed = ingest(); }
+    if (auto id = actionable()) { claimed = claim(*id); }
+  }
+  if (routed) {
+    SIRIUS_LOG_DEBUG("Merge sort: ranges={}, nonempty_ranges={}", routed->first, routed->second);
+  }
+  return claimed;
 }
 
 std::optional<task_creation_hint> sirius_physical_merge_sort::get_next_task_hint()
