@@ -48,6 +48,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/gpu_admission.hpp"
+#include "planner/mark_join_conversion.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
@@ -63,11 +64,18 @@
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_columnref_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <duckdb/planner/operator/logical_expression_get.hpp>
+#include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_order.hpp>
+#include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
@@ -124,7 +132,11 @@ class scoped_temp_db_path {
 /// rolling back and restoring the optimizer settings) so a planner regression fails the
 /// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
-  Connection& con, const std::string& query, const std::vector<OptimizerType>& also_disabled = {})
+  Connection& con,
+  const std::string& query,
+  const std::vector<OptimizerType>& also_disabled = {},
+  bool pre_resolve                                = true,
+  std::string* logical_plan_text                  = nullptr)
 {
   auto& context = *con.context;
 
@@ -158,13 +170,17 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    plan->ResolveOperatorTypes();
+    // Production hands the generator an unresolved plan; the MARK-join conversion needs that.
+    if (pre_resolve) {
+      plan->ResolveOperatorTypes();
 
-    ColumnBindingResolver resolver;
-    duckdb::ColumnBindingResolver verifier(true);
-    verifier.VisitOperator(*plan);
-    resolver.VisitOperator(*plan);
+      ColumnBindingResolver resolver;
+      duckdb::ColumnBindingResolver verifier(true);
+      verifier.VisitOperator(*plan);
+      resolver.VisitOperator(*plan);
+    }
 
+    if (logical_plan_text) { *logical_plan_text = plan->ToString(); }
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));
   } catch (...) {
@@ -1037,6 +1053,203 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
   REQUIRE(dedup_builds > 0);
   require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - an IN subquery under a delim CTE plans as a SEMI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // TPC-H Q20 shape: an IN predicate inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  for (auto* node : joins) {
+    CHECK(node->Cast<sirius::op::sirius_physical_hash_join>().join_type != duckdb::JoinType::MARK);
+  }
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a NOT EXISTS subquery under a delim CTE plans as an ANTI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // A NOT EXISTS predicate (null-safe keys) inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE NOT EXISTS (SELECT 1 FROM parts q WHERE q.pk = i.fk "
+    "  AND q.pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  bool has_anti = false;
+  for (auto* node : joins) {
+    auto const type = node->Cast<sirius::op::sirius_physical_hash_join>().join_type;
+    CHECK(type != duckdb::JoinType::MARK);
+    has_anti = has_anti || type == duckdb::JoinType::ANTI || type == duckdb::JoinType::RIGHT_ANTI;
+  }
+  CHECK(has_anti);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - MARK joins DuckDB keeps are not converted under a delim CTE",
+                 "[plan_tree_shape][isolated_context][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // Each query has a MARK join whose mark is not a bare filter: it is projected, sits inside an
+  // OR, or is negated over keys that are not null-safe (NOT IN, <> ALL).
+  auto const sql =
+    GENERATE(std::string("SELECT p.pk, p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
+                         "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk)) FROM parts p"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pk NOT IN (SELECT i.fk FROM items i "
+                         "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pk <> ALL (SELECT i.fk FROM items i "
+                         "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pname = 'p1' OR p.pk IN (SELECT i.fk "
+                         "FROM items i WHERE i.qty > "
+                         "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"));
+  INFO(sql);
+  auto plan = generate_sirius_plan(*con, sql, /*also_disabled=*/{}, /*pre_resolve=*/false);
+  INFO(tree_to_string(plan.get()));
+
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  CHECK(std::any_of(joins.begin(), joins.end(), [](auto* node) {
+    return node->template Cast<sirius::op::sirius_physical_hash_join>().join_type ==
+           duckdb::JoinType::MARK;
+  }));
+}
+
+namespace {
+
+// One constant row of @p width INTEGER columns, bound to @p table.
+duckdb::unique_ptr<duckdb::LogicalOperator> constant_row(duckdb::TableIndex table,
+                                                         std::size_t width,
+                                                         duckdb::TableIndex dummy)
+{
+  duckdb::vector<duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>> rows(1);
+  duckdb::vector<duckdb::LogicalType> types;
+  for (std::size_t i = 0; i < width; ++i) {
+    rows[0].push_back(
+      duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)));
+    types.push_back(duckdb::LogicalType::INTEGER);
+  }
+  auto get =
+    duckdb::make_uniq<duckdb::LogicalExpressionGet>(table, std::move(types), std::move(rows));
+  get->children.push_back(duckdb::make_uniq<duckdb::LogicalDummyScan>(dummy));
+  return get;
+}
+
+duckdb::TableIndex const kLeftRow{1};
+duckdb::TableIndex const kRightRow{2};
+duckdb::TableIndex const kMark{3};
+
+// FILTER(mark) over a MARK join of a two-column row against a one-column row: the conversion's
+// candidate in its smallest form, with bindings unresolved as the pass expects. The filter's
+// output is the join's: the two left columns, then the mark.
+duckdb::unique_ptr<duckdb::LogicalFilter> make_mark_filter(duckdb::LogicalComparisonJoin*& join)
+{
+  auto mark_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
+  mark_join->mark_index = kMark;
+  mark_join->children.push_back(constant_row(kLeftRow, 2, duckdb::TableIndex{4}));
+  mark_join->children.push_back(constant_row(kRightRow, 1, duckdb::TableIndex{5}));
+  mark_join->conditions.emplace_back(
+    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kLeftRow, duckdb::ProjectionIndex(0))),
+    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kRightRow, duckdb::ProjectionIndex(0))),
+    duckdb::ExpressionType::COMPARE_EQUAL);
+  join = mark_join.get();
+  auto filter =
+    duckdb::make_uniq<duckdb::LogicalFilter>(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      duckdb::LogicalType::BOOLEAN, duckdb::ColumnBinding(kMark, duckdb::ProjectionIndex(0))));
+  filter->children.push_back(std::move(mark_join));
+  return filter;
+}
+
+// A projection of the left row's first column over @p child: a consumer that addresses its input
+// by binding.
+duckdb::unique_ptr<duckdb::LogicalOperator> project_left(
+  duckdb::unique_ptr<duckdb::LogicalOperator> child)
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
+  select_list.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+    duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kLeftRow, duckdb::ProjectionIndex(0))));
+  auto projection =
+    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::TableIndex{6}, std::move(select_list));
+  projection->children.push_back(std::move(child));
+  return projection;
+}
+
+}  // namespace
+
+// Converting drops the mark, the last column of the filter's output. That is safe only when nothing
+// between the filter and the next projection reads its input by position, and when the filter's
+// projection map neither keeps the mark nor reorders columns into a projection of its own.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "mark conversion - a positional consumer of the mark filter keeps the join MARK",
+                 "[plan_tree_shape][isolated_context][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  auto const shape = GENERATE(as<std::string>{},
+                              "projection above",
+                              "identity projection map",
+                              "ORDER BY between filter and projection",
+                              "projection map keeps the mark",
+                              "projection map reorders the columns",
+                              "filter at the plan root");
+  INFO(shape);
+  duckdb::LogicalComparisonJoin* join = nullptr;
+  auto filter                         = make_mark_filter(join);
+  bool expect_converted               = false;
+  duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+  if (shape == "projection above") {
+    expect_converted = true;
+    plan             = project_left(std::move(filter));
+  } else if (shape == "identity projection map") {
+    expect_converted       = true;
+    filter->projection_map = {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(1)};
+    plan                   = project_left(std::move(filter));
+  } else if (shape == "ORDER BY between filter and projection") {
+    auto order =
+      duckdb::make_uniq<duckdb::LogicalOrder>(duckdb::vector<duckdb::BoundOrderByNode>{});
+    order->children.push_back(std::move(filter));
+    plan = project_left(std::move(order));
+  } else if (shape == "projection map keeps the mark") {
+    filter->projection_map = {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(2)};
+    plan                   = project_left(std::move(filter));
+  } else if (shape == "projection map reorders the columns") {
+    filter->projection_map = {duckdb::ProjectionIndex(1), duckdb::ProjectionIndex(0)};
+    plan                   = project_left(std::move(filter));
+  } else {
+    plan = std::move(filter);
+  }
+
+  std::size_t const expected_conversions = expect_converted ? 1 : 0;
+  CHECK(sirius::planner::convert_mark_joins(*con->context, plan) == expected_conversions);
+  CHECK(join->join_type == (expect_converted ? duckdb::JoinType::SEMI : duckdb::JoinType::MARK));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

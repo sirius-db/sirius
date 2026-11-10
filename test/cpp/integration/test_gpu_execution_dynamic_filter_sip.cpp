@@ -456,6 +456,72 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - MARK joins converted to SEMI or ANTI keep results on NULL keys",
+                 "[integration][gpu_execution][dynamic_filter][mark_conversion]")
+{
+  run_ok("SET gpu_execution = false;");
+  run_ok(
+    "CREATE TABLE parts AS SELECT (range % 50)::INTEGER AS pk, "
+    "concat('p', range % 3) AS pname FROM range(100);");
+  run_ok("INSERT INTO parts VALUES (NULL, 'p1'), (NULL, 'p2'), (1, NULL);");
+  run_ok(
+    "CREATE TABLE items AS SELECT range::INTEGER AS id, (range % 60)::INTEGER AS fk, "
+    "(range % 5)::INTEGER AS qty FROM range(3000);");
+  run_ok("INSERT INTO items VALUES (3000, NULL, 1), (3001, 1, NULL), (3002, NULL, NULL);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // Each outer query filters its rows so that DuckDB keeps the delim CTE.
+  std::string query;
+
+  SECTION("IN inside a delim CTE becomes SEMI")
+  {
+    query =
+      "SELECT p.pk FROM parts p WHERE p.pname = 'p1' AND p.pk IN ("
+      "SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p2') "
+      "AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))";
+  }
+
+  SECTION("a correlated IN with a plain and a null-safe key")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND "
+      "i.qty IN (SELECT p.pk % 5 FROM parts p WHERE p.pk = i.fk)";
+  }
+
+  SECTION("a correlated > ANY")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND "
+      "i.qty > ANY (SELECT p.pk % 5 FROM parts p WHERE p.pname = 'p1' AND p.pk = i.fk)";
+  }
+
+  SECTION("NOT EXISTS on nullable keys inside a delim CTE becomes ANTI")
+  {
+    query =
+      "SELECT p.pk FROM parts p WHERE p.pk IN (SELECT i.fk FROM items i WHERE NOT EXISTS "
+      "(SELECT 1 FROM parts q WHERE q.pk = i.fk AND q.pname = 'p1') AND i.qty > "
+      "(SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))";
+  }
+
+  SECTION("NOT EXISTS correlated with IS NOT DISTINCT FROM")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND NOT EXISTS "
+      "(SELECT 1 FROM parts q WHERE q.pk IS NOT DISTINCT FROM i.fk AND q.pname = 'p1')";
+  }
+
+  SECTION("NOT EXISTS correlated with IS DISTINCT FROM")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND NOT EXISTS "
+      "(SELECT 1 FROM parts q WHERE q.pk IS DISTINCT FROM i.fk AND q.pname = 'p0')";
+  }
+
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - right semi and anti filter admission preserves results",
                  "[integration][gpu_execution][dynamic_filter][right_family]")
 {
