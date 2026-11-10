@@ -49,6 +49,7 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
@@ -465,6 +466,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   }
 
   normalize_non_null_join_keys(op);
+  planner::drop_join_implied_filters(op);
 
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
