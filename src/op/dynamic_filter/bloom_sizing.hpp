@@ -16,9 +16,9 @@
 
 /**
  * @file bloom_sizing.hpp
- * @brief Bloom filter sizing shared by `sirius_dynamic_bloom_filter`, built from a whole build, and
- * `detail::accumulated_bloom_geometry`, accumulated from a multi-partition build, so that retuning
- * the bits per key changes both.
+ * @brief Bloom filter sizing shared by the `sirius_dynamic_bloom_filter` column constructor and
+ * the construction plan (`bloom_membership`) whose arrays `detail::accumulated_bloom_builder`
+ * accumulates, so that retuning the bits per key changes both.
  */
 
 #pragma once

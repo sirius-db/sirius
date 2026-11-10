@@ -230,7 +230,7 @@ TEST_CASE("HOST publication submits every target upload before waiting for any",
 }
 
 TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
-          "[dynamic_filter][multi_partition][accumulation_fault][multi_gpu][cuda_status_fault]")
+          "[dynamic_filter][construction][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   acc::fixture fixture({.devices = 2});

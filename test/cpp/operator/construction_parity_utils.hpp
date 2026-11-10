@@ -18,8 +18,9 @@
  * @file construction_parity_utils.hpp
  * @brief The parity harness for `build_filter_construction`: builds a join's publish plan over
  * chosen key types, constructs its filters from any split of a build (in any order, from any number
- * of threads), and compares the result with the same build as one batch (oracle O1) and with the
- * legacy one-shot builder `publish_dynamic_filters` (oracle O2).
+ * of threads), and compares the result with the same build as one batch (oracle O1), with the
+ * column constructor of the same filter kind over the whole build, and with one reduction for the
+ * zone-map bounds.
  */
 
 #pragma once
@@ -28,12 +29,15 @@
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
 #include "operator/dynamic_filter_column_test_utils.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
@@ -45,7 +49,6 @@
 #include <op/dynamic_filter/construction_plan.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
 #include <op/dynamic_filter/dynamic_filter_publish_plan.hpp>
-#include <op/dynamic_filter/dynamic_filter_publisher.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 #include <cstddef>
@@ -79,7 +82,7 @@ struct test_access {
   }
 };
 
-/// The smallest L2 of GPU 0, as the one-shot builder reads it.
+/// The smallest L2 of GPU 0, as construction reads it.
 [[nodiscard]] inline std::size_t l2_bytes()
 {
   int l2 = 0;
@@ -222,50 +225,6 @@ struct constructed {
   return {std::move(plan), std::move(*finished)};
 }
 
-/**
- * @brief The filters the legacy one-shot builder publishes for @p subject over @p whole, by key.
- */
-struct one_shot {
-  std::vector<std::shared_ptr<op::sirius_dynamic_filter const>> membership;
-  std::vector<std::shared_ptr<op::sirius_dynamic_filter const>> zone_map;
-  op::dynamic_filter_publication_outcome outcome;
-};
-
-[[nodiscard]] inline one_shot publish_one_shot(acc::fixture const& fixture,
-                                               std::vector<cudf::data_type> const& recorded,
-                                               cudf::table_view const& whole,
-                                               std::size_t l2,
-                                               bool zone_maps,
-                                               double inlist_max_l2_fraction = 0.125)
-{
-  join const subject{fixture, recorded, l2, zone_maps, inlist_max_l2_fraction};
-  std::vector<std::size_t> columns;
-  for (std::size_t index = 0; index < recorded.size(); ++index) {
-    columns.push_back(index);
-  }
-  std::vector<op::sirius_dynamic_filter_set::producer> producers;
-  producers.push_back(subject.channel->register_producer(columns));
-  subject.channel->freeze_registration();
-  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
-  auto const stream = fixture.publication_stream(0);
-  one_shot result;
-  result.outcome = op::publish_dynamic_filters(subject.plan, whole, stream, producers);
-  stream.sync();
-  producers.front().finish(result.outcome.filters_pushed != 0
-                             ? op::sirius_dynamic_filter_set::completion::PUBLISHED
-                             : op::sirius_dynamic_filter_set::completion::SKIPPED);
-  result.membership.resize(recorded.size());
-  result.zone_map.resize(recorded.size());
-  auto const published = subject.channel->snapshot();  // entries() views the snapshot
-  for (auto const& entry : published.entries()) {
-    auto& slot = entry.filter->kind() == op::sirius_dynamic_filter_kind::ZONE_MAP
-                   ? result.zone_map[entry.column_index]
-                   : result.membership[entry.column_index];
-    slot       = entry.filter;
-  }
-  return result;
-}
-
 /// The bytes of a scalar's value: its storage, or its string.
 [[nodiscard]] inline std::vector<std::byte> scalar_bytes(cudf::scalar const& bound,
                                                          ::cuda::stream_ref stream)
@@ -354,6 +313,46 @@ inline void require_same_zone_map(op::sirius_dynamic_filter const* left,
         scalar_bytes(*right_zones.front().min, stream));
   CHECK(scalar_bytes(*left_zones.front().max, stream) ==
         scalar_bytes(*right_zones.front().max, stream));
+}
+
+/**
+ * @brief The filter the column constructor of @p constructed's kind builds over @p keys, the whole
+ * build at the construction type; what construction from any split must equal. Waits on @p stream.
+ */
+[[nodiscard]] inline std::shared_ptr<op::sirius_dynamic_filter const> column_oracle(
+  op::sirius_dynamic_filter const& constructed,
+  cudf::column_view const& keys,
+  ::cuda::stream_ref stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  std::shared_ptr<op::sirius_dynamic_filter const> oracle;
+  if (dynamic_cast<op::sirius_dynamic_small_in_list_filter const*>(&constructed)) {
+    oracle = std::make_shared<op::sirius_dynamic_small_in_list_filter>(keys, stream, mr);
+  } else if (dynamic_cast<op::sirius_dynamic_in_list_filter const*>(&constructed)) {
+    oracle = std::make_shared<op::sirius_dynamic_in_list_filter>(keys, stream, mr);
+  } else {
+    REQUIRE(dynamic_cast<op::sirius_dynamic_bloom_filter const*>(&constructed));
+    oracle = std::make_shared<op::sirius_dynamic_bloom_filter>(keys, stream, mr);
+  }
+  stream.sync();
+  return oracle;
+}
+
+/// Requires @p zone_map's bounds to be one reduction's minimum and maximum over @p keys.
+inline void require_zone_map_bounds(op::sirius_dynamic_filter const* zone_map,
+                                    cudf::column_view const& keys,
+                                    ::cuda::stream_ref stream)
+{
+  REQUIRE(zone_map != nullptr);
+  auto const& zones = dynamic_cast<op::sirius_dynamic_zone_map_filter const&>(*zone_map).zones();
+  REQUIRE(zones.size() == 1);
+  auto const minimum = cudf::reduce(
+    keys, *cudf::make_min_aggregation<cudf::reduce_aggregation>(), keys.type(), stream);
+  auto const maximum = cudf::reduce(
+    keys, *cudf::make_max_aggregation<cudf::reduce_aggregation>(), keys.type(), stream);
+  CHECK(zones.front().min->type() == keys.type());
+  CHECK(scalar_bytes(*zones.front().min, stream) == scalar_bytes(*minimum, stream));
+  CHECK(scalar_bytes(*zones.front().max, stream) == scalar_bytes(*maximum, stream));
 }
 
 /// The constructed entry for admitted key @p index, or null.

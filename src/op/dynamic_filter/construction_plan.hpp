@@ -21,11 +21,10 @@
  *
  * The policy is a pure function of plain values: the `build_input_facts` of a
  * `complete_build_inventory`, the plan's admitted keys, what each key's bindings can read, and
- * `construction_limits`. It reuses the whole-build publisher's rules (`choose_membership_filter`,
- * the domain gate, valid-row sizing, and the carrier rule `can_restore_to` /
- * `membership_same_family`), so a key gets the filter the whole-build path would choose for the
- * same rows. Building the planned filters is the mechanism's job; the policy touches no GPU, memory
- * space, or channel.
+ * `construction_limits`. It applies the shared membership rules (`choose_membership_filter`, the
+ * domain gate, valid-row sizing, and the carrier rule `can_restore_to` / `membership_same_family`),
+ * so a key gets the filter a single batch of the same rows would get. Building the planned filters
+ * is the mechanism's job; the policy touches no GPU, memory space, or channel.
  */
 
 #pragma once

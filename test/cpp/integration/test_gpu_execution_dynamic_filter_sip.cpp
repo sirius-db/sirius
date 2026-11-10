@@ -74,13 +74,12 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
 
 // Dynamic-filter counter deltas for one query execution.
 struct publication_deltas {
-  std::uint64_t producers_enabled                    = 0;
-  std::uint64_t membership_filters_built             = 0;
-  std::uint64_t publications_finished                = 0;
-  std::uint64_t publications_skipped_build_not_whole = 0;
-  std::uint64_t filters_pushed                       = 0;
-  std::uint64_t accumulation_publications_finished   = 0;
-  std::uint64_t zone_map_filters_built               = 0;
+  std::uint64_t producers_enabled                  = 0;
+  std::uint64_t membership_filters_built           = 0;
+  std::uint64_t publications_finished              = 0;
+  std::uint64_t filters_pushed                     = 0;
+  std::uint64_t accumulation_publications_finished = 0;
+  std::uint64_t zone_map_filters_built             = 0;
 };
 
 struct switch_comparison {
@@ -100,9 +99,7 @@ publication_deltas run_and_measure(duckdb::Connection& con,
     .producers_enabled        = after.producers_enabled - before.producers_enabled,
     .membership_filters_built = after.membership_filters_built - before.membership_filters_built,
     .publications_finished    = after.publications_finished - before.publications_finished,
-    .publications_skipped_build_not_whole =
-      after.publications_skipped_build_not_whole - before.publications_skipped_build_not_whole,
-    .filters_pushed = after.filters_pushed - before.filters_pushed,
+    .filters_pushed           = after.filters_pushed - before.filters_pushed,
     .accumulation_publications_finished =
       after.accumulation_publications_finished - before.accumulation_publications_finished,
     .zone_map_filters_built = after.zone_map_filters_built - before.zone_map_filters_built};
@@ -339,7 +336,6 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
 
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.publications_finished > 0);
-    REQUIRE(deltas.on.publications_skipped_build_not_whole == 0);
   }
 
   SECTION("an unfiltered aggregate build supplies no publication evidence")

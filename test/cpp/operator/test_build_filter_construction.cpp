@@ -17,9 +17,10 @@
 /*
  * Tests `build_filter_construction`: filters constructed from any split of a certified build, in
  * any order and from several streams, equal those of the same build as one batch (O1) and those of
- * the legacy one-shot builder (O2); claims are validated; contributions never wait on the host;
- * failures join accepted work; and the drop rules (overflow, DECIMAL128 fit, root admission) remove
- * only the affected filter. Also pins `in_list_storage_upper_bound` against the sets it bounds.
+ * the column constructors of the same kind; claims are validated; contributions never wait on the
+ * host; failures join accepted work; and the drop rules (overflow, DECIMAL128 fit, root admission)
+ * remove only the affected filter. Also pins `in_list_storage_upper_bound` against the sets it
+ * bounds.
  */
 
 #include "operator/construction_parity_utils.hpp"
@@ -40,6 +41,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <op/dynamic_filter/detail/bounds_accumulator.hpp>
 #include <op/dynamic_filter/detail/exact_key_stager.hpp>
 
@@ -81,9 +83,9 @@ std::vector<std::vector<cudf::column_view>> split(cudf::column_view const& colum
 }
 
 /**
- * @brief The membership sizing a join is planned with. The one-shot builder always reads the device
- * L2, so every sizing uses it; a zero IN-list fraction makes a Bloom key of any build too large for
- * a small IN-list.
+ * @brief The membership sizing a join is planned with. Construction always reads the device L2, so
+ * every sizing uses it; a zero IN-list fraction makes a Bloom key of any build too large for a
+ * small IN-list.
  */
 struct sizing {
   std::string_view name;
@@ -204,7 +206,7 @@ void require_same_key(cons::constructed const& left,
 
 }  // namespace
 
-TEST_CASE("filters from any split equal one batch and the one-shot builder",
+TEST_CASE("filters from any split equal one batch and the column constructors",
           "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
@@ -223,23 +225,21 @@ TEST_CASE("filters from any split equal one batch and the one-shot builder",
       REQUIRE(single->membership);
       REQUIRE(single->zone_map);
 
-      // O2: the one-shot builder over the whole build, whose counters agree except for attempts and
-      // contributions.
-      auto const legacy = cons::publish_one_shot(fixture,
-                                                 {tested.construction},
-                                                 cudf::table_view{{build->view()}},
-                                                 cons::l2_bytes(),
-                                                 true,
-                                                 sized.inlist_max_l2_fraction);
+      // The whole build equals the column constructor of the same kind over the whole build, and
+      // its bounds equal one reduction; its one key is judged and kept. The plan builds at the
+      // carrier when it stays in the recorded type's family.
+      auto const& built_from =
+        whole.plan.keys.front().construction_type == build->type() ? build->view() : oracle->view();
       cons::require_same_membership(
-        single->membership.get(), legacy.membership[0].get(), oracle->view(), stream);
-      cons::require_same_zone_map(single->zone_map.get(), legacy.zone_map[0].get(), stream);
-      CHECK(whole.plan.selection.keys_considered == legacy.outcome.keys_considered);
-      CHECK(whole.plan.selection.keys_with_known_domain == legacy.outcome.keys_with_known_domain);
-      CHECK(whole.plan.selection.keys_skipped_domain_gate ==
-            legacy.outcome.keys_skipped_domain_gate);
-      CHECK(whole.plan.selection.keys_skipped_type_mismatch ==
-            legacy.outcome.keys_skipped_type_mismatch);
+        single->membership.get(),
+        cons::column_oracle(*single->membership, built_from, stream).get(),
+        oracle->view(),
+        stream);
+      cons::require_zone_map_bounds(single->zone_map.get(), oracle->view(), stream);
+      CHECK(whole.plan.selection.keys_considered == 1);
+      CHECK(whole.plan.selection.keys_with_known_domain == 0);
+      CHECK(whole.plan.selection.keys_skipped_domain_gate == 0);
+      CHECK(whole.plan.selection.keys_skipped_type_mismatch == 0);
 
       // O1: every split, also contributed in reverse order, equals the single batch.
       for (std::size_t const pieces : {2, 5}) {
@@ -256,7 +256,7 @@ TEST_CASE("filters from any split equal one batch and the one-shot builder",
   }
 }
 
-TEST_CASE("a small build constructs the one-shot small IN-list from any split",
+TEST_CASE("a small build constructs the column constructor's small IN-list from any split",
           "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
@@ -270,10 +270,11 @@ TEST_CASE("a small build constructs the one-shot small IN-list from any split",
   REQUIRE(single != nullptr);
   CHECK(dynamic_cast<op::sirius_dynamic_small_in_list_filter const*>(single->membership.get()) !=
         nullptr);
-  auto const legacy = cons::publish_one_shot(
-    fixture, {int64}, cudf::table_view{{keys->view()}}, cons::l2_bytes(), true);
   cons::require_same_membership(
-    single->membership.get(), legacy.membership[0].get(), keys->view(), stream);
+    single->membership.get(),
+    cons::column_oracle(*single->membership, keys->view(), stream).get(),
+    keys->view(),
+    stream);
   require_same_key(
     whole,
     cons::construct(fixture, subject, cons::make_batches(fixture, split(keys->view(), 5))),
@@ -474,15 +475,11 @@ TEST_CASE("an all-null key constructs an empty membership filter and no zone map
     REQUIRE(key != nullptr);
     REQUIRE(key->membership);
     CHECK_FALSE(key->zone_map);
-    auto const legacy = cons::publish_one_shot(fixture,
-                                               {int32},
-                                               cudf::table_view{{nulls->view()}},
-                                               cons::l2_bytes(),
-                                               true,
-                                               sized.inlist_max_l2_fraction);
     cons::require_same_membership(
-      key->membership.get(), legacy.membership[0].get(), nulls->view(), stream);
-    CHECK_FALSE(legacy.zone_map[0]);
+      key->membership.get(),
+      cons::column_oracle(*key->membership, nulls->view(), stream).get(),
+      nulls->view(),
+      stream);
   }
 }
 
@@ -507,18 +504,19 @@ TEST_CASE("a DECIMAL128 key publishes membership only when its values fit int64"
       CHECK(key->zone_map);  // Bounds are exact at DECIMAL128 either way.
       CHECK(static_cast<bool>(key->membership) == !large);
       CHECK((key->dropped == op::dynamic_filter_key_reason::decimal128_unfit) == large);
-      auto const legacy = cons::publish_one_shot(fixture,
-                                                 {decimal},
-                                                 cudf::table_view{{keys->view()}},
-                                                 cons::l2_bytes(),
-                                                 true,
-                                                 sized.inlist_max_l2_fraction);
-      CHECK(static_cast<bool>(legacy.membership[0]) == !large);
+      // The fit rule, applied to the whole column independently.
+      CHECK(sirius::column_values_fit(keys->view(),
+                                      cudf::data_type{cudf::type_id::DECIMAL64, -2},
+                                      stream,
+                                      cudf::get_current_device_resource_ref()) == !large);
       if (!large) {
         cons::require_same_membership(
-          key->membership.get(), legacy.membership[0].get(), keys->view(), stream);
+          key->membership.get(),
+          cons::column_oracle(*key->membership, keys->view(), stream).get(),
+          keys->view(),
+          stream);
       }
-      cons::require_same_zone_map(key->zone_map.get(), legacy.zone_map[0].get(), stream);
+      cons::require_zone_map_bounds(key->zone_map.get(), keys->view(), stream);
     }
   }
 }

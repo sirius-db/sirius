@@ -923,10 +923,10 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
   };
   {
     using builder_type = op::detail::accumulated_bloom_builder;
-    auto builder       = builder_type::try_create(
-      {{0, cudf::data_type{cudf::type_id::INT32}}, {1, cudf::data_type{cudf::type_id::INT64}}},
-      geometry,
-      memory.spaces);
+    auto builder =
+      builder_type::try_create({{0, cudf::data_type{cudf::type_id::INT32}, geometry.blocks},
+                                {1, cudf::data_type{cudf::type_id::INT64}, geometry.blocks}},
+                               memory.spaces);
     REQUIRE(builder);
     {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{1}};

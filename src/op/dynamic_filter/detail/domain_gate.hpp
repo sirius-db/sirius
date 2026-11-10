@@ -22,22 +22,8 @@
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 
 #include <cstddef>
-#include <cstdint>
 
 namespace sirius::op::detail {
-
-/// Publication path named in domain-gate diagnostics.
-enum class publication_path : std::uint8_t { ordinary, accumulated, construction };
-
-[[nodiscard]] constexpr char const* to_string(publication_path path) noexcept
-{
-  switch (path) {
-    case publication_path::ordinary: return "ordinary";
-    case publication_path::accumulated: return "accumulated";
-    case publication_path::construction: return "construction";
-  }
-  return "invalid";
-}
 
 /**
  * @brief Counts a bound @p key of a build with @p build_rows rows in `keys_considered`,
@@ -53,7 +39,6 @@ inline bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
                                dynamic_filter_publish_plan::admitted_key const& key,
                                std::size_t build_rows,
                                double threshold,
-                               publication_path path,
                                bool publishable) noexcept
 {
   ++counts.keys_considered;
@@ -67,9 +52,8 @@ inline bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
     domain_coverage_gate_fires(build_rows, domain.cardinality, eligible, threshold);
   log::log_noexcept([&] {
     SIRIUS_LOG_DEBUG(
-      "[dynamic_filter_domain] path={} condition={} rows={} domain={} provenance={} eligible={} "
-      "threshold={} decision={}",
-      to_string(path),
+      "[dynamic_filter_domain] path=construction condition={} rows={} domain={} provenance={} "
+      "eligible={} threshold={} decision={}",
       key.planner_condition_index,
       build_rows,
       domain.cardinality,

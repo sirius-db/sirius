@@ -80,8 +80,6 @@ void require_complete_publication(observed_run const& run,
   REQUIRE(run.after.accumulations_skipped_transient == run.before.accumulations_skipped_transient);
   REQUIRE(run.after.accumulations_abandoned == run.before.accumulations_abandoned);
   REQUIRE(run.after.filters_pushed > run.before.filters_pushed);
-  REQUIRE(run.after.publications_skipped_build_not_whole ==
-          run.before.publications_skipped_build_not_whole);
 }
 
 void run_ok(duckdb::Connection& con, std::string const& sql)
@@ -161,13 +159,13 @@ void check_union_all_accumulation(duckdb::Connection& con, bool host_staged = fa
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - multi-partition accumulation through UNION ALL matches the CPU",
-                 "[integration][gpu_execution][dynamic_filter][multi_partition]")
+                 "[integration][gpu_execution][dynamic_filter][construction]")
 {
   check_union_all_accumulation(*con);
 }
 
 TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two GPUs",
-          "[integration][gpu_execution][dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[integration][gpu_execution][dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   // The `[integration][multi_gpu]` tags make the `shared_env_listener` in `unittest.cpp` activate
@@ -201,7 +199,7 @@ TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - complete multi-partition dynamic filters match the CPU",
-                 "[integration][gpu_execution][dynamic_filter][multi_partition]")
+                 "[integration][gpu_execution][dynamic_filter][construction]")
 {
   std::string const key_type = GENERATE(std::string{"INTEGER"}, std::string{"BIGINT"});
   CAPTURE(key_type);
@@ -329,8 +327,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
     REQUIRE(run.after.accumulations_started > run.before.accumulations_started);
-    REQUIRE(run.after.publications_skipped_build_not_whole ==
-            run.before.publications_skipped_build_not_whole);
     REQUIRE(run.after.keys_skipped_bloom_size_gate == run.before.keys_skipped_bloom_size_gate);
     REQUIRE(run.after.membership_filters_built > run.before.membership_filters_built);
     REQUIRE(run.after.filters_pushed > run.before.filters_pushed);
