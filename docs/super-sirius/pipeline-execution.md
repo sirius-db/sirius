@@ -301,14 +301,7 @@ work is exposed by task hints and completion-driven downstream scheduling — pl
 
 ### Dynamic-filter independence
 
-The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance
-dynamic-filter publication. Immediate probes remain strictly ordered by synchronous build-CONCAT
-publication in the join pipeline. An accumulated multi-partition filter is published inside the
-elected build PARTITION task, before its deposit. Work requiring that deposit or build completion
-observes the publication outcome; already-runnable CONCAT/probe work may see an earlier snapshot.
-A scan reached transitively through an intervening join has no
-such edge and samples whatever complete filters are visible at its reader and post-decode
-checkpoints.
+The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance dynamic-filter publication. A join's filters are published inside the elected build PARTITION task (or BUILD_FILTER task for a right semi/anti join), before its deposit. Work requiring that deposit or build completion observes the publication outcome, so an immediate `BUILD_PROBE` probe, which follows the build CONCAT's `concat_all` push, normally sees it; already-runnable CONCAT/probe work may see an earlier snapshot. A scan reached transitively through an intervening join has no such edge and samples whatever complete filters are visible at its reader and post-decode checkpoints.
 
 Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) measured the former build-subtree
 preference. It provided no coverage benefit while costing wall time and run-to-run variance, so it

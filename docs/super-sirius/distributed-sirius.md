@@ -276,14 +276,14 @@ publication policy every rank shares (`merged_bloom_policy`). Every rank then:
 A key whose filters cannot all be merged publishes nothing: a rank sent none, a header differs,
 or a rank missed the 2-minute wait. IN-lists and zone maps are not published in distributed mode.
 
-A build split into several partitions accumulates its Bloom from every batch instead, and merges
-it the same way, at the same size, so a rank on either path merges with the others.
-`max_dynamic_filter_bloom_bytes_per_gpu` does not cut a distributed Bloom: the merged filter holds
+Every rank constructs its Bloom from every certified batch of its build at the build PARTITION,
+at the same size, so the ranks' Blooms merge.
+The per-GPU Bloom budget does not cut a distributed Bloom: the merged filter holds
 every rank's keys, and one cut far below them passes almost every probe row. Right semi and anti joins plan no
 BUILD_FILTER stage in distributed mode (`distribute_plan()` removes it), so they publish nothing.
 
 A rank with an empty build still merges, contributing an empty Bloom. A rank
-that never saw a whole build joins each key's all-gather without a filter, so the others drop
+that never began construction joins each key's all-gather without a filter, so the others drop
 that key at once instead of waiting out the timeout. It does so as soon as its build side ends
 (a finalize listener on the build `CONCAT` closes the join's publication), before its probe side runs, and without
 waiting (`leave_all_gather`): a rank holding build rows holds its probe side until the merge
