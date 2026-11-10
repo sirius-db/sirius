@@ -265,9 +265,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::CONCAT:
     case SiriusPhysicalOperatorType::BUILD_FILTER:
     case SiriusPhysicalOperatorType::PASSTHROUGH_SINK:
-    case SiriusPhysicalOperatorType::SORT_NORMALIZE:
-    case SiriusPhysicalOperatorType::SORT_CUTS:
-    case SiriusPhysicalOperatorType::SORT_EXTRACT:
     case SiriusPhysicalOperatorType::MERGE_SORT:
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY:
     case SiriusPhysicalOperatorType::MERGE_TOP_N:

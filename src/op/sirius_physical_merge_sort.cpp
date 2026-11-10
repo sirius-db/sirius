@@ -38,14 +38,13 @@ sirius_physical_merge_sort::sirius_physical_merge_sort(
   duckdb::vector<std::size_t> projections_p,
   std::size_t estimated_cardinality,
   std::shared_ptr<const sort_comparison_config> comparison_p)
-  : sirius_physical_sort_stage(
-      SiriusPhysicalOperatorType::MERGE_SORT,
-      types,
-      estimated_cardinality,
-      comparison_p ? std::move(comparison_p)
-                   : std::make_shared<const sort_comparison_config>(orders, types.size())),
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::MERGE_SORT, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
-    projections(std::move(projections_p))
+    projections(std::move(projections_p)),
+    comparison(comparison_p
+                 ? std::move(comparison_p)
+                 : std::make_shared<const sort_comparison_config>(this->orders, this->types.size()))
 {
 }
 
