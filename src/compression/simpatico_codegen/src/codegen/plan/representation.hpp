@@ -828,6 +828,11 @@ struct codegen_fused_representation : compressed_representation {
   // Buffers in manifest order, each tagged with its manifest field name.
   std::vector<std::pair<std::string, std::unique_ptr<cudf::column>>> buffers;
 
+  // A Bitpack rep's per-chunk word offsets (int32[num_chunks + 1]) as the encoder computed them,
+  // ready when the rep is published. Not stored on the wire, so a deserialized rep has none and
+  // each decode derives them from chunk_count and chunk_bits instead.
+  rmm::device_buffer word_offsets;
+
   codegen_fused_representation(OpId id, cudf::data_type type, cudf::size_type n_rows)
     : compressed_representation(type, n_rows), op_id_(id)
   {

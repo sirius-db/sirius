@@ -380,6 +380,15 @@ void bind_real_node_buffers(std::int32_t node_id,
     labeled[codegen::jit::buffer_key(node_id, slot)] = {
       ptr, len, elem_size_for_slot(slot, element_size)};
   }
+
+  auto const* fused = dynamic_cast<codegen_fused_representation const*>(repr);
+  if (fused != nullptr && kind == "bitpack") {
+    auto const entries = labeled.at(codegen::jit::buffer_key(node_id, "chunk_count")).length + 1;
+    if (fused->word_offsets.size() == entries * sizeof(std::int32_t)) {
+      labeled[codegen::jit::buffer_key(node_id, "kept_bp_offsets")] = {
+        fused->word_offsets.data(), entries, sizeof(std::int32_t)};
+    }
+  }
 }
 
 // Each fused node's lane width, as both renderers type it: Rle's `runs` are int32 run
