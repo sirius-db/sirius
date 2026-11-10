@@ -49,4 +49,14 @@ init=${conf%/*}/client.init.sql
   } > "$init.$$"
   mv -f "$init.$$" "$init"
 )
-exec "$here/../gateway/build/release/duckdb" -unsigned -no-agent -init "$init" "$@"
+client=("$here/../gateway/build/release/duckdb" -unsigned -no-agent -init "$init" "$@")
+# At a terminal, Ctrl-C cancels the statement, as in any DuckDB shell.
+[ ! -t 0 ] || exec "${client[@]}"
+# Reading statements from a file or a pipe, the shell would cancel one statement on SIGINT and run
+# the rest. This script stays as its parent and stops it.
+"${client[@]}" <&0 &
+shell=$!
+trap 'kill "$shell" 2> /dev/null || true; wait "$shell" || true; exit 130' INT TERM
+rc=0
+wait "$shell" || rc=$?
+exit "$rc"
