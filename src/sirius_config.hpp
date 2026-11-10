@@ -118,7 +118,7 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-/// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
+/// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;

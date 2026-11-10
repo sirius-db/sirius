@@ -77,25 +77,6 @@ else()
   endif()
 endif()
 
-# CTrack is retained as an opt-in profiling dependency.
-if(BUILD_WITH_CTRACK)
-  # --- ctrack (profiling instrumentation) --- #
-  include(FetchContent)
-  FetchContent_Declare(
-    ctrack
-    GIT_REPOSITORY https://github.com/Compaile/ctrack.git
-    GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
-    SOURCE_SUBDIR do-not-build)
-  FetchContent_MakeAvailable(ctrack)
-  if(NOT TARGET ctrack::ctrack)
-    add_library(ctrack::ctrack INTERFACE IMPORTED)
-    set_target_properties(
-      ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                "${ctrack_SOURCE_DIR}/include")
-  endif()
-
-endif()
-
 if(VCPKG_BUILD)
   set(_sirius_pkg_config_path "$ENV{PKG_CONFIG_PATH}")
   set(ENV{PKG_CONFIG_PATH}

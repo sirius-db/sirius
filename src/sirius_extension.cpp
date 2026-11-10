@@ -2671,7 +2671,7 @@ static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Val
 {
   auto* params                     = get_operator_params(context, scope);
   params->max_sort_partition_bytes = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
+  SIRIUS_LOG_DEBUG("Updated config max_sort_partition_bytes to {}",
                    params->max_sort_partition_bytes);
 }
 

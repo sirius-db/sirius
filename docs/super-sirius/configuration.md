@@ -1058,22 +1058,6 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
-## Compile-Time Config Flags
-
-### Static flags
-
-**File:** `src/include/config.hpp`
-
-Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
-
-| Flag | Value | Namespace |
-|------|-------|-----------|
-| `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
-| `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
-| `NUM_GPU` | 1 | `sirius::Config` |
-
-These are compile-time defaults. Runtime configuration via `sirius_config` and DuckDB SET variables takes precedence.
-
 ## Key Files
 
 | File | Purpose |
