@@ -740,7 +740,7 @@ void launch_rendered_decode(jit::FusedTree const& tree,
   trailing.append(spec.trailing, args, "fused kernel");
 
   // A dense grid follows the renderer's block-to-chunk mapping; a row set brings its own.
-  auto const dense_grid = cuda::ceil_div(num_chunks, cdj::chunks_per_block(va.shape));
+  auto const dense_grid = cuda::ceil_div(num_chunks, spec.chunks_per_block);
   launch_decode_kernel(spec,
                        args.data(),
                        static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : dense_grid),

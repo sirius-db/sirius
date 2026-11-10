@@ -195,6 +195,9 @@ struct DecodeKernelSpec {
   // Launch geometry.  The launcher computes grid_x = ceil(num_chunks_for(n) / chunks_per_block).
   int block_x      = 128;  // plain-CUDA block; RLE/Delta primitives assume 128
   int shared_bytes = 0;    // dynamic shared workspace peak (RLE boundaries)
+  // chunks_per_block(shape), or kTBSize / 32 where the renderer maps one chunk per warp for a
+  // shape that otherwise maps one per block (the full decode of a Bitpack/FOR/Zigzag/Delta chain).
+  int chunks_per_block = 1;
 
   std::string note;  // human-readable diagnostic
 };
