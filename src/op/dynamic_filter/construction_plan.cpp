@@ -323,7 +323,6 @@ construction_plan plan_construction(
                                                   key,
                                                   facts.total_rows,
                                                   limits.domain_coverage_threshold,
-                                                  detail::publication_path::CONSTRUCTION,
                                                   restorable && (readable || zone_possible));
     if (!restorable) {
       ++counts.keys_skipped_type_mismatch;

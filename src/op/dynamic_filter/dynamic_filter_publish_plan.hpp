@@ -72,7 +72,9 @@ struct dynamic_filter_publication_policy {
   //! Non-zero: every Bloom, whole-build or accumulated, is sized for this many keys whatever the
   //! build's rows, and max_bloom_bytes_per_gpu does not cut it. Zero: sized from the build.
   std::size_t fixed_bloom_keys = 0;
-  //! Publish even an empty build, or with every target drained, rather than skip the publication.
+  //! Publish even an empty build, or with every channel closed, rather than skip the publication.
+  //! Closed channels still count `publications_skipped_targets_drained`; the process builds its
+  //! filters only for the other processes' cross-rank merge.
   bool publish_when_empty_or_drained = false;
 };
 

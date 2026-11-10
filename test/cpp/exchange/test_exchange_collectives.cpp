@@ -322,35 +322,6 @@ struct accumulating_join {
   }
 };
 
-/// One rank's whole-build publication on INT64 key column 0, merged with the other ranks'.
-struct whole_build_join {
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel =
-    std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-  dynamic_filter_publish_plan plan;
-
-  explicit whole_build_join(std::shared_ptr<exchange_service> service,
-                            std::size_t bloom_keys = 4096,
-                            std::uint64_t cap      = 64 * KiB)
-    : plan(filter_plan(channel, cap))
-  {
-    merge_across_ranks(plan, std::move(service), bloom_keys);
-  }
-
-  sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
-  {
-    std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
-    producers.push_back(channel->register_producer({0}));
-    channel->freeze_registration();
-    auto const stream  = utils::default_stream();
-    auto const outcome = sirius::op::publish_dynamic_filters(plan, build, stream, producers);
-    stream.sync();
-    producers.front().finish(outcome.filters_pushed != 0
-                               ? sirius::op::sirius_dynamic_filter_set::completion::PUBLISHED
-                               : sirius::op::sirius_dynamic_filter_set::completion::SKIPPED);
-    return outcome;
-  }
-};
-
 /// How many of @p keys @p bloom may hold.
 std::size_t members(sirius::op::sirius_dynamic_bloom_filter const& bloom,
                     std::vector<std::int64_t> const& keys)
@@ -430,22 +401,19 @@ TEST_CASE("ranks that each accumulate several batches publish once, after their 
   }
 }
 
-TEST_CASE("a rank that accumulates and one that publishes a whole build size their Blooms alike",
+TEST_CASE("ranks size their Blooms by the merge policy, not the per-GPU cap",
           "[exchange][collectives][dynamic_filter]")
 {
   // Planned for 64Ki keys, 128 KiB: the per-GPU cap of 64 KiB does not cut a distributed Bloom.
   ranks c(2);
   auto const planned = std::size_t{64} * KiB;
-  accumulating_join accumulated(c.all[0].service, planned, 64 * KiB);
-  whole_build_join whole(c.all[1].service, planned, 64 * KiB);
-  on_every_rank(2, [&](rank_t r) {
-    if (r == 0) {
-      accumulated.build({keys_batch(0, 2, 2000)});
-    } else {
-      static_cast<void>(whole.publish(keys_table(1, 2, 2000)->view()));
-    }
-  });
-  for (auto const* bloom : {accumulated.bloom(), published_bloom(*whole.channel)}) {
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, planned, 64 * KiB));
+  }
+  on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 2000)}); });
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const* bloom = joins[r]->bloom();
     REQUIRE(bloom != nullptr);
     CHECK(bloom->storage_bytes() == 128 * KiB);
     CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
@@ -483,31 +451,28 @@ TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
   CHECK(joins[1]->bloom() == nullptr);
 }
 
-TEST_CASE("whole-build ranks merge even when one build is empty and another's targets are drained",
+TEST_CASE("ranks merge even when one build is empty and another's channels are closed",
           "[exchange][collectives][dynamic_filter]")
 {
   ranks c(2);
-  std::vector<std::unique_ptr<whole_build_join>> joins;
+  std::vector<std::unique_ptr<accumulating_join>> joins;
   for (rank_t r = 0; r < 2; ++r) {
-    joins.push_back(std::make_unique<whole_build_join>(c.all[r].service));
+    joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, 4096, 64 * KiB));
   }
   joins[1]->channel->close_for_new_filters();
   auto const odd_keys = sequence(1, 2, 2000);
 
-  std::vector<sirius::op::dynamic_filter_publication_outcome> outcomes(2);
   auto const start = std::chrono::steady_clock::now();
-  on_every_rank(2, [&](rank_t r) {
-    auto const build = r == 0 ? keys_table(0, 1, 0) : keys_table(1, 2, 2000);
-    outcomes[r]      = joins[r]->publish(build->view());
-  });
+  on_every_rank(
+    2, [&](rank_t r) { joins[r]->build({r == 0 ? keys_batch(0, 1, 0) : keys_batch(1, 2, 2000)}); });
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
 
-  auto const* bloom = published_bloom(*joins[0]->channel);
+  auto const* bloom = joins[0]->bloom();
   REQUIRE(bloom != nullptr);
   CHECK(members(*bloom, odd_keys) == odd_keys.size());
-  CHECK(outcomes[0].publications_skipped_targets_drained == 0);
-  CHECK(outcomes[1].publications_skipped_targets_drained == 1);
-  CHECK(published_bloom(*joins[1]->channel) == nullptr);
+  CHECK(joins[0]->stats.publications_skipped_targets_drained.load() == 0);
+  CHECK(joins[1]->stats.publications_skipped_targets_drained.load() == 1);
+  CHECK(joins[1]->bloom() == nullptr);
 }
 
 TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter merge",
@@ -558,18 +523,24 @@ TEST_CASE("a rank missing from one key's merge costs the others one timeout, not
     {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
     {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 64 * KiB}};
   merge_across_ranks(plan, c.all[0].service, 4096, std::chrono::seconds{1});
-  std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
-  producers.push_back(channel->register_producer({0, 1}));
-  channel->freeze_registration();
+  sirius::op::dynamic_filter_stats stats;
+  sirius::op::dynamic_filter_publication_session session{std::move(plan), &stats};
 
   // Rank 1 never takes part: rank 0 waits out key 0's gather, then leaves key 1's.
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(numeric_column(int64, sequence(0, 2, 2000)));
   columns.push_back(numeric_column(int64, sequence(1, 2, 2000)));
-  cudf::table const build{std::move(columns)};
+  auto const batch = gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+  sirius::op::build_arrival_ledger ledger;
+  ledger.record(*batch);
+  auto certified = ledger.certify({.repository_batches = 1});
+  REQUIRE(std::holds_alternative<sirius::op::complete_build_inventory>(certified));
   auto const stream = utils::default_stream();
   auto const start  = std::chrono::steady_clock::now();
-  static_cast<void>(sirius::op::publish_dynamic_filters(plan, build.view(), stream, producers));
+  REQUIRE(session.begin(std::move(std::get<sirius::op::complete_build_inventory>(certified))));
+  session.contribute(batch->get_batch_id(), batch->to_read_only(), stream);
+  stream.sync();
+  session.publish_if_final(batch->get_batch_id(), *env().gpu, stream);
   stream.sync();
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds{1800});
   CHECK(published_bloom(*channel) == nullptr);

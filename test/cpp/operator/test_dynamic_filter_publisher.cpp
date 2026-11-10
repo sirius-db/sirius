@@ -16,7 +16,8 @@
 
 /**
  * @file test_dynamic_filter_publisher.cpp
- * @brief Pins publish_dynamic_filters' per-key filter construction, fan-out, and plan validation
+ * @brief Pins the per-key filters a publication session constructs from a one-batch build, their
+ * fan-out, and plan validation
  *
  * Sections, in file order:
  *  - Tier precedence: the raw small IN-list wins at <= k_max_keys build rows, and one row above
@@ -62,6 +63,7 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/host_allocation_fault.hpp"
 #include "utils/log_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -105,36 +107,46 @@ constexpr std::size_t kProbeColumnIndex = 7;
 using sirius::op::dynamic_filter_publish_plan;
 using sirius::op::dynamic_filter_route_class;
 
-sirius::op::dynamic_filter_publication_outcome publish_for_test(
-  dynamic_filter_publish_plan const& plan, cudf::table_view const& table, ::cuda::stream_ref stream)
+/// What one publication added to the counters, and the targets that still accepted filters.
+struct publication_result : sirius::op::dynamic_filter_stats_snapshot {
+  std::size_t active_targets = 0;
+};
+
+/**
+ * @brief Constructs and publishes @p plan's filters from @p table as one certified build batch,
+ * through the session a build PARTITION drives; exceptions propagate.
+ */
+publication_result publish_for_test(dynamic_filter_publish_plan const& plan,
+                                    cudf::table_view const& table,
+                                    ::cuda::stream_ref stream)
 {
-  std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
-  for (auto const& target : plan.probe_targets()) {
-    std::vector<std::size_t> columns;
-    for (auto const& binding : target.key_bindings) {
-      columns.push_back(binding.channel_push_ordinal);
-    }
-    producers.push_back(target.filter_set->register_producer(std::move(columns)));
-  }
-  for (auto const& target : plan.probe_targets()) {
-    target.filter_set->freeze_registration();
-  }
-  try {
-    auto result = sirius::op::publish_dynamic_filters(plan, table, stream, producers);
+  auto& space = plan.replica_spaces().front().get_gpu_space();
+  auto batch  = sirius::make_data_batch(cudf::table{table, stream, space.get_default_allocator()},
+                                       space,
+                                       stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  stream.sync();
+  publication_result result;
+  result.active_targets =
+    static_cast<std::size_t>(std::ranges::count_if(plan.probe_targets(), [](auto const& target) {
+      return target.filter_set && target.filter_set->accepting_filters();
+    }));
+  sirius::op::dynamic_filter_stats stats;
+  sirius::op::dynamic_filter_publication_session session{plan, &stats};
+  sirius::op::build_arrival_ledger ledger;
+  ledger.record(*batch);
+  auto certified = ledger.certify({.repository_batches = 1});
+  REQUIRE(std::holds_alternative<sirius::op::complete_build_inventory>(certified));
+  if (session.begin(std::move(std::get<sirius::op::complete_build_inventory>(certified)))) {
+    auto source = batch->to_read_only();
+    session.contribute(batch->get_batch_id(), source, stream);
     stream.sync();
-    for (auto const& producer : producers) {
-      producer.finish(result.filters_pushed != 0
-                        ? sirius::op::sirius_dynamic_filter_set::completion::PUBLISHED
-                        : sirius::op::sirius_dynamic_filter_set::completion::SKIPPED);
-    }
-    return result;
-  } catch (...) {
+    session.publish_if_final(batch->get_batch_id(), space, stream);
     stream.sync();
-    for (auto const& producer : producers) {
-      producer.finish(sirius::op::sirius_dynamic_filter_set::completion::FAILED);
-    }
-    throw;
   }
+  session.finalize_input();
+  static_cast<sirius::op::dynamic_filter_stats_snapshot&>(result) = stats.snapshot();
+  return result;
 }
 
 constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
@@ -479,14 +491,13 @@ void require_published_membership(
   }
 }
 
-void require_nothing_published(sirius::op::dynamic_filter_publication_outcome const& outcome)
+// The key is judged when construction begins; nothing is built or pushed.
+void require_nothing_published(publication_result const& outcome)
 {
-  REQUIRE(outcome.keys_considered == 0);
   REQUIRE(outcome.keys_skipped_domain_gate == 0);
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
   REQUIRE(outcome.membership_filters_built == 0);
   REQUIRE(outcome.zone_map_filters_built == 0);
-  REQUIRE(outcome.active_targets == 0);
   REQUIRE(outcome.filters_pushed == 0);
 }
 
@@ -570,7 +581,7 @@ void require_domain_gate_skips_only(std::size_t gated_key_index,
     std::size_t decisions = 0;
     std::size_t skips     = 0;
     for (auto const& record : logs.records()) {
-      if (!record.message.starts_with("[dynamic_filter_domain] path=ordinary ")) { continue; }
+      if (!record.message.starts_with("[dynamic_filter_domain] path=construction ")) { continue; }
       INFO(record.message);
       REQUIRE(record.message.find("provenance=pinned_parquet_exact eligible=1") !=
               std::string::npos);
@@ -1473,7 +1484,7 @@ TEST_CASE("an unknown domain source cannot authorize a declared uniqueness gate"
           std::vector<std::uint8_t>(95, 1));
   std::size_t decisions = 0;
   for (auto const& record : logs.records()) {
-    if (!record.message.starts_with("[dynamic_filter_domain] path=ordinary ")) { continue; }
+    if (!record.message.starts_with("[dynamic_filter_domain] path=construction ")) { continue; }
     INFO(record.message);
     REQUIRE(record.message.find("provenance=unknown eligible=0") != std::string::npos);
     REQUIRE(record.message.ends_with("decision=keep"));
@@ -1729,6 +1740,7 @@ TEST_CASE("dynamic-filter publisher publishes nothing once every target has drai
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   require_nothing_published(outcome);
+  REQUIRE(outcome.active_targets == 0);
   REQUIRE(channel->snapshot().empty());
   REQUIRE_FALSE(channel->has_filters());
 }
@@ -2186,11 +2198,14 @@ struct recording_merge final : sirius::op::cross_rank_filter_merge {
   std::vector<bool> handed;
   /// Whether merge() drops every key, as when another process sent none.
   bool drop_all = false;
+  /// Whether merge() throws after taking part, as when the exchange fails.
+  bool fail = false;
 
   void merge(std::span<std::shared_ptr<sirius::op::sirius_dynamic_filter>> membership,
              ::cuda::stream_ref) override
   {
     ++merges;
+    if (fail) { throw std::runtime_error{"recording_merge: the exchange failed"}; }
     handed.clear();
     for (auto& filter : membership) {
       handed.push_back(filter != nullptr);
@@ -2209,11 +2224,12 @@ sirius::op::dynamic_filter_publication_policy merged_policy(std::size_t bloom_ke
           .publish_when_empty_or_drained = true};
 }
 
-/// A one-key INT64 plan publishing to @p channel, merged by @p merge when it is set.
+/// A one-key plan of @p key publishing to @p channel, merged by @p merge when it is set.
 dynamic_filter_publish_plan one_key_plan(
   publisher_fixture& fixture,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel,
-  std::shared_ptr<recording_merge> merge = nullptr)
+  std::shared_ptr<recording_merge> merge               = nullptr,
+  dynamic_filter_publish_plan::admitted_key const& key = make_int64_key(0, 0))
 {
   std::vector<dynamic_filter_publish_plan::probe_target> targets;
   targets.push_back({.filter_set               = std::move(channel),
@@ -2222,10 +2238,8 @@ dynamic_filter_publish_plan one_key_plan(
                      .key_bindings             = {{.admitted_key_index   = 0,
                                                    .channel_push_ordinal = kProbeColumnIndex,
                                                    .probe_storage_type   = kInt64}}});
-  dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
-                                   std::move(targets),
-                                   std::move(fixture.replica_spaces),
-                                   {.emit_zone_map_filters = true}};
+  dynamic_filter_publish_plan plan{
+    {key}, std::move(targets), std::move(fixture.replica_spaces), {.emit_zone_map_filters = true}};
   if (merge) { plan.set_cross_rank_merge(std::move(merge), merged_policy(4096)); }
   return plan;
 }
@@ -2276,25 +2290,7 @@ TEST_CASE("an empty build with a cross-rank merge still takes part in it",
   auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   auto merge   = std::make_shared<recording_merge>();
   auto plan    = one_key_plan(fixture, channel, merge);
-  auto& space  = plan.replica_spaces().front().get_gpu_space();
-  auto batch   = sirius::make_data_batch(
-    cudf::table{fixture.build_view(), fixture.stream, space.get_default_allocator()},
-    space,
-    fixture.stream,
-    sirius::telemetry::batch_telemetry_info{});
-  fixture.stream.sync();
-  sirius::op::dynamic_filter_publication_session session{std::move(plan)};
-  sirius::op::build_arrival_ledger ledger;
-  ledger.record(*batch);
-  auto certified = ledger.certify({.repository_batches = 1});
-  REQUIRE(std::holds_alternative<sirius::op::complete_build_inventory>(certified));
-  // The merge policy keeps construction going for a build without rows.
-  REQUIRE(session.begin(std::move(std::get<sirius::op::complete_build_inventory>(certified))));
-  session.contribute(batch->get_batch_id(), batch->to_read_only(), fixture.stream);
-  fixture.stream.sync();
-  session.publish_if_final(batch->get_batch_id(), space, fixture.stream);
-  fixture.stream.sync();
-  session.finalize_input();
+  static_cast<void>(publish_for_test(plan, fixture.build_view(), fixture.stream));
   // An empty Bloom of the shared size, so the other processes still publish their keys.
   CHECK(merge->merges == 1);
   CHECK(merge->handed == std::vector<bool>{true});
@@ -2327,4 +2323,203 @@ TEST_CASE("a session closed before any build leaves its cross-rank merge once",
     CHECK(merge->leaves == 0);
     CHECK(merge->merges == 0);
   }
+}
+
+namespace {
+
+/**
+ * @brief A one-key session with a `recording_merge`, over one certified batch of the fixture's
+ * columns, that a test drives one step at a time.
+ */
+struct merged_session {
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel =
+    std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::shared_ptr<recording_merge> merge = std::make_shared<recording_merge>();
+  sirius::op::dynamic_filter_stats stats;
+  ::cuda::stream_ref stream;
+  std::shared_ptr<cucascade::data_batch> batch;
+  std::unique_ptr<sirius::op::dynamic_filter_publication_session> session;
+
+  explicit merged_session(publisher_fixture& fixture) : stream{fixture.stream}
+  {
+    auto plan   = one_key_plan(fixture, channel, merge);
+    auto& space = plan.replica_spaces().front().get_gpu_space();
+    batch       = sirius::make_data_batch(
+      cudf::table{fixture.build_view(), stream, space.get_default_allocator()},
+      space,
+      stream,
+      sirius::telemetry::batch_telemetry_info{});
+    stream.sync();
+    session =
+      std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), &stats);
+  }
+
+  [[nodiscard]] bool begin()
+  {
+    sirius::op::build_arrival_ledger ledger;
+    ledger.record(*batch);
+    auto certified = ledger.certify({.repository_batches = 1});
+    REQUIRE(std::holds_alternative<sirius::op::complete_build_inventory>(certified));
+    return session->begin(std::move(std::get<sirius::op::complete_build_inventory>(certified)));
+  }
+
+  void contribute()
+  {
+    session->contribute(batch->get_batch_id(), batch->to_read_only(), stream);
+    stream.sync();
+  }
+
+  void publish()
+  {
+    session->publish_if_final(
+      batch->get_batch_id(), session->plan().replica_spaces().front().get_gpu_space(), stream);
+    stream.sync();
+  }
+};
+
+}  // namespace
+
+TEST_CASE("every end of a merged session before its publication leaves the merge once",
+          "[dynamic_filter][publisher][cross_rank]")
+{
+  publisher_fixture fixture;
+
+  SECTION("a repeated decline")
+  {
+    fixture.add_key_column(3);
+    merged_session merged{fixture};
+    merged.session->decline(sirius::op::construction_decline::INPUT_SHAPE);
+    merged.session->decline(sirius::op::construction_decline::PIPELINE_BARRIER);
+    merged.session->finalize_input();
+    merged.session->cancel();
+    CHECK(merged.merge->leaves == 1);
+    CHECK(merged.merge->merges == 0);
+  }
+
+  SECTION("a begin that plans no filter")
+  {
+    // A FLOAT64 carrier cannot restore the INT64 key, so begin ends the session at once.
+    fixture.add_key_column_as(3, kFloat64);
+    merged_session merged{fixture};
+    CHECK_FALSE(merged.begin());
+    merged.session->finalize_input();
+    CHECK(merged.merge->leaves == 1);
+    CHECK(merged.merge->merges == 0);
+  }
+
+  SECTION("a task input declined while collecting")
+  {
+    fixture.add_key_column(3);
+    merged_session merged{fixture};
+    REQUIRE(merged.begin());
+    merged.session->decline_task_input();
+    merged.session->finalize_input();
+    merged.session->cancel();
+    CHECK(merged.merge->leaves == 1);
+    CHECK(merged.merge->merges == 0);
+  }
+
+  SECTION("an owed publication that never runs")
+  {
+    fixture.add_key_column(3);
+    merged_session merged{fixture};
+    REQUIRE(merged.begin());
+    merged.contribute();
+    merged.session->finalize_input();
+    merged.session.reset();
+    CHECK(merged.merge->leaves == 1);
+    CHECK(merged.merge->merges == 0);
+    CHECK(merged.stats.accumulations_abandoned.load() == 1);
+  }
+
+  SECTION("a cancel while collecting")
+  {
+    fixture.add_key_column(3);
+    merged_session merged{fixture};
+    REQUIRE(merged.begin());
+    merged.session->cancel();
+    merged.session->finalize_input();
+    CHECK(merged.merge->leaves == 1);
+    CHECK(merged.merge->merges == 0);
+  }
+}
+
+TEST_CASE("a merged session whose channels all closed still merges once and counts them",
+          "[dynamic_filter][publisher][cross_rank]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+  merged_session merged{fixture};
+  merged.channel->close_for_new_filters();
+  REQUIRE(merged.begin());
+  merged.contribute();
+  merged.publish();
+  merged.session->finalize_input();
+  CHECK(merged.merge->merges == 1);
+  CHECK(merged.merge->leaves == 0);
+  CHECK(merged.merge->handed == std::vector<bool>{true});
+  CHECK(merged.channel->filter_count() == 0);
+  auto const counts = merged.stats.snapshot();
+  CHECK(counts.publications_skipped_targets_drained == 1);
+  CHECK(counts.filters_pushed == 0);
+}
+
+TEST_CASE("a cross-rank merge that throws is not followed by a leave",
+          "[dynamic_filter][publisher][cross_rank]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+  merged_session merged{fixture};
+  merged.merge->fail = true;
+  REQUIRE(merged.begin());
+  merged.contribute();
+  CHECK_THROWS_AS(merged.publish(), std::runtime_error);
+  merged.session->finalize_input();
+  merged.session->cancel();
+  CHECK(merged.merge->merges == 1);
+  CHECK(merged.merge->leaves == 0);
+  CHECK(merged.stats.accumulations_skipped_error.load() == 1);
+}
+
+TEST_CASE("a fixed-size Bloom filter's estimated selectivity counts the build's valid rows",
+          "[dynamic_filter][publisher][cross_rank]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(10);
+  fixture.null_last_key_rows(0, 4);
+  auto key                   = make_int64_key(0, 0);
+  key.build_key_value_domain = 100;
+  auto channel               = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto merge                 = std::make_shared<recording_merge>();
+  auto const plan            = one_key_plan(fixture, channel, merge, key);
+  static_cast<void>(publish_for_test(plan, fixture.build_view(), fixture.stream));
+  auto const published = filters_on_column(*channel, kProbeColumnIndex);
+  REQUIRE(published.size() == 1);
+  REQUIRE(published.front()->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM);
+  auto const selectivity = published.front()->estimated_selectivity();
+  REQUIRE(selectivity.has_value());
+  CHECK(*selectivity == Approx(0.06));
+}
+
+TEST_CASE("a recoverable allocation failure while constructing leaves the merge once",
+          "[.][host_allocation_fault][cross_rank]")
+{
+  REQUIRE(sirius::test::scoped_host_allocation_fault::available());
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+  merged_session merged{fixture};
+  REQUIRE(merged.begin());
+  merged.contribute();
+  {
+    sirius::test::scoped_host_allocation_fault fault{
+      sirius::test::scoped_host_allocation_fault::filter_shell_scope, 1};
+    merged.publish();
+    static_cast<void>(fault.stop());
+    REQUIRE(fault.fired());
+  }
+  merged.session->finalize_input();
+  CHECK(merged.merge->leaves == 1);
+  CHECK(merged.merge->merges == 0);
+  CHECK(merged.stats.accumulations_skipped_admission.load() == 1);
+  CHECK(merged.channel->filter_count() == 0);
 }
