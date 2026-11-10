@@ -661,13 +661,12 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
 }
 
 //===----------------------------------------------------------------------===//
-// Broadcast small-build BUILD_PROBE. When the build side is small
-// (< small_table_bytes == num_gpus * 16 MiB), the PARTITION operator replicates
-// it to every GPU (one hash table per GPU) instead of funneling the whole build
-// to a single GPU. Correctness alone cannot prove the broadcast path engaged —
-// a single-GPU fallback also returns the right rows — so these tests also assert
-// the runtime log markers ("[broadcast]" from the partition decision; "Pushed
-// ... dynamic filter(s)" from the publisher). They are 2-GPU-gated.
+// Broadcast small-build BUILD_PROBE. When the build side is small (< small_table_bytes == num_gpus
+// * 16 MiB), the PARTITION operator replicates it to every GPU (one hash table per GPU) instead of
+// funneling the entire build side to a single GPU. Correctness alone cannot prove the broadcast
+// path engaged — a single-GPU fallback also returns the right rows — so these tests also assert the
+// runtime log markers ("[broadcast]" from the partition decision; "constructed filters published"
+// from the Publication Session). They are 2-GPU-gated.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates across two GPUs",
           "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][gpu_execution][multi_gpu]")
@@ -730,13 +729,11 @@ TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates acr
 }
 
 //===----------------------------------------------------------------------===//
-// A broadcast join publishes dynamic filters: every partition holds the full
-// replicated build, so the first GPU to arrive wins the OPEN->PUBLISHING race
-// and publishes the membership filter (exactly once). Before the broadcast
-// fix, >1 partition disabled publication entirely. The build-side predicate
-// supplies the filter evidence discovery requires to wire a producer, and the
-// filtered build (2500 keys) vs the large probe domain (500000 keys)
-// guarantees a membership filter is emitted. 2-GPU-gated.
+// A broadcast join publishes Dynamic Filters: Construction runs at the build PARTITION on the
+// broadcast layout as on every other layout, and its Publishing Task publishes once. The build-side
+// predicate supplies the filter evidence discovery requires to wire a Producer, and the filtered
+// build (2500 keys) against the large probe domain (500000 keys) keeps its Membership Filter past
+// the Domain Gate. 2-GPU-gated.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters across two GPUs",
           "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][dynamic_filter][gpu_execution]["
@@ -785,11 +782,14 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
   }
 
   INFO("log dir: " << log_dir.path());
-  // Broadcast engaged AND the publication winner's success summary appears; no delivery may log
-  // the not-published diagnostic.
+  // Broadcast engaged, the Publishing Task pushed at least one filter, and Construction was never
+  // declined.
   REQUIRE(log_dir_contains(log_dir.path(), "[broadcast]"));
-  REQUIRE(log_dir_contains(log_dir.path(), "dynamic-filter publication:"));
-  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "build is not one whole delivery"));
+  REQUIRE(log_dir_contains(log_dir.path(),
+                           "[dynamic_filter_publication_session] constructed filters published"));
+  REQUIRE_FALSE(log_dir_contains(log_dir.path(), ": 0 filter(s) pushed"));
+  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "constructs no dynamic filter"));
+  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "construction declined: a task input"));
 
   fs::remove_all(tmp, ec);
 }

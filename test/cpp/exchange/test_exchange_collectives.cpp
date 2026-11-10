@@ -54,6 +54,7 @@
 #include <set>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -299,8 +300,9 @@ struct accumulating_join {
     for (auto const& b : batches) {
       ledger.record(*b);
     }
-    REQUIRE(
-      session->try_begin_accumulation(ledger.certify({.repository_batches = batches.size()})));
+    auto certified = ledger.certify({.repository_batches = batches.size()});
+    REQUIRE(std::holds_alternative<sirius::op::complete_build_inventory>(certified));
+    REQUIRE(session->begin(std::move(std::get<sirius::op::complete_build_inventory>(certified))));
     if (close_first) {
       session->finalize_input();
       return;

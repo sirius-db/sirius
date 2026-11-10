@@ -54,7 +54,9 @@
  * `test_dynamic_filter_source_policy.cpp`.
  */
 
+#include "data/data_batch_utils.hpp"
 #include "op/dynamic_filter/bloom_sizing.hpp"
+#include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/cross_rank_filter_merge.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
@@ -67,6 +69,7 @@
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -91,6 +94,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -2272,7 +2276,25 @@ TEST_CASE("an empty build with a cross-rank merge still takes part in it",
   auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   auto merge   = std::make_shared<recording_merge>();
   auto plan    = one_key_plan(fixture, channel, merge);
-  static_cast<void>(publish_for_test(plan, fixture.build_view(), fixture.stream));
+  auto& space  = plan.replica_spaces().front().get_gpu_space();
+  auto batch   = sirius::make_data_batch(
+    cudf::table{fixture.build_view(), fixture.stream, space.get_default_allocator()},
+    space,
+    fixture.stream,
+    sirius::telemetry::batch_telemetry_info{});
+  fixture.stream.sync();
+  sirius::op::dynamic_filter_publication_session session{std::move(plan)};
+  sirius::op::build_arrival_ledger ledger;
+  ledger.record(*batch);
+  auto certified = ledger.certify({.repository_batches = 1});
+  REQUIRE(std::holds_alternative<sirius::op::complete_build_inventory>(certified));
+  // The merge policy keeps construction going for a build without rows.
+  REQUIRE(session.begin(std::move(std::get<sirius::op::complete_build_inventory>(certified))));
+  session.contribute(batch->get_batch_id(), batch->to_read_only(), fixture.stream);
+  fixture.stream.sync();
+  session.publish_if_final(batch->get_batch_id(), space, fixture.stream);
+  fixture.stream.sync();
+  session.finalize_input();
   // An empty Bloom of the shared size, so the other processes still publish their keys.
   CHECK(merge->merges == 1);
   CHECK(merge->handed == std::vector<bool>{true});
@@ -2296,7 +2318,7 @@ TEST_CASE("a session closed before any build leaves its cross-rank merge once",
     CHECK(merge->merges == 0);
   }
 
-  SECTION("cancel neither merges nor leaves")
+  SECTION("cancel before construction neither merges nor leaves")
   {
     sirius::op::dynamic_filter_publication_session session(
       one_key_plan(fixture, std::make_shared<sirius::op::sirius_dynamic_filter_set>(), merge));

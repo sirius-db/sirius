@@ -54,8 +54,8 @@ namespace sirius::op {
  * be matched to exactly one certified batch. The other certification declines are counted by
  * reason: `accumulations_declined_pipeline_barrier` (an ORDER BY producer's PIPELINE barrier),
  * `accumulations_declined_port_directive` (a late-materialization directive),
- * `accumulations_declined_unreadable_arrival` (an arrival the ledger cannot accept, including any
- * non-GPU arrival), and `accumulations_declined_compressed_arrival` (a compressed arrival).
+ * `accumulations_declined_unreadable_arrival` (an arrival whose rows or types cannot be read), and
+ * `accumulations_declined_compressed_arrival` (a compressed arrival).
  * `keys_skipped_shadowed` counts Shadowed Keys: keys planned without a membership filter because
  * no Consumer would select it over the filters already on its Channels.
  * `keys_sized_on_total_rows` counts keys whose null count was unknown, so their Bloom filter was

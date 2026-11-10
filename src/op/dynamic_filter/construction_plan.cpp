@@ -132,7 +132,7 @@ namespace {
     build_keys = exact->valid_rows;
   } else if (auto const* bloom = std::get_if<bloom_membership>(&membership)) {
     facts.kind = membership_filter_kind::bloom;
-    build_keys = bloom->sized_rows;
+    build_keys = bloom->rows;
   } else {
     return facts;
   }
@@ -221,6 +221,14 @@ void log_shadow_judgement(std::string_view at,
   return rmm::align_up(raw, alignment);
 }
 
+/// A Bloom filter for @p rows keys, or for `construction_limits::fixed_bloom_keys` when set.
+[[nodiscard]] bloom_membership bloom_for(std::size_t rows, construction_limits const& limits)
+{
+  auto const sized_rows = limits.fixed_bloom_keys != 0 ? limits.fixed_bloom_keys : rows;
+  return bloom_membership{
+    .rows = rows, .sized_rows = sized_rows, .blocks = bloom_blocks_for(sized_rows)};
+}
+
 /**
  * @brief The membership filter `choose_membership_filter` selects for `valid_rows` valid keys.
  */
@@ -234,15 +242,16 @@ void log_shadow_judgement(std::string_view at,
      .estimated_hash_set_bytes =
        sirius_dynamic_in_list_filter::estimated_set_bytes(valid_rows, type),
      .inlist_max_l2_fraction = limits.inlist_max_l2_fraction,
-     .supports_small_in_list = sirius_dynamic_small_in_list_filter::supports(type, valid_rows),
-     .supports_hash_in_list  = sirius_dynamic_in_list_filter::supports(type, valid_rows),
-     .supports_bloom         = sirius_dynamic_bloom_filter::supports(type)});
+     .supports_small_in_list =
+       !limits.bloom_only && sirius_dynamic_small_in_list_filter::supports(type, valid_rows),
+     .supports_hash_in_list =
+       !limits.bloom_only && sirius_dynamic_in_list_filter::supports(type, valid_rows),
+     .supports_bloom = sirius_dynamic_bloom_filter::supports(type)});
   switch (kind) {
     case membership_filter_kind::small_in_list:
     case membership_filter_kind::hash_in_list:
       return exact_membership{.kind = kind, .valid_rows = valid_rows};
-    case membership_filter_kind::bloom:
-      return bloom_membership{.sized_rows = valid_rows, .blocks = bloom_blocks_for(valid_rows)};
+    case membership_filter_kind::bloom: return bloom_for(valid_rows, limits);
     case membership_filter_kind::none: break;
   }
   return std::monostate{};
@@ -345,8 +354,7 @@ construction_plan plan_construction(
       }
     } else if (readable && sirius_dynamic_bloom_filter::supports(construction_type)) {
       // Without a null count the valid rows are unknown: an exact list could not be sized.
-      planned.membership = bloom_membership{.sized_rows = facts.total_rows,
-                                            .blocks     = bloom_blocks_for(facts.total_rows)};
+      planned.membership = bloom_for(facts.total_rows, limits);
       ++counts.keys_sized_on_total_rows;
     }
     planned.candidate = candidate_of(key, planned.membership, column.null_rows.has_value());
@@ -380,7 +388,7 @@ construction_plan plan_construction(
   }
 
   // The cap applies to every Bloom key's aligned array together; exact and bound storage is
-  // bounded by the IN-list policy instead.
+  // bounded by the IN-list policy instead. A fixed Bloom size is uncapped.
   std::uint64_t required = 0;
   std::size_t bloom_keys = 0;
   for (auto const& planned : plan.keys) {
@@ -392,7 +400,8 @@ construction_plan plan_construction(
                          ? required + *bytes
                          : std::numeric_limits<std::uint64_t>::max();
   }
-  if (bloom_keys != 0 && required > limits.max_bloom_bytes_per_gpu) {
+  if (bloom_keys != 0 && limits.fixed_bloom_keys == 0 &&
+      required > limits.max_bloom_bytes_per_gpu) {
     for (auto& planned : plan.keys) {
       if (!std::holds_alternative<bloom_membership>(planned.membership)) { continue; }
       planned.membership  = std::monostate{};

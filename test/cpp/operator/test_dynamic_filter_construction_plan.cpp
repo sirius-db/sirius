@@ -216,6 +216,7 @@ TEST_CASE("each key's membership kind equals the one-shot choice",
     CHECK(exact->valid_rows == valid);
   }
   if (auto const* bloom = std::get_if<op::bloom_membership>(&key->membership)) {
+    CHECK(bloom->rows == valid);
     CHECK(bloom->sized_rows == valid);
     CHECK(bloom->blocks == op::bloom_blocks_for(valid));
   }
@@ -258,10 +259,25 @@ TEST_CASE("an unknown null count plans a Bloom filter sized on every row",
   auto const result = plan_for({plain_key(k_int32, std::nullopt)}, 5).plan;
   auto const* bloom = std::get_if<op::bloom_membership>(&key_of(result, 0)->membership);
   REQUIRE(bloom != nullptr);
+  CHECK(bloom->rows == 5);
   CHECK(bloom->sized_rows == 5);
   CHECK(bloom->blocks == op::bloom_blocks_for(5));
   CHECK(result.selection.keys_sized_on_total_rows == 1);
   CHECK_FALSE(outcome_of(result, 0).valid_rows);
+}
+
+TEST_CASE("a fixed-size Bloom filter still counts the build's valid rows",
+          "[dynamic_filter][construction_plan]")
+{
+  auto limit             = limits();
+  limit.bloom_only       = true;
+  limit.fixed_bloom_keys = 4096;
+  auto const result      = plan_for({plain_key(k_int64, 4)}, 10, limit).plan;
+  auto const* bloom      = std::get_if<op::bloom_membership>(&key_of(result, 0)->membership);
+  REQUIRE(bloom != nullptr);
+  CHECK(bloom->rows == 6);
+  CHECK(bloom->sized_rows == 4096);
+  CHECK(bloom->blocks == op::bloom_blocks_for(4096));
 }
 
 TEST_CASE("the carrier rule picks each key's construction type",
