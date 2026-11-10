@@ -15,8 +15,11 @@
  */
 
 #include "catch.hpp"
+#include "config.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
+#include "sirius_context.hpp"
+#include "util/env_guard.hpp"
 
 #include <duckdb.hpp>  // IWYU pragma: keep
 
@@ -32,6 +35,12 @@ namespace {
 struct sink_restorer {
   std::shared_ptr<sirius::log::sink> prev = sirius::log::get_sink();
   ~sink_restorer() { sirius::log::set_sink(prev); }
+};
+
+// Restores the process-wide log backend that loading Sirius takes from the environment.
+struct log_backend_restorer {
+  std::string prev = duckdb::Config::LOG_BACKEND;
+  ~log_backend_restorer() { duckdb::Config::LOG_BACKEND = prev; }
 };
 
 }  // namespace
@@ -85,4 +94,23 @@ TEST_CASE("duckdb sink is a safe no-op after the database is destroyed", "[log]"
   CHECK_FALSE(sink->should_log(level::error));
   sink->log(level::error, std::source_location::current(), "after destroy");  // must not crash
   CHECK_FALSE(sink->flush());  // safe no-op, reports false once the db is gone
+}
+
+TEST_CASE("duckdb backend captures messages logged while loading the configuration", "[log]")
+{
+  sink_restorer restore_sink;
+  log_backend_restorer restore_backend;
+  sirius::util::env_guard disable_env("SIRIUS_DISABLE", "1");
+  sirius::util::env_guard backend_env("SIRIUS_LOG_BACKEND", "duckdb");
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  REQUIRE_FALSE(con.Query("CALL enable_logging()")->HasError());
+  duckdb::SiriusContextExtensionCallback callback(db.instance.get());
+
+  auto result = con.Query(
+    "SELECT count(*) FROM duckdb_logs WHERE type = 'Sirius' "
+    "AND message LIKE '%Sirius disabled via SIRIUS_DISABLE%'");
+  REQUIRE_FALSE(result->HasError());
+  CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
 }

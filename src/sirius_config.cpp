@@ -68,6 +68,12 @@ uint64_t derived_default_batch_size()
 
 }  // namespace config
 
+#ifdef SIRIUS_DISTRIBUTION_DEFAULTS
+bool const telemetry_config::default_enable_quent = false;
+#else
+bool const telemetry_config::default_enable_quent = true;
+#endif
+
 namespace {
 
 struct batch_setting {

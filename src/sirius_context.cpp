@@ -1723,16 +1723,21 @@ bool compressed_materialization_enabled(ClientContext& context)
   return sirius::operator_params{}.enable_compressed_materialization;
 }
 
-void print_cpu_fallback_banner()
+void print_cpu_fallback_banner(std::string_view reason)
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;
   const char* red = tty ? "\033[1;31m" : "";
   const char* off = tty ? "\033[0m" : "";
+  std::string line(reason);
+  std::replace(line.begin(), line.end(), '\n', ' ');
+  std::replace(line.begin(), line.end(), '\r', ' ');
   std::fprintf(stdout,
                "%s=============================================\n"
                "Error in Sirius GPU execution, fallback to DuckDB\n"
+               "Reason: %s\n"
                "=============================================%s\n",
                red,
+               line.c_str(),
                off);
   std::fflush(stdout);
 }
@@ -2172,7 +2177,7 @@ void install_configured_log_sink(DatabaseInstance* db)
   }
 }
 
-SiriusContextExtensionCallback::SiriusContextExtensionCallback()
+SiriusContextExtensionCallback::SiriusContextExtensionCallback(DatabaseInstance* db)
   : disabled_(sirius_disabled_by_env())
 {
   std::lock_guard log_lock(Config::logging_mutex);
@@ -2197,11 +2202,9 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   if (backend_env) { Config::LOG_BACKEND = backend_env; }
   if (log_dir_env) { Config::LOG_DIR = log_dir_env; }
   if (level_env) { Config::LOG_LEVEL = level_env; }
-  // Install now (no db yet) so spdlog/noop capture the logs emitted by
-  // read_config_file_if_exists() below; the duckdb backend needs a db (installed
-  // later).
+  // Install now so the sink captures the logs emitted by read_config_file_if_exists() below.
   try {
-    install_configured_log_sink(nullptr);
+    install_configured_log_sink(db);
   } catch (...) {
     Config::LOG_BACKEND = previous_log_backend;
     Config::LOG_DIR     = previous_log_dir;

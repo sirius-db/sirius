@@ -89,6 +89,19 @@ class ShellOutputTests(unittest.TestCase):
         self.assertEqual(json.loads("".join(output)), [{"1": 1}])
         self.assertIn("fallback to DuckDB", "".join(banners))
 
+    def test_sirius_fallback_banner_reason_is_kept_in_log(self):
+        output, banners = _strip_fallback_banners(
+            [
+                "=============================================\n",
+                "Error in Sirius GPU execution, fallback to DuckDB\n",
+                "Reason: out of memory\n",
+                "=============================================\n",
+                '[{"1":1}]\n',
+            ]
+        )
+        self.assertEqual(json.loads("".join(output)), [{"1": 1}])
+        self.assertIn("Reason: out of memory", "".join(banners))
+
     def test_other_stdout_is_not_discarded(self):
         output, banners = _strip_fallback_banners(
             ['[{"1":1}]\n', "unexpected output\n"]
