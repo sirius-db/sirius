@@ -987,6 +987,27 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
                 targets);
 }
 
+std::size_t accumulated_bloom_builder::publication_scratch_bytes(std::span<key const> keys,
+                                                                 std::size_t replicas) noexcept
+{
+  auto constexpr maximum = std::numeric_limits<std::size_t>::max();
+  if (replicas < 2 || keys.empty()) { return 0; }
+  std::size_t chunk_slot = 0;
+  std::size_t chunks     = 0;
+  for (auto const& active : keys) {
+    if (active.blocks > maximum / bloom_bytes_per_block) { return maximum; }
+    auto const raw_bytes = active.blocks * bloom_bytes_per_block;
+    if (raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) { return maximum; }
+    auto const chunk = accumulated_bloom_chunk_bytes(raw_bytes);
+    chunk_slot       = std::max(chunk_slot, chunk);
+    chunks += ::cuda::ceil_div(raw_bytes, chunk);
+  }
+  // The direct transport's bound, which also covers the HOST-staged transport's single slot.
+  auto const slots = std::min<std::size_t>(2, chunks) * (replicas - 1);
+  return chunk_slot > maximum / slots ? maximum
+                                      : tracked_replica_allocation_bytes(slots * chunk_slot);
+}
+
 std::optional<accumulated_bloom_builder> accumulated_bloom_builder::create(
   std::unique_ptr<impl> state, std::span<dynamic_filter_replica_space const> targets)
 {
