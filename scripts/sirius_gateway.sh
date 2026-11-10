@@ -107,6 +107,13 @@ host=${host:-127.0.0.1}
 }
 # Nodes pick their own address in the gateway's subnet; empty if the host is a name.
 networks=$(sirius_address_network "$host") || networks=
+# The server binds with SO_REUSEPORT, so a second gateway on a port in use would start, and the
+# kernel would then hand each client and rank to one gateway or the other.
+# shellcheck disable=SC2016 # $0 and $1 expand in the inner bash
+if timeout 3 bash -c 'exec 3<> "/dev/tcp/$0/$1"' "$host" "$port" 2> /dev/null; then
+  echo "port $port on $host is in use, by another gateway or another program: stop it, or set SIRIUS_GATEWAY_PORT" >&2
+  exit 1
+fi
 
 new_hex()
 {
