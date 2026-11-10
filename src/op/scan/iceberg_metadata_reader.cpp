@@ -26,8 +26,11 @@
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
+#include <duckdb/main/database.hpp>
+#include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/query_result_stream.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
 #include <log/logging.hpp>
@@ -149,6 +152,20 @@ std::shared_ptr<physical_check_counters> iceberg_counters(duckdb::ClientContext&
   return state ? state->physical_counters() : nullptr;
 }
 
+bool iceberg_metadata_accepts_expected_table_uuid(duckdb::ClientContext& context)
+{
+  duckdb::ExtensionLoader loader(duckdb::DatabaseInstance::GetDatabase(context), "iceberg");
+  auto entry = loader.TryGetTableFunction(duckdb::Identifier("iceberg_metadata"));
+  if (!entry) return false;
+  duckdb::Identifier const option("expected_table_uuid");
+  auto const& functions = entry->Cast<duckdb::TableFunctionCatalogEntry>().functions.functions;
+  return std::ranges::any_of(functions, [&](auto const& function) {
+    auto const& signature = function->GetSignature();
+    auto const kwargs     = signature.GetTypedKwargs();
+    return signature.GetParameterIndexByName(option).IsValid() || (kwargs && kwargs->Find(option));
+  });
+}
+
 }  // namespace
 
 void validate_deletion_vector_claims(iceberg_delete_discovery const& files)
@@ -212,7 +229,8 @@ std::unordered_set<std::string> iceberg_files_without_partition_values(
 inventory_result read_delete_inventory(duckdb::ClientContext& context,
                                        std::string const& table_path,
                                        std::optional<int64_t> snapshot_id,
-                                       std::string_view injection)
+                                       std::string_view injection,
+                                       std::string_view expected_table_uuid)
 {
   auto counters = iceberg_counters(context);
   iceberg_metadata_connection metadata_conn(context);
@@ -220,6 +238,10 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   std::string source = "iceberg_metadata('" + escape_sql_string(table_path) + "'";
   if (snapshot_id.has_value()) {
     source += ", snapshot_from_id = " + std::to_string(snapshot_id.value());
+  }
+  if (!expected_table_uuid.empty() && iceberg_metadata_accepts_expected_table_uuid(context)) {
+    source +=
+      ", expected_table_uuid = '" + escape_sql_string(std::string(expected_table_uuid)) + "'";
   }
   source += ")";
   // status is the entry's liveness (ADDED / EXISTING / DELETED); a manifest keeps listing entries
