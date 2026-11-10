@@ -18,11 +18,14 @@
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_join.hpp>
 #include <duckdb/planner/operator/logical_order.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
+
+#include <algorithm>
 
 namespace sirius::planner {
 
@@ -75,15 +78,38 @@ std::optional<ordinal_origin> join_origin(duckdb::LogicalJoin const& join,
       return mapped_origin(1, join.right_projection_map, ordinal, right_width);
     case duckdb::JoinType::SINGLE:
       // At most one match per left row: the left side is a row subset, the right is padded, and
-      // a second right row that matches throws.
+      // a left row that matches two right rows throws.
+      if (policy == origin_policy::row_wise) { return std::nullopt; }
       if (ordinal < left_block) { return left(); }
-      if (policy != origin_policy::value_preserving) { return std::nullopt; }
+      if (policy == origin_policy::row_subset) { return std::nullopt; }
       return right();
     default:
       // Either side may be duplicated, so only the values survive.
       if (policy == origin_policy::row_subset) { return std::nullopt; }
       if (ordinal < left_block) { return left(); }
       return right();
+  }
+}
+
+/// Whether @p op evaluates an expression that can throw on some input row.
+bool evaluates_throwing_expression(duckdb::LogicalOperator const& op)
+{
+  auto const throws = [](auto const& expression) { return expression && expression->CanThrow(); };
+  if (std::ranges::any_of(op.expressions, throws)) { return true; }
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+      return std::ranges::any_of(op.Cast<duckdb::LogicalAggregate>().groups, throws);
+    case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY:
+      return std::ranges::any_of(op.Cast<duckdb::LogicalOrder>().orders,
+                                 [](auto const& order) { return order.expression->CanThrow(); });
+    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+      return std::ranges::any_of(
+        op.Cast<duckdb::LogicalComparisonJoin>().conditions, [](auto const& condition) {
+          return condition.IsComparison()
+                   ? condition.GetLHS().CanThrow() || condition.GetRHS().CanThrow()
+                   : condition.GetJoinExpression().CanThrow();
+        });
+    default: return false;
   }
 }
 
@@ -94,6 +120,10 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
                                           origin_policy policy)
 {
   if (op.children.empty()) { return std::nullopt; }
+  // Rows a dropped filter lets through must not reach an expression that could fail on them.
+  if (policy == origin_policy::row_wise && evaluates_throwing_expression(op)) {
+    return std::nullopt;
+  }
   auto const child_width = op.children[0]->types.size();
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {

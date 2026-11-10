@@ -30,7 +30,7 @@ namespace sirius::planner {
  * TPC-H q18's `c_custkey <= 149999999`, however few rows that removes. The join drops those rows
  * anyway, and the filter makes the build side look selective to the dynamic-filter wiring. A
  * filter goes when the other scan's Parquet column statistics prove it passes every key the other
- * side can supply, and its own column's statistics show it keeps at least 99% of the key range,
+ * side can supply, and the keys both sides can hold span at least 99% of its own column's range,
  * which keeps about as many of the rows when the keys are unique or evenly spread.
  *
  * @pre @p join still owns both logical children, with resolved types and positional references.

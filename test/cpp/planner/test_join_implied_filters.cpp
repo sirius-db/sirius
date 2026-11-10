@@ -129,6 +129,30 @@ TEST_CASE("join implied filters - implied filters that remove many rows stay",
   CHECK(has_filter(*raw));
 }
 
+TEST_CASE("join implied filters - implied filters on ranges that barely overlap stay",
+          "[planner][join_implied_filters]")
+{
+  // Equally wide ranges that share ten keys: the filter keeps 1% of the scan.
+  auto other      = make_scan(1, 991, 1990, 1000);
+  auto const* raw = other.get();
+  auto join       = make_join(duckdb::JoinType::INNER, make_scan(0, 1, 1000), std::move(other));
+  drop_join_implied_filters(*join);
+  CHECK(has_filter(*raw));
+}
+
+TEST_CASE("join implied filters - a scan under a SINGLE join keeps its filter",
+          "[planner][join_implied_filters]")
+{
+  // Rows the filter removes could match two scalar-subquery rows, which throws.
+  auto customer   = make_scan(1, 1, k_customers, k_customers - 1);
+  auto const* raw = customer.get();
+  auto single     = make_join(duckdb::JoinType::SINGLE, std::move(customer), make_scan(2, 1, 10));
+  auto join =
+    make_join(duckdb::JoinType::INNER, make_scan(0, 1, k_customers - 1), std::move(single));
+  drop_join_implied_filters(*join);
+  CHECK(has_filter(*raw));
+}
+
 TEST_CASE("join implied filters - only joins that drop unmatched rows qualify",
           "[planner][join_implied_filters]")
 {

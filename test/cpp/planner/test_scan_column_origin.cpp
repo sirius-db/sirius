@@ -522,13 +522,27 @@ TEST_CASE("row-wise tracing crosses joins but not operators that choose rows",
     distinct->ResolveOperatorTypes();
     CHECK_FALSE(origin_of(*distinct, 0, kRowWise).has_value());
   }
-  SECTION("SINGLE joins refuse the right side")
+  SECTION("SINGLE joins refuse both sides")
   {
     auto join = make_join(duckdb::JoinType::SINGLE, make_get(0, 1), make_get(1, 1));
     join->ResolveOperatorTypes();
-    CHECK(origin_of(*join, 0, kRowWise) == at{0, 0});
+    CHECK_FALSE(origin_of(*join, 0, kRowWise).has_value());
     CHECK_FALSE(origin_of(*join, 1, kRowWise).has_value());
+    CHECK(origin_of(*join, 0, kValues) == at{0, 0});
     CHECK(origin_of(*join, 1, kValues) == at{1, 0});
+  }
+  SECTION("operators that evaluate an expression that can throw refuse")
+  {
+    for (auto const narrowing : {true, false}) {
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
+      expressions.push_back(make_ref(0));
+      expressions.push_back(duckdb::BoundCastExpression::AddDefaultCastToType(
+        make_ref(1), narrowing ? duckdb::LogicalType::TINYINT : duckdb::LogicalType::BIGINT));
+      auto projection = make_projection(make_get(0, 2), std::move(expressions));
+      projection->ResolveOperatorTypes();
+      CHECK(origin_of(*projection, 0, kRowWise).has_value() == !narrowing);
+      CHECK(origin_of(*projection, 0, kValues) == at{0, 0});
+    }
   }
   SECTION("DELIM joins refuse")
   {
