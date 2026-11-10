@@ -1772,9 +1772,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // or optimization removes scans. Decide before the GPU gate and SQL replan.
   unique_ptr<LogicalOperator> logical_plan;
   std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views;
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs;
   if (conn_state) {
     logical_plan           = conn_state->take_captured_plan_if_current();
     logical_original_views = conn_state->take_captured_original_views_if_current();
+    cte_reader_proofs      = conn_state->take_captured_cte_reader_proofs_if_current();
     if (sirius::transparent::should_use_duckdb(context, nullptr, &prepared.properties) !=
         sirius::transparent::decline_reason::none) {
       return RebindQueryInfo::DO_NOT_REBIND;
@@ -1782,6 +1784,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   auto const candidate_source = logical_plan ? sirius::transparent::candidate_origin::copy
                                              : sirius::transparent::candidate_origin::replan;
+  // The proofs describe the captured plan only; a plan replanned from SQL gets none.
+  if (candidate_source != sirius::transparent::candidate_origin::copy) {
+    cte_reader_proofs.reset();
+  }
   // Mirror the optimizer hook's gpu_execution gate: when transparent execution
   // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
   // never rewrite the physical plan even if we could.
@@ -1923,6 +1929,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                          sirius::planner::scan_contract_provenance{
                            std::nullopt, conn_state->planning_generation()})
                      : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
+
+    planner->cte_reader_proofs = cte_reader_proofs;
     // Hand the validated plan over instead of discarding it, so the first execution can skip
     // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the
     // execution window re-checks it and rebuilds if a pin or unpin landed in between.
@@ -1998,7 +2006,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       0,
       std::move(validated_sirius_plan),
       validated_plan_pin_epoch,
-      context.transaction.ActiveTransaction().global_transaction_id);
+      context.transaction.ActiveTransaction().global_transaction_id,
+      std::move(cte_reader_proofs));
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.

@@ -2,6 +2,7 @@ target_sources(
   sirius_objects
   PRIVATE connector_registry.cpp
           decimal_sum_input_bounds.cpp
+          delim_cte_proof.cpp
           late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp
           dynamic_filter/build_key_domain.cpp

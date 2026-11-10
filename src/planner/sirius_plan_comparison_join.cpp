@@ -711,7 +711,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
              .channel_push_ordinal = terminal.ordinal,
              .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
-          scan_bound = true;
+          // A body scan is an addition to the reader's endpoint, not a replacement for it.
+          scan_bound = scan_bound || !terminal.in_cte_body;
         }
         if (scan_bound) { continue; }
         // Admission proves build-block safety; placement preserves the reported site ordinal.
