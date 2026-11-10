@@ -256,7 +256,6 @@ TEST_CASE("declared domain coverage gates accumulation before partial allocation
                                            base.replica_spaces(),
                                                    {.domain_coverage_threshold = threshold,
                                                     .inlist_max_l2_fraction    = 0.0,
-                                                    .enable_multi_partition    = true,
                                                     .max_bloom_bytes_per_gpu   = 256 * mib}};
   }();
   sirius::test::scoped_recording_log_sink logs{"debug"};
@@ -309,7 +308,6 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
   SECTION("a zero cap refuses every geometry")
   {
     REQUIRE_FALSE(fixture.begin({batch}, 0));
-    REQUIRE(fixture.session->plan().multi_partition_enabled());
     auto const counters = fixture.stats.snapshot();
     // One attempt per begin, ended at once: the cap left no key to construct.
     REQUIRE(counters.publication_attempts == 1);
@@ -1375,12 +1373,11 @@ TEST_CASE("declared coverage gates every constructible key type, and only constr
                      .cardinality     = 100,
                      .source          = op::dynamic_filter_domain_source::pinned_parquet_exact,
                      .declared_unique = true};
-    return op::dynamic_filter_publish_plan{std::move(keys),
-                                           base.probe_targets(),
-                                           base.replica_spaces(),
-                                                   {.inlist_max_l2_fraction  = 0.0,
-                                                    .enable_multi_partition  = true,
-                                                    .max_bloom_bytes_per_gpu = 256 * mib}};
+    return op::dynamic_filter_publish_plan{
+      std::move(keys),
+      base.probe_targets(),
+      base.replica_spaces(),
+              {.inlist_max_l2_fraction = 0.0, .max_bloom_bytes_per_gpu = 256 * mib}};
   }();
   sirius::test::scoped_recording_log_sink logs{"debug"};
   REQUIRE_FALSE(fixture.begin({batch}, std::move(plan)));
@@ -1544,9 +1541,7 @@ TEST_CASE("an accumulated fan-out skips bindings whose probe type the key cannot
                   {.planner_condition_index = 1, .build_key_ordinal = 1, .storage_type = int64}},
                  std::move(targets),
                  fixture.spaces,
-                 {.inlist_max_l2_fraction  = 0.0,
-                  .enable_multi_partition  = true,
-                  .max_bloom_bytes_per_gpu = 256 * mib}};
+                 {.inlist_max_l2_fraction = 0.0, .max_bloom_bytes_per_gpu = 256 * mib}};
   REQUIRE(fixture.begin({first, second}, std::move(plan)));
   REQUIRE(fixture.allocated_bytes()[0] == before[0] + partial_bytes(600, 2));
   REQUIRE(fixture.stats.snapshot().bindings_skipped_incompatible_probe == 0);
@@ -2232,9 +2227,7 @@ TEST_CASE("one accumulated key completes both accepting bindings", "[dynamic_fil
                  {{fixture.channel, op::dynamic_filter_route_class::scan, false, {{0, 0, int32}}},
                   {other, op::dynamic_filter_route_class::scan, false, {{0, 1, int32}}}},
                  fixture.spaces,
-                 {.inlist_max_l2_fraction  = 0.0,
-                  .enable_multi_partition  = true,
-                  .max_bloom_bytes_per_gpu = 256 * mib}};
+                 {.inlist_max_l2_fraction = 0.0, .max_bloom_bytes_per_gpu = 256 * mib}};
   REQUIRE(fixture.begin({batch}, std::move(plan)));
   fixture.contribute(batch);
   fixture.publish(0, batch->get_batch_id());

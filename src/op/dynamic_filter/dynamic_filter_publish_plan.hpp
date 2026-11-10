@@ -58,7 +58,6 @@ struct dynamic_filter_publication_policy {
   bool emit_zone_map_filters            = false;
   double domain_coverage_threshold      = default_dynamic_filter_domain_coverage_threshold;
   double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
-  bool enable_multi_partition           = false;
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
 };
 
@@ -154,10 +153,6 @@ class dynamic_filter_publish_plan final {
   [[nodiscard]] double inlist_max_l2_fraction() const noexcept
   {
     return _policy.inlist_max_l2_fraction;
-  }
-  [[nodiscard]] bool multi_partition_enabled() const noexcept
-  {
-    return _policy.enable_multi_partition && enabled();
   }
   [[nodiscard]] std::uint64_t max_bloom_bytes_per_gpu() const noexcept
   {

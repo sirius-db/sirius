@@ -308,14 +308,11 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
   }
 
-  SECTION("a multi-partition build publishes its complete filter whatever the retired switch says")
+  SECTION("a multi-partition build publishes its complete filter")
   {
     // Correctness stake: a filter built from one partition's slice of the build keys would drop
     // probe rows that do join, so this must be pinned on a build that really spans partitions. The
-    // build PARTITION constructs from every batch of the certified build, with or without the
-    // retired multi-partition switch.
-    sirius::test::scoped_sirius_setting accumulation_off(
-      con, "enable_dynamic_filter_multi_partition", false);
+    // build PARTITION constructs from every batch of the certified build.
     // The summed columns exist only to keep the projection from pruning them, widening the build
     // past broadcast candidacy. Reaching a genuinely partition-sliced build needs all three pins:
     // broadcast off, a small hash-partition target so the natural count exceeds one, and a build
@@ -461,8 +458,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   std::string const join_type = GENERATE("SEMI", "ANTI");
   std::string const input_case =
     GENERATE("matching", "no matching keys", "runtime empty probe", "runtime empty build");
-  bool const enable_accumulation = GENERATE(false, true);
-  CAPTURE(join_type, input_case, enable_accumulation);
+  CAPTURE(join_type, input_case);
 
   run_ok("SET gpu_execution = false;");
   run_ok("CREATE TABLE retained (id INTEGER, k INTEGER, keep INTEGER);");
@@ -480,8 +476,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   // relation on the physical build side when its runtime filter produces no rows.
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", enable_accumulation);
   auto const probe_filter = input_case == "runtime empty probe" ? " AND p.v = 50 " : " ";
   auto const build_filter =
     input_case == "runtime empty build" ? "WHERE s.keep = 2" : "WHERE s.keep = 1";
@@ -496,7 +490,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   auto const deltas = require_switch_result_equivalence(*con, query);
   REQUIRE(deltas.off.producers_enabled == 0);
-  // BUILD_FILTER constructs right-family filters whatever the retired multi-partition switch says.
   REQUIRE(deltas.on.producers_enabled > 0);
   auto const expected_rows = input_case == "runtime empty build" ? 0
                              : input_case == "matching"          ? (join_type == "SEMI" ? 3 : 1)
@@ -592,8 +585,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   auto const probe_filter = empty_probe ? " AND p.v = 50 " : " ";
   auto const query        = "SELECT s.id, s.k FROM retained s " + join_type +
                      " JOIN probes p ON s.k IS NOT DISTINCT FROM p.k" + probe_filter +
@@ -715,8 +706,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("CHECKPOINT;");
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   auto const grouping = deduplicate ? " GROUP BY id, k" : "";
   auto const query =
     "WITH shared AS MATERIALIZED (SELECT id, k FROM retained) "
@@ -846,8 +835,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("CHECKPOINT");
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   auto const query =
     "WITH matches AS MATERIALIZED (SELECT k FROM rf_matches) SELECT c.k FROM rf_candidates c " +
     join_type + " JOIN matches m ON c.k IS NOT DISTINCT FROM m.k WHERE c.keep=1";

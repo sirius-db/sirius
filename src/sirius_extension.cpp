@@ -3009,25 +3009,13 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
                    params->enable_dynamic_zone_map_filter);
 }
 
-static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
-                                                 SetScope scope,
-                                                 Value& parameter)
-{
-  auto* params                                  = get_operator_params(context, scope);
-  params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
-                   params->enable_dynamic_filter_multi_partition);
-}
-
 static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
                                                 SetScope scope,
                                                 Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
   if (bytes == 0) {
-    throw InvalidInputException(
-      "max_dynamic_filter_bloom_bytes_per_gpu must be greater than zero; set "
-      "enable_dynamic_filter_multi_partition = false to disable Bloom accumulation");
+    throw InvalidInputException("max_dynamic_filter_bloom_bytes_per_gpu must be greater than zero");
   }
   auto* params                                   = get_operator_params(context, scope);
   params->max_dynamic_filter_bloom_bytes_per_gpu = bytes;
@@ -3656,19 +3644,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(
     config,
     option_visibility::internal,
-    "enable_dynamic_filter_multi_partition",
-    "Enable Bloom accumulation for eligible non-broadcast hash builds with more than one "
-    "partition; requires enable_dynamic_filter",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_multi_partition),
-    SetEnableDynamicFilterMultiPartition);
-
-  add_sirius_option(
-    config,
-    option_visibility::internal,
     "max_dynamic_filter_bloom_bytes_per_gpu",
-    "Aggregate aligned Bloom-array budget in bytes per GPU for multi-partition accumulation; "
-    "must be greater than zero",
+    "Aggregate aligned Bloom-array budget in bytes per GPU for one join's Bloom filters; must be "
+    "greater than zero",
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
     SetMaxDynamicFilterBloomBytesPerGpu);
