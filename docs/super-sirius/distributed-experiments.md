@@ -2,7 +2,8 @@
 
 How to run a distributed Sirius benchmark on GB200 NVLink nodes under Slurm and get numbers
 that can be trusted. Without Slurm, follow
-[Distributed experiments without Slurm](distributed-experiments-no-slurm.md) instead. Read
+[Distributed experiments without Slurm](distributed-experiments-no-slurm.md) instead, and on an
+AWS instance [Distributed experiments on AWS g7e instances](distributed-experiments-aws.md). Read
 [Distributed Quick Start](distributed-quickstart.md) first for the commands and the
 `sirius.distributed` settings.
 
@@ -190,6 +191,11 @@ On a machine Slurm does not schedule, such as a standalone NVL4 node, follow
 [Distributed experiments without Slurm](distributed-experiments-no-slurm.md): the same config,
 `run.sql` and checks, from an empty account, with one script that starts the gateway and the
 ranks, and stops them.
+
+On an AWS `g7e` instance (no Slurm, no NVLink, data on local NVMe), follow
+[Distributed experiments on AWS g7e instances](distributed-experiments-aws.md): launch, storage,
+build and dataset from scratch, a config for 96 GB GPUs, and why scans there are bound by the
+disks.
 
 ## Check the run
 

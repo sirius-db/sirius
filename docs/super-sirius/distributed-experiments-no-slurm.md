@@ -3,7 +3,9 @@
 How to run a distributed Sirius benchmark on a machine Slurm does not schedule, such as a
 standalone NVL4 node (4 GPUs), from an empty account to checked numbers. On a node Slurm
 schedules, follow [Distributed experiments](distributed-experiments.md) instead: a process
-started outside Slurm there can get the node drained.
+started outside Slurm there can get the node drained. On an AWS instance, start from
+[Distributed experiments on AWS g7e instances](distributed-experiments-aws.md), which sets the
+machine up and then uses the script below.
 
 One script starts a gateway and one rank per GPU, on one machine or on several, sends the SQL
 through the client, and stops everything. CPU fallback is off: a query Sirius cannot run on the
