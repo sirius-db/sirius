@@ -53,7 +53,7 @@ SELECT * FROM gpu_execution('SELECT 42');
 Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer
 
 statement error
-SELECT * FROM gpu_execution('SELECT 42', query_label => 'q');
+SELECT * FROM gpu_execution('SELECT 42', enable_optimizer => false);
 ----
 Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer
 
