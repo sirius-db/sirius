@@ -14,13 +14,17 @@
  * limitations under the License.
  */
 
+#include "construction_parity_utils.hpp"
 #include "dynamic_filter_accumulation_test_utils.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "partitioned_join_test_utils.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 
+#include <rmm/aligned.hpp>
+
 #include <catch.hpp>
 
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -47,9 +51,15 @@ struct build_filter_fixture {
   std::unique_ptr<op::sirius_physical_build_filter> filter;
 
   explicit build_filter_fixture(std::uint64_t cap = 256 * acc::mib)
+    : build_filter_fixture([&](acc::fixture const& memory) { return memory.make_plan(cap); })
   {
-    gpu.session =
-      std::make_unique<op::dynamic_filter_publication_session>(gpu.make_plan(cap), &gpu.stats);
+  }
+
+  /// @param plan Makes the session's plan from the fixture's memory
+  explicit build_filter_fixture(
+    std::function<op::dynamic_filter_publish_plan(acc::fixture const&)> const& plan)
+  {
+    gpu.session = std::make_unique<op::dynamic_filter_publication_session>(plan(gpu), &gpu.stats);
     filter = std::make_unique<op::sirius_physical_build_filter>(build_types(), 100, *gpu.session);
     sirius::pipeline::sirius_pipeline_build_state state;
     state.add_pipeline_operator(*source, upstream);
@@ -59,6 +69,8 @@ struct build_filter_fixture {
     input->src_pipeline = source;
     filter->add_port("default", std::move(input));
   }
+
+  void push(acc::batch_ptr const& batch) { filter->push_data_batch("default", batch); }
 
   acc::batch_ptr push(std::int64_t start, cudf::size_type rows = 32)
   {
@@ -143,7 +155,7 @@ TEST_CASE("build filter publishes once after every complete-input batch contribu
   REQUIRE(fixture.gpu.channel->filter_count() == 2);
 }
 
-TEST_CASE("declined build filter forwards input and preserves the later publication path",
+TEST_CASE("a declined build filter forwards input and ends its session Terminal",
           "[dynamic_filter][build_filter]")
 {
   build_filter_fixture fixture;
@@ -176,14 +188,28 @@ TEST_CASE("declined build filter forwards input and preserves the later publicat
 
   auto input = fixture.filter->get_next_task_input_data();
   REQUIRE(input);
+  // BUILD_FILTER is its join's sole construction site, so its decline is final: a filter built
+  // later would follow the probe-driven sizing it exists to precede.
+  REQUIRE(fixture.gpu.session->terminal());
+  REQUIRE(fixture.gpu.channel->snapshot().terminal());
   fixture.execute(*input, batch);
-  REQUIRE_FALSE(fixture.gpu.session->terminal());
   REQUIRE(fixture.gpu.channel->filter_count() == 0);
   REQUIRE(fixture.gpu.stats.snapshot().*counter == 1);
+  REQUIRE(fixture.gpu.stats.snapshot().accumulations_started == 0);
   fixture.filter->finalize_operator();
-  REQUIRE_FALSE(fixture.gpu.channel->snapshot().terminal());
-  fixture.gpu.session->finish_input();
   REQUIRE(fixture.gpu.channel->snapshot().terminal());
+}
+
+TEST_CASE("a build filter without input batches ends its session Terminal at finalize",
+          "[dynamic_filter][build_filter]")
+{
+  build_filter_fixture fixture;
+  fixture.source->finished = true;
+  REQUIRE_FALSE(fixture.filter->get_next_task_input_data());
+  fixture.filter->finalize_operator();
+  REQUIRE(fixture.gpu.session->terminal());
+  REQUIRE(fixture.gpu.channel->snapshot().terminal());
+  REQUIRE(fixture.gpu.channel->filter_count() == 0);
 }
 
 TEST_CASE("build filter cancellation and allocation refusal preserve batches",
@@ -236,6 +262,40 @@ TEST_CASE("a build filter budgets scratch rather than its resident input",
 
   install_stage_materialization(fixture);
   REQUIRE(fixture.filter->no_history_peak_memory_estimate({1, input_bytes}) == 2 * input_bytes);
+}
+
+TEST_CASE("a build filter budgets construction only while its attempt may still publish",
+          "[dynamic_filter][build_filter][memory_estimate]")
+{
+  build_filter_fixture fixture;
+  constexpr std::size_t input_bytes = 256 * acc::mib;
+  auto const estimate               = [&] {
+    return fixture.filter->no_history_peak_memory_estimate({1, input_bytes});
+  };
+  REQUIRE(estimate() == rmm::CUDA_ALLOCATION_ALIGNMENT);
+  // Few enough keys for small IN-lists, which the publishing task constructs at the root.
+  auto const first         = fixture.push(0, 4);
+  auto const second        = fixture.push(100, 4);
+  fixture.source->finished = true;
+  auto first_input         = fixture.filter->get_next_task_input_data();
+  REQUIRE(first_input);
+  auto const constructing = fixture.gpu.session->task_scratch_bound();
+  REQUIRE(constructing > rmm::CUDA_ALLOCATION_ALIGNMENT);
+  REQUIRE(estimate() == constructing);
+  fixture.execute(*first_input, first);
+  REQUIRE(estimate() == constructing);
+  auto second_input = fixture.filter->get_next_task_input_data();
+  REQUIRE(second_input);
+  SECTION("publication ends the attempt") { REQUIRE(fixture.gpu.channel->filter_count() == 0); }
+  SECTION("a task input that is not one certified batch ends the attempt")
+  {
+    fixture.gpu.session->decline_task_input();
+  }
+  fixture.execute(*second_input, second);
+  REQUIRE(fixture.gpu.session->terminal());
+  // Construction is released only when the stage finalizes, but no later task constructs.
+  REQUIRE(estimate() == rmm::CUDA_ALLOCATION_ALIGNMENT);
+  fixture.filter->finalize_operator();
 }
 
 TEST_CASE("a build filter scratch bound covers peer reduction",
@@ -378,6 +438,70 @@ TEST_CASE("an empty build filter pipeline finishes without tasks and releases it
   REQUIRE(publication_pipeline->get_tasks_created() == 0);
   REQUIRE(publication_pipeline->get_tasks_completed() == 0);
   REQUIRE(publication_ptr->finalized.load());
-  REQUIRE_FALSE(tree.join->dynamic_filter_session().terminal());
+  // An empty build stage still finalizes its join's session, which ends Terminal.
+  REQUIRE(tree.join->dynamic_filter_session().terminal());
   REQUIRE_FALSE(build.get_next_task_hint());
+}
+
+TEST_CASE("a build filter constructs every key family and filter kind its plan allows",
+          "[dynamic_filter][build_filter][right_family]")
+{
+  namespace cons    = sirius::test::construction;
+  using family_list = std::vector<sirius::test::columns::family>;
+  for (auto const& tested : family_list{sirius::test::columns::families()}) {
+    // No IN-list may take any L2 (Bloom), or the default share (an exact IN-list).
+    for (double const fraction : {0.0, 0.125}) {
+      CAPTURE(tested.name, fraction);
+      std::optional<cons::join> subject;
+      build_filter_fixture fixture{[&](acc::fixture const& memory) {
+        subject.emplace(memory, std::vector{tested.construction}, cons::l2_bytes(), true, fraction);
+        return subject->plan;
+      }};
+      auto const stream = fixture.gpu.publication_stream(0);
+      auto const build  = tested.carrier(stream);
+      auto const oracle = tested.oracle(stream);
+      auto const batches =
+        cons::make_batches(fixture.gpu,
+                           {{cudf::slice(build->view(), {0, 250}).front()},
+                            {cudf::slice(build->view(), {250, build->size()}).front()}});
+      for (auto const& batch : batches) {
+        fixture.push(batch);
+      }
+      fixture.source->finished = true;
+      for (auto const& batch : batches) {
+        auto input = fixture.filter->get_next_task_input_data();
+        REQUIRE(input);
+        fixture.execute(*input, batch);
+      }
+      fixture.filter->finalize_operator();
+      REQUIRE(fixture.gpu.session->terminal());
+      REQUIRE(subject->channel->snapshot().terminal());
+
+      // The published filters are the ones the same build constructs as one batch.
+      cons::join const whole_subject{
+        fixture.gpu, std::vector{tested.construction}, cons::l2_bytes(), true, fraction};
+      auto const whole = cons::construct(
+        fixture.gpu, whole_subject, cons::make_batches(fixture.gpu, {{build->view()}}));
+      auto const* expected = cons::key_of(whole, 0);
+      REQUIRE(expected != nullptr);
+      REQUIRE(expected->membership);
+      auto const membership = acc::filters_on_column(*subject->channel, 0);
+      std::shared_ptr<op::sirius_dynamic_filter const> published_membership;
+      std::shared_ptr<op::sirius_dynamic_filter const> published_zone_map;
+      for (auto const& filter : membership) {
+        (filter->kind() == op::sirius_dynamic_filter_kind::ZONE_MAP ? published_zone_map
+                                                                    : published_membership) =
+          filter;
+      }
+      REQUIRE(published_membership);
+      CHECK(published_membership->kind() == expected->membership->kind());
+      CHECK(static_cast<bool>(published_zone_map) == static_cast<bool>(expected->zone_map));
+      cons::require_same_membership(
+        published_membership.get(), expected->membership.get(), oracle->view(), stream);
+      cons::require_same_zone_map(published_zone_map.get(), expected->zone_map.get(), stream);
+      // Published scalars free on the task stream they were built on, so the channel must not
+      // outlive the fixture's streams.
+      subject.reset();
+    }
+  }
 }

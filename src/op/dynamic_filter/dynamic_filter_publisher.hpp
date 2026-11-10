@@ -123,12 +123,6 @@ class dynamic_filter_publication_session final {
   void decline(construction_decline reason) noexcept;
 
   /**
-   * @brief Counts @p reason without ending the session, so the build PARTITION may still construct.
-   * BUILD_FILTER calls this until it becomes its join's sole construction site.
-   */
-  void count_decline(construction_decline reason) noexcept;
-
-  /**
    * @brief Contributes one certified original batch, on the contributing task's thread and stream.
    *
    * Claims each original identity once, then, under the session mutex, checks the batch against
