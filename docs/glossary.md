@@ -12,6 +12,8 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## C
 
+**CPU Replay** - Re-running a query on DuckDB's CPU engine after its GPU execution failed at runtime. DuckDB's outcome, including any SQL error, is final. Avoid: "fallback" (ambiguous with Plan-time Fallback and Downgrade).
+
 ## D
 
 **Data Batch** - A Data Wrapper in Sirius for input and output of a pipeline. It can be a wrapper of cudf::table (for pipeline output) or spilling::allocation (for downgrade output).
@@ -28,7 +30,13 @@ This document contains definitions of key terms and concepts used throughout the
 
 **Downgrade Thread Pool** - A pool of threads that exist in downgrade executor and are used to copy Data Batch from GPU to CPU.
 
+**Downgrade** - Moving a Data Batch from GPU memory to a lower memory tier. Execution stays on the GPU; it is not CPU execution. Avoid: "CPU fallback".
+
 ## E
+
+**Evaluated Operation** - An operation that SQL semantics actually apply to a given row, i.e. one not inside a branch that a Row-exact Guard excluded for that row. Only an evaluated operation can raise a SQL error.
+
+**Expression Evaluator Strategy** - The per-query choice of how Sirius evaluates expressions on the GPU: `materialize`, `ast_interpret`, `ast_jit`, or `nvrtc_jit`.
 
 ## F
 
@@ -54,6 +62,8 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## M
 
+**Materialization Boundary** - A subexpression that a fused NVRTC kernel cannot compute itself; it is evaluated beforehand and supplied to the kernel as an input column.
+
 **Memory Reservation** - A lease on memory. It means you are expected to be consuming that amount of memory during your execution.
 
 **Memory Reservation Manager** - A module that can give memory reservations into one or more memory tiers. Its purpose is to be able to block executing threads from proceeding when the reservations are full utilized (to prevent too many tasks running at the same time).
@@ -62,9 +72,13 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## N
 
+**NVRTC Sink** - The final stage of a fused NVRTC expression kernel, which produces the projected columns or the filter selection and reports per-row errors. Avoid: "sink" alone (clashes with pipeline sink operators).
+
 ## O
 
 **Operators** - Parts of the physical plan that are used to build a pipeline. Operators that can be pipelined are used to create a pipeline that then gets wrapped into a task and executed.
+
+**Overflow Poison** - The per-value mark that an Evaluated Operation, or one of its inputs, overflowed. It flows to every value computed from it, and reaching the NVRTC Sink makes it a SQL error. Avoid: "poison" alone (clashes with stream failure).
 
 ## P
 
@@ -78,9 +92,13 @@ This document contains definitions of key terms and concepts used throughout the
 
 **Pipeline Metadata Hash Map** - A global data structure (hash map) that stores the logical plan and DuckDB pipeline information.
 
+**Plan-time Fallback** - Sirius declines to build a GPU plan for a query, so DuckDB executes it on the CPU from the start. Avoid: "fallback" alone.
+
 ## Q
 
 ## R
+
+**Row-exact Guard** - A construct (CASE, COALESCE, TRY) under which DuckDB guarantees that operations in branches not selected for a row are not evaluated for that row.
 
 ## S
 
