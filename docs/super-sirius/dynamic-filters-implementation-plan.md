@@ -28,8 +28,8 @@ the campaign host.
 
 Include the Sirius H02 integration. Keep its cuCascade implementation in a separate
 `NVIDIA/cuCascade` PR. Exclude the campaign driver shim, unrelated optimization
-branches, and placeholder campaign commit authorship. Preserve the existing
-non-broadcast, more-than-one-hash-partition eligibility for accumulation.
+branches, and placeholder campaign commit authorship. S1-S5 preserve the existing
+non-broadcast, more-than-one-hash-partition eligibility for accumulation; S5b lifts it.
 
 ## GitHub records
 
@@ -47,6 +47,7 @@ Published planning records:
 | S3 | [Scan consumer and fused masks — #1822](https://github.com/sirius-db/sirius/issues/1822) |
 | S4 | [H02 and pipelined publication — #1823](https://github.com/sirius-db/sirius/issues/1823) |
 | S5 | [Pinned-domain usefulness — #1824](https://github.com/sirius-db/sirius/issues/1824) |
+| S5b | [Unified filter construction — #2568](https://github.com/sirius-db/sirius/issues/2568) |
 | S6 | [Early probe activation — #1825](https://github.com/sirius-db/sirius/issues/1825) |
 
 S1-S6 are native sub-issues of the umbrella, with native blocked-by relationships
@@ -81,7 +82,10 @@ seventh branch in the Sirius stack.
 | S3 | `df/03-scan-consumer` | `df/02-multibatch-bloom` | Shared scan application, one gather, and fused membership masks |
 | S4 | `df/04-peer-pipelined-publication` | `df/03-scan-consumer` | Bounded accumulated staging and publication validation |
 | S5 | `df/05-domain-evidence` | `df/04-peer-pipelined-publication` | Pinned-domain usefulness evidence and measured coverage profile |
-| S6 | `df/06-early-probe` | `df/05-domain-evidence` | Optional early probe activation with preserved progress |
+| S5b PR1 | `stacked/df/05b-construction` | `df/05-domain-evidence` | Additive construction pieces, not yet wired |
+| S5b PR2 | `stacked/df/05b-switch` | `stacked/df/05b-construction` | Construction at every build PARTITION and BUILD_FILTER, one-shot path deleted |
+| S5b PR3 | `stacked/df/05b-fold-rule` | `stacked/df/05b-switch` | Filter-independent build-fold rule, around a perf checkpoint |
+| S6 | `stacked/df/06-early-probe` | S5b PR3 commit A | Optional early probe activation with preserved progress |
 | C1 | `memory/pool-peer-access` | cuCascade `main` | Safe per-pair pool grant and borrowed pool accessor |
 
 The branches above are reserved names in the plan, not claims that branches or PRs
@@ -111,7 +115,11 @@ API; reordering them is possible only with an explicit update to this plan.
 
 ```mermaid
 flowchart LR
-    DEV["Sirius dev"] --> S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    DEV["Sirius dev"] --> S1 --> S2 --> S3 --> S4 --> S5
+    S5 --> B1["S5b PR1: construction"] --> B2["S5b PR2: switch"] --> B3A["S5b PR3 commit A"]
+    B3A --> CHK["perf checkpoint"] --> B3B["S5b PR3 commit B"]
+    B3A --> S6
+    B3B -.->|"S6 rebases"| S6
     MAIN["cuCascade main"] --> C1["C1: separate cuCascade PR"]
     C1 --> MERGED["Merged upstream commit"]
     MERGED --> PIN["Sirius pins merged cuCascade revision"]
@@ -229,6 +237,25 @@ Acceptance: unknown/zero/inconsistent domains, duplicate and row-multiplying
 lineage, re-pin/invalidation, mismatched sources, incorrect caller declarations,
 and parity with filtering disabled. Validate both production `0.9` and measured
 profile `0.45`; publish the chosen regime with performance evidence.
+
+## S5b: unified filter construction
+
+Construct every dynamic filter from the Complete Build Inventory at one site per join: the build PARTITION, on every layout, or the BUILD_FILTER stage of a right semi/anti join. The inventory, which records every batch's rows and per-column carrier types and null counts, is the sole source of the facts that choose and size each key's filters. Every key type and filter kind (exact IN-lists, Bloom filters, and zone maps) is accumulated across batches; the task whose contribution completes the inventory constructs the filters on its GPU, builds the exact IN-lists and zone maps under its own reservation after checking the room left for each, replicates, and publishes before its deposit. Every enabled session is Terminal by Build Layout Completion, which S6 relies on.
+
+S5b lands as three stacked PRs:
+
+1. `stacked/df/05b-construction`: additive and not wired. Shared certification (`certify_decision`), the per-key policy (`plan_construction`), membership filters built from prepared keys, Bloom accumulation for every key type, the exact-key stager and bounds accumulator, `build_filter_construction`, and one `[dynamic_filter_key]` debug line per admitted key as the parity baseline.
+2. `stacked/df/05b-switch`: the switch-over. Construction at every build PARTITION and BUILD_FILTER, BUILD_FILTER for every key type, deletion of the one-shot deposit path and its counters, retirement of `enable_dynamic_filter_multi_partition`, and these docs.
+3. `stacked/df/05b-fold-rule`: a filter-independent build-fold rule (commit A), a user-run perf checkpoint, then commit B. S6 stacks on commit A and rebases after commit B.
+
+Declared deltas, which the parity check accepts as the only per-key strength changes:
+
+- The Bloom cap applies to every build.
+- Build inputs fed through a PIPELINE barrier (`ORDER BY`) decline.
+- Compressed spilled arrivals decline.
+- Bloom filters are sized on valid rows, so nullable keys move to the designed false-positive rate.
+
+Acceptance: results equal to CPU execution; per (query, join, key), `scripts/dynamic_filter_key_parity.py` reports no filter weaker than the PR1 baseline except a declared delta; every enabled session Terminal; and focused tests for certification, planning, construction, root memory admission, and failure joins.
 
 ## S6: early probe activation
 

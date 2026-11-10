@@ -115,7 +115,7 @@ for (auto& batch : output_batches) {
 }
 ```
 
-`push_data_batch()` calls the receiving operator's `on_input_batch_pushed(port_id, batch)` hook inside the pushing task, before the batch becomes poppable. The hook must not block or touch device memory. The default does nothing; the build PARTITION of a join that accumulates dynamic filters records each arrival in its `build_arrival_ledger` (see [Dynamic Filters](dynamic-filters.md#multi-partition-build-accumulation)).
+`push_data_batch()` calls the receiving operator's `on_input_batch_pushed(port_id, batch)` hook inside the pushing task, before the batch becomes poppable. The hook must not block or touch device memory. The default does nothing; the dynamic-filter construction site of a hash join (its build PARTITION, or its BUILD_FILTER stage) records each arrival in its `build_arrival_ledger` (see [Dynamic Filters](dynamic-filters.md#build-filter-construction)).
 
 `next_port_after_sink` is configured when repository wiring is materialized: the pipeline converter emits pure-data `repository_wiring` descriptors at plan time, and `pipeline::materialize_repository_wiring(wirings, *repo_manager)` creates the repositories and calls `source_op->add_next_port_after_sink({next_op, port_id})` at query setup (see [Multi-GPU Architecture](multi-gpu-architecture.md) for the two-phase split).
 

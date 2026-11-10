@@ -14,7 +14,7 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## C
 
-**Complete Build Inventory** - The frozen, exact record of every batch, row count, and key type entering a hash join's build-side PARTITION, certified once the build input has finished. It is the single proof that the build is complete. Dynamic filters accumulated across build batches are chosen and sized from it alone; filters built in one shot from the whole build table read that table instead. _Avoid_: whole build, build snapshot.
+**Complete Build Inventory** - The frozen, exact record of every batch, row count, and per-column carrier types and null counts entering a hash join's dynamic-filter construction site (its build-side PARTITION, or the BUILD_FILTER stage of a right semi/anti join), certified once the build input has finished. It is the single proof that the build is complete, and the sole source of the facts that choose and size the join's dynamic filters. _Avoid_: whole build, build snapshot.
 
 ## D
 
