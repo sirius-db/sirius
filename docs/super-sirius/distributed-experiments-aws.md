@@ -24,8 +24,11 @@ instance-store NVMe, no EFA) as one cluster over TCP, one rank per machine, at c
 checked. See [Several machines](#several-machines) and [Data on S3](#data-on-s3).
 
 Three scripts do the steps below for you. They are the commands of that `g6.4xlarge` run with
-its addresses, paths, bucket and two-machine limit taken out, and **have not been run end to end
-in this form**:
+its addresses, paths, bucket and two-machine limit taken out. `sirius_aws_run.sh` was then run
+as it is here on those machines, without its S3 options: two machines at SF1000 (Q1, Q6, Q12:
+6 of 6 answers match, nothing left running on either machine) and one machine at SF100. **Not
+run in this form:** `sirius_aws_setup.sh`, `sirius_aws_s3_secret.sh`, the S3 options, more than
+two machines, and a machine with several GPUs.
 
 | Script | Does |
 |---|---|
