@@ -881,14 +881,6 @@ void dynamic_filter_publication_session::decline(construction_decline reason) no
   std::move(actions).dispatch();
 }
 
-void dynamic_filter_publication_session::count_decline(construction_decline reason) noexcept
-{
-  dynamic_filter_stats_snapshot declined;
-  declined.*decline_counter(reason) = 1;
-  std::scoped_lock lock(_state->mutex);
-  _state->record(declined);
-}
-
 bool dynamic_filter_publication_session::begin(complete_build_inventory inventory)
 {
   auto& operation = *_state;

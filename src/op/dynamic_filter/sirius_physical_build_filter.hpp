@@ -16,22 +16,23 @@
 
 #pragma once
 
-#include "op/dynamic_filter/complete_build_inventory.hpp"
+#include "op/dynamic_filter/build_input_certifier.hpp"
 #include "op/sirius_physical_operator.hpp"
-
-#include <atomic>
-#include <mutex>
 
 namespace sirius::op {
 
 class dynamic_filter_publication_session;
 
 /**
- * @brief Publishes a complete build's optional filter before join partition sizing.
+ * @brief Publishes a complete build's dynamic filters before join partition sizing: the sole
+ * construction site of a right-family join (RIGHT_SEMI, RIGHT_ANTI) that has this stage.
  *
- * A FULL input certifies all original batches. Scheduled GPU tasks accumulate their keys and
- * forward the same batches; the last contribution publishes before this pipeline completes.
- * The owning join retains its publication session and its original partitioning strategy.
+ * A FULL input certifies all original batches, and the session plans every filter kind its plan
+ * allows for every key type. Scheduled GPU tasks contribute their keys and forward the same
+ * batches; the last contribution publishes before this pipeline completes. A certification decline
+ * is final, since a filter built later would follow the probe-driven sizing this stage precedes,
+ * and finalize always leaves the session Terminal. The owning join retains its publication session
+ * and its original partitioning strategy.
  */
 class sirius_physical_build_filter final : public sirius_physical_operator {
  public:
@@ -59,15 +60,8 @@ class sirius_physical_build_filter final : public sirius_physical_operator {
   void on_finalize_operator() override;
 
  private:
-  // Starts once on the untracked creator thread, before the first batch leaves the repository.
-  // Returns false while the source is still producing; unsupported inputs remain pass-through.
-  [[nodiscard]] bool decide_accumulation();
-
   dynamic_filter_publication_session& _session;
-  build_arrival_ledger _arrival_ledger;
-  std::mutex _decision_mutex;
-  bool _decided = false;
-  std::atomic<bool> _accumulating{false};
+  build_input_certifier _certifier;
 };
 
 }  // namespace sirius::op
