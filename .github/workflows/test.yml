@@ -60,7 +60,7 @@ jobs:
         with:
           cache: false
           locked: true
-          pixi-version: v0.81.0
+          pixi-version: v0.84.1
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
@@ -195,7 +195,7 @@ jobs:
         with:
           cache: false
           locked: true
-          pixi-version: v0.81.0
+          pixi-version: v0.84.1
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
@@ -339,7 +339,7 @@ jobs:
         with:
           cache: false
           locked: true
-          pixi-version: v0.81.0
+          pixi-version: v0.84.1
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 

@@ -41,7 +41,7 @@ For the legacy Sirius implementation used for the ClickBench results, see the
 ### Build Requirements
 
 - Git (to clone the repo)
-- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+- Pixi 0.84.1 or newer (install instructions [here](https://pixi.sh/latest/installation/))
 
 ## Installing a Prebuilt Sirius Release
 
