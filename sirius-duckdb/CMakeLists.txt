@@ -63,10 +63,11 @@ if(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
   set_target_properties(
     ${extension_name}_loadable_extension
     PROPERTIES LINK_LIBRARIES "${sirius_link_libraries}" SKIP_BUILD_RPATH ON)
+  # Strip at link time: DuckDB appends its metadata footer after linking.
   target_link_options(
     ${extension_name}_loadable_extension PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/exports.map"
-    -static-libgcc -static-libstdc++)
+    "LINKER:--strip-all" -static-libgcc -static-libstdc++)
   set_property(
     TARGET ${extension_name}_loadable_extension
     APPEND
