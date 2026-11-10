@@ -18,6 +18,8 @@ pub const SIRIUS_ALLOCATION_FAILURE: _bindgen_ty_1 = 4;
 pub const SIRIUS_INVALID_ARGUMENT: _bindgen_ty_1 = 5;
 /// An unexpected implementation failure occurred.
 pub const SIRIUS_INTERNAL_ERROR: _bindgen_ty_1 = 6;
+/// Hardware resolution or engine initialization failed.
+pub const SIRIUS_CONTEXT_INITIALIZATION: _bindgen_ty_1 = 7;
 pub type _bindgen_ty_1 = ::core::ffi::c_uint;
 pub const SIRIUS_BINDGEN_ABI_VERSION: u32 = 0;
 unsafe extern "C" {
