@@ -4,7 +4,7 @@ How to run a distributed Sirius benchmark on a machine Slurm does not schedule, 
 standalone NVL4 node (4 GPUs), from an empty account to checked numbers. On a node Slurm
 schedules, follow [Distributed experiments](distributed-experiments.md) instead: a process
 started outside Slurm there can get the node drained. On an AWS instance, start from
-[Distributed experiments on AWS g7e instances](distributed-experiments-aws.md), which sets the
+[Distributed experiments on AWS GPU instances](distributed-experiments-aws.md), which sets the
 machine up and then uses the script below.
 
 One script starts a gateway and one rank per GPU, on one machine or on several, sends the SQL
@@ -220,7 +220,10 @@ and what [Report](distributed-experiments.md#report) lists.
   GPUs each). The script then checks each machine, starts its ranks over `ssh`, and stops them
   at the end. It needs `ssh` without a password, and on every machine the same `$HOME`, and the
   checkout, the data, `$OUT` and Pixi at the same paths. A machine with another `$HOME` takes
-  `--gateway` and `--token-file` instead ([Quick Start](distributed-quickstart.md#prerequisites)).
+  `--gateway` and `--token-file` instead ([Quick Start](distributed-quickstart.md#prerequisites)),
+  or a copy of `gateway.conf`: see
+  [Several machines](distributed-experiments-aws.md#several-machines) for machines that share
+  nothing.
 
 ## When it goes wrong
 
