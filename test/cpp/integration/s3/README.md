@@ -30,6 +30,11 @@ SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 \
   build/release/test/cpp/sirius_unittest --order decl "[s3][integration]~[large]~[aws]"
 ```
 
+The DuckLake remote-delete test uses native HTTPFS for its CPU reference results.
+The strict gate loads the installed extension or installs it for the test host's DuckDB
+version and platform. Set `SIRIUS_TEST_DUCKLAKE_HTTPFS_EXTENSION` to a matching
+local extension for offline or custom builds.
+
 ## Tags and gates
 
 Every S3 case carries `[s3]`. Gate membership comes from the full
@@ -73,14 +78,15 @@ Without an external endpoint, SeaweedFS-backed cases skip when
 `SIRIUS_TEST_S3_STRICT=1` so missing prerequisites fail instead.
 SF10, SF1 TPC-H and glob-scale also require their LARGE, TPCH and
 GLOB_SCALE switches; the targets export them for the appropriate
-process. The three harness-PUT cases skip against an external endpoint,
+process. The harness-PUT cases skip against an external endpoint,
 even in strict mode.
 
 Catch2's `[.]` hides a case from an unfiltered run only. A hidden case
 still runs when it matches an explicit positive name or tag selector,
-subject to that selector's exclusions. These 15 hidden cases run in
+subject to that selector's exclusions. These hidden cases run in
 `make s3-test`:
 
+- `DuckLake REST deletes preserve bound snapshot visibility`
 - `DuckDB external file cache invalidates an overwritten S3 range by ETag`
 - `gpu_execution rejects operations on nested S3 parquet columns cleanly`
 - `gpu_execution S3 nested parquet projections match local DuckDB CPU`

@@ -185,6 +185,8 @@ std::shared_ptr<const provider_api> resolve_provider(duckdb::DatabaseInstance& d
     lookup.find("_ZN6duckdb23DuckLakeMultiFileReader14CreateInstanceERKNS_18BoundTableFunctionE"));
   api->get_files =
     lookup.member<decltype(api->get_files)>("_ZNK6duckdb21DuckLakeMultiFileList8GetFilesEv");
+  api->get_delete_scan_entry = lookup.member<decltype(api->get_delete_scan_entry)>(
+    "_ZN6duckdb21DuckLakeMultiFileList18GetDeleteScanEntryEm");
   api->set_scan_columns = lookup.member<decltype(api->set_scan_columns)>(
     "_ZNK6duckdb21DuckLakeMultiFileList14SetScanColumnsERKNS_6vectorINS_"
     "25MultiFileColumnDefinitionELb1ESaIS2_EEERKNS1_INS_11ColumnIndexELb1ESaIS7_EEE");
@@ -202,8 +204,9 @@ std::shared_ptr<const provider_api> resolve_provider(duckdb::DatabaseInstance& d
     static_cast<decltype(api->reader_type)>(lookup.find("_ZTIN6duckdb23DuckLakeMultiFileReaderE"));
   api->list_type =
     static_cast<decltype(api->list_type)>(lookup.find("_ZTIN6duckdb21DuckLakeMultiFileListE"));
-  if (!api->scan_function || !api->create_reader || !api->get_files || !api->set_scan_columns ||
-      !api->has_local_delete || !api->info_type || !api->reader_type || !api->list_type)
+  if (!api->scan_function || !api->create_reader || !api->get_files ||
+      !api->get_delete_scan_entry || !api->set_scan_columns || !api->has_local_delete ||
+      !api->info_type || !api->reader_type || !api->list_type)
     return {};
   api->path = std::move(path);
   return api;

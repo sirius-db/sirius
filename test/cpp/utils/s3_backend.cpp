@@ -898,9 +898,15 @@ bool ensure_s3_test_env()
   }
 }
 
+bool has_managed_s3_test_backend()
+{
+  std::lock_guard<std::mutex> lock(g_state_mutex);
+  return g_state == 1;
+}
+
 bool put_s3_test_object(std::string_view key, std::span<std::uint8_t const> bytes)
 {
-  if (g_state != 1) { return false; }
+  if (!has_managed_s3_test_backend()) { return false; }
 
   auto endpoint         = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto const scheme_end = endpoint.find("://");

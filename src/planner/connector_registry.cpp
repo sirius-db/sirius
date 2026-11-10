@@ -813,7 +813,8 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
 template <class Function>
 lookup_outcome lookup_connector_classified_impl(Function const& function,
                                                 duckdb::FunctionData const* bind,
-                                                duckdb::ClientContext& context)
+                                                duckdb::ClientContext& context,
+                                                bool source_policy_only = false)
 {
   bool function_known = false;
 #ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
@@ -844,6 +845,12 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
         initialize_ducklake_callbacks(*context.db);
         lake = db_cache.Get<ducklake_reference>(ducklake_reference::key);
       }
+    }
+    // An authenticated provider binding can expose dependencies even when its
+    // scan mode changes callbacks and is ineligible for GPU lowering.
+    if (source_policy_only && entry.verify_binding && entry.source_policy) {
+      if (entry.verify_binding(function, bind, context)) return {&entry, lookup_decline::none};
+      return {nullptr, lookup_decline::bind_data_mismatch};
     }
     auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
@@ -902,6 +909,13 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
                                   duckdb::ClientContext& context)
 {
   return lookup_connector_classified_impl(function, bind, context).entry;
+}
+
+connector const* lookup_source_policy_connector(duckdb::BoundTableFunction const& function,
+                                                duckdb::FunctionData const* bind,
+                                                duckdb::ClientContext& context)
+{
+  return lookup_connector_classified_impl(function, bind, context, true).entry;
 }
 
 connector const* lookup_connector(duckdb::BoundTableFunction const& function,

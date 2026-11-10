@@ -83,6 +83,20 @@ using sirius::test::query;
 using sirius::transparent::connection_provenance;
 using sirius::transparent::decline_reason;
 
+// DuckDB errors can echo the statement. Do not pass credential-bearing SQL or
+// its diagnostics to Catch, and keep it out of Sirius query tracing.
+void create_test_secret(duckdb::Connection& con, std::string const& sql)
+{
+  duckdb::SiriusContext::InternalQueryGuard guard(*con.context);
+  try {
+    auto result = con.Query(sql);
+    if (result && !result->HasError()) return;
+  } catch (std::exception const&) {
+    // Report the same credential-free setup failure for thrown errors.
+  }
+  throw std::runtime_error("S3 test secret creation failed");
+}
+
 std::string load_ducklake(duckdb::Connection& con)
 {
   char const* path = std::getenv("SIRIUS_TEST_DUCKLAKE_EXTENSION");
@@ -614,6 +628,87 @@ TEST_CASE("DuckLake verifies the loaded provider independently of its directory"
     std::filesystem::create_directories(shadow.parent_path());
     std::filesystem::copy_file(original, shadow);
     CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  }
+}
+
+TEST_CASE("DuckLake S3 secret setup errors omit credentials", "[isolated_context][ducklake]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  REQUIRE_THROWS_WITH(
+    create_test_secret(con,
+                       "CREATE SECRET invalid (TYPE missing_provider, KEY_ID 'test-key-id', "
+                       "SECRET 'test-secret-value')"),
+    "S3 test secret creation failed");
+}
+
+TEST_CASE("DuckLake retained CPU scans reject remote deletion dependencies",
+          "[isolated_context][ducklake][ducklake_remote_policy]")
+{
+  const bool previous = GENERATE(false, true);
+  const bool verified = GENERATE(true, false);
+  CAPTURE(previous, verified);
+  sirius::test::scoped_temp_directory disk;
+  auto root     = std::filesystem::path(disk.directory);
+  auto original = ducklake_test_provider();
+  auto loaded   = root / "ducklake.duckdb_extension";
+  std::filesystem::copy_file(original, loaded);
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  query(con, "LOAD " + duckdb::Value(loaded.string()).ToSQLString());
+  query(con, "SET gpu_execution=false");
+  auto attach = "ATTACH 'ducklake:" + disk.directory + "/meta.db' AS lake (DATA_PATH '" +
+                disk.directory + "/data', METADATA_CATALOG 'meta', DATA_INLINING_ROW_LIMIT 0)";
+  query(con, attach);
+  query(con, "CALL lake.set_option('write_deletion_vectors',false)");
+  query(con, "CREATE TABLE lake.t AS SELECT i FROM range(100) r(i)");
+  auto before = query(con, "SELECT max(snapshot_id) FROM ducklake_snapshots('lake')")
+                  ->Collection()
+                  .GetValue(0, 0)
+                  .ToString();
+  if (previous) {
+    // The full-file deletion has no current delete file; only the preceding
+    // positional delete file can introduce an S3 dependency.
+    query(con, "DELETE FROM lake.t WHERE i=1");
+    query(con, "DELETE FROM lake.t");
+  } else {
+    query(con, "DELETE FROM lake.t WHERE i=2");
+  }
+  auto snapshot = query(con, "SELECT max(snapshot_id) FROM ducklake_snapshots('lake')")
+                    ->Collection()
+                    .GetValue(0, 0)
+                    .ToString();
+  auto sql = "SELECT i FROM ducklake_table_deletions('lake','main','t'," + snapshot + "," +
+             snapshot + ") WHERE i=2";
+  REQUIRE(ducklake_result_bag(*query(con, sql)) == std::vector<std::string>{"2|"});
+  REQUIRE(query(con, "SELECT path FROM meta.ducklake_delete_file")->RowCount() == 1);
+  query(con,
+        "UPDATE meta.ducklake_delete_file SET path='s3://policy-test/delete.parquet', "
+        "path_is_relative=false");
+  query(con, "DETACH lake");
+  query(con, attach);
+  if (!verified) {
+    // Retain the original loaded module but invalidate its filesystem identity.
+    std::filesystem::rename(loaded, root / "original-provider");
+    std::filesystem::create_symlink(std::filesystem::canonical(original), loaded);
+  }
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=true");
+  auto check_refusal = [&](duckdb::QueryResult& result) {
+    REQUIRE(result.HasError());
+    INFO(result.GetError());
+    CHECK(result.GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+    CHECK((result.GetError().find("[sirius_httpfs]") != std::string::npos) == !verified);
+  };
+  check_refusal(*con.Query(sql));
+  if (!verified) {
+    auto prepared = con.Prepare(sql);
+    REQUIRE_FALSE(prepared->HasError());
+    check_refusal(*prepared->Execute());
+    check_refusal(*prepared->Execute());
+    // The same unqualified provider must still serve a local-only read.
+    CHECK(query(con, "SELECT i FROM lake.t AT (VERSION => " + before + ") WHERE i=2")->RowCount() ==
+          1);
   }
 }
 
@@ -5090,13 +5185,17 @@ std::unique_ptr<cucascade::io::datasource> cache_remote_delete(duckdb::Connectio
 }  // namespace
 
 TEST_CASE("DuckLake REST deletes preserve bound snapshot visibility",
-          "[.][isolated_context][ducklake][ducklake_remote_deletes][s3]")
+          "[.][isolated_context][ducklake][ducklake_remote_deletes][s3][integration]")
 {
   auto httpfs = sirius::test::s3::env_or("SIRIUS_TEST_DUCKLAKE_HTTPFS_EXTENSION");
-  REQUIRE_FALSE(httpfs.empty());
+
   {
     sirius::util::env_guard disabled("SIRIUS_DISABLE", std::string("1"));
-    REQUIRE(sirius::test::ensure_s3_test_env());
+    if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                              "S3 test backend is not configured"))
+      return;
+    if (!sirius::test::has_managed_s3_test_backend())
+      SKIP("this test writes fixtures to the managed SeaweedFS endpoint");
   }
   auto remote_data      = GENERATE(false, true);
   auto puffin           = GENERATE(true, false);
@@ -5132,14 +5231,28 @@ TEST_CASE("DuckLake REST deletes preserve bound snapshot visibility",
     duckdb::ExtensionHelper::LoadExtension(native_db, "parquet");
     duckdb::ExtensionHelper::LoadExtension(native_db, "core_functions");
     duckdb::Connection native(native_db);
-    query(native, "LOAD " + quote(httpfs));
+    if (!httpfs.empty()) {
+      query(native, "LOAD " + quote(httpfs));
+    } else {
+      auto loaded = native.Query("LOAD httpfs");
+      if (loaded->HasError() && sirius::test::s3::strict_mode()) {
+        // INSTALL uses the native oracle's DuckDB version and platform. The
+        // explicit fixture path remains available for offline/custom builds.
+        query(native, "INSTALL httpfs");
+        query(native, "LOAD httpfs");
+      } else if (sirius::test::s3::skip_or_fail_unless(!loaded->HasError(),
+                                                       "native HTTPFS fixture is unavailable")) {
+        return;
+      }
+    }
     load_ducklake(native);
     auto endpoint = sirius::test::s3::require_env("SIRIUS_TEST_S3_ENDPOINT");
     REQUIRE(endpoint.starts_with("http://"));
     endpoint.erase(0, 7);
-    query(native,
-          "CREATE SECRET native_remote (TYPE S3, SCOPE " + quote(prefix) + credentials +
-            ", ENDPOINT " + quote(endpoint) + ", URL_STYLE 'path', USE_SSL false)");
+    create_test_secret(native,
+                       "CREATE SECRET native_remote (TYPE S3, SCOPE " + quote(prefix) +
+                         credentials + ", ENDPOINT " + quote(endpoint) +
+                         ", URL_STYLE 'path', USE_SSL false)");
     query(native, attach);
     query(native, "CALL lake.set_option('data_inlining_row_limit',0)");
     query(native,
@@ -5337,9 +5450,10 @@ TEST_CASE("DuckLake REST deletes preserve bound snapshot visibility",
   sirius::test::shared_test_env env(remote_delete_cache_config(disk.directory));
   auto con = env.make_connection();
   load_ducklake(con);
-  query(con,
-        "CREATE SECRET ducklake_remote (TYPE SIRIUS_S3, SCOPE " + quote(prefix) + credentials +
-          ", ENDPOINT " + quote(sirius::test::s3::require_env("SIRIUS_TEST_S3_ENDPOINT")) + ")");
+  create_test_secret(con,
+                     "CREATE SECRET ducklake_remote (TYPE SIRIUS_S3, SCOPE " + quote(prefix) +
+                       credentials + ", ENDPOINT " +
+                       quote(sirius::test::s3::require_env("SIRIUS_TEST_S3_ENDPOINT")) + ")");
   auto gpu_attach = duckdb::StringUtil::Replace(attach, "/meta.ducklake", "/gpu.ducklake");
   query(con, gpu_attach);
   query(con, "SET gpu_execution=true");
@@ -5701,7 +5815,7 @@ TEST_CASE("DuckLake remote delete queries enforce backend identity contracts",
 }
 
 TEST_CASE("DuckLake remote Puffin byte source retains snapshots and charged ownership",
-          "[isolated_context][ducklake][ducklake_remote_transport][s3]")
+          "[isolated_context][ducklake][ducklake_remote_transport][s3][integration]")
 {
   namespace dl = sirius::ducklake;
   namespace sm = sirius::scan_manager;
@@ -5711,6 +5825,8 @@ TEST_CASE("DuckLake remote Puffin byte source retains snapshots and charged owne
     if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
                                               "S3 test backend is not configured"))
       return;
+    if (!sirius::test::has_managed_s3_test_backend())
+      SKIP("this test writes fixtures to the managed SeaweedFS endpoint");
   }
   sirius::test::scoped_temp_directory disk;
   sirius::test::shared_test_env env(remote_delete_cache_config(disk.directory));

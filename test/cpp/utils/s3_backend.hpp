@@ -50,6 +50,9 @@ namespace sirius::test {
  */
 bool ensure_s3_test_env();
 
+/// True when the harness owns the endpoint and can write or overwrite test objects.
+bool has_managed_s3_test_backend();
+
 /**
  * @brief PUT a small object into the managed HTTP SeaweedFS instance.
  *

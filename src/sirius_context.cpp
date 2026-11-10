@@ -63,6 +63,7 @@
 #include <duckdb/execution/operator/persistent/physical_insert.hpp>
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
+#include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
@@ -1733,6 +1734,31 @@ bool compressed_materialization_enabled(ClientContext& context)
   return sirius::operator_params{}.enable_compressed_materialization;
 }
 
+static bool contains_ducklake_cpu_scan(PhysicalOperator const& op)
+{
+  if (dynamic_cast<sirius::transparent::PhysicalSiriusExecution const*>(&op)) return false;
+  if (op.type == PhysicalOperatorType::TABLE_SCAN &&
+      op.Cast<PhysicalTableScan>().function.GetName() == "ducklake_scan")
+    return true;
+  for (auto const& child : op.GetChildren()) {
+    if (contains_ducklake_cpu_scan(child.get())) return true;
+  }
+  return false;
+}
+
+// Scope the filesystem veto to the retained CPU statement, including cached executions.
+// This check never dereferences provider bind data. Local CPU scans can still execute.
+static void guard_retained_cpu_plan(ClientContext& context, PreparedStatementData const& statement)
+{
+  if (SiriusContext::is_internal_query_active(context)) return;
+  auto state = get_sirius_connection_state(context);
+  if (!state) return;
+  bool candidate = statement.statement_type == StatementType::SELECT_STATEMENT ||
+                   statement.statement_type == StatementType::EXECUTE_STATEMENT;
+  state->set_retained_cpu_ducklake(candidate && statement.physical_plan &&
+                                   contains_ducklake_cpu_scan(statement.physical_plan->Root()));
+}
+
 void print_cpu_fallback_banner()
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;
@@ -1748,6 +1774,15 @@ void print_cpu_fallback_banner()
 }
 
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
+                                                 PreparedStatementData& statement,
+                                                 PreparedStatementMode mode)
+{
+  auto decision = finalize_gpu_plan(context, statement, mode);
+  guard_retained_cpu_plan(context, statement);
+  return decision;
+}
+
+RebindQueryInfo SiriusContext::finalize_gpu_plan(ClientContext& context,
                                                  PreparedStatementData& statement,
                                                  PreparedStatementMode mode)
 {
@@ -2073,6 +2108,7 @@ RebindQueryInfo SiriusContext::OnRebindPreparedStatement(ClientContext& context,
       !enabled.IsNull() && enabled.GetValue<bool>()) {
     return RebindQueryInfo::ATTEMPT_TO_REBIND;
   }
+  if (current_rebind == RebindQueryInfo::DO_NOT_REBIND) guard_retained_cpu_plan(context, prepared);
   // Only Sirius-backed statements need an extra rebind to recheck GPU eligibility
   // after data changes. Retain DuckDB's normal caching for CPU and table-function plans.
   if (!prepared.unbound_statement || !prepared.physical_plan) return current_rebind;

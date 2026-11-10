@@ -124,6 +124,9 @@ connector const* lookup_connector(duckdb::PhysicalTableScan const&, duckdb::Clie
 connector const* lookup_connector(duckdb::TableFunction const&,
                                   duckdb::FunctionData const*,
                                   duckdb::ClientContext&);
+connector const* lookup_source_policy_connector(duckdb::BoundTableFunction const& function,
+                                                duckdb::FunctionData const* bind,
+                                                duckdb::ClientContext& context);
 connector const* lookup_connector(duckdb::BoundTableFunction const&,
                                   duckdb::FunctionData const*,
                                   duckdb::ClientContext&);

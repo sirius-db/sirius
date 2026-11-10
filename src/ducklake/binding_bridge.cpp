@@ -234,16 +234,14 @@ std::shared_ptr<binding_handle> binding_handle::capture(BoundTableFunction const
     new binding_handle(std::make_unique<impl>(function, data, context)));
 }
 op::scan::bound_read_view const& binding_handle::view() const noexcept { return impl_->captured; }
-void binding_handle::validate_statement() const
-{
-  impl_->validate();
-}
+void binding_handle::validate_statement() const { impl_->validate(); }
 transparent::scan_source_policy classify_bound_sources(BoundTableFunction const& function,
                                                        FunctionData const* data,
                                                        ClientContext& context)
 {
-  auto api = planner::registered_ducklake_provider(*context.db);
-  if (!verified_info(api, function, data, context))
+  auto api  = planner::registered_ducklake_provider(*context.db);
+  auto info = verified_info(api, function, data, context);
+  if (!info)
     throw std::invalid_argument("DuckLake source policy requires a verified original binding");
   auto const& bind = *dynamic_cast<MultiFileBindData const*>(data);
   auto const* list = api->file_list(bind.file_list.get());
@@ -251,8 +249,20 @@ transparent::scan_source_policy classify_bound_sources(BoundTableFunction const&
   // The bound provider list includes transaction-local changes and snapshot-selected
   // delete descriptors. Inline table names are not filesystem paths. No Parquet or
   // Puffin reader is opened by this inspection.
-  for (auto const& entry : (list->*api->get_files)()) {
-    if (entry.data_type == DuckLakeDataType::DATA_FILE) policy.observe(entry.file.path);
+  auto const& files = (list->*api->get_files)();
+  for (size_t i = 0; i < files.size(); ++i) {
+    auto const& entry = files[i];
+    if (entry.data_type == DuckLakeDataType::DATA_FILE) {
+      policy.observe(entry.file.path);
+      if (info->scan_type == DuckLakeScanType::SCAN_DELETIONS) {
+        // GetFiles initialized the parallel deletion-scan descriptors. Inline entries
+        // appended to the file list have no corresponding deletion-scan descriptor.
+        auto& mutable_list   = const_cast<DuckLakeMultiFileList&>(*list);
+        auto const& deletion = (mutable_list.*api->get_delete_scan_entry)(i);
+        policy.observe(deletion.delete_file.path);
+        policy.observe(deletion.previous_delete_file.path);
+      }
+    }
     policy.observe(entry.delete_file.path);
   }
   return policy.finish();
@@ -698,10 +708,7 @@ struct inline_reader::impl {
 };
 inline_reader::inline_reader(std::unique_ptr<impl> value) : impl_(std::move(value)) {}
 inline_reader::~inline_reader() = default;
-duckdb::DataChunk const* inline_reader::next()
-{
-  return impl_->next();
-}
+duckdb::DataChunk const* inline_reader::next() { return impl_->next(); }
 std::unique_ptr<inline_reader> binding_handle::open_inline_unit(uint64_t index,
                                                                 std::vector<size_t> const& selected)
 {

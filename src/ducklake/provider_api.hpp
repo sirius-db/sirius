@@ -39,6 +39,7 @@ struct provider_api {
   decltype(&duckdb::DuckLakeFunctions::GetDuckLakeScanFunction) scan_function;
   decltype(&duckdb::DuckLakeMultiFileReader::CreateInstance) create_reader;
   decltype(&duckdb::DuckLakeMultiFileList::GetFiles) get_files;
+  decltype(&duckdb::DuckLakeMultiFileList::GetDeleteScanEntry) get_delete_scan_entry;
   decltype(&duckdb::DuckLakeMultiFileList::SetScanColumns) set_scan_columns;
   decltype(&duckdb::DuckLakeTransaction::HasLocalDeleteForFile) has_local_delete;
 

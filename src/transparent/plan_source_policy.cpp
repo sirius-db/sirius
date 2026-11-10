@@ -58,7 +58,7 @@ scan_source_policy classify(duckdb::BoundTableFunction const& function,
 {
   scan_source_policy result{
     function.GetName().GetIdentifierName(), byte_source_class::unclassified, true, ""};
-  auto const* entry = planner::lookup_connector(function, bind, context);
+  auto const* entry = planner::lookup_source_policy_connector(function, bind, context);
   if (entry && entry->source_policy) return entry->source_policy(function, bind, context);
   if (entry) {
     result.source             = entry->byte_source;

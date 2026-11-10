@@ -113,6 +113,7 @@ class SiriusConnectionState : public ClientContextState {
   void QueryBegin(ClientContext& context) final
   {
     if (is_internal_query_active()) return;
+    retained_cpu_ducklake_.store(false);
     captured_plan_.reset();
     captured_original_views_.reset();
     // DuckDB has finished/abandoned the previous statement before starting another.
@@ -125,6 +126,7 @@ class SiriusConnectionState : public ClientContextState {
   void QueryEnd() final
   {
     if (is_internal_query_active()) return;
+    retained_cpu_ducklake_.store(false);
     pinned_update_guard_.reset();
     execution_options.reset();
   }
@@ -293,6 +295,12 @@ class SiriusConnectionState : public ClientContextState {
     return internal_query_depth_.load(std::memory_order_relaxed) > 0;
   }
 
+  void set_retained_cpu_ducklake(bool active) noexcept { retained_cpu_ducklake_.store(active); }
+  bool blocks_cpu_s3_access() const noexcept
+  {
+    return is_cpu_fallback_active() || retained_cpu_ducklake_.load();
+  }
+
   void enter_cpu_fallback() noexcept
   {
     cpu_fallback_depth_.fetch_add(1, std::memory_order_relaxed);
@@ -325,6 +333,7 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<std::string> session_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
+  std::atomic<bool> retained_cpu_ducklake_{false};
   sirius::exec::query_admission::permit pinned_update_guard_;
   /// The failed CPU replay's error and the query it belongs to. Written by a worker thread.
   struct cpu_replay_error {
@@ -466,6 +475,10 @@ class SiriusContext : public ClientContextState {
                                     PreparedStatementData& prepared_statement,
                                     PreparedStatementMode mode) final;
 
+ private:
+  RebindQueryInfo finalize_gpu_plan(ClientContext&, PreparedStatementData&, PreparedStatementMode);
+
+ public:
   /// \brief Called on each execute of a reusable prepared statement. Requests a
   /// rebind for Sirius-backed plans so GPU eligibility is re-decided with current
   /// stats.
