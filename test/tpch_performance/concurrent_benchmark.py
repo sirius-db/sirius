@@ -7,7 +7,7 @@ are retained between requests unless validation is enabled.
 """
 
 import argparse
-from collections import Counter, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 import csv
 import hashlib
 import json
@@ -191,7 +191,9 @@ def split_keyed_logs(directory):
                 window = re.search(r"window=(\d+)", line)
                 if window and identity in queries:
                     windows[(identity[0], window[1])] = queries[identity]
-    destinations = {}
+    destinations = OrderedDict()
+    initialized = set()
+    max_open_destinations = 32
     try:
         for path in files:
             with path.open(errors="replace") as source:
@@ -203,11 +205,19 @@ def split_keyed_logs(directory):
                         if window:
                             label = windows.get(window.groups())
                     if label:
-                        if label not in destinations:
+                        destination = destinations.pop(label, None)
+                        if destination is None:
+                            if len(destinations) >= max_open_destinations:
+                                _, oldest = destinations.popitem(last=False)
+                                oldest.close()
                             folder = directory / "sirius" / "execution_logs"
                             folder.mkdir(parents=True, exist_ok=True)
-                            destinations[label] = (folder / f"{label}.log").open("w")
-                        destinations[label].write(line)
+                            # Evicted destinations must retain their earlier lines.
+                            mode = "a" if label in initialized else "w"
+                            destination = (folder / f"{label}.log").open(mode)
+                            initialized.add(label)
+                        destinations[label] = destination
+                        destination.write(line)
     finally:
         for output in destinations.values():
             output.close()
