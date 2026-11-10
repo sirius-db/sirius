@@ -391,6 +391,22 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
 # -----------------------------------------------------------------------------
+# test/io/gds_probe — cuFileRead into GPU memory outside the engine; the first
+# thing to run on a machine before scan_manager.backend: gds
+# -----------------------------------------------------------------------------
+add_executable(gds_probe test/io/gds_probe.cpp src/io/gds/gds_stats.cpp)
+target_include_directories(
+  gds_probe PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+target_link_libraries(gds_probe PRIVATE kvikio::kvikio rmm::rmm
+                                        ${CMAKE_DL_LIBS} Threads::Threads)
+set_target_properties(
+  gds_probe
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
 # test/io/retirer_benchmark — cuda_event_completion_poll vs. event + retire
 # threads
 # -----------------------------------------------------------------------------

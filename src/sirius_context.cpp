@@ -49,6 +49,7 @@
 #include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
+#include "util/scoped_process_affinity.hpp"
 #include "vss/cuvs_index_cache.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
@@ -2464,6 +2465,13 @@ void SiriusContextExtensionCallback::initialize_context()
   if (disabled_ || context_) { return; }
 
   auto context = duckdb::make_shared_ptr<SiriusContext>();
+  // Every pool Sirius owns is started in here, on whatever thread runs the LOAD.
+  sirius::util::scoped_process_affinity const affinity;
+  if (affinity.widened()) {
+    SIRIUS_LOG_INFO(
+      "SiriusContext: initializing on a thread pinned to fewer CPUs than the "
+      "process; its threads get the process's CPU set");
+  }
   context->initialize(config_);
   context_ = std::move(context);
 }

@@ -372,7 +372,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native`, `kvikio` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `native`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
+| `backend` | enum: `native`, `kvikio`, `gds` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. `gds` reads local files into GPU memory with cuFile (GPUDirect Storage), see [`scan_manager.gds`](#scan_managergds--gpudirect-storage-backend-srciogds); `s3://` reads then go through kvikIO as under `kvikio`. `kvikio` and `gds` are single-GPU only: a multi-GPU configuration forces `kvikio` back to `native` and rejects `gds`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own libcurl event loop and connection pool. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
@@ -503,6 +503,25 @@ readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
 | `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
 | `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
 | `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
+
+### `scan_manager.gds` — GPUDirect Storage backend (`src/io/gds/`)
+
+Used when `backend: gds`. Local files are read into GPU memory with cuFile, with no copy through
+host memory. Like `kvikio`, this backend runs without the prefetching cache and the readahead.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `num_threads` | int (**1–64**) | 32 | Threads that issue cuFile reads: the bound on reads in flight per process. On GPFS 32 and 64 were fastest, 128 slower, and at 256 a read stopped returning, so more than 64 is rejected. |
+| `task_size` | bytes (**> 0**) | 16Mi | Bytes per cuFile read. A larger read is cut into pieces of this size. |
+| `require` | bool | true | Refuse to start unless cuFile reports GDS available with its POSIX fallback off, and fail reads once cuFile serves most reads through POSIX (after the first GiB; cuFile reads a few KiB at a time through POSIX even under GDS). With `false` these are logged only. |
+| `slow_read_ms_per_mib` | number (**>= 0**) | 5 | Reads fail with "GDS reads slowed down" once they stay slower than this many milliseconds per MiB for two seconds; 0 turns the check off. Measured on GPFS: 0.8–1.2 ms per MiB when healthy, 10–62 on a path that was going bad. |
+| `read_timeout_s` | int (**> 0**) | 10 | A cuFile read in flight longer than this ends the process with status 70. cuFile reads cannot be cancelled, and failing the query instead would free buffers a stuck read still writes to. `scripts/sirius_rank_node.sh` does not restart a rank that exits with 70. |
+
+cuFile falls back to POSIX reads without an error while its own configuration has
+`allow_compat_mode: true`, so `require: true` needs a cuFile configuration with that turned off.
+`scripts/gds/cufile_json.sh <dir>` writes such a copy of the node's file; `scripts/sirius_rank_node.sh`
+does it for each rank when `SIRIUS_GDS=1` is set. See [Scan](scan.md#gpudirect-storage-backend) for
+the start-up line, the per-query proof line and the first test to run on a new machine.
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 

@@ -342,7 +342,8 @@ void check_backend_support(const ObjectStoreConfig& cfg,
   if (cfg.transport == Transport::kRdma) {
     invalid_field("transport", "no S3-over-RDMA backend is registered in this build");
   }
-  if (scan_manager.backend == sirius::scan_manager::io_backend::kvikio) {
+  // Under gds, s3:// reads go to cuCascade's kvikIO context as well.
+  if (scan_manager.backend != sirius::scan_manager::io_backend::native) {
     if (cfg.signing_mode != SigningMode::kPresigned) {
       invalid_field("signing_mode", "the configured kvikio backend does not honor a signing mode");
     }
