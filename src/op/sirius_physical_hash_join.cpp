@@ -1024,12 +1024,6 @@ bool sirius_physical_hash_join::publishes_dynamic_filters() const
   return _dynamic_filter_session.plan().enabled();
 }
 
-void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
-{
-  std::lock_guard<std::mutex> lg(op_state_mutex);
-  _build_arrives_whole = arrives_whole;
-}
-
 std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_probe_slots()
 {
   auto* build_port = get_port("build");
@@ -2325,30 +2319,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             *input_batches[0].get_memory_space(),
                             stream,
                             batch_telemetry());
-}
-
-void sirius_physical_hash_join::push_data_batch_partitioned(
-  std::string_view port_id,
-  std::shared_ptr<::cucascade::data_batch> batch,
-  std::size_t partition_idx)
-{
-  auto const deposit = [&] {
-    sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
-      port_id, batch, partition_idx);
-  };
-  if (port_id == "build" && batch) {
-    bool whole = false;
-    {
-      std::scoped_lock lock(op_state_mutex);
-      whole = _build_arrives_whole;
-    }
-    if (whole) {
-      _dynamic_filter_session.observe_whole_build(complete_build_delivery{batch}, deposit);
-      return;
-    }
-  }
-
-  deposit();
 }
 
 void sirius_physical_hash_join::on_finalize_operator()

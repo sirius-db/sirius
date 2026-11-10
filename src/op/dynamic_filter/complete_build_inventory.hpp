@@ -95,11 +95,11 @@ struct build_input_facts {
 /**
  * @brief The certified set of original batches received through one complete build input.
  *
- * `dynamic_filter_publication_session` accumulates a Bloom filter against this inventory: every
- * listed batch must contribute exactly once before the filter can be published. Batch IDs are
- * sorted and unique and carry their exact row counts and, per top-level column, the carrier and
- * null count they arrived with. Only `build_arrival_ledger::certify` creates an inventory, and
- * neither construction nor inspection performs GPU work.
+ * `dynamic_filter_publication_session` plans and constructs a join's dynamic filters against this
+ * inventory alone: every listed batch must contribute exactly once before any filter can be
+ * published. Batch IDs are sorted and unique and carry their exact row counts and, per top-level
+ * column, the carrier and null count they arrived with. Only `build_arrival_ledger::certify`
+ * creates an inventory, and neither construction nor inspection performs GPU work.
  */
 class complete_build_inventory final {
  public:
@@ -250,57 +250,15 @@ class build_arrival_ledger final {
 
 namespace detail {
 
-/**
- * @brief The Bloom geometry shared by every key and every GPU of one accumulation.
- *
- * Every per-GPU partial array and every published replica has `raw_bytes` of storage. Publication
- * moves each array in chunks of `chunk_bytes`; the last chunk of an array may be shorter.
- */
-struct accumulated_bloom_geometry {
-  static constexpr std::size_t k_min_transfer_chunk_bytes = std::size_t{2} << 20;
-  static constexpr std::size_t k_max_transfer_chunk_bytes = std::size_t{8} << 20;
-
-  /**
-   * @brief Bloom filter blocks per key.
-   */
-  std::size_t blocks;
-  /**
-   * @brief Bytes of one key's filter array, a whole number of blocks.
-   */
-  std::size_t raw_bytes;
-  /**
-   * @brief `raw_bytes` rounded up to the allocation alignment and summed over the active keys: the
-   * footprint on one GPU.
-   */
-  std::size_t arrays_bytes;
-  /**
-   * @brief Transfer chunk: a multiple of the allocation alignment and at most `raw_bytes` rounded
-   * up to that alignment.
-   */
-  std::size_t chunk_bytes;
-
-  /**
-   * @brief Number of chunks per key array.
-   */
-  [[nodiscard]] std::size_t chunks_per_key() const noexcept
-  {
-    return ::cuda::ceil_div(raw_bytes, chunk_bytes);
-  }
-
-  /**
-   * @brief Sizes one Bloom array for @p total_rows keys.
-   *
-   * @return nullopt when there are no active keys, the arithmetic overflows, or `arrays_bytes`
-   * exceeds @p cap
-   */
-  [[nodiscard]] static std::optional<accumulated_bloom_geometry> try_create(
-    std::size_t total_rows, std::size_t active_keys, std::uint64_t cap) noexcept;
-};
+/// Smallest transfer chunk a Bloom array moves in when it is merged or replicated.
+inline constexpr std::size_t k_min_bloom_transfer_chunk_bytes = std::size_t{2} << 20;
+/// Largest transfer chunk a Bloom array moves in when it is merged or replicated.
+inline constexpr std::size_t k_max_bloom_transfer_chunk_bytes = std::size_t{8} << 20;
 
 /**
  * @brief The transfer chunk for one array of @p raw_bytes: an eighth of the array, clamped to
- * `accumulated_bloom_geometry`'s chunk bounds, rounded up to the allocation alignment, and at most
- * the aligned array.
+ * [`k_min_bloom_transfer_chunk_bytes`, `k_max_bloom_transfer_chunk_bytes`], rounded up to the
+ * allocation alignment, and at most the aligned array.
  *
  * @pre @p raw_bytes rounded up to the allocation alignment does not overflow
  */

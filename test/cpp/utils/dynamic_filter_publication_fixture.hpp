@@ -18,6 +18,8 @@
 
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/dynamic_filter/complete_build_inventory.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -50,6 +52,7 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::test::publication {
@@ -157,7 +160,7 @@ struct claim_fixture {
     }
 
     // Ports the converter would normally materialize. Repositories stay null ("nowhere to
-    // route"); publication claims and reads only the batch, independent of routing.
+    // route"); construction reads only the batch, independent of routing.
     for (auto const port_id : {std::string_view{"build"}, std::string_view{"default"}}) {
       auto port  = std::make_unique<sirius::op::sirius_physical_operator::port>();
       port->type = sirius::op::MemoryBarrierType::FULL;
@@ -183,19 +186,41 @@ struct claim_fixture {
       space, keys, cudf::type_id::INT64);
   }
 
-  /// The default whole-build batch: kBuildRows keys in the fixture's GPU-0 space.
+  /// The default build batch: kBuildRows keys in the fixture's GPU-0 space.
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_build_batch()
   {
     return make_build_batch_on(*gpu_space);
   }
 
-  void push_build_batch()
+  /**
+   * @brief Constructs and publishes the join's filters from @p batch as its build PARTITION would:
+   * certify the one-batch build, begin, contribute on a task stream, and publish as the final
+   * contributor. Exceptions propagate.
+   */
+  void construct_from(std::shared_ptr<cucascade::data_batch> const& batch)
   {
-    hash_join->push_data_batch_partitioned("build", make_build_batch(), /*partition_idx=*/0);
+    auto& session = hash_join->dynamic_filter_session();
+    sirius::op::build_arrival_ledger ledger;
+    ledger.record(*batch);
+    auto certified = ledger.certify({.repository_batches = 1});
+    if (auto const* decline = std::get_if<sirius::op::construction_decline>(&certified)) {
+      session.decline(*decline);
+      return;
+    }
+    (void)session.begin(std::move(std::get<sirius::op::complete_build_inventory>(certified)));
+    auto source       = batch->to_read_only();
+    auto const stream = gpu_space->acquire_stream();
+    session.contribute(batch->get_batch_id(), source, stream);
+    stream.sync();
+    session.publish_if_final(batch->get_batch_id(), *gpu_space, stream);
+    stream.sync();
   }
 
-  /// The same whole-build batch, converted in place to the host tier before delivery (the shape of
-  /// a batch downgraded ahead of the publish hook).
+  /// Constructs from the default build batch.
+  void construct() { construct_from(make_build_batch()); }
+
+  /// The same build batch, converted in place to the host tier (the shape of a batch downgraded
+  /// before it is read).
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_host_build_batch()
   {
     auto batch     = make_build_batch();

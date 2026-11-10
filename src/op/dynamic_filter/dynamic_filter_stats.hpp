@@ -28,13 +28,12 @@ namespace sirius::op {
  *
  * `dynamic_filter_stats` holds them as atomics for the lifetime of a connection.
  * `dynamic_filter_stats_snapshot` holds plain values, both for a copy of those atomics and for the
- * counts that one publication attempt adds to them (`dynamic_filter_publication_outcome`).
+ * counts that one publication attempt adds to them.
  * `dynamic_filter_counter_fields` lists every field once for both conversions.
  *
- * `producers_enabled` counts plan construction, not execution. Each claim increments
- * `publication_attempts` and exactly one of `publications_finished`, `publications_failed`, or
- * `publications_skipped_source_not_resident`; a source skip may reopen the claim window.
- * `publications_skipped_build_not_whole` is counted once per join rather than once per delivery.
+ * `producers_enabled` counts plan construction, not execution. Each `begin` increments
+ * `publication_attempts` and, once the attempt ends, exactly one of `publications_finished` or
+ * `publications_failed`.
  * `bindings_skipped_incompatible_probe` counts bindings whose recorded probe type no membership
  * adapter can read, which would decline every batch. `applications_skipped_other_device` counts
  * batches a `sirius::op::scan::dynamic_filter_consumer` passed through unfiltered because the batch
@@ -95,7 +94,6 @@ struct dynamic_filter_counters {
   Counter accumulation_publications_host_staged{};
   Counter accumulation_publication_latency_ns{};
   Counter keys_skipped_bloom_size_gate{};
-  Counter keys_skipped_bloom_unsupported{};
   Counter keys_sized_on_total_rows{};
   Counter filters_skipped_construction_invariant{};
   Counter filters_skipped_construction_admission{};
@@ -112,8 +110,6 @@ struct dynamic_filter_counters {
   Counter publication_attempts{};
   Counter publications_finished{};
   Counter publications_failed{};
-  Counter publications_skipped_source_not_resident{};
-  Counter publications_skipped_build_not_whole{};
   Counter publications_skipped_targets_drained{};
   Counter filters_pushed{};
 
@@ -152,7 +148,6 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulation_publications_host_staged,
   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
-  &dynamic_filter_counters<Counter>::keys_skipped_bloom_unsupported,
   &dynamic_filter_counters<Counter>::keys_sized_on_total_rows,
   &dynamic_filter_counters<Counter>::filters_skipped_construction_invariant,
   &dynamic_filter_counters<Counter>::filters_skipped_construction_admission,
@@ -167,8 +162,6 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::publication_attempts,
   &dynamic_filter_counters<Counter>::publications_finished,
   &dynamic_filter_counters<Counter>::publications_failed,
-  &dynamic_filter_counters<Counter>::publications_skipped_source_not_resident,
-  &dynamic_filter_counters<Counter>::publications_skipped_build_not_whole,
   &dynamic_filter_counters<Counter>::publications_skipped_targets_drained,
   &dynamic_filter_counters<Counter>::filters_pushed,
   &dynamic_filter_counters<Counter>::bindings_skipped_incompatible_probe,

@@ -300,35 +300,14 @@ void build_arrival_ledger::close(construction_decline reason) noexcept
   close();
 }
 
-//===--------------------------------------------------------------------===//
-// accumulated_bloom_geometry
-//===--------------------------------------------------------------------===//
-std::optional<detail::accumulated_bloom_geometry> detail::accumulated_bloom_geometry::try_create(
-  std::size_t total_rows, std::size_t active_keys, std::uint64_t cap) noexcept
-{
-  auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  auto constexpr maximum   = std::numeric_limits<std::size_t>::max();
-  if (active_keys == 0) { return std::nullopt; }
-  auto const blocks = bloom_blocks_for(total_rows);
-  if (blocks > maximum / bloom_bytes_per_block) { return std::nullopt; }
-  auto const raw_bytes = blocks * bloom_bytes_per_block;
-  if (raw_bytes > maximum - (alignment - 1)) { return std::nullopt; }
-  auto const aligned_bytes = rmm::align_up(raw_bytes, alignment);
-  if (active_keys > maximum / aligned_bytes) { return std::nullopt; }
-  auto const arrays_bytes = aligned_bytes * active_keys;
-  if (arrays_bytes > cap) { return std::nullopt; }
-  return accumulated_bloom_geometry{
-    blocks, raw_bytes, arrays_bytes, accumulated_bloom_chunk_bytes(raw_bytes)};
-}
-
 std::size_t detail::accumulated_bloom_chunk_bytes(std::size_t raw_bytes) noexcept
 {
   auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  return std::min(rmm::align_up(std::clamp(raw_bytes / 8,
-                                           accumulated_bloom_geometry::k_min_transfer_chunk_bytes,
-                                           accumulated_bloom_geometry::k_max_transfer_chunk_bytes),
-                                alignment),
-                  rmm::align_up(raw_bytes, alignment));
+  return std::min(
+    rmm::align_up(
+      std::clamp(raw_bytes / 8, k_min_bloom_transfer_chunk_bytes, k_max_bloom_transfer_chunk_bytes),
+      alignment),
+    rmm::align_up(raw_bytes, alignment));
 }
 
 }  // namespace sirius::op

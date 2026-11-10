@@ -2637,7 +2637,7 @@ TEST_CASE("BOOL8 prior default remains a sound unhinted capability fallback",
 }
 
 TEST_CASE("BOOL8 prior probes accumulated Bloom replicas",
-          "[dynamic_filter][probe][bool8_prior][multi_partition]")
+          "[dynamic_filter][probe][bool8_prior][construction]")
 {
   sirius::test::accumulation::fixture fixture;
   auto first  = fixture.make_batch(0, 0, 100);

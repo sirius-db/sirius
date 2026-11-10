@@ -94,7 +94,7 @@ Each right has a preallocated terminal slot; finishing it is allocation-free, no
 | Terminal, empty | No producer can add a filter |
 | Terminal, nonempty | The final set of independently valid filters is available |
 
-Filter presence is separate from attempt completion. A successfully examined empty or policy-skipped build increments `publications_finished` but resolves its right without a filter. A cancelled active attempt increments `publications_failed`; cancellation before any claim creates no attempt. An unusable source is counted only in `publications_skipped_source_not_resident`, including when input closure prevents retry.
+Filter presence is separate from attempt completion. A successfully examined empty or policy-skipped build increments `publications_finished` but resolves its right without a filter. A cancelled active attempt increments `publications_failed`; cancellation before any claim creates no attempt.
 
 ### Multi-partition build accumulation
 
@@ -313,7 +313,7 @@ The settings live under `sirius.operator_params`:
 - The join-edge (direct) route additionally requires identical build and probe storage types (including decimal scale).
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.
 - Accumulation publishes only a Bloom filter (no IN-list or zone map), and only from a closed FULL input. A single-partition multi-batch build needs one folded delivery unless it has an eligible BUILD_FILTER stage.
-- Accumulation accepts only `INT32` and `INT64` keys; other admitted key types are counted in `keys_skipped_bloom_unsupported` and publish only from a whole build. An accumulated filter is probed through the same per-carrier adapter as every other membership filter, so it serves every probe carrier its key family accepts. Accumulation applies the fan-out's probe-type rule too: a key none of whose bindings it could serve is skipped before any array is allocated, and each binding the accumulated fan-out cannot serve gets no filter; both are counted as `bindings_skipped_incompatible_probe`.
+- An accumulated filter is probed through the same per-carrier adapter as every other membership filter, so it serves every probe carrier its key family accepts. Accumulation applies the fan-out's probe-type rule too: a key none of whose bindings it could serve is skipped before any array is allocated, and each binding the accumulated fan-out cannot serve gets no filter; both are counted as `bindings_skipped_incompatible_probe`.
 - Accumulated publication keeps the elected PARTITION or BUILD_FILTER task's worker slot and reservation through reduction and its host wait, then permits that task's deposit. It delays work requiring that deposit or build completion; it adds no barrier to already-runnable CONCAT, probe, or scan work.
 - Accumulated publication selects direct `cudaMemcpyPeerAsync` copies when every replica pool grants access to every other replica GPU; otherwise, or when direct scratch is refused during preparation, it stages each chunk through bounded pinned HOST memory, so missing peer permission alone does not decline the filter; workspace refusal can still decline accumulation (see [multi-partition build accumulation](#multi-partition-build-accumulation)). A grant does not measure the physical copy route. On PCIe topologies HOST staging lengthens publication, which delays the elected task's deposit and any CONCAT shuffle that depends on it.
 - Accumulation does not yet judge selectivity: a Bloom filter that keeps most probe rows is still built and applied. Such a filter can cost more than it saves.
@@ -333,7 +333,7 @@ The settings live under `sirius.operator_params`:
 - GPU membership implementations: `src/cuda/sirius_dynamic_small_in_list_filter.cu`, `src/cuda/sirius_dynamic_in_list_filter.cu`, and `src/cuda/sirius_dynamic_bloom_filter.cu`
 - Focused validation: dynamic-filter tests under `test/cpp/planner/`, `test/cpp/operator/`, `test/cpp/scan/`, `test/cpp/pipeline/`, and `test/cpp/integration/`
 
-The lifecycle selector is `[dynamic_filter][publication_lifecycle]`; existing one-shot publication tests remain under `[dynamic_filter][publication_claim]` and `[dynamic_filter][publisher]`. Accumulation is covered by `[dynamic_filter][multi_partition]` and its memory isolation by `[dynamic_filter][memory]`. These tests share the GPU-initializing test harness. Coordinate GPU availability before running `pixi run build/release/test/cpp/sirius_unittest '[dynamic_filter]'`.
+The lifecycle selector is `[dynamic_filter][publication_lifecycle]`; existing one-shot publication tests remain under `[dynamic_filter][publication_claim]` and `[dynamic_filter][publisher]`. Construction is covered by `[dynamic_filter][construction]` and its memory isolation by `[dynamic_filter][memory]`. These tests share the GPU-initializing test harness. Coordinate GPU availability before running `pixi run build/release/test/cpp/sirius_unittest '[dynamic_filter]'`.
 
 Related details are covered in [Pipeline Execution](pipeline-execution.md), [Scan](scan.md), and [Multi-GPU Architecture](multi-gpu-architecture.md).
 

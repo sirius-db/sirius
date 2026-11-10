@@ -16,7 +16,8 @@
 
 /**
  * @file test_dynamic_filter_publisher.cpp
- * @brief Pins publish_dynamic_filters' per-key filter construction, fan-out, and plan validation
+ * @brief Pins the per-key filters a publication session constructs from a one-batch build, their
+ * fan-out, and plan validation
  *
  * Sections, in file order:
  *  - Tier precedence: the raw small IN-list wins at <= k_max_keys build rows, and one row above
@@ -54,6 +55,8 @@
  * `test_dynamic_filter_source_policy.cpp`.
  */
 
+#include "data/data_batch_utils.hpp"
+#include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -65,6 +68,7 @@
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -88,6 +92,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -98,36 +103,46 @@ constexpr std::size_t kProbeColumnIndex = 7;
 using sirius::op::dynamic_filter_publish_plan;
 using sirius::op::dynamic_filter_route_class;
 
-sirius::op::dynamic_filter_publication_outcome publish_for_test(
-  dynamic_filter_publish_plan const& plan, cudf::table_view const& table, ::cuda::stream_ref stream)
+/// What one publication added to the counters, and the targets that still accepted filters.
+struct publication_result : sirius::op::dynamic_filter_stats_snapshot {
+  std::size_t active_targets = 0;
+};
+
+/**
+ * @brief Constructs and publishes @p plan's filters from @p table as one certified build batch,
+ * through the session a build PARTITION drives; exceptions propagate.
+ */
+publication_result publish_for_test(dynamic_filter_publish_plan const& plan,
+                                    cudf::table_view const& table,
+                                    ::cuda::stream_ref stream)
 {
-  std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
-  for (auto const& target : plan.probe_targets()) {
-    std::vector<std::size_t> columns;
-    for (auto const& binding : target.key_bindings) {
-      columns.push_back(binding.channel_push_ordinal);
-    }
-    producers.push_back(target.filter_set->register_producer(std::move(columns)));
-  }
-  for (auto const& target : plan.probe_targets()) {
-    target.filter_set->freeze_registration();
-  }
-  try {
-    auto result = sirius::op::publish_dynamic_filters(plan, table, stream, producers);
+  auto& space = plan.replica_spaces().front().get_gpu_space();
+  auto batch  = sirius::make_data_batch(cudf::table{table, stream, space.get_default_allocator()},
+                                       space,
+                                       stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  stream.sync();
+  publication_result result;
+  result.active_targets =
+    static_cast<std::size_t>(std::ranges::count_if(plan.probe_targets(), [](auto const& target) {
+      return target.filter_set && target.filter_set->accepting_filters();
+    }));
+  sirius::op::dynamic_filter_stats stats;
+  sirius::op::dynamic_filter_publication_session session{plan, &stats};
+  sirius::op::build_arrival_ledger ledger;
+  ledger.record(*batch);
+  auto certified = ledger.certify({.repository_batches = 1});
+  REQUIRE(std::holds_alternative<sirius::op::complete_build_inventory>(certified));
+  if (session.begin(std::move(std::get<sirius::op::complete_build_inventory>(certified)))) {
+    auto source = batch->to_read_only();
+    session.contribute(batch->get_batch_id(), source, stream);
     stream.sync();
-    for (auto const& producer : producers) {
-      producer.finish(result.filters_pushed != 0
-                        ? sirius::op::sirius_dynamic_filter_set::completion::PUBLISHED
-                        : sirius::op::sirius_dynamic_filter_set::completion::SKIPPED);
-    }
-    return result;
-  } catch (...) {
+    session.publish_if_final(batch->get_batch_id(), space, stream);
     stream.sync();
-    for (auto const& producer : producers) {
-      producer.finish(sirius::op::sirius_dynamic_filter_set::completion::FAILED);
-    }
-    throw;
   }
+  session.finalize_input();
+  static_cast<sirius::op::dynamic_filter_stats_snapshot&>(result) = stats.snapshot();
+  return result;
 }
 
 constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
@@ -472,14 +487,13 @@ void require_published_membership(
   }
 }
 
-void require_nothing_published(sirius::op::dynamic_filter_publication_outcome const& outcome)
+// The key is judged when construction begins; nothing is built or pushed.
+void require_nothing_published(publication_result const& outcome)
 {
-  REQUIRE(outcome.keys_considered == 0);
   REQUIRE(outcome.keys_skipped_domain_gate == 0);
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
   REQUIRE(outcome.membership_filters_built == 0);
   REQUIRE(outcome.zone_map_filters_built == 0);
-  REQUIRE(outcome.active_targets == 0);
   REQUIRE(outcome.filters_pushed == 0);
 }
 
@@ -563,7 +577,7 @@ void require_domain_gate_skips_only(std::size_t gated_key_index,
     std::size_t decisions = 0;
     std::size_t skips     = 0;
     for (auto const& record : logs.records()) {
-      if (!record.message.starts_with("[dynamic_filter_domain] path=ordinary ")) { continue; }
+      if (!record.message.starts_with("[dynamic_filter_domain] path=construction ")) { continue; }
       INFO(record.message);
       REQUIRE(record.message.find("provenance=pinned_parquet_exact eligible=1") !=
               std::string::npos);
@@ -1466,7 +1480,7 @@ TEST_CASE("an unknown domain source cannot authorize a declared uniqueness gate"
           std::vector<std::uint8_t>(95, 1));
   std::size_t decisions = 0;
   for (auto const& record : logs.records()) {
-    if (!record.message.starts_with("[dynamic_filter_domain] path=ordinary ")) { continue; }
+    if (!record.message.starts_with("[dynamic_filter_domain] path=construction ")) { continue; }
     INFO(record.message);
     REQUIRE(record.message.find("provenance=unknown eligible=0") != std::string::npos);
     REQUIRE(record.message.ends_with("decision=keep"));
@@ -1722,6 +1736,7 @@ TEST_CASE("dynamic-filter publisher publishes nothing once every target has drai
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   require_nothing_published(outcome);
+  REQUIRE(outcome.active_targets == 0);
   REQUIRE(channel->snapshot().empty());
   REQUIRE_FALSE(channel->has_filters());
 }

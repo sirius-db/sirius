@@ -673,7 +673,7 @@ struct partition_sizing_fixture {
 }  // namespace
 
 TEST_CASE("build PARTITION certifies its pushed input once before any batch leaves",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture;
   auto const first  = fixture.push({1, 3});
@@ -708,7 +708,7 @@ TEST_CASE("build PARTITION certifies its pushed input once before any batch leav
 }
 
 TEST_CASE("a push after certification fails, and is harmless once the ledger is abandoned",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   SECTION("certified: the late batch is rejected before it becomes poppable")
   {
@@ -745,7 +745,7 @@ TEST_CASE("a push after certification fails, and is harmless once the ledger is 
 }
 
 TEST_CASE("build PARTITION declines inputs it cannot account for",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture;
   auto const first  = fixture.push({1, 3});
@@ -827,7 +827,7 @@ TEST_CASE("build PARTITION declines inputs it cannot account for",
 }
 
 TEST_CASE("a build input that cannot be read fails the task and leaves the accumulation to cancel",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture;
   auto const first  = fixture.push({1, 3});
@@ -855,7 +855,7 @@ TEST_CASE("a build input that cannot be read fails the task and leaves the accum
 }
 
 TEST_CASE("a final contributor rescheduled before its scatter publishes once on its retry",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture;
   std::vector<std::int32_t> many(300'000);
@@ -897,7 +897,7 @@ TEST_CASE("a final contributor rescheduled before its scatter publishes once on 
 }
 
 TEST_CASE("the build PARTITION's finalize releases storage a task thread retired",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture{{.per_thread_tracking = true}};
   auto const* allocator = fixture.gpu->get_memory_resource_of<Tier::GPU>();
@@ -930,7 +930,7 @@ TEST_CASE("the build PARTITION's finalize releases storage a task thread retired
 }
 
 TEST_CASE("drained finalization closes and releases unfinished accumulated input",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   auto const per_thread = GENERATE(false, true);
   auto const pending    = GENERATE(false, true);
@@ -971,7 +971,7 @@ TEST_CASE("drained finalization closes and releases unfinished accumulated input
 }
 
 TEST_CASE("single-partition and broadcast builds construct at the PARTITION and end Terminal",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   auto const multi_partition = GENERATE(false, true);
   auto const broadcast       = GENERATE(false, true);
@@ -992,7 +992,6 @@ TEST_CASE("single-partition and broadcast builds construct at the PARTITION and 
   } else {
     fixture.tree.build_partition->set_fixed_layout(
       sirius::test::operator_utils::fixed_hash_layout(1));
-    fixture.tree.join->set_build_arrives_whole(true);
   }
   std::size_t index = 0;
   for (auto const name : {"build", "default"}) {
@@ -1001,8 +1000,8 @@ TEST_CASE("single-partition and broadcast builds construct at the PARTITION and 
     port->repo = &join_input[index++];
     fixture.tree.join->add_port(name, std::move(port));
   }
-  auto const batch = fixture.push({1, 3, 7, 9});
-  auto input       = fixture.tree.build_partition->get_next_task_input_data();
+  fixture.push({1, 3, 7, 9});
+  auto input = fixture.tree.build_partition->get_next_task_input_data();
   REQUIRE(input);
   if (broadcast) { REQUIRE(fixture.tree.join->is_build_probe_mode()); }
   REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
@@ -1017,10 +1016,6 @@ TEST_CASE("single-partition and broadcast builds construct at the PARTITION and 
   REQUIRE_FALSE(fixture.channel->snapshot().empty());
   fixture.tree.build_partition->finalize_operator();
   REQUIRE(fixture.tree.join->dynamic_filter_session().terminal());
-  // The one-shot path claims only an OPEN session, so the deposit publishes nothing more.
-  auto const filters = fixture.channel->filter_count();
-  fixture.tree.join->push_data_batch_partitioned("build", batch, 0);
-  REQUIRE(fixture.channel->filter_count() == filters);
   auto const counters = fixture.stats.snapshot();
   REQUIRE(counters.accumulation_completed_contributions == 1);
   REQUIRE(counters.publication_attempts == 1);
@@ -1028,7 +1023,7 @@ TEST_CASE("single-partition and broadcast builds construct at the PARTITION and 
 }
 
 TEST_CASE("a single-partition build over the Bloom cap gets no Bloom and ends Terminal",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture{
     {.cap = 1, .preset_partition_count = false, .inlist_max_l2_fraction = 0.0}};
@@ -1086,7 +1081,7 @@ void move_batch(data_batch& batch, memory_space const& space, ::cuda::stream_ref
 }  // namespace
 
 TEST_CASE("a compressed spilled build arrival declines construction at the PARTITION",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture;
   fixture.push({1, 3});
@@ -1104,7 +1099,7 @@ TEST_CASE("a compressed spilled build arrival declines construction at the PARTI
 }
 
 TEST_CASE("a build batch that arrives spilled to host publishes once it is back on the GPU",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture;
   fixture.push({1, 3});
@@ -1131,7 +1126,7 @@ TEST_CASE("a build batch that arrives spilled to host publishes once it is back 
 }
 
 TEST_CASE("an empty build ends Terminal without a filter",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   partition_accumulation_fixture fixture{{.preset_partition_count = false}};
   fixture.tree.build_partition->set_fixed_layout(
@@ -1163,7 +1158,7 @@ TEST_CASE("an empty build ends Terminal without a filter",
 }
 
 TEST_CASE("a constructing forward-layout PARTITION budgets its task scratch",
-          "[physical_partition][dynamic_filter][multi_partition][memory_estimate]")
+          "[physical_partition][dynamic_filter][construction][memory_estimate]")
 {
   partition_accumulation_fixture fixture{{.preset_partition_count = false}};
   fixture.tree.build_partition->set_fixed_layout(
@@ -1231,7 +1226,7 @@ TEST_CASE("a constructing forward layout adds no wait and no wake to its FULL in
 }
 
 TEST_CASE("a non-FULL build input never accumulates and never blocks",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   sirius_physical_operator order_by{
     SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
@@ -1253,7 +1248,7 @@ TEST_CASE("a non-FULL build input never accumulates and never blocks",
 }
 
 TEST_CASE("a FULL build input is certified only after its source pipeline finished",
-          "[physical_partition][dynamic_filter][multi_partition]")
+          "[physical_partition][dynamic_filter][construction]")
 {
   SECTION("an unfinished source keeps every batch queued")
   {
