@@ -5784,12 +5784,12 @@ TEST_CASE(
       CHECK(d5_vals[0] == 123);
       CHECK(d5_vals[1] == -999);
       CHECK(d5_vals[2] == 0);
-      // Col 1 (TINYINT): {12, -99, 0, NULL}
+      // Col 1 (TINYINT): {12, -100, 0, NULL}; like DuckDB, the cast rounds to the nearest integer.
       CHECK(copy_valids_to_host(dec_out->view().column(1)) ==
             std::vector<bool>{true, true, true, false});
       auto const ti_vals = copy_column_to_host<std::int8_t>(dec_out->view().column(1));
       CHECK(ti_vals[0] == 12);
-      CHECK(ti_vals[1] == -99);
+      CHECK(ti_vals[1] == -100);
       CHECK(ti_vals[2] == 0);
       // Col 2 (BOOLEAN): {1, 1, 0, 1}
       CHECK(copy_bool_column_to_host(dec_out->view().column(2)) ==
