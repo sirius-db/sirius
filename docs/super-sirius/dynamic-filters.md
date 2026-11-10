@@ -100,7 +100,7 @@ Filter presence is separate from attempt completion. A successfully examined emp
 
 ### Multi-partition build accumulation
 
-`enable_dynamic_filter_multi_partition` enables Bloom accumulation in a non-broadcast HASH build PARTITION with more than one downstream partition, and in the early BUILD_FILTER stage described below. Whole-build publication keeps its existing selection and lifecycle. Accumulation admits INT32 and INT64 keys independently, using the existing domain-coverage and probe-compatibility gates. `max_dynamic_filter_bloom_bytes_per_gpu` limits the aligned arrays across all active keys on each replica GPU and must be greater than zero; cap refusal logs the row count, active-key count, required bytes (or arithmetic overflow), and cap.
+Every build PARTITION constructs its join's filters from the certified batches of its build, and so does the early BUILD_FILTER stage described below; `enable_dynamic_filter` governs both. `max_dynamic_filter_bloom_bytes_per_gpu` limits the aligned arrays across all active keys on each replica GPU and must be greater than zero; cap refusal logs the row count, active-key count, required bytes (or arithmetic overflow), and cap.
 
 **Complete input and stable identity.** `build_arrival_ledger` records original IDs, exact row counts, and consistent top-level types before each batch is deposited into the PARTITION or BUILD_FILTER stage's `default` port. Certification requires one single-partition input behind a FULL barrier, a finished source pipeline, and an exact match with repository batch count. The resulting `complete_build_inventory` is independent of the downstream partition count; the ordinary PARTITION path still requires more than one downstream partition. Unreadable or non-GPU arrivals decline certification. The ledger also records each top-level column's carrier type and null count per batch (`read_arrival`, from GPU column views or host and disk column metadata), which `complete_build_inventory::facts` summarizes. Both sites share one decision, `certify_decision` (`build_input_certification.hpp`), and count each decline by reason: a wrong input shape or a ledger mismatch in `accumulations_skipped_inventory`, and a PIPELINE barrier, a late-materialization directive, an unreadable or non-GPU arrival, or a compressed arrival in its own `accumulations_declined_*` counter. A missing or retyped column makes that ordinal permanently unavailable while independently valid sibling keys remain eligible. Payload columns and nested child layouts do not constrain key admission. A late arrival with rows violates the FULL-barrier contract and throws; a readable empty batch adds no keys and is ignored. Direct `ORDER BY` inputs to PARTITION use a PIPELINE barrier and decline accumulation.
 
@@ -120,7 +120,7 @@ This placement holds the final task's reservation, input pins, scatter outputs, 
 
 ### Early publication for right semi/anti joins
 
-`RIGHT_SEMI` and `RIGHT_ANTI` size their partitions from the complete probe input. Publishing only while partitioning the build would therefore be too late for that probe. For eligible filters, the planner inserts `sirius_physical_build_filter` between the build subtree and its PARTITION. It requires dynamic filters, `enable_dynamic_filter_multi_partition`, a positive Bloom cap, and admitted INT32 or INT64 keys.
+`RIGHT_SEMI` and `RIGHT_ANTI` size their partitions from the complete probe input. Publishing only while partitioning the build would therefore be too late for that probe. For eligible filters, the planner inserts `sirius_physical_build_filter` between the build subtree and its PARTITION. It requires dynamic filters.
 
 The stage certifies its complete FULL input before popping any batch. Scheduled GPU tasks contribute the original batch IDs to the join's publication session and forward the same batches unchanged. The final contribution publishes before the stage completes. The non-driving build PARTITION follows this stage's readiness before asking the probe to determine partition sizing; the existing rules for partition count, placement, broadcast eligibility, and execution mode still apply.
 
@@ -296,7 +296,6 @@ The settings live under `sirius.operator_params`:
 | Setting | Default | Meaning |
 |---|---:|---|
 | `enable_dynamic_filter` | `true` | Enable key discovery, membership publication, scan targets, and join-edge endpoints |
-| `enable_dynamic_filter_multi_partition` | `true` | Enable PARTITION accumulation and early BUILD_FILTER publication for right semi/anti joins |
 | `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Per-GPU cap on one join's accumulated arrays (active keys times the array size rounded up to 256 bytes); must be greater than zero |
 | `enable_dynamic_zone_map_filter` | `false` | Also emit a global min/max filter; requires dynamic filters |
 | `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip an eligible key at or above this known row-domain coverage; values above `1.0` disable the gate |

@@ -457,7 +457,6 @@ struct partition_accumulation_options {
   std::uint64_t cap           = 64 * mib;  ///< `max_dynamic_filter_bloom_bytes_per_gpu`
   bool per_thread_tracking    = false;     ///< Track reservations per thread, as the engine does
   bool preset_partition_count = true;      ///< Give both PARTITIONs two partitions up front
-  bool multi_partition        = true;      ///< `enable_dynamic_filter_multi_partition`
   double inlist_max_l2_fraction =
     dynamic_filter_publication_policy::k_default_inlist_max_l2_fraction;  ///< 0 plans only Bloom
 };
@@ -487,7 +486,6 @@ struct partition_accumulation_fixture {
                                   {{channel, dynamic_filter_route_class::scan, false, {{0, 0, type}}}},
                                   {{*gpu, *host}},
                                   {.inlist_max_l2_fraction  = options.inlist_max_l2_fraction,
-                                   .enable_multi_partition  = options.multi_partition,
                                    .max_bloom_bytes_per_gpu = options.cap}},
                   .stats       = &stats});
     tree.join->operator_id            = 1;
@@ -973,11 +971,9 @@ TEST_CASE("drained finalization closes and releases unfinished accumulated input
 TEST_CASE("single-partition and broadcast builds construct at the PARTITION and end Terminal",
           "[physical_partition][dynamic_filter][construction]")
 {
-  auto const multi_partition = GENERATE(false, true);
-  auto const broadcast       = GENERATE(false, true);
-  CAPTURE(multi_partition, broadcast);
-  partition_accumulation_fixture fixture{
-    {.preset_partition_count = false, .multi_partition = multi_partition}};
+  auto const broadcast = GENERATE(false, true);
+  CAPTURE(broadcast);
+  partition_accumulation_fixture fixture{{.preset_partition_count = false}};
   cucascade::shared_data_repository probe_input;
   std::array<cucascade::shared_data_repository, 2> join_input;
   if (broadcast) {

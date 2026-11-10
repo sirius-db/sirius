@@ -183,7 +183,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
-    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
     REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
@@ -249,7 +248,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
-    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
     REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
@@ -274,7 +272,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 1);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
-    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 1);
+    // The retired switch is gone even where internal options are visible.
+    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
+    REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
@@ -1508,7 +1508,6 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
-      current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
       current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
       current_setting('max_build_probe_resident_bytes')::UBIGINT,
       current_setting('spill_compression')::BOOLEAN,
@@ -1540,9 +1539,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->Collection().GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE(settings->Collection().GetValue(19, 0).GetValue<double>() == Approx(0.4));
-  REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
-  REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
-  REQUIRE(settings->Collection().GetValue(22, 0).GetValue<uint64_t>() == 9 * mib);
+  REQUIRE(settings->Collection().GetValue(20, 0).GetValue<uint64_t>() == 17 * mib);
+  REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 9 * mib);
   auto require_resident_budget = [&](uint64_t value) {
     auto result = con.Query("SELECT current_setting('max_build_probe_resident_bytes')::UBIGINT");
     REQUIRE(result != nullptr);
@@ -1558,9 +1556,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(resident_reset != nullptr);
   REQUIRE_FALSE(resident_reset->HasError());
   require_resident_budget(9 * mib);
-  REQUIRE(settings->Collection().GetValue(23, 0).GetValue<bool>());
-  REQUIRE_FALSE(settings->Collection().GetValue(24, 0).GetValue<bool>());
-  REQUIRE(settings->Collection().GetValue(25, 0).GetValue<uint64_t>() == 9 * mib);
+  REQUIRE(settings->Collection().GetValue(22, 0).GetValue<bool>());
+  REQUIRE_FALSE(settings->Collection().GetValue(23, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(24, 0).GetValue<uint64_t>() == 9 * mib);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
@@ -1569,7 +1567,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     REQUIRE(rejected->HasError());
     if (std::string_view{invalid_budget} == "0") {
       REQUIRE_THAT(rejected->GetError(),
-                   Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition"));
+                   Catch::Matchers::ContainsSubstring("must be greater than zero") &&
+                     !Catch::Matchers::ContainsSubstring("multi_partition"));
     }
     REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
             17 * mib);
@@ -1671,28 +1670,20 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET max_sort_partition_memory_fraction");
   require_ok("SET enable_dynamic_filter = true");
   require_ok("RESET enable_dynamic_filter");
-  require_ok("SET enable_dynamic_filter_multi_partition = false");
-  REQUIRE_FALSE(
-    duckdb::session_operator_params(*con.context).enable_dynamic_filter_multi_partition);
-  // Session overrides must leave the shared YAML defaults unchanged.
-  REQUIRE(sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
-  require_ok("RESET enable_dynamic_filter_multi_partition");
-  REQUIRE(duckdb::session_operator_params(*con.context).enable_dynamic_filter_multi_partition);
   require_ok("SET max_dynamic_filter_bloom_bytes_per_gpu = 18446744073709551615");
   REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
           std::numeric_limits<uint64_t>::max());
+  // Session overrides must leave the shared YAML defaults unchanged.
   REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
           17 * mib);
   require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
   REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
           17 * mib);
-  auto multi_reset = con.Query(
-    "SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN, "
-    "current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT");
-  REQUIRE(multi_reset != nullptr);
-  REQUIRE_FALSE(multi_reset->HasError());
-  REQUIRE(multi_reset->Collection().GetValue(0, 0).GetValue<bool>());
-  REQUIRE(multi_reset->Collection().GetValue(1, 0).GetValue<uint64_t>() == 17 * mib);
+  auto budget_reset =
+    con.Query("SELECT current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT");
+  REQUIRE(budget_reset != nullptr);
+  REQUIRE_FALSE(budget_reset->HasError());
+  REQUIRE(budget_reset->Collection().GetValue(0, 0).GetValue<uint64_t>() == 17 * mib);
   require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
   require_ok("RESET dynamic_filter_domain_coverage_threshold");
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
