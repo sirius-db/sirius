@@ -49,6 +49,7 @@
 #include <op/dynamic_filter/prepared_build_keys.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -196,15 +197,16 @@ TEST_CASE("staged keys equal the column constructor's prepared keys for any spli
       stream.sync();
 
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
-      auto const published =
-        stager->finish(rmm::cuda_device_id{0}, fixture.publication_stream(0), mr);
-      REQUIRE(published);
-      CHECK(published->counts.filters_skipped_construction_invariant == 0);
+      auto const publication = fixture.publication_stream(0);
+      auto const gathered    = stager->gather(rmm::cuda_device_id{0}, publication);
+      REQUIRE(gathered);
+      CHECK_FALSE(gathered->overflowed(0));
       auto const staged = stager->inspect_buffer(0, rmm::cuda_device_id{0});
       REQUIRE(staged);
       CHECK(*staged == bytes_of(expected.keys->view(), stream));
-      auto const* list =
-        dynamic_cast<op::sirius_dynamic_in_list_filter const*>(published->filters.front().get());
+      auto const built = gathered->build(0, publication, mr);
+      publication.sync();
+      auto const* list = dynamic_cast<op::sirius_dynamic_in_list_filter const*>(built.get());
       REQUIRE(list != nullptr);
       CHECK(list->size() == valid);
       CHECK(list->domain() == expected.domain);
@@ -246,23 +248,24 @@ TEST_CASE("staged keys build a small IN-list, and an all-null key the empty set"
   stream.sync();
 
   rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
-  auto const published = stager->finish(rmm::cuda_device_id{0}, fixture.publication_stream(0), mr);
-  REQUIRE(published);
+  auto const publication = fixture.publication_stream(0);
+  auto const gathered    = stager->gather(rmm::cuda_device_id{0}, publication);
+  REQUIRE(gathered);
+  std::array const built{gathered->build(0, publication, mr), gathered->build(1, publication, mr)};
+  publication.sync();
   auto const expected = op::prepare_build_column("[test]", keys->view(), stream, mr);
   CHECK(*stager->inspect_buffer(0, rmm::cuda_device_id{0}) ==
         bytes_of(expected.keys->view(), stream));
-  auto const* small =
-    dynamic_cast<op::sirius_dynamic_small_in_list_filter const*>(published->filters[0].get());
+  auto const* small = dynamic_cast<op::sirius_dynamic_small_in_list_filter const*>(built[0].get());
   REQUIRE(small != nullptr);
   CHECK(small->size() == valid_rows(10));
   CHECK_FALSE(stager->inspect_buffer(1, rmm::cuda_device_id{0}));
-  auto const* empty =
-    dynamic_cast<op::sirius_dynamic_in_list_filter const*>(published->filters[1].get());
+  auto const* empty = dynamic_cast<op::sirius_dynamic_in_list_filter const*>(built[1].get());
   REQUIRE(empty != nullptr);
   CHECK(empty->size() == 0);
 }
 
-TEST_CASE("a staged key with more valid rows than its slice is dropped",
+TEST_CASE("a staged key with more valid rows than its slice builds no list",
           "[dynamic_filter][construction][stager]")
 {
   acc::fixture fixture;
@@ -275,17 +278,20 @@ TEST_CASE("a staged key with more valid rows than its slice is dropped",
                                   {0, int32, op::membership_filter_kind::hash_in_list, 20}},
                                  fixture.spaces);
   REQUIRE(stager);
-  // The second key's slice is one row short: that row is not written, and the key is dropped.
+  // The second key's slice is one row short: that row is not written, and the key reports it.
   std::vector<exact_key_stager::slice> const slices{{0, 20}, {0, 19}};
   REQUIRE(stager->enqueue_add(
     slices, cudf::table_view{{keys->view()}}, rmm::cuda_device_id{0}, stream, mr));
   stream.sync();
   rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
-  auto const published = stager->finish(rmm::cuda_device_id{0}, fixture.publication_stream(0), mr);
-  REQUIRE(published);
-  CHECK(published->filters[0] != nullptr);
-  CHECK(published->filters[1] == nullptr);
-  CHECK(published->counts.filters_skipped_construction_invariant == 1);
+  auto const publication = fixture.publication_stream(0);
+  auto const gathered    = stager->gather(rmm::cuda_device_id{0}, publication);
+  REQUIRE(gathered);
+  CHECK_FALSE(gathered->overflowed(0));
+  CHECK(gathered->overflowed(1));
+  CHECK(gathered->build(0, publication, mr) != nullptr);
+  CHECK_THROWS_AS(gathered->build(1, publication, mr), op::detail::accumulation_invariant_error);
+  publication.sync();
   // The overflowing row stayed inside the slice: the last buffer row is still zero.
   auto const staged = stager->inspect_buffer(1, rmm::cuda_device_id{0});
   REQUIRE(staged);
