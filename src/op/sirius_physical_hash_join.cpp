@@ -2337,25 +2337,10 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       port_id, batch, partition_idx);
   };
   if (port_id == "build" && batch) {
-    bool const accumulated = _dynamic_filter_session.accumulation_claimed();
-    bool whole             = false;
-    bool report_incomplete = false;
+    bool whole = false;
     {
       std::scoped_lock lock(op_state_mutex);
-      whole             = _build_arrives_whole;
-      report_incomplete = !whole && !accumulated && _dynamic_filter_session.plan().enabled() &&
-                          !_build_not_whole_reported;
-      if (report_incomplete) { _build_not_whole_reported = true; }
-    }
-    if (report_incomplete) {
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic filter skipped (id={}): build is not one whole "
-        "delivery.",
-        get_operator_id());
-      if (_dynamic_filter_stats) {
-        _dynamic_filter_stats->publications_skipped_build_not_whole.fetch_add(
-          1, std::memory_order_relaxed);
-      }
+      whole = _build_arrives_whole;
     }
     if (whole) {
       _dynamic_filter_session.observe_whole_build(complete_build_delivery{batch}, deposit);

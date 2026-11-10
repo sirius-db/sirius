@@ -100,7 +100,7 @@ class build_filter_construction final {
   struct publication_root {
     /** @brief The root GPU's memory space; the room left in it is checked before each root filter
      */
-    cucascade::memory::memory_space& space;
+    cucascade::memory::memory_space const& space;
     /** @brief The publishing task's stream, on the root GPU */
     ::cuda::stream_ref stream;
     /** @brief The publishing task's allocator: publication scratch and the root filters are charged

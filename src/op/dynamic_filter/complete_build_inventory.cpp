@@ -220,15 +220,15 @@ namespace {
 //===--------------------------------------------------------------------===//
 
 /**
- * @brief Whether @p batch is readable without blocking and holds a GPU table with no rows.
+ * @brief Whether @p batch is readable without blocking and holds a GPU, host, or disk table with no
+ * rows.
  */
-[[nodiscard]] bool holds_no_rows(cucascade::data_batch const& batch) noexcept
+[[nodiscard]] bool holds_no_rows(cucascade::data_batch& batch) noexcept
 {
   try {
-    auto source = batch.try_to_read_only();
-    return source && source->get_data() != nullptr &&
-           source->get_current_tier() == cucascade::memory::Tier::GPU &&
-           sirius::get_cudf_table_view(*source).num_rows() == 0;
+    auto const arrival = read_arrival(batch);
+    auto const* facts  = std::get_if<arrival_facts>(&arrival);
+    return facts != nullptr && facts->rows == 0;
   } catch (...) {
     return false;
   }
@@ -254,11 +254,6 @@ void build_arrival_ledger::record(cucascade::data_batch& batch)
       return;
     }
     auto& facts = std::get<arrival_facts>(arrival);
-    // Host and disk facts are read, but only GPU arrivals are accepted for now.
-    if (facts.tier != cucascade::memory::Tier::GPU) {
-      close(construction_decline::unreadable_arrival);
-      return;
-    }
     _entries.push_back(
       {.entry = {batch.get_batch_id(), facts.rows}, .columns = std::move(facts.columns)});
   } catch (std::exception const&) {
