@@ -14,7 +14,8 @@ gateway, one rank per GPU, and `sirius-client` for the SQL. Under Slurm,
 `scripts/sirius_slurm.sbatch` starts the gateway and the ranks ([Run](#run)); elsewhere you
 start them yourself ([Run without Slurm](#run-without-slurm)). Ranks on different nodes exchange
 over NVLink (MNNVL). CPU fallback is off: a query Sirius cannot run on the GPU fails. Tested
-with 4, 8 and 16 ranks.
+with 4, 8 and 16 ranks. Last followed from an empty account on 2026-11-10: clone, build, SF100
+without Slurm and SF10000 on one node under Slurm.
 
 ## Rules
 
@@ -32,22 +33,33 @@ with 4, 8 and 16 ranks.
 
 ## Setup
 
+Needs Git and [Pixi](https://pixi.sh/latest/installation/) 0.78 or newer on `PATH`, and under
+Slurm its client commands (export `SLURM_CONF` if `sinfo` finds no configuration). What the
+machine needs is in [docs/README.md](../README.md#requirements).
+
 The repository holds no cluster names or paths. Export these first:
 
 | Variable | What |
 |---|---|
 | `PARTITION`, `NODES` | The GPU partition, and idle nodes, comma-separated (`sinfo -N -o '%N %T %E'`) |
-| `CHECKOUT` | The Sirius checkout, on a file system every node mounts |
+| `CHECKOUT` | Where the Sirius checkout goes, on a file system every node mounts |
 | `DATA` | The Parquet dataset, one folder per table, same path on every node |
-| `OUT` | The run folder, with `config.yaml` and `run.sql` |
+| `OUT` | A new run folder, for `config.yaml`, `run.sql` and the output |
 
-`$HOME` must be shared by the nodes and have free space: the gateway writes
+`$HOME` must be shared by the nodes and have free space: the build puts about 8 GB there
+(Pixi's package cache; `PIXI_CACHE_DIR` moves it) and the gateway writes
 `~/.sirius/gateways/<job id>/`. With `$HOME` at its quota, jobs fail within seconds.
 
 ```bash
-cd "$CHECKOUT" && git submodule update --init --recursive
+git clone --branch experimental/distributed-sirius https://github.com/sirius-db/sirius.git "$CHECKOUT"
+cd "$CHECKOUT" && git submodule update --init --depth=1 --jobs 5 \
+  duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run build-distributed            # once: NIXL, Sirius with NIXL, the gateway
+mkdir -p "$OUT"
 ```
+
+The build takes 35 to 40 minutes on 144 cores and the checkout grows to 14 GB. `pixi run` may
+warn that its cache is on a network file system: ignore it.
 
 Before the first job on a set of nodes (without Slurm, run the two commands on each node
 instead of through `srun`):
@@ -55,7 +67,7 @@ instead of through `srun`):
 ```bash
 for n in ${NODES//,/ }; do              # every node sees the build and the data
   srun -p "$PARTITION" -w "$n" -N1 --time=2 bash -c \
-    "hostname; ls $CHECKOUT/build/release/libsirius.so $DATA | head -3"
+    "hostname; ls -d $CHECKOUT/build/release/libsirius.so $DATA/lineitem"
 done
 srun -p "$PARTITION" -w "${NODES%%,*}" -N1 --gpus=4 --time=2 \
   bash -c 'nvidia-smi -q | grep -A4 "^ *Fabric$"'
@@ -70,7 +82,7 @@ GPU pair should move about 700 GB/s; under 150 GB/s, UCX is not using NVLink.
 ## Config
 
 `$OUT/config.yaml` configures every rank. The SF10000 config, tuned on 1 node and used
-unchanged on 2:
+unchanged on 2, and for a first check at SF100:
 
 ```yaml
 sirius:
@@ -120,10 +132,12 @@ sirius:
 - **Exchange and UCX:** keep the defaults. Never list `bond0` with the rail NICs in
   `UCX_NET_DEVICES`.
 - The Bloom cap is set in the file only; a `SET` fails.
+- **Spill folder:** create it first, on a disk with free space.
 
 ## Run
 
-One arm is one Slurm job with fresh ranks: start the gateway, send the SQL, cancel the job.
+One arm is one Slurm job with fresh ranks: start the gateway, send the SQL, cancel the job. As a
+script:
 
 ```bash
 export SIRIUS_CONFIG_FILE=$OUT/config.yaml
@@ -137,54 +151,61 @@ until [ -s "$HOME/.sirius/gateways/$job/gateway.conf" ]; do
   squeue -j "$job" -h -o %T | grep -q . || { echo "job $job ended: see $OUT/job.out"; exit 1; }
   sleep 5
 done
-SIRIUS_CLUSTER=$job timeout 7200 pixi run sirius-client < "$OUT/run.sql" > "$OUT/client.txt" 2>&1
+SIRIUS_CLUSTER=$job pixi run sirius-client < "$OUT/run.sql" > "$OUT/client.txt" 2>&1
+sleep 5                                              # the ranks flush their logs every 3 s
 scancel "$job"
 ```
 
 If `rank exited` keeps repeating in `job.out`, the ranks die at start (usually the config):
 cancel the job and read the rank's log.
 
-`run.sql`:
+`run.sql`, here for five queries:
 
-```sql
-.mode csv
-.timer on
-CREATE OR REPLACE VIEW lineitem AS FROM read_parquet('<DATA>/lineitem/*.parquet');
--- ... one view per table
-SELECT 'Q1 run 1' AS marker;
-<query 1>
-SELECT 'Q1 run 2' AS marker;
-<query 1>
--- ... the other queries
-FROM sirius_gateway_status();   -- every rank ready, no last_error
+```bash
+q=$CHECKOUT/test/tpch_performance/tpch_queries/orig
+{
+  printf '.mode csv\n.timer on\n'
+  for t in customer lineitem nation orders part partsupp region supplier; do
+    echo "CREATE OR REPLACE VIEW $t AS FROM read_parquet('$DATA/$t/*.parquet');"
+  done
+  for n in 1 3 6 11 12; do                              # $(seq 1 22) for all
+    for run in 1 2; do
+      echo "SELECT 'Q$n run $run' AS marker;"
+      sed 's/\* 0\.00001$/* 0.00000001/' "$q/q$n.sql"   # Q11's fraction, 0.0001 / SF: here SF10000
+    done
+  done
+  echo "FROM sirius_gateway_status();"                  # every rank up, no last_error
+} > "$OUT/run.sql"
 ```
 
-- Each query runs twice in a row: "cold" is the first run after the ranks start, "warm" the
-  second.
-- Query texts are in `test/tpch_performance/tpch_queries/orig/`. Change Q11's fraction to
-  `0.0001 / SF` (`0.00000001` at SF10000).
+- Each query runs twice in a row: "cold" is its first run in the job, "warm" the second. The
+  first query of a job is slower still (Q6 at SF10000: 10.8 s as the first query, 6.4 s as the
+  third), so keep the query order when comparing runs.
 - At SF100000, footer statistics are per query: Q3 needs
   `SET parquet_footer_statistics = false`, Q9 needs the default (`true`).
 
 ## Run without Slurm
 
 For a machine Slurm does not schedule, such as a standalone NVL4 node. The config, `run.sql`
-and the checks are the same; only the launch differs. On the node:
+and the checks are the same; only the launch differs. On the node, as a script:
 
 ```bash
 export SIRIUS_CLUSTER=bench SIRIUS_GATEWAY_MIN_RANKS=4    # the ranks of all nodes together
 export SIRIUS_CONFIG_FILE=$OUT/config.yaml SIRIUS_RANK_LOG_ROOT=$OUT/rank-logs
 export SIRIUS_PRIORITY_DOWNSTREAM_FIRST=1 SIRIUS_GATEWAY_STATEMENT_TIMEOUT=300
-conf=$HOME/.sirius/gateways/$SIRIUS_CLUSTER/gateway.conf
-cd "$CHECKOUT" && rm -f "$conf"
+state=$HOME/.sirius/gateways/$SIRIUS_CLUSTER
+cd "$CHECKOUT" && git log -1 --oneline > "$OUT/env.txt"
+rm -f "$state/gateway.conf"
 pixi run sirius-gateway --serve > "$OUT/gateway.out" 2>&1 &
 gateway=$!
-until [ -s "$conf" ]; do sleep 1; done
-pixi run sirius-node --check --data "$DATA"               # the build, the GPUs, the gateway, the data
+until [ -s "$state/gateway.conf" ]; do sleep 1; done
+pixi run sirius-node --check --data "$DATA" || { kill "$gateway"; exit 1; }
 pixi run sirius-node > "$OUT/node.out" 2>&1 &             # one rank per GPU
 node=$!
 pixi run sirius-client < "$OUT/run.sql" > "$OUT/client.txt" 2>&1
-kill "$node" "$gateway"
+sleep 5                                                   # the ranks flush their logs every 3 s
+kill "$node" "$gateway"; wait
+rm -rf "$state"                                           # or the next gateway replays these views
 ```
 
 - **More nodes:** on each one, export the same variables and run `pixi run sirius-node` from
@@ -204,13 +225,16 @@ kill "$node" "$gateway"
 ## Check the run
 
 **Answers.** Compare every answer with an independent engine on the same data and query texts
-(DuckDB on CPU handles SF10000 in about 15 minutes with 1 TB of memory). Compare rows in any
-order, numbers within `1e-6` relative or `0.01` absolute. Q3 and Q18 end in `ORDER BY ... LIMIT`
-and may return different rows that tie at the cut: that is a tie, not an error, once the
-differing rows are shown to have the same order-column values.
+(DuckDB on CPU handles SF10000 in about 15 minutes with 1 TB of memory). The build's shell is a
+plain DuckDB when started as `pixi run sirius-duckdb/build/release/duckdb < ref.sql`, with
+`ref.sql` the same views and queries. Compare rows in any order, numbers within `1e-6` relative
+or `0.01` absolute. Q3 and Q18 end in `ORDER BY ... LIMIT` and may return different rows that
+tie at the cut: that is a tie, not an error, once the differing rows are shown to have the same
+order-column values.
 
-**Logs.** `client.txt` has the answers and a `Run Time` line per statement. Each rank's log in
-`rank-logs/<host>-<port>/` should show every peer on another node as:
+**Logs.** In `client.txt` each run is its marker, the answer, then the query's `Run Time` (the
+second after the marker). Each rank's log in `rank-logs/<host>-<port>/` should show every peer
+as:
 
 ```text
 exchange: rank 0 (GPU ...) -> rank 5 (GPU ..., NVLink domain ...): NIXL over the NVLink fabric
@@ -218,7 +242,11 @@ exchange: query 24 on rank 0: sent 1.655 GB in 322 batches, received 1.602 GB in
 ```
 
 Anything other than `NIXL over the NVLink fabric` means that pair uses the network. The `sent`
-lines, summed over ranks, give the bytes a query moved between ranks.
+lines, summed over ranks, give the bytes a query moved between ranks. Query numbers count every
+statement: with the `run.sql` above, the first run is query 10 and each run adds 2. A
+`Transparent execution fallback ... quack_nop_authorization(...)` line precedes every statement
+and is not the query: a query on the GPU logs `physical plan replaced with GPU operator`. Rank
+logs contain the gateway's token: remove it before sharing them.
 
 **Dataset layout.** Row-group size changes the result by 2× and more, so report it with every
 number. With small row groups a scan is bound by read requests, not bytes.
