@@ -156,8 +156,7 @@ cd "$CHECKOUT" && pixi run bash "$OUT/run.sh"
 The script prints the node check (`ok` lines, then `node ready for gateway bench`) and returns
 when the client is done; the ranks need about 10 s to start. `-bail` stops the client at the
 first failed statement. Ctrl-C, or `kill` of the script, stops the gateway and every rank within
-seconds. The script calls the launch scripts themselves, not their `pixi run` tasks: Ctrl-C
-ends a `pixi run` and leaves its gateway or client running.
+seconds.
 
 | File in `$OUT` | What |
 |---|---|
@@ -226,10 +225,9 @@ and what [Report](distributed-experiments.md#report) lists.
 | Symptom | Cause and fix |
 |---|---|
 | `ports in use`, after `LISTEN` lines | A gateway or rank of an earlier run that was killed, or another user. Yours: [stop them](#stop-what-a-killed-run-left). Another user's: other ports |
-| `no gateway: see .../gateway.out` | That file says why: `config.yaml` is not valid YAML, or `gateway bench already runs` |
+| `no gateway: see .../gateway.out` | That file says why: `config.yaml` is not valid YAML, `gateway bench already runs`, or `port 9494 on ... is in use` (another gateway holds it) |
 | A `FAIL` line from the node check | The line under it names the fix |
 | `client.txt`: `the gateway starts once 4 ranks are registered ...; 3 are` | Fewer ranks than `SIRIUS_GATEWAY_MIN_RANKS` joined within `SIRIUS_GATEWAY_JOIN_WAIT`. `rank exited` in `node.out` means a rank dies at start (usually the config): read `/tmp/sirius_node_<user>_bench/rank_<port>/rank.log` |
-| `client.txt`: `does not match the pinned ssl_fingerprint` | Two gateways listen on one port: [stop the old one](#stop-what-a-killed-run-left) |
 | The script was killed with `kill -9` | Its gateway and ranks still run and hold the GPUs: [stop them](#stop-what-a-killed-run-left) |
 | A statement hangs | The statement timeout (300 s here) cancels it and the next statement restarts the ranks |
 
@@ -240,7 +238,7 @@ in [Known failures](distributed-experiments.md#known-failures).
 
 ```bash
 pkill -u "$USER" -f "$CHECKOUT/script[s]/"; sleep 5      # the gateway, the client, every rank
-pkill -9 -u "$USER" -f "$CHECKOUT/script[s]/"            # a rank's wrapper can outlive the first
+pkill -9 -u "$USER" -f "$CHECKOUT/script[s]/"            # whatever did not stop
 ```
 
 Then repeat the last two checks of step 3; with several machines, do both on each. The `[s]`

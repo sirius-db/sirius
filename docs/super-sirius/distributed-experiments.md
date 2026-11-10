@@ -150,13 +150,14 @@ until [ -s "$HOME/.sirius/gateways/$job/gateway.conf" ]; do
   squeue -j "$job" -h -o %T | grep -q . || { echo "job $job ended: see $OUT/job.out"; exit 1; }
   sleep 5
 done
-SIRIUS_CLUSTER=$job pixi run sirius-client < "$OUT/run.sql" > "$OUT/client.txt" 2>&1
+SIRIUS_CLUSTER=$job pixi run sirius-client -bail < "$OUT/run.sql" > "$OUT/client.txt" 2>&1
 sleep 5                                              # the ranks flush their logs every 3 s
 scancel "$job"
 ```
 
-If `rank exited` keeps repeating in `job.out`, the ranks die at start (usually the config):
-cancel the job and read the rank's log.
+`-bail` stops the client at the first failed statement: without it, every statement of a run
+whose ranks never start waits its turn to fail. If `rank exited` keeps repeating in `job.out`,
+the ranks die at start (usually the config): cancel the job and read the rank's log.
 
 `run.sql`, here for five queries:
 
