@@ -125,8 +125,8 @@ libcudf = "==26.10.02"
 libcuvs = "==26.10.00"
 
 [feature.cuda13.activation.env]
-# GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120a, 120)
-CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120"
+# GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120f)
+CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100f-real;120f-real"
 VCPKG_CUDA_VERSION = "13"
 
 [feature.cuda12]
