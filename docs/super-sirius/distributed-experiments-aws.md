@@ -1,6 +1,7 @@
-# Distributed experiments on AWS g7e instances
+# Distributed experiments on AWS GPU instances
 
-How to take one AWS `g7e` instance from launch to a checked TPC-H benchmark through the gateway.
+How to take AWS GPU instances (`g7e`, `g6`) from launch to a checked TPC-H benchmark through the
+gateway: one instance, or [several machines](#several-machines) with one gateway.
 An instance is a machine without Slurm and without NVLink. This document covers what AWS adds
 (launch, storage, build, dataset, config) and what the numbers mean there; the launch script and
 the checks are those of
@@ -16,6 +17,20 @@ GPU as on eight, so the numbers compare.
 at commit `e11487d2`. That commit started the gateway and the ranks by hand. The launch script
 and `scripts/compare_answers.py` are newer: steps 5 to 7 were run as written here on a GB200
 machine at SF100, not on an instance. Other `g7e` sizes were not run: check step 1 on yours.
+
+**Also tested:** two `g6.4xlarge` (each 1 x L4 23 GB, 16 vCPUs, 64 GiB RAM, 549 GB of
+instance-store NVMe, no EFA) as one cluster over TCP, one rank per machine, at commit
+`7a5904b3`: TPC-H SF100 with all 22 answers checked, and SF1000 timings. See
+[Several machines](#several-machines).
+
+Two scripts do the steps below for you. They are the commands of that `g6.4xlarge` run with its
+addresses, paths and two-machine limit taken out, and **have not been run end to end in this
+form**:
+
+| Script | Does |
+|---|---|
+| `scripts/sirius_aws_setup.sh [SF]` | Steps 2 to 4 on one machine: work folders, Pixi, Rust, checkout, build, and the dataset when given a scale factor |
+| `scripts/sirius_aws_run.sh` | Steps 5 and 6 from a config file you give it: `run.sql`, the gateway, the ranks on this machine and on the others, a sampler of disk, network, GPU and memory, the timings, and the answer check |
 
 ## Rules
 
@@ -42,7 +57,7 @@ Any way of launching works. What the instance needs:
 | AMI | A Deep Learning Base AMI with the NVIDIA driver, for the region (tested: "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20260818"). Sirius's CUDA 13 environment needs driver 580 or newer |
 | Root volume | 200 GB. The build and caches go on the instance store, but leave room for the OS |
 | Purchase | On-demand. A spot reclaim mid-run wastes the build and the data |
-| Network | SSH (22) from your address only |
+| Network | SSH (22) from your address only. For several machines, also everything between them: see [Several machines](#several-machines) |
 
 - `g7e` capacity is zone-limited, and `InsufficientInstanceCapacity` in every zone of a region is
   common. Retry another zone or region; the AMI, key pair and security group are per region.
@@ -90,7 +105,9 @@ Everything large goes under `$WORK`. Space needed:
 | Spill | up to 1 TB (none was used at SF3000) | not run |
 
 Check `df -h "$WORK"` against this before choosing a scale factor: smaller `g7e` sizes have less
-instance storage.
+instance storage. A `g6.4xlarge` has 549 GB, which held the build and SF1000; at 802 GB for
+SF3000, expect about 270 GB for SF1000 and 27 GB for SF100. With several machines the limit is
+one machine's disk, not the sum: every rank reads every file.
 
 ## 3. Build
 
@@ -110,13 +127,20 @@ cd sirius && git submodule update --init --depth=1 --jobs 5 \
 tmux new-session -d -s build "pixi run build-distributed > $WORK/logs/build.log 2>&1; echo \$? > $WORK/logs/build.rc"
 ```
 
+`scripts/sirius_aws_setup.sh` does steps 2 and 3, and step 4 with a scale factor. Copy it to the
+instance first, since it makes the checkout:
+
+```bash
+tmux new-session -d -s setup "bash sirius_aws_setup.sh 100"     # logs: /opt/dlami/nvme/work/logs
+```
+
 - A non-interactive `ssh host '<command>'` does not read `~/.bashrc`: start every remote command
   with `. /opt/dlami/nvme/work/env.sh`.
 - Run long jobs in a detached `tmux` session with a log and an exit-code file, as above. Do not
   hold an SSH connection open for them.
 - The build took **905 s** on 96 vCPUs (NIXL, Sirius, gateway), with no change needed on x86_64.
   That run cloned every submodule (`--recursive`), which the 120 GB above includes; the five
-  named here are the ones the build uses.
+  named here are the ones the build uses. On a `g6.4xlarge` (16 vCPUs) the build took 35 minutes.
 - The rank and the client use `gateway/build/release/duckdb`. The plain DuckDB without Sirius,
   for reference answers, is `sirius-duckdb/build/release/duckdb` (`build/release/duckdb` is a
   directory).
@@ -225,6 +249,16 @@ The run is over when `$OUT/run.rc` exists; it holds 0 unless the script stopped 
   per-task timings. Sessions of 26 to 75 s that were killed left their telemetry files empty;
   sessions of 150 s and more had them.
 
+`scripts/sirius_aws_run.sh` does this step and writes `run.sql` itself, from a config file:
+
+```bash
+cd "$CHECKOUT" && tmux new-session -d -s run "pixi run bash scripts/sirius_aws_run.sh --name <name> \
+  --data $DATA --frac 0.0000000333333 --config <config.yaml> 1 6 12 > $WORK/logs/run-<name>.out 2>&1"
+```
+
+It counts the GPUs, does not pass `-bail` (a failed query does not hide the next ones), and
+prints the seconds per query at the end. `--ref-dir $WORK/ref` adds the comparison of step 7.
+
 ## 7. Check the run
 
 A time without a checked answer is not a result. Run the checks of
@@ -292,6 +326,67 @@ grep BANDWIDTH /tmp/distributed_nixl_rank_*.log
 Expect about 40 to 55 GB/s per pair on PCIe Gen5, against about 700 GB/s for an NVLink pair.
 Each reading moves under 4 GB, so repeat it; single readings as low as 12 GB/s were seen.
 
+## Several machines
+
+One gateway, and one rank per GPU on every machine. This is
+[More machines](distributed-experiments-no-slurm.md#variations) of the other document, plus what
+instances add: they share no `$HOME` and no disk.
+
+**What it needs**
+
+| Need | How |
+|---|---|
+| The machines reach each other | Same VPC and zone, one security group with a rule that allows all traffic from the group itself. The gateway listens on 9494; rank i of a machine on 9500 + i and 27000 + i. Without the rule every machine is healthy and the ranks never register |
+| Private addresses | Use each machine's private IP (`hostname -I`) between machines. Public addresses leave the VPC |
+| `ssh` without a password, from the gateway's machine to the others | On the gateway's machine: `ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519`. Append `~/.ssh/id_ed25519.pub` to `~/.ssh/authorized_keys` on each other machine, then `ssh -o StrictHostKeyChecking=accept-new <private-ip> true` once per machine |
+| The same checkout, build and data, at the same paths | Run steps 2 to 4 (`scripts/sirius_aws_setup.sh <SF>`) on every machine, at the same commit. A build does not move between GPU types. Generate the data on each machine, or copy it |
+| The environment over `ssh` | `. $WORK/env.sh` at the start of every remote command: a non-interactive `ssh` does not read `~/.bashrc` |
+| The gateway's address and token on every machine | They are in `~/.sirius/gateways/<cluster>/gateway.conf` on the gateway's machine, written when it starts. Copy the file to the same path on the others, in a folder of mode 700, for every run. Or start the ranks with `--gateway HOST:PORT --token-file FILE` ([Quick Start](distributed-quickstart.md#prerequisites)), which was not run here |
+| Disk for the whole dataset on every machine | Every rank reads every file: the scale factor is limited by one machine's instance store |
+
+A cluster placement group puts the machines close together in one zone.
+
+**Run.** On the gateway's machine, with the others as `--nodes`:
+
+```bash
+. /opt/dlami/nvme/work/env.sh && cd "$WORK/sirius"
+tmux new-session -d -s run "pixi run bash scripts/sirius_aws_run.sh --name sf100-2m \
+  --data $WORK/tpch_sf100 --frac 0.000001 --config $WORK/config.yaml \
+  --nodes '<private-ip> <private-ip>' --ref-dir $WORK/ref \
+  \$(seq 1 22) > $WORK/logs/run-sf100-2m.out 2>&1"
+```
+
+The script counts the GPUs of all machines for `SIRIUS_GATEWAY_MIN_RANKS`, copies the config and
+`gateway.conf` to each machine, checks each one, starts its ranks over `ssh`, and at the end
+stops them, removes the copied `gateway.conf` and fetches each machine's rank logs and sampler
+file into `$WORK/runs/<name>`. Leave `--nodes` out for one machine. Reference answers
+(`--ref-dir`) are those of step 7, computed on one machine while no rank runs.
+
+The config of the `g6.4xlarge` run, per rank (1 x L4 23 GB, 64 GiB RAM):
+
+```yaml
+sirius:
+  memory:
+    host: { capacity_bytes: 36Gi }
+    disk: { disk_id: 0, capacity_bytes: 150000000000, downgrade_root_dirs: "/opt/dlami/nvme/work/spill" }
+  executor:
+    pipeline: { num_threads: 4 }
+    scan_manager: { num_threads: 8, uring_n_reactors: 1, cache: { mode: none } }
+  operator_params:
+    max_dynamic_filter_bloom_bytes_per_gpu: 512Mi
+    max_build_probe_resident_bytes: 6Gi
+    max_build_hash_table_bytes: 4Gi
+```
+
+That run kept its spill folder inside the run's folder; the script's sampler watches
+`$WORK/spill`, so name that one. For the reference answers on 64 GiB it used
+`SET memory_limit='46GB'; SET threads=16; SET preserve_insertion_order=false;`.
+
+**After the run**, on every machine: `nvidia-smi --query-compute-apps=pid --format=csv,noheader`
+prints nothing. If the script was killed with `kill -9`,
+[stop what is left](distributed-experiments-no-slurm.md#stop-what-a-killed-run-left) on each
+machine and delete `~/.sirius/gateways/bench` there.
+
 ## Reference numbers
 
 `g7e.24xlarge`, TPC-H SF3000, lineitem in 180 files with row groups of about 1.06 million rows,
@@ -309,6 +404,22 @@ disk.
 
 Raw GPU copy speeds on this machine: pinned host to GPU 55.6 GB/s, GPU to host 57.2, GPU to GPU
 inside a pair 53 (peer access on), across pairs 43.
+
+### Two g6.4xlarge
+
+Each 1 x L4 23 GB, 16 vCPUs, 64 GiB RAM, 549 GB of instance store, ranks exchanging over TCP, the config of [Several machines](#several-machines), commit `7a5904b3`.
+
+- **SF100, 2 machines, 1 rank each:** all 22 queries, cold and warm, match DuckDB (44 of 44).
+- **SF1000:** one machine is bound by its disk, which reads about 1 GB/s. Two machines, each
+  reading its own copy, are 1.8 to 2.0 times faster:
+
+  | Machines | Ranks | Q6 s |
+  |---|---|---|
+  | 1 | 1 | 34.6 |
+  | 2 | 2 | 17.2 |
+
+That is what a second disk would give, so read it with [What we learned](#what-we-learned)
+before calling it GPU scaling. The split between disk and GPU was not measured.
 
 ## What we learned
 
@@ -380,6 +491,9 @@ document. On an instance, also:
 | `pixi: command not found` over `ssh host '...'` | Non-interactive shells skip `~/.bashrc`: source `env.sh` first |
 | `build/release/duckdb: Is a directory` | The plain DuckDB binary is `sirius-duckdb/build/release/duckdb` |
 | Adding ranks does not make scans faster | The disks are the limit: see [What we learned](#what-we-learned) |
+| Several machines: `the gateway starts once N ranks are registered ...; fewer are` | The other machines' ranks cannot reach the gateway, or it them: the security group lacks the rule allowing traffic from itself, or a machine has no copy of this run's `gateway.conf` |
+| Several machines: `Permission denied (publickey)` or a host-key question from the run script | `ssh` from the gateway's machine to the others is not set up: see [Several machines](#several-machines) |
+| Several machines: the node check fails on another machine only | The checkout, build or data is missing there or at another path |
 | Q3 or Q18 differ from the reference | LIMIT tie: pass `--ties` |
 | Q11 returns no or too few rows | Fraction must be `0.0001 / SF` |
 | Ranks killed mid-query | Host tier too large for the RAM: lower `host.capacity_bytes` |
