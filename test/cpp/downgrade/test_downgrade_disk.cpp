@@ -18,13 +18,18 @@
 
 // sirius
 #include "data/convertible_data_batch.hpp"
+#include "data/convertible_gpu_pipeline_task.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 
 // data utilities
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <utils/convertible_task_test_utils.hpp>
 #include <utils/utils.hpp>
 
 // cucascade
@@ -46,12 +51,10 @@ using namespace sirius::parallel;
 
 namespace {
 
-/// Helper: get the tier of a data_batch using a temporary read-only lock.
-inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
-}
+using sirius::test::flat_key_extractor;
+using sirius::test::get_batch_size;
+using sirius::test::get_batch_tier;
+using sirius::test::make_test_gpu_task;
 
 cucascade::memory::memory_space* get_gpu_space(
   sirius::memory::sirius_memory_reservation_manager& mgr)
@@ -497,4 +500,179 @@ TEST_CASE("HOST-source monitor backs off when no disk is configured", "[downgrad
 
   REQUIRE(n2 == n1);  // HOST source with no disk has no target -> never fires
   REQUIRE(n1 == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Task-queue tier: a queued task holding inputs in more than one memory space
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// GPU (2 GB) + HOST (4 GB) + DISK (4 GB): every tier has room, so what moves is decided by the
+// source-space binding alone.
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_three_tier_manager()
+{
+  sirius::converter_registry::reset_for_testing();
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "sirius_test_disk";
+  std::filesystem::create_directories(tmp_dir);
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(4ull << 30)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75)
+    .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
+
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  return manager;
+}
+
+/// A fresh batch moved to HOST, so a task can hold inputs in two spaces.
+std::shared_ptr<cucascade::data_batch> make_host_batch(
+  cucascade::memory::memory_space& gpu_space,
+  cucascade::memory::memory_space& host_space,
+  sirius::memory::sirius_memory_reservation_manager& mgr,
+  ::cuda::stream_ref stream)
+{
+  auto batch = make_gpu_batch(gpu_space);
+  sirius::convertible_data_batch conv(batch);
+  REQUIRE(conv.convert({&host_space}, stream, mgr, true).has_value());
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  return batch;
+}
+
+// The queued tasks here carry the default priority, which names query 0.
+const sirius::query_id_t kTaskQueryId = sirius::make_query_id(0);
+
+}  // namespace
+
+// A queued task can hold inputs in several spaces. A conversion relieving HOST must move only the
+// task's HOST batches: its GPU inputs belong to the GPU executor, and on a multi-GPU box the HOST
+// executor's device-0 stream cannot even touch another GPU's memory.
+TEST_CASE("task conversion bound to HOST leaves the task's GPU batches on the GPU",
+          "[downgrade_disk]")
+{
+  auto mem_mgr     = make_three_tier_manager();
+  auto* gpu_space  = get_gpu_space(*mem_mgr);
+  auto* host_space = mem_mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  auto* disk_space = mem_mgr->get_memory_space(cucascade::memory::Tier::DISK, 0);
+  REQUIRE(gpu_space != nullptr);
+  REQUIRE(host_space != nullptr);
+  REQUIRE(disk_space != nullptr);
+
+  rmm::cuda_stream stream;
+  auto gpu_batch        = make_gpu_batch(*gpu_space);
+  auto host_batch       = make_host_batch(*gpu_space, *host_space, *mem_mgr, stream);
+  auto const gpu_bytes  = get_batch_size(*gpu_batch);
+  auto const host_bytes = get_batch_size(*host_batch);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTaskQueryId);
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {gpu_batch, host_batch})));
+
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(host_space, /*front_to_back=*/false);
+  REQUIRE(cd != nullptr);
+  REQUIRE(cd->bytes_in_space(host_space) == host_bytes);
+  REQUIRE(cd->bytes_in_space(gpu_space) == gpu_bytes);
+
+  auto result = cd->convert({disk_space}, stream, *mem_mgr, /*blocking=*/false);
+  REQUIRE(result.has_value());
+  REQUIRE(result->size() == 1);
+  REQUIRE((*result)[0] == host_bytes);
+  REQUIRE(get_batch_tier(*host_batch) == cucascade::memory::Tier::DISK);
+  REQUIRE(get_batch_tier(*gpu_batch) == cucascade::memory::Tier::GPU);
+}
+
+// Same through the executor: a HOST-source executor scanning the task queue spills the task's
+// HOST batch to DISK, reports exactly those bytes, and returns the task to the queue.
+TEST_CASE("HOST executor spills only a mixed task's host batches to disk", "[downgrade_disk]")
+{
+  auto mem_mgr     = make_three_tier_manager();
+  auto* gpu_space  = get_gpu_space(*mem_mgr);
+  auto* host_space = mem_mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(gpu_space != nullptr);
+  REQUIRE(host_space != nullptr);
+
+  rmm::cuda_stream stream;
+  auto gpu_batch        = make_gpu_batch(*gpu_space);
+  auto host_batch       = make_host_batch(*gpu_space, *host_space, *mem_mgr, stream);
+  auto const host_bytes = get_batch_size(*host_batch);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTaskQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;  // empty: task-queue tier only
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {gpu_batch, host_batch})));
+
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade-host"},
+    .monitor_period = std::chrono::milliseconds{0}};
+  downgrade_executor executor(
+    lifecycle, config, repo_registry, host_space->get_id(), host_space, *mem_mgr, &queue);
+  executor.start();
+  size_t const freed = executor.request_free_memory_and_wait(host_bytes);
+  executor.stop();
+
+  REQUIRE(freed == host_bytes);
+  REQUIRE(get_batch_tier(*host_batch) == cucascade::memory::Tier::DISK);
+  REQUIRE(get_batch_tier(*gpu_batch) == cucascade::memory::Tier::GPU);
+  REQUIRE(queue.size() == 1);
+}
+
+// With HOST room for only one of a task's two GPU batches, the task-queue tier moves one and must
+// report that one, not the task's whole GPU footprint.
+TEST_CASE("task-queue downgrade credits only the bytes it moved", "[downgrade_disk]")
+{
+  sirius::converter_registry::reset_for_testing();
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(2ull << 20)  // 2 MB HOST
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75);
+  // No set_disk_mounting_point -- the batch that does not fit on HOST has nowhere else to go.
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  // Leave HOST room for exactly one more block.
+  auto held_host = exhaust_host_capacity(*mem_mgr);
+  REQUIRE_FALSE(held_host.empty());
+  held_host.pop_back();
+
+  // ~800 KB each: one fits the freed block, two do not.
+  auto first             = make_gpu_batch(*gpu_space, 200000);
+  auto second            = make_gpu_batch(*gpu_space, 200000);
+  auto const batch_bytes = get_batch_size(*first);
+  REQUIRE(get_batch_size(*second) == batch_bytes);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTaskQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;  // empty: task-queue tier only
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  REQUIRE(queue.push(make_test_gpu_task(1, {first, second})));
+
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{0}};
+  downgrade_executor executor(
+    lifecycle, config, repo_registry, GPU_SPACE_ID, gpu_space, *mem_mgr, &queue);
+  executor.start();
+  size_t const freed = executor.request_free_memory_and_wait(2 * batch_bytes);
+  executor.stop();
+
+  bool const first_moved  = get_batch_tier(*first) == cucascade::memory::Tier::HOST;
+  bool const second_moved = get_batch_tier(*second) == cucascade::memory::Tier::HOST;
+  REQUIRE(first_moved != second_moved);  // exactly one fit
+  REQUIRE(freed == batch_bytes);
 }
