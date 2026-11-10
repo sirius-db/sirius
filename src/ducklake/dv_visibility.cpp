@@ -69,20 +69,30 @@ void validate_parquet_unit_dependencies(unit_descriptor const& unit)
 {
   if (auto error = parquet_dependency_error(unit)) throw std::invalid_argument(error);
 }
+sm::unit_envelope puffin_visibility_envelope(uint64_t file_bytes)
+{
+  // Footer/parser storage overlaps the inline copy, prior union, decoded blob and new union.
+  constexpr auto positions = dv_max_positions * sizeof(int64_t);
+  auto footer              = 14 * std::min<uint64_t>(file_bytes, dv_max_footer_bytes) + 512;
+  return {{file_bytes}, footer, {positions, positions, positions, positions}};
+}
 sm::unit_envelope parquet_unit_envelope(unit_descriptor const& unit)
 {
   validate_parquet_unit_dependencies(unit);
   if (unit.inline_delete_count > dv_max_positions)
     throw sm::preparation_resource_error("DuckLake inline delete positions exceed limit", true);
-  if (unit.deletes == delete_format::none)
-    return {{1}, unit.inline_delete_count ? 3 * dv_max_positions * sizeof(int64_t) : 0};
+  if (unit.deletes == delete_format::none) {
+    if (!unit.inline_delete_count) return {{1}, 0};
+    auto bytes = unit.inline_delete_count * sizeof(uint64_t);
+    return {{1}, bytes, {bytes}};
+  }
   if (!unit.delete_file_size || unit.delete_file_size > dv_max_file_bytes)
     throw sm::preparation_resource_error("DuckLake delete file exceeds the bounded profile", true);
-  if (unit.deletes == delete_format::parquet) return {{1}, 4 * dv_max_positions * sizeof(int64_t)};
-  // JSON text/parser, previous union, decoded blob and replacement union can overlap.
-  return {{unit.delete_file_size},
-          14 * std::min<uint64_t>(unit.delete_file_size, dv_max_footer_bytes) + 512 +
-            4 * dv_max_positions * sizeof(int64_t)};
+  if (unit.deletes == delete_format::parquet) {
+    constexpr auto positions = dv_max_positions * sizeof(int64_t);
+    return {{1}, positions, {unit.inline_delete_count * sizeof(uint64_t), positions}};
+  }
+  return puffin_visibility_envelope(unit.delete_file_size);
 }
 namespace {
 void check_stop(sm::preparation_stop_token stop)

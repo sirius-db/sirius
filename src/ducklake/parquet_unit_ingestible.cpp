@@ -67,13 +67,13 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
       (count_only && (!fields.empty() || !required_columns.empty())))
     throw std::invalid_argument(
       "DuckLake Parquet unit has an invalid bound schema or scan identity");
-  validate_parquet_unit_dependencies(unit);
+  auto envelope                = parquet_unit_envelope(unit);
   auto info                    = std::make_unique<plain_info>();
   info->approximate_batch_size = options.scan_task_batch_size;
   info->contract_id            = contract;
   if (options.profiles) info->profiles = std::move(options.profiles);
   info->identities = std::move(options.identities);
-  if (parquet_unit_envelope(unit).retained) {
+  if (envelope.retained_charge(1)) {
     info->retained_slot = std::move(options.parquet_slot);
     info->gate          = std::move(options.inline_gate);
   }
@@ -208,6 +208,7 @@ struct claimed_unit {
 std::shared_ptr<claimed_unit> claim_unit(plain_info const& info,
                                          unit_descriptor const& unit,
                                          uint64_t preparation_id,
+                                         uint64_t granularity,
                                          std::shared_ptr<sm::preparation_ledger> const& ledger)
 {
   auto owned    = std::make_shared<claimed_unit>();
@@ -221,7 +222,8 @@ std::shared_ptr<claimed_unit> claim_unit(plain_info const& info,
     owned->gate   = info.gate;
     owned->permit = owned->slot->try_acquire();
   } else {
-    owned->permit = ledger->try_acquire_unit(owned->key, parquet_unit_envelope(unit).retained);
+    owned->permit = ledger->try_acquire_unit(
+      owned->key, parquet_unit_envelope(unit).retained_charge(granularity));
   }
   return owned->permit ? std::move(owned) : nullptr;
 }
@@ -296,8 +298,11 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
     if (!copied) return scan_manager::preparation_pending{};
     owned = copied->claim;
   } else {
-    owned =
-      claim_unit(static_cast<plain_info const&>(table_info()), unit_, preparation_id_, ledger_);
+    owned = claim_unit(static_cast<plain_info const&>(table_info()),
+                       unit_,
+                       preparation_id_,
+                       admission_->decision.allocation_granularity,
+                       ledger_);
     if (!owned) return scan_manager::preparation_pending{};
   }
   auto work = parquet_gpu_ingestible::next_split_provider(resolve);
@@ -407,8 +412,11 @@ parquet_unit_ingestible::make_preparation_sources(io::ioctx_resolver resolve)
     owner.coalescer = create_batch_coalescer();
     owner.try_claim = [this]() -> metadata_claim {
       if (inline_deletes_->claimed) return sm::preparation_exhausted{};
-      auto owned =
-        claim_unit(static_cast<plain_info const&>(table_info()), unit_, preparation_id_, ledger_);
+      auto owned = claim_unit(static_cast<plain_info const&>(table_info()),
+                              unit_,
+                              preparation_id_,
+                              admission_->decision.allocation_granularity,
+                              ledger_);
       if (!owned) return sm::preparation_pending{};
       inline_deletes_->claimed = true;
       return metadata_job{[this, owned](

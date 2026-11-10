@@ -2,6 +2,7 @@
 #include "op/scan/field_id_mapping.hpp"
 
 #include "helper/hugeint.hpp"
+#include "helper/logical_type.hpp"
 #include "io/parquet_helpers.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -53,12 +54,14 @@ cudf::data_type flat_type(duckdb::LogicalType const& type)
     case D::DECIMAL: {
       auto precision = duckdb::DecimalType::GetWidth(type);
       auto scale     = duckdb::DecimalType::GetScale(type);
-      if (!precision || precision > 38 || scale > precision)
+      if (!precision || precision > sirius::logical_type::decimal_max_precision_int128 ||
+          scale > precision)
         throw std::invalid_argument("unsupported decimal precision or scale");
-      return cudf::data_type{precision <= 9    ? C::DECIMAL32
-                             : precision <= 18 ? C::DECIMAL64
-                                               : C::DECIMAL128,
-                             -static_cast<int32_t>(scale)};
+      return cudf::data_type{
+        precision <= sirius::logical_type::decimal_max_precision_int32   ? C::DECIMAL32
+        : precision <= sirius::logical_type::decimal_max_precision_int64 ? C::DECIMAL64
+                                                                         : C::DECIMAL128,
+        -static_cast<int32_t>(scale)};
     }
     case D::VARCHAR: return cudf::data_type{C::STRING};
     case D::DATE: return cudf::data_type{C::TIMESTAMP_DAYS};

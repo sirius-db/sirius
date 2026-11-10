@@ -44,6 +44,9 @@ struct unit_envelope {
   // Independently allocated blocks are rounded separately by the backing allocator.
   std::vector<uint64_t> temporary;
   uint64_t retained = 0;
+  // The first retained allocation and any additional live blocks round independently.
+  std::vector<uint64_t> additional_retained_blocks = {};
+  uint64_t retained_charge(uint64_t allocation_granularity) const;
   // Sum independently rounded blocks, matching admission and runtime accounting.
   uint64_t temporary_charge(uint64_t allocation_granularity) const;
 };

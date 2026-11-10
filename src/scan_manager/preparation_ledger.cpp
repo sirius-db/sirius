@@ -83,6 +83,13 @@ uint64_t unit_envelope::temporary_charge(uint64_t quantum) const
     total = add(total, round(bytes, quantum));
   return total;
 }
+uint64_t unit_envelope::retained_charge(uint64_t quantum) const
+{
+  auto total = round(retained, quantum);
+  for (auto bytes : additional_retained_blocks)
+    total = add(total, round(bytes, quantum));
+  return total;
+}
 uint64_t host_reservation_provider::allocation_granularity(memory_space_id space) const
 {
   if (space.tier != cucascade::memory::Tier::HOST)
@@ -227,7 +234,7 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
       for (auto const& unit : scan.units) {
         auto unit_w      = unit.temporary_charge(quantum);
         units            = add(units, 1);
-        d.sigma_retained = add(d.sigma_retained, round(unit.retained, quantum));
+        d.sigma_retained = add(d.sigma_retained, unit.retained_charge(quantum));
         d.w              = std::max(d.w, unit_w);
       }
     }

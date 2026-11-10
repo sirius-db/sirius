@@ -124,10 +124,10 @@ struct scan_ingestible::impl {
         // if this optional cursor cannot be funded. The progress cursor will read it.
         auto extra = ledger->try_reserve_reusable_slot(contract, slot);
         if (!extra) return {};
-        budget.retained =
-          std::make_shared<preparation_slot>(std::move(extra),
-                                             sm::unit_key{contract, options.identities->next()},
-                                             envelope(0, 0).retained);
+        budget.retained = std::make_shared<preparation_slot>(
+          std::move(extra),
+          sm::unit_key{contract, options.identities->next()},
+          envelope(0, 0).retained_charge(admission->decision.allocation_granularity));
       }
       state.ledger      = budget.retained->ledger();
       opts.parquet_slot = budget.retained;
@@ -188,9 +188,10 @@ sm::unit_envelope scan_ingestible::envelope(size_t columns,
                                             size_t wide_columns)
 {
   auto result              = inline_batch_producer::envelope(columns, string_columns, wide_columns);
-  result.temporary.front() = std::max<uint64_t>(dv_max_file_bytes, result.temporary.front());
-  result.retained = 14 * dv_max_footer_bytes + 512 + 4 * dv_max_positions * sizeof(int64_t);
-  return result;
+  auto visibility          = puffin_visibility_envelope(dv_max_file_bytes);
+  result.temporary.front() = std::max(visibility.temporary.front(), result.temporary.front());
+  visibility.temporary     = std::move(result.temporary);
+  return visibility;
 }
 
 void scan_ingestible::preflight_for_query()
@@ -231,7 +232,7 @@ void scan_ingestible::attach_preparation_ledger(std::shared_ptr<sm::preparation_
   impl_->slots.front().retained = std::make_shared<preparation_slot>(
     ledger,
     sm::unit_key{impl_->contract, impl_->options.identities->next()},
-    envelope(0, 0).retained);
+    envelope(0, 0).retained_charge(impl_->admission->decision.allocation_granularity));
   impl_->ledger = std::move(ledger);
 }
 void scan_ingestible::stop_preparation() noexcept

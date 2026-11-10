@@ -176,7 +176,7 @@ struct query_pause {
   }
 };
 
-std::vector<std::string> ducklake_result_bag(duckdb::QueryResult& result)
+std::vector<std::string> ducklake_result_rows(duckdb::QueryResult& result)
 {
   if (result.HasError()) throw std::runtime_error(result.GetError());
   std::vector<std::string> rows;
@@ -188,6 +188,12 @@ std::vector<std::string> ducklake_result_bag(duckdb::QueryResult& result)
       rows.push_back(std::move(value));
     }
   }
+  return rows;
+}
+
+std::vector<std::string> ducklake_result_bag(duckdb::QueryResult& result)
+{
+  auto rows = ducklake_result_rows(result);
   std::sort(rows.begin(), rows.end());
   return rows;
 }
@@ -411,7 +417,9 @@ void check_mixed_input_gate(std::shared_ptr<sirius::ducklake::binding_handle> co
   auto identities = std::make_shared<dl::preparation_identity>();
   auto gate       = std::make_shared<dl::preparation_gate>();
   auto slot       = std::make_shared<dl::preparation_slot>(
-    ledger, sm::unit_key{1, identities->next()}, envelope.retained);
+    ledger,
+    sm::unit_key{1, identities->next()},
+    envelope.retained_charge(admission->decision.allocation_granularity));
   auto options = [&] {
     dl::unit_scan_options result;
     result.identities     = identities;
@@ -491,7 +499,8 @@ struct ducklake_fixture {
   template <typename Execute>
   void check_gpu_execution(std::vector<std::string> const& expected,
                            Execute execute,
-                           bool explicit_entry = false)
+                           bool explicit_entry                    = false,
+                           decltype(&ducklake_result_bag) collect = ducklake_result_bag)
   {
     CAPTURE(explicit_entry);
     run("SET gpu_execution=true");
@@ -505,7 +514,7 @@ struct ducklake_fixture {
     auto result   = execute();
     INFO((result->HasError() ? result->GetError() : "GPU query completed"));
     REQUIRE_FALSE(result->HasError());
-    CHECK(ducklake_result_bag(*result) == expected);
+    CHECK(collect(*result) == expected);
     result.reset();
     auto after = get_transparent_execution_stats(con);
     if (explicit_entry) {
@@ -1083,12 +1092,17 @@ TEST_CASE_METHOD(ducklake_fixture,
   auto clear =
     std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
   run("SET enable_duckdb_fallback=false");
+  auto ordered_sql = "SELECT id,value FROM lake.q ORDER BY id DESC, value ASC NULLS LAST LIMIT 3";
+  std::vector<std::string> ordered_rows{"5|55|", "4|44|", "3|NULL|"};
+  run("SET gpu_execution=false");
+  CHECK(ducklake_result_rows(*run(ordered_sql)) == ordered_rows);
+  check_gpu_execution(
+    ordered_rows, [&] { return con.Query(ordered_sql); }, false, ducklake_result_rows);
   std::vector<std::pair<std::string, bool>> queries = {
     {"SELECT id FROM lake.q", true},
     {"SELECT 1 FROM lake.q", true},
     {"SELECT value,id,label FROM lake.q WHERE id>=2", false},
     {"SELECT id FROM lake.q WHERE id=1 OR id=4", false},
-    {"SELECT id,value FROM lake.q ORDER BY id DESC, value ASC NULLS LAST LIMIT 3", false},
     {"SELECT COUNT(*) FROM lake.q", false},
     {"SELECT COUNT(*) FROM lake.q WHERE id>=2", false},
     {"SELECT COUNT(*) FROM lake.q WHERE id%2=0", false},
@@ -1396,7 +1410,7 @@ TEST_CASE_METHOD(ducklake_fixture,
   counters->track_units = true;
   auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
   auto envelope         = sirius::ducklake::scan_ingestible::envelope(1, 0);
-  provider->grant_bytes = 2 * envelope.retained;
+  provider->grant_bytes = 2 * envelope.retained_charge(provider->quantum);
   for (auto bytes : envelope.temporary)
     provider->grant_bytes += bytes;
   counters->preparation_provider_for_testing = provider;
@@ -2781,7 +2795,7 @@ TEST_CASE_METHOD(ducklake_fixture,
     auto budget = std::make_unique<sm::preparation_ledger>(backing);
     auto env    = dl::parquet_unit_ingestible::envelope(binding->unit_at(0).value());
     std::vector<sm::scan_envelope> scans{{{env}, {}, true, 1}};
-    backing.grant_bytes = std::max<uint64_t>(1, env.retained + env.temporary_charge(1));
+    backing.grant_bytes = std::max<uint64_t>(1, env.retained_charge(1) + env.temporary_charge(1));
     auto decision  = budget->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0});
     auto admission = std::make_shared<sm::preparation_admission>(std::move(budget), decision);
     auto ledger    = std::shared_ptr<sm::preparation_ledger>(admission->consume());

@@ -524,31 +524,35 @@ TEST_CASE("DuckLake zero-output mapping retains a physical carrier without user 
 namespace {
 namespace sm         = sirius::scan_manager;
 using dv_test_source = sirius::test::memory_puffin_source;
-std::vector<std::byte> dv_test_payload()
-{
-  std::ifstream file(
+std::vector<std::byte> dv_test_payload(
+  char const* path =
     "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
     "dv-00000-0-d7e8f9a0-0007-0007-0007-000000000002-00001.puffin",
-    std::ios::binary);
+  size_t size = 44)
+{
+  std::ifstream file(path, std::ios::binary);
   REQUIRE(file.good());
   file.seekg(4);
-  std::vector<std::byte> bytes(44);
+  std::vector<std::byte> bytes(size);
   file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
   REQUIRE(file.good());
   return bytes;
 }
-dv_test_source dv_test_container(std::string properties, bool corrupt_second = false)
+dv_test_source dv_test_container(std::string properties,
+                                 bool corrupt_second           = false,
+                                 std::vector<std::byte> second = dv_test_payload())
 {
   auto payload = dv_test_payload();
   auto blobs   = payload;
-  if (corrupt_second) payload.back() ^= std::byte{1};
-  blobs.insert(blobs.end(), payload.begin(), payload.end());
+  if (corrupt_second) second.back() ^= std::byte{1};
+  blobs.insert(blobs.end(), second.begin(), second.end());
   std::string json = R"({"blobs":[)";
   for (int i = 0; i < 2; ++i) {
     if (i) json += ",";
     json +=
       R"({"type":"deletion-vector-v1","fields":[],"snapshot-id":-1,"sequence-number":-1,"offset":)" +
-      std::to_string(4 + i * 44) + R"(,"length":44,"properties":{)" +
+      std::to_string(i ? 4 + payload.size() : 4) + R"(,"length":)" +
+      std::to_string(i ? second.size() : payload.size()) + R"(,"properties":{)" +
       (i ? properties : std::string{}) + "}}";
   }
   json += "]}";
@@ -566,13 +570,14 @@ struct dv_test_budget {
   sm::test::test_reservation_provider provider;
   sm::preparation_ledger ledger{provider};
   sm::w_permit permit;
-  explicit dv_test_budget(unit_descriptor const& unit)
+  explicit dv_test_budget(unit_descriptor const& unit, uint64_t quantum = 1)
   {
-    provider.grant_bytes = 128 * 1024 * 1024;
+    provider.quantum     = quantum;
     auto envelope        = parquet_unit_envelope(unit);
+    provider.grant_bytes = envelope.retained_charge(quantum) + envelope.temporary_charge(quantum);
     std::array scans{sm::scan_envelope{{envelope}, {}, true}};
     REQUIRE(ledger.admit(scans, sm::memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
-    permit = ledger.try_acquire_unit({1, 1}, envelope.retained);
+    permit = ledger.try_acquire_unit({1, 1}, envelope.retained_charge(provider.quantum));
     REQUIRE(permit);
   }
 };
@@ -601,6 +606,66 @@ TEST_CASE("DuckLake DV visibility validates and unions every relevant blob",
   visibility.reset();
   CHECK(budget.provider.seen->allocated_bytes == 0);
 }
+TEST_CASE("DuckLake delete preparation charges overlapping retained blocks separately",
+          "[ducklake_units][ducklake_delete_rounding]")
+{
+  auto puffin = GENERATE(false, true);
+  CAPTURE(puffin);
+  // The fixture payloads encode {1,3} and {0,1,2,4}, respectively.
+  auto source = dv_test_container(
+    "",
+    false,
+    dv_test_payload("test/cpp/integration/data/iceberg_v3_dv_replaced/data/"
+                    "dv-retired-00000-0-d7e8f9a0-0007-0007-0007-000000000002.puffin",
+                    48));
+  auto unit                = puffin ? dv_test_unit(source) : local();
+  unit.inline_delete_count = puffin ? 0 : 1;
+  dv_test_budget budget(unit, (puffin ? 16ULL : 64ULL) << 20);
+  auto allocator = budget.ledger.allocator(budget.permit);
+  {
+    if (puffin) {
+      auto visible = prepare_dv_visibility(unit, 5, "data", source, allocator, {}, "deletes");
+      CHECK(visible->validated_blobs == 2);
+      CHECK(std::vector<int64_t>(visible->positions.begin(), visible->positions.end()) ==
+            std::vector<int64_t>{0, 1, 2, 3, 4});
+    } else {
+      auto copied = allocator.allocate_retained(sizeof(uint64_t));
+      auto* pos   = reinterpret_cast<uint64_t*>(copied.data());
+      *pos        = 1;
+      auto visible =
+        combine_inline_visibility(std::make_shared<dv_visibility>(), {pos, 1}, 5, allocator);
+      REQUIRE(visible->positions.size() == 1);
+      CHECK(visible->positions.front() == 1);
+    }
+  }
+  CHECK(budget.ledger.charged_bytes({1, 1}) == 0);
+  CHECK(budget.provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("DuckLake reusable preparation slots admit the rounded visibility budget",
+          "[ducklake_units][ducklake_delete_rounding]")
+{
+  constexpr uint64_t block = 16ULL << 20;
+  auto provider            = std::make_shared<sm::test::test_reservation_provider>();
+  provider->quantum        = block;
+  auto envelope            = scan_ingestible::envelope(1, 0);
+  // One footer/parser block and four independently allocated position buffers.
+  auto retained         = 5 * block;
+  provider->grant_bytes = retained + envelope.temporary_charge(block);
+  auto ledger           = std::make_shared<sm::preparation_ledger>(provider);
+  std::array scans{sm::scan_envelope{{envelope}, {}, true, 1, 1}};
+  auto decision = ledger->admit(scans, sm::memory_space_id(cucascade::memory::Tier::HOST, 0), 2);
+  REQUIRE(decision.deferred);
+  CHECK(decision.sigma_retained == retained);
+  auto second = ledger->try_reserve_reusable_slot(1, 1);
+  REQUIRE(second);
+  for (auto const& owner : {ledger, second}) {
+    sm::preparation_slot slot(owner, {1, 1}, retained);
+    auto permit = slot.try_acquire();
+    REQUIRE(permit);
+  }
+}
+
 TEST_CASE("DuckLake DV invalid later blobs cannot publish partial visibility",
           "[ducklake_units][ducklake_dv]")
 {
@@ -783,14 +848,14 @@ TEST_CASE("DuckLake narrow scans admit without reserving unused string capacity"
   auto strings = GENERATE(false, true);
   sm::test::test_reservation_provider provider;
   auto envelope        = scan_ingestible::envelope(1, strings ? 1 : 0);
-  provider.grant_bytes = envelope.retained + dv_max_file_bytes;
+  provider.grant_bytes = envelope.retained_charge(provider.quantum) + dv_max_file_bytes;
   {
     sm::preparation_ledger ledger(provider);
     std::array scans{sm::scan_envelope{{envelope}, {}, true, 1}};
     auto admitted = ledger.admit(scans, sm::memory_space_id(cucascade::memory::Tier::HOST, 0));
     CHECK(admitted.deferred == !strings);
     if (admitted.deferred) {
-      auto permit = ledger.try_acquire_unit({1, 1}, envelope.retained);
+      auto permit = ledger.try_acquire_unit({1, 1}, envelope.retained_charge(provider.quantum));
       REQUIRE(permit);
     }
   }
