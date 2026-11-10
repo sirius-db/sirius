@@ -16,8 +16,8 @@
 
 /*
  * Tests the `[dynamic_filter_key]` outcome line: its spelling, the structural join identity, the
- * deferred `post_unlock_actions` that carries it, and the one line per bound key that each legacy
- * publication path (whole-build and accumulated) emits when its session becomes terminal.
+ * deferred `post_unlock_actions` that carries it, and the one line per bound key that a
+ * publication session emits when it becomes terminal.
  */
 
 #include "dynamic_filter_accumulation_test_utils.hpp"
@@ -181,9 +181,9 @@ TEST_CASE("post-unlock actions are move-only and log their lines once when dispa
 
 namespace {
 
-/// The one key line of a single-key whole-build session after @p act, with its identity set.
-std::vector<std::string> whole_build_lines(sirius::test::publication::claim_fixture& fixture,
-                                           auto const& act)
+/// The one key line of a single-key session after @p act, with its identity set.
+std::vector<std::string> session_lines(sirius::test::publication::claim_fixture& fixture,
+                                       auto const& act)
 {
   sirius::test::scoped_recording_log_sink sink{"debug"};
   fixture.hash_join->dynamic_filter_session().set_join_identity(
@@ -194,85 +194,63 @@ std::vector<std::string> whole_build_lines(sirius::test::publication::claim_fixt
   return key_lines(sink);
 }
 
-constexpr std::string_view k_whole_build_identity =
+constexpr std::string_view k_identity =
   "[dynamic_filter_key] v=1 sig=000000000000002a occ=1 join=7 condition=0 build_ordinal=0 ";
 
 }  // namespace
 
-TEST_CASE("a whole-build publication logs its key once, after terminal completion",
+TEST_CASE("a publication logs its key once, after terminal completion",
           "[dynamic_filter][key_outcome][publication_claim]")
 {
   sirius::test::publication::claim_fixture fixture;
-  auto const lines = whole_build_lines(fixture, [&] {
-    fixture.hash_join->set_build_arrives_whole(true);
-    fixture.hash_join->push_data_batch_partitioned(
-      "build",
-      sirius::test::publication::claim_fixture::make_build_batch_on(*fixture.gpu_space, 5),
-      /*partition_idx=*/0);
+  auto const lines = session_lines(fixture, [&] {
+    fixture.construct_from(
+      sirius::test::publication::claim_fixture::make_build_batch_on(*fixture.gpu_space, 5));
     REQUIRE(fixture.channel->snapshot().terminal());
   });
-  CHECK(lines == std::vector<std::string>{std::string{k_whole_build_identity} +
+  CHECK(lines == std::vector<std::string>{std::string{k_identity} +
                                           "rows=5 valid=5 kind=small_in_list size=5 zone_map=0 "
                                           "pushed=1 reason=-"});
 }
 
-TEST_CASE("a whole-build membership filter no binding can read is logged as absent",
+TEST_CASE("a membership filter no binding can read is logged as absent",
           "[dynamic_filter][key_outcome][publication_claim]")
 {
-  // No integer key domain reads a FLOAT64 probe: the filter is built but never pushed.
+  // No integer key domain reads a FLOAT64 probe, so no membership filter is built for it.
   sirius::test::publication::claim_fixture fixture{
     duckdb::JoinType::INNER, 1, 0, cudf::data_type{cudf::type_id::FLOAT64}};
-  auto const lines = whole_build_lines(fixture, [&] {
-    fixture.hash_join->set_build_arrives_whole(true);
-    fixture.hash_join->push_data_batch_partitioned(
-      "build",
-      sirius::test::publication::claim_fixture::make_build_batch_on(*fixture.gpu_space, 5),
-      /*partition_idx=*/0);
+  auto const lines = session_lines(fixture, [&] {
+    fixture.construct_from(
+      sirius::test::publication::claim_fixture::make_build_batch_on(*fixture.gpu_space, 5));
   });
-  REQUIRE(fixture.stats.snapshot().membership_filters_built == 1);
-  CHECK(lines == std::vector<std::string>{std::string{k_whole_build_identity} +
+  REQUIRE(fixture.stats.snapshot().membership_filters_built == 0);
+  CHECK(lines == std::vector<std::string>{std::string{k_identity} +
                                           "rows=5 valid=5 kind=none size=0 zone_map=0 pushed=0 "
                                           "reason=unreadable_probe"});
 }
 
-TEST_CASE("a whole-build session that never claims logs its key at finalization",
+TEST_CASE("a session that never begins logs its key at finalization",
           "[dynamic_filter][key_outcome][publication_claim]")
 {
   sirius::test::publication::claim_fixture fixture;
-  auto const lines = whole_build_lines(fixture, [&] { fixture.push_build_batch(); });
-  CHECK(lines == std::vector<std::string>{std::string{k_whole_build_identity} +
+  auto const lines = session_lines(fixture, [] {});
+  CHECK(lines == std::vector<std::string>{std::string{k_identity} +
                                           "rows=0 valid=unknown kind=none size=0 zone_map=0 "
                                           "pushed=0 reason=not_constructed"});
 }
 
-TEST_CASE("a whole-build attempt that ends early names the counter that ended it",
+TEST_CASE("an attempt that ends early names the counter that ended it",
           "[dynamic_filter][key_outcome][publication_claim]")
 {
   sirius::test::publication::claim_fixture fixture;
-  SECTION("drained targets")
-  {
-    auto const lines = whole_build_lines(fixture, [&] {
-      fixture.channel->close_for_new_filters();
-      fixture.hash_join->set_build_arrives_whole(true);
-      fixture.push_build_batch();
-    });
-    CHECK(lines ==
-          std::vector<std::string>{std::string{k_whole_build_identity} +
-                                   "rows=0 valid=unknown kind=none size=0 zone_map=0 pushed=0 "
-                                   "reason=attempt_skip_publications_skipped_targets_drained"});
-  }
-  SECTION("a source outside the replica set, then closed input")
-  {
-    auto const lines = whole_build_lines(fixture, [&] {
-      fixture.hash_join->set_build_arrives_whole(true);
-      fixture.hash_join->push_data_batch_partitioned(
-        "build", fixture.make_host_build_batch(), /*partition_idx=*/0);
-    });
-    CHECK(lines ==
-          std::vector<std::string>{std::string{k_whole_build_identity} +
-                                   "rows=0 valid=unknown kind=none size=0 zone_map=0 pushed=0 "
-                                   "reason=attempt_skip_publications_skipped_source_not_resident"});
-  }
+  auto const lines = session_lines(fixture, [&] {
+    fixture.channel->close_for_new_filters();
+    fixture.construct();
+  });
+  CHECK(lines ==
+        std::vector<std::string>{std::string{k_identity} +
+                                 "rows=64 valid=64 kind=none size=0 zone_map=0 pushed=0 "
+                                 "reason=attempt_skip_publications_skipped_targets_drained"});
 }
 
 TEST_CASE("a session narrowed to no replica logs no key line",
@@ -289,7 +267,7 @@ TEST_CASE("a session narrowed to no replica logs no key line",
 }
 
 TEST_CASE("an accumulated publication logs every bound key once",
-          "[dynamic_filter][key_outcome][multi_partition]")
+          "[dynamic_filter][key_outcome][construction]")
 {
   acc::fixture fixture;
   sirius::test::scoped_recording_log_sink sink{"debug"};
@@ -316,7 +294,7 @@ TEST_CASE("an accumulated publication logs every bound key once",
 }
 
 TEST_CASE("an accumulation that ends without publishing logs why per key",
-          "[dynamic_filter][key_outcome][multi_partition]")
+          "[dynamic_filter][key_outcome][construction]")
 {
   acc::fixture fixture;
   sirius::test::scoped_recording_log_sink sink{"debug"};

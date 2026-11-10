@@ -131,8 +131,8 @@ hash_join_test_fixture create_test_hash_join(
 
   dynamic_filter_publish_plan filter_plan;
   if (mixed_filter) {
-    // A mixed INNER join cannot use BUILD_PROBE; its small single-partition build is
-    // nevertheless eligible for whole-build dynamic-filter publication.
+    // A mixed INNER join cannot use BUILD_PROBE; its small single-partition build still folds whole
+    // because the join publishes dynamic filters.
     conditions.emplace_back(
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),

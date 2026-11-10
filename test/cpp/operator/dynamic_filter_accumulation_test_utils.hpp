@@ -19,10 +19,12 @@
 #include "data/data_batch_utils.hpp"
 #include "memory/pool_peer_access.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+#include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -320,24 +322,46 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
 }
 
 /**
- * @brief The accumulation geometry for @p rows rows over @p keys keys under @p cap.
+ * @brief The shape of @p keys equal Bloom arrays, each sized on @p rows rows: what the construction
+ * plan gives keys of equal valid rows.
  */
-[[nodiscard]] inline sirius::op::detail::accumulated_bloom_geometry bloom_geometry(
-  std::size_t rows, std::size_t keys = 2, std::uint64_t cap = 256 * mib)
+struct bloom_geometry_shape {
+  std::size_t blocks;        ///< Bloom blocks of each array
+  std::size_t raw_bytes;     ///< Bytes of each array
+  std::size_t arrays_bytes;  ///< Tracked bytes of every array on one GPU
+  std::size_t chunk_bytes;   ///< Each array's transfer chunk
+
+  [[nodiscard]] std::size_t chunks_per_key() const noexcept
+  {
+    return ::cuda::ceil_div(raw_bytes, chunk_bytes);
+  }
+};
+
+/**
+ * @brief The arrays of @p keys keys sized on @p rows rows, which must fit @p cap.
+ */
+[[nodiscard]] inline bloom_geometry_shape bloom_geometry(std::size_t rows,
+                                                         std::size_t keys  = 2,
+                                                         std::uint64_t cap = 256 * mib)
 {
-  auto const geometry = sirius::op::detail::accumulated_bloom_geometry::try_create(rows, keys, cap);
-  REQUIRE(geometry);
-  return *geometry;
+  auto const blocks    = sirius::op::bloom_blocks_for(rows);
+  auto const raw_bytes = blocks * sirius::op::bloom_bytes_per_block;
+  bloom_geometry_shape const shape{
+    blocks,
+    raw_bytes,
+    keys * sirius::op::detail::tracked_replica_allocation_bytes(raw_bytes),
+    sirius::op::detail::accumulated_bloom_chunk_bytes(raw_bytes)};
+  REQUIRE(shape.arrays_bytes <= cap);
+  return shape;
 }
 
 /**
  * @brief Merge scratch the publication root allocates for @p sources contributing non-root GPUs;
  * mirrors `accumulated_bloom_builder::finish` in `src/cuda/sirius_dynamic_bloom_filter.cu`.
  */
-[[nodiscard]] inline std::size_t merge_scratch_bytes(
-  sirius::op::detail::accumulated_bloom_geometry const& geometry,
-  std::size_t keys    = 2,
-  std::size_t sources = 1)
+[[nodiscard]] inline std::size_t merge_scratch_bytes(bloom_geometry_shape const& geometry,
+                                                     std::size_t keys    = 2,
+                                                     std::size_t sources = 1)
 {
   return std::min<std::size_t>(2, keys * geometry.chunks_per_key()) * sources *
          geometry.chunk_bytes;
@@ -765,14 +789,12 @@ inline bool publish_behind_gates(fixture const& owner,
  * @brief Builds a diagnostic accumulator using the fixture's two integer columns.
  */
 inline sirius::op::detail::accumulated_bloom_builder make_builder(
-  fixture const& owner,
-  sirius::op::detail::accumulated_bloom_geometry geometry,
-  std::size_t keys = 2)
+  fixture const& owner, bloom_geometry_shape const& geometry, std::size_t keys = 2)
 {
   using builder = sirius::op::detail::accumulated_bloom_builder;
-  std::vector<builder::key> active{{0, cudf::data_type{cudf::type_id::INT32}}};
-  if (keys == 2) { active.push_back({1, cudf::data_type{cudf::type_id::INT64}}); }
-  auto result = builder::try_create(std::move(active), geometry, owner.spaces);
+  std::vector<builder::key> active{{0, cudf::data_type{cudf::type_id::INT32}, geometry.blocks}};
+  if (keys == 2) { active.push_back({1, cudf::data_type{cudf::type_id::INT64}, geometry.blocks}); }
+  auto result = builder::try_create(std::move(active), owner.spaces);
   REQUIRE(result);
   return std::move(*result);
 }

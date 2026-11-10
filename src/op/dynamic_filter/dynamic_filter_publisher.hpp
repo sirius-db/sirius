@@ -22,47 +22,27 @@
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
-#include <cudf/table/table_view.hpp>
-
 #include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace cucascade {
-class data_batch;
 class read_only_data_batch;
 }  // namespace cucascade
 
 namespace sirius::op {
-
-class sirius_physical_hash_join;
-
-/**
- * @brief A single-batch whole-build delivery
- */
-class complete_build_delivery final {
- private:
-  friend class sirius_physical_hash_join;
-  friend class dynamic_filter_publication_session;
-  explicit complete_build_delivery(std::shared_ptr<cucascade::data_batch> batch)
-    : _batch(std::move(batch))
-  {
-  }
-  std::shared_ptr<cucascade::data_batch> _batch;
-};
 
 /**
  * @brief Owns one hash join's optional dynamic filter publication and endpoint completion rights
  *
  * 3 responsibilities:
  *  - Own the producer handles for this join's target channels
- *  - Decide which delivery, if any, to publish to the channels
+ *  - Run at most one construction attempt over the certified build and publish its filters
  *  - Finish those handles after publication, cancellation, or failure
  *
  * Ownership relationship: 1 join -> 1 publication session -> 1 producer handle per target channel.
@@ -73,12 +53,10 @@ class complete_build_delivery final {
  * contribution completes the inventory constructs, replicates, and publishes every planned filter
  * (`publish_if_final`) through `build_filter_construction`. The session moves through the phases
  * OPEN, COLLECTING, PUBLISHING, and TERMINAL, and is Terminal once its site finalizes
- * (`finalize_input`). The one-shot whole-build path (`observe_whole_build`) claims only an OPEN
- * session, so it no longer publishes once the site has begun or declined. Recoverable optional
- * allocation and launch failures end an attempt locally; invalid internal state and failed CUDA
- * cleanup propagate. The session retains the leased accumulator storage until
- * `release_retired_storage` can safely free it outside task tracking. Engine task drain precedes
- * session destruction.
+ * (`finalize_input`). Recoverable optional allocation and launch failures end an attempt locally;
+ * invalid internal state and failed CUDA cleanup propagate. The session retains the leased
+ * accumulator storage until `release_retired_storage` can safely free it outside task tracking.
+ * Engine task drain precedes session destruction.
  */
 class dynamic_filter_publication_session final {
   struct state;
@@ -214,23 +192,6 @@ class dynamic_filter_publication_session final {
   void seal_plan() noexcept;
 
   /**
-   * @brief Observe a complete hash-join build table and publish filters to the session's channels.
-   *
-   * The winning delivery is claimed and pinned before deposit runs; readiness checks and optional
-   * filter publication follow it. Without a claim, deposit still runs exactly once. The callback
-   * runs synchronously outside session locks and is never stored. Pin or deposit failures terminate
-   * a claimed attempt and propagate, including deposit allocation failures. Transitions the session
-   * OPEN -> PUBLISHING (single-batch builds).
-   *
-   * @pre @p deposit is nonempty
-   * @throw std::runtime_error if the CUDA call establishing source readiness fails
-   * @param delivery Delivery certified to contain the join's entire build side, not a partial batch
-   * @param deposit Callback that deposits this delivery in the join's existing repository
-   */
-  void observe_whole_build(complete_build_delivery const& delivery,
-                           std::function<void()> const& deposit);
-
-  /**
    * @brief Close input without cancelling an active publication.
    *
    * A running publication may finish; an incomplete accumulation ends without a filter, and an
@@ -248,35 +209,5 @@ class dynamic_filter_publication_session final {
  private:
   std::unique_ptr<state> _state;
 };
-
-/**
- * @brief The counts one whole-build publication adds to `dynamic_filter_stats`, and the number of
- * targets that still accepted filters.
- */
-struct dynamic_filter_publication_outcome : dynamic_filter_stats_snapshot {
-  std::size_t active_targets = 0;
-  /// One outcome per admitted key of the plan, by admitted-key index; keys without a binding keep
-  /// the default.
-  std::vector<dynamic_filter_key_outcome> keys;
-};
-
-/**
- * @brief Builds and publishes filters from a complete hash-join build table
- *
- * Replicas are ready before filters reach bound channels. The SESSION supplies one publication
- * right (producer handle) per plan target (channel), pins the ready source (whole-build batch), and
- * retires submitted work on failure. Type-mismatched keys are skipped. before_fanout, when
- * supplied, arbitrates cancellation after construction and before the first push.
- *
- * @pre @p plan is enabled
- * @throw std::runtime_error if the source GPU cannot be identified
- * @throw std::logic_error for inconsistent plan or filter metadata
- */
-[[nodiscard]] dynamic_filter_publication_outcome publish_dynamic_filters(
-  dynamic_filter_publish_plan const& plan,
-  cudf::table_view const& build_view,
-  ::cuda::stream_ref stream,
-  std::span<sirius_dynamic_filter_set::producer const> producers,
-  std::function<bool()> const& before_fanout = {});
 
 }  // namespace sirius::op

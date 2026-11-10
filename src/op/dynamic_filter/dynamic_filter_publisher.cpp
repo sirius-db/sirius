@@ -16,17 +16,12 @@
 
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
-#include "data/data_batch_utils.hpp"
-#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
-#include "memory/runtime_stream_pool.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/build_filter_construction.hpp"
 #include "op/dynamic_filter/construction_plan.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
-#include "op/dynamic_filter/detail/domain_gate.hpp"
-#include "op/dynamic_filter/detail/restore_scalar.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_outcome.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
@@ -36,13 +31,8 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/aggregation.hpp>
-#include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
-#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
@@ -55,13 +45,11 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -109,8 +97,6 @@ constexpr attempt_counter incomplete{&counts::accumulations_incomplete, "accumul
 constexpr attempt_counter abandoned{&counts::accumulations_abandoned, "accumulations_abandoned"};
 constexpr attempt_counter targets_drained{&counts::publications_skipped_targets_drained,
                                           "publications_skipped_targets_drained"};
-constexpr attempt_counter source_not_resident{&counts::publications_skipped_source_not_resident,
-                                              "publications_skipped_source_not_resident"};
 /// Counts every failed or cancelled attempt, so it names the end of one without a specific counter.
 constexpr std::string_view publications_failed = "publications_failed";
 }  // namespace attempt_counters
@@ -201,24 +187,6 @@ std::vector<std::vector<cudf::data_type>> binding_probe_types(
   });
 }
 
-/**
- * @brief Whether some binding of admitted key @p key_index could receive a zone map whose bounds
- * have type @p bound_type: the plan-time part of `fan_out`'s rule
- */
-[[nodiscard]] bool zone_map_reaches_a_binding(dynamic_filter_publish_plan const& plan,
-                                              std::size_t key_index,
-                                              cudf::data_type bound_type) noexcept
-{
-  if (plan.admitted_keys()[key_index].preserve_nulls) { return false; }
-  return std::ranges::any_of(plan.probe_targets(), [&](auto const& target) {
-    return target.accepts_zone_map_filters &&
-           std::ranges::any_of(target.key_bindings, [&](auto const& binding) {
-             return binding.admitted_key_index == key_index &&
-                    binding.probe_storage_type == bound_type;
-           });
-  });
-}
-
 // Size exact filters for the smallest probe-device L2; return 0 if unavailable.
 std::size_t device_l2_cache_bytes(
   std::span<dynamic_filter_replica_space const> replica_spaces) noexcept
@@ -254,9 +222,9 @@ struct key_filters {
   std::shared_ptr<sirius_dynamic_filter> membership;
   /// The domain the membership filter was built over.
   std::optional<membership_key_domain> membership_domain;
-  /// The kind of the whole-build membership filter.
+  /// The kind of the membership filter.
   membership_filter_kind membership_kind = membership_filter_kind::none;
-  /// The whole-build membership filter's IN-list key count or Bloom array bytes.
+  /// The membership filter's IN-list key count or Bloom array bytes.
   std::size_t membership_size = 0;
 };
 
@@ -268,7 +236,7 @@ struct fanout_counts {
 
 /**
  * @brief Pushes @p filters, indexed by admitted key, to every binding of every target of @p plan
- * that still accepts filters; the fan-out shared by whole-build and accumulated publication.
+ * that still accepts filters.
  *
  * A zone map lowers to literals of its bound type against the probe column, so it goes only to a
  * binding of a zone-map-accepting target that probes at exactly that type (an EMPTY probe type
@@ -322,7 +290,8 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
           !membership_probe_compatible(*key.membership_domain, binding.probe_storage_type)) {
         sirius::log::log_noexcept([&] {
           SIRIUS_LOG_DEBUG(
-            "[publish_dynamic_filters] dynamic filter key {}: membership filter not pushed to "
+            "[dynamic_filter_publication_session] dynamic filter key {}: membership filter not "
+            "pushed to "
             "channel ordinal {}: probe storage type id {} is not a carrier of the key family.",
             binding.admitted_key_index,
             binding.channel_push_ordinal,
@@ -347,16 +316,14 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
 struct dynamic_filter_publication_session::state {
   /**
    * @brief The phases of a dynamic filter publication session:
-   * Healthy:
-   * OPEN -> COLLECTING -> PUBLISHING -> TERMINAL
-   *  |                        ^
-   *  -------------------------|
+   * Healthy: OPEN -> COLLECTING -> PUBLISHING -> TERMINAL, or OPEN -> TERMINAL (a decline, or a
+   * begin that constructs nothing).
    * Corrupt: any state may transition to TERMINAL.
    */
   enum class phase {
     OPEN,        // A producer may still register on the plan's channels
-    COLLECTING,  // An accumulation accepts contributions from certified build batches
-    PUBLISHING,  // One whole-build delivery or the final contributor's task owns publication
+    COLLECTING,  // Construction accepts contributions from certified build batches
+    PUBLISHING,  // The final contributor's task owns publication
     TERMINAL  // The session has completed, cancelled, or failed; no further producer registration
   };
 
@@ -764,11 +731,10 @@ struct dynamic_filter_publication_session::state {
   dynamic_filter_join_identity identity;
   // The counter that ended the accumulation attempt, named by its unpublished key lines.
   std::string_view ending_counter;
-  phase current       = phase::OPEN;
-  bool sealed         = false;
-  bool input_closed   = false;
-  bool cancelled      = false;
-  bool fanout_started = false;
+  phase current     = phase::OPEN;
+  bool sealed       = false;
+  bool input_closed = false;
+  bool cancelled    = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1118,472 +1084,6 @@ void dynamic_filter_publication_session::publish_if_final(
     active.claimed = true;
   }
   operation.publish(task_space, stream);
-}
-
-void dynamic_filter_publication_session::observe_whole_build(
-  complete_build_delivery const& delivery, std::function<void()> const& deposit)
-{
-  auto& operation = *_state;
-  bool claimed    = false;
-  {
-    std::scoped_lock lock(operation.mutex);
-    operation.seal();
-    if (operation.current == state::phase::OPEN && operation.plan.enabled() && delivery._batch) {
-      operation.current = state::phase::PUBLISHING;
-      claimed           = true;
-      if (operation.stats) {
-        operation.stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-  }
-  if (!claimed) {
-    deposit();
-    return;
-  }
-
-  // Ends the claimed attempt as failed and logs its key lines after releasing the mutex.
-  auto const fail_attempt = [&operation]() noexcept {
-    post_unlock_actions actions;
-    {
-      std::scoped_lock lock(operation.mutex);
-      operation.set_key_lines({.reason        = dynamic_filter_key_reason::attempt_fail,
-                               .reason_detail = attempt_counters::publications_failed});
-      actions.append(operation.complete(completion::FAILED, true));
-    }
-    std::move(actions).dispatch();
-  };
-
-  // Repository delivery is mandatory, so its allocation failures must not fail open.
-  auto source = [&] {
-    try {
-      auto pinned = delivery._batch->to_read_only();
-      deposit();
-      return pinned;
-    } catch (...) {
-      fail_attempt();
-      throw;
-    }
-  }();
-
-  try {
-    nvtx_scoped_range range{"dynfilter::publish_hook"};
-    auto* space = source.get_data() ? source.get_memory_space() : nullptr;
-    if (!space || source.get_current_tier() != cucascade::memory::Tier::GPU ||
-        !operation.plan.has_replica_on_device(space->get_device_id())) {
-      post_unlock_actions actions;
-      {
-        std::scoped_lock lock(operation.mutex);
-        if (operation.stats) {
-          operation.stats->publications_skipped_source_not_resident.fetch_add(
-            1, std::memory_order_relaxed);
-        }
-        // A sibling delivery that claims the reopened window replaces these outcomes.
-        operation.set_key_lines({.reason        = dynamic_filter_key_reason::attempt_skip,
-                                 .reason_detail = attempt_counters::source_not_resident.name});
-        if (operation.input_closed) {
-          actions.append(
-            operation.complete(operation.cancelled ? completion::CANCELLED : completion::SKIPPED));
-        } else {
-          operation.current = state::phase::OPEN;
-        }
-      }
-      std::move(actions).dispatch();
-      return;
-    }
-
-    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-    auto stream_lease         = sirius::memory::runtime_stream_pool::acquire(*space);
-    ::cuda::stream_ref stream = stream_lease.get();
-    auto const writer         = source.get_writer_event();
-    auto const ready =
-      writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();
-    // Use cuDF's standard clearing/sticky-error probe while retaining CUDA status
-    // for the runtime-health reporter in the execution owner.
-    CUDF_CUDA_TRY(ready);
-
-    dynamic_filter_publication_outcome outcome;
-    try {
-      outcome = publish_dynamic_filters(operation.plan,
-                                        sirius::get_cudf_table_view(source),
-                                        stream,
-                                        operation.producers,
-                                        [&operation] {
-                                          std::scoped_lock lock(operation.mutex);
-                                          if (operation.cancelled) { return false; }
-                                          operation.fanout_started = true;
-                                          return true;
-                                        });
-    } catch (...) {
-      // The source pin must outlive every accepted read, including a partially built filter.
-      auto error = std::current_exception();
-      stream.sync();
-      std::rethrow_exception(error);
-    }
-
-    post_unlock_actions actions;
-    {
-      std::scoped_lock lock(operation.mutex);
-      operation.record(outcome);
-      auto const result = operation.cancelled && !operation.fanout_started ? completion::CANCELLED
-                          : outcome.filters_pushed != 0                    ? completion::PUBLISHED
-                                                                           : completion::SKIPPED;
-      operation.record_key_outcomes(outcome.keys);
-      if (result == completion::CANCELLED) {
-        operation.end_unconstructed_lines(dynamic_filter_key_reason::attempt_cancel,
-                                          attempt_counters::publications_failed);
-      }
-      actions.append(operation.complete(result, true));
-    }
-    std::move(actions).dispatch();
-  } catch (rmm::out_of_memory const& error) {
-    fail_attempt();
-    SIRIUS_LOG_WARN(
-      "[publish_dynamic_filters] publication exhausted device memory; continuing without filters: "
-      "{}",
-      error.what());
-  } catch (...) {
-    fail_attempt();
-    throw;
-  }
-}
-
-// 4. Whole-build publication: build the filters from one complete build, publish them to the
-// probe targets, and record the outcome.
-dynamic_filter_publication_outcome publish_dynamic_filters(
-  dynamic_filter_publish_plan const& plan,
-  cudf::table_view const& build_view,
-  ::cuda::stream_ref stream,
-  std::span<sirius_dynamic_filter_set::producer const> producers,
-  std::function<bool()> const& before_fanout)
-{
-  nvtx_scoped_range nvtx_range{"dynfilter::push_build_side"};
-  assert(plan.enabled());
-  if (producers.size() != plan.probe_targets().size()) {
-    throw std::invalid_argument(
-      "[publish_dynamic_filters] publication requires one right per target");
-  }
-  dynamic_filter_publication_outcome outcome;
-  outcome.keys.resize(plan.admitted_keys().size());
-
-  if (build_view.num_rows() == 0) {
-    SIRIUS_LOG_DEBUG("[publish_dynamic_filters] Skipping dynamic filter push: empty build table.");
-    return outcome;
-  }
-
-  auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& tgt) {
-    return tgt.filter_set && tgt.filter_set->accepting_filters();
-  };
-  auto const& probe_targets = plan.probe_targets();
-  if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
-    SIRIUS_LOG_DEBUG(
-      "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
-    outcome.publications_skipped_targets_drained = 1;
-    for (auto& key : outcome.keys) {
-      key = {.reason        = dynamic_filter_key_reason::attempt_skip,
-             .reason_detail = attempt_counters::targets_drained.name};
-    }
-    return outcome;
-  }
-
-  auto const& admitted_keys = plan.admitted_keys();
-  auto const probe_types    = binding_probe_types(plan);
-
-  int source_device = -1;
-  if (cudaGetDevice(&source_device) != cudaSuccess) {
-    throw std::runtime_error(
-      "[publish_dynamic_filters] Dynamic-filter publisher could not identify its source GPU");
-  }
-  auto const source_space =
-    std::find_if(plan.replica_spaces().begin(),
-                 plan.replica_spaces().end(),
-                 [source_device](auto const& target) {
-                   return target.get_gpu_space().get_device_id() == source_device;
-                 });
-  if (source_space == plan.replica_spaces().end()) {
-    throw std::logic_error(
-      "[publish_dynamic_filters] Dynamic-filter source GPU is absent from the immutable publish "
-      "plan");
-  }
-  auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
-  auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
-  auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
-
-  std::vector<key_filters> per_key(admitted_keys.size());
-  // Build columns restored from a narrowed carrier; filters copy from them asynchronously on
-  // `stream`, so they must outlive the synchronize below.
-  std::vector<std::unique_ptr<cudf::column>> restored_build_columns;
-
-  try {
-    for (std::size_t admitted_key_index = 0; admitted_key_index < admitted_keys.size();
-         ++admitted_key_index) {
-      if (probe_types[admitted_key_index].empty()) { continue; }
-      auto const& admitted_key = admitted_keys[admitted_key_index];
-      auto& filters            = per_key[admitted_key_index];
-      auto& reported           = outcome.keys[admitted_key_index];
-      reported.rows            = build_rows;
-      if (detail::consider_bound_key(outcome,
-                                     admitted_key,
-                                     build_rows,
-                                     plan.domain_coverage_threshold(),
-                                     detail::publication_path::ordinary,
-                                     /*publishable=*/true)) {
-        ++outcome.keys_skipped_domain_gate;
-        reported.reason = dynamic_filter_key_reason::domain_gate;
-        continue;
-      }
-
-      if (admitted_key.build_key_ordinal >= build_view.num_columns()) {
-        throw std::logic_error(
-          "[publish_dynamic_filters] An admitted key's build ordinal lies outside the runtime "
-          "build "
-          "table");
-      }
-      // The build column may arrive at a narrower carrier than the plan recorded: compressed
-      // materialization casts a pinned column to the narrowest carrier its values fit, and that
-      // carrier is restorable to the recorded type without changing any value. Any other
-      // disagreement is a type-derivation bug and skips the key; the join stays authoritative.
-      cudf::column_view col   = build_view.column(admitted_key.build_key_ordinal);
-      auto const arrived_type = col.type();
-      if (arrived_type != admitted_key.storage_type) {
-        if (!sirius::can_restore_to(arrived_type, admitted_key.storage_type)) {
-          SIRIUS_LOG_WARN(
-            "[publish_dynamic_filters] dynamic filter key {}: skipped (plan recorded type id {} "
-            "but build column {} carries type id {}).",
-            admitted_key_index,
-            static_cast<int32_t>(admitted_key.storage_type.id()),
-            admitted_key.build_key_ordinal,
-            static_cast<int32_t>(arrived_type.id()));
-          ++outcome.keys_skipped_type_mismatch;
-          reported.reason = dynamic_filter_key_reason::type_mismatch;
-          continue;
-        }
-        // One rule for every key family. The membership filters classify on the runtime column,
-        // so they are built at the carrier when it lands the key in the same family as the
-        // recorded type (an INT16 carrier of a BIGINT key, a DECIMAL32 carrier of a DECIMAL64
-        // key): every probe the recorded type accepts is comparable to the carrier-sized set and
-        // range-checks into it, and no widened build copy is made. A carrier that changes the
-        // family (a DATE stored as INT16 classifies as a signed integer, and a signed-integer set
-        // would decline the native TIMESTAMP_DAYS probe) is restored to the recorded type first;
-        // the cast is small (the build side) and costs no set width.
-        if (!membership_same_family(admitted_key.storage_type, arrived_type)) {
-          restored_build_columns.push_back(
-            sirius::cast_through_rep(col, admitted_key.storage_type, stream, allocator_ref));
-          col = restored_build_columns.back()->view();
-          SIRIUS_LOG_DEBUG(
-            "[publish_dynamic_filters] dynamic filter key {}: build column {} arrives at carrier "
-            "type id {} outside the recorded type's key family; restored to type id {} for "
-            "publication.",
-            admitted_key_index,
-            admitted_key.build_key_ordinal,
-            static_cast<int32_t>(arrived_type.id()),
-            static_cast<int32_t>(admitted_key.storage_type.id()));
-        } else {
-          SIRIUS_LOG_DEBUG(
-            "[publish_dynamic_filters] dynamic filter key {}: build column {} arrives at "
-            "narrowed carrier type id {} (plan recorded type id {}); building filters at the "
-            "carrier.",
-            admitted_key_index,
-            admitted_key.build_key_ordinal,
-            static_cast<int32_t>(arrived_type.id()),
-            static_cast<int32_t>(admitted_key.storage_type.id()));
-        }
-      }
-
-      // Zone-map bounds are lowered to AST literals compared against the consumer's column, which
-      // carries the recorded storage type once decoded, so the bounds are reduced at whatever
-      // carrier the build arrived at and then restored to the recorded type: two scalars, not the
-      // whole column, so a narrowed build publishes the same zone map a native one does.
-      filters.zone_map_type = admitted_key.storage_type;
-      if (plan.emit_zone_map_filters() &&
-          sirius::op::sirius_dynamic_zone_map_filter::supports(admitted_key.storage_type)) {
-        nvtx_scoped_range vr{"dynfilter::build_zone_map"};
-        auto min_s = cudf::reduce(col,
-                                  *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
-                                  col.type(),
-                                  stream,
-                                  allocator_ref);
-        auto max_s = cudf::reduce(col,
-                                  *cudf::make_max_aggregation<cudf::reduce_aggregation>(),
-                                  col.type(),
-                                  stream,
-                                  allocator_ref);
-        if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
-          if (col.type() != admitted_key.storage_type) {
-            min_s =
-              detail::restore_scalar(*min_s, admitted_key.storage_type, stream, allocator_ref);
-            max_s =
-              detail::restore_scalar(*max_s, admitted_key.storage_type, stream, allocator_ref);
-          }
-          std::vector<sirius::op::zone_map_entry> zones;
-          zones.push_back({std::move(min_s), std::move(max_s)});
-          filters.zone_map = std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(
-            std::move(zones), true, true);
-        }
-      }
-      filters.membership_domain = classify_membership_key(col.type());
-
-      // Every membership filter compacts null build keys out (they match nothing under the join's
-      // null_equality::UNEQUAL), so the representation is sized and chosen on the valid rows.
-      auto const valid_rows = build_rows - static_cast<std::size_t>(col.null_count());
-      reported.valid_rows   = valid_rows;
-      auto const set_bytes =
-        sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(valid_rows, col.type());
-      auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(valid_rows);
-
-      // The type gates below are necessary, not sufficient: a DECIMAL128 key sits on the int64 rep
-      // only when its unscaled build values fit, which is a property of this build, not the type.
-      // One min/max reduction here spares every filter's supports() from re-deriving it; an
-      // unfitting build declines membership for the key while the zone map (exact at DECIMAL128)
-      // still publishes.
-      bool const fits_rep = membership_key_supported(col.type()) &&
-                            membership_build_fits_rep(col, stream, allocator_ref);
-      if (membership_key_supported(col.type()) && !fits_rep) {
-        SIRIUS_LOG_DEBUG(
-          "[publish_dynamic_filters] dynamic filter key {}: build values exceed the membership "
-          "key rep (DECIMAL128 outside int64); membership filters declined.",
-          admitted_key_index);
-      }
-
-      auto const chosen = choose_membership_filter(
-        {.build_rows               = valid_rows,
-         .l2_cache_bytes           = l2_bytes,
-         .estimated_hash_set_bytes = set_bytes,
-         .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
-         .supports_small_in_list =
-           fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
-         .supports_hash_in_list =
-           fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
-         .supports_bloom =
-           fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
-
-      char const* choice = "none";
-      switch (chosen) {
-        case membership_filter_kind::small_in_list: {
-          nvtx_scoped_range vr{"dynfilter::build_small_in_list"};
-          auto filter = std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
-            col, stream, allocator_ref);
-          filters.membership_size = filter->size();
-          filters.membership      = std::move(filter);
-          choice                  = "small_in_list";
-          break;
-        }
-        case membership_filter_kind::hash_in_list: {
-          nvtx_scoped_range vr{"dynfilter::build_in_list"};
-          auto filter =
-            std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
-          filters.membership_size = filter->size();
-          filters.membership      = std::move(filter);
-          choice                  = "in_list";
-          break;
-        }
-        case membership_filter_kind::bloom: {
-          nvtx_scoped_range vr{"dynfilter::build_bloom"};
-          filters.membership =
-            std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
-          filters.membership_size = bloom_bytes;
-          choice                  = "bloom";
-          break;
-        }
-        case membership_filter_kind::none: break;
-      }
-      if (filters.membership) { filters.membership_kind = chosen; }
-      // A filter no binding could receive is reported as absent, with the reason it is.
-      if (!filters.membership ||
-          !membership_reaches_a_binding(plan, admitted_key_index, filters.membership_domain)) {
-        if (filters.membership) {
-          reported.reason = dynamic_filter_key_reason::unreadable_probe;
-        } else if (membership_key_supported(col.type()) && !fits_rep) {
-          reported.reason = dynamic_filter_key_reason::decimal128_unfit;
-        } else if (!filters.zone_map ||
-                   !zone_map_reaches_a_binding(plan, admitted_key_index, filters.zone_map_type)) {
-          reported.reason = dynamic_filter_key_reason::unsupported_type;
-        }
-      }
-      if (filters.membership) { ++outcome.membership_filters_built; }
-      if (filters.zone_map) { ++outcome.zone_map_filters_built; }
-      SIRIUS_LOG_DEBUG(
-        "[publish_dynamic_filters] dynamic filter key {}: build_rows={} (valid={}) zone_map={} "
-        "membership: in_list_set={}B bloom={}B L2={}B inlist_max_l2_fraction={} -> {}",
-        admitted_key_index,
-        build_rows,
-        valid_rows,
-        filters.zone_map ? "yes" : "no",
-        set_bytes,
-        bloom_bytes,
-        l2_bytes,
-        plan.inlist_max_l2_fraction(),
-        choice);
-    }
-
-    // Finish construction and replication before publishing to independent consumer streams.
-    if (std::ranges::any_of(per_key, [](key_filters const& filters) {
-          return filters.membership || filters.zone_map;
-        })) {
-      stream.sync();
-
-      nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
-      auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
-        if (!filter) { return; }
-        auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());
-        if (replicable == nullptr) {
-          throw std::logic_error(
-            "[publish_dynamic_filters] A published device-backed dynamic filter must implement "
-            "sirius_device_replicable");
-        }
-        replicable->replicate_to_devices(plan.replica_spaces());
-      };
-      for (auto const& filters : per_key) {
-        replicate(filters.zone_map);
-      }
-      for (auto const& filters : per_key) {
-        replicate(filters.membership);
-      }
-    }
-
-    // Permission to publish is granted by before_fanout(). This allows the caller to cancel
-    // publication after construction and replication, but before the first push to any target
-    // channel, providing a mechanism to separate replication from publication.
-    // Allocated before permission is granted, so nothing can fail once fan-out has started.
-    std::vector<std::size_t> pushed_bindings(admitted_keys.size());
-    if (before_fanout && !before_fanout()) { return outcome; }
-
-    auto const counts = fan_out(plan, producers, per_key, pushed_bindings, [] {});
-    for (std::size_t index = 0; index < admitted_keys.size(); ++index) {
-      auto const& filters = per_key[index];
-      auto& reported      = outcome.keys[index];
-      if (filters.membership &&
-          membership_reaches_a_binding(plan, index, filters.membership_domain)) {
-        reported.kind = filters.membership_kind;
-        reported.size = filters.membership_size;
-      }
-      reported.zone_map =
-        filters.zone_map && zone_map_reaches_a_binding(plan, index, filters.zone_map_type);
-      reported.pushed = pushed_bindings[index];
-      if (reported.reason == dynamic_filter_key_reason::not_constructed &&
-          (reported.kind != membership_filter_kind::none || reported.zone_map)) {
-        reported.reason = dynamic_filter_key_reason::published;
-      }
-    }
-    SIRIUS_LOG_INFO(
-      "[publish_dynamic_filters] dynamic-filter publication: pushed {} dynamic filter(s) "
-      "across {} active target(s) of {} wired target(s) ({} build rows, {} bound keys of {} "
-      "admitted).",
-      counts.pushed,
-      counts.active_targets,
-      probe_targets.size(),
-      build_view.num_rows(),
-      outcome.keys_considered,
-      admitted_keys.size());
-    outcome.active_targets                      = counts.active_targets;
-    outcome.filters_pushed                      = counts.pushed;
-    outcome.bindings_skipped_incompatible_probe = counts.incompatible_probes;
-    return outcome;
-  } catch (...) {
-    // Retire accepted work before the outer filter owners are destroyed during unwinding.
-    auto error = std::current_exception();
-    stream.sync();
-    std::rethrow_exception(error);
-  }
 }
 
 void dynamic_filter_publication_session::finish_input() noexcept
