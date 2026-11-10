@@ -28,10 +28,8 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 `sirius.max_concurrent_queries` is a positive startup integer, default **1**, shared by
 connections to one DatabaseInstance. It bounds initialization through retirement. Additional
-queries wait in a cancellable FIFO queue. The former
-`sirius.executor.scan_manager.max_concurrent_queries` key is a deprecated alias; conflicting
-values fail configuration loading. See [Concurrent queries](concurrent-queries.md) for the
-maintenance, error and multi-GPU contracts.
+queries wait in a cancellable FIFO queue. See [Concurrent queries](concurrent-queries.md) for
+the maintenance, error and multi-GPU contracts.
 
 ### `SIRIUS_DISABLE`
 
@@ -835,9 +833,6 @@ These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is
 rejected. `RESET` restores the registered default. Query initialization captures both
 settings in an immutable snapshot, so later changes do not affect an existing query.
 Evaluators retain their own policy values rather than reading mutable global defaults.
-
-`expression_executor_strategy` remains registered as a deprecated compatibility alias for
-`expression_evaluator_strategy`; new configuration should use the evaluator name.
 
 ### Scan
 

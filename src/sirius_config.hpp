@@ -391,10 +391,7 @@ struct sirius_config {
   /// Replace all settings with hardware-resolved defaults. Apply programmatic
   /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
-  [[nodiscard]] int max_concurrent_queries() const noexcept
-  {
-    return _scan_manager_config.max_concurrent_queries;
-  }
+  [[nodiscard]] int max_concurrent_queries() const noexcept { return _max_concurrent_queries; }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -485,6 +482,8 @@ struct sirius_config {
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
+  /// Query admission limit (`sirius.max_concurrent_queries`).
+  int _max_concurrent_queries{1};
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
