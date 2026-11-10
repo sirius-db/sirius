@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <latch>
 #include <memory>
 #include <string>
 #include <thread>
@@ -269,12 +270,18 @@ TEST_CASE("C plan failures clear outputs and provide optional diagnostics", "[pu
                                  "file:/tmp/data.parquet",
                                  "file:data.parquet",
                                  "s3:bucket/file",
-                                 "a+b.c-d:x"}) {
+                                 "a+b.c-d:x",
+                                 "data:1.parquet"}) {
     CHECK(sirius_plan_scan_parquet(path.data(), path.size(), fields.get(), &invalid, nullptr) ==
           SIRIUS_INVALID_ARGUMENT);
   }
-  for (const std::string path :
-       {"./name:part", "1a:x.parquet", "*.parquet", "a?.parquet", "a[b].parquet", "a].parquet"}) {
+  for (const std::string path : {"./data:1.parquet",
+                                 "./name:part",
+                                 "1a:x.parquet",
+                                 "*.parquet",
+                                 "a?.parquet",
+                                 "a[b].parquet",
+                                 "a].parquet"}) {
     sirius_plan_node* local = nullptr;
     REQUIRE(sirius_plan_scan_parquet(path.data(), path.size(), fields.get(), &local, nullptr) ==
             SIRIUS_SUCCESS);
@@ -380,6 +387,87 @@ TEST_CASE("C immutable plans support concurrent ownership and construction", "[p
         }
       });
     }
+  }
+  CHECK(failures == 0);
+}
+
+TEST_CASE("C final expression release tears down combined-depth ownership", "[public_plan]")
+{
+  auto fields = schema();
+  auto source = scan(fields.get());
+  for (size_t node_depth = 1; node_depth < 256; ++node_depth) {
+    auto predicate = column(source.get(), 1);
+    for (size_t expression_depth = 1; expression_depth < 256; ++expression_depth) {
+      predicate = compare(predicate.get(), predicate.get());
+    }
+    source = filter(source.get(), predicate.get());
+  }
+  // An external expression becomes the sole owner of the entire input chain.
+  auto external = column(source.get(), 1);
+  for (size_t depth = 1; depth < 256; ++depth) {
+    external = compare(external.get(), external.get());
+  }
+  const auto* borrowed_root = source.get();
+  source.reset();
+  fields.reset();
+  size_t nodes = 0;
+  for (auto* node = borrowed_root; node; node = sirius_plan_node_input(node)) {
+    ++nodes;
+  }
+  CHECK(nodes == 256);
+  CHECK(sirius_expression_type(external.get()) == SIRIUS_TYPE_BOOLEAN);
+  // ASan/LSan check the nested teardown for invalid accesses and leaked references.
+  external.reset();
+}
+
+TEST_CASE("C shared handles can lose their final references on worker threads", "[public_plan]")
+{
+  std::atomic<unsigned> failures{0};
+  for (int iteration = 0; iteration < 32; ++iteration) {
+    auto fields    = schema();
+    auto source    = scan(fields.get());
+    auto predicate = column(source.get(), 1);
+    auto result    = plan(filter(source.get(), predicate.get()).get());
+    std::latch start{1};
+    std::vector<std::jthread> threads;
+    try {
+      for (int worker = 0; worker < 4; ++worker) {
+        sirius_schema_retain(fields.get());
+        schema_handle owned_fields(fields.get(), sirius_schema_release);
+        sirius_plan_node_retain(source.get());
+        node_handle owned_source(source.get(), sirius_plan_node_release);
+        sirius_expression_retain(predicate.get());
+        expression_handle owned_predicate(predicate.get(), sirius_expression_release);
+        sirius_plan_retain(result.get());
+        plan_handle owned_result(result.get(), sirius_plan_release);
+        threads.emplace_back([&,
+                              fields    = std::move(owned_fields),
+                              source    = std::move(owned_source),
+                              predicate = std::move(owned_predicate),
+                              result    = std::move(owned_result)]() mutable {
+          start.wait();
+          if (sirius_schema_field_count(fields.get()) != 2 ||
+              sirius_plan_node_get_kind(source.get()) != SIRIUS_NODE_PARQUET_SCAN ||
+              sirius_expression_type(predicate.get()) != SIRIUS_TYPE_BOOLEAN ||
+              sirius_plan_node_input(sirius_plan_root(result.get())) != source.get()) {
+            ++failures;
+          }
+          result.reset();
+          predicate.reset();
+          source.reset();
+          fields.reset();
+        });
+      }
+    } catch (...) {
+      // Release waiting workers before their jthread destructors join them.
+      start.count_down();
+      throw;
+    }
+    result.reset();
+    predicate.reset();
+    source.reset();
+    fields.reset();
+    start.count_down();
   }
   CHECK(failures == 0);
 }

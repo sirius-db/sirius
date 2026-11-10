@@ -55,6 +55,8 @@ enum {
 };
 /** Describe one local Parquet file with an explicit schema. path is a nonempty native-byte
  * path without NUL or a URI scheme. The path is literal: glob characters are never expanded.
+ * A scheme-shaped prefix such as data:1.parquet is rejected; use ./data:1.parquet
+ * to identify that literal POSIX filename.
  * Relative paths use the working directory at future preparation time.
  * No file is opened or schema inferred; preparation must bind the source
  * and check its schema and engine support. schema and out must not be NULL.
