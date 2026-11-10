@@ -16,14 +16,9 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
-#include "config.hpp"
 #include "creator/task_creator.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/settings.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -36,23 +31,6 @@ namespace pipeline {
 sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
   : ready(false), initialized(false), source(nullptr), sink(nullptr), build_ctx_(ctx)
 {
-}
-
-bool sirius_pipeline::is_order_dependent() const
-{
-  if (source) {
-    auto source_order = source->source_order();
-    if (source_order == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
-    if (source_order == sirius::OrderPreservationType::NO_ORDER) { return false; }
-  }
-  for (auto& op_ref : operators) {
-    auto& op = op_ref.get();
-    if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
-    if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
-  }
-  if (!build_ctx_.preserve_insertion_order()) { return false; }
-  if (sink && sink->sink_order_dependent()) { return true; }
-  return false;
 }
 
 std::vector<op::sirius_physical_operator::next_port_info>
@@ -353,9 +331,33 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   }
 }
 
-std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
+sirius_pipeline::task_creation_guard::task_creation_guard(sirius_pipeline& pipeline)
+  : pipeline_(&pipeline), lock_(pipeline._task_creation_mutex)
 {
-  return std::unique_lock<std::mutex>(_status_mutex);
+  std::lock_guard status(pipeline._status_mutex);
+  pipeline._task_creation_active = true;
+}
+sirius_pipeline::task_creation_guard::~task_creation_guard() { unlock(); }
+void sirius_pipeline::task_creation_guard::unlock()
+{
+  if (!pipeline_) return;
+  {
+    std::lock_guard status(pipeline_->_status_mutex);
+    pipeline_->_task_creation_active = false;
+  }
+  pipeline_ = nullptr;
+  lock_.unlock();
+}
+sirius_pipeline::task_creation_guard sirius_pipeline::get_task_creation_lock()
+{
+  return task_creation_guard(*this);
+}
+
+bool sirius_pipeline::is_limit_exhausted() const
+{
+  return std::any_of(operators.begin(), operators.end(), [](auto const& op) {
+    return op.get().is_limit_exhausted();
+  });
 }
 
 void sirius_pipeline::update_pipeline_status(bool original_pipeline)
@@ -368,6 +370,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
   bool just_closed = false;
   {
     std::lock_guard<std::mutex> lock(_status_mutex);
+    if (_task_creation_active) return;
 
     auto end_nvtx_range_if_finished = [this]() {
       if (pipeline_finished.load() && _nvtx_range_started.load()) {
@@ -384,13 +387,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (first_node == nullptr) { throw internal_exception("First node of pipeline is nullptr"); }
       // Check if any operator has exhausted its limit — this allows the pipeline to finish
       // early without waiting for the source pipeline to drain all remaining batches.
-      bool limit_exhausted = false;
-      for (auto& op_ref : operators) {
-        if (op_ref.get().is_limit_exhausted()) {
-          limit_exhausted = true;
-          break;
-        }
-      }
+      bool limit_exhausted = is_limit_exhausted();
       // Source-exhaustion conjunct: the task
       // counters can be transiently balanced (0==0 before the first split
       // arrives, or all-done-before-close), so finishing additionally requires

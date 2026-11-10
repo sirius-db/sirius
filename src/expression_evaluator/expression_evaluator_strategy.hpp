@@ -22,8 +22,8 @@ namespace sirius {
 
 /**
  * @brief The expression_evaluator_strategy defines how the expression_evaluator executes.
- * MATERIALIZE: Executes by materializing intermediate results as cudf::columns (every expression
- *              node is a single kernel).
+ * MATERIALIZE: Materializes intermediate results as cudf::columns. Floating comparisons use
+ *              interpreted ASTs for NaN semantics; this strategy never selects AST JIT.
  * AST_INTERPRET: Executes by constructing a cudf::ast::tree and interpreting it with cudf::compute
  *                (monolithic kernel with large switch statement).
  * AST_JIT: Executes by constructing a cudf::ast::tree and compiling it with cudf::compute_jit.

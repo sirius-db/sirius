@@ -6,10 +6,9 @@ add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
 set_target_properties(sirius_unittest PROPERTIES ENABLE_EXPORTS ON)
 # Load Sirius in a DuckDB-only host to avoid a second embedded engine copy.
 add_executable(sirius_extension_host test/cpp/utils/duckdb_extension_host.cpp)
-target_link_libraries(
-  sirius_extension_host
-  PRIVATE Catch2::Catch2WithMain sirius::duckdb_dependency
-          duckdb_generated_extension_loader)
+target_link_libraries(sirius_extension_host PRIVATE Catch2::Catch2WithMain
+                                                    sirius::duckdb_dependency)
+sirius_link_duckdb_extensions(sirius_extension_host PRIVATE)
 target_include_directories(sirius_extension_host
                            PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp")
 target_compile_definitions(
@@ -25,27 +24,57 @@ set_target_properties(
 add_dependencies(sirius_unittest sirius_extension_host)
 
 # Compile the public API test separately so engine tests remain C++20.
-add_library(sirius_context_config_test OBJECT
-            test/cpp/config/test_context_config.cpp)
-target_compile_features(sirius_context_config_test PRIVATE cxx_std_23)
-target_compile_definitions(sirius_context_config_test
+add_library(
+  sirius_public_api_test OBJECT test/cpp/config/test_context_config.cpp
+                                test/cpp/config/test_public_context.cpp)
+target_compile_features(sirius_public_api_test PRIVATE cxx_std_23)
+target_compile_definitions(sirius_public_api_test
                            PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
-set_target_properties(sirius_context_config_test PROPERTIES CXX_SCAN_FOR_MODULES
-                                                            OFF)
+set_target_properties(sirius_public_api_test PROPERTIES CXX_SCAN_FOR_MODULES
+                                                        OFF)
 target_include_directories(
-  sirius_context_config_test BEFORE
+  sirius_public_api_test BEFORE
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(sirius_context_config_test PRIVATE sirius_core
-                                                         Catch2::Catch2)
+target_link_libraries(sirius_public_api_test PRIVATE sirius_core Catch2::Catch2)
 if(VCPKG_BUILD)
-  set_target_properties(sirius_context_config_test
+  set_target_properties(sirius_public_api_test
                         PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
-  target_include_directories(sirius_context_config_test BEFORE
+  target_include_directories(sirius_public_api_test BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+target_sources(sirius_unittest PRIVATE $<TARGET_OBJECTS:sirius_public_api_test>)
+
+# Test variant of the connector registry: the same translation unit compiled
+# with the test-connector override seam. Linking the object ahead of sirius_core
+# keeps the archive's production object out of the test executable; production
+# libraries never see the seam.
+add_library(sirius_connector_registry_test OBJECT
+            src/planner/connector_registry.cpp)
+target_compile_definitions(
+  sirius_connector_registry_test
+  PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES
+          CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+set_target_properties(
+  sirius_connector_registry_test
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON)
+target_include_directories(
+  sirius_connector_registry_test BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(sirius_connector_registry_test PRIVATE sirius_core
+                                                             duckdb_static)
+if(VCPKG_BUILD)
+  set_target_properties(sirius_connector_registry_test
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_connector_registry_test BEFORE
                              PRIVATE ${_VCPKG_INC})
 endif()
 target_sources(sirius_unittest
-               PRIVATE $<TARGET_OBJECTS:sirius_context_config_test>)
+               PRIVATE $<TARGET_OBJECTS:sirius_connector_registry_test>)
+target_compile_definitions(sirius_unittest
+                           PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES)
 
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
@@ -77,8 +106,12 @@ target_link_libraries(
   ${CMAKE_DL_LIBS})
 
 target_include_directories(
-  sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
-                                 ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
+  sirius_unittest BEFORE
+  PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+          ${SIRIUS_SUBSTRAIT_DIR}/third_party
+          ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
+
+sirius_link_duckdb_extensions(sirius_unittest)
 
 # A fresh-process helper for NVTX startup tests. A shared test context can cache
 # domain handles and mask first-domain capture bugs.
@@ -100,10 +133,67 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 add_dependencies(sirius_unittest sirius_nvtx_startup)
 
-# DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
-# that conflict with inline definitions from headers included in test files.
+# DuckDB unity builds emit strong symbols for static constexpr members that
+# conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
+
+# CUDA fault injection is isolated from the ordinary unit-test executable: an
+# armed fault must never intercept unrelated test teardown synchronization.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(
+    sirius_cuda_fault_test
+    test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
+    test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
+    test/cpp/memory/test_device_transfer_fault.cpp
+    test/cpp/scan_manager/test_memory_prefetcher_health.cpp
+    test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
+    test/cpp/utils/cuda_status_fault.cpp
+    src/sirius_extension_entry.cpp
+    test/cpp/utils/sirius_extension_loader.cpp)
+  target_include_directories(
+    sirius_cuda_fault_test BEFORE
+    PRIVATE $<TARGET_PROPERTY:sirius_unittest,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(
+    sirius_cuda_fault_test
+    PRIVATE $<TARGET_PROPERTY:sirius_unittest,COMPILE_DEFINITIONS>)
+  target_link_libraries(
+    sirius_cuda_fault_test
+    PRIVATE sirius_core duckdb_static ZLIB::ZLIB Catch2::Catch2WithMain
+            ${SIRIUS_CURL_TARGET} ${CMAKE_DL_LIBS})
+  sirius_link_duckdb_extensions(sirius_cuda_fault_test PRIVATE)
+  # Wrap device_copy_batch::enqueue at the Sirius boundary: cuDF dispatches its
+  # CUDA batch call from its shared library.
+  target_link_options(
+    sirius_cuda_fault_test
+    PRIVATE
+    "LINKER:--allow-multiple-definition"
+    "LINKER:--wrap=cudaStreamWaitEvent"
+    "LINKER:--wrap=cudaDeviceSynchronize"
+    "LINKER:--wrap=cudaMemPoolGetAccess"
+    "LINKER:--wrap=cudaMemcpyAsync"
+    "LINKER:--wrap=cudaMemcpyBatchAsync"
+    "LINKER:--wrap=cudaStreamSynchronize"
+    "LINKER:--wrap=_ZN9cucascade6memory21exclusive_stream_pool14acquire_streamENS1_21stream_acquire_policyE"
+    "LINKER:--wrap=cudaMemcpyPeerAsync"
+    "LINKER:--wrap=_ZNK6sirius4cuda17device_copy_batch7enqueueEN4cuda3__410stream_refE"
+    "LINKER:--wrap=cudaEventRecord"
+    "LINKER:--wrap=cudaEventCreateWithFlags")
+  set_target_properties(
+    sirius_cuda_fault_test
+    PROPERTIES ENABLE_EXPORTS ON
+               CXX_SCAN_FOR_MODULES OFF
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+  if(VCPKG_BUILD)
+    set_target_properties(sirius_cuda_fault_test
+                          PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(sirius_cuda_fault_test BEFORE
+                               PRIVATE ${_VCPKG_INC})
+  endif()
+  add_dependencies(sirius_unittest sirius_cuda_fault_test)
+endif()
 
 # Isolated opt-in host allocation fault tests; the runner supplies exact
 # call-site ranges.
@@ -134,7 +224,8 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
 
 # -----------------------------------------------------------------------------
-# test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
+# test/io/parquet_benchmark — standalone benchmark binary for
+# cucascade::io::datasource
 # -----------------------------------------------------------------------------
 add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
 
@@ -160,9 +251,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(parquet_benchmark duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(parquet_benchmark)
 
 target_link_options(parquet_benchmark PRIVATE
                     "LINKER:--allow-multiple-definition")
@@ -199,9 +291,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(prefetch_benchmark duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(prefetch_benchmark)
 
 target_link_options(prefetch_benchmark PRIVATE
                     "LINKER:--allow-multiple-definition")
@@ -241,10 +334,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(prefetch_hybrid_scan_benchmark
-                      duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(prefetch_hybrid_scan_benchmark)
 
 target_link_options(prefetch_hybrid_scan_benchmark PRIVATE
                     "LINKER:--allow-multiple-definition")
@@ -281,9 +374,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(columnar_parquet_poc duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(columnar_parquet_poc)
 
 target_link_options(columnar_parquet_poc PRIVATE
                     "LINKER:--allow-multiple-definition")
@@ -320,9 +414,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(retirer_benchmark duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(retirer_benchmark)
 
 target_link_options(retirer_benchmark PRIVATE
                     "LINKER:--allow-multiple-definition")
@@ -360,9 +455,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(s3_throughput_test duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(s3_throughput_test)
 
 target_link_options(s3_throughput_test PRIVATE
                     "LINKER:--allow-multiple-definition")
@@ -402,10 +498,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(s3_autotune_throughput_bench
-                      duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(s3_autotune_throughput_bench)
 
 target_link_options(s3_autotune_throughput_bench PRIVATE
                     "LINKER:--allow-multiple-definition")
@@ -443,10 +539,10 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
-target_link_libraries(range_prefetch_benchmark
-                      duckdb_generated_extension_loader)
+sirius_link_duckdb_extensions(range_prefetch_benchmark)
 
 target_link_options(range_prefetch_benchmark PRIVATE
                     "LINKER:--allow-multiple-definition")

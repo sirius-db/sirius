@@ -37,13 +37,17 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
     PlanEdge const* zz = find_edge(node, "zigzag");
     auto t             = jit::FusedTree::make(OpKind::Zigzag);
     out.preorder.push_back({t.get(), nid, false, 0});
+    // Child keyed "zigzag" everywhere — the DSL port, the fused rep channel,
+    // and the renderer all agree, so there is no name translation.
+    std::shared_ptr<jit::FusedTree> zz_child;
     if (zz != nullptr && is_codegen_compressor(tree.nodes[zz->child].op)) {
-      auto child = build_rec(tree, zz->child, out);
-      if (!child) return nullptr;
-      // Child keyed "zigzag" everywhere — the DSL port, the fused rep channel,
-      // and the renderer all agree, so there is no name translation.
-      t->children.emplace("zigzag", std::move(child));
+      zz_child = build_rec(tree, zz->child, out);
+      if (!zz_child) return nullptr;
+    } else {
+      zz_child = jit::FusedTree::make(OpKind::Raw);
+      out.preorder.push_back({zz_child.get(), 0, true, nid, "zigzag", "zigzag"});
     }
+    t->children.emplace("zigzag", std::move(zz_child));
     return t;
   }
 

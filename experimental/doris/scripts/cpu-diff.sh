@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # CPU differential of the translator (single-plan execution preparation, no GPU): every captured dispatch in
 # the corpus is stitched into one Substrait plan, the plan bytes are run through DuckDB's
-# substrait consumer (the reader Sirius compiles into libsirius, built by
-# scripts/build-duckdb-substrait.sh) and the rows are validated against the DuckDB baseline
+# pinned pre-v2 Substrait consumer (built by scripts/build-duckdb-substrait.sh) and the rows are validated against the DuckDB baseline
 # in tests/expected/tpch-sf1.
 #
 #   scripts/cpu-diff.sh [--data DIR] [--queries 1,6,...] [--corpus DIR] [--out DIR]

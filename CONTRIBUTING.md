@@ -23,8 +23,8 @@ git submodule update --init --recursive
 make test
 
 # Run a specific tag or test name
-build/release/test/cpp/sirius_unittest "[uri_parser]"
-build/release/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
+build/release/test/cpp/sirius_unittest "[path_utils]"
+build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
 
 `make test` builds the release build and runs `scripts/run_unit_tests.py`, which CI also runs.
@@ -32,6 +32,13 @@ See [test/README.md](test/README.md) for its options.
 
 Test logs are written to `build/release/test/cpp/log/`, one subdirectory per
 test process.
+
+### On-demand SQL fuzzing
+
+The [Sirius fuzzer guide](test/fuzz/README.md) covers GPU setup, bounded SQL campaigns,
+replayable findings and rechecking them after a fix. Run it directly or use the
+[sirius-fuzz agent skill](.agents/skills/sirius-fuzz/SKILL.md) with an available development GPU.
+Harness unit tests use `pixi run fuzz-test` and do not require a GPU.
 
 ## Code style
 
@@ -49,6 +56,42 @@ pre-commit run -a
 
 Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`, and
 `rumdl` (Markdown links and anchors).
+
+Run clang-tidy independently from compilation with Pixi:
+
+```bash
+pixi run --locked clang-tidy
+```
+
+Task dependencies configure a separate `build/clang-tidy` directory and generate
+telemetry and Simpatico headers before analysis. They do not compile the engine
+or run tests. The Pixi toolchain and initialized build submodules are required;
+configuration disables the optional TPC-Havoc dataset download in this build.
+
+The task uses the full `.clang-tidy` check set on configured C/C++ sources under
+`src/` and `test/`, including standalone Simpatico tests. CUDA translation units,
+third-party sources, and build-generated sources are excluded. Findings are
+advisory; configuration, generation, and compiler errors fail the task. Normal
+builds, commits, and lint CI do not run clang-tidy.
+
+Additional arguments go directly to LLVM's `run-clang-tidy`. Use source regexes
+to narrow analysis and `-j` to override automatic CPU-count parallelism:
+
+```bash
+pixi run --locked clang-tidy 'src/io/uri_parser[.]cpp$'
+pixi run --locked clang-tidy -j 8 'test/cpp/config/test_context_config[.]cpp$'
+```
+
+Regexes select source files from the compilation database, rather than literal
+filenames or changed lines. Headers are analyzed through their including sources;
+run without a regex for header/configuration changes. The task reports diagnostics
+in owned headers and applies no fixes. An unmatched regex checks no sources, so
+check the tool's reported file count. If staged telemetry headers have been
+deleted while Cargo still reports its bridge build as cached, remove
+`build/clang-tidy` and rerun the task to regenerate them.
+
+Public re-exports can be declared using Clang's `IWYU pragma: export` and
+`IWYU pragma: begin_exports` / `end_exports` annotations.
 
 ## Submodules
 

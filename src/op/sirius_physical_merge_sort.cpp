@@ -59,7 +59,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   std::lock_guard<std::mutex> lg(_drain_mutex);
 
   auto* repo = ports.begin()->second->repo;
-  if (_current_partition_index < repo->num_partitions()) {
+  while (_current_partition_index < repo->num_partitions()) {
     std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
     while (true) {
       auto batch = repo->pop_next_data_batch(_current_partition_index);
@@ -70,8 +70,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     SIRIUS_LOG_DEBUG("merge_sort: drained {} batches for partition {}",
                      all_batches.size(),
                      _current_partition_index - 1);
-    if (all_batches.empty()) { return nullptr; }
-    return std::make_unique<pipelineable_operator_data>(all_batches);
+    if (all_batches.empty()) { continue; }
+    return std::make_unique<pipelineable_operator_data>(all_batches, _current_partition_index - 1);
   }
   return nullptr;
 }
@@ -117,7 +117,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     } else {
       outputs.push_back(apply_final_projection(input_batches[0]));
     }
-    return std::make_unique<pipelineable_operator_data>(outputs);
+    return std::make_unique<pipelineable_operator_data>(outputs, input.get_position());
   }
 
   // Build cudf order vectors from BoundOrderByNode
@@ -129,10 +129,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   null_precedence.reserve(orders.size());
 
   for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("Merge sort only supports bound reference expressions");
     }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     order_key_idx.push_back(idx);
     column_order.push_back(to_cudf_order(ord.type));
     null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
@@ -150,7 +150,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
       outputs.push_back(apply_final_projection(ro));
     }
   }
-  return std::make_unique<pipelineable_operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs, input.get_position());
 }
 
 }  // namespace op

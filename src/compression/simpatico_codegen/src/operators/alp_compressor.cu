@@ -18,6 +18,7 @@
 
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 #include "operators/alp_common.cuh"
 
 #include <cudf/column/column.hpp>
@@ -196,52 +197,30 @@ void alp_upload_constants(::cuda::stream_ref stream)
     }
   }
 
-  auto const s = stream.get();
-  cudaMemcpyToSymbolAsync(d_alp_exp_f32,
-                          host_consts_f32::kExp,
-                          sizeof(host_consts_f32::kExp),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(d_alp_frac_f32,
-                          host_consts_f32::kFrac,
-                          sizeof(host_consts_f32::kFrac),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(d_alp_fact_f32,
-                          host_consts_f32::kFact,
-                          sizeof(host_consts_f32::kFact),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(
-    d_alp_combos_f32, combos_f32, sizeof(combos_f32), 0, cudaMemcpyHostToDevice, s);
+  auto const s      = stream.get();
+  auto const upload = [s](auto const& symbol, auto const& table, char const* what) {
+    static_assert(sizeof(symbol) == sizeof(table));
+    throw_if_cuda_error(
+      cudaMemcpyToSymbolAsync(symbol, table, sizeof(table), 0, cudaMemcpyHostToDevice, s), what);
+  };
+  try {
+    upload(d_alp_exp_f32, host_consts_f32::kExp, "alp: upload f32 exponents");
+    upload(d_alp_frac_f32, host_consts_f32::kFrac, "alp: upload f32 fractions");
+    upload(d_alp_fact_f32, host_consts_f32::kFact, "alp: upload f32 factors");
+    upload(d_alp_combos_f32, combos_f32, "alp: upload f32 combinations");
+    upload(d_alp_exp_f64, host_consts_f64::kExp, "alp: upload f64 exponents");
+    upload(d_alp_frac_f64, host_consts_f64::kFrac, "alp: upload f64 fractions");
+    upload(d_alp_fact_f64, host_consts_f64::kFact, "alp: upload f64 factors");
+    upload(d_alp_combos_f64, combos_f64, "alp: upload f64 combinations");
 
-  cudaMemcpyToSymbolAsync(d_alp_exp_f64,
-                          host_consts_f64::kExp,
-                          sizeof(host_consts_f64::kExp),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(d_alp_frac_f64,
-                          host_consts_f64::kFrac,
-                          sizeof(host_consts_f64::kFrac),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(d_alp_fact_f64,
-                          host_consts_f64::kFact,
-                          sizeof(host_consts_f64::kFact),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(
-    d_alp_combos_f64, combos_f64, sizeof(combos_f64), 0, cudaMemcpyHostToDevice, s);
-
-  // Constants must be visible before any kernel that reads them runs; the
-  // upload is host-side one-time work so a bounded sync here is acceptable.
-  cudaStreamSynchronize(s);
+    // Constants must be visible before any kernel that reads them runs; the
+    // upload is host-side one-time work so a bounded sync here is acceptable.
+    throw_if_cuda_error(cudaStreamSynchronize(s), "alp: publish initialized constants");
+  } catch (...) {
+    // The stack-backed combination tables must survive any earlier queued upload.
+    (void)cudaStreamSynchronize(stream.get());
+    throw;
+  }
 }
 
 // Thread-safe init: uploads the constant tables once PER DEVICE. The __constant__
@@ -601,11 +580,12 @@ std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_vi
 
 template <typename T>
 std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation const& repr,
-                                                  ::cuda::stream_ref stream,
-                                                  rmm::device_async_resource_ref mr)
+                                                  decode_frame& frame)
 {
-  using traits = alp_traits<T>;
-  using int_t  = typename traits::int_t;
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
+  using traits      = alp_traits<T>;
+  using int_t       = typename traits::int_t;
 
   if (repr.num_rows == 0) {
     return cudf::make_fixed_width_column(
@@ -634,7 +614,7 @@ std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation 
                                           out->mutable_view().data<T>());
   }
 
-  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "alp_decompress sync");
+  throw_if_cuda_error(cudaGetLastError(), "alp_decompress launch");
   return out;
 }
 
@@ -660,12 +640,11 @@ alp_compressed_representation::alp_compressed_representation(
   channels_.push_back(std::move(metadata_in));
 }
 
-std::unique_ptr<cudf::column> alp_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+std::unique_ptr<cudf::column> alp_compressed_representation::decompress(decode_frame& frame) const
 {
   switch (original_type.id()) {
-    case cudf::type_id::FLOAT32: return alp_decompress_impl<float>(*this, stream, mr);
-    case cudf::type_id::FLOAT64: return alp_decompress_impl<double>(*this, stream, mr);
+    case cudf::type_id::FLOAT32: return alp_decompress_impl<float>(*this, frame);
+    case cudf::type_id::FLOAT64: return alp_decompress_impl<double>(*this, frame);
     default:
       throw std::runtime_error("alp: only FLOAT32 / FLOAT64 are supported (got " +
                                type_id_to_name(original_type) + ")");

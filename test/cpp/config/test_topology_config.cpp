@@ -56,9 +56,9 @@ TEST_CASE("parsed hardware configuration resolves independently after copying",
                    "    gpu: { usage_limit_bytes: 1Gi }\n"
                    "    host: { capacity_bytes: 2Gi }\n"
                    "  operator_params: { concat_batch_bytes: 123456789 }\n"
-                   "  telemetry: { exporter: msgpack, output_directory: deferred_telemetry }\n");
+                   "  telemetry: { exporter: ndjson, output_directory: deferred_telemetry }\n");
   auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
-  CHECK(parsed.get_telemetry_config().exporter == "msgpack");
+  CHECK(parsed.get_telemetry_config().exporter == sirius::QUENT_NDJSON_EXPORTER);
   CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
 
   auto copy = parsed;

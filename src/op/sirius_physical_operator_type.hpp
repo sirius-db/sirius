@@ -29,6 +29,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   ORDER_BY,
   LIMIT,
   STREAMING_LIMIT,
+  UNORDERED_STREAMING_LIMIT,
   LIMIT_PERCENT,
   TOP_N,
   WINDOW,
@@ -151,7 +152,9 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   DYNAMIC_FILTER,
   STREAMING_SOURCE,
   STREAMING_SINK,
-  DENSE_COUNT_JOIN
+  DENSE_COUNT_JOIN,
+  BUILD_FILTER,
+  REPLICATE
 };
 
 std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type);

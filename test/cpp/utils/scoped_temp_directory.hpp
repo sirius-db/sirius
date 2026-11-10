@@ -27,8 +27,8 @@
 
 namespace sirius::test {
 
-inline duckdb::unique_ptr<duckdb::MaterializedQueryResult> query(duckdb::Connection& con,
-                                                                 std::string const& sql)
+inline duckdb::unique_ptr<duckdb::QueryResult> query(duckdb::Connection& con,
+                                                     std::string const& sql)
 {
   auto result = con.Query(sql);
   if (!result || result->HasError()) {

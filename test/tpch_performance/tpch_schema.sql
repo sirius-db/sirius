@@ -1,19 +1,10 @@
 -- TPC-H schema for loading classic dbgen .tbl output into DuckDB.
 --
--- Key widths follow spec clause 1.3.1: an identifier must hold every key value
--- generated for its column and support at least 2,147,483,647 unique values.
--- Orderkeys are sparsely populated across 6,000,000 * SF, so they exceed 2^31
--- above ~SF358 and must be BIGINT. Every other key is densely populated and
--- stays inside INTEGER well past SF1000 (partkey SF*200,000, custkey
--- SF*150,000, suppkey SF*10,000). Clause 1.3.1 exempts identifier columns from
--- the datatype-consistency rule so they can be sized individually.
---
--- This matches sirius-db/tpchgen-rs, which emits Int32 for every key except
--- l_orderkey/o_orderkey, so the parquet and duckdb datasets share one key
--- layout. It diverges from DuckDB's tpch extension, which makes all keys
--- BIGINT: a database built here is no longer column-type-interchangeable with
--- one built by CALL dbgen(). Narrower keys are what let the SF1000 working set
--- fit -- l_partkey and l_suppkey alone are 48 GB smaller at that scale.
+-- This file uses INTEGER keys for small datasets. Before loading .tbl files,
+-- generate_tpch_data.sh runs tpch_schema.py to widen every primary and foreign
+-- key in a family together when its full dataset range exceeds INTEGER.
+-- The resulting widths match the adaptive defaults in sirius-db/tpchgen-rs.
+-- Nation and region keys always fit INTEGER.
 --
 -- Fixed-width text is VARCHAR, which is how DuckDB stores CHAR anyway.
 
@@ -72,7 +63,7 @@ CREATE TABLE partsupp (
 );
 
 CREATE TABLE orders (
-    o_orderkey      BIGINT,
+    o_orderkey      INTEGER,
     o_custkey       INTEGER,
     o_orderstatus   VARCHAR,
     o_totalprice    DECIMAL(15,2),
@@ -84,7 +75,7 @@ CREATE TABLE orders (
 );
 
 CREATE TABLE lineitem (
-    l_orderkey      BIGINT,
+    l_orderkey      INTEGER,
     l_partkey       INTEGER,
     l_suppkey       INTEGER,
     l_linenumber    BIGINT,

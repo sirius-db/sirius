@@ -18,12 +18,14 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "scan_manager/preparation_ledger.hpp"
 #include "transparent/plan_source_policy.hpp"
 
 #include <duckdb/function/table_function.hpp>
 
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace duckdb {
 class DatabaseInstance;
@@ -37,7 +39,8 @@ class sirius_physical_operator;
 class sirius_physical_table_scan;
 namespace scan {
 enum class dynamic_filter_apply_mode;
-}
+class gpu_ingestible;
+}  // namespace scan
 }  // namespace op
 }  // namespace sirius
 namespace sirius::planner {
@@ -72,6 +75,21 @@ struct connector {
                                             op::sirius_physical_table_scan const&,
                                             duckdb::ClientContext&,
                                             scan_contract_provenance&) = nullptr;
+  // On success, lookup delegates the bound candidate's function_info validation to
+  // this hook. The bridge must verify its provider-owned function_info and binding
+  // identity together; verifying only the nested Parquet wrapper is insufficient.
+  bool (*verify_binding)(duckdb::BaseTableFunction const&,
+                         duckdb::FunctionData const*,
+                         duckdb::ClientContext&) = nullptr;
+  // Original semantic binding only: no SQL rebind, inventory discovery or reader
+  // state consumption. May also run for a pre-declined scan to retain correspondence.
+  op::scan::bound_read_view (*capture)(duckdb::BoundTableFunction const&,
+                                       duckdb::FunctionData const*,
+                                       duckdb::ClientContext&) = nullptr;
+  // Contribute to the single statement admission before lowering any scan.
+  std::optional<scan_manager::preparation_request> (*prepare)(op::sirius_physical_table_scan&,
+                                                              operator_params const&,
+                                                              duckdb::ClientContext&) = nullptr;
 };
 
 enum class lookup_decline : uint8_t {
@@ -92,12 +110,50 @@ connector const* lookup_connector(duckdb::PhysicalTableScan const&, duckdb::Clie
 connector const* lookup_connector(duckdb::TableFunction const&,
                                   duckdb::FunctionData const*,
                                   duckdb::ClientContext&);
+connector const* lookup_connector(duckdb::BoundTableFunction const&,
+                                  duckdb::FunctionData const*,
+                                  duckdb::ClientContext&);
 //! Whether an Iceberg bind exposes a complete table schema with integer field IDs.
+bool iceberg_flat_mapping_supported(duckdb::FunctionData const* bind_data);
 bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data);
 std::span<connector const> registered_connectors();
 
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+namespace testing {
+// Test builds only. Replaces the policy and hook fields of existing trusted registry entries for
+// one database instance. Lookup uses the override's bind-data matcher to decide whether the
+// binding is accepted, and its optional verify_binding check. Lookup still checks the registered
+// function's trusted references and catalog registration.
+// A matching override is authoritative: its
+// decline never falls through to the original entry. Install the scope before any binding,
+// policy or capture lookup and keep it alive until every prepared statement, callback and
+// execution that may observe it has drained. The database must outlive the scope.
+// One scope per database instance at a time.
+class scoped_connector_overrides {
+ public:
+  scoped_connector_overrides(duckdb::DatabaseInstance const& db, std::vector<connector> overrides);
+  ~scoped_connector_overrides();
+  scoped_connector_overrides(scoped_connector_overrides const&)            = delete;
+  scoped_connector_overrides& operator=(scoped_connector_overrides const&) = delete;
+
+ private:
+  duckdb::DatabaseInstance const* db_;
+};
+// A test that calls this probe fails to link if the guarded registry variant is missing.
+bool connector_overrides_linked();
+}  // namespace testing
+#endif
+
 // Register at Sirius load; bootstrap Iceberg trust during extension loading, never in lookup.
 void register_scan_source_callbacks(duckdb::DatabaseInstance&);
+
+// Assemble an already prepared materializer using the shared dynamic-filter path.
+duckdb::unique_ptr<op::sirius_physical_operator> lower_prepared_scan(
+  std::shared_ptr<op::scan::gpu_ingestible>,
+  op::sirius_physical_table_scan const&,
+  operator_params const&,
+  duckdb::ClientContext&,
+  op::scan::dynamic_filter_apply_mode);
 
 // These wrappers keep the existing format builders and admission gates at their original sites.
 duckdb::unique_ptr<op::sirius_physical_operator> lower_native_scan(
@@ -118,4 +174,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_iceberg_scan(
 op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet&,
                                                                duckdb::ClientContext&,
                                                                scan_contract_provenance&);
+/// Verify the nested multi-file wrapper against this host's Parquet implementation.
+/// Does not verify the outer provider's function_info or binding identity.
+bool verified_parquet_interface(duckdb::FunctionData const*, duckdb::ClientContext&);
+
 }  // namespace sirius::planner

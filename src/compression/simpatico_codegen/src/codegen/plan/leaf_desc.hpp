@@ -30,8 +30,10 @@ struct alp_rd {
 // ANS: opaque byte blob — uncompressed_size and original type_id cannot be
 // recovered from the compressed payload alone.
 struct ans {
+  // 5: pre-v6 payload; 6: v6 payload. Independent of the .hpln layout version.
   std::uint64_t uncompressed_size = 0;
   std::int32_t original_type_id   = 0;  // cast of cudf::type_id
+  std::uint8_t payload_format     = 0;  // Unspecified metadata is rejected.
 };
 
 // Bitcomp: same as ANS, plus the algorithm knob used at compress time.
@@ -50,6 +52,7 @@ struct nvcomp_cascaded {
   std::int32_t num_deltas         = 1;
   std::int32_t num_RLEs           = 2;
   std::int32_t use_bp             = 1;
+  std::uint8_t payload_format     = 0;  // Same format identifiers as ANS.
 };
 
 // Simple nvcomp codecs (Snappy, LZ4, GDeflate): opaque byte blob, no extra

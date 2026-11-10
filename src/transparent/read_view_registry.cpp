@@ -16,16 +16,13 @@
 
 #include "transparent/read_view_registry.hpp"
 
-#include "io/sirius_datasource.hpp"
-#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
-#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/table_scan/split_validation.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
-#include "transparent/replay_admission.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/storage/single_file_block_manager.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -179,8 +176,20 @@ read_view_comparison compare_read_views_impl(
   candidate_origin origin,
   std::span<original_binding_ref const> logical_original,
   std::span<op::scan::read_view_fingerprint const* const> physical_original,
-  std::span<candidate_binding const> candidate)
+  std::span<candidate_binding const> planned,
+  std::span<candidate_binding const> skipped)
 {
+  // Skipped definitions get the same identity checks; only replan's single correspondence,
+  // which names the scan the GPU reads, considers planned scans alone.
+  std::vector<candidate_binding> all;
+  auto candidate = planned;
+  if (!skipped.empty()) {
+    all.reserve(planned.size() + skipped.size());
+    all.assign(planned.begin(), planned.end());
+    all.insert(all.end(), skipped.begin(), skipped.end());
+    candidate = all;
+  }
+
   read_view_comparison result;
   result.original_count  = physical_original.size();
   result.candidate_count = candidate.size();
@@ -190,29 +199,29 @@ read_view_comparison compare_read_views_impl(
   if (!candidate.empty() && candidate.front().view && candidate.front().view->identity) {
     result.candidate_hash = candidate.front().view->identity->fingerprint.hash;
   }
+  bool const multi_replan = origin == candidate_origin::replan && planned.size() > 1;
   if (origin == candidate_origin::replan) {
-    result.correspondence = candidate.empty() ? "none" : "single";
-    if (candidate.size() > 1) {
-      result.correspondence = "none";
-      result.reason         = "no_correspondence";
-      return result;
-    }
+    // For multi-scan replans, table indexes propose pairs; the checks below
+    // must still prove identity and required selector equality.
+    result.correspondence = planned.empty() ? "none"
+                            : multi_replan  ? "table_index_replan"
+                                            : "single";
   } else {
     result.correspondence = "table_index";
   }
   if (!compare_multiset(physical_original, candidate, result)) return result;
 
-  if (origin == candidate_origin::replan) {
-    if (candidate.empty()) {
+  if (origin == candidate_origin::replan && !multi_replan) {
+    if (planned.empty()) {
       result.equal = true;
       return result;
     }
     op::scan::bound_read_view const* selector_original = nullptr;
     if (logical_original.size() == 1 &&
-        same_identity(logical_original.front().view, candidate.front().view)) {
+        same_identity(logical_original.front().view, planned.front().view)) {
       selector_original = logical_original.front().view;
     }
-    if (!selector_proven(*candidate.front().view, selector_original)) {
+    if (!selector_proven(*planned.front().view, selector_original)) {
       result.reason = "selector_unproven";
       return result;
     }
@@ -220,25 +229,23 @@ read_view_comparison compare_read_views_impl(
     return result;
   }
 
-  if (logical_original.size() != candidate.size()) {
-    result.reason = "binding_mismatch";
+  auto pairing_failed = [&] {
+    if (multi_replan) result.correspondence = "none";
+    result.reason = multi_replan ? "no_correspondence" : "binding_mismatch";
     return result;
-  }
+  };
+  if (logical_original.size() != candidate.size()) return pairing_failed();
   std::unordered_set<duckdb::idx_t> matched_table_indexes;
   matched_table_indexes.reserve(candidate.size());
   for (auto const& candidate_binding : candidate) {
-    if (!matched_table_indexes.insert(candidate_binding.table_index).second) {
-      result.reason = "binding_mismatch";
-      return result;
-    }
+    if (!matched_table_indexes.insert(candidate_binding.table_index).second)
+      return pairing_failed();
     auto const found =
       std::find_if(logical_original.begin(), logical_original.end(), [&](auto const& original) {
         return original.table_index == candidate_binding.table_index;
       });
-    if (found == logical_original.end() || !same_identity(found->view, candidate_binding.view)) {
-      result.reason = "binding_mismatch";
-      return result;
-    }
+    if (found == logical_original.end() || !same_identity(found->view, candidate_binding.view))
+      return pairing_failed();
     if (!selector_proven(*candidate_binding.view, found->view)) {
       result.reason = "selector_unproven";
       return result;
@@ -253,7 +260,8 @@ read_view_comparison compare_read_views(
   candidate_origin origin,
   std::span<original_binding const> logical_original,
   std::span<op::scan::read_view_fingerprint const> physical_original,
-  std::span<candidate_binding const> candidate)
+  std::span<candidate_binding const> candidate,
+  std::span<candidate_binding const> skipped)
 {
   std::vector<original_binding_ref> logical;
   logical.reserve(logical_original.size());
@@ -263,7 +271,7 @@ read_view_comparison compare_read_views(
   physical.reserve(physical_original.size());
   for (auto const& fingerprint : physical_original)
     physical.push_back(&fingerprint);
-  return compare_read_views_impl(origin, logical, physical, candidate);
+  return compare_read_views_impl(origin, logical, physical, candidate, skipped);
 }
 
 read_view_comparison compare_read_views(
@@ -290,7 +298,8 @@ read_view_comparison compare_read_views(
     physical.push_back(&view.identity->fingerprint);
   }
   auto bindings = candidate.candidate_bindings();
-  auto result   = compare_read_views_impl(origin, logical, physical, bindings);
+  auto result =
+    compare_read_views_impl(origin, logical, physical, bindings, candidate.skipped_bindings());
   if (!physical_original.empty()) result.original_depth = physical_original.front().depth;
   if (!bindings.empty() && bindings.front().view) {
     result.candidate_depth = bindings.front().view->depth;
@@ -302,8 +311,10 @@ void share_equal_read_view_identities(op::scan::logical_bound_read_view_capture*
                                       std::span<op::scan::bound_read_view> physical_original,
                                       read_view_registry const& candidate)
 {
-  auto const bindings = candidate.candidate_bindings();
-  auto share          = [&](op::scan::bound_read_view& original, bool required) {
+  auto bindings       = candidate.candidate_bindings();
+  auto const& skipped = candidate.skipped_bindings();
+  bindings.insert(bindings.end(), skipped.begin(), skipped.end());
+  auto share = [&](op::scan::bound_read_view& original, bool required) {
     if (!original.identity) {
       throw std::logic_error("cannot share a missing original read-view identity");
     }
@@ -413,6 +424,15 @@ std::vector<candidate_binding> read_view_registry::candidate_bindings() const
   return result;
 }
 
+void read_view_registry::record_skipped_scans(std::vector<op::scan::logical_bound_read_view> views)
+{
+  skipped_.reserve(skipped_.size() + views.size());
+  for (auto& view : views) {
+    skipped_.push_back(
+      {view.table_index, std::make_shared<op::scan::bound_read_view const>(std::move(view.view))});
+  }
+}
+
 void read_view_registry::record_delete_preparation(op::scan::scan_contract_id id,
                                                    uint64_t elapsed_us)
 {
@@ -455,6 +475,17 @@ void read_view_registry::record_verdict(op::scan::scan_contract_id id,
   certificate.semantic_columns = result.semantic_columns;
 }
 
+void read_view_registry::bind_split_validator(
+  op::scan::scan_contract_id id, std::shared_ptr<op::scan::split_validator const> validator)
+{
+  if (!validator) throw std::invalid_argument("missing split validator");
+  auto& entry = entries_.at(by_contract_id_.at(id));
+  if (entry.eligibility.evidence_scope != op::scan::certificate_evidence_scope::none)
+    throw std::logic_error("cannot replace a published split validator");
+  entry.contract.materializer.validator    = std::move(validator);
+  entry.eligibility.materializer.validator = entry.contract.materializer.validator;
+}
+
 bool read_view_registry::record_declined_lookup(duckdb::LogicalGet const& get,
                                                 planner::lookup_decline decline)
 {
@@ -470,7 +501,7 @@ bool read_view_registry::record_declined_lookup(duckdb::LogicalGet const& get,
     case L::none: return false;
   }
   return declined_lookups_
-    .emplace(get.table_index,
+    .emplace(get.table_index.index,
              declined_lookup_record{op::scan::eligibility_verdict::unsupported, reason})
     .second;
 }
@@ -502,7 +533,7 @@ op::scan::scan_contract_id read_view_registry::allocate_declined_scan(
                                           scan.contract_window_id,
                                           scan.contract_finalize_generation,
                                           scan.scan_node_id,
-                                          nullptr,
+                                          scan.bound_view,
                                           std::move(columns),
                                           {},
                                           {kind, connector.registry_profile},
@@ -606,6 +637,7 @@ scan_contract_id allocate_scan_contract(transparent::read_view_registry& registr
   contract.output_types = std::move(output_types);
   contract.columns      = std::move(columns);
   contract.predicates   = std::move(predicates);
+  if (!materializer.validator) materializer.validator = default_split_validator(materializer.kind);
   contract.materializer = std::move(materializer);
   contract.contract_id  = id;
 
@@ -684,132 +716,6 @@ std::string format_split_certificates_for_dump(scan_info const& split)
     out << ']';
   }
   return out.str();
-}
-
-void validate_split_for_gpu(scan_contract_id expected,
-                            later_check_set const& required,
-                            std::optional<key_held_witness> const& expected_key,
-                            scan_info const& split)
-{
-  // Preserve R1's handle mismatch and its precedence.
-  if (split.contract_id() != expected) {
-    throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
-                                                  "scan split contract mismatch: expected " +
-                                                    std::to_string(expected) + ", got " +
-                                                    std::to_string(split.contract_id()));
-  }
-  for (auto const& certificate : split.certificates()) {
-    if (certificate.contract_id != expected) {
-      throw transparent::classified_execution_error(
-        transparent::late_failure_cause::certificate,
-        "scan split certificate contract mismatch: expected " + std::to_string(expected) +
-          ", got " + std::to_string(certificate.contract_id));
-    }
-  }
-  auto fail = [&](std::string text, later_check_set missing = {}) {
-    throw certificate_incomplete(expected, missing, "scan certificate incomplete: " + text);
-  };
-  auto certificates = split.certificates();
-  auto dependencies = split.dependencies();
-  if (certificates.size() != dependencies.size()) fail("non-parallel dependencies");
-  auto same_source = [](auto const& a, auto const& b) {
-    return a && b && &a->get_io_object() == &b->get_io_object();
-  };
-  auto coverage = [&](std::size_t i, later_check_set checks) {
-    auto missing = checks & ~certificates[i].validation;
-    if (missing.any()) fail("missing physical checks", missing);
-    if (!dependencies[i].profiles || !dependencies[i].profiles->contains(certificates[i].profile))
-      fail("missing physical profile");
-  };
-  if (auto const* parquet = dynamic_cast<parquet_split_info const*>(&split)) {
-    bool empty = std::all_of(parquet->rg_slices.begin(),
-                             parquet->rg_slices.end(),
-                             [](auto const& s) { return s.row_group_indices.empty(); });
-    if (certificates.empty() && empty) return;
-    if (certificates.size() != parquet->rg_slices.size()) fail("Parquet slice count");
-    for (std::size_t i = 0; i < certificates.size(); ++i) {
-      auto const& slice      = parquet->rg_slices[i];
-      auto const& dependency = dependencies[i];
-      if (!dependency.parquet_approval || !dependency.parquet_approval->footer_bytes)
-        fail("Parquet file approval missing");
-      auto const prefix =
-        slice.file_path + "|footer=" + std::to_string(dependency.parquet_approval->footer_bytes);
-      auto const& identity = certificates[i].input_identity;
-      if (!slice.file_metadata || dependency.footer != slice.file_metadata ||
-          !same_source(dependency.datasource, slice.datasource) ||
-          (identity != prefix && !identity.starts_with(prefix + "|")))
-        fail("Parquet slice identity or dependencies");
-      for (auto rg : slice.row_group_indices)
-        if (rg < 0 || static_cast<std::size_t>(rg) >= slice.file_metadata->row_groups.size())
-          fail("Parquet row group outside footer");
-        else if (!std::binary_search(dependency.parquet_approval->row_groups.begin(),
-                                     dependency.parquet_approval->row_groups.end(),
-                                     rg))
-          fail("Parquet row group was not physically checked");
-      coverage(i, required);
-    }
-    return;
-  }
-  if (auto const* native = dynamic_cast<duckdb_native_scan_info const*>(&split)) {
-    if (certificates.empty() && native->row_groups.empty()) return;
-    if (certificates.size() != native->row_groups.size()) fail("native row-group count");
-    for (std::size_t i = 0; i < certificates.size(); ++i) {
-      auto const& group       = native->row_groups[i];
-      auto const& certificate = certificates[i];
-      auto const& dependency  = dependencies[i];
-      auto suffix             = "|row_group=" + std::to_string(group.row_group_index);
-      if (certificate.split_id != group.row_group_index ||
-          !certificate.input_identity.ends_with(suffix))
-        fail("native row-group identity");
-      if (dependency.footer) fail("native unit carries a file footer");
-      later_check_set checks = required;
-      if (native->is_insert_delta) {
-        checks         = check_bit(later_check::key_held);
-        bool file_read = false;
-        auto segments  = [&](auto const& lane) {
-          for (auto const& segment : lane) {
-            checks |= segment.is_transient ? check_bit(later_check::host_staged)
-                                            : check_bit(later_check::segments_per_range) |
-                                               check_bit(later_check::matrix_per_range);
-            if (segment.is_transient && !segment.all_null && !segment.host_ptr)
-              fail("transient segment has no staged bytes");
-            file_read |= !segment.is_transient && segment.block_id >= 0;
-          }
-        };
-        for (auto const& column : group.columns) {
-          segments(column.data_segments);
-          segments(column.validity_segments);
-          segments(column.array_child_data_segments);
-          segments(column.array_child_validity_segments);
-        }
-        if (!expected_key || !expected_key->database || !certificate.key_held ||
-            certificate.key_held->database != expected_key->database ||
-            certificate.key_held->db_path != expected_key->db_path ||
-            certificate.key_held->query_token != expected_key->query_token)
-          fail("delta checkpoint key does not belong to this query/database",
-               check_bit(later_check::key_held));
-        if (dependency.checkpoint_iteration) fail("delta carries a fresh-native iteration");
-        if (file_read && !same_source(dependency.datasource, native->datasource))
-          fail("delta file dependency");
-        if (dependency.datasource && !same_source(dependency.datasource, native->datasource))
-          fail("delta datasource mismatch");
-      } else {
-        if (!dependency.checkpoint_iteration ||
-            !same_source(dependency.datasource, native->datasource))
-          fail("native datasource or iteration missing");
-        auto const identity = native->datasource->get_io_object().object_path() +
-                              "|checkpoint=" + std::to_string(*dependency.checkpoint_iteration) +
-                              suffix;
-        if (certificate.input_identity != identity) fail("native identity/iteration mismatch");
-        if (!native->block_manager ||
-            native->block_manager->GetCheckpointIteration() != *dependency.checkpoint_iteration)
-          fail("native checkpoint iteration changed");
-      }
-      coverage(i, checks);
-    }
-    return;
-  }
-  fail("unknown input class");
 }
 
 void admit_resident_batch(scan_contract_id expected,

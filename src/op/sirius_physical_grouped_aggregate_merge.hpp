@@ -27,12 +27,14 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
 #include <memory>
 #include <numeric>
+#include <variant>
 
 namespace sirius {
 namespace planner {
@@ -42,6 +44,11 @@ namespace op {
 
 class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition_consumer_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
@@ -56,7 +63,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     std::vector<cudf::aggregation::Kind> cudf_aggregates,
     std::vector<int> cudf_aggregate_idx,
     std::vector<std::vector<int>> cudf_aggregate_struct_col_indices,
-    std::vector<AggregateSlot> aggregate_slots,
+    std::vector<aggregate_slot> aggregate_slots,
     bool has_avg,
     bool has_count_distinct,
     std::size_t estimated_cardinality);
@@ -88,10 +95,14 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
 
-  // AVG and COUNT DISTINCT decomposition metadata
-  std::vector<AggregateSlot> aggregate_slots;
+  // AVG, COUNT DISTINCT and FIRST slot metadata
+  std::vector<aggregate_slot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
+
+  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG.
+  /// Derived from aggregate_slots (wide_integer_sum_mask).
+  std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
   /// Number of group columns after the `group_idx` keys: the set id and GROUPING() columns of
   /// an aggregate over several grouping sets, see
@@ -114,18 +125,24 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     return indices;
   }
 
+  //! Whether the partial batch already has the final output's slot order and types.
+  [[nodiscard]] bool partials_are_output() const noexcept
+  {
+    return partial_layout().matches_output(aggregate_slots);
+  }
+
+  [[nodiscard]] bool has_first() const { return has_slot<first_slot>(aggregate_slots); }
+
+  [[nodiscard]] grouped_aggregate_layout partial_layout() const
+  {
+    return {num_output_group_columns(), cudf_aggregates.size(), aggregate_slots};
+  }
+
   // Source interface
   bool is_source() const override { return true; }
 
-  sirius::OrderPreservationType source_order() const override
-  {
-    return sirius::OrderPreservationType::NO_ORDER;
-  }
-
   // Sink interface
   bool is_sink() const override { return true; }
-
-  bool sink_order_dependent() const override { return false; }
 
   //! Whether this merge joins its downstream pipeline.
   [[nodiscard]] bool fuse_into_parent() const noexcept { return _fuse_into_parent; }
@@ -136,12 +153,15 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Decide the partition count for the upstream PARTITION operator that feeds this merge
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
  private:
+  /// Consumer-owned sizing target; batch-only receivers have no sizing configuration.
+  uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 

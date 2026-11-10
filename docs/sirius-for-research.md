@@ -28,7 +28,7 @@
 
 7. **GPU-optimized relational operators** — Relational operators are the building blocks of a query engine, and better performance is always desirable. Joins, group-by, sorting, aggregation, top-K, window functions, and string operators all reward optimization specifically for GPU hardware.
 
-8. **Code generation and JIT compilation** — Fusing query fragments into single kernels produced huge gains on ClickBench q28, making it one of the largest demonstrated wins. Open questions are fusion granularity, amortizing compile latency on short queries, and how far fusion can go beyond individual operators.
+8. **Code generation and JIT compilation** — Fusing query fragments into single kernels produced huge gains on ClickBench q28, making it one of the largest demonstrated wins. DuckDB v2 currently rewrites this regex pattern to a [CPU fallback](https://github.com/sirius-db/sirius/issues/2146). Open questions are fusion granularity, amortizing compile latency on short queries, and how far fusion can go beyond individual operators.
 
 9. **GPU-optimized shuffle and exchange** — Data exchange is critical for distributed GPU queries, making it a major bottleneck in scale-out. Existing libraries such as NCCL and NIXL were designed for ML workloads. Optimizing the communication layer for distributed GPU query processing is an open question.
 

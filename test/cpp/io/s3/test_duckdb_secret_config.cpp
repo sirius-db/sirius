@@ -8,8 +8,7 @@
 #include "catch.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 
-#include <duckdb.hpp>
-#include <duckdb/common/string_util.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/main/secret/secret.hpp>
 #include <duckdb/main/secret/secret_manager.hpp>
 
@@ -32,7 +31,7 @@ duckdb::unique_ptr<duckdb::BaseSecret> create_test_httpfs_s3_secret(
   auto secret =
     duckdb::make_uniq<duckdb::KeyValueSecret>(input.scope, input.type, input.provider, input.name);
   for (auto const& [key, value] : input.options) {
-    secret->secret_map[key] = value;
+    secret->secret_map[duckdb::Identifier(key)] = value;
   }
   secret->redact_keys.insert("secret");
   return duckdb::unique_ptr_cast<duckdb::KeyValueSecret, duckdb::BaseSecret>(std::move(secret));
@@ -42,7 +41,7 @@ void register_test_httpfs_s3_secret(duckdb::SecretManager& manager)
 {
   auto const secret_types = manager.AllSecretTypes();
   if (std::any_of(secret_types.begin(), secret_types.end(), [](duckdb::SecretType const& type) {
-        return duckdb::StringUtil::CIEquals(type.name, "s3");
+        return type.name == "s3";
       })) {
     return;
   }
@@ -83,7 +82,7 @@ TEST_CASE("Sirius S3 secrets resolve without httpfs and rotate by path", "[s3][s
                  "REGION 'test-region-1', SESSION_TOKEN 'first-token', "
                  "ENDPOINT 'object-store:9000', USE_SSL true, VERIFY_SSL false, URL_STYLE 'PATH')");
 
-  sirius::io::object_store_config defaults;
+  cucascade::io::object_store_config defaults;
   defaults.endpoint      = "https://yaml-endpoint";
   defaults.region        = "yaml-region";
   defaults.access_key    = "yaml-key";
@@ -165,7 +164,7 @@ TEST_CASE("Sirius S3 secret lookup prefers Sirius then httpfs then config", "[s3
   require_sql_ok(con,
                  "CREATE SECRET legacy (TYPE S3, SCOPE 's3://bucket/data/', "
                  "KEY_ID 'legacy-key', SECRET 'legacy-secret', REGION 'us-east-1')");
-  sirius::io::object_store_config defaults;
+  cucascade::io::object_store_config defaults;
   auto const legacy = sirius::io::s3::resolve_duckdb_s3_secret(
     *con.context, "s3://bucket/data/file.parquet", defaults);
   CHECK(legacy.access_key == "legacy-key");

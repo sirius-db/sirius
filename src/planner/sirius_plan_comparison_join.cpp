@@ -15,11 +15,12 @@
  */
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -33,11 +34,14 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/join_condition.hpp"
-#include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
+#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -45,8 +49,9 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "planner/join_implied_filters.hpp"
+#include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
@@ -58,15 +63,84 @@
 
 namespace sirius::planner {
 
+/// Whether @p get is a plain parquet scan whose output columns are the files' own columns, read by
+/// name. A pin proves something about those columns, so a scan that maps, renames, merges or
+/// synthesizes columns (iceberg_scan resolves them by field id and fills in added columns and
+/// partition values; union_by_name and an explicit schema merge and remap the files') may return
+/// different values under the same name. An allowlist, so a scan this does not know is not proven.
+static bool returns_raw_parquet_columns(duckdb::LogicalGet const& get)
+{
+  auto const function_name = get.function.GetName().GetIdentifierName();
+  if (function_name != "read_parquet" && function_name != "parquet_scan") { return false; }
+  auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (multi_file == nullptr) { return false; }
+  auto const& options = multi_file->file_options;
+  return !options.union_by_name && options.schema.empty() && options.bound_schema.empty() &&
+         options.mapping == duckdb::MultiFileColumnMappingMode::BY_NAME;
+}
+
+/// Output position of a parquet scan's column that the pinned copy of the same files proved
+/// distinct at pin time (see late_mat::unique_probe: no nulls and no repeated value across the
+/// whole table), or an empty set. Only the scan's own files count, so a filter or projection above
+/// the scan keeps the fact valid: a subset of distinct values is distinct.
+static std::unordered_set<duckdb::idx_t> prove_unique_from_pin(
+  duckdb::SiriusContext* sirius_context, duckdb::LogicalGet& get)
+{
+  if (sirius_context == nullptr || !returns_raw_parquet_columns(get)) { return {}; }
+  auto const files = resolve_parquet_scan_file_paths(
+    get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
+  if (files.empty()) { return {}; }
+  auto const entry = sirius_context->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+  if (!entry) { return {}; }
+  auto const& pinned_names = entry->cache_info.names;
+  auto const proven_unique = [&](std::string const& name) {
+    for (std::size_t entry_idx = 0; entry_idx < pinned_names.size(); ++entry_idx) {
+      if (pinned_names[entry_idx] == name) {
+        return entry_idx < entry->proven_unique_columns.size() &&
+               entry->proven_unique_columns[entry_idx];
+      }
+    }
+    return false;
+  };
+
+  // A Hive partition column takes its value from the directory name, even when the files also hold
+  // a column of that name, so what the pin proved about the file column says nothing about it.
+  std::unordered_set<duckdb::idx_t> hive_partition_columns;
+  if (auto const* multi_file =
+        dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
+    for (auto const& partition : multi_file->reader_bind.hive_partitioning_indexes) {
+      hive_partition_columns.insert(partition.index);
+    }
+  }
+
+  auto const& column_ids  = get.GetColumnIds();
+  auto const& proj_ids    = get.projection_ids;
+  auto const output_count = proj_ids.empty() ? column_ids.size() : proj_ids.size();
+  for (duckdb::idx_t output_idx = 0; output_idx < output_count; ++output_idx) {
+    auto const column_idx           = proj_ids.empty() ? output_idx : proj_ids[output_idx];
+    auto const primary_column_index = column_ids[column_idx].GetPrimaryIndex();
+    // Virtual columns (row ids and the like) have no pinned counterpart.
+    if (primary_column_index >= get.names.size()) { continue; }
+    if (hive_partition_columns.contains(primary_column_index)) { continue; }
+    auto const& column_name = get.names[primary_column_index].GetIdentifierName();
+    if (proven_unique(column_name)) {
+      SIRIUS_LOG_DEBUG("[join] build key '{}' proven distinct by the pinned table", column_name);
+      return {output_idx};
+    }
+  }
+  return {};
+}
+
 /// Returns a set of output column indices proven to form a unique key for the
 /// given logical operator subtree, or an empty set if uniqueness cannot be proven.
-static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
+static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::SiriusContext* sirius_context,
+                                                              duckdb::LogicalOperator& op)
 {
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET: {
       auto& get  = op.Cast<duckdb::LogicalGet>();
       auto table = get.GetTable();
-      if (!table) { return {}; }
+      if (!table) { return prove_unique_from_pin(sirius_context, get); }
 
       const auto& constraints = table->GetConstraints();
       const auto& column_ids  = get.GetColumnIds();
@@ -141,12 +215,12 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
       // These operators only truncate rows — no column remapping.
       if (op.children.empty()) { return {}; }
-      return prove_unique_columns(*op.children[0]);
+      return prove_unique_columns(sirius_context, *op.children[0]);
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_FILTER: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
       auto& filter = op.Cast<duckdb::LogicalFilter>();
       if (!filter.HasProjectionMap()) { return child_unique; }
@@ -161,7 +235,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 
     case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
       auto& order = op.Cast<duckdb::LogicalOrder>();
       if (!order.HasProjectionMap()) { return child_unique; }
@@ -175,7 +249,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 
     case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
 
       auto& proj = op.Cast<duckdb::LogicalProjection>();
@@ -185,7 +259,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       for (duckdb::idx_t i = 0; i < proj.expressions.size(); i++) {
         auto& expr = proj.expressions[i];
         if (expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
-        auto child_idx = expr->Cast<duckdb::BoundReferenceExpression>().index;
+        auto child_idx = expr->Cast<duckdb::BoundReferenceExpression>().Index();
         if (child_unique.count(child_idx)) { remapped.insert(i); }
       }
       // All child unique columns must map through.
@@ -197,19 +271,22 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       if (op.children.size() != 2) { return {}; }
       auto& join = op.Cast<duckdb::LogicalComparisonJoin>();
 
-      auto left_unique  = prove_unique_columns(*op.children[0]);
-      auto right_unique = prove_unique_columns(*op.children[1]);
+      auto left_unique  = prove_unique_columns(sirius_context, *op.children[0]);
+      auto right_unique = prove_unique_columns(sirius_context, *op.children[1]);
       if (left_unique.empty() && right_unique.empty()) { return {}; }
 
       // Collect equality key columns on each side (only direct column refs).
       std::unordered_set<duckdb::idx_t> left_eq_keys, right_eq_keys;
       for (const auto& c : join.conditions) {
-        if (c.comparison != duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
-        if (c.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-          left_eq_keys.insert(c.left->Cast<duckdb::BoundReferenceExpression>().index);
+        if (!c.IsComparison() || c.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL) {
+          continue;
         }
-        if (c.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-          right_eq_keys.insert(c.right->Cast<duckdb::BoundReferenceExpression>().index);
+        if (c.LeftReference()->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          left_eq_keys.insert(c.LeftReference()->Cast<duckdb::BoundReferenceExpression>().Index());
+        }
+        if (c.RightReference()->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          right_eq_keys.insert(
+            c.RightReference()->Cast<duckdb::BoundReferenceExpression>().Index());
         }
       }
 
@@ -251,7 +328,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 
       // Remap child unique indices through a projection map to output positions.
       auto remap = [](const std::unordered_set<duckdb::idx_t>& child_unique,
-                      const duckdb::vector<duckdb::idx_t>& proj_map,
+                      const duckdb::vector<duckdb::ProjectionIndex>& proj_map,
                       duckdb::idx_t offset) -> std::unordered_set<duckdb::idx_t> {
         std::unordered_set<duckdb::idx_t> mapped;
         if (proj_map.empty()) {
@@ -303,10 +380,67 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // now visit the children
   D_ASSERT(op.children.size() == 2);
 
+  // Inner-join residuals use the unprojected left/right schema in DuckDB v2.
+  // Evaluate them before applying the join's output projection. Outer/semi/anti joins
+  // must evaluate residuals while matching rows. DELIM planning requires a bare join.
+  if (std::any_of(op.conditions.begin(), op.conditions.end(), [](auto const& condition) {
+        return !condition.IsComparison();
+      })) {
+    if (op.type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+        op.join_type != duckdb::JoinType::INNER) {
+      throw duckdb::NotImplementedException(
+        "Sirius does not support arbitrary join conditions for this join type");
+    }
+    auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
+      duckdb::ExpressionType::CONJUNCTION_AND);
+    duckdb::vector<duckdb::JoinCondition> comparisons;
+    for (auto& condition : op.conditions) {
+      if (condition.IsComparison()) {
+        comparisons.push_back(std::move(condition));
+      } else {
+        reject_nested_column_operation(condition.GetJoinExpression(), "a join predicate");
+        conjunction->GetChildrenMutable().push_back(std::move(condition.JoinExpressionReference()));
+      }
+    }
+    auto predicate = sirius::ast::from_duckdb(*conjunction);
+    if (!predicate) {
+      throw duckdb::NotImplementedException("Unsupported inner-join residual predicate");
+    }
+    auto output_types = sirius::from_duckdb_vec(op.types);
+    std::vector<cudf::size_type> output_indices;
+    auto const left_width        = op.children[0]->types.size();
+    auto const append_projection = [&](auto const& map, std::size_t width, std::size_t offset) {
+      if (map.empty()) {
+        for (std::size_t i = 0; i < width; ++i) {
+          output_indices.push_back(static_cast<cudf::size_type>(offset + i));
+        }
+      } else {
+        for (auto index : map) {
+          output_indices.push_back(static_cast<cudf::size_type>(offset + index));
+        }
+      }
+    };
+    append_projection(op.left_projection_map, left_width, 0);
+    append_projection(op.right_projection_map, op.children[1]->types.size(), left_width);
+    op.conditions = std::move(comparisons);
+    op.left_projection_map.clear();
+    op.right_projection_map.clear();
+    op.types = op.children[0]->types;
+    op.types.insert(op.types.end(), op.children[1]->types.begin(), op.children[1]->types.end());
+    auto plan   = plan_comparison_join(op);
+    auto filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(std::move(output_types),
+                                                                        std::move(predicate),
+                                                                        op.estimated_cardinality,
+                                                                        std::move(output_indices));
+    filter->children.push_back(std::move(plan));
+    return filter;
+  }
+
   // Reject nested join keys before planning either child.
   for (auto const& condition : op.conditions) {
-    reject_nested_column_operation(*condition.left, "a join condition");
-    reject_nested_column_operation(*condition.right, "a join condition");
+    D_ASSERT(condition.IsComparison());
+    reject_nested_column_operation(*condition.LeftReference(), "a join condition");
+    reject_nested_column_operation(*condition.RightReference(), "a join condition");
   }
 
   // A MARK join mixing null-safe (IS NOT DISTINCT FROM) and plain keys has no correct GPU
@@ -318,7 +452,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     bool has_null_safe = false;
     bool all_null_safe = !op.conditions.empty();
     for (auto const& condition : op.conditions) {
-      if (condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      if (condition.GetComparisonType() == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
         has_null_safe = true;
       } else {
         all_null_safe = false;
@@ -331,12 +465,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     }
   }
 
+  normalize_non_null_join_keys(op);
+  planner::drop_join_implied_filters(op);
+
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   bool const dynamic_filter_enabled =
-    sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
+    sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter;
 
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
@@ -347,16 +484,44 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
                    : std::vector<std::size_t>{};
 
-  auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
+  // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
+  // context, prove_unique_columns considers declared PRIMARY KEYs alone.
+  auto* const pin_facts_context =
+    sirius_context && duckdb::query_operator_options(context)->prove_unique_keys
+      ? sirius_context.get()
+      : nullptr;
+  auto build_side_unique_cols  = prove_unique_columns(pin_facts_context, *op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;
   right->estimated_cardinality = rhs_cardinality;
 
   if (op.conditions.empty()) {
-    throw duckdb::NotImplementedException("Cross product not supported in GPU");
-    // no conditions: insert a cross product
-    // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
+    // No conditions: a cross product, as LogicalCrossProduct lowers to. DuckDB emits this for a
+    // correlated scalar count(*): a LEFT join against a one-row default. On two non-empty inputs
+    // INNER/LEFT/RIGHT/OUTER all equal the cross product and the nested loop join pads a 0-row
+    // side per join type; SEMI/ANTI/MARK/SINGLE would need rows filtered or marked, which the
+    // condition-less path does not do.
+    switch (op.join_type) {
+      case duckdb::JoinType::INNER:
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::RIGHT:
+      case duckdb::JoinType::OUTER:
+        op.estimated_cardinality = memory::saturating_mul(lhs_cardinality, rhs_cardinality);
+        return make_cross_product_join(
+          op,
+          std::move(left),
+          std::move(right),
+          op.join_type,
+          op.estimated_cardinality,
+          duckdb::vector<std::size_t>(op.left_projection_map.begin(), op.left_projection_map.end()),
+          duckdb::vector<std::size_t>(op.right_projection_map.begin(),
+                                      op.right_projection_map.end()));
+      default:
+        throw duckdb::NotImplementedException("Cross product with join type " +
+                                              duckdb::JoinTypeToString(op.join_type) +
+                                              " not supported in GPU");
+    }
   }
 
   // Preserve key shape before materialization makes computed keys look like direct references.
@@ -387,8 +552,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     duckdb::PhysicalNestedLoopJoin::IsSupported(op.conditions, op.join_type);
   // DuckDB's check accepts join types the Sirius NLJ execute switch has no arm for
   // (RIGHT_SEMI / RIGHT_ANTI / SINGLE), which would throw mid-query instead of falling back.
-  // The hash join screens the same way via are_conditions_supported, so SINGLE -- which no GPU
-  // join implements -- is rejected on both routes.
+  // The hash join screens the same way via are_conditions_supported. SINGLE is implemented by
+  // the hash join only, so a SINGLE join whose conditions need the NLJ (no hashable equality)
+  // still falls back.
   const bool nlj_join_type_supported =
     sirius::op::sirius_physical_nested_loop_join::is_join_type_supported(op.join_type);
   const bool nlj_is_supported = nlj_conditions_supported && nlj_join_type_supported;
@@ -396,13 +562,19 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // Wrap once — subsequent checks and ctors consume from the wrapped vector.
   duckdb::vector<sirius::join_condition> conditions =
     sirius::wrap_join_conditions(std::move(op.conditions));
+  duckdb::vector<std::size_t> left_projection_map(op.left_projection_map.begin(),
+                                                  op.left_projection_map.end());
+  duckdb::vector<std::size_t> right_projection_map(op.right_projection_map.begin(),
+                                                   op.right_projection_map.end());
   sirius::op::sirius_physical_hash_join::materialize_expression_join_keys(
-    conditions, left, right, op.left_projection_map, op.right_projection_map);
+    conditions, left, right, left_projection_map, right_projection_map);
 
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    const auto& op_params = sirius_context->get_config().get_operator_params();
+    auto options          = duckdb::query_operator_options(context);
+    const auto& op_params = *options;
+    auto* const stats     = &sirius_context->get_dynamic_filter_stats();
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
@@ -421,16 +593,27 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs     = build_evidence &&
-                                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-                                !gpu_spaces.empty() && !host_spaces.empty();
+    bool const needs_early_publication =
+      op.join_type == duckdb::JoinType::RIGHT_SEMI || op.join_type == duckdb::JoinType::RIGHT_ANTI;
+    bool const discovery_runs =
+      build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+      !gpu_spaces.empty() && !host_spaces.empty() &&
+      (!needs_early_publication || (op_params.enable_dynamic_filter_multi_partition &&
+                                    op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
     if (discovery_runs) {
-      bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
-      descent_policy const policy{.descend_build_blocks = true};
+      bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
         auto const& key       = admitted_keys[key_index];
         auto const& condition = conditions[key.planner_condition_index];
+        // Right-family partitioning waits for the probe. Only register keys that the
+        // pre-partition accumulator can publish before that scan drains.
+        if (needs_early_publication &&
+            !sirius::op::detail::accumulated_bloom_builder::supports(key.storage_type)) {
+          continue;
+        }
+        descent_policy const policy{.descend_build_blocks = true,
+                                    .preserve_nulls       = key.preserve_nulls};
         // Terminal ordinals are local to each terminal, not the probe entry schema.
         auto const terminals =
           trace_probe_key(*left, static_cast<std::size_t>(key.probe_key_ordinal), policy);
@@ -447,7 +630,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
               "'{}' carries exit ordinal {} outside the scan's {} output columns; skipping this "
               "binding.",
               key_index,
-              scan.function.name,
+              scan.function.GetName().GetIdentifierName(),
               terminal.ordinal,
               scan.types.size());
             continue;
@@ -468,7 +651,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           targets[entry->second].key_bindings.push_back(
             {.admitted_key_index   = key_index,
              .channel_push_ordinal = terminal.ordinal,
-             .probe_storage_type   = sirius::try_get_cudf_type(scan.types[terminal.ordinal])
+             .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
           scan_bound = true;
         }
@@ -486,15 +669,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           std::move(left),
           static_cast<std::size_t>(key.probe_key_ordinal),
           policy,
-          [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
+          [&site_channels, &op_params, stats](sirius::op::sirius_physical_operator const& site)
             -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
             auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-              site.types,
-              site.estimated_cardinality,
+            auto consumer = sirius::op::scan::make_dynamic_filter_consumer(
               channel,
+              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
               op_params.dynamic_filter_keep_threshold,
-              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
+              /*decode_bindings=*/{},
+              stats);
+            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+              site.types, site.estimated_cardinality, std::move(consumer));
             site_channels.push_back(std::move(channel));
             return endpoint;
           });
@@ -585,19 +770,21 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(right),
       std::move(conditions),
       op.join_type,
-      op.left_projection_map,
-      op.right_projection_map,
+      std::move(left_projection_map),
+      std::move(right_projection_map),
       sirius::from_duckdb_vec(op.mark_types),
       op.estimated_cardinality,
       op_params.max_build_hash_table_bytes,
       std::move(filter_plan),
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size,
-      &sirius_context->get_dynamic_filter_stats());
-    auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.join_stats                   = std::move(op.join_stats);
-    hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
-    hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;
+      stats);
+    auto& hj                          = join->Cast<sirius::op::sirius_physical_hash_join>();
+    hj.mark_join_build_switch_ratio   = op_params.mark_join_build_switch_ratio;
+    hj.runtime_distinct_build_probe   = op_params.enable_runtime_distinct_build_probe;
+    hj.max_build_probe_resident_bytes = op_params.max_build_probe_resident_bytes;
+    hj.set_single_join_error_on_multiple_rows(
+      duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).
@@ -676,15 +863,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // }
   if (nlj_is_supported) {
     // inequality join: use nested loop; pass projection maps so output column order matches plan
-    auto join =
-      duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(op,
-                                                                      std::move(left),
-                                                                      std::move(right),
-                                                                      std::move(conditions),
-                                                                      op.join_type,
-                                                                      op.estimated_cardinality,
-                                                                      op.left_projection_map,
-                                                                      op.right_projection_map);
+    auto join = duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
+      op,
+      std::move(left),
+      std::move(right),
+      std::move(conditions),
+      op.join_type,
+      op.estimated_cardinality,
+      std::move(left_projection_map),
+      std::move(right_projection_map));
     return join;
   }
 
@@ -697,7 +884,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   throw duckdb::NotImplementedException("Blockwise nested loop join not supported in GPU");
   // for (auto &cond : op.conditions) {
-  // 	RewriteJoinCondition(cond.right, left.types.size());
+  // 	RewriteJoinCondition(cond.RightReference(), left.types.size());
   // }
   // auto condition = JoinCondition::CreateExpression(std::move(op.conditions));
   // return Make<PhysicalBlockwiseNLJoin>(op, left, right, std::move(condition), op.join_type,

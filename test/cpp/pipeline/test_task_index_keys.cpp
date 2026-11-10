@@ -28,9 +28,9 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "pipeline/sirius_pipeline_task_states.hpp"
 #include "query_id.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <limits>
 #include <memory>
@@ -55,7 +55,7 @@ struct task_fixture {
     sirius::query_id_t query_id, sirius::exec::queue_priority priority)
   {
     auto pipeline  = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
-    auto& op       = *operators.emplace_back(std::make_unique<sirius::op::sirius_physical_operator>(
+    auto& op       = *operators.emplace_back(std::make_unique<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::FILTER,
       duckdb::vector<sirius::logical_type>{},
       /*estimated_cardinality=*/0));
@@ -87,7 +87,7 @@ struct task_fixture {
       std::move(global_state));
   }
 
-  sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   //! Outlive every pipeline/task built from this fixture.
   std::vector<std::unique_ptr<sirius::op::sirius_physical_operator>> operators;
 };
@@ -110,19 +110,18 @@ TEST_CASE("index_keys_for takes the query id from the task's pipeline", "[task_i
 TEST_CASE("index_keys_for does not unpack the query id from the priority", "[task_index_keys]")
 {
   task_fixture f;
-  // query_priority_bits masks the id to 31 bits, so a bit-31 id and 0 pack to the SAME priority
-  // bits. Recovering the query from those bits would report 0 here, and a
-  // drain(query_index{value_of(query_id)}) would then never match this task.
-  const auto query_id = make_query_id(0x8000'0000U);
-  REQUIRE(sirius::query_priority_bits(query_id) == sirius::query_priority_bits(make_query_id(0)));
-
-  auto pipeline = f.make_pipeline(query_id, /*priority=*/sirius::query_priority_bits(query_id));
-  auto task     = f.make_task(pipeline, /*priority=*/sirius::query_priority_bits(query_id));
+  // Give the task a priority encoding a different valid query. Ownership comes from the
+  // pipeline, so per-query drains must still find this task regardless of scheduling priority.
+  const auto query_id = make_query_id(7);
+  const auto priority = sirius::query_priority_bits(make_query_id(3));
+  auto pipeline       = f.make_pipeline(query_id, priority);
+  auto task           = f.make_task(pipeline, priority);
 
   const auto keys = index_keys_for(*task);
 
   CHECK(keys.query_id == sirius::value_of(query_id));
-  CHECK(keys.query_id != 0U);
+  CHECK(keys.priority == priority);
+  CHECK(keys.query_id != 3U);
 }
 
 TEST_CASE("index_keys_for reports the pipeline source's operator type", "[task_index_keys]")

@@ -16,21 +16,22 @@
 
 #include "op/sirius_physical_operator.hpp"
 
-#include "config.hpp"
 #include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
-#include "telemetry/batch_telemetry.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/memory/error.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <optional>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -39,18 +40,71 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
+std::uint64_t pipelineable_operator_data::original_batch_id_at(std::size_t position) const
+{
+  auto const replaced =
+    std::ranges::find(_replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first);
+  return replaced != _replaced_batch_ids.end() ? replaced->second
+                                               : _data_batches[position]->get_batch_id();
+}
+
 std::vector<std::uint64_t> pipelineable_operator_data::original_batch_ids() const
 {
   std::vector<std::uint64_t> ids;
   ids.reserve(_data_batches.size());
   for (std::size_t position = 0; position < _data_batches.size(); ++position) {
-    if (!_data_batches[position]) { continue; }
-    auto const replaced = std::ranges::find(
-      _replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first);
-    ids.push_back(replaced != _replaced_batch_ids.end() ? replaced->second
-                                                        : _data_batches[position]->get_batch_id());
+    if (_data_batches[position]) { ids.push_back(original_batch_id_at(position)); }
   }
   return ids;
+}
+
+void pipelineable_operator_data::adopt_row_identity(pipelineable_operator_data const& source)
+{
+  auto const same_positions = std::ranges::equal(
+    _data_batches, source._data_batches, [](auto const& replacement, auto const& original) {
+      return (replacement == nullptr) == (original == nullptr);
+    });
+  if (!same_positions) {
+    throw std::invalid_argument(
+      "pipelineable_operator_data: a row-preserving replacement must replace each batch in place");
+  }
+  if (auto const device = source.get_preferred_device_id()) { set_preferred_device_id(*device); }
+  _position = source._position;
+  _replaced_batch_ids.clear();
+  for (std::size_t position = 0; position < _data_batches.size(); ++position) {
+    if (!_data_batches[position]) { continue; }
+    auto const original = source.original_batch_id_at(position);
+    if (_data_batches[position]->get_batch_id() != original) {
+      _replaced_batch_ids.emplace_back(position, original);
+    }
+  }
+}
+
+std::unique_ptr<pipelineable_operator_data>
+pipelineable_operator_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  auto replacement = std::make_unique<pipelineable_operator_data>(std::move(batches));
+  replacement->adopt_row_identity(*this);
+  return replacement;
+}
+
+//===--------------------------------------------------------------------===//
+// partitioned_operator_data
+//===--------------------------------------------------------------------===//
+
+void partitioned_operator_data::adopt_partition_identity(partitioned_operator_data const& source)
+{
+  adopt_row_identity(source);
+  _partition_idx = source._partition_idx;
+}
+
+std::unique_ptr<pipelineable_operator_data> partitioned_operator_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  auto replacement = std::make_unique<partitioned_operator_data>(std::move(batches));
+  replacement->adopt_partition_identity(*this);
+  return replacement;
 }
 
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
@@ -74,6 +128,14 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     }
   }
   return ro_batches;
+}
+
+std::unique_ptr<pipelineable_operator_data>
+pipelineable_operator_data::forward_with_read_only_locks(std::optional<std::size_t> position) const
+{
+  auto output = std::make_unique<pipelineable_operator_data>(_data_batches, position);
+  output->_read_only_data_batches = get_read_only_batches();
+  return output;
 }
 
 void pipelineable_operator_data::prepare_for_processing(
@@ -150,6 +212,25 @@ std::string sirius_physical_operator::get_name() const
 std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }
 
 void sirius_physical_operator::print() const { std::cout << to_string() << std::endl; }
+
+sirius::OrderPreservationType sirius_physical_operator::output_order() const
+{
+  const auto preservation = output_order_preservation();
+  if (preservation != sirius::OrderPreservationType::INSERTION_ORDER) { return preservation; }
+
+  const auto inputs = get_children();
+  // A CTE's first child materializes a definition; only its consumer child produces the
+  // enclosing plan's result. Do not let an ORDER BY inside an unused definition affect it.
+  if (type == SiriusPhysicalOperatorType::CTE) {
+    if (inputs.size() != 2) { throw internal_exception("CTE ordering requires two children"); }
+    return inputs[1].get().output_order();
+  }
+  if (inputs.empty()) { return sirius::OrderPreservationType::INSERTION_ORDER; }
+  if (inputs.size() != 1) {
+    throw internal_exception("Order-preserving operator requires one output-driving child");
+  }
+  return inputs.front().get().output_order();
+}
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
 sirius_physical_operator::get_children() const
@@ -282,9 +363,19 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 void sirius_physical_operator::sink(const operator_data& output_data, ::cuda::stream_ref stream)
 {
   auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
+  auto position             = pipelineable_output.get_position();
+  if (position && pipelineable_output.get_data_batches().size() != 1) {
+    throw internal_exception("Positioned publication requires exactly one output batch");
+  }
   for (auto& batch : pipelineable_output.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
-      next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name, batch);
+      if (position) {
+        next_port_info.next_operator->push_data_batch_at_position(
+          next_port_info.next_operator_port_name, batch, *position);
+      } else {
+        next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name,
+                                                      batch);
+      }
     }
   }
 }
@@ -302,22 +393,39 @@ void sirius_physical_operator::on_input_batch_pushed(std::string_view /*port_id*
 {
 }
 
+void sirius_physical_operator::push_data_batch_partitioned(
+  std::string_view port_id, std::shared_ptr<cucascade::data_batch> batch, std::size_t partition_idx)
+{
+  auto* p = get_port(port_id);
+  if (p && p->repo) {
+    if (batch) { on_input_batch_pushed(port_id, *batch); }
+    p->repo->add_data_batch(std::move(batch), partition_idx);
+  }
+}
+
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
                                                std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
   if (p && p->repo) {
     if (batch) { on_input_batch_pushed(port_id, *batch); }
-    // Emit before the batch becomes poppable so `queued` precedes `packaged`.
-    telemetry::batch_telemetry_registry::instance().on_published(
-      batch, p->repo, telemetry::batch_origin::operator_output);
     p->repo->add_data_batch(std::move(batch));
+  }
+}
+
+void sirius_physical_operator::push_data_batch_at_position(
+  std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch, std::size_t position)
+{
+  auto* p = get_port(port_id);
+  if (p && p->repo) {
+    if (batch) { on_input_batch_pushed(port_id, *batch); }
+    p->repo->add_data_batch_at_position(std::move(batch), position);
   }
 }
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
-  port_info.pseudo_sink_port_uuid = uuid::now_v7();
+  port_info.pseudo_sink_port_uuid = quent::now_v7();
   next_port_after_sink.push_back(port_info);
 }
 
@@ -373,15 +481,22 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+  std::optional<std::size_t> position;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch_and_handle = port_ptr->repo->pop_next_data_batch();
-    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
+    auto [batch, batch_position] = port_ptr->repo->pop_next_data_batch_with_position();
+    if (batch) {
+      if (!input_batch.empty() && (position || batch_position)) {
+        throw internal_exception("Cannot combine independent positioned inputs in one task");
+      }
+      position = batch_position;
+      input_batch.push_back(std::move(batch));
+    }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch, position);
 }
 
 bool sirius_physical_operator::all_ports_empty()
@@ -424,6 +539,12 @@ void sirius_physical_operator::set_pipeline(std::shared_ptr<pipeline::sirius_pip
   _pipeline = std::move(pipeline);
 }
 
+expression_query_policy sirius_physical_operator::expression_policy() const noexcept
+{
+  return _pipeline ? _pipeline->get_operator_params().expression_policy()
+                   : expression_query_policy{};
+}
+
 bool sirius_physical_operator::like_swar_fastpath_enabled() const noexcept
 {
   return _pipeline != nullptr && _pipeline->get_operator_params().like_swar_fastpath;
@@ -436,7 +557,7 @@ std::shared_ptr<like_multiliteral_cache const> sirius_physical_operator::like_ca
 
 telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
 {
-  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
+  if (not _pipeline) { return {nullptr, quent::Uuid{}}; }
   return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
 }
 

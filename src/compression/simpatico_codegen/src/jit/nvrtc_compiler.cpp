@@ -1,5 +1,8 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 
+#include "codegen/util/cuda_check.hpp"
+#include "compilation_request.hpp"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -48,58 +51,58 @@ namespace {
   throw std::runtime_error(msg);
 }
 
-[[noreturn]] void throw_cu(const char* api, CUresult r)
-{
-  const char* name = nullptr;
-  const char* desc = nullptr;
-  cuGetErrorName(r, &name);
-  cuGetErrorString(r, &desc);
-  std::string msg = "cu";
-  msg += api;
-  msg += " failed: ";
-  msg += name ? name : "<unknown>";
-  if (desc) {
-    msg += " (";
-    msg += desc;
-    msg += ")";
-  }
-  throw std::runtime_error(msg);
-}
-
 #define NVRTC_OR_THROW(call)                         \
   do {                                               \
     nvrtcResult _r = (call);                         \
     if (_r != NVRTC_SUCCESS) throw_nvrtc(#call, _r); \
   } while (0)
 
-#define CU_OR_THROW(call)                        \
-  do {                                           \
-    CUresult _r = (call);                        \
-    if (_r != CUDA_SUCCESS) throw_cu(#call, _r); \
-  } while (0)
-
 }  // namespace
+
+const detail::Digest& detail::cache_environment()
+{
+  static const Digest identity = [] {
+    int major = 0, minor = 0;
+    NVRTC_OR_THROW(nvrtcVersion(&major, &minor));
+    // Both linkage modes use the reported version. Same-version compiler
+    // patches intentionally retain reuse; header contents have their own digests.
+    return environment_identity({kEmbeddedJitHeadersIdentity,
+                                 kCcclEmbeddedHeadersIdentity,
+                                 static_cast<uint32_t>(major),
+                                 static_cast<uint32_t>(minor)});
+  }();
+  return identity;
+}
 
 CUfunction CompiledKernel::func_for_current_device() const
 {
   if (!kern) return nullptr;
 
-  int device_id = 0;
-  cudaGetDevice(&device_id);  // runtime API — no driver context required
+  // cuKernelGetFunction binds the kernel to the calling thread's current context,
+  // and cuLaunchKernel rejects the result from any other context
+  // (CUDA_ERROR_INVALID_HANDLE). Threads on one device can hold different
+  // contexts, so a device-keyed cache would hand every thread but the first a
+  // function it cannot launch.
+  CUcontext ctx = nullptr;
+  if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS) return nullptr;
+  if (ctx == nullptr) {
+    // A thread that never touched the runtime has no context; make the current
+    // device's primary context current instead of deriving against none.
+    cudaFree(nullptr);
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || ctx == nullptr) return nullptr;
+  }
 
   {
     std::lock_guard<std::mutex> lock(func_mu_);
-    auto it = func_per_dev_.find(device_id);
-    if (it != func_per_dev_.end()) return it->second;
+    auto it = func_per_ctx_.find(ctx);
+    if (it != func_per_ctx_.end()) return it->second;
   }
 
-  // cuKernelGetFunction binds the kernel to the current device context,
-  // which RMM/cuDF sets up correctly per-thread before calling encode/decode.
   CUfunction fn = nullptr;
   if (cuKernelGetFunction(&fn, kern) != CUDA_SUCCESS) return nullptr;
 
   std::lock_guard<std::mutex> lock(func_mu_);
-  func_per_dev_[device_id] = fn;
+  func_per_ctx_[ctx] = fn;
   return fn;
 }
 
@@ -118,7 +121,7 @@ CompiledKernel::CompiledKernel(CompiledKernel&& other) noexcept
     cubin(std::move(other.cubin)),
     rendered_source(std::move(other.rendered_source))
 {
-  func_per_dev_ = std::move(other.func_per_dev_);
+  func_per_ctx_ = std::move(other.func_per_ctx_);
   other.library = nullptr;
   other.kern    = nullptr;
 }
@@ -131,7 +134,7 @@ CompiledKernel& CompiledKernel::operator=(CompiledKernel&& other) noexcept
     kern            = other.kern;
     cubin           = std::move(other.cubin);
     rendered_source = std::move(other.rendered_source);
-    func_per_dev_   = std::move(other.func_per_dev_);
+    func_per_ctx_   = std::move(other.func_per_ctx_);
     other.library   = nullptr;
     other.kern      = nullptr;
   }
@@ -142,6 +145,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
                                     const std::string& entry_symbol,
                                     const CompileOptions& opts)
 {
+  return detail::compile_request(detail::CompilationRequest(source, entry_symbol, opts));
+}
+
+CompiledKernel detail::compile_request(const CompilationRequest& request)
+{
+  const auto& source       = request.source;
+  const auto& entry_symbol = request.entry;
   if (source.empty()) { throw std::runtime_error("compile_plain_kernel: empty source"); }
   if (entry_symbol.empty()) {
     throw std::runtime_error("compile_plain_kernel: empty entry_symbol");
@@ -168,22 +178,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
   nvrtcProgram prog = nullptr;
   NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
                                     source.c_str(),
-                                    "codegen_jit.cu",
+                                    CompilationRequest::program_name,
                                     static_cast<int>(hdr_names.size()),
                                     hdr_sources.data(),
                                     hdr_names.data()));
 
-  const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
-
-  std::vector<const char*> nvrtc_opts = {
-    "-std=c++20",
-    arch_opt.c_str(),
-    "--no-source-include",
-    "-default-device",
-  };
-
   nvrtcResult compile_result =
-    nvrtcCompileProgram(prog, static_cast<int>(nvrtc_opts.size()), nvrtc_opts.data());
+    nvrtcCompileProgram(prog, static_cast<int>(request.options.size()), request.options.data());
 
   // Capture the log unconditionally so warnings on success and errors
   // on failure surface to callers symmetrically.
@@ -236,13 +237,15 @@ CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
   // cuLibraryGetKernel returns a device-independent CUkernel handle; the
   // per-device CUfunction is derived lazily via func_for_current_device().
   CUlibrary lib = nullptr;
-  CU_OR_THROW(cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+  simpatico::throw_if_cu_error(
+    cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0),
+    "cuLibraryLoadData");
 
   CUkernel kern = nullptr;
   CUresult r    = cuLibraryGetKernel(&kern, lib, entry_symbol.c_str());
   if (r != CUDA_SUCCESS) {
     cuLibraryUnload(lib);
-    throw_cu("LibraryGetKernel", r);
+    simpatico::throw_if_cu_error(r, "cuLibraryGetKernel");
   }
 
   CompiledKernel out;

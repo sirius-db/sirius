@@ -16,21 +16,21 @@
 
 #pragma once
 
-#include "blockingconcurrentqueue.h"
 #include "cucascade/data/data_batch.hpp"
 #include "exec/try.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/batch_coalescer.hpp"
+#include "op/scan/dynamic_filter_merge.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
+#include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
+#include "scan_manager/split_provider.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
-
-#include <concurrentqueue.h>
 
 #include <cstddef>
 #include <memory>
@@ -62,44 +62,20 @@ struct databatch_provider {
     /// unless the late-mat gate is on and the scan is one whose batches are a
     /// chunk each — the addressing means nothing otherwise.
     std::shared_ptr<late_mat::scan_batch_origin const> origin;
+    /// The identities of dynamic filters attached to this batch's decoder configuration.
+    /// Transferred by the coalescer into the scan_operator_input.
+    std::vector<op::scan::applied_entry> decode_attached;
   };
 
   virtual ~databatch_provider()  = default;
   virtual batch get_next_batch() = 0;
 };
 
-/**
- * @brief Pipeline-ordered sequencer for @c fadvise(opportunistic) calls.
- *
- * Each pipeline registers a per-pipeline slot (a @c metadata_processing_state)
- * holding a blocking queue its split provider feeds and the coalescer,
- * balancer and connector used to place and forward the resulting splits.  A
- * single sequencer task drains the slots in the order they were registered,
- * coalescing each pipeline's splits, choosing a device, issuing the
- * @c fadvise(opportunistic) / prefetch hints and pushing onto the connector,
- * advancing to the next slot only after the current one signals closure.  This
- * serialises the opportunistic fadvise tier across pipelines so the prefetching
- * cache receives ranges in execution order rather than in
- * metadata-scan-completion order — giving the cache its longest possible lead
- * time for the head-of-line pipeline before later pipelines start competing for
- * the buffer pool.
- *
- * Usage:
- *   - scan_manager calls @c register_pipeline(scan_op, balancer) once per
- *     pipeline that needs opportunistic prefetching; the returned slot pointer
- *     drives that pipeline's splits.  Its split provider is wired up via
- *     @c get_split_provider_bridge (live metadata scan) or
- *     @c use_cached_entries_for_pipeline (cached-batch replay).
- *   - scan_manager calls @c spawn_workers(dispatcher) once, after all slots
- *     have been registered, to launch the sequencer task.  The task processes
- *     slots in registration order until either all slots are drained or the
- *     stop_token fires.
- */
+// Registers scan outputs with shared placement and readahead state. The coordinator
+// prepares live inputs; cached providers drain on workers with the same publication gate.
 class load_balancing_scan_batch_coalescer {
  public:
-  /// Per-pipeline mailbox.  The provider produces, the sequencer task
-  /// consumes.  Holds its own semaphore so the sequencer can block on
-  /// an empty slot without spinning.
+  /// Per-scan publication and cached-input state.
   struct metadata_processing_state {
     explicit metadata_processing_state(std::size_t op_id,
                                        std::size_t pipeline_id,
@@ -124,10 +100,9 @@ class load_balancing_scan_batch_coalescer {
       batch_provider = std::move(provider);
     }
 
+    std::shared_ptr<preparation_gate> publication;
     std::size_t op_id{0};
     std::size_t pipeline_id{0};
-    using provider_value_t = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
-    duckdb_moodycamel::BlockingConcurrentQueue<provider_value_t> queue;
     std::shared_ptr<op::scan::batch_coalescer> coalescer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
@@ -147,20 +122,45 @@ class load_balancing_scan_batch_coalescer {
   load_balancing_scan_batch_coalescer& operator=(load_balancing_scan_batch_coalescer const&) =
     delete;
 
-  /// Register a slot for @p pipeline_id.  Slots are processed by the
-  /// sequencer task in the order they were added — typically scan_manager
-  /// adds them in pipeline-id order so the head-of-line pipeline drains
-  /// first.  The returned pointer is valid for the manager's lifetime.
+  /// Register per-scan publication state. The returned slot remains valid
+  /// until this coalescer is destroyed.
   metadata_processing_state* register_pipeline(
     op::scan::sirius_gpu_scan_operator* scan_op,
     std::shared_ptr<balancing_strategy> balancer,
     std::shared_ptr<readahead_scan_manager> readahead = nullptr);
 
+  void register_coordinator_source(op::scan::sirius_gpu_scan_operator*,
+                                   split_provider&,
+                                   preparation_coordinator&);
+  // Legacy cached providers may block: keep their executor and count their owner window.
+  std::vector<exec::invocable<void(std::stop_token)>> prepare_cached_workers(
+    preparation_coordinator& coordinator)
+  {
+    std::vector<exec::invocable<void(std::stop_token)>> work;
+    for (auto id : _pipeline_order) {
+      auto state = _slots.at(id);
+      if (!state->batch_provider) continue;
+      if (state->publication) throw std::logic_error("cached slot already has a coordinator owner");
+      state->publication = coordinator.publication_gate();
+      auto use           = coordinator.external_use();
+      if (!use) continue;
+      work.emplace_back(
+        [this, id, use = std::move(use)](std::stop_token stop) { slot_loop(id, stop); });
+    }
+    return work;
+  }
+  void close_all_slots() noexcept
+  {
+    for (auto const& [id, state] : _slots) {
+      try {
+        if (state->readahead) state->readahead->mark_operator_closed(state->op_id);
+      } catch (...) {
+      }
+      state->connector->close();
+    }
+  }
   void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
                                        std::unique_ptr<databatch_provider> provider);
-
-  std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
-  get_split_provider_bridge(op::scan::sirius_gpu_scan_operator* scan_op);
 
   /// Drain @p provider into @p connector: pull batches until the provider is
   /// exhausted (or @p stop fires), wrapping each as a resident
@@ -191,44 +191,17 @@ class load_balancing_scan_batch_coalescer {
                                     bool invalidate_witness                           = false,
                                     bool native_pin                                   = false,
                                     std::shared_ptr<readahead_scan_manager> readahead = nullptr,
-                                    std::size_t operator_id                           = 0);
-
-  /// Spawn one sequencer task per slot on @p dispatcher.  The dispatcher must
-  /// expose @c enqueue(callable) and inject a @c std::stop_token when the
-  /// callable asks for one (e.g. @c scoped_dispatcher).  Call once after all
-  /// slots have been added — each task captures its slot by id, so adding slots
-  /// after this call leaves them without a sequencer.
-  ///
-  /// One task per slot rather than one walking them in order: a slot blocks in
-  /// @c wait_dequeue until its own metadata arrives, so a single walker cannot
-  /// emit pipeline N+1's splits until pipeline N has closed, and the readahead's
-  /// cross-pipeline lookahead then never has anything to find.
-  ///
-  /// @warning @p dispatcher must NOT be the one running the metadata tasks that
-  /// feed these slots.  These tasks block waiting for that work, so sharing a
-  /// bounded dispatcher lets them occupy every slot and starve the producers
-  /// they are waiting on — a deadlock, not merely slow.
-  template <class Dispatcher>
-  void spawn_workers(Dispatcher& dispatcher)
-  {
-    for (auto pipeline_id : _pipeline_order) {
-      dispatcher.enqueue(
-        [this, pipeline_id](std::stop_token const& stop) { slot_loop(pipeline_id, stop); });
-    }
-  }
+                                    std::size_t operator_id                           = 0,
+                                    std::shared_ptr<preparation_gate> publication     = {});
 
  private:
   /// Drain one slot to completion.  Runs concurrently with the other slots'
   /// loops, so everything it touches is per-slot state.
   void slot_loop(std::size_t pipeline_id, std::stop_token const& stop);
 
-  void process_provider_inputs(metadata_processing_state& state, std::stop_token const& stop);
-
   void process_cached_entries(metadata_processing_state& state, std::stop_token const& stop);
 
-  /// shared_ptr storage: the slot contains a semaphore and a moodycamel
-  /// queue, both of which are non-movable, so slots need stable addresses —
-  /// and the split-provider bridge lambda shares ownership of its slot.
+  /// Publication callbacks retain their slot through source drain.
   std::vector<std::size_t> _pipeline_order;
   std::unordered_map<std::size_t, std::shared_ptr<metadata_processing_state>> _slots;
 };

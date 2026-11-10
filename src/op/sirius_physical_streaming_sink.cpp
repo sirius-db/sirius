@@ -71,6 +71,9 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
       SiriusPhysicalOperatorType::STREAMING_SINK, std::move(types), estimated_cardinality),
     _spec(std::move(spec))
 {
+  if (_spec.mode != partition_mode::hash && _spec.mode != partition_mode::broadcast) {
+    throw sirius::invalid_input_exception("streaming sink supports hash or broadcast routing");
+  }
   if (output_repositories.empty()) {
     throw sirius::invalid_input_exception(
       "sirius_physical_streaming_sink: at least one output repository is required");
@@ -172,7 +175,8 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                                      num_partitions,
                                                      stream,
                                                      *space,
-                                                     batch_telemetry());
+                                                     batch_telemetry(),
+                                                     _spec.preserve_input_order);
 
     for (std::size_t i = 0; i < slices.size(); ++i) {
       // Empty partition stays WAITING until finalize.

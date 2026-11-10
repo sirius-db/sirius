@@ -24,7 +24,6 @@ CompileFlags:
 
 # Tweak the clangd parse settings for all files
 CompileFlags:
-  Compiler: clang++
   CompilationDatabase: ./build/release
   Add:
     # report all errors

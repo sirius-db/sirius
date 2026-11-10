@@ -190,7 +190,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   rmm::cuda_stream_view stream);
 ```
 
-If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, falling back with a warning to the no-reservation overload — see [Memory Management](memory-management.md).
+If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, using the conversion path described in [Memory Management](memory-management.md). Materialized result collection also attempts a HOST reservation, but this baseline falls back to conversion without one if the reservation is unavailable; that conversion may OOM. Mandatory reservation-backed collection is introduced by the later memory-progress PR (#2001).
 
 **Postcondition.** When `prepare_for_processing` returns, every input accessor references data on `requested_memory_space`. Therefore the per-operator expression `batches[0].get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp`, `sirius_physical_merge_sort.cpp`, `sirius_physical_table_scan.cpp`) are safe by the same postcondition.
 
@@ -208,17 +208,15 @@ if (evt->kind == task_request_kind::device_ready) {
 
 `schedule()` pushes directly into the task queue and also publishes `task_available`. The queue push wakes a matcher waiting for work while a device is already ready; the channel event wakes it when it is waiting for a device signal.
 
-**Per-device match.** For each ready device, the scheduler first pops a task with that exact preferred device. If none exists, it pops a task with no preference.
+**Per-device match.** The scheduler first selects the highest-priority exact-device task and
+considers the unbound bucket only if no exact-device task is available. Priority ordering applies
+within each bucket; the two bucket heads are not compared. Retry backoff sleeps in the worker
+before resubmission, rather than attaching a deadline to a queued task. A device preference remains binding;
+another GPU cannot claim that task. The creator confines tasks to their query's admitted GPU set.
+There is no equal-share or round-robin guarantee.
 
-```cpp
-task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
-if (!task) {
-  task =
-    _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
-}
-```
-
-A preference is binding: another ready GPU cannot claim that task. A preference-less task may be claimed by whichever ready device the management thread considers. With multiple ready devices, each independently searches for an exact-preference task before falling back to the shared no-preference bucket. There is no counter, offset, or round-robin ordering guarantee in this matcher.
+A ready-device credit is consumed only when the executor accepts dispatch. Refusing a canceled
+task leaves that worker capacity available for another query.
 
 `test/cpp/operator/test_task_scheduler_routing.cpp` covers these routing invariants with a task pinned to each available test GPU plus one preference-less task, without relying on scheduling order or timing.
 
@@ -266,10 +264,10 @@ sub-executor or scan-priority queue owned here.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
-| `prepare_for_query(query)` | Drains executor leftovers and installs query/completion state |
-| `start_query()` | Schedules `query.get_scan_operators().front()` through `task_creator` and returns the completion future |
-| `terminate_query(exception)` | Reports error to completion handler |
-| `drain_after_error()` | Multi-stage drain for clean shutdown |
+| `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator` |
+| `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
+| `validate_query_complete(query_id)` | Checks execution queues after the owner settles publication; does not wait |
+| `discard_query_tasks(query_id)` | Disposes of queued scheduler/pool work; the owner waits for work leases |
 
 ### Management Event Loop
 
@@ -284,9 +282,9 @@ while running:
        (schedule_lookahead(first ready device) — speculatively warms up a
        not-yet-activated scan; no-op unless strategy is `lookahead`)
     3. For each ready device, select a compatible queued task:
-       a. exact preferred-device match
-       b. unpreferred task
-    4. Dispatch the selected task to that device's GPU executor
+       a. pop the highest-priority exact-preference task
+       b. if none exists, pop the highest-priority unbound task
+    4. Dispatch; consume readiness only if the executor accepts the task
 ```
 
 Tasks stay in the top-level queue until a ready device can accept them, preserving visibility to
@@ -382,15 +380,17 @@ This epilogue is the usual signaller, but not the only one — see the completio
 query-terminal pipeline signals completion there because task-creator, streaming-source, and
 parent-cascade paths can finish a pipeline without returning through the GPU epilogue.
 
-`task_scheduler::prepare_for_query()` installs the handler on terminal pipelines as a
-`std::weak_ptr`, preventing retired pipelines from retaining or signaling a later query's handler.
+`sirius_engine::execute()` creates the handler and future, then passes the handler through
+`SiriusContext::create_query()` to `task_creator::prepare_for_query()`. Terminal pipelines hold it
+as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work before
-operators are destroyed.
+`SiriusContext::retire_query_work(query_id, completed)` closes publication, joins scan producers,
+validates execution queues, discards redundant creator hints, and waits for work leases before
+operators can be destroyed.
 
 ### Task Request Flow
 
@@ -441,17 +441,16 @@ If max retries are exceeded, the error propagates and terminates the query.
 
 ## Error Handling and Draining
 
-**File:** `src/pipeline/task_scheduler.cpp`
+**File:** `src/sirius_context.cpp` — `retire_query_work(query_id, mode)`
 
-`drain_after_error()` performs a multi-stage clean shutdown:
+The runtime owner closes the query's publication gate, waits for admitted publishers, and joins
+its scan producers. It then discards that query's creator/scheduler queues and queued pool work.
+GPU staging tasks stay with their managers so accepted handoffs return readiness normally.
+The owner waits for the query's work leases before releasing its resources. Other queries keep
+running; per-query retirement does not stop shared pools or managers.
 
-1. **Stop task creator thread pool** — prevents new tasks from being created
-2. **Drain the task queue** — clears pending pipeline tasks
-3. **Drain GPU executors** — `drain_and_wait()` per device: interrupts the queue, joins the manager thread, waits for all in-flight tasks
-4. **Drain the task creator's pending tasks** — `drain_pending_tasks()` (also clears look-ahead state)
-5. **Clear the task queue again** — catches tasks enqueued during the drain
-
-This ensures that when `drain_after_error()` returns, no tasks are referencing operators or data repositories that are about to be destroyed.
+Successful completion validates execution queues before the work barrier rather than silently
+dropping unfinished execution tasks. See [Query lifetime and retirement](query-lifecycle.md).
 
 ## Key Files
 

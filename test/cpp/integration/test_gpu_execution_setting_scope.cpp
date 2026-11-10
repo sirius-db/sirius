@@ -19,7 +19,6 @@
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 
 #include <memory>
 #include <vector>
@@ -66,7 +65,7 @@ struct scope_fixture {
     auto before = sirius::test::get_transparent_execution_stats(con);
     auto result = query(con, "SELECT 42::INTEGER");
     auto after  = sirius::test::get_transparent_execution_stats(con);
-    REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
     sirius::test::require_transparent_execution_delta(before, after, gpu ? 1 : 0, 0, gpu ? 1 : 0);
   }
 };

@@ -20,6 +20,7 @@ dbgen/
 test_datasets/tpch-dbgen/
 test_datasets/tpch-mod-dbgen/
 test_datasets/tpchgen-rs/
+/test_datasets/tpch_iceberg_sf*/
 test_datasets/hits_0.parquet
 .codex/
 runs/
@@ -68,3 +69,7 @@ test/tpch_performance/log/
 
 PR_digests/
 plans/
+
+# Core dumps (debugging concurrency crashes writes these into the repo root)
+core
+core.*

@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <config.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
@@ -30,14 +29,13 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
-#include <cucascade/memory/memory_reservation_manager.hpp>
 
 // sirius exceptions
 #include "sirius/exception.hpp"
 
 // duckdb
-#include <duckdb/main/materialized_query_result.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/query_result.hpp>
 
 // standard library
 #include <algorithm>
@@ -67,7 +65,8 @@ std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches(),
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_position());
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -113,7 +112,13 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
       duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
   }
 
-  return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
+  // All producer tasks have finished before get_result(). Sparse positions are intentional.
+  for (auto& [position, collection] : _positioned_collections) {
+    result_collection->Combine(*collection);
+  }
+  _positioned_collections.clear();
+
+  return duckdb::make_uniq<duckdb::QueryResult>(
     statement_type, properties, names, std::move(result_collection), props);
 }
 
@@ -128,8 +133,23 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     return;  // todo(kevin) we should handle this case properly
   }
 
-  auto sink_single_batch = [this,
-                            stream](std::shared_ptr<cucascade::data_batch> const& input_batch) {
+  auto position = pipelineable_input.get_position();
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    if (position && input_batches.size() != 1) {
+      throw internal_exception("Positioned result requires one output batch");
+    }
+    if (_positioned && *_positioned != position.has_value()) {
+      throw internal_exception("Cannot mix positioned and unpositioned query results");
+    }
+    _positioned = position.has_value();
+    if (position && !_seen_positions.insert(*position).second) {
+      throw internal_exception("Duplicate query result position");
+    }
+  }
+
+  auto sink_single_batch = [this, position, stream](
+                             std::shared_ptr<cucascade::data_batch> const& input_batch) {
     // Acquire read-only access to inspect the batch
     auto ro    = input_batch->to_read_only();
     auto* data = ro.get_data();
@@ -219,8 +239,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     }
 
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, result_column_types);
+    duckdb::ColumnDataCollection local_collection(_client_ctx, result_column_types);
+    duckdb::ColumnDataAppendState append_state;
+    local_collection.InitializeAppend(append_state);
 
-    // Push chunks to result collection
+    // Append into a task-local collection so chunk copies do not hold the shared lock.
     while (true) {
       // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we
       // are passing local variable chunk reader by reference. We should investigate if this can
@@ -230,13 +253,22 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       duckdb::DataChunk chunk;
       if (!chunk_reader.get_next_chunk(chunk)) { break; }
 
-      std::lock_guard<std::mutex> guard(lock);
-      // Initialize result collection if it is null (from a move)
-      if (!result_collection) {
-        result_collection =
-          duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
-      }
-      result_collection->Append(chunk);
+      local_collection.Append(append_state, chunk);
+    }
+
+    // Combine moves the local segments into the result collection without copying their rows.
+    std::lock_guard<std::mutex> guard(lock);
+    if (!result_collection) {
+      result_collection =
+        duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
+    }
+    if (position) {
+      auto collection =
+        duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
+      collection->Combine(local_collection);
+      _positioned_collections.emplace(*position, std::move(collection));
+    } else {
+      result_collection->Combine(local_collection);
     }
   };
 

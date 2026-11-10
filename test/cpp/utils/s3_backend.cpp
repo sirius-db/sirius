@@ -16,11 +16,10 @@
 
 #include "utils/s3_backend.hpp"
 
-#include "io/rest/s3/sigv4.hpp"
-
-#include <arpa/inet.h>
+#include <arpa/inet.h>  // IWYU pragma: keep
+#include <cucascade/io/rest/s3/sigv4.hpp>
 #include <curl/curl.h>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -28,6 +27,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -314,6 +314,29 @@ void create_special_key_fixtures(fs::path const& fixture_dir)
   }
 }
 
+void create_virtual_column_fixtures(fs::path const& fixture_dir)
+{
+  scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  for (auto const& [name, query] : std::vector<std::pair<std::string, std::string>>{
+         {"virtual_provenance",
+          "SELECT range AS marker, (range % 3)::INTEGER AS keep FROM range(8193)"},
+         {"virtual_nested_only", "SELECT [range, range + 1] AS items FROM range(19)"},
+         {"virtual_physical_names",
+          "SELECT range AS marker, CASE WHEN range = 0 THEN NULL WHEN range = 1 THEN 'NULL' "
+          "ELSE 'physical' END AS filename, "
+          "77::BIGINT AS file_index, 88::INTEGER AS file_row_number FROM range(3)"}}) {
+    auto const path = fixture_dir / "parquet" / (name + ".parquet");
+    auto result     = con.Query("COPY (" + query + ") TO " + sql_literal(path.string()) +
+                            " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    if (!result || result->HasError()) {
+      throw std::runtime_error("failed to generate virtual-column fixture " + name + ": " +
+                               (result ? result->GetError() : "no query result"));
+    }
+  }
+}
+
 void create_edge_types_fixture(fs::path const& fixture_dir)
 {
   auto const output = fixture_dir / "parquet" / "edge_types.parquet";
@@ -420,7 +443,7 @@ long s3_put(s3_endpoint const& ep,
             std::optional<fs::path> const& ca_bundle,
             long timeout_seconds = 0)
 {
-  sirius::io::rest::s3::sigv4_signer_config creds;
+  cucascade::io::rest::s3::sigv4_signer_config creds;
   creds.access_key = kAccessKey;
   creds.secret_key = kSecretKey;
   creds.region     = kRegion;
@@ -428,14 +451,14 @@ long s3_put(s3_endpoint const& ep,
 
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
   // lineitem fixture) without hashing them; SeaweedFS accepts it.
-  auto signed_req = sirius::io::rest::s3::sign_request("PUT",
-                                                       ep.authority,
-                                                       canonical_uri,
-                                                       /*query=*/"",
-                                                       "UNSIGNED-PAYLOAD",
-                                                       /*extra_headers=*/{},
-                                                       creds,
-                                                       std::time(nullptr));
+  auto signed_req = cucascade::io::rest::s3::sign_request("PUT",
+                                                          ep.authority,
+                                                          canonical_uri,
+                                                          /*query=*/"",
+                                                          "UNSIGNED-PAYLOAD",
+                                                          /*extra_headers=*/{},
+                                                          creds,
+                                                          std::time(nullptr));
 
   CURL* curl = curl_easy_init();
   if (curl == nullptr) return -1;
@@ -481,8 +504,8 @@ long s3_put(s3_endpoint const& ep,
 
 std::string uri_path_for(std::string const& bucket, std::string const& key)
 {
-  std::string p = "/" + sirius::io::rest::s3::uri_encode(bucket, false);
-  if (!key.empty()) p += "/" + sirius::io::rest::s3::uri_encode(key, false);
+  std::string p = "/" + cucascade::io::rest::s3::uri_encode(bucket, false);
+  if (!key.empty()) p += "/" + cucascade::io::rest::s3::uri_encode(key, false);
   return p;
 }
 
@@ -795,6 +818,7 @@ bool bring_up()
   create_special_key_fixtures(fixture_dir);
   create_edge_types_fixture(fixture_dir);
   write_s3_identities_config(s3_config);
+  create_virtual_column_fixtures(fixture_dir);
 
   weed_server srv =
     start_weed(data_dir, s3_config, certs_dir / "public.crt", certs_dir / "private.key", weed_log);

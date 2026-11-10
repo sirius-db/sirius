@@ -16,14 +16,13 @@
 
 #include "op/scan/parquet_materialize.hpp"
 
-#include "io/io_context.hpp"
-#include "io/types.hpp"
-
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/device_buffer.hpp>
+
+#include <cucascade/io/types.hpp>
 
 #include <algorithm>
 #include <iterator>
@@ -146,7 +145,7 @@ fetched_chunks fetch_chunks(parquet_source const& src,
     out.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, mr);
   }
 
-  std::vector<io::slice> reads;
+  std::vector<cucascade::io::slice> reads;
   reads.reserve(ranges.size());
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     reads.emplace_back(static_cast<std::size_t>(ranges[i].offset()),
@@ -256,7 +255,12 @@ std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const>
   }
 
   auto opts = options;
-  opts.set_row_groups(std::move(rg_per_src));
+  if (std::all_of(
+        rg_per_src.begin(), rg_per_src.end(), [](auto const& groups) { return groups.empty(); })) {
+    opts.set_num_rows(0);
+  } else {
+    opts.set_row_groups(std::move(rg_per_src));
+  }
 
   auto [table, _] =
     cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr);

@@ -30,20 +30,16 @@
 
 #include "compressed_materialization_test_common.hpp"
 #include "cudf/cudf_utils.hpp"
-#include "op/scan/sirius_physical_dynamic_filter.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_partition.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/types.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
@@ -142,6 +138,11 @@ constexpr char const* kGroupByQuery =
   "SELECT k, COUNT(*) AS c, SUM(v) AS sv FROM t GROUP BY k ORDER BY k LIMIT 10;";
 constexpr char const* kCountValidGroupByQuery =
   "SELECT k, COUNT(k) AS c FROM t GROUP BY k ORDER BY k LIMIT 10;";
+constexpr char const* kFirstGroupByQuery =
+  "SELECT k, first(k) AS fk, SUM(v) AS sv FROM t GROUP BY k ORDER BY k LIMIT 10;";
+constexpr char const* kFirstBracketQuery =
+  "SELECT count(*) AS c FROM (SELECT k, first(v) AS fv, min(v) AS lo, max(v) AS hi FROM t "
+  "GROUP BY k) WHERE fv < lo OR fv > hi;";
 
 // Small exchange sizes force multi-way hash partitioning on the fixture's data volumes.
 constexpr config_values kConfigValues{.scan_batch_bytes           = kScanBatchBytes,
@@ -185,7 +186,7 @@ duckdb::unique_ptr<sirius_physical_operator> build_sirius_plan(duckdb::Connectio
 
   duckdb::unique_ptr<sirius_physical_operator> result;
   try {
-    duckdb::Parser parser(context.GetParserOptions());
+    duckdb::Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -194,7 +195,7 @@ duckdb::unique_ptr<sirius_physical_operator> build_sirius_plan(duckdb::Connectio
     REQUIRE(planner.plan);
 
     auto plan = std::move(planner.plan);
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       duckdb::Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -405,7 +406,7 @@ TEST_CASE("gpu_execution - outer joins over narrow carriers match the CPU",
         auto const& physical = child->get_physical_types();
         REQUIRE(physical.size() == child->get_types().size());
         for (std::size_t column_idx = 0; column_idx < physical.size(); column_idx++) {
-          auto const native = sirius::get_cudf_type(child->get_types()[column_idx]);
+          auto const native = sirius::require_cudf_type(child->get_types()[column_idx]);
           if (cudf::size_of(physical[column_idx]) < cudf::size_of(native)) { narrow_inputs++; }
         }
       }
@@ -567,6 +568,15 @@ TEST_CASE("gpu_execution - narrow group keys cross the aggregate exchange",
     REQUIRE(count_after.partition_narrow_columns > count_before.partition_narrow_columns);
     REQUIRE(count_after.scan_narrow_targets_retracted ==
             count_before.scan_narrow_targets_retracted);
+
+    // A FIRST keeps the native boundary below the aggregate, so its input reaches the gather native
+    // and no narrow column crosses the aggregate-side exchange. The second query's min/max bracket
+    // catches a carried value read at the wrong width.
+    auto const first_before = sirius::test::get_compressed_materialization_stats(con);
+    compare_gpu_vs_cpu(con, kFirstGroupByQuery);
+    compare_gpu_vs_cpu(con, kFirstBracketQuery);
+    auto const first_after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(first_after.partition_narrow_columns == first_before.partition_narrow_columns);
 
     // Flag-off contrast: everything restores at the scan; the exchange sees native batches.
     require_ok(con.Query("SET enable_compressed_materialization = false;"), "disable flag");

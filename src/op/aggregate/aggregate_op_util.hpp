@@ -19,8 +19,12 @@
 #include "duckdb/common/vector.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
+#include "helper/logical_type.hpp"
+#include "op/aggregate/wide_integer_sum.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
@@ -28,9 +32,14 @@
 
 #include <cuda/stream>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace sirius {
@@ -44,18 +53,35 @@ namespace op {
  * intercepted by the caller (COLLECT_SET path) before this helper runs — so there is no
  * count_distinct case to add here.
  *
- * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg`
- * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
+ * STDDEV_SAMP maps to Kind::M2 as an internal marker for its count/mean/M2 STRUCT.
+ * The local executor expands the marker into three cuDF aggregations and packs their results.
+ *
+ * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg` (decomposes
+ * into SUM + COUNT_VALID) and `first` (a carried column in the grouped aggregate, NTH_ELEMENT in
+ * the ungrouped one).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
+
+/// Whether @p id over an input of type @p input_type is a SUM that DuckDB accumulates in HUGEINT
+/// (128 bits) from an integer column the GPU carries as INT32 or INT64: `sum` or `avg` over
+/// INTEGER or BIGINT. Its total can exceed INT64 even when every input fits, so the GPU must not
+/// accumulate it in INT64 unchecked. `sum_no_overflow` is excluded: DuckDB's statistics
+/// propagation already proved that the total fits in INT64. Narrower inputs (SMALLINT, BOOLEAN)
+/// are excluded: leaving INT64 would take more than 2^48 rows. A HUGEINT input is carried as
+/// DECIMAL128 with scale 0 and takes the decimal SUM path.
+bool is_wide_integer_sum(sirius::aggregate_id id, sirius::logical_type const& input_type);
 
 /// The type a SUM over a column of type @p type is computed in when it must not overflow the
 /// input width: the next wider decimal type for DECIMAL32 and DECIMAL64, nullopt otherwise.
 std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type);
 
-/// The columns among @p candidates (indices into @p table; DECIMAL32 or DECIMAL64) whose SUM over
-/// this batch could overflow the column's own storage width and so must be summed over a wider
-/// decimal type.
+/// The type a SUM candidate of type @p type (see sums_to_widen) is widened to: the next wider
+/// decimal type for DECIMAL32 and DECIMAL64, wide_integer_sum_type() for INT64, nullopt otherwise.
+std::optional<cudf::data_type> widened_sum_type(cudf::data_type type);
+
+/// The columns among @p candidates (indices into @p table; DECIMAL32, DECIMAL64 or INT64) whose
+/// SUM over this batch could overflow the column's own storage width and so must be summed over a
+/// wider type (widened_sum_type).
 ///
 /// A sum of n values of magnitude at most m is at most n * m, so rows * max|value| within the
 /// storage width (2^31-1 or 2^63-1) rules out wrap-around in every group. The bound is exact. It
@@ -63,24 +89,179 @@ std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type);
 /// 128-bit accumulation. Nulls are skipped, and a column with no valid value cannot overflow.
 /// All cudf::minmax passes are launched first and their results come back in one device-to-host
 /// copy, so a batch costs a single stream synchronization. Throws sirius::internal_exception if a
-/// candidate is not DECIMAL32 or DECIMAL64.
-std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
-                                                      std::vector<int> const& candidates,
-                                                      ::cuda::stream_ref stream,
-                                                      rmm::device_async_resource_ref mr);
+/// candidate is not DECIMAL32, DECIMAL64 or INT64.
+std::unordered_set<int> sums_needing_widening(cudf::table_view const& table,
+                                              std::vector<int> const& candidates,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr);
+
+/// |v| as an unsigned 64-bit magnitude; the most negative value's 2^63 fits.
+constexpr std::uint64_t decimal_magnitude(std::int64_t v)
+{
+  auto const bits = static_cast<std::uint64_t>(v);
+  return v < 0 ? std::uint64_t{0} - bits : bits;
+}
+
+/// Whether a SUM of @p num_rows values of magnitude at most @p max_abs can exceed the storage
+/// width of @p type (2^31-1 for DECIMAL32, 2^63-1 for DECIMAL64 and INT64). Throws
+/// sirius::internal_exception for any other type.
+bool sum_may_overflow(cudf::data_type type, cudf::size_type num_rows, std::uint64_t max_abs);
+
+/// A SUM input of one batch that may need widening: its column and, when the planner proved one
+/// from base-table statistics (planner::resolve_sum_input_bounds), the largest |unscaled value| it
+/// holds.
+struct sum_candidate {
+  int column;
+  std::optional<std::uint64_t> max_abs;
+};
+
+/// The columns among @p candidates (DECIMAL32, DECIMAL64 or INT64) whose SUM over this batch could
+/// overflow their storage width. A column whose every candidate carries a bound is decided on the
+/// host from the batch row count; the others are measured with sums_needing_widening. A batch
+/// without unproven columns therefore costs no device work and no synchronization.
+std::unordered_set<int> sums_to_widen(cudf::table_view const& table,
+                                      std::vector<sum_candidate> const& candidates,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr);
+
+/// Throws not_implemented_exception, falling back to DuckDB, unless summing all of @p partials
+/// provably stays below 2^127: the bound is the sum of rows x max |v| over the DECIMAL128 columns
+/// (others are skipped). cuDF's SUM wraps where DuckDB raises an overflow error. Synchronizes
+/// @p stream once per checked column.
+void require_decimal128_partial_sums_in_range(std::vector<cudf::column_view> const& partials,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr);
+
+/// Whether summing @p column (INT64 partial sums of a wide integer SUM, nulls skipped) can
+/// overflow INT64 in any group: true unless sum(|value|) over the whole column provably stays
+/// below 2^62. Any group's sum, and every running sum on the way, is bounded by that total, so a
+/// merge over a column for which this returns false is exact in INT64. The total is accumulated in
+/// double, whose relative error is far inside the factor-two margin. Synchronizes @p stream.
+bool partial_sums_may_overflow(cudf::column_view const& column,
+                               ::cuda::stream_ref stream,
+                               rmm::device_async_resource_ref mr);
+
+/// The final value of an aggregate whose result is HUGEINT: @p column in HUGEINT's carrier,
+/// DECIMAL128 with scale 0. An INT64 column (a SUM that was accumulated in 64 bits) is widened; a
+/// DECIMAL128 column with scale 0 is returned as is. Throws sirius::internal_exception for any
+/// other type.
+std::unique_ptr<cudf::column> to_hugeint_carrier(std::unique_ptr<cudf::column> column,
+                                                 ::cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr);
+
+/// The narrower type a SUM over a column of type @p type can be computed in when the batch's values
+/// are small enough: DECIMAL64 at the same scale for DECIMAL128, nullopt otherwise.
+std::optional<cudf::data_type> narrowed_decimal_sum_type(cudf::data_type type);
+
+/// The columns among @p candidates (DECIMAL128) whose SUM over this batch can be computed over
+/// DECIMAL64 and widened back afterwards, with the same result.
+///
+/// DuckDB types some sums wider than their values need. For example, DuckDB v2 types the TPC-H Q9
+/// profit `DECIMAL(18,4) - DECIMAL(18,4)` as DECIMAL(19,4), which the GPU holds as DECIMAL128,
+/// although every value fits 64 bits. cuDF's hash aggregation sums 128-bit values far more slowly
+/// than 64-bit ones, especially over few groups. A column is narrowed only when rows * max|value|
+/// is at most 2^63 - 1, the same exact proof sums_needing_widening uses, so no value and no
+/// partial sum of any group can leave the DECIMAL64 range. A column whose every candidate carries a
+/// plan-time bound is decided on the host. The others are measured: all cudf::minmax passes are
+/// launched first and come back in one device-to-host copy, so a batch costs a single stream
+/// synchronization. Nulls are skipped. Throws sirius::internal_exception if a candidate is not
+/// DECIMAL128.
+std::unordered_set<int> decimal_sums_to_narrow(cudf::table_view const& table,
+                                               std::vector<sum_candidate> const& candidates,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr);
+
+/** @brief An aggregate answered by one cuDF request whose partial is also its output. */
+struct plain_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+  /// True if this is a wide integer SUM (is_wide_integer_sum): its partial results are INT64 or,
+  /// where INT64 could overflow, DECIMAL128 with scale 0.
+  bool is_wide_integer_sum = false;
+  /// True if the aggregate's DuckDB result is HUGEINT. Its partials may be INT64; the merge
+  /// finalizes them to DECIMAL128 with scale 0 (to_hugeint_carrier).
+  bool returns_hugeint = false;
+  /// True if this SUM reads a HUGEINT input: its DECIMAL128 partials can
+  /// approach 2^127, so the merge checks their total cannot pass it
+  /// (require_decimal128_partial_sums_in_range).
+  bool sums_hugeint_input = false;
+};
+
+/** @brief AVG: SUM at `sum_idx` and COUNT_VALID at `sum_idx + 1`, divided at the merge. */
+struct avg_slot {
+  std::size_t sum_idx{};                              ///< Index of the SUM in cudf_aggregates
+  cudf::data_type output_type{cudf::type_id::EMPTY};  ///< Quotient type: FLOAT64 or DECIMAL
+  bool is_wide_integer_sum = false;  ///< True if the SUM is a wide integer SUM, as in plain_slot
+  /// True if the SUM reads a HUGEINT input; its partials need a 128-bit overflow check at merge.
+  bool sums_hugeint_input = false;
+};
+
+/** @brief COUNT(DISTINCT): COLLECT_SET locally and MERGE_SETS at the merge, then counted. */
+struct count_distinct_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+};
+
+/** @brief STDDEV_SAMP: a count/mean/M2 STRUCT, merged by MERGE_M2 and finalized after merge. */
+struct stddev_samp_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+};
+
+/** @brief FIRST: no cuDF request; child column `input_idx` is carried at `carried_idx`. */
+struct first_slot {
+  cudf::size_type input_idx{-1};  ///< Child column whose value this slot carries
+  std::size_t carried_idx{};      ///< Position in the carried block that follows the partials
+};
 
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
- * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
- * COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts list elements.
+ * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two entries), FIRST uses none,
+ * all others use one. STDDEV_SAMP uses a count/mean/M2 STRUCT identified by Kind::M2 and finalizes
+ * after merge. COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts
+ * list elements.
  */
-struct AggregateSlot {
-  bool is_avg            = false;
-  bool is_count_distinct = false;  ///< True if this is a COUNT(DISTINCT col) aggregate
-  size_t cudf_idx;  ///< Index in cudf_aggregates. For AVG, this is the SUM slot; cudf_idx+1 is
-                    ///< COUNT_VALID.
-  cudf::data_type output_type{cudf::type_id::EMPTY};  ///< For AVG: the desired output cudf type
-                                                      ///< (FLOAT64 or DECIMAL).
+using aggregate_slot =
+  std::variant<plain_slot, avg_slot, count_distinct_slot, stddev_samp_slot, first_slot>;
+
+/**
+ * @brief Column positions shared by grouped aggregation, merge, and finalization
+ *
+ * Partial batches contain group keys, expanded cuDF partials, then carried FIRST columns. Indices
+ * passed to `partial_column` and `carried_column` are relative to their respective blocks.
+ */
+class grouped_aggregate_layout {
+ public:
+  grouped_aggregate_layout(std::size_t num_keys, std::size_t num_partials, std::size_t num_carried)
+    : _num_keys(num_keys), _num_partials(num_partials), _num_carried(num_carried)
+  {
+  }
+
+  grouped_aggregate_layout(std::size_t num_keys,
+                           std::size_t num_partials,
+                           std::span<aggregate_slot const> slots);
+
+  [[nodiscard]] std::size_t num_keys() const noexcept { return _num_keys; }
+  [[nodiscard]] std::size_t num_partials() const noexcept { return _num_partials; }
+  [[nodiscard]] std::size_t num_carried() const noexcept { return _num_carried; }
+  [[nodiscard]] std::size_t partial_column(std::size_t index) const noexcept
+  {
+    return _num_keys + index;
+  }
+  [[nodiscard]] std::size_t carried_column(std::size_t index) const noexcept
+  {
+    return partial_column(_num_partials) + index;
+  }
+  [[nodiscard]] std::size_t num_columns() const noexcept { return carried_column(_num_carried); }
+
+  /**
+   * @brief Whether final slot order and types need no post-merge projection
+   *
+   * HUGEINT carrier widening is checked separately against the runtime columns.
+   */
+  [[nodiscard]] bool matches_output(std::span<aggregate_slot const> slots) const noexcept;
+
+ private:
+  std::size_t _num_keys;
+  std::size_t _num_partials;
+  std::size_t _num_carried;
 };
 
 /**
@@ -97,11 +278,20 @@ struct CudfAggregateDefinitions {
   /// cudf_aggregates; empty entries mean single-column (use cudf_aggregate_idx directly).
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
 
-  /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions.
-  std::vector<AggregateSlot> aggregate_slots;
+  /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions or,
+  /// for a FIRST, to its carried column.
+  std::vector<aggregate_slot> aggregate_slots;
+  /// Runtime partial schema: group keys, expanded aggregate carriers, then the FIRST carried
+  /// columns.
+  duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
 };
+
+/// Parallel to a cudf_aggregates vector of @p num_cudf_aggregates entries: true at the SUM entry
+/// of every wide integer SUM or AVG among @p slots.
+std::vector<bool> wide_integer_sum_mask(std::vector<aggregate_slot> const& slots,
+                                        std::size_t num_cudf_aggregates);
 
 /**
  * @brief Convert DuckDB aggregate expressions to cuDF compute definitions.
@@ -119,6 +309,39 @@ struct CudfAggregateDefinitions {
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Child column read by each FIRST slot, indexed by its `carried_idx`
+ *
+ * @param aggregate_slots One entry per aggregate expression
+ * @return The columns a grouped aggregate carries after its partials, in carried-block order
+ */
+std::vector<int> carried_inputs(std::vector<aggregate_slot> const& aggregate_slots);
+
+/**
+ * @brief Whether every slot in @p aggregate_slots holds a `plain_slot`
+ *
+ * Any other `AggregateSlot` alternative, including one added later, makes the result false. An
+ * empty list is all plain.
+ */
+[[nodiscard]] bool all_slots_plain(std::vector<aggregate_slot> const& aggregate_slots);
+
+/**
+ * @brief Whether any slot in @p aggregate_slots holds the alternative `Kind`
+ *
+ * @tparam Kind One of the `AggregateSlot` alternatives; any other type does not compile
+ */
+template <typename Kind>
+[[nodiscard]] bool has_slot(std::vector<aggregate_slot> const& aggregate_slots)
+{
+  return std::ranges::any_of(
+    aggregate_slots, [](aggregate_slot const& slot) { return std::holds_alternative<Kind>(slot); });
+}
+/// Whether @p keys is in ascending order with nulls last, i.e. valid input for
+/// `cudf::sorted::YES` with `cudf::null_order::AFTER`. Null-free fixed-width integer, boolean,
+/// timestamp, duration and fixed-point columns take one typed pass that stops at the first
+/// descent; every other column uses `cudf::is_sorted`. Synchronizes @p stream.
+bool keys_ascending(cudf::column_view const& keys, ::cuda::stream_ref stream);
 
 }  // namespace op
 }  // namespace sirius

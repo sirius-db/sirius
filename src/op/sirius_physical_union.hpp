@@ -24,14 +24,19 @@
 namespace sirius {
 namespace op {
 
-//! Physical `UNION ALL`: an N-ary, non-materializing fan-in. Bag union computes nothing, so this
-//! operator only routes batches and `execute` is the identity. Distinct `UNION`, `EXCEPT` and
-//! `INTERSECT` never reach it: the plan builder accepts only `setop_all == true`.
+//! N-ary union: joins its arms' rows into one stream without inspecting them, so this operator
+//! only routes batches and `execute` is the identity. It does not materialize.
+//! Also merges the tagged inputs of EXCEPT ALL / INTERSECT ALL.
 //!
 //! `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, and each sink feeds a distinct
 //! `port_label(i)` port.
 class sirius_physical_union : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::UNION;
 
   //! @param types  Output schema. The binder has already cast every arm to the common super-type,
@@ -50,15 +55,11 @@ class sirius_physical_union : public sirius_physical_operator {
 
   bool is_source() const override;
 
-  //! `order_preservation_recursive` stops at the first `is_source()` operator, so this answer
-  //! decides the whole plan's.
-  sirius::OrderPreservationType source_order() const override;
-
   //! The base throws for a non-sink operator with more than one child.
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
-  //! The base recurses into `children[0]` only; collect every arm's sources instead.
+  //! The base throws for more than one child; collect every arm's sources instead.
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_sources() const override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,

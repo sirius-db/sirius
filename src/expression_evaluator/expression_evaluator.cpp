@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "cudf/compute_column_compat.hpp"
+
 #include <cudf/cudf_utils.hpp>
 
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
@@ -38,7 +40,6 @@
 
 // standard library
 #include <memory>
-#include <numeric>
 #include <variant>
 
 namespace {
@@ -140,11 +141,11 @@ expression_evaluator::expression_evaluator(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
-  : _strategy(strategy),
+  : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -161,14 +162,14 @@ expression_evaluator::expression_evaluator(
   sirius::ast::node const& expression,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
   : expression_evaluator(&expression,
                          resource_ref,
                          stream,
-                         strategy,
+                         policy,
                          min_ast_size,
                          like_swar_fastpath,
                          std::move(like_cache))
@@ -179,11 +180,11 @@ expression_evaluator::expression_evaluator(
   sirius::ast::node const* expression,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
-  : _strategy(strategy),
+  : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -197,12 +198,12 @@ expression_evaluator::expression_evaluator(
   std::vector<sirius::ast::node const*> expressions,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
   : _ast_expressions(std::move(expressions)),
-    _strategy(strategy),
+    _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -232,11 +233,14 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_e
   }
 
   cudf::table_view combined_table_view(combined_column_views);
-  if (_strategy == expression_evaluator_strategy::AST_INTERPRET) {
-    return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
-  } else {
-    return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
+  if (_policy.strategy == expression_evaluator_strategy::AST_JIT) {
+    ++_ast_jit_evaluation_count;
+    return sirius::cudf_compat::compute_column_jit(
+      combined_table_view, root_expr.get(), _stream, _mr);
   }
+  // MATERIALIZE uses a small interpreted AST for floating comparison semantics.
+  // Building that AST must not opt a query into the JIT backend.
+  return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::materialize_as_ast_column(
@@ -247,6 +251,14 @@ evaluate_result expression_evaluator::materialize_as_ast_column(
   _temp_columns.push_back(std::move(column));
   auto const& col_ref = _ast_tree.emplace<cudf::ast::column_reference>(col_idx);
   return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
+}
+
+evaluate_result expression_evaluator::evaluate_as_column(sirius::ast::node const& expr)
+{
+  auto result = evaluate(expr, evaluation_mode::MATERIALIZE);
+  if (!result.is_scalar()) { return result; }
+  return evaluate_result(
+    cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
 }
 
 void expression_evaluator::release_temporaries(
@@ -264,7 +276,40 @@ void expression_evaluator::release_temporaries(
   }
 }
 
+std::unique_ptr<cudf::column> expression_evaluator::to_owned_column(evaluate_result result)
+{
+  if (result.is_scalar()) {
+    return cudf::make_column_from_scalar(
+      result.get_scalar(), _input_table.num_rows(), _stream, _mr);
+  }
+  if (result.is_column_view()) {
+    return std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
+  }
+  return result.release_column();
+}
+
+std::unique_ptr<cudf::column> expression_evaluator::cast_to_type(
+  std::unique_ptr<cudf::column> column, cudf::data_type type)
+{
+  if (column->type() == type) { return column; }
+  // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
+  if (!IsFixedWidth(column->type()) || !IsFixedWidth(type)) {
+    throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
+                             cudf::type_to_name(column->type()),
+                             cudf::type_to_name(type));
+  }
+  // Final result-type reconciliation is a physical schema restore. The declared output type
+  // provides the provenance needed to restore a narrowed DATE representation.
+  return sirius::cast_through_rep(column->view(), type, _stream, _mr);
+}
+
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
+{
+  return evaluate_roots(input, /*predicates=*/false);
+}
+
+std::unique_ptr<cudf::table> expression_evaluator::evaluate_roots(cudf::table_view input,
+                                                                  bool predicates)
 {
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
@@ -273,6 +318,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // the restored-reference cache over them, and the per-call instrumentation do not carry stale
   // state across calls.
   _restored_reference_cache.clear();
+  _hugeint_reference_bounds.clear();
   _restored_reference_cast_count  = 0;
   _narrow_domain_comparison_count = 0;
   _ast_tree                       = cudf::ast::tree{};
@@ -298,32 +344,9 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
     } else {
       // Cast the `result` from libcudf to the node's return type if `result` has a different
       // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
-      // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
-      // STRING/LIST/STRUCT).
-      auto const cudf_return_type = sirius::get_cudf_type(expr.return_type());
-      std::unique_ptr<cudf::column> result_column;
-      if (result.is_scalar()) {
-        result_column =
-          cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr);
-      } else if (result.is_column_view()) {
-        result_column = std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr);
-      } else {
-        result_column = result.release_column();
-      }
-      if (result_column->type() != cudf_return_type) {
-        // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
-        if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
-          // Final result-type reconciliation is a physical schema restore. The declared output
-          // type provides the provenance needed to restore a narrowed DATE representation.
-          result_column =
-            sirius::cast_through_rep(result_column->view(), cudf_return_type, _stream, _mr);
-        } else {
-          throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
-                                   cudf::type_to_name(result_column->type()),
-                                   cudf::type_to_name(cudf_return_type));
-        }
-      }
-      _output_columns.push_back(std::move(result_column));
+      // int64_t.
+      _output_columns.push_back(cast_to_type(to_owned_column(std::move(result)),
+                                             sirius::require_cudf_type(expr.return_type())));
     }
   };
 
@@ -341,7 +364,8 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
         "from_duckdb returned nullptr for an unsupported expression; "
         "cannot evaluate on GPU");
     }
-    auto result = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
+    auto result = predicates ? evaluate_predicate(*ast_expr)
+                             : evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
     post_process(*ast_expr, std::move(result));
   }
 
@@ -354,7 +378,7 @@ std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_vie
   // A filter predicate must be BOOLEAN. Read the type natively from the Sirius AST.
   D_ASSERT(_ast_expressions[0]->return_type().id() == sirius::type_id::BOOLEAN);
 
-  return std::move(evaluate(input)->release()[0]);
+  return std::move(evaluate_roots(input, _short_circuit)->release()[0]);
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::select(
@@ -369,7 +393,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
   auto mask = compute_mask(input);
-  return ApplyRetentionMask(
+  return sirius::apply_retention_mask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 }
 
@@ -385,7 +409,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
   // ONE mask, used twice: the survivors must be exactly the rows the output
   // holds, so computing the predicate a second time would risk two answers.
   auto mask     = compute_mask(input);
-  auto selected = ApplyRetentionMask(
+  auto selected = sirius::apply_retention_mask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 
   auto const rows = input.num_rows();
@@ -395,7 +419,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
                                   _stream,
                                   _mr);
   auto surviving =
-    ApplyRetentionMask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
+    sirius::apply_retention_mask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
   survivors = std::make_unique<cudf::column>(surviving->get_column(0), _stream, _mr);
   return selected;
 }
@@ -403,7 +427,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
   auto mask = compute_mask(input);
-  return ApplyRetentionMask(input, mask->view(), _stream, _mr);
+  return sirius::apply_retention_mask(input, mask->view(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*expr*/,

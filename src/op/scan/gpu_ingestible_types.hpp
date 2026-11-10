@@ -14,11 +14,15 @@
  * limitations under the License.
  */
 
-#include "io/cache/types.hpp"
+#include "exec/invocable.hpp"
+#include "op/scan/gpu_row_positions.hpp"
 #include "op/scan/owning_table_view.hpp"
+#include "op/scan/scan_execution_record.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
-#include <io/sirius_datasource.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/cache/types.hpp>
+#include <expression/ast/node.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +55,7 @@ class ingestible_table_info {
   std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
 
   virtual ~ingestible_table_info() = default;
+  virtual bool allows_cached_rows() const { return true; }
 
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
@@ -92,7 +97,7 @@ class ingestible_table_info {
 class scan_info : public std::enable_shared_from_this<scan_info> {
  public:
   struct fadvise_entry {
-    std::shared_ptr<sirius::io::sirius_datasource> datasource;
+    std::shared_ptr<cucascade::io::datasource> datasource;
     std::vector<cudf::io::text::byte_range_info> ranges;
   };
 
@@ -110,28 +115,12 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   [[nodiscard]] std::span<const fadvise_entry> fadvise_hints() const { return _hints; }
 
-  [[nodiscard]] std::span<const std::shared_ptr<sirius::io::sirius_datasource>> datasources() const
+  [[nodiscard]] std::span<const std::shared_ptr<cucascade::io::datasource>> datasources() const
   {
     return _datasources;
   }
 
   // ---- readahead -----------------------------------------------------------
-
-  /// Whether anybody managed to read this split ahead of demand.  Producer-side
-  /// and deliberately separate from @c io::cache::scan_stage, which tracks the
-  /// consumer's progress: the two advance independently.
-  enum class prefetch_state : int {
-    idle       = 0,  ///< no prefetch has been attempted
-    attempted  = 1,  ///< @ref prefetch ran but every datasource refused
-    prefetched = 2,  ///< at least one datasource started IO
-  };
-
-  /// Read without a lock -- the readahead worker writes this while the executor
-  /// may be reading it.
-  [[nodiscard]] prefetch_state get_prefetch_state() const noexcept
-  {
-    return _prefetch_state.load(std::memory_order_acquire);
-  }
 
   /// How one @ref prefetch call resolved, once every datasource has settled.
   /// A backend refusing the request is not an error -- it is busy -- but it is
@@ -146,6 +135,8 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     /// per-split state at the moment the attempt completes.
     std::size_t declined_memory_pressure{0};
     bool ok{true};  ///< every datasource that started IO completed it
+    /// Every requested extent was covered by successful prefetch or resident data.
+    bool covered{true};
   };
 
   /// How preparing this split's prefetch requests turned out, across its
@@ -174,14 +165,14 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   ///
   /// Monotone, because stages only ever advance and a report that arrives late
   /// must not walk one back.
-  void set_scan_stage(io::cache::scan_stage stage) noexcept
+  void set_scan_stage(cucascade::io::cache::scan_stage stage) noexcept
   {
     auto cur = _scan_stage.load(std::memory_order_relaxed);
     while (stage > cur && !_scan_stage.compare_exchange_weak(
                             cur, stage, std::memory_order_release, std::memory_order_relaxed)) {}
   }
 
-  [[nodiscard]] io::cache::scan_stage get_scan_stage() const noexcept
+  [[nodiscard]] cucascade::io::cache::scan_stage get_scan_stage() const noexcept
   {
     return _scan_stage.load(std::memory_order_acquire);
   }
@@ -191,24 +182,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   /// the executor is doing for itself.
   [[nodiscard]] bool has_fallen_behind() const noexcept
   {
-    return get_scan_stage() >= io::cache::scan_stage::preparing;
-  }
-
-  /// Take / give back the readahead ticket this split holds for its own read.
-  ///
-  /// A split the readahead never covered spends from the same IO budget the
-  /// readahead does, and the flag is what makes that exactly-once: `take`
-  /// returns false if it already holds one (a stage can be reported twice), and
-  /// `give_back` returns false if it never had one, so neither a double-charge
-  /// nor a double-refund is possible.
-  [[nodiscard]] bool take_readahead_ticket() noexcept
-  {
-    return !_holds_readahead_ticket.exchange(true, std::memory_order_acq_rel);
-  }
-
-  [[nodiscard]] bool give_back_readahead_ticket() noexcept
-  {
-    return _holds_readahead_ticket.exchange(false, std::memory_order_acq_rel);
+    return get_scan_stage() >= cucascade::io::cache::scan_stage::preparing;
   }
 
   /// Allocate staging buffers for this split's prefetch requests.  A chunk
@@ -222,10 +196,10 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     prepare_outcome out;
     for (auto const& ds : _datasources) {
       switch (ds->prepare_prefetch(wait_for_eviction)) {
-        case sirius::io::prepare_result::prepared: ++out.prepared; break;
-        case sirius::io::prepare_result::allocation_failed: ++out.failed; break;
-        case sirius::io::prepare_result::fallen_behind: ++out.fell_behind; break;
-        case sirius::io::prepare_result::nothing_to_prepare: break;
+        case cucascade::io::prepare_result::prepared: ++out.prepared; break;
+        case cucascade::io::prepare_result::allocation_failed: ++out.failed; break;
+        case cucascade::io::prepare_result::fallen_behind: ++out.fell_behind; break;
+        case cucascade::io::prepare_result::nothing_to_prepare: break;
       }
     }
     return out;
@@ -246,7 +220,6 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   {
     if (_datasources.empty()) {
       // Nothing to read ahead of: an attempt that could never have issued.
-      _prefetch_state.store(prefetch_state::attempted, std::memory_order_release);
       on_done(prefetch_outcome{});
       return;
     }
@@ -257,26 +230,22 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     // had even been asked.
     auto pending =
       std::make_shared<prefetch_completion>(_datasources.size() + 1, std::move(on_done));
-    std::size_t issued = 0;
     for (auto const& ds : _datasources) {
-      switch (ds->prefetch_async([pending](bool ok) noexcept { pending->arrive(ok); })) {
-        case sirius::io::prefetch_refusal::issued:
-          ++issued;
+      switch (ds->prefetch_async([pending](cucascade::io::cache::prefetch_result result) noexcept {
+        pending->arrive(result);
+      })) {
+        case cucascade::io::prefetch_refusal::issued:
           pending->issued.fetch_add(1, std::memory_order_relaxed);
           continue;
-        case sirius::io::prefetch_refusal::memory_pressure:
+        case cucascade::io::prefetch_refusal::memory_pressure:
           pending->declined_memory_pressure.fetch_add(1, std::memory_order_relaxed);
           break;
-        case sirius::io::prefetch_refusal::consumer_ahead:
-        case sirius::io::prefetch_refusal::other:
-        case sirius::io::prefetch_refusal::no_cache: break;
+        case cucascade::io::prefetch_refusal::consumer_ahead:
+        case cucascade::io::prefetch_refusal::other:
+        case cucascade::io::prefetch_refusal::no_cache: break;
       }
       pending->declined.fetch_add(1, std::memory_order_relaxed);
     }
-    // Published before the guard drops, so anybody woken by the completion
-    // already sees which of the two outcomes this was.
-    _prefetch_state.store(issued > 0 ? prefetch_state::prefetched : prefetch_state::attempted,
-                          std::memory_order_release);
     pending->release_guard();
   }
 
@@ -318,6 +287,11 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
    * Returns 0 for splits with no a-priori size estimate.
    */
   [[nodiscard]] virtual std::size_t estimated_bytes() const noexcept { return 0; }
+  // Additive decoded work retained from preparation until the consumer takes its batch.
+  [[nodiscard]] virtual std::size_t preparation_bytes() const noexcept
+  {
+    return estimated_working_set_bytes();
+  }
 
   /**
    * @brief Estimated decoded column buffers needed to materialize the split.
@@ -332,6 +306,13 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return estimated_bytes();
   }
 
+  /// Refine execution workspace for the task's target device, without changing
+  /// the additive preparation charge or observing new execution decisions.
+  [[nodiscard]] virtual std::size_t estimated_working_set_bytes_for_device(int) const noexcept
+  {
+    return estimated_working_set_bytes();
+  }
+
  private:
   /// Fan-in for @ref prefetch: counts the per-datasource completions down to a
   /// single report.  Shared by every callback, so it outlives the call that
@@ -342,9 +323,10 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     {
     }
 
-    void arrive(bool success) noexcept
+    void arrive(cucascade::io::cache::prefetch_result result) noexcept
     {
-      if (!success) { ok.store(false, std::memory_order_relaxed); }
+      if (!result.ok) { ok.store(false, std::memory_order_relaxed); }
+      if (!result.covered) { covered.store(false, std::memory_order_relaxed); }
       settle();
     }
 
@@ -356,6 +338,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     std::atomic<std::size_t> declined{0};
     std::atomic<std::size_t> declined_memory_pressure{0};
     std::atomic<bool> ok{true};
+    std::atomic<bool> covered{true};
     sirius::exec::invocable<void(prefetch_outcome) noexcept> on_done;
 
    private:
@@ -366,15 +349,14 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
         .issued                   = issued.load(std::memory_order_relaxed),
         .declined                 = declined.load(std::memory_order_relaxed),
         .declined_memory_pressure = declined_memory_pressure.load(std::memory_order_relaxed),
-        .ok                       = ok.load(std::memory_order_relaxed)});
+        .ok                       = ok.load(std::memory_order_relaxed),
+        .covered                  = covered.load(std::memory_order_relaxed)});
     }
   };
 
   std::vector<fadvise_entry> _hints;
-  std::vector<std::shared_ptr<sirius::io::sirius_datasource>> _datasources;
-  std::atomic<prefetch_state> _prefetch_state{prefetch_state::idle};
-  std::atomic<io::cache::scan_stage> _scan_stage{io::cache::scan_stage::none};
-  std::atomic<bool> _holds_readahead_ticket{false};
+  std::vector<std::shared_ptr<cucascade::io::datasource>> _datasources;
+  std::atomic<cucascade::io::cache::scan_stage> _scan_stage{cucascade::io::cache::scan_stage::none};
 
   scan_contract_id contract_id_ = 0;
   std::vector<split_materializer_certificate> certificates_;
@@ -419,6 +401,30 @@ struct filtered_table {
   /// sirius::pushdown_outcome::predicates_enforced), so post_filter_and_project
   /// drops them from the residual instead of referencing the answer.
   bool predicates_enforced{false};
+  /// Bytes the cached batch behind a resident view stores, read through the lease @c table holds;
+  /// zero on every other path.
+  std::size_t stored_bytes{0};
+  /// Additive during migration; a producer must qualify before this drives decisions.
+  std::optional<scan_execution_record> execution;
+  /// Present only while an internal positional consumer still needs reader survivors.
+  std::unique_ptr<gpu_row_positions> row_positions;
+  // Certified batch requirements, not reconstructed from execution.visibility_applied.
+  // Null for ordinary Parquet; Iceberg shares an empty binding when it has no deletes.
+  std::shared_ptr<visibility_bindings const> required_visibility;
+};
+
+/**
+ * @brief Owns the original materialized-column coordinates and residual for a cached checkpoint.
+ */
+struct cached_view_layout {
+  /// Maps each canonical endpoint ordinal to its source column; a layout that cannot map every
+  /// ordinal is declined rather than produced. output_columns[endpoint_ordinal] = source_column
+  std::vector<cudf::size_type> output_columns;
+  /// The source columns to gather after payload elision, in output order and including duplicates.
+  /// The residual references the same unmodified source rows.
+  std::vector<cudf::size_type> projected_columns;
+  /// The residual expression that must still be applied to the projected columns.
+  std::unique_ptr<sirius::ast::node> residual;
 };
 
 }  // namespace sirius::op::scan

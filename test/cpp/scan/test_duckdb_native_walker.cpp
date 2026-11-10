@@ -15,25 +15,17 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/common/column_index.hpp>
-#include <duckdb/common/constants.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/filter/optional_filter.hpp>
-#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
-#include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
-#include <unistd.h>
+#include <unistd.h>  // IWYU pragma: keep
 #include <utils/utils.hpp>
 
-#include <algorithm>
-#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -65,7 +57,8 @@ duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -300,8 +293,7 @@ filter_ctx make_constant_filter(duckdb::idx_t col_key,
                                 duckdb::Value constant)
 {
   filter_ctx ctx;
-  ctx.filters.filters[col_key] =
-    duckdb::make_uniq<duckdb::ConstantFilter>(cmp, std::move(constant));
+  ctx.filters.SetFilterByColumnIndex(duckdb::ProjectionIndex(col_key), sirius::test::constant_filter(cmp, std::move(constant)));
   // column_ids must be indexable at col_key; pad with the same storage_idx.
   ctx.column_ids.resize(col_key + 1, duckdb::ColumnIndex(storage_idx));
   ctx.column_ids[col_key] = duckdb::ColumnIndex(storage_idx);
@@ -914,9 +906,8 @@ TEST_CASE("statistics pruning prunes through an OPTIONAL_FILTER wrapper",
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
 
   filter_ctx ctx;
-  ctx.filters.filters[0] =
-    duckdb::make_uniq<duckdb::OptionalFilter>(duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)));
+  ctx.filters.SetFilterByColumnIndex(duckdb::ProjectionIndex(0), sirius::test::optional_filter(sirius::test::constant_filter(
+      duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)), duckdb::LogicalType::INTEGER));
   ctx.column_ids.push_back(duckdb::ColumnIndex(0));
 
   auto md = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);

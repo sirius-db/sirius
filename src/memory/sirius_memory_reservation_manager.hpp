@@ -17,10 +17,14 @@
 
 #pragma once
 
+#include "memory/runtime_stream_pool.hpp"
+
 #include <cuda/memory_resource>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <optional>
 #include <vector>
 
 namespace sirius {
@@ -28,19 +32,37 @@ namespace memory {
 
 class sirius_memory_reservation_manager : public cucascade::memory::memory_reservation_manager {
  public:
+  using allocation_tracking_scope =
+    cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope;
+
   explicit sirius_memory_reservation_manager(
     const std::vector<cucascade::memory::memory_space_config>& configs);
 
   ~sirius_memory_reservation_manager();
 
+  /**
+   * @brief Look up the configured allocation tracking scope of a live manager's GPU space.
+   *
+   * Lookups are synchronized; the caller must keep @p space alive. cuCascade does not expose this
+   * configuration, so Sirius records it during manager construction.
+   *
+   * @param space Memory space to look up
+   * @return The registered scope, or std::nullopt if the space is unregistered
+   */
+  [[nodiscard]] static std::optional<allocation_tracking_scope> gpu_allocation_tracking_scope(
+    cucascade::memory::memory_space const& space);
+
  private:
-  // Previous cuDF device resources, saved in constructor and restored in destructor.
-  // Stored as owning any_resource (not as non-owning device_async_resource_ref) because
-  // rmm 26.06 moved the per-device resource map to store any_resource by value: calling
-  // set_current_device_resource_ref() moves the old map entry out, so any previously
-  // captured resource_ref into that entry dangles. Capturing the *return value* of
-  // set_current_device_resource_ref (the evicted old resource) avoids this.
-  std::vector<::cuda::mr::any_resource<::cuda::mr::device_accessible>> prev_device_mrs_;
+  std::vector<runtime_stream_pool::registration> runtime_stream_pools_;
+  void restore_device_resources() noexcept;
+
+  struct device_resource_registration {
+    int device_id;
+    ::cuda::mr::any_resource<::cuda::mr::device_accessible> previous;
+  };
+  // Keep owning resources: references into RMM's default-resource map are
+  // invalidated when its entries are replaced.
+  std::vector<device_resource_registration> prev_device_mrs_;
 };
 
 }  // namespace memory

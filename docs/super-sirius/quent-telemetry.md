@@ -28,7 +28,7 @@ sirius:
 |-----|------|---------|-------------|
 | `enable_quent` | bool | `true` | Emit Quent telemetry using the configured exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
 | `enable_nvtx` | bool | `false` | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is `false`. |
-| `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
+| `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 | `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is `true`. |
@@ -40,8 +40,7 @@ ship a sidecar DSO.
 
 Load the config through the normal resolution path — usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading the extension. Any Sirius query run with
-`enable_quent: true` then writes ndjson files into `output_directory` by default. Set
-`exporter: postcard` for compact benchmark or CI telemetry.
+`enable_quent: true` then writes ndjson files into `output_directory` as NDJSON.
 
 ## 2. Label your queries (optional)
 

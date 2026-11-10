@@ -18,13 +18,14 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cmath>
@@ -32,7 +33,9 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -77,8 +80,10 @@ constexpr batch_setting batch_settings[] = {
   {"scan_task_batch_size", &operator_params::scan_task_batch_size, 1},
   {"hash_partition_bytes", &operator_params::hash_partition_bytes, 1},
   {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
+  {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
   {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
-  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 2}};
+  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
+  {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
 
 }  // namespace
 
@@ -188,7 +193,7 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
   for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
@@ -224,12 +229,15 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
+// cuCascade does not validate slices_per_pass (a value above the slot count merely acts
+// as no cap) and its factories report other config errors only through compiled-out
+// logging, so Sirius validates the uring keys here and names the key.
+static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
   {
     // Preserve whether the value was named: an explicit value may equal the
-    // struct default and must not be replaced by the pipeline-derived default.
+    // struct default, and cuCascade's readahead resolution tells the two apart.
     std::optional<std::size_t> n_max;
     r.optional("n_max_concurrent_scans", n_max);
     if (n_max.has_value()) {
@@ -237,10 +245,48 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  {
+    // Deprecated: the reactor priority tiers replaced prefetch-reactor
+    // partitioning. Consume any value (including null) without deserializing,
+    // always warn, then ignore it so configs that still name it keep loading.
+    if (r.has("prefetch_reactors")) {
+      std::ignore = r.optional_node("prefetch_reactors");
+      SIRIUS_LOG_WARN(
+        "'uring.prefetch_reactors' is deprecated and ignored: the reactor priority tiers replaced "
+        "prefetch-reactor partitioning; remove the key from the config");
+    }
+  }
+  {
+    // Signed, so a negative value is reported as itself rather than wrapped.
+    std::optional<long long> slices;
+    r.optional("slices_per_pass", slices);
+    if (slices.has_value()) {
+      auto const max_slices = static_cast<long long>(cucascade::io::uring::max_slices_per_pass);
+      if (*slices < 0 || *slices > max_slices) {
+        throw std::runtime_error(
+          "'uring.slices_per_pass': must be between 0 and " + std::to_string(max_slices) +
+          " (0 = no cap: fill every free staging slot), got " + std::to_string(*slices));
+      }
+      opt.slices_per_pass = static_cast<std::size_t>(*slices);
+    }
+  }
+  {
+    // Signed for the same reason.
+    std::optional<long long> batch;
+    r.optional("range_batch_slices", batch);
+    if (batch.has_value()) {
+      if (*batch < 0) {
+        throw std::runtime_error(
+          "'uring.range_batch_slices': must be 0 or more (0 = no split), got " +
+          std::to_string(*batch));
+      }
+      opt.range_batch_slices = static_cast<std::size_t>(*batch);
+    }
+  }
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
   r.optional("nthreads", opt.nthreads);
@@ -267,10 +313,23 @@ static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
-  r.optional("mode", opt.mode);
+  {
+    // Read as a string so the deprecated spelling `sirius` (the cache's name before it
+    // moved to cuCascade) still selects `cucs`; everything else goes through
+    // cuCascade's own parser, with the reader's usual error format.
+    std::optional<std::string> mode;
+    r.optional("mode", mode);
+    if (mode.has_value()) {
+      if (*mode == "sirius") {
+        opt.mode = cucascade::io::cache::cache_mode::cucs;
+      } else if (!cucascade::io::cache::string_to_enum(std::string_view{*mode}, opt.mode)) {
+        throw std::runtime_error("'cache.mode': invalid enum value '" + *mode + "'");
+      }
+    }
+  }
   r.optional("eviction", opt.eviction);
   r.optional("min_prefetching_budget_fraction",
              opt.min_prefetching_budget_fraction,
@@ -292,6 +351,50 @@ static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_co
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& opt)
+{
+  yaml::reader r(node, "preparation");
+  auto limit = [&](char const* key, std::optional<size_t>& out, bool allow_zero = false) {
+    // Parse signed first so negative values cannot wrap into a large size_t.
+    std::optional<int64_t> value;
+    r.optional(key, value);
+    if (!value) return;
+    if (*value < 0 || (!allow_zero && *value == 0) ||
+        static_cast<uint64_t>(*value) > std::numeric_limits<size_t>::max())
+      throw std::runtime_error(std::string("preparation.") + key +
+                               (allow_zero ? ": must be a nonnegative integer that fits size_t"
+                                           : ": must be a positive integer that fits size_t"));
+    out = static_cast<size_t>(*value);
+  };
+  limit("max_inflight_metadata_jobs", opt.max_inflight_metadata_jobs, true);
+  limit("max_inflight_dv_jobs", opt.max_inflight_dv_jobs, true);
+  limit("lookahead_batches", opt.lookahead_batches);
+  limit("max_control_work", opt.max_control_work);
+  limit("drain_quantum", opt.drain_quantum);
+  limit("coordinator_workers", opt.coordinator_workers, true);
+  limit("native_reader_workers", opt.native_reader_workers);
+  limit("max_native_readers", opt.max_native_readers);
+  if (opt.resolved_native_readers() < opt.resolved_native_workers())
+    throw std::runtime_error(
+      "preparation.max_native_readers must be at least native_reader_workers");
+  if (auto node = r.optional_node("partial_batch")) {
+    auto& policy = opt.partial_batch.emplace();
+    yaml::reader partial(*node, "preparation.partial_batch");
+    int64_t fill = policy.min_fill_percent;
+    partial.optional(
+      "min_fill_percent", fill, [](auto value) { return value >= 1 && value <= 100; });
+    policy.min_fill_percent = static_cast<size_t>(fill);
+    partial.optional("min_residence", policy.min_residence);
+    partial.optional("max_residence", policy.max_residence);
+    policy.validate();
+    partial.reject_unknown();
+  }
+  r.optional("interrupt_check_interval", opt.interrupt_check_interval, [](auto value) {
+    return value.count() > 0;
+  });
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
@@ -300,9 +403,10 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
       "'sirius.executor.scan_manager.object_store': no longer YAML-loadable; use "
       "CREATE SECRET (TYPE SIRIUS_S3, ...) or sirius_config::set_object_store_config()");
   }
-  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("backend", opt.backend);
+  r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
@@ -312,6 +416,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
+  if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
   r.reject_unknown();
   // Stamped here rather than by the caller: `cache` and the `uring` sub-config
   // it overrides have both been read by now.
@@ -334,8 +439,10 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");
   }
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
+  r.optional("cross_join_task_bytes", yaml::bytes(opt.cross_join_task_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
+  r.optional("max_build_probe_resident_bytes", yaml::bytes(opt.max_build_probe_resident_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
@@ -365,8 +472,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional(
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
+  r.optional("enable_decimal_sum_stats_bound", opt.enable_decimal_sum_stats_bound);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  r.optional("pin_table_prove_unique_keys", opt.prove_unique_keys);
+  // 0 is meaningful here: it selects the share of GPU memory space capacity.
+  r.optional("pin_table_unique_exact_max_bytes", yaml::bytes(opt.unique_exact_max_bytes));
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
@@ -390,11 +501,10 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
 {
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
-  r.optional("enable_batch_events", opt.enable_batch_events);
   r.optional("enable_nvtx", opt.enable_nvtx);
   r.optional("exporter", opt.exporter, [](std::string const& value) {
-    if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
-    throw std::runtime_error("must be one of ndjson, msgpack, postcard");
+    if (value == QUENT_NDJSON_EXPORTER) { return true; }
+    throw std::runtime_error("must be ndjson");
   });
   r.optional("output_directory", opt.output_directory, [](std::string const& value) {
     if (!value.empty()) return true;
@@ -417,6 +527,14 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("enable_spill_compression", opt.enable_spill_compression);
+  r.optional("spill_min_batch_bytes", yaml::bytes(opt.spill_min_batch_bytes));
+  r.optional("spill_max_compressed_fraction", opt.spill_max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
+  r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+  });
   r.reject_unknown();
 }
 
@@ -714,6 +832,11 @@ const telemetry_config& parsed_sirius_config::get_telemetry_config() const noexc
 {
   return impl_->settings.get_telemetry_config();
 }
+const scan_manager::scan_manager_config& parsed_sirius_config::get_scan_manager_config()
+  const noexcept
+{
+  return impl_->settings.get_scan_manager_config();
+}
 
 namespace {
 // Compatibility for internal callers explicitly requesting a resolved configuration.
@@ -806,16 +929,32 @@ try {
     mr.reject_unknown();
   }
 
+  int query_limit            = 1;
+  bool const has_query_limit = r.has_value("max_concurrent_queries");
+  r.optional("max_concurrent_queries", query_limit, yaml::greater_than<int>{0});
+  bool has_scan_limit = false;
   // Executors
   if (auto exec_node = r.optional_node("executor")) {
     yaml::reader er(*exec_node, "sirius.executor");
     if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
-    if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
+    if (auto n = er.optional_node("scan_manager")) {
+      yaml::reader scan_reader(*n, "sirius.executor.scan_manager");
+      has_scan_limit = scan_reader.has_value("max_concurrent_queries");
+      from_yaml(*n, settings._scan_manager_config);
+    }
     if (auto n = er.optional_node("pipeline"))
       from_yaml(*n, settings._gpu_pipeline_executor_config);
     if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
     er.reject_unknown();
   }
+
+  if (has_query_limit && has_scan_limit &&
+      query_limit != settings._scan_manager_config.max_concurrent_queries)
+    throw std::runtime_error(
+      "conflicting sirius.max_concurrent_queries and deprecated "
+      "executor.scan_manager.max_concurrent_queries");
+  if (has_query_limit) settings._scan_manager_config.max_concurrent_queries = query_limit;
+  // Both YAML names share one stored authority.
 
   // Parse operator settings below and record which batch sizes are explicit,
   // so hardware resolution only fills in omitted values.
@@ -918,12 +1057,23 @@ try {
 
   const auto defaults =
     operator_defaults_for(settings._memory_space_configs, impl_->use_effective_gpu_capacity);
+  auto const is_explicit = [&](uint64_t operator_params::* member) {
+    return std::find(impl_->explicit_batch_settings.begin(),
+                     impl_->explicit_batch_settings.end(),
+                     member) != impl_->explicit_batch_settings.end();
+  };
   for (const auto& setting : batch_settings) {
-    if (std::find(impl_->explicit_batch_settings.begin(),
-                  impl_->explicit_batch_settings.end(),
-                  setting.member) == impl_->explicit_batch_settings.end()) {
+    if (!is_explicit(setting.member)) {
       settings._operator_params.*setting.member = defaults.*setting.member;
     }
+  }
+  // Derive the index budget from the startup partition size, preserving YAML tuning.
+  // The former payload limit was 2x partitions; 4-byte rows need a 4x larger index estimate
+  // (16 bytes/row). The independent resident budget remains batch-derived.
+  // SET hash_partition_bytes does not re-derive either budget.
+  if (!is_explicit(&operator_params::max_build_hash_table_bytes)) {
+    settings._operator_params.max_build_hash_table_bytes =
+      sirius::memory::saturating_mul(8, settings._operator_params.hash_partition_bytes);
   }
   settings.finalize_derived_config();
   return settings;
@@ -936,16 +1086,14 @@ try {
 
 void sirius_config::finalize_derived_config()
 {
-  // The uring (local-disk) readahead budget is NOT derived from the pipeline
-  // width: the local backend defaults to 0 (readahead off), because on local
-  // NVMe the prefetch competes with the executor's own reads for the same
-  // device.  An explicit uring.n_max_concurrent_scans in the config still wins.
+  // The uring (local-disk) readahead budget keeps its default of 0: on local
+  // NVMe a prefetch competes with the executor's own reads for the same device.
   // The opportunistic strategy schedules against what the executor can run,
   // not what the device can queue, so it needs the pipeline pool's width.
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
-  enforce_sirius_backend_for_multi_gpu();
+  enforce_native_backend_for_multi_gpu();
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -955,7 +1103,8 @@ void sirius_config::derive_rest_scan_budget()
   // per pipeline thread the readahead has no lead — every split a thread picks
   // up is the split whose prefetch only just started, so the read blocks on it.
   // Several splits per thread give the prefetch time to land.  Local disk has no
-  // such round trip to hide, so uring stays at one per thread.
+  // such round trip to hide, so uring keeps its own default (0, readahead off)
+  // unless the config names a budget.
   //
   // Only the untouched default is replaced, so an explicit
   // rest.n_max_concurrent_scans in the config still wins.  The derived budget is
@@ -981,18 +1130,18 @@ void sirius_config::derive_rest_scan_budget()
   _scan_manager_config.rest.n_max_concurrent_scans = derived;
 }
 
-void sirius_config::enforce_sirius_backend_for_multi_gpu()
+void sirius_config::enforce_native_backend_for_multi_gpu()
 {
   size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
-  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::sirius) {
+  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
     SIRIUS_LOG_WARN(
-      "sirius_config: backend was not 'sirius' but {} GPUs are configured; "
-      "the sirius backend is required for multi-GPU IO routing. Overriding "
-      "backend to 'sirius'.",
+      "sirius_config: backend was not 'native' but {} GPUs are configured; "
+      "the native backend is required for multi-GPU IO routing. Overriding "
+      "backend to 'native'.",
       num_gpus);
-    _scan_manager_config.backend = scan_manager::io_backend::sirius;
+    _scan_manager_config.backend = scan_manager::io_backend::native;
   }
 }
 
@@ -1027,7 +1176,7 @@ void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config co
   _scan_manager_config = std::move(config);
 }
 
-void sirius_config::set_object_store_config(io::object_store_config config) noexcept
+void sirius_config::set_object_store_config(cucascade::io::object_store_config config) noexcept
 {
   _scan_manager_config.object_store = std::move(config);
 }

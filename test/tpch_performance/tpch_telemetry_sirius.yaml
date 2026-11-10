@@ -1,7 +1,7 @@
 sirius:
   telemetry:
     enable_quent: true
-    exporter: postcard
+    exporter: ndjson
     output_directory: telemetry_data
     engine_name: siriusDB
     enable_nvtx: true

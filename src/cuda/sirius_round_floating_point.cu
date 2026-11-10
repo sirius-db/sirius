@@ -24,6 +24,8 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <cuda_runtime_api.h>
+
 // standard library
 #include <cmath>
 #include <cstdint>
@@ -46,8 +48,12 @@ __global__ void round_floating_point_kernel(T const* input,
     auto const x = static_cast<double>(input[i]);
     double rounded;
     if constexpr (NegativePrecision) {
-      rounded = ::round(x / modifier) * modifier;
-      if (!::isfinite(rounded)) { rounded = 0; }
+      if (::isinf(modifier)) {
+        rounded = ::isfinite(input[i]) ? 0 : x;
+      } else {
+        rounded = ::round(x / modifier) * modifier;
+      }
+      if (!::isfinite(rounded)) { rounded = x; }
     } else {
       rounded = ::round(x * modifier) / modifier;
       if (!::isfinite(rounded)) { rounded = x; }
@@ -75,7 +81,7 @@ void launch_round(cudf::column_view const& input,
     round_floating_point_kernel<T, false><<<num_blocks, threads_per_block, 0, stream.get()>>>(
       input.data<T>(), output.data<T>(), input.size(), modifier);
   }
-  CUDF_CHECK_CUDA(stream.get());
+  CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 }  // namespace

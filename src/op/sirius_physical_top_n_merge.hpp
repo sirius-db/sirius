@@ -34,6 +34,11 @@ namespace op {
 //! the data but only add a selection vector.
 class sirius_physical_top_n_merge : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::FIXED_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_TOP_N;
 
  public:
@@ -57,10 +62,6 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
-  sirius::OrderPreservationType source_order() const override
-  {
-    return sirius::OrderPreservationType::FIXED_ORDER;
-  }
 
  public:
   bool is_sink() const override { return true; }

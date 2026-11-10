@@ -19,6 +19,7 @@
 #include "op/sirius_physical_union.hpp"
 #include "operator_test_utils.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
@@ -55,9 +56,10 @@ class controllable_pipeline final : public sirius_pipeline {
 
 class recording_task_creator final : public sirius::creator::task_creator {
  public:
-  recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  recording_task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
+                         sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                          sirius::creator::request_type strategy)
-    : task_creator(sirius::creator::task_creator_config{.strategy = strategy}, mem_mgr)
+    : task_creator(lifecycle, sirius::creator::task_creator_config{.strategy = strategy}, mem_mgr)
   {
   }
 
@@ -81,6 +83,7 @@ class recording_task_creator final : public sirius::creator::task_creator {
 class union_fixture {
  private:
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> _memory_manager;
+  sirius::exec::query_lifecycle_registry lifecycle;
   recording_task_creator _creator;
 
  public:
@@ -88,23 +91,22 @@ class union_fixture {
     std::size_t num_arms,
     sirius::creator::request_type strategy = sirius::creator::request_type::active)
     : _memory_manager(sirius::test::operator_utils::initialize_memory_manager()),
-      _creator(*_memory_manager, strategy),
+      _creator(lifecycle, *_memory_manager, strategy),
       union_op({}, 0),
-      union_pipeline(std::make_shared<sirius_pipeline>(pipeline_build_context{nullptr, true}))
+      union_pipeline(std::make_shared<sirius_pipeline>(pipeline_build_context{nullptr}))
   {
     union_op.set_pipeline(union_pipeline);
     union_pipeline->set_task_creator(&_creator);
 
     sirius_pipeline_build_state build_state;
     for (std::size_t arm = 0; arm < num_arms; ++arm) {
-      auto producer = duckdb::make_uniq<sirius_physical_operator>(
+      auto producer = duckdb::make_uniq<sirius::op::test_physical_operator>(
         SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0);
       auto* producer_ptr = producer.get();
       union_op.children.push_back(std::move(producer));
       producers.push_back(producer_ptr);
 
-      auto pipeline =
-        std::make_shared<controllable_pipeline>(pipeline_build_context{nullptr, true});
+      auto pipeline = std::make_shared<controllable_pipeline>(pipeline_build_context{nullptr});
       duckdb::vector<std::reference_wrapper<sirius_physical_operator>> operators;
       operators.emplace_back(*producer_ptr);
       build_state.set_pipeline_operators(*pipeline, std::move(operators));

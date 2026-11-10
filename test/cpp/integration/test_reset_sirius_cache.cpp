@@ -40,9 +40,9 @@ void expect_success_row(duckdb::Connection& con, std::string const& sql)
   if (result->HasError()) { UNSCOPED_INFO("query error: " << result->GetError()); }
   REQUIRE_FALSE(result->HasError());
 
-  auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+  auto& materialized = *result;
   REQUIRE(materialized.RowCount() == 1);
-  REQUIRE(materialized.GetValue(0, 0) == duckdb::Value::BOOLEAN(true));
+  REQUIRE(materialized.Collection().GetValue(0, 0) == duckdb::Value::BOOLEAN(true));
 }
 
 }  // namespace
@@ -78,9 +78,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto result = con->Query("SELECT count(*) FROM reset_probe;");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
-  auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+  auto& materialized = *result;
   REQUIRE(materialized.RowCount() == 1);
-  CHECK(materialized.GetValue(0, 0).GetValue<std::int64_t>() == 1000);
+  CHECK(materialized.Collection().GetValue(0, 0).GetValue<std::int64_t>() == 1000);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

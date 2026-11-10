@@ -167,13 +167,14 @@ struct membership_key_domain {
 /**
  * @brief True when a probe column of type @p probe can be adapted to @p domain
  *
- * The one acceptance rule for probe types: the device dispatch (`dispatch_probe_adapter`) consults
- * this predicate rather than keeping a list of its own, so a probe type this rejects is exactly
- * one every filter's `compute_mask` declines with a null result. Signed and unsigned carriers never
- * mix; decimal probes must carry the domain's scale (a rescale is a planner cast and never reaches
- * a filter); the string family accepts only a STRING probe (the fused decode materializes
- * dictionary and str_split carriers back into STRING before probing, so DICTIONARY32 never reaches
- * a probe and declines).
+ * The one acceptance rule for probe types: the device dispatch (`dispatch_probe_adapter`) and fused
+ * descriptor preparation (`prepare_fused_membership_probe`) consult this predicate rather than
+ * keeping a list of their own, so a probe type this rejects is exactly one every filter's
+ * `compute_mask` declines with a null result and no fused round accepts. Signed and unsigned
+ * carriers never mix; decimal probes must carry the domain's scale (a rescale is a planner cast and
+ * never reaches a filter); the string family accepts only a STRING probe (the fused decode
+ * materializes dictionary and str_split carriers back into STRING before probing, so DICTIONARY32
+ * never reaches a probe and declines).
  */
 [[nodiscard]] bool membership_probe_compatible(membership_key_domain const& domain,
                                                cudf::data_type probe) noexcept;

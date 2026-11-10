@@ -16,7 +16,6 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 
@@ -57,7 +56,7 @@ std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
                                cudaMemcpyHostToDevice,
                                stream.get()));
 
-  return sirius::ApplyRetentionMask(view, bool_col->view(), stream, mr);
+  return sirius::apply_retention_mask(view, bool_col->view(), stream, mr);
 }
 
 std::unique_ptr<cudf::table> apply_host_keep_bitmask(cudf::table_view const& view,
@@ -92,7 +91,7 @@ std::unique_ptr<cudf::table> apply_host_keep_bitmask(cudf::table_view const& vie
                                       stream,
                                       mr);
 
-  return sirius::ApplyRetentionMask(view, bool_col->view(), stream, mr);
+  return sirius::apply_retention_mask(view, bool_col->view(), stream, mr);
 }
 
 }  // namespace sirius::op::scan

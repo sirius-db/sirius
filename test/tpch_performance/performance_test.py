@@ -14,6 +14,7 @@
 
 import argparse
 import csv
+import datetime as datetime_module
 import glob
 import json
 import math
@@ -59,7 +60,7 @@ PROFILES = {
     # this is measuring.
     "cold": {
         "ordering": "sequential",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         # 'lru', not 'idle': the per-query reset_sirius_cache() below is what
         # makes this profile cold, so the evictor does not also need to drop a
         # chunk the moment nothing is reading it. 'idle' additionally retires
@@ -77,7 +78,7 @@ PROFILES = {
     # leftovers.
     "lukewarm": {
         "ordering": "sequential",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         "eviction": "lru",
         "drop_os_cache_between": False,
         "reset_cache_between": False,
@@ -87,7 +88,7 @@ PROFILES = {
     },
     "hot": {
         "ordering": "grouped",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         # LRU, not idle: back-to-back iterations of one query leave the cache
         # briefly idle between runs, and idle eviction would dispose exactly the
         # chunks the next iteration is about to re-read -- measuring a cold read
@@ -151,13 +152,13 @@ DEFAULT_PROFILE = {
 
 CACHE_CONFIG_PATH = ("sirius", "executor", "scan_manager", "cache")
 
-# --pin parquet pins undecoded column chunks into the prefetching cache, so it
-# needs a cache that keeps them: 'sirius' to have one at all, 'lru' because
+# --pin parquet pins undecoded column chunks into the pinned file cache, so it
+# needs a cache that keeps them: 'cucs' to have one at all, 'lru' because
 # 'idle' drops a chunk the moment nothing is reading it, and a threshold of 1.0
 # so the evictor only starts once the pool is genuinely full. Without these the
 # pin populates the cache and the evictor empties it again.
 PARQUET_PIN_CACHE = {
-    "mode": "sirius",
+    "mode": "cucs",
     "eviction": "lru",
     "eviction_threshold_fraction": 1.0,
 }
@@ -297,7 +298,8 @@ VALIDATION_ABS_TOL = 1e-10
 _RESULT_EVAL_GLOBALS = {
     "__builtins__": {},
     "Decimal": Decimal,
-    "datetime": datetime,
+    # repr() uses module-qualified constructors such as datetime.date(...).
+    "datetime": datetime_module,
     "date": date,
     "time": dtime,
     "timedelta": timedelta,
@@ -798,7 +800,7 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
             con.execute("SET pin_table_compression = true;")
             con.execute(
                 "SET pin_table_input_compression_plan_dir = "
-                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
             )
         pre_sql = os.environ.get("SIRIUS_PRE_SQL", "")
         if pre_sql:
@@ -832,10 +834,16 @@ def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
         con.execute("PRAGMA profiling_mode='detailed';")
         con.execute(f"PRAGMA profiling_output='{profile_path}';")
     log(f"  Executing q{qnum} on {engine_label}…")
+    # Time con.execute() only: it plans and runs the query to completion and materializes the
+    # result inside DuckDB. The rows for result.txt are fetched afterwards, because converting a
+    # large result into Python objects (Q11 at SF1000 returns ~937K rows) costs far more than
+    # executing the query and is not engine time. Both the DuckDB 1.5 and the v2 Python clients
+    # support execute() + fetchall(); the v2 client has no Arrow export on execute() results.
     start = time.perf_counter()
-    rows = con.execute(query_sql).fetchall()
+    result = con.execute(query_sql)
     elapsed = time.perf_counter() - start
-    log(f"  q{qnum} fetched {len(rows)} rows in {elapsed:.4f}s")
+    rows = result.fetchall()
+    log(f"  q{qnum} executed in {elapsed:.4f}s, fetched {len(rows)} rows")
     return elapsed, rows
 
 
@@ -1141,7 +1149,7 @@ def _build_precmd_temp_sql(
             parts.append("SET pin_table_compression = true;")
             parts.append(
                 "SET pin_table_input_compression_plan_dir = "
-                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
             )
         parts.append(emit_pin(qnum, source, data_source))
 
@@ -1879,8 +1887,8 @@ def parse_args():
             "'host' selects the cache tier; 'none' disables pinning. Pin is "
             "per-query under the hot profile and a single union-pin at "
             "session start under cold/lukewarm. 'parquet' pins the undecoded "
-            "column-chunk bytes into the Sirius prefetching cache instead of "
-            "materialising on the GPU, so it needs cache.mode='sirius' and "
+            "column-chunk bytes into the pinned file cache instead of "
+            "materialising on the GPU, so it needs cache.mode='cucs' and "
             "--data-source parquet. (default: none)"
         ),
     )

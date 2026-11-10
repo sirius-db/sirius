@@ -17,6 +17,54 @@ Benchmarking tools for comparing DuckDB (CPU) vs Sirius (GPU) on TPC-H queries a
 3. Ensure parquet data exists (auto-generated if missing via `generate_tpch_data.sh`).
    - On the GB300 machine, the SF1000 dataset is at `/home/nvidia/tpch_parquet_sf1000`.
 
+For `generate_tpch_data.sh --format duckdb`, keys use `INTEGER` until their full
+dataset range requires `BIGINT`, matching tpchgen-rs's Parquet defaults. Each key
+family widens across all tables together: order keys at integer SF358, part keys
+at SF10,738, customer keys at SF14,317, and supplier keys at SF214,749. Nation and
+region keys stay `INTEGER`. Clustered DuckDB datasets use the same widths.
+Regenerate existing datasets to apply the new types.
+
+## Generating local Iceberg tables
+
+Generate the reference TPC-H Parquet data first, then write an Iceberg V2 warehouse:
+
+```bash
+pixi run bash test/tpch_performance/generate_tpch_data.sh 1 --format parquet
+pixi run python test/tpch_performance/generate_tpch_iceberg.py \
+  test_datasets/tpch_parquet_sf1 test_datasets/tpch_iceberg_sf1
+```
+
+An existing Parquet dataset can be passed directly to the second command. All eight
+tables are required. Supported layouts are `table.parquet`, `table/*.parquet`,
+`table_*.parquet`, or `table.N.parquet`; mixing layouts for one table is rejected.
+The output must be a new directory. An interrupted run leaves partial output for
+inspection; use a fresh directory when retrying.
+
+The writer uses the existing Python and PyArrow in the Pixi development
+environment. PyIceberg's `sql-sqlite` extra supplies SQLAlchemy for the local
+SQLite catalog. Writing the tables needs no GPU or Sirius build.
+
+Each table gets its own `data/` and `metadata/` directories. PyIceberg rewrites
+the input into Parquet with Iceberg field IDs, preserving the source column types
+and values, including dates, decimals and adaptive key widths. The warehouse owns
+the new files. Source Parquet files are unchanged and are no longer needed to read
+the Iceberg tables. `--batch-rows` (default 1,000,000) controls rows per write batch;
+each batch is appended as a snapshot. The final snapshot includes all batches.
+
+`dataset.json` records the source files, row counts, writer versions, metadata
+paths and final snapshot IDs. `create_views.sql` loads the DuckDB Iceberg extension
+and creates the eight TPC-H views over their table directories. Each directory's
+`metadata/version-hint.text` points to the committed metadata.
+
+```sql
+.read test_datasets/tpch_iceberg_sf1/create_views.sql
+SELECT sum(l_extendedprice * l_discount) FROM lineitem;
+```
+
+Use this in the DuckDB shell after loading Sirius; `iceberg` must already be installed
+for that DuckDB build. Generated paths are absolute: regenerate if the warehouse moves.
+Use the Iceberg benchmark below to compare results and timings.
+
 ## Running Benchmarks
 
 All commands run from the **project root** directory.
@@ -47,9 +95,27 @@ All commands run from the **project root** directory.
 ./test/tpch_performance/benchmark_and_validate.sh --report runs/<run_dir>
 ```
 
+Run the same benchmark on local Iceberg tables with:
+
+```bash
+pixi run bash test/tpch_performance/benchmark_and_validate.sh --data-source iceberg 1
+```
+
+This uses `test_datasets/tpch_iceberg_sf1` by default. Pass `--iceberg-dir` to reuse
+a different generated warehouse. If the warehouse does not exist, the benchmark
+prepares the source Parquet and generates Iceberg once before running either engine.
+`--parquet-dir` selects the source Parquet for generation. Use a fresh output path
+if a previous generation left an incomplete warehouse.
+
+Both engines use the same saved `create_views.sql`. Keep the warehouse unchanged
+between runs. Each engine uses one session by default and Sirius allows CPU fallback.
+The DuckDB Iceberg extension must already be installed for that build.
+
 Options:
 - `--config <path>` — Sirius config file (default: `~/.sirius/sirius.yaml`)
+- `--data-source <source>` — `parquet` (default), `iceberg`, `duckdb`, or `duckdb-native`
 - `--parquet-dir <path>` — parquet dataset directory (default: `test_datasets/tpch_parquet_sf<SF>`)
+- `--iceberg-dir <path>` — Iceberg warehouse directory (default: `test_datasets/tpch_iceberg_sf<SF>`)
 - `--engines <list>` — space-separated engine list (default: `"sirius duckdb"`)
 - `--pinning-mode none|per-query|pinned-hot` — Sirius-only parquet pinning mode. `per-query` pins each query's referenced columns around that query block; `pinned-hot` pins the union of referenced columns once before the single-session run and unpins after all queries.
 
@@ -107,7 +173,7 @@ sirius:
 
 `run_tpch_parquet_and_generate_telemetry.sh` runs TPC-H queries in Sirius,
 labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
-Quent postcard files to `sirius.telemetry.output_directory`.
+Quent NDJSON files to `sirius.telemetry.output_directory`.
 
 ```bash
 pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \

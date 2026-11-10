@@ -74,7 +74,7 @@ concept reader_event_recording =
  *
  * The selection is stored as indices into the owner's *original* columns so
  * that @ref reorder_columns / @ref drop_columns are pure index manipulations
- * (no allocation) and so that @ref materialize can, when the owner supports it
+ * (no allocation) and so that @ref owning_table_view::materialize can, when the owner supports it
  * (@ref no_alloc_materializable), move the surviving column buffers out of the
  * owner rather than copying them.
  */
@@ -146,13 +146,11 @@ class my_view {
     _selection = std::move(next);
   }
 
-  /// Realize the currently-exposed columns into an owned @c cudf::table. Moves
-  /// buffers out of the owner when it is @ref no_alloc_materializable, otherwise
-  /// copies the selected view (allocating).
-  [[nodiscard]] std::unique_ptr<cudf::table> materialize(::cuda::stream_ref stream,
-                                                         rmm::device_async_resource_ref mr)
+  /// Move the selected columns out of a @ref no_alloc_materializable owner; otherwise return
+  /// nullptr without changing the owner.
+  [[nodiscard]] std::unique_ptr<cudf::table> try_materialize_without_copy()
   {
-    return _model->materialize(_selection, stream, mr);
+    return _model->try_materialize_without_copy(_selection);
   }
 
   void record_reader_event(::cuda::stream_ref stream) { _model->record_reader_event(stream); }
@@ -163,10 +161,8 @@ class my_view {
 
     [[nodiscard]] virtual cudf::table_view full_view() const = 0;
 
-    [[nodiscard]] virtual std::unique_ptr<cudf::table> materialize(
-      std::span<const cudf::size_type> selection,
-      ::cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr) = 0;
+    [[nodiscard]] virtual std::unique_ptr<cudf::table> try_materialize_without_copy(
+      std::span<const cudf::size_type> selection) = 0;
 
     virtual void record_reader_event(::cuda::stream_ref) {}
   };
@@ -180,10 +176,8 @@ class my_view {
 
     [[nodiscard]] cudf::table_view full_view() const override { return _base_view; }
 
-    [[nodiscard]] std::unique_ptr<cudf::table> materialize(
-      std::span<const cudf::size_type> selection,
-      ::cuda::stream_ref stream,
-      rmm::device_async_resource_ref mr) override
+    [[nodiscard]] std::unique_ptr<cudf::table> try_materialize_without_copy(
+      std::span<const cudf::size_type> selection) override
     {
       if constexpr (no_alloc_materializable<Owner>) {
         // Move the selected columns out of the owner; no device buffer copy.
@@ -201,16 +195,7 @@ class my_view {
         }
         return std::make_unique<cudf::table>(std::move(out));
       } else {
-        // Generic owner: copy the selected view into a fresh table.
-        std::vector<cudf::size_type> sel(selection.begin(), selection.end());
-        auto out = std::make_unique<cudf::table>(_base_view.select(sel), stream, mr);
-        // The caller destroys `_owner` as soon as this returns, so the copy must be
-        // complete first: `_owner` is what keeps the source memory alive. Unlike the
-        // scan's carrier cast, the source here belongs to an external owner (a
-        // pinned-cache lock), so there is no buffer of ours whose deallocation
-        // stream could be rebound instead.
-        stream.sync();
-        return out;
+        return nullptr;
       }
     }
 
@@ -331,8 +316,13 @@ class owning_table_view {
   /// them. No-op unless the owner tracks reader events.
   void record_reader_event(::cuda::stream_ref stream) const;
 
-  /// Realize a view state into an owned table. No-op if already materialized or
-  /// empty. May allocate (copying path) depending on the underlying owner.
+  /// Realize a view state into an owned table. No-op if already materialized or empty. May allocate
+  /// (copying path) depending on the underlying owner.
+  ///
+  /// Copying waits for completion before releasing the source. On failure, checked cleanup
+  /// preserves the source for retry; if completion cannot be established, source and output are
+  /// retained, the handle becomes empty, and sirius::unjoined_gpu_work replaces the
+  /// original error.
   void materialize(::cuda::stream_ref stream         = cudf::get_default_stream(),
                    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
@@ -357,5 +347,17 @@ class owning_table_view {
     variant<std::unique_ptr<cudf::table>, std::unique_ptr<detail::my_view>, std::monostate>
       _state{std::monostate{}};
 };
+
+namespace detail {
+
+/**
+ * @brief Keeps the erased source and copied output together until checked completion.
+ */
+struct table_copy_state {
+  std::unique_ptr<my_view> source;
+  std::unique_ptr<cudf::table> output;
+};
+
+}  // namespace detail
 
 }  // namespace sirius::op::scan

@@ -6,14 +6,14 @@
  */
 
 #include "catch.hpp"
-#include "io/datasource_factory.hpp"
+#include "io/scoped_object_store_configs.hpp"
 
 TEST_CASE("S3 config scopes isolate paths and publish immutable replacement snapshots",
           "[s3][routing]")
 {
   sirius::io::scoped_object_store_configs scopes;
 
-  sirius::io::object_store_config alpha;
+  cucascade::io::object_store_config alpha;
   alpha.endpoint   = "http://127.0.0.1:19001";
   alpha.region     = "us-east-1";
   alpha.access_key = "alpha-key";
@@ -22,10 +22,13 @@ TEST_CASE("S3 config scopes isolate paths and publish immutable replacement snap
   CHECK_FALSE(scopes.install("s3://alpha-bucket/table/data.parquet", alpha).has_value());
   auto const alpha_first = scopes.resolve("s3://alpha-bucket/table/data.parquet");
   auto const alpha_again = scopes.resolve("s3://alpha-bucket/table/data.parquet");
+  auto const alpha_upper = scopes.resolve("S3://alpha-bucket/table/data.parquet");
   auto const neighbor    = scopes.resolve("s3://alpha-bucket/table/neighbor.parquet");
   REQUIRE(alpha_first.has_value());
   REQUIRE(alpha_again.has_value());
+  REQUIRE(alpha_upper.has_value());
   CHECK(alpha_first->id == alpha_again->id);
+  CHECK(alpha_upper->id == alpha_first->id);
   CHECK_FALSE(neighbor.has_value());
   CHECK_FALSE(scopes.install("s3://alpha-bucket/table/other.parquet", alpha).has_value());
   auto const alpha_other = scopes.resolve("s3://alpha-bucket/table/other.parquet");

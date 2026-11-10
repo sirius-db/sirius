@@ -1,7 +1,13 @@
 target_sources(
   sirius_objects
-  PRIVATE dense_count_join_impl.cu
+  PRIVATE date_cast.cu
+          decimal_integer_cast.cu
+          dense_count_join_impl.cu
+          sorted_keys.cu
+          low_cardinality_groupby.cu
           device_copy_batch.cpp
+          device_transfer.cpp
+          dynamic_filter_mask_ops.cu
           dynamic_filter_replica_transfer.cu
           sirius_dynamic_bloom_filter.cu
           sirius_dynamic_in_list_filter.cu

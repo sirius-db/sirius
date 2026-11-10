@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
@@ -34,6 +35,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
@@ -154,6 +156,11 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
                       OnFirstPush&& on_first_push) noexcept
 {
   fanout_counts counts;
+  for (std::size_t i = 0; i < filters.size(); ++i) {
+    if (filters[i].membership) {
+      filters[i].membership->set_preserve_nulls(plan.admitted_keys()[i].preserve_nulls);
+    }
+  }
   auto const push = [&](sirius_dynamic_filter_set::producer const& producer,
                         std::size_t ordinal,
                         std::shared_ptr<sirius_dynamic_filter> const& filter) noexcept {
@@ -168,8 +175,8 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
     auto const& producer = producers[target_index];
     for (auto const& binding : target.key_bindings) {
       auto const& key = filters[binding.admitted_key_index];
-      if (key.zone_map && target.accepts_zone_map_filters &&
-          binding.probe_storage_type == key.zone_map_type) {
+      if (key.zone_map && !plan.admitted_keys()[binding.admitted_key_index].preserve_nulls &&
+          target.accepts_zone_map_filters && binding.probe_storage_type == key.zone_map_type) {
         push(producer, binding.channel_push_ordinal, key.zone_map);
       }
       if (!key.membership) { continue; }
@@ -386,21 +393,26 @@ struct dynamic_filter_publication_session::state {
       if (task_space.get_tier() != cucascade::memory::Tier::GPU) {
         throw detail::accumulation_invariant_error{"publication task space must be a GPU space"};
       }
-      auto const filters = builder->finish(rmm::cuda_device_id{task_space.get_device_id()},
-                                           stream,
-                                           task_space.get_default_allocator());
-      if (!filters) {
+      auto const published_filters =
+        builder->finish(rmm::cuda_device_id{task_space.get_device_id()},
+                        stream,
+                        task_space.get_default_allocator());
+      if (!published_filters) {
         skip_locked(&dynamic_filter_stats_snapshot::accumulations_skipped_admission);
         return;
       }
+      auto const filters = published_filters->filters;
+      bool const host_staged =
+        published_filters->transport ==
+        detail::accumulated_bloom_builder::publication_transport::HOST_STAGED;
       {
         std::scoped_lock lock(mutex);
-        outcome.membership_filters_built = filters->size();
+        outcome.membership_filters_built = filters.size();
         if (end_if_fanout_forbidden()) { return; }
       }
       std::vector<key_filters> per_key(plan.admitted_keys().size());
       for (std::size_t index = 0; index < active_keys.size(); ++index) {
-        auto const& filter    = (*filters)[index];
+        auto const& filter    = filters[index];
         auto& key             = per_key[active_keys[index]];
         key.membership        = filter;
         key.membership_domain = filter->domain();
@@ -412,17 +424,19 @@ struct dynamic_filter_publication_session::state {
       });
       sirius::log::log_noexcept([&] {
         SIRIUS_LOG_INFO(
-          "[dynamic_filter_publication_session] accumulated Bloom published: {} filter(s) pushed "
-          "to {} target(s), {:.1f} ms after the final contribution.",
+          "[dynamic_filter_publication_session] accumulated Bloom published through {}: {} "
+          "filter(s) pushed to {} target(s), {:.1f} ms after the final contribution.",
+          host_staged ? "HOST staging" : "peer copies",
           counts.pushed,
           counts.active_targets,
           latency ? std::chrono::duration<double, std::milli>(*latency).count() : 0.0);
       });
       bool const published = counts.pushed != 0;
       std::scoped_lock lock(mutex);
-      outcome.filters_pushed                      = counts.pushed;
-      outcome.bindings_skipped_incompatible_probe = counts.incompatible_probes;
-      outcome.accumulation_publications_finished  = published ? 1 : 0;
+      outcome.filters_pushed                        = counts.pushed;
+      outcome.bindings_skipped_incompatible_probe   = counts.incompatible_probes;
+      outcome.accumulation_publications_finished    = published ? 1 : 0;
+      outcome.accumulation_publications_host_staged = published && host_staged ? 1 : 0;
       if (latency) {
         outcome.accumulation_publication_latency_ns = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());
@@ -644,20 +658,6 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       selection.accumulations_skipped_admission = 1;
       return false;
     }
-    std::vector<int> replica_devices;
-    replica_devices.reserve(replicas.size());
-    for (auto const& replica : replicas) {
-      replica_devices.push_back(replica.get_gpu_space().get_device_id());
-    }
-    if (auto const broken = find_pair_without_peer_dma(replica_devices)) {
-      SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom skipped: no working peer DMA "
-        "from GPU {} to GPU {}.",
-        broken->first,
-        broken->second);
-      selection.accumulations_skipped_admission = 1;
-      return false;
-    }
 
     // Allocation happens outside the mutex; the builder is installed only if nothing closed the
     // session meanwhile.
@@ -868,16 +868,14 @@ void dynamic_filter_publication_session::observe_whole_build(
     }
 
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-    ::cuda::stream_ref stream = space->acquire_stream();
+    auto stream_lease         = sirius::memory::runtime_stream_pool::acquire(*space);
+    ::cuda::stream_ref stream = stream_lease.get();
     auto const writer         = source.get_writer_event();
     auto const ready =
       writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();
-    if (ready != cudaSuccess) {
-      throw std::runtime_error(
-        std::string(
-          "[dynamic_filter_publication_session::observe_whole_build] source readiness failed: ") +
-        cudaGetErrorString(ready));
-    }
+    // Use cuDF's standard clearing/sticky-error probe while retaining CUDA status
+    // for the runtime-health reporter in the execution owner.
+    CUDF_CUDA_TRY(ready);
 
     dynamic_filter_publication_outcome outcome;
     try {

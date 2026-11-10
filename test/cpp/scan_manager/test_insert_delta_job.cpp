@@ -26,18 +26,18 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 #include <exec/scoped_dispatcher.hpp>
 #include <exec/thread_pool.hpp>
-#include <io/kvikio/kvikio_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <memory/topology_index.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
@@ -104,7 +104,8 @@ duckdb::DataTable& resolve_storage(duckdb::Connection& con, const std::string& t
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -139,13 +140,14 @@ insert_delta_job_request make_request(duckdb::Connection& con,
                                       std::vector<sirius::logical_type> types)
 {
   insert_delta_job_request request;
-  request.storage         = &storage;
-  request.context         = con.context.get();
-  request.n_cache         = n_cache;
-  request.union_cols      = std::move(cols);
-  request.union_types     = std::move(types);
-  request.entry_name      = "t";
-  request.storage_version = storage.GetAttached().GetStorageManager().GetStorageVersion();
+  request.storage     = &storage;
+  request.context     = con.context.get();
+  request.n_cache     = n_cache;
+  request.union_cols  = std::move(cols);
+  request.union_types = std::move(types);
+  request.entry_name  = "t";
+  request.storage_version =
+    static_cast<uint64_t>(storage.GetAttached().GetStorageManager().GetStorageVersion());
   return request;
 }
 
@@ -374,8 +376,9 @@ TEST_CASE("insert-delta job: file-backed splits each own a duplicated datasource
   auto const& request = requests[0];
   REQUIRE(request.bundles.size() >= 2);
 
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
-  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    cucascade::io::open_datasource(ioctx, tdb.path);
 
   std::vector<sirius::op::scan::projected_column> op{real_col(0)};
   auto splits =
@@ -385,7 +388,7 @@ TEST_CASE("insert-delta job: file-backed splits each own a duplicated datasource
   // The datasource's prefetch handle is per-scan state: every file-backed
   // split must own its own duplicate, never the shared original; host-only
   // splits carry none.
-  std::unordered_set<sirius::io::sirius_datasource const*> seen;
+  std::unordered_set<cucascade::io::datasource const*> seen;
   bool saw_host_only = false;
   for (auto const& split : splits) {
     if (split.info->host_backed_only) {
@@ -426,8 +429,9 @@ TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
   run(requests);
   auto const& request = requests[0];
 
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
-  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    cucascade::io::open_datasource(ioctx, tdb.path);
 
   // An operator projecting only the constant column cuts splits whose
   // persistent descriptors are all blockless: nothing reads the file, so the
@@ -567,8 +571,9 @@ TEST_CASE("insert-delta physical evidence is the union inside a mixed row group"
     mixed |= persistent && transient;
   }
   REQUIRE(mixed);
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
-  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    cucascade::io::open_datasource(ioctx, tdb.path);
   std::vector<projected_column> columns{real_col(0), real_col(1)};
   auto splits = cut_delta_splits_for_op(requests[0], columns, datasource, nullptr, 81);
   REQUIRE(splits.size() == 1);
@@ -607,7 +612,7 @@ TEST_CASE("insert-delta physical evidence is the union inside a mixed row group"
                             stream.value()) == cudaSuccess);
     stream.synchronize();
     for (std::size_t row = 0; row < values.size(); ++row)
-      CHECK(values[row] == cpu->GetValue(c, row).GetValue<int32_t>());
+      CHECK(values[row] == cpu->Collection().GetValue(c, row).GetValue<int32_t>());
   }
   exec_ok(*tdb.con, "ROLLBACK");
 }
@@ -628,7 +633,7 @@ TEST_CASE("insert-delta physical refusal preserves the first contract through fa
   auto codecs =
     tdb.con->Query("SELECT count(*) FROM pragma_storage_info('t') WHERE compression='ZSTD'");
   REQUIRE_FALSE(codecs->HasError());
-  REQUIRE(codecs->GetValue(0, 0).GetValue<int64_t>() > 0);
+  REQUIRE(codecs->Collection().GetValue(0, 0).GetValue<int64_t>() > 0);
   exec_ok(*tdb.con, "BEGIN TRANSACTION");
   auto& storage = resolve_storage(*tdb.con, "t");
   std::vector<insert_delta_job_request> requests;

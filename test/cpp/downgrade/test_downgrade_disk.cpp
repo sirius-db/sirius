@@ -28,21 +28,14 @@
 #include <utils/utils.hpp>
 
 // cucascade
-#include <cucascade/cudf/gpu_data_representation.hpp>
-#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/data_repository_manager.hpp>
-#include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // cudf / rmm
-#include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -148,6 +141,7 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_no_disk_
 }
 
 downgrade_executor make_monitoring_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   sirius::data::data_repository_manager_registry& repo_registry,
   cucascade::memory::memory_space* gpu_space,
   sirius::memory::sirius_memory_reservation_manager& mgr)
@@ -155,7 +149,7 @@ downgrade_executor make_monitoring_executor(
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
     .monitor_period = std::chrono::milliseconds{10}};
-  return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mgr);
+  return downgrade_executor(lifecycle, config, repo_registry, GPU_SPACE_ID, gpu_space, mgr);
 }
 
 }  // namespace
@@ -339,9 +333,11 @@ TEST_CASE("monitor backs off when no downgrade target is viable (no disk)", "[do
   REQUIRE(gpu_hold);
   REQUIRE(gpu_space->should_downgrade_memory());
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   repo_registry.create_for_query(kTestQueryId);
-  auto executor = make_monitoring_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_monitoring_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;
@@ -373,9 +369,11 @@ TEST_CASE("monitor resumes after a downgrade target frees up (no disk)", "[downg
   REQUIRE(gpu_hold);
   REQUIRE(gpu_space->should_downgrade_memory());
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   repo_registry.create_for_query(kTestQueryId);
-  auto executor = make_monitoring_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_monitoring_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;
@@ -438,9 +436,11 @@ TEST_CASE("monitor backs off when HOST is full of stored downgraded data (no dis
   REQUIRE(gpu_hold);
   REQUIRE(gpu_space->should_downgrade_memory());
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   repo_registry.create_for_query(kTestQueryId);
-  auto executor = make_monitoring_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_monitoring_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;
@@ -479,9 +479,12 @@ TEST_CASE("HOST-source monitor backs off when no disk is configured", "[downgrad
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade-host"},
     .monitor_period = std::chrono::milliseconds{10}};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   repo_registry.create_for_query(kTestQueryId);
-  downgrade_executor executor(config, repo_registry, host_space->get_id(), host_space, *mem_mgr);
+  downgrade_executor executor(
+    lifecycle, config, repo_registry, host_space->get_id(), host_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;

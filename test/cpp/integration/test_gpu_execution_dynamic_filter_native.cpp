@@ -15,14 +15,12 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <string>
-#include <vector>
 
 namespace {
 
@@ -77,8 +75,8 @@ void compare_gpu_vs_cpu(duckdb::Connection& con, const std::string& query)
   REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
   REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-  auto gpu_rows = sirius::test::collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::collect_rows(*gpu_result);
+  auto cpu_rows = sirius::test::collect_rows(*cpu_result);
   REQUIRE(gpu_rows == cpu_rows);
 }
 

@@ -17,6 +17,7 @@
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -64,17 +65,16 @@ TEST_CASE("mixed SEMI/ANTI keeps NULL and valid build residuals distinct",
   LogicalComparisonJoin logical_join(join_type);
   logical_join.types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER};
   auto make_child    = [&]() {
-    return make_uniq<sirius_physical_operator>(
+    return make_uniq<sirius::op::test_physical_operator>(
       SiriusPhysicalOperatorType::PROJECTION, sirius::from_duckdb_vec(logical_join.types), 0);
   };
   vector<JoinCondition> conditions;
   for (idx_t index = 0; index < 3; ++index) {
-    JoinCondition condition;
-    condition.left       = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, index);
-    condition.right      = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, index);
-    condition.comparison = index == 0  ? ExpressionType::COMPARE_EQUAL
-                           : null_safe ? ExpressionType::COMPARE_NOT_DISTINCT_FROM
-                                       : ExpressionType::COMPARE_NOTEQUAL;
+    JoinCondition condition(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, index),
+                            make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, index),
+                            index == 0  ? ExpressionType::COMPARE_EQUAL
+                            : null_safe ? ExpressionType::COMPARE_NOT_DISTINCT_FROM
+                                        : ExpressionType::COMPARE_NOTEQUAL);
     conditions.push_back(std::move(condition));
   }
   sirius_physical_hash_join join(logical_join,

@@ -19,18 +19,15 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
-#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"  // IWYU pragma: keep
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
-#include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "sirius/exception.hpp"
@@ -39,12 +36,30 @@
 #include <duckdb/common/types/blob.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace {
+// Diagnostic label for the static filter bytes: zero-padded 64-bit FNV-1a, first eight hex digits;
+// "-" when the contract carries no static filter. Never a cache, equality or enforcement input.
+std::string static_filter_label(std::string const& bytes)
+{
+  if (bytes.empty()) return "-";
+  uint64_t hash = 14695981039346656037ull;
+  for (unsigned char c : bytes) {
+    hash ^= c;
+    hash *= 1099511628211ull;
+  }
+  char text[17];
+  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+  return std::string(text, 8);
+}
+}  // namespace
 
 namespace sirius::pipeline {
 
@@ -62,11 +77,10 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   compute_repository_wiring(root_pipeline.get_state());
   setup_pipeline_parents();
   finalize_pipeline_structure();
-  link_join_partition_siblings();
   configure_partition_consumers();
   restrict_dynamic_filter_replicas();
-  // Must run after finalize_pipeline_structure (populates `dependencies`) and after
-  // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
+  // Dependencies are complete after finalize_pipeline_structure; input roles were bound by
+  // planning.
   reorder_pipelines_topologically(scheduled_);
 
   // Number the operators now that the pipeline set is final and topologically ordered. This is
@@ -131,7 +145,7 @@ void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline
     }
     auto build_sink = pipeline->dependencies[0]->get_sink();
     D_ASSERT(build_sink->type == op::SiriusPhysicalOperatorType::CONCAT &&
-             build_sink->Cast<op::sirius_physical_concat>().is_build_concat());
+             pipeline->get_source()->input_port_for(*build_sink) == "build");
   }
 #endif
 }
@@ -337,8 +351,7 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
   // parent->dependency population.
   for (const auto& pipeline : scheduled_) {
     // For each parent pipeline, add the current pipeline to its dependencies. Join
-    // dependencies must end up build-side-first: link_join_partition_siblings() reads
-    // dependencies[0]/[1] positionally, and reorder_pipelines_topologically() visits
+    // dependencies must end up build-side-first: reorder_pipelines_topologically() visits
     // producers in slot order — build-first is what schedules a join's dynamic-filter
     // publication before the probe-side scans it prunes. The meta-sweep emits
     // probe-first, so build concats are inserted at the front instead.
@@ -349,74 +362,11 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
         (locked_parent->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
          locked_parent->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) &&
         pipeline->sink->type == op::SiriusPhysicalOperatorType::CONCAT &&
-        pipeline->sink->Cast<op::sirius_physical_concat>().is_build_concat();
+        locked_parent->source->input_port_for(*pipeline->sink) == "build";
       if (build_side_of_join) {
         locked_parent->dependencies.insert(locked_parent->dependencies.begin(), pipeline);
       } else {
         locked_parent->dependencies.push_back(pipeline);
-      }
-    }
-  }
-}
-
-void sirius_pipeline_converter::link_join_partition_siblings()
-{
-  for (const auto& pipeline : scheduled_) {
-    // DENSE_COUNT_JOIN feeds from bare PARTITIONs with no CONCAT between, so its dependencies are
-    // the partition pipelines directly. Sides are identified by is_build_partition() rather than
-    // by dependency position: dependency order follows build_pipelines' child order, which is not
-    // the same for this operator as for the joins below.
-    if (pipeline->source->type == op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
-      if (pipeline->dependencies.size() != 2) { continue; }
-      auto* first  = pipeline->dependencies[0]->get_sink().get();
-      auto* second = pipeline->dependencies[1]->get_sink().get();
-      if (first == nullptr || second == nullptr ||
-          first->type != op::SiriusPhysicalOperatorType::PARTITION ||
-          second->type != op::SiriusPhysicalOperatorType::PARTITION) {
-        continue;
-      }
-      auto& first_partition  = first->Cast<op::sirius_physical_partition>();
-      auto& second_partition = second->Cast<op::sirius_physical_partition>();
-      // Exactly one side is the build (preserved) side; it drives the partition count.
-      D_ASSERT(first_partition.is_build_partition() != second_partition.is_build_partition());
-      first_partition.set_sibling_partition_op(&second_partition);
-      second_partition.set_sibling_partition_op(&first_partition);
-      continue;
-    }
-    // Both join types use the same CONCAT/PARTITION wrap. Probe input is PARTIAL except for
-    // right-family hash joins whose complete probe drives partition sizing; RIGHT_DELIM_JOIN
-    // inner joins use their build side instead.
-    if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
-        pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-      auto build_concat_pipeline    = pipeline->dependencies[0];
-      auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
-      auto probe_concat_pipeline    = pipeline->dependencies[1];
-      auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
-      // Positional roles are guaranteed by finalize_pipeline_structure() (tree path) /
-      // emission order (legacy). A swap here mislinks sibling partitions and, for
-      // right-family joins, drives_partition_count.
-      D_ASSERT(
-        build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
-        build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
-      bool const inner_join_of_rdj =
-        pipeline->source->get_parent_op() != nullptr &&
-        pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
-      // Right-family sizing applies to hash joins only — NLJ probe partitions always stream.
-      bool const probe_drives_partition_count =
-        pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN &&
-        pipeline->source->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-        !inner_join_of_rdj;
-
-      // partition pipeline only has one operator, so sink and source are the same
-      auto& build_partition_op =
-        build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-      auto& probe_partition_op =
-        probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-      build_partition_op.set_sibling_partition_op(&probe_partition_op);
-      probe_partition_op.set_sibling_partition_op(&build_partition_op);
-      if (probe_drives_partition_count) {
-        build_partition_op.set_drives_partition_count(false);
-        probe_partition_op.set_drives_partition_count(true);
       }
     }
   }
@@ -477,9 +427,6 @@ void sirius_pipeline_converter::configure_partition_consumers()
     auto source = pipe->get_source();
     if (sink) set_ids(sink.get());
     if (source) set_ids(source.get());
-    if (sink && sink->type == op::SiriusPhysicalOperatorType::PARTITION) {
-      set_ids(sink->Cast<op::sirius_physical_partition>().get_downstream_consumer_op());
-    }
   }
   // Sub-operators that emit or receive through a wiring without being a pipeline boundary (build
   // CONCATs, delim-join internals), resolved the way materialize_repository_wiring resolves them.
@@ -594,6 +541,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
           << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
           << (contract.predicates.pushdown_mode.empty() ? "none"
                                                         : contract.predicates.pushdown_mode)
+
+          << " fingerprint=" << static_filter_label(contract.predicates.static_filter_fingerprint)
           << " scan_cpu_replay="
           << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
                                                                                : "forbidden")
@@ -660,6 +609,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " depth=" << dump_evidence_depth(entry.eligibility.depth)
         << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
         << (contract.predicates.pushdown_mode.empty() ? "none" : contract.predicates.pushdown_mode)
+
+        << " fingerprint=" << static_filter_label(contract.predicates.static_filter_fingerprint)
         << " scan_cpu_replay="
         << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
                                                                              : "forbidden")

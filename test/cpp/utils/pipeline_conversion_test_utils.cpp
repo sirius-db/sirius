@@ -27,11 +27,9 @@
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
 
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
-#include <duckdb/main/database.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
@@ -63,6 +61,10 @@ class optimizer_disable_guard {
     auto disabled  = dbconfig.options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    disabled.insert(duckdb::OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN);
+    disabled.insert(duckdb::OptimizerType::GROUPING_SETS);
+    disabled.insert(duckdb::OptimizerType::AGGREGATE_REUSE);
+    disabled.insert(duckdb::OptimizerType::DISTINCT_AGGREGATE_REWRITE);
 #ifdef DEBUG
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -85,19 +87,12 @@ class optimizer_disable_guard {
   std::set<duckdb::OptimizerType> original_disabled_optimizers_;
 };
 
-struct extracted_plan {
-  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
-  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
-};
+}  // namespace
 
-//! Parse + plan + optimize + resolve a SQL query, mirroring the sirius-specific order of
-//! `SiriusTableFunctionData::ExtractPlan`: `ResolveOperatorTypes` BEFORE `ColumnBindingResolver`.
-//! DuckDB's `Connection::ExtractPlan` uses the reverse order, which trips sirius plan
-//! generation with an "inequal types" binder error on some queries.
 extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
                                                  const std::string& query)
 {
-  duckdb::Parser parser(context.GetParserOptions());
+  duckdb::Parser parser(context);
   parser.ParseQuery(query);
   auto statement_type = parser.statements[0]->type;
 
@@ -111,16 +106,19 @@ extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
   prepared->value_map = std::move(planner.value_map);
 
   duckdb::unique_ptr<duckdb::LogicalOperator> plan = std::move(planner.plan);
-  if (context.config.enable_optimizer) {
+  if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
     duckdb::Optimizer optimizer(*planner.binder, context);
     plan = optimizer.Optimize(std::move(plan));
   }
   plan->ResolveOperatorTypes();
   duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*plan);
+  duckdb::ColumnBindingResolver verifier(true);
+  verifier.VisitOperator(*plan);
   resolver.VisitOperator(*plan);
   return {std::move(plan), std::move(prepared)};
 }
+
+namespace {
 
 //! Starts far above any window id a test process will reach, so a synthetic query can never
 //! collide with a genuine execution window's registration (the registry rejects duplicates).
@@ -136,14 +134,28 @@ scoped_test_query::scoped_test_query(duckdb::ClientContext& context)
   : ctx_(context.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
     query_id_(next_test_query_id())
 {
-  if (usable()) { ctx_->get_data_repository_registry().create_for_query(query_id_); }
+  if (usable()) {
+    auto& lifecycle = ctx_->get_query_lifecycle_registry();
+    lifecycle.open_query(query_id_);
+    try {
+      ctx_->get_data_repository_registry().create_for_query(query_id_);
+    } catch (...) {
+      lifecycle.close(query_id_);
+      throw;
+    }
+  }
 }
 
 scoped_test_query::~scoped_test_query()
 {
   if (!usable()) { return; }
   try {
+    auto& lifecycle = ctx_->get_query_lifecycle_registry();
+    lifecycle.quiesce_and_wait_for_submissions(query_id_);
+    lifecycle.wait_for_work(query_id_);
+    lifecycle.release_resources(query_id_);
     ctx_->get_data_repository_registry().erase(query_id_);
+    lifecycle.close(query_id_);
   } catch (...) {  // best-effort: never throw out of a test-scaffolding destructor
   }
 }
@@ -196,10 +208,7 @@ void with_conversion_result(
       std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
     query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
     pipeline::pipeline_build_context build_ctx(
-      /*telemetry_context=*/nullptr,
-      duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-      std::move(active_gpu_ids),
-      std::move(query_operator_params));
+      /*telemetry_context=*/nullptr, std::move(active_gpu_ids), std::move(query_operator_params));
 
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =

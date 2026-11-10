@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+#include "op/scan/detail/read_retirement.hpp"
 #include "op/scan/owning_table_view.hpp"
+#include "sirius/exception.hpp"
+#include "utils/host_allocation_fault.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
@@ -23,6 +26,7 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -30,13 +34,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 using namespace sirius::op::scan;
+using sirius::op::scan::detail::read_checkpoint;
+using sirius::op::scan::detail::read_retirement_test_hooks;
 
 namespace {
 
@@ -324,6 +334,81 @@ struct reclaiming_owner {
   }
 };
 
+static_assert(!std::copy_constructible<reclaiming_owner>);
+static_assert(!detail::no_alloc_materializable<reclaiming_owner>);
+
+owning_table_view reclaimable_table(std::shared_ptr<reclaim_probe> const& probe,
+                                    ::cuda::stream_ref work_stream,
+                                    ::cuda::stream_ref reclaim_stream)
+{
+  auto table            = tagged_table({kSourceValue, kSourceValue});
+  auto view             = table->view();
+  probe->work_stream    = work_stream.get();
+  probe->reclaim_stream = reclaim_stream.get();
+  probe->source_data    = table->get_column(0).mutable_view().data<std::int32_t>();
+  probe->source_bytes   = sizeof(std::int32_t);
+  return owning_table_view{reclaiming_owner{probe, std::move(table)}, view};
+}
+
+struct copy_resource_state {
+  rmm::device_async_resource_ref upstream{test_mr()};
+  std::size_t allocation_calls{};
+  std::size_t live_allocations{};
+  std::size_t fail_at{};
+  std::atomic_bool failure_work_completed{false};
+  cudaError_t submission_status{cudaSuccess};
+  std::exception_ptr failure = std::make_exception_ptr(rmm::out_of_memory{"table copy allocation"});
+  std::optional<sirius::test::scoped_host_allocation_fault>* cleanup_host_fault{};
+};
+
+struct copy_resource {
+  std::shared_ptr<copy_resource_state> state = std::make_shared<copy_resource_state>();
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    return state->upstream.allocate_sync(bytes, alignment);
+  }
+
+  void deallocate_sync(void* pointer, std::size_t bytes, std::size_t alignment) noexcept
+  {
+    state->upstream.deallocate_sync(pointer, bytes, alignment);
+  }
+
+  void* allocate(::cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
+  {
+    if (++state->allocation_calls == state->fail_at) {
+      // This marker follows the first column's copy in the table constructor.
+      state->submission_status = cudaLaunchHostFunc(
+        stream.get(),
+        [](void* done) { static_cast<std::atomic_bool*>(done)->store(true); },
+        &state->failure_work_completed);
+      if (state->cleanup_host_fault) {
+        using fault = sirius::test::scoped_host_allocation_fault;
+        state->cleanup_host_fault->emplace(fault::every_allocation_scope, 1);
+      }
+      std::rethrow_exception(state->failure);
+    }
+    auto* pointer = state->upstream.allocate(stream, bytes, alignment);
+    ++state->live_allocations;
+    return pointer;
+  }
+
+  void deallocate(::cuda::stream_ref stream,
+                  void* pointer,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    --state->live_allocations;
+    state->upstream.deallocate(stream, pointer, bytes, alignment);
+  }
+
+  friend void get_property(copy_resource const&, ::cuda::mr::device_accessible) noexcept {}
+  bool operator==(copy_resource const& other) const noexcept { return state == other.state; }
+};
+
+static_assert(std::copyable<copy_resource>);
+static_assert(std::constructible_from<rmm::device_async_resource_ref, copy_resource&>);
+
 }  // namespace
 
 TEST_CASE("owning_table_view release awaits the copy before the owner reclaims memory",
@@ -386,4 +471,212 @@ TEST_CASE("owning_table_view release awaits the copy before the owner reclaims m
   REQUIRE(poisoned == 0);
   REQUIRE(host.front() == kSourceValue);
   REQUIRE(host.back() == kSourceValue);
+}
+
+TEST_CASE("owning_table_view constructor OOM retires submitted copies and permits retry",
+          "[owning_table_view][retirement]")
+{
+  rmm::cuda_stream work_stream;
+  rmm::cuda_stream reclaim_stream;
+  copy_resource resource;
+  resource.state->fail_at  = 2;
+  auto probe               = std::make_shared<reclaim_probe>();
+  auto handle              = reclaimable_table(probe, work_stream, reclaim_stream);
+  auto const original_ptrs = data_ptrs(handle.view());
+
+  std::exception_ptr failure;
+  try {
+    (void)handle.release(work_stream, resource);
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  REQUIRE(failure == resource.state->failure);
+  REQUIRE(resource.state->allocation_calls == 2);
+  REQUIRE(resource.state->submission_status == cudaSuccess);
+  REQUIRE(resource.state->failure_work_completed.load());
+  REQUIRE(resource.state->live_allocations == 0);
+  REQUIRE_FALSE(probe->reclaimed);
+  REQUIRE(data_ptrs(handle.view()) == original_ptrs);
+
+  resource.state->fail_at = 0;
+  auto output             = handle.release(work_stream, resource);
+  REQUIRE_FALSE(handle);
+  REQUIRE(probe->reclaimed);
+  REQUIRE(probe->stream_status_at_reclaim == cudaSuccess);
+  REQUIRE(read_tags(output->view()) == std::vector<std::int32_t>{kSourceValue, kSourceValue});
+}
+
+TEST_CASE("owning_table_view post-copy OOM preserves the source and releases scratch",
+          "[owning_table_view][retirement]")
+{
+  rmm::cuda_stream work_stream;
+  rmm::cuda_stream reclaim_stream;
+  copy_resource resource;
+  auto probe               = std::make_shared<reclaim_probe>();
+  auto handle              = reclaimable_table(probe, work_stream, reclaim_stream);
+  auto const original_ptrs = data_ptrs(handle.view());
+
+  {
+    read_retirement_test_hooks fault(read_checkpoint::COPY);
+    REQUIRE_THROWS_AS(handle.materialize(work_stream, resource), rmm::out_of_memory);
+    REQUIRE(fault.checkpoint_reached);
+    REQUIRE_FALSE(fault.retained.has_value());
+  }
+  REQUIRE(resource.state->allocation_calls == 2);
+  REQUIRE(resource.state->live_allocations == 0);
+  REQUIRE_FALSE(probe->reclaimed);
+  REQUIRE(data_ptrs(handle.view()) == original_ptrs);
+  REQUIRE(cudaStreamQuery(work_stream.value()) == cudaSuccess);
+
+  auto output = handle.release(work_stream, resource);
+  REQUIRE(probe->reclaimed);
+  REQUIRE(probe->stream_status_at_reclaim == cudaSuccess);
+  REQUIRE(read_tags(output->view()) == std::vector<std::int32_t>{kSourceValue, kSourceValue});
+}
+
+TEST_CASE("owning_table_view failed completion retains noncopyable source and copied output",
+          "[owning_table_view][retirement]")
+{
+  // Without a failure point the completion join fails; with one, the cleanup join does.
+  auto const failure =
+    GENERATE(as<std::optional<read_checkpoint>>{}, std::nullopt, read_checkpoint::COPY);
+  rmm::cuda_stream work_stream;
+  rmm::cuda_stream reclaim_stream;
+  copy_resource resource;
+  auto probe = std::make_shared<reclaim_probe>();
+  {
+    read_retirement_test_hooks fault(failure, true);
+    {
+      auto handle = reclaimable_table(probe, work_stream, reclaim_stream);
+      REQUIRE_THROWS_AS(handle.materialize(work_stream, resource), sirius::unjoined_gpu_work);
+      REQUIRE_FALSE(handle);
+      REQUIRE(handle.release(work_stream, resource) == nullptr);
+    }
+    auto const* retained = fault.retained.get<detail::table_copy_state>();
+    REQUIRE(retained != nullptr);
+    REQUIRE(retained->source != nullptr);
+    REQUIRE(retained->output != nullptr);
+    REQUIRE_FALSE(probe->reclaimed);
+    REQUIRE(resource.state->live_allocations == 2);
+    // The hooks retain storage only after a physical join, so inspection and release are safe.
+    REQUIRE(cudaStreamQuery(work_stream.value()) == cudaSuccess);
+    REQUIRE(read_tags(retained->source->view()) ==
+            std::vector<std::int32_t>{kSourceValue, kSourceValue});
+    REQUIRE(read_tags(retained->output->view()) ==
+            std::vector<std::int32_t>{kSourceValue, kSourceValue});
+    REQUIRE(data_ptrs(retained->source->view()) != data_ptrs(retained->output->view()));
+  }
+  REQUIRE(resource.state->live_allocations == 0);
+  REQUIRE(probe->reclaimed);
+  REQUIRE(probe->stream_status_at_reclaim == cudaSuccess);
+}
+
+TEST_CASE("owning_table_view constructor OOM becomes nonretryable when cleanup fails",
+          "[owning_table_view][retirement]")
+{
+  rmm::cuda_stream work_stream;
+  rmm::cuda_stream reclaim_stream;
+  copy_resource resource;
+  resource.state->fail_at = 2;
+  auto probe              = std::make_shared<reclaim_probe>();
+  {
+    read_retirement_test_hooks fault(std::nullopt, true);
+    {
+      auto handle = reclaimable_table(probe, work_stream, reclaim_stream);
+      REQUIRE_THROWS_AS(handle.materialize(work_stream, resource), sirius::unjoined_gpu_work);
+      REQUIRE_FALSE(handle);
+    }
+    REQUIRE(resource.state->allocation_calls == 2);
+    REQUIRE(resource.state->submission_status == cudaSuccess);
+    REQUIRE(resource.state->failure_work_completed.load());
+    auto const* retained = fault.retained.get<detail::table_copy_state>();
+    REQUIRE(retained != nullptr);
+    REQUIRE(retained->source != nullptr);
+    REQUIRE(retained->output == nullptr);
+    REQUIRE_FALSE(probe->reclaimed);
+    REQUIRE(resource.state->live_allocations == 0);
+  }
+  REQUIRE(probe->reclaimed);
+  REQUIRE(probe->stream_status_at_reclaim == cudaSuccess);
+}
+
+TEST_CASE("owning_table_view transfer fast paths bypass copy retirement",
+          "[owning_table_view][retirement]")
+{
+  auto const project = GENERATE(false, true);
+  auto table         = tagged_table({10, 20});
+  auto original_ptrs = data_ptrs(table->view());
+  owning_table_view handle{std::move(table)};
+  if (project) {
+    handle.select_columns(std::array<std::size_t, 1>{1});
+    original_ptrs.erase(original_ptrs.begin());
+  }
+  copy_resource resource;
+  resource.state->fail_at = 1;
+  read_retirement_test_hooks fault(std::nullopt, true);
+  auto output = handle.release(test_stream(), resource);
+  REQUIRE_FALSE(fault.retained.has_value());
+  REQUIRE(data_ptrs(output->view()) == original_ptrs);
+  REQUIRE(resource.state->allocation_calls == 0);
+}
+
+TEST_CASE("owning_table_view failed cleanup retains owners without host allocation",
+          "[.][owning_table_view][retirement][host_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  rmm::cuda_stream work_stream;
+  rmm::cuda_stream reclaim_stream;
+  copy_resource resource;
+  resource.state->fail_at = 2;
+  auto probe              = std::make_shared<reclaim_probe>();
+  auto handle             = reclaimable_table(probe, work_stream, reclaim_stream);
+  {
+    read_retirement_test_hooks hooks(std::nullopt, true);
+    std::optional<fault> injection;
+    resource.state->cleanup_host_fault = &injection;
+    bool unjoined                      = false;
+    try {
+      handle.materialize(work_stream, resource);
+    } catch (sirius::unjoined_gpu_work const&) {
+      unjoined = true;
+    }
+    auto const allocations = injection ? injection->stop() : 0;
+    REQUIRE(injection.has_value());
+    REQUIRE_FALSE(injection->fired());
+    REQUIRE(allocations == 0);
+    REQUIRE(unjoined);
+    auto const* retained = hooks.retained.get<detail::table_copy_state>();
+    REQUIRE(retained != nullptr);
+    REQUIRE(retained->source != nullptr);
+    REQUIRE_FALSE(probe->reclaimed);
+  }
+  REQUIRE(probe->reclaimed);
+  REQUIRE(probe->stream_status_at_reclaim == cudaSuccess);
+}
+
+TEST_CASE("owning_table_view prelaunch host OOM preserves the source without device allocation",
+          "[.][owning_table_view][retirement][host_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  rmm::cuda_stream work_stream;
+  rmm::cuda_stream reclaim_stream;
+  copy_resource resource;
+  auto probe               = std::make_shared<reclaim_probe>();
+  auto handle              = reclaimable_table(probe, work_stream, reclaim_stream);
+  auto const original_ptrs = data_ptrs(handle.view());
+  bool failed              = false;
+  fault injection(fault::every_allocation_scope, 1);
+  try {
+    (void)handle.release(work_stream, resource);
+  } catch (std::bad_alloc const&) {
+    failed = true;
+  }
+  (void)injection.stop();
+  REQUIRE(injection.fired());
+  REQUIRE(failed);
+  REQUIRE(resource.state->allocation_calls == 0);
+  REQUIRE_FALSE(probe->reclaimed);
+  REQUIRE(data_ptrs(handle.view()) == original_ptrs);
 }

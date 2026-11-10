@@ -9,7 +9,6 @@
 
 #include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/exception.hpp>
-#include <duckdb/common/string_util.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/main/secret/secret.hpp>
@@ -29,7 +28,7 @@ duckdb::unique_ptr<duckdb::BaseSecret> create_sirius_s3_secret(duckdb::ClientCon
   auto secret =
     duckdb::make_uniq<duckdb::KeyValueSecret>(input.scope, input.type, input.provider, input.name);
   for (auto const& [key, value] : input.options) {
-    secret->secret_map[key] = value;
+    secret->secret_map[duckdb::Identifier(key)] = value;
   }
   secret->redact_keys.insert("key_id");
   secret->redact_keys.insert("secret");
@@ -158,7 +157,7 @@ object_store_config resolve_duckdb_s3_secret(duckdb::ClientContext& context,
   auto match             = manager.LookupSecret(transaction, secret_path, "sirius_s3");
   if (!match.HasMatch()) { match = manager.LookupSecret(transaction, secret_path, "s3"); }
   if (!match.HasMatch()) { return defaults; }
-  if (!duckdb::StringUtil::CIEquals(match.GetSecret().GetProvider(), "config")) {
+  if (!(match.GetSecret().GetProvider() == "config")) {
     throw duckdb::NotImplementedException(
       "Sirius S3 currently supports only static TYPE SIRIUS_S3 or TYPE S3 PROVIDER CONFIG secrets");
   }

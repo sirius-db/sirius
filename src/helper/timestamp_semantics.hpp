@@ -18,10 +18,13 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/transform.hpp>
 
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
+
+#include <expression/function_id.hpp>
 
 #include <memory>
 
@@ -44,11 +47,24 @@ namespace sirius::temporal {
 
 /**
  * Converts second, millisecond, or nanosecond timestamps to microseconds.
- * Preserves infinity and NULL; truncates nanoseconds toward zero; throws
+ * Preserves infinity and NULL; rounds nanoseconds to nearest with ties away from the epoch; throws
  * sirius::invalid_input_exception on finite overflow or unsupported input type.
  * The overflow check synchronizes the supplied stream to read its result.
  */
 [[nodiscard]] std::unique_ptr<cudf::column> cast_to_microseconds_checked(
   cudf::column_view const& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr);
+
+// Applies a bound DATE/day signature. Offsets preserve NULL and infinity and
+// throw invalid_input_exception on finite overflow. Differences subtract raw day
+// counts in INT64. Column inputs must have row_count rows; scalar inputs broadcast
+// their single row. The caller retains input ownership; overflow checks synchronize
+// the supplied stream.
+[[nodiscard]] std::unique_ptr<cudf::column> date_arithmetic_checked(
+  cudf::transform_input const& left,
+  cudf::transform_input const& right,
+  date_arithmetic_operation operation,
+  cudf::size_type row_count,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::temporal

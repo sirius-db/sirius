@@ -13,6 +13,7 @@
 #pragma once
 
 #include "codegen/plan/representation.hpp"
+#include "decode/decode_session.hpp"
 #include "nvcomp_batched_codec.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -58,26 +59,17 @@ inline std::unique_ptr<cudf::column> nvcomp_decompress_impl(batched_codec_ops co
                                                             std::size_t compressed_size,
                                                             cudf::data_type orig_type,
                                                             cudf::size_type n_rows,
-                                                            ::cuda::stream_ref stream,
-                                                            rmm::device_async_resource_ref mr)
+                                                            decode_frame& frame)
 {
-  if (n_rows == 0 || compressed_data == nullptr || compressed_size == 0) {
-    return cudf::make_fixed_width_column(
-      orig_type, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  }
+  auto output = cudf::make_fixed_width_column(
+    orig_type, n_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
+  if (n_rows == 0 || compressed_data == nullptr || compressed_size == 0) { return output; }
 
-  auto out_col =
-    cudf::make_fixed_width_column(orig_type, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
   std::size_t const out_bytes =
     static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(cudf::size_of(orig_type));
-  batched_decompress_bytes(ops,
-                           compressed_data,
-                           compressed_size,
-                           out_col->mutable_view().head<void>(),
-                           out_bytes,
-                           stream,
-                           mr);
-  return out_col;
+  batched_decompress_bytes(
+    ops, compressed_data, compressed_size, output->mutable_view().head<void>(), out_bytes, frame);
+  return output;
 }
 
 }  // namespace detail

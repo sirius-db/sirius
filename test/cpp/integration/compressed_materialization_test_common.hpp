@@ -38,8 +38,7 @@
 
 namespace sirius::test::compmat {
 
-inline void require_ok(duckdb::unique_ptr<duckdb::MaterializedQueryResult> const& r,
-                       char const* what)
+inline void require_ok(duckdb::unique_ptr<duckdb::QueryResult> const& r, char const* what)
 {
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO(what << " error: " << r->GetError()); }
@@ -145,13 +144,14 @@ inline void compare_gpu_vs_cpu(duckdb::Connection& con, std::string const& query
   REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
   REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-  auto collect_rows = [](duckdb::MaterializedQueryResult& result) {
+  auto collect_rows = [](duckdb::QueryResult& result) {
     std::vector<std::vector<std::string>> rows;
-    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+    auto result_rows = result.Collection().GetRows();
+    for (duckdb::idx_t r = 0; r < result_rows.size(); r++) {
       std::vector<std::string> row;
       row.reserve(result.ColumnCount());
       for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-        row.push_back(result.GetValue(c, r).ToString());
+        row.push_back(result_rows.GetValue(c, r).ToString());
       }
       rows.push_back(std::move(row));
     }

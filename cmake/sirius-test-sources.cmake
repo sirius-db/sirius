@@ -1,18 +1,38 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan/test_parquet_delete_reader.cpp
+    test/cpp/scan/bench_parquet_footer_cache.cpp
+    test/cpp/io/test_parquet_metadata_retention.cpp
+    test/cpp/scan_manager/test_preparation_readiness.cpp
+    test/cpp/scan_manager/test_preparation_parquet.cpp
+    test/cpp/scan_manager/test_coordinator_pool.cpp
+    test/cpp/scan_manager/test_preparation_output_lifetime.cpp
+    test/cpp/scan_manager/test_native_reader_executor.cpp
+    test/cpp/scan_manager/test_preparation.cpp
+    test/cpp/scan_manager/test_preparation_unit.cpp
+    test/cpp/scan_manager/test_preparation_ledger.cpp
+    test/cpp/scan_manager/test_host_pin_placement.cpp
+    test/cpp/scan_manager/test_preparation_config.cpp
     test/cpp/scan/test_native_physical_matrix.cpp
     test/cpp/scan/test_parquet_physical_profile.cpp
+    test/cpp/memory/test_numa_small_pinned_mr.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
+    test/cpp/transparent/test_read_view_scaling.cpp
     test/cpp/integration/test_transparent_read_view.cpp
     test/cpp/scan/test_split_certificates.cpp
     test/cpp/transparent/test_late_failure.cpp
     test/cpp/transparent/test_plan_source_policy.cpp
+    test/cpp/transparent/test_pre_optimizer_hook.cpp
+    test/cpp/transparent/test_parquet_footer_statistics.cpp
     test/cpp/scan/test_scan_contracts.cpp
     test/cpp/scan/test_scan_verdicts.cpp
     test/cpp/scan/test_certification_cost.cpp
     test/cpp/integration/test_transparent_verdicts.cpp
     test/cpp/compression/test_compression.cpp
+    test/cpp/compression/test_decode_reservation.cpp
+    test/cpp/compression/test_spill_compression.cpp
+    test/cpp/config/test_c_api_config.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
@@ -20,6 +40,9 @@ set(TEST_SOURCES
     test/cpp/config/test_topology_config.cpp
     test/cpp/creator/test_task_creator_query_state.cpp
     test/cpp/creator/test_task_creator_schedule_validation.cpp
+    test/cpp/memory/test_pool_peer_access.cpp
+    test/cpp/memory/test_device_transfer.cpp
+    test/cpp/downgrade/test_downgrade_acquisition_failure.cpp
     test/cpp/data/test_chunked_spill_copy.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_spill_converter_ordering.cpp
@@ -30,15 +53,21 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_spill_policy.cpp
+    test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
+    test/cpp/exec/test_query_lifecycle_registry.cpp
+    test/cpp/exec/test_query_admission.cpp
+    test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/event/test_query_event_publisher.cpp
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_sirius_ffi_embedder.cpp
+    test/cpp/exec/test_sirius_ffi_byte_ranges.cpp
+    test/cpp/exec/test_sirius_ffi_object_store.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
@@ -52,11 +81,14 @@ set(TEST_SOURCES
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
+    test/cpp/expression_evaluator/test_checked_division.cpp
+    test/cpp/expression_evaluator/test_conditional_unselected_errors.cpp
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
     test/cpp/expression_evaluator/test_like_multiliteral.cpp
     test/cpp/expression_evaluator/test_round_floating_point.cpp
+    test/cpp/expression_evaluator/test_decimal_integer_cast.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -64,31 +96,48 @@ set(TEST_SOURCES
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_compressed_materialization_gate.cpp
     test/cpp/integration/test_compressed_materialization_partition.cpp
+    test/cpp/integration/test_gpu_execution_aggregate_filter.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
+    test/cpp/integration/test_gpu_execution_conditional_errors.cpp
     test/cpp/integration/test_gpu_execution_constant_or_null.cpp
     test/cpp/integration/test_gpu_execution_cross_product.cpp
+    test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
+    test/cpp/integration/test_gpu_execution_cte.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
+    test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
+    test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_multi_partition.cpp
+    test/cpp/integration/test_gpu_execution_date_arithmetic.cpp
     test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_grouping_sets.cpp
+    test/cpp/integration/test_gpu_execution_division.cpp
+    test/cpp/integration/test_gpu_execution_hugeint.cpp
+    test/cpp/integration/test_gpu_execution_integer_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
+    test/cpp/integration/test_gpu_execution_single_join.cpp
     test/cpp/integration/test_gpu_execution_unsigned_narrowing.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
+    test/cpp/integration/test_gpu_execution_parquet_nan.cpp
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
+    test/cpp/integration/test_gpu_execution_integer_varchar_cast.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
+    test/cpp/integration/test_gpu_execution_abs.cpp
+    test/cpp/integration/test_gpu_execution_negate.cpp
     test/cpp/integration/test_gpu_execution_round.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
     test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
@@ -98,10 +147,14 @@ set(TEST_SOURCES
     test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_execution_tpch_havoc.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
-    test/cpp/integration/test_gpu_execution_union_all.cpp
+    test/cpp/integration/test_gpu_execution_setop_all.cpp
+    test/cpp/integration/test_gpu_execution_union.cpp
+    test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
+    test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
@@ -123,6 +176,7 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_materialize.cpp
     test/cpp/late_mat/test_port_materialize.cpp
     test/cpp/integration/test_late_mat_deferred_query.cpp
+    test/cpp/integration/test_pin_unique_join.cpp
     test/cpp/integration/test_late_mat_native_filter.cpp
     test/cpp/late_mat/test_defer_policy.cpp
     test/cpp/late_mat/test_defer_directive.cpp
@@ -131,27 +185,18 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_pin_handle_lifecycle.cpp
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/cuda/test_device_copy_batch.cpp
-    test/cpp/io/s3/test_sigv4.cpp
-    test/cpp/io/s3/test_sigv4_authorizer.cpp
-    test/cpp/io/s3/test_static_credentials.cpp
-    test/cpp/io/cache/test_cache_read_arbitration.cpp
-    test/cpp/io/cache/test_chunk_state.cpp
-    test/cpp/io/cache/test_dispose_eviction.cpp
-    test/cpp/io/cache/test_explicit_eviction.cpp
-    test/cpp/io/cache/test_stage_machines.cpp
-    test/cpp/io/kvikio/test_kvikio_remote.cpp
-    test/cpp/io/test_io_request.cpp
     test/cpp/io/test_parquet_helpers.cpp
-    test/cpp/io/test_templated_ioctx.cpp
-    test/cpp/io/test_uri_parser.cpp
-    test/cpp/io/uring/test_uring_readv.cpp
-    test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/io/test_path_utils.cpp
+    test/cpp/io/rest/test_rest_datasource_integration.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_s3_config_scopes.cpp
+    test/cpp/scan_manager/test_scan_input_prefetch.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_readahead_tickets.cpp
+    test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
@@ -161,6 +206,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
+    test/cpp/scan_manager/test_uring_gauges_sampler.cpp
     test/cpp/scan_manager/test_pin_registry_epoch_mutations.cpp
     test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
     test/cpp/scan_manager/test_split_connector.cpp
@@ -174,11 +220,20 @@ set(TEST_SOURCES
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_build_probe_reclaim.cpp
+    test/cpp/operator/test_ungrouped_aggregate_empty_input.cpp
+    test/cpp/integration/test_gpu_execution_join_empty_sides.cpp
     test/cpp/operator/test_partition_placement.cpp
+    test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp
+    test/cpp/operator/test_cross_join_slicing.cpp
+    test/cpp/operator/window/test_ranking.cpp
+    test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+    test/cpp/operator/aggregate/test_sorted_keys.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
+    test/cpp/operator/aggregate/test_low_cardinality_groupby.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
@@ -189,13 +244,17 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
+    test/cpp/operator/test_physical_gpu_values.cpp
+    test/cpp/operator/test_output_order.cpp
     test/cpp/operator/test_physical_limit.cpp
     test/cpp/operator/test_physical_mark_join.cpp
+    test/cpp/operator/test_physical_single_join.cpp
     test/cpp/operator/test_physical_mixed_filter_join.cpp
     test/cpp/operator/test_physical_merge_sort.cpp
     test/cpp/operator/test_physical_order.cpp
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
+    test/cpp/operator/test_physical_replicate.cpp
     test/cpp/operator/test_physical_result_collector.cpp
     test/cpp/operator/test_physical_streaming_sink.cpp
     test/cpp/operator/test_physical_streaming_source.cpp
@@ -208,11 +267,15 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_complete_build_inventory.cpp
+    test/cpp/operator/test_physical_build_filter.cpp
     test/cpp/operator/test_dynamic_filter_accumulation.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
+    test/cpp/planner/test_connector_admission.cpp
+    test/cpp/planner/test_connector_capture.cpp
+    test/cpp/planner/test_connector_overrides.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_gpu_admission.cpp
@@ -220,17 +283,26 @@ set(TEST_SOURCES
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
-    test/cpp/planner/test_build_key_domain.cpp
+    test/cpp/planner/test_decimal_sum_input_bounds.cpp
+    test/cpp/planner/test_scan_column_origin.cpp
+    test/cpp/planner/test_join_implied_filters.cpp
+    test/cpp/planner/test_join_key_nullability.cpp
+    test/cpp/planner/test_scan_filter_projection.cpp
+    test/cpp/planner/test_scan_returned_types.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
     test/cpp/planner/test_dynamic_filter_target_discovery.cpp
     test/cpp/planner/test_join_expression_key.cpp
+    test/cpp/planner/test_plan_aggregate_filter.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
+    test/cpp/planner/test_set_operation_lowering.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/planner/test_substrait_scan_ranges.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
+    test/cpp/planner/test_window_plan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
@@ -240,6 +312,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_data_size_estimator.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
+    test/cpp/pipeline/test_cte_build_pipelines.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
@@ -266,7 +339,9 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_metadata_cache.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
+    test/cpp/scan/test_dynamic_filter_integration.cpp
     test/cpp/scan/test_fused_membership_mask.cpp
+    test/cpp/scan/test_fused_scan_filter_delivery.cpp
     test/cpp/scan/test_iceberg_batch_layout.cpp
     test/cpp/scan/test_iceberg_equality_delete.cpp
     test/cpp/scan/test_puffin_reader.cpp
@@ -277,13 +352,20 @@ set(TEST_SOURCES
     test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
+    test/cpp/scan/test_parquet_byte_range.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_scan_execution.cpp
+    test/cpp/scan/test_scan_materialization.cpp
+    test/cpp/scan/test_arrow_import_resources.cpp
+    test/cpp/scan/test_composite_scan_driver.cpp
+    test/cpp/scan/test_arrow_import_driver.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/scan/test_parquet_virtual_column_plan.cpp
+    test/cpp/scan/test_parquet_provenance_contract.cpp
     test/cpp/scan/test_scan_output_assembly.cpp
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/scan/test_stream_lineage_item5.cpp
@@ -303,13 +385,14 @@ set(TEST_SOURCES
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/test_child_process_environment.cpp
     test/cpp/utils/test_gpu_execution_comparator.cpp
+    test/cpp/utils/test_tpch_havoc_queries.cpp
+    test/cpp/utils/tpch_havoc_queries.cpp
     test/cpp/utils/utils.cpp
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/s3/test_duckdb_secret_config.cpp
-    test/cpp/io/rest/test_rest_ioctx_integration.cpp
-    test/cpp/io/cache/test_cache_object_identity.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
+    test/cpp/scan_manager/test_describe_parquet_overwrite_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
 # cmake-format: on

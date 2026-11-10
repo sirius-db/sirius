@@ -18,6 +18,8 @@
 
 #include "helper/logical_type.hpp"
 
+#include <absl/functional/function_ref.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -32,12 +34,17 @@ class sirius_physical_operator;
 namespace sirius::planner {
 
 /**
- * @brief Collect every GPU_SCAN operator reachable from @p node.
+ * @brief Visit every GPU_SCAN operator reachable from @p node.
  *
  * Mirrors sirius_physical_plan_generator::set_parent_ops, the canonical full-tree descent.
  * RESULT_COLLECTOR holds its child in `plan` and DELIM JOIN holds `join`/`distinct_root`,
  * both outside `children[]`; missing either under-counts scans and admits too few GPUs.
+ * Allocates nothing, so cleanup paths that must not fail can use it.
  */
+void for_each_gpu_scan(const op::sirius_physical_operator& node,
+                       absl::FunctionRef<void(const op::sirius_physical_operator&)> visit);
+
+/// @brief Collect every GPU_SCAN operator reachable from @p node, in visit order.
 void collect_gpu_scans(const op::sirius_physical_operator& node,
                        std::vector<const op::sirius_physical_operator*>& out);
 

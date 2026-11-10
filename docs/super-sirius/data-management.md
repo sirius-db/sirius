@@ -61,6 +61,26 @@ Data repositories are thread-safe containers managed by a `shared_data_repositor
 - Track total size and per-partition sizes
 - Registered in the query's `shared_data_repository_manager` for downgrade candidate selection
 
+### Logical batch positions
+
+A repository has a uniform batch mode (`UNKNOWN`, `UNORDERED`, or `ORDERED`). The first
+successful insertion establishes the mode, and draining does not reset it. Positioned and
+unpositioned insertion cannot be mixed. Positions are unique among resident entries within a
+partition and may have gaps. They are logical sequence numbers, independent of batch IDs,
+physical arrival order, and the repository partition index.
+
+Plain `get_`/`pop_` methods return only the batch pointer and intentionally discard position metadata.
+Their `_with_position` variants return the batch and its optional position; order-preserving
+consumers use those variants. FIFO pops still use arrival order.
+`get_positions()` is only a complete input snapshot after **all
+producers have finished**, and consumers must coordinate to avoid invalidating that snapshot.
+
+`pipelineable_operator_data::get_position()` describes the logical destination of a unit of
+work. A multi-batch merge input can carry one destination position. Positioned publication
+requires one output batch; publishing several batches at the same position is an error.
+`partitioned_operator_data` and late-materialization replacement inputs retain this metadata.
+Operators that reorder rows or combine unrelated sequences explicitly discard it.
+
 ### Query-scoped repository managers
 
 **Files:** `src/data/data_repository_manager_registry.hpp`, `src/query_id.hpp`
@@ -131,6 +151,10 @@ Operators access their ports by string name:
 
 Minimal empty base class. Provides a generic extension point for any type of operator data — signaling objects, metadata-only data, or non-batch representations can derive from `operator_data` without being forced into the batch model.
 
+### `input_free_operator_data`
+
+Used by GPU_VALUES and zero-input ungrouped aggregate finalization. It owns no batches and captures the reserved GPU memory space during `prepare_for_processing()`. Its estimated byte basis accounts for output allocation. An empty relation may finish with zero batches; operators that must produce an empty-input result schedule work explicitly. There is no universal requirement for an operator to emit a batch.
+
 ### `pipelineable_operator_data`
 
 Extends `operator_data` with batch-based data flow. Holds two optional internal stores that are
@@ -156,6 +180,7 @@ Extends `pipelineable_operator_data` with a partition index (`get_partition_idx(
 
 ```
 operator_data                       (empty generic base)
+  ├── input_free_operator_data       (reservation space, no batches)
   └── pipelineable_operator_data    (batch vector + data flow methods)
        └── partitioned_operator_data (adds partition_idx)
 ```

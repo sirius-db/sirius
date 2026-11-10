@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/parquet_batch_layout.hpp"
 
 #include <cudf/join/distinct_hash_join.hpp>
@@ -60,6 +61,7 @@ struct IcebergDeleteData;  // iceberg_metadata_reader.hpp
 class positional_delete_filter : public iceberg_delete_filter {
  public:
   explicit positional_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data);
+  explicit positional_delete_filter(iceberg_delete_sets delete_sets);
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      batch_layout layout,
@@ -71,7 +73,8 @@ class positional_delete_filter : public iceberg_delete_filter {
   [[nodiscard]] bool affects(batch_layout layout) const;
 
  private:
-  std::shared_ptr<const IcebergDeleteData> _delete_data;
+  [[nodiscard]] std::span<int64_t const> positions_for(std::string const& path) const;
+  iceberg_delete_sets _delete_sets;
 };
 
 /// Applies V2 equality deletes: probes the group's prebuilt hash join with the batch's key
