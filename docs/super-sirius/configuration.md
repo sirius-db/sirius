@@ -114,7 +114,6 @@ sirius:
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
-    enable_dynamic_filter_multi_partition: true   # Bloom accumulation for multi-partition builds
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip all filters for keys meeting known-domain coverage
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
@@ -763,7 +762,7 @@ The per-GPU dynamic-filter Bloom budget is always **4× the query's
 settings. Multiplication saturates at the maximum unsigned 64-bit byte count.
 The budget is engine-owned: `max_dynamic_filter_bloom_bytes_per_gpu` is no longer
 accepted in YAML or registered as a SQL setting. Remove the old key from existing
-configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulation.
+configs. Use `enable_dynamic_filter: false` to disable dynamic filters.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -1128,7 +1127,6 @@ rejected as unknown, and the old `SET` variables no longer exist.
 |----------|---------|-------------|
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
-| `enable_dynamic_filter_multi_partition` | true | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition. Requires `enable_dynamic_filter`, a build fed through a FULL barrier (an `ORDER BY`-fed build never accumulates), and working peer DMA between every pair of replica GPUs. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |

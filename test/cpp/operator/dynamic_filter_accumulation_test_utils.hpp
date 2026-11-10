@@ -584,9 +584,7 @@ struct fixture {
       std::move(keys),
       {{channel, sirius::op::dynamic_filter_route_class::scan, false, std::move(bindings)}},
       std::move(replicas),
-      {.inlist_max_l2_fraction  = 0.0,
-       .enable_multi_partition  = true,
-       .max_bloom_bytes_per_gpu = cap}};
+      {.inlist_max_l2_fraction = 0.0, .max_bloom_bytes_per_gpu = cap}};
   }
 
   /**

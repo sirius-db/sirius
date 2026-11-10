@@ -261,9 +261,6 @@ struct operator_params {
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
 
-  /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
-  bool enable_dynamic_filter_multi_partition = true;
-
   /// Engine-owned per-GPU Bloom-array cap, always 4x this query's scan batch size.
   /// Saturate overflow; YAML and SQL cannot override the budget independently.
   [[nodiscard]] uint64_t max_dynamic_filter_bloom_bytes_per_gpu() const noexcept

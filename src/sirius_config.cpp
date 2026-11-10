@@ -672,12 +672,15 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "remove this key");
   }
   r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
-  r.optional("enable_dynamic_filter_multi_partition", opt.enable_dynamic_filter_multi_partition);
+  if (r.has("enable_dynamic_filter_multi_partition")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.enable_dynamic_filter_multi_partition': removed; every build "
+      "constructs its dynamic filters, governed by enable_dynamic_filter; remove this key");
+  }
   if (r.has("max_dynamic_filter_bloom_bytes_per_gpu")) {
     throw std::runtime_error(
       "'operator_params.max_dynamic_filter_bloom_bytes_per_gpu': removed; the Bloom budget is "
-      "always 4x scan_task_batch_size; remove this key. Set enable_dynamic_filter_multi_partition "
-      "to false to disable Bloom accumulation");
+      "always 4x scan_task_batch_size; remove this key");
   }
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",

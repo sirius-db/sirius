@@ -239,7 +239,7 @@ dynamic_filter_publish_plan filter_plan(
     {{.build_key_ordinal = 0, .storage_type = int64}},
     {{std::move(channel), sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
     {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
-    {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
+    {.max_bloom_bytes_per_gpu = cap}};
 }
 
 /// The merge of every rank's filters for @p plan's keys, the same on every rank.
@@ -521,7 +521,7 @@ TEST_CASE("a rank missing from one key's merge costs the others one timeout, not
       false,
       {{0, 0, int64}, {1, 1, int64}}}},
     {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
-    {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 64 * KiB}};
+    {.max_bloom_bytes_per_gpu = 64 * KiB}};
   merge_across_ranks(plan, c.all[0].service, 4096, std::chrono::seconds{1});
   sirius::op::dynamic_filter_stats stats;
   sirius::op::dynamic_filter_publication_session session{std::move(plan), &stats};

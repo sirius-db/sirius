@@ -838,29 +838,26 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("multi-partition dynamic-filter switch preserves the derived budget",
-          "[config_opt][dynamic_filter][multi_partition]")
+TEST_CASE("the dynamic-filter Bloom budget stays derived from the scan batch size",
+          "[config_opt][dynamic_filter]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter_multi.yaml";
   {
     std::ofstream out(path);
     out << "sirius:\n"
            "  operator_params:\n"
-           "    enable_dynamic_filter_multi_partition: false\n";
+           "    enable_dynamic_filter: true\n";
   }
 
   sirius_config cfg;
-  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
         4 * cfg.get_operator_params().scan_task_batch_size);
   cfg.load_from_file(path);
-  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
         4 * cfg.get_operator_params().scan_task_batch_size);
   CHECK(cfg.get_operator_params().enable_dynamic_filter);
   CHECK(cfg.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.9));
   cfg.apply_defaults();
-  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
         4 * cfg.get_operator_params().scan_task_batch_size);
 
@@ -868,8 +865,7 @@ TEST_CASE("multi-partition dynamic-filter switch preserves the derived budget",
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("multi-partition dynamic-filter budget rejects YAML overrides",
-          "[config_opt][dynamic_filter][multi_partition]")
+TEST_CASE("the dynamic-filter Bloom budget rejects YAML overrides", "[config_opt][dynamic_filter]")
 {
   auto const budget = GENERATE(std::string{"-1"}, std::string{"0"}, std::string{"32MiB"});
   auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter_multi_bad.yaml";
@@ -881,8 +877,30 @@ TEST_CASE("multi-partition dynamic-filter budget rejects YAML overrides",
         << budget << '\n';
   }
   sirius_config cfg;
+  // The message names no retired option.
   CHECK_THROWS_WITH(cfg.load_from_file(path),
-                    Catch::Matchers::ContainsSubstring("always 4x scan_task_batch_size"));
+                    Catch::Matchers::ContainsSubstring("always 4x scan_task_batch_size") &&
+                      !Catch::Matchers::ContainsSubstring("multi_partition"));
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("YAML that sets the retired multi-partition switch fails with a removal message",
+          "[config_opt][dynamic_filter]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_dynamic_filter_multi_removed.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    enable_dynamic_filter_multi_partition: true\n";
+  }
+  sirius_config cfg;
+  CHECK_THROWS_WITH(
+    cfg.load_from_file(path),
+    Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition': removed") &&
+      Catch::Matchers::ContainsSubstring("remove this key"));
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
