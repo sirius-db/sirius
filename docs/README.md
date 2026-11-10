@@ -277,6 +277,19 @@ Sirius is under active development. Notable current limitations include:
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). Unsupported types and operators fall back to DuckDB CPU execution when fallback is enabled.
 
+## Third-Party Licenses
+
+Each Sirius extension binary embeds the license and notice texts of the third-party software it
+bundles (DuckDB, RAPIDS libraries, NVIDIA CUDA libraries, Rust crates, and others). List them with:
+
+```sql
+SELECT component, version, license, homepage FROM sirius_licenses();
+```
+
+The `license_text` column holds the full texts. GitHub releases also include them as
+`THIRD_PARTY_NOTICES-<platform>-cuda<version>.txt` next to each binary. The `sirius` loader lists its
+own (DuckDB's) notices only when no CUDA backend is loaded, since a loaded backend's list covers them.
+
 ## Contributors and Partners
 
 <p align="center">

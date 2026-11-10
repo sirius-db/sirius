@@ -53,6 +53,8 @@ include(cmake/sirius-substrait.cmake)
 
 include(cmake/sirius-targets.cmake)
 
+include(cmake/sirius-third-party.cmake)
+
 include(cmake/sirius-install.cmake)
 
 if(ENABLE_STREAM_CHECK)

@@ -1,0 +1,40 @@
+# name: test/sql/sirius_licenses.test
+# description: Without a backend, sirius_licenses() lists the notices the loader embeds
+# group: [sirius]
+# Assumes no usable NVIDIA driver, as on DuckDB's CI runners.
+
+require sirius
+
+statement ok
+LOAD sirius;
+
+# Sirius comes first, then the components sorted by name.
+query III
+SELECT component, license, license_text LIKE '%Apache License%Version 2.0%'
+FROM sirius_licenses() LIMIT 1;
+----
+Sirius	Apache-2.0	true
+
+query II
+SELECT version IS NOT NULL, license_text LIKE '%Stichting DuckDB Foundation%'
+FROM sirius_licenses() WHERE component = 'DuckDB';
+----
+true	true
+
+# Every row has a license and its text; vendored libraries have no version.
+query I
+SELECT count(*) FROM sirius_licenses()
+WHERE license IS NULL OR license_text IS NULL OR length(license_text) < 100;
+----
+0
+
+query I
+SELECT count(*) > 20 FROM sirius_licenses() WHERE component LIKE '% (vendored by DuckDB)';
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name = 'sirius_licenses' AND description IS NOT NULL AND len(examples) > 0;
+----
+1
