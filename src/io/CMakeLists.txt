@@ -1,6 +1,8 @@
 target_sources(
   sirius_objects
-  PRIVATE parquet_helpers.cpp
+  PRIVATE gds/gds_ioctx.cpp
+          gds/gds_stats.cpp
+          parquet_helpers.cpp
           path_utils.cpp
           scoped_object_store_configs.cpp
           rest/s3/endpoint.cpp
