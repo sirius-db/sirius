@@ -1140,7 +1140,8 @@ TEST_CASE_METHOD(
   auto const& targets = join.dynamic_filter_plan().probe_targets();
   REQUIRE(join.children.size() == 2);
   auto* build_root = require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true);
-  if (enable_accumulation) {
+  // The retired multi-partition switch no longer gates right-family discovery or BUILD_FILTER.
+  {
     REQUIRE(join.dynamic_filter_plan().admitted_keys().size() == 1);
     CHECK(join.dynamic_filter_plan().admitted_keys()[0].preserve_nulls == !probe_not_null);
     REQUIRE(targets.size() == 1);
@@ -1152,10 +1153,6 @@ TEST_CASE_METHOD(
     REQUIRE(build_root->type == SiriusPhysicalOperatorType::BUILD_FILTER);
     REQUIRE(build_root->children.size() == 1);
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::BUILD_FILTER).size() == 1);
-  } else {
-    CHECK(targets.empty());
-    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
-    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::BUILD_FILTER).empty());
   }
   require_parent_links(plan.get(), /*expected_parent=*/nullptr);
 }
