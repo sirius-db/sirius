@@ -325,7 +325,8 @@ class sirius_loader {
       duckdb::ExtensionInstallOptions options;
       options.repository = repository;
       auto& fs           = duckdb::FileSystem::GetLocal(db);
-      // Mirrors core's check: install is a no-op when the file exists.
+      // Mirrors core's install layout, where install is a no-op when the file exists. If this
+      // drifts, the worst case is a missing or extra status line.
       auto directory = duckdb::ExtensionHelper::ExtensionDirectory(db, fs);
       if (repository.type == duckdb::ExtensionRepositoryType::USER_PROVIDED) {
         directory = fs.JoinPath(fs.JoinPath(directory, "repositories"), repository.name);
@@ -348,21 +349,34 @@ class sirius_loader {
   {
     auto& db = loader_.GetDatabaseInstance();
     report(duckdb::StringUtil::Format(
-      "Sirius: installing %s from %s. This one-time download is large and may take a few "
-      "minutes.",
-      backend,
-      options.repository->path));
-    auto const start = std::chrono::steady_clock::now();
-    duckdb::ExtensionHelper::InstallExtension(
-      db, duckdb::FileSystem::GetLocal(db), backend, options);
-    std::chrono::duration<double> const elapsed = std::chrono::steady_clock::now() - start;
-    report(duckdb::StringUtil::Format("Sirius: installed %s in %.1f s.", backend, elapsed.count()));
+      "Sirius: installing %s. This one-time download is large and may take a few minutes.",
+      backend));
+    auto const start   = std::chrono::steady_clock::now();
+    auto const elapsed = [&] {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    try {
+      duckdb::ExtensionHelper::InstallExtension(
+        db, duckdb::FileSystem::GetLocal(db), backend, options);
+    } catch (...) {
+      // The caller may fall back to the CPU, which is only logged; close the status line here.
+      // The reason stays out of it: it can span lines and contain the URL with credentials.
+      report(duckdb::StringUtil::Format(
+        "Sirius: installing %s failed after %.1f s.", backend, elapsed()));
+      throw;
+    }
+    report(duckdb::StringUtil::Format("Sirius: installed %s in %.1f s.", backend, elapsed()));
   }
 
   void report(std::string const& message)
   {
     duckdb::Printer::Print(duckdb::OutputStream::STREAM_STDERR, message);
     duckdb::Printer::Flush(duckdb::OutputStream::STREAM_STDERR);
+    log_info(message);
+  }
+
+  void log_info(std::string const& message)
+  {
     auto& db = loader_.GetDatabaseInstance();
     using namespace duckdb;  // The logging macros use unqualified DuckDB names.
     DUCKDB_LOG_INFO(db, message);
@@ -390,11 +404,8 @@ class sirius_loader {
     option.info = duckdb::make_shared_ptr<fallback_gpu_execution_option>(status);
     config.AddExtensionOption(gpu_execution_setting, std::move(option));
     loader_.RegisterFunction(fallback_gpu_execution_function::create(status));
-    auto const message =
-      "Sirius GPU execution is unavailable; queries run on DuckDB's CPU engine. " +
-      status->fallback_reason;
-    using namespace duckdb;  // The logging macros use unqualified DuckDB names.
-    DUCKDB_LOG_INFO(db, message);
+    log_info("Sirius GPU execution is unavailable; queries run on DuckDB's CPU engine. " +
+             status->fallback_reason);
   }
 
   duckdb::ExtensionLoader& loader_;

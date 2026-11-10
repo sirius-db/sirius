@@ -5,7 +5,6 @@
 import argparse
 import json
 import os
-import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -250,13 +249,23 @@ class LoaderTests(unittest.TestCase):
         )
 
     def test_unavailable_repository(self):
-        status = self.assert_fallback(
+        load = (
             f"SET autoinstall_extension_repository={quote(self.root / 'missing')};"
-            f"LOAD {quote(self.loader)};",
+            f"LOAD {quote(self.loader)};"
+        )
+        status = self.assert_fallback(
+            load,
             "Sirius selected sirius_cuda13 for CUDA driver version 13.0",
             autoinstall=True,
         )
         self.assertEqual(status["backend"], "sirius_cuda13")
+        result = self.query(load, autoinstall=True)
+        self.assertEqual((result.returncode, result.stdout), (0, ""))
+        self.assertRegex(
+            result.stderr,
+            r"^Sirius: installing sirius_cuda13\. .*\n"
+            r"Sirius: installing sirius_cuda13 failed after \d+\.\d s\.\n$",
+        )
 
     def test_selected_backend_already_loaded(self):
         result = self.query(
@@ -335,7 +344,7 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), [{"backend": 13}])
         self.assertRegex(
             result.stderr,
-            rf"^Sirius: installing sirius_cuda13 from {re.escape(str(repository))}\. .*\n"
+            r"^Sirius: installing sirius_cuda13\. .*\n"
             r"Sirius: installed sirius_cuda13 in \d+\.\d s\.\n$",
         )
         self.assertTrue(
