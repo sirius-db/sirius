@@ -20,6 +20,7 @@
 #include "op/order/bounded_sort.hpp"
 #include "op/order/gpu_sampled_merge.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cudf/copying.hpp>
@@ -121,8 +122,14 @@ void sirius_physical_merge_sort::register_refinement(
 // byte metadata only: nothing is restored to a device.
 std::pair<std::size_t, std::size_t> sirius_physical_merge_sort::ingest()
 {
-  _ingested  = true;
-  auto& repo = *get_port("default")->repo;
+  _ingested = true;
+  // The sample operator sized ranges for one merge each; accept up to that size plus
+  // slack, and refine anything larger into children of the target size.
+  auto partition_bytes = _sample_op ? _sample_op->get_partition_bytes() : 0;
+  _merge_bytes =
+    partition_bytes ? std::max(chunk_bytes, sort_merge_limit_bytes(partition_bytes)) : chunk_bytes;
+  _tile_bytes = partition_bytes ? std::max(chunk_bytes, partition_bytes) : chunk_bytes;
+  auto& repo  = *get_port("default")->repo;
   if (repo.all_empty()) { return {repo.num_partitions(), 0}; }
   if (!_parts || !_samples || !_splitters) {
     throw internal_exception("Merge sort refinement repositories are not registered");
@@ -145,6 +152,17 @@ std::pair<std::size_t, std::size_t> sirius_physical_merge_sort::ingest()
       n.bytes += info.bytes;
     }
     if (n.parts.empty()) { continue; }
+    auto [smallest, largest] = std::ranges::minmax(n.parts, {}, &contribution::bytes);
+    SIRIUS_LOG_DEBUG(
+      "Merge sort: range={}, contributions={}, rows={}, bytes={}, min_part_bytes={}, "
+      "max_part_bytes={}, fits={}",
+      range,
+      n.parts.size(),
+      n.rows,
+      n.bytes,
+      smallest.bytes,
+      largest.bytes,
+      fits(n));
     n.state = phase::ready;
     _active.emplace(n.lo, _nodes.size());
     _nodes.push_back(std::move(n));
@@ -154,7 +172,7 @@ std::pair<std::size_t, std::size_t> sirius_physical_merge_sort::ingest()
 
 bool sirius_physical_merge_sort::fits(node const& n) const
 {
-  return n.rows <= native_rows && (n.bytes <= chunk_bytes || n.rows == 1);
+  return n.rows <= native_rows && (n.bytes <= _merge_bytes || n.rows == 1);
 }
 
 std::optional<std::size_t> sirius_physical_merge_sort::actionable() const
@@ -287,13 +305,13 @@ std::unique_ptr<sirius_physical_merge_sort::work> sirius_physical_merge_sort::cl
         n.state = phase::merging;
         ++n.outstanding;
         return std::make_unique<work>(
-          std::move(values), step::merge, id, std::move(ordinals), 0, n.lo);
+          std::move(values), step::merge, id, std::move(ordinals), n.hi - n.lo, n.lo);
       }
       // Oversized. With R rows per tile and k contributions, the sampled-merge bound
-      // gives tiles of at most R rows. Since bytes > chunk_bytes, rows > R, so every
-      // child has strictly fewer rows than this node.
+      // gives tiles of at most R rows. Since bytes > _merge_bytes >= _tile_bytes,
+      // rows > R, so every child has strictly fewer rows than this node.
       auto average  = 1 + (n.bytes - 1) / n.rows;
-      auto limit    = std::min(native_rows, std::max(uint64_t{1}, chunk_bytes / average));
+      auto limit    = std::min(native_rows, std::max(uint64_t{1}, _tile_bytes / average));
       uint64_t k    = n.parts.size();
       n.stride      = limit / k / 4 + 1;
       n.sample_step = (limit - k * (n.stride - 1)) / n.stride;
@@ -365,7 +383,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     }
   }
   if (routed) {
-    SIRIUS_LOG_DEBUG("Merge sort: ranges={}, nonempty_ranges={}", routed->first, routed->second);
+    SIRIUS_LOG_DEBUG("Merge sort: ranges={}, nonempty_ranges={}, merge_bytes={}, tile_bytes={}",
+                     routed->first,
+                     routed->second,
+                     _merge_bytes,
+                     _tile_bytes);
   }
   return claimed;
 }
@@ -649,7 +671,25 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_merge(work co
     table = std::make_unique<cudf::table>(std::move(columns));
   }
   auto merged = make_data_batch(std::move(table), *space, stream, batch_telemetry());
-  return std::make_unique<result>(batches{std::move(merged)},
+  batches output;
+  {
+    auto read  = merged->to_read_only();
+    auto bytes = read.get_data()->get_uncompressed_data_size_in_bytes();
+    if (bytes > chunk_bytes) {
+      // Publish chunk_bytes batches; each slice is an owning copy, and the merged
+      // table is released once they exist.
+      auto view = get_cudf_table_view(read);
+      for (auto slice : bounded_sort_slices(view, chunk_bytes, bytes, stream)) {
+        output.push_back(make_data_batch(
+          std::make_unique<cudf::table>(slice, stream, mr), *space, stream, batch_telemetry()));
+      }
+    }
+  }
+  if (output.empty()) { output.push_back(std::move(merged)); }
+  if (output.size() > input.parameter) {
+    throw invalid_input_exception("Sort merge output exceeds its output positions");
+  }
+  return std::make_unique<result>(std::move(output),
                                   step::merge,
                                   input.node,
                                   std::vector<uint64_t>{},
@@ -664,7 +704,18 @@ void sirius_physical_merge_sort::sink(operator_data const& output, ::cuda::strea
   auto const& data   = dynamic_cast<result const&>(output);
   auto const& values = data.get_data_batches();
   switch (data.kind) {
-    case step::merge: sirius_physical_operator::sink(output, stream); return;
+    case step::merge: {
+      // A merged node publishes its chunks at consecutive positions from the start of
+      // its interval; execute_merge checked that they fit within it.
+      auto lo = data.get_position().value();
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        for (auto& next : next_port_after_sink) {
+          next.next_operator->push_data_batch_at_position(
+            next.next_operator_port_name, values[i], lo + i);
+        }
+      }
+      return;
+    }
     case step::sample:
       for (std::size_t i = 0; i < values.size(); ++i) {
         _samples->add_data_batch_at_position(values[i], data.ordinals.at(i), data.node);

@@ -93,6 +93,25 @@ TEST_CASE("row sizing caps native arithmetic without allocating native-sized tab
   CHECK_THROWS_AS(sort_chunk_rows(10, 10, 0), sirius::invalid_input_exception);
 }
 
+TEST_CASE("sort partitions are sized for one merge each", "[bounded_sort][cpu]")
+{
+  constexpr std::size_t mib = 1024 * 1024;
+  constexpr std::size_t cap = 4096 * mib;
+  // An explicit target wins over every bound, including below one chunk.
+  CHECK(sort_partition_target_bytes(100, 512 * mib, cap, 7) == 7);
+  // Few runs: one output chunk is the floor.
+  CHECK(sort_partition_target_bytes(4, 512 * mib, cap, 0) == 512 * mib);
+  // Many runs: each run contributes a piece of at least sort_min_piece_bytes.
+  CHECK(sort_partition_target_bytes(20, 512 * mib, cap, 0) == 20 * sort_min_piece_bytes);
+  // A device-memory cap bounds the piece floor, but never goes below one chunk.
+  CHECK(sort_partition_target_bytes(1000, 512 * mib, cap, 0) == cap);
+  CHECK(sort_partition_target_bytes(1000, 512 * mib, 256 * mib, 0) == 512 * mib);
+  CHECK(sort_partition_target_bytes(0, 512 * mib, cap, 0) == 512 * mib);
+  // The merge accepts ranges over target by the slack, saturating instead of wrapping.
+  CHECK(sort_merge_limit_bytes(1000) == 1500);
+  CHECK(sort_merge_limit_bytes(std::numeric_limits<std::size_t>::max()) > cap);
+}
+
 TEST_CASE("registered bounded chunks spill and restore independently", "[bounded_sort]")
 {
   auto manager       = sirius::test::operator_utils::initialize_memory_manager();

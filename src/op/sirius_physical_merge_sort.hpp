@@ -26,11 +26,16 @@
 
 namespace sirius::op {
 
+class sirius_physical_sort_sample;
+
 // Input: individually sorted contributions in each range partition. Each range is a
 // refinement node with an interval of output positions. A node whose decoded bytes fit
-// chunk_bytes (from metadata only) is merged by one task and published at the start of
-// its interval. An oversized node is refined in place, through registered repositories
-// owned by this operator:
+// the merge limit (from metadata only) is merged by one task; its output is sliced into
+// chunk_bytes batches published at consecutive positions from the start of its interval.
+// The merge limit is the sample operator's partition target plus slack, so ranges are
+// normally merged directly. An oversized node (skew, a poor estimate) is refined in
+// place into partition-target-sized children, through registered repositories owned by
+// this operator:
 //
 //   ready -> sampling (bounded contribution groups) -> plan (one splitter task)
 //         -> cutting (bounded contribution groups) -> children ready
@@ -52,8 +57,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
 
   // `ordinals` identify each payload batch within its node (merge/sample/cut/coalesce).
   // For a cut, the node's shared splitter table is the final batch. `parameter` is the
-  // sample stride (sample), splitter step (plan), first child node (cut) or replacement
-  // node (coalesce).
+  // interval width (merge), sample stride (sample), splitter step (plan), first child
+  // node (cut) or replacement node (coalesce).
   struct work : pipelineable_operator_data {
     step kind;
     std::size_t node;
@@ -75,8 +80,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   };
 
   // Batches align with `ordinals` (sample) or `pieces` (cut). A plan result holds the
-  // splitter table, and `ordinals` holds its row count; a merge result holds one
-  // positioned output batch.
+  // splitter table, and `ordinals` holds its row count; a merge result holds the
+  // node's ordered output chunks, positioned from the start of its interval.
   struct result : pipelineable_operator_data {
     step kind;
     std::size_t node;
@@ -97,6 +102,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   bool all_ports_empty() override;
   void on_task_output_published(operator_data const& output) override;
   void register_refinement(cucascade::shared_data_repository_manager& manager);
+  // Supplies the partition target that sets the merge limit; without it, chunk_bytes.
+  void set_sample_op(sirius_physical_sort_sample const* sample) { _sample_op = sample; }
   sirius_physical_merge_sort(sirius_physical_order* order_by);
   sirius_physical_merge_sort(duckdb::vector<sirius::logical_type> types,
                              duckdb::vector<duckdb::BoundOrderByNode> orders,
@@ -127,7 +134,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::vector<std::size_t> projections;
   std::shared_ptr<const sort_comparison_config> comparison;
-  // Decoded-byte target for a merged output chunk; larger nodes are refined.
+  // Decoded-byte target for a published output chunk, and for the input of one
+  // sample, cut or coalesce task.
   std::size_t chunk_bytes{config::DEFAULT_SORT_CHUNK_BYTES};
 
  private:
@@ -177,6 +185,10 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute_coalesce(work const&, ::cuda::stream_ref);
 
   duckdb::vector<std::size_t> _final_projections;
+  sirius_physical_sort_sample const* _sample_op = nullptr;
+  // Largest node merged by one task, and the target size of refined children; set at
+  // ingest.
+  std::size_t _merge_bytes{0}, _tile_bytes{0};
   // Payload contributions by node, positioned by ordinal; samples likewise; one splitter
   // table per node at position zero. All are registered, so queued state is spillable.
   cucascade::shared_data_repository* _parts     = nullptr;

@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/order/bounded_sort.hpp"
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -71,7 +72,8 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* 
                                 sort_sample_bytes,
                                 max_partition_bytes,
                                 max_partition_memory_fraction,
-                                order_by->comparison)
+                                order_by->comparison,
+                                order_by->chunk_bytes)
 {
 }
 
@@ -82,7 +84,8 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
   uint64_t sort_sample_bytes,
   uint64_t max_partition_bytes,
   double max_partition_memory_fraction,
-  std::shared_ptr<const sort_comparison_config> comparison_p)
+  std::shared_ptr<const sort_comparison_config> comparison_p,
+  uint64_t chunk_bytes)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_SAMPLE, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
@@ -91,7 +94,8 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
                                                                              this->types.size())),
     _sort_sample_bytes(sort_sample_bytes),
     _max_partition_bytes_override(max_partition_bytes),
-    _max_partition_memory_fraction(max_partition_memory_fraction)
+    _max_partition_memory_fraction(max_partition_memory_fraction),
+    _chunk_bytes(chunk_bytes)
 {
 }
 
@@ -266,6 +270,17 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
     size_t num_parts          = 1;
     bool const can_size = complete_input || (estimated_cardinality > 0 && avg_rows_per_batch > 0);
+    // Each input batch is one locally sorted run: the run count k sizes the merge unit.
+    size_t total_batch_count = valid_batches.size();
+    if (can_size && !complete_input) {
+      total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
+    }
+    size_t available_memory = space->get_available_memory(stream);
+    size_t partition_bytes  = sort_partition_target_bytes(
+      total_batch_count,
+      _chunk_bytes,
+      static_cast<size_t>(static_cast<double>(available_memory) * _max_partition_memory_fraction),
+      _max_partition_bytes_override);
     if (!can_size) {
       SIRIUS_LOG_WARN(
         "Sort sample: estimated_cardinality={} or avg_rows_per_batch={} is zero, "
@@ -273,20 +288,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         estimated_cardinality,
         avg_rows_per_batch);
     } else {
-      size_t total_batch_count = valid_batches.size();
-      size_t bytes_for_sizing  = total_sample_bytes;
-      if (!complete_input) {
-        total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
-        bytes_for_sizing  = avg_batch_bytes * total_batch_count;
-      }
-      size_t available_memory    = space->get_available_memory(stream);
-      size_t max_partition_bytes = _max_partition_bytes_override > 0
-                                     ? _max_partition_bytes_override
-                                     : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                           _max_partition_memory_fraction);
-
-      if (max_partition_bytes > 0 && bytes_for_sizing > max_partition_bytes) {
-        num_parts = (bytes_for_sizing + max_partition_bytes - 1) / max_partition_bytes;
+      size_t bytes_for_sizing = total_sample_bytes;
+      if (!complete_input) { bytes_for_sizing = avg_batch_bytes * total_batch_count; }
+      if (bytes_for_sizing > partition_bytes) {
+        num_parts = (bytes_for_sizing + partition_bytes - 1) / partition_bytes;
       }
       num_parts = std::min(num_parts, std::max<size_t>(1, total_rows));
 
@@ -294,7 +299,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         "Sort sample: complete_input={}, estimated_cardinality={}, total_rows={}, "
         "avg_rows_per_batch={}, "
         "avg_batch_bytes={}, total_batch_count={}, "
-        "bytes_for_sizing={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+        "bytes_for_sizing={}, available_memory={}, partition_bytes={}, num_partitions={}",
         complete_input,
         estimated_cardinality,
         total_rows,
@@ -303,7 +308,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         total_batch_count,
         bytes_for_sizing,
         available_memory,
-        max_partition_bytes,
+        partition_bytes,
         num_parts);
     }
 
@@ -316,7 +321,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     if (num_parts <= 1 || total_rows == 0) {
       // Single partition — no boundaries needed
       if (_boundary_state.load(std::memory_order_acquire) != BoundaryState::DONE) {
-        _num_partitions = 1;
+        _num_partitions  = 1;
+        _partition_bytes = partition_bytes;
         _partition_boundaries.reset();
       }
     } else {
@@ -356,7 +362,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       if (_boundary_state.load(std::memory_order_acquire) != BoundaryState::DONE) {
         _partition_boundaries = output_boundaries;
         if (_boundary_repo) { _boundary_repo->add_data_batch(_partition_boundaries, 0); }
-        _num_partitions = num_parts;
+        _num_partitions  = num_parts;
+        _partition_bytes = partition_bytes;
       }
     }
 

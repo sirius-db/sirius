@@ -87,7 +87,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     uint64_t sort_sample_bytes           = config::DEFAULT_SORT_SAMPLE_BYTES,
     uint64_t max_partition_bytes         = 0,
     double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION,
-    std::shared_ptr<const sort_comparison_config> comparison_p = nullptr);
+    std::shared_ptr<const sort_comparison_config> comparison_p = nullptr,
+    uint64_t chunk_bytes                                       = config::DEFAULT_SORT_CHUNK_BYTES);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -113,6 +114,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Get the computed number of partitions
   size_t get_num_partitions() const { return _num_partitions; }
 
+  //! Target bytes of one range partition (the merge unit); valid once boundaries are computed
+  size_t get_partition_bytes() const { return _partition_bytes; }
+
   //! Whether boundaries have been computed
   bool boundaries_computed() const
   {
@@ -127,6 +131,12 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;
+
+  //! Target bytes per range partition, set with _num_partitions
+  size_t _partition_bytes = 0;
+
+  //! Output chunk target of the sort; the floor of the partition target
+  uint64_t _chunk_bytes = config::DEFAULT_SORT_CHUNK_BYTES;
 
   //! Boundary computation lifecycle: NOT_DONE → SCHEDULED (input claimed) → DONE.
   //! get_next_task_input_data() transitions to SCHEDULED under the task-creation lock;

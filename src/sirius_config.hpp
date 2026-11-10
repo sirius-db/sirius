@@ -76,8 +76,10 @@ constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 /// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
 constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
-/// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
-constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
+/// Cap on a sort partition, as a fraction of available GPU memory, when
+/// max_sort_partition_bytes is 0. One partition is merged by one task, which holds about
+/// four times its input; partitions may exceed the target by the merge slack.
+constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.08;
 
 /// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
 /// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only

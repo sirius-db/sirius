@@ -29,6 +29,7 @@
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <op/order/bounded_sort.hpp>
 #include <op/sirius_physical_sort_partition.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
@@ -305,6 +306,7 @@ TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition b
   REQUIRE(output != nullptr);
   REQUIRE(sample_op.boundaries_computed());
   REQUIRE(sample_op.get_num_partitions() == 2);
+  CHECK(sample_op.get_partition_bytes() == 2500);
   REQUIRE(sirius::get_cudf_table_view(*dynamic_cast<sort_sample_output&>(*output).boundaries)
             .num_rows() == 1);
 
@@ -357,6 +359,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
 
   auto output = sample_op.execute(*input, cudf::get_default_stream());
   CHECK(sample_op.get_num_partitions() == 2);
+  CHECK(sample_op.get_partition_bytes() == batch_bytes - 1);
   CHECK(sirius::get_cudf_table_view(*dynamic_cast<sort_sample_output&>(*output).boundaries)
           .num_rows() == 1);
 
@@ -373,6 +376,41 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
   REQUIRE(sampled.boundaries);
   CHECK(sampled.get_data_batches().size() == 1);
   CHECK(sirius::get_cudf_table_view(*sampled.boundaries).num_rows() == 1);
+}
+
+TEST_CASE("sirius_physical_sort_sample sizes automatic partitions from runs and chunk size",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::INTEGER));
+  // Two complete runs and a tiny chunk: the piece floor (two runs of 64 MiB) sets
+  // the target, so this small input stays in one range. The whole of the test memory
+  // space is the cap, which keeps it above the floor.
+  sirius_physical_sort_sample sample_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    1000,
+    /*sort_sample_bytes=*/1'000'000,
+    /*max_partition_bytes=*/0,
+    /*max_partition_memory_fraction=*/1.0,
+    nullptr,
+    /*chunk_bytes=*/1);
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  add_int_batches(*repo, *space, 2, 10);
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(true);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  REQUIRE(space->get_available_memory(cudf::get_default_stream()) >
+          4 * sirius::op::sort_min_piece_bytes);
+  sample_op.execute(*input, cudf::get_default_stream());
+  CHECK(sample_op.get_num_partitions() == 1);
+  CHECK(sample_op.get_partition_bytes() == 2 * sirius::op::sort_min_piece_bytes);
 }
 
 TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplicate boundaries",

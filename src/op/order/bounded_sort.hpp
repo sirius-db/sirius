@@ -28,15 +28,39 @@
 
 namespace sirius::op {
 
-// Cold start: merge output and owning copies coexist (2x); key search, merge
-// scratch, promoted string offsets and allocation rounding get another 4x.
-// This is a starting estimate, not a permanent floor over observed history.
+// Cold start, beyond the admitted input: the merged output and potentially the copied slices.
 inline constexpr std::size_t merge_cold_estimate_base  = 64 * 1024;
-inline constexpr std::size_t merge_cold_estimate_scale = 6;
+inline constexpr std::size_t merge_cold_estimate_scale = 2;
 inline std::size_t merge_cold_peak_estimate(std::size_t input_bytes)
 {
   return memory::saturating_add(memory::saturating_mul(input_bytes, merge_cold_estimate_scale),
                                 merge_cold_estimate_base);
+}
+
+// Partitioning k runs into ranges of P bytes cuts each run into pieces of about P / k.
+// Ranges are kept large enough that pieces do not become slivers.
+inline constexpr std::size_t sort_min_piece_bytes = std::size_t{64} * 1024 * 1024;
+// A merge accepts ranges up to this multiple of the partition target, absorbing the
+// error of sampled boundaries without refining ranges slightly over target.
+inline constexpr std::size_t sort_merge_slack_num = 3;
+inline constexpr std::size_t sort_merge_slack_den = 2;
+
+// The merge unit: the target bytes of one range partition, merged by one task.
+// `override_bytes` (when nonzero) wins. Otherwise at least one output chunk, and k
+// pieces of sort_min_piece_bytes, but no more than `cap` (a share of device memory).
+inline std::size_t sort_partition_target_bytes(std::size_t runs,
+                                               std::size_t chunk_bytes,
+                                               std::size_t cap,
+                                               std::size_t override_bytes)
+{
+  if (override_bytes) { return override_bytes; }
+  auto pieces = memory::saturating_mul(std::max<std::size_t>(runs, 1), sort_min_piece_bytes);
+  return std::max(chunk_bytes, std::min(pieces, cap));
+}
+
+inline std::size_t sort_merge_limit_bytes(std::size_t partition_bytes)
+{
+  return memory::saturating_mul(partition_bytes, sort_merge_slack_num) / sort_merge_slack_den;
 }
 
 // Native row arithmetic is independent of device allocation. Logical row

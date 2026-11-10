@@ -118,9 +118,12 @@ std::shared_ptr<data_batch> sort_batch(const std::shared_ptr<data_batch>& batch,
 
 // Drive the same claim/prepare/execute/publish lifecycle as production. Each round
 // claims every currently available task, then completes them in reverse claim order,
-// so publication order differs from claim order. Returns final chunks in position order.
+// so publication order differs from claim order. Returns final chunks in position order,
+// and records the kind of every executed task in `kinds` when given.
 std::vector<std::shared_ptr<data_batch>> run_ranges(
-  sirius_physical_merge_sort& merge, std::vector<std::vector<std::shared_ptr<data_batch>>> ranges)
+  sirius_physical_merge_sort& merge,
+  std::vector<std::vector<std::shared_ptr<data_batch>>> ranges,
+  std::vector<sirius_physical_merge_sort::step>* kinds = nullptr)
 {
   cucascade::shared_data_repository_manager repositories;
   cucascade::shared_data_repository input, output;
@@ -147,6 +150,7 @@ std::vector<std::shared_ptr<data_batch>> run_ranges(
     if (claimed.empty()) { break; }
     for (auto it = claimed.rbegin(); it != claimed.rend(); ++it) {
       auto& work = dynamic_cast<pipelineable_operator_data&>(**it);
+      if (kinds) { kinds->push_back(dynamic_cast<sirius_physical_merge_sort::work&>(work).kind); }
       work.prepare_for_processing(get_default_gpu_space(), default_stream());
       auto result = merge.execute(work, default_stream());
       default_stream().sync();
@@ -652,6 +656,45 @@ TEST_CASE("merge sort coalesces many small contributions before refining", "[phy
   auto op                       = make_bigint_merge(duckdb::OrderType::ASCENDING, chunk_bytes);
   auto chunks                   = run_ranges(*op, {inputs});
   CHECK(chunks.size() > 1);
+  REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == expected);
+}
+
+TEST_CASE("merge sort merges a range within the partition target and slices its output",
+          "[physical_merge_sort]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  // The sample operator's partition target sets the merge limit: 8 KiB plus slack.
+  duckdb::vector<duckdb::BoundOrderByNode> sample_orders;
+  sample_orders.push_back(make_order(0, duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT)));
+  sirius_physical_sort_sample sample(
+    duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::BIGINT)},
+    std::move(sample_orders),
+    1,
+    /*sort_sample_bytes=*/1,
+    /*max_partition_bytes=*/8192);
+  sample.execute(pipelineable_operator_data({make_1col_batch(*space, {1, 2, 3})}),
+                 default_stream());
+  REQUIRE(sample.get_partition_bytes() == 8192);
+
+  std::mt19937_64 rng(5);
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  std::vector<int64_t> expected;
+  // 1200 rows (9600 bytes): over the chunk target, within the merge limit.
+  for (std::size_t rows : {500, 300, 400}) {
+    auto values = sorted_values(rng, rows, 1000, false);
+    expected.insert(expected.end(), values.begin(), values.end());
+    inputs.push_back(make_1col_batch(*space, values));
+  }
+  std::sort(expected.begin(), expected.end());
+
+  std::size_t const chunk_bytes = 1024;
+  auto op                       = make_bigint_merge(duckdb::OrderType::ASCENDING, chunk_bytes);
+  op->set_sample_op(&sample);
+  std::vector<sirius_physical_merge_sort::step> kinds;
+  auto chunks = run_ranges(*op, {inputs}, &kinds);
+  CHECK(kinds == std::vector{sirius_physical_merge_sort::step::merge});
+  CHECK(chunks.size() >= 9);
   REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == expected);
 }
 
