@@ -308,12 +308,12 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
   }
 
-  SECTION("a multi-partition build publishes nothing without accumulation")
+  SECTION("a multi-partition build publishes its complete filter whatever the retired switch says")
   {
     // Correctness stake: a filter built from one partition's slice of the build keys would drop
-    // probe rows that do join, so this must be pinned on a build that really spans partitions.
-    // Accumulation (on by default) legitimately publishes for such a build, so it is turned off
-    // here to pin the whole-build path alone.
+    // probe rows that do join, so this must be pinned on a build that really spans partitions. The
+    // build PARTITION constructs from every batch of the certified build, with or without the
+    // retired multi-partition switch.
     sirius::test::scoped_sirius_setting accumulation_off(
       con, "enable_dynamic_filter_multi_partition", false);
     // The summed columns exist only to keep the projection from pruning them, widening the build
@@ -335,8 +335,8 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
       "where l.l_shipdate >= date '1992-01-01'");
 
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
-    REQUIRE(deltas.on.publications_finished == 0);
-    REQUIRE(deltas.on.publications_skipped_build_not_whole > 0);
+    REQUIRE(deltas.on.publications_finished > 0);
+    REQUIRE(deltas.on.publications_skipped_build_not_whole == 0);
   }
 
   SECTION("an unfiltered aggregate build supplies no publication evidence")

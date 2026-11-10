@@ -502,9 +502,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool _build_arrives_whole = false;
 
-  // Guarded by op_state_mutex.
-  bool _build_not_whole_reported = false;
-
   // Whole-counted BUILD_PROBE and orphan bytes. Relaxed reads may be slightly stale.
   std::atomic<std::size_t> _whole_probe_bytes{0};
 

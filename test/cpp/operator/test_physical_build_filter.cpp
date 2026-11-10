@@ -138,7 +138,8 @@ TEST_CASE("build filter publishes once after every complete-input batch contribu
 
   fixture.filter->finalize_operator();
   REQUIRE(fixture.gpu.channel->snapshot().terminal());
-  REQUIRE_FALSE(fixture.gpu.session->try_begin_accumulation(acc::fixture::certify(batches)));
+  REQUIRE_FALSE(fixture.gpu.session->begin(
+    std::get<op::complete_build_inventory>(acc::fixture::certify(batches))));
   REQUIRE(fixture.gpu.channel->filter_count() == 2);
 }
 
@@ -176,7 +177,7 @@ TEST_CASE("declined build filter forwards input and preserves the later publicat
   auto input = fixture.filter->get_next_task_input_data();
   REQUIRE(input);
   fixture.execute(*input, batch);
-  REQUIRE_FALSE(fixture.gpu.session->accumulation_claimed());
+  REQUIRE_FALSE(fixture.gpu.session->terminal());
   REQUIRE(fixture.gpu.channel->filter_count() == 0);
   REQUIRE(fixture.gpu.stats.snapshot().*counter == 1);
   fixture.filter->finalize_operator();
@@ -204,7 +205,8 @@ TEST_CASE("build filter cancellation and allocation refusal preserve batches",
   REQUIRE(fixture.gpu.channel->filter_count() == 0);
   REQUIRE(fixture.input_repo.total_size() == 0);
   fixture.filter->finalize_operator();
-  REQUIRE(fixture.gpu.channel->snapshot().terminal() == !refuse_allocation);
+  // A refused begin ends the session at once, like a cancelled one.
+  REQUIRE(fixture.gpu.channel->snapshot().terminal());
 }
 
 TEST_CASE("a build filter budgets scratch rather than its resident input",
@@ -247,12 +249,16 @@ TEST_CASE("a build filter scratch bound covers peer reduction",
   op::sirius_physical_build_filter filter{build_types(), 100, *fixture.session};
   auto const first  = fixture.make_batch(0, 0, 300);
   auto const second = fixture.make_batch(1, 1000, 300);
-  REQUIRE(fixture.session->try_begin_accumulation(acc::fixture::certify({first, second})));
+  REQUIRE(fixture.session->begin(
+    std::get<op::complete_build_inventory>(acc::fixture::certify({first, second}))));
   fixture.contribute(first);
   fixture.contribute(second);
 
+  // The Construction Plan gives each key only a Bloom Filter, sized on the build's 600 valid rows.
+  // A Bloom Contribution allocates nothing, so the Publishing Task on GPU 1 allocates only the
+  // buffers that merge GPU 0's arrays into its own.
   auto const bound = filter.no_history_peak_memory_estimate({1, 256 * acc::mib});
-  REQUIRE(bound == 16 * acc::mib);
+  REQUIRE(bound == acc::merge_scratch_bytes(acc::bloom_geometry(600)));
   auto const stream = fixture.task_stream(1);
   {
     rmm::cuda_set_device_raii device{rmm::cuda_device_id{1}};
@@ -372,6 +378,6 @@ TEST_CASE("an empty build filter pipeline finishes without tasks and releases it
   REQUIRE(publication_pipeline->get_tasks_created() == 0);
   REQUIRE(publication_pipeline->get_tasks_completed() == 0);
   REQUIRE(publication_ptr->finalized.load());
-  REQUIRE_FALSE(tree.join->dynamic_filter_session().accumulation_claimed());
+  REQUIRE_FALSE(tree.join->dynamic_filter_session().terminal());
   REQUIRE_FALSE(build.get_next_task_hint());
 }

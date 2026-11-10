@@ -176,15 +176,15 @@ using certified_build_input = std::variant<complete_build_inventory, constructio
  *
  * PARTITION or BUILD_FILTER records each arrival from `on_input_batch_pushed`, before the batch
  * becomes poppable, and certifies the ledger once its source pipeline has finished. The ledger
- * records `(id, rows)` and each top-level column's carrier and null count (`read_arrival`). A
- * compressed, unreadable, or non-GPU arrival closes the ledger with that reason, and it then cannot
- * certify; a missing or changed column only makes that ordinal unavailable to key admission.
- * Payload child layouts do not affect certification. After such an arrival, `abandon()`, or a
- * failed `certify()`, arrivals are ignored.
+ * records `(id, rows)` and each top-level column's carrier and null count (`read_arrival`) from a
+ * GPU, host, or disk table. A compressed or unreadable arrival closes the ledger with that reason,
+ * and it then cannot certify; a missing or changed column only makes that ordinal unavailable to
+ * key admission. Payload child layouts do not affect certification. After such an arrival,
+ * `abandon()`, or a failed `certify()`, arrivals are ignored.
  *
  * After `certify()` succeeded, an arrival that could add keys throws `std::logic_error`: a FULL
- * barrier received a batch after its source pipeline finished. A readable GPU arrival without rows
- * cannot add keys and is ignored.
+ * barrier received a batch after its source pipeline finished. A readable GPU, host, or disk
+ * arrival without rows cannot add keys and is ignored.
  */
 class build_arrival_ledger final {
  public:
@@ -198,7 +198,7 @@ class build_arrival_ledger final {
   /**
    * @brief Records one arriving batch without waiting for its data lock or accessing device data.
    *
-   * @throw std::logic_error if the ledger was already certified and @p batch is not a readable GPU
+   * @throw std::logic_error if the ledger was already certified and @p batch is not a readable
    * batch without rows
    */
   void record(cucascade::data_batch& batch);
@@ -206,8 +206,8 @@ class build_arrival_ledger final {
   /**
    * @brief Certifies the recorded batches as the complete build input, at most once.
    *
-   * Transitions RECORDING to CERTIFIED on success, or to CLOSED on failure (non-GPU, unreadable, or
-   * inconsistent batch).
+   * Transitions RECORDING to CERTIFIED on success, or to CLOSED on failure (compressed, unreadable,
+   * or inconsistent batch).
    *
    * @pre No further batch can arrive: the input port is FULL and its source pipeline has finished.
    * @return The inventory iff the ledger is still recording and recorded exactly

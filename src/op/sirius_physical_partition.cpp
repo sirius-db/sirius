@@ -156,6 +156,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
   // the input batches; the fan-out to slots happens in sink().
   if (routing->mode != partition_mode::hash || count < 2) {
+    // Contribute to the dynamic filters before the routed output is built.
+    std::optional<std::uint64_t> forward_publication_id;
+    if (_input_observer) {
+      forward_publication_id = _input_observer->before_transform(input, input_batch_ro, stream);
+    }
     std::vector<std::size_t> destinations;
     std::vector<std::shared_ptr<cucascade::data_batch>> batches;
     auto add = [&](std::size_t destination) {
@@ -185,6 +190,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     }
     auto result =
       std::make_unique<routed_operator_data>(std::move(batches), std::move(destinations));
+    if (forward_publication_id && space != nullptr) {
+      _input_observer->after_transform(*forward_publication_id, *space, stream);
+    }
     record_actual_bytes();
     return result;
   }
@@ -217,8 +225,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       }
     }
   }
-  // Contribute to the accumulated filter before scattering to partitions.
+  // Contribute to the dynamic filters before scattering to partitions.
   if (_input_observer) {
+    _input_observer->on_hash_input(input_batch_ro);
     publication_id = _input_observer->before_transform(input, input_batch_ro, stream);
   }
   partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
@@ -496,12 +505,15 @@ void sirius_physical_partition::on_finalize_operator()
 std::size_t sirius_physical_partition::no_history_peak_memory_estimate(
   input_stats const& stats) const
 {
+  // A Construction Site task also reserves `task_scratch_bytes`, in case it is the Publishing Task.
+  auto const scratch  = _input_observer ? _input_observer->task_scratch_bytes() : 0;
   auto const resolved = layout();
-  if (resolved &&
+  if (resolved && scratch == 0 &&
       (resolved->mode != partition_mode::hash || resolved->placement->num_partitions() == 1)) {
     return 0;
   }
-  return sirius::memory::saturating_mul(stats.bytes, std::size_t{2});
+  return sirius::memory::saturating_add(sirius::memory::saturating_mul(stats.bytes, std::size_t{2}),
+                                        scratch);
 }
 
 }  // namespace op

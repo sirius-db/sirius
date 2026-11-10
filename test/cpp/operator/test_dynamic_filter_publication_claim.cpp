@@ -121,18 +121,16 @@ TEST_CASE("hash join in BUILD_PROBE mode still publishes from a whole build",
   CHECK_FALSE(fixture.channel->snapshot().empty());
 }
 
-TEST_CASE("a wired join whose build is not whole reports the skip exactly once",
+TEST_CASE("a wired join whose build is not whole publishes nothing from its deposits",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
-  // `set_build_arrives_whole` is never called, so the window can never claim. The condition is
-  // fixed before the first delivery, so every later build batch would report the same fact.
+  // `set_build_arrives_whole` is never called, so the window can never claim. The build PARTITION
+  // is the construction site, so the deposit path no longer counts anything either.
   claim_fixture fixture;
 
   fixture.push_build_batch();
-  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 1);
-
   fixture.push_build_batch();
-  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 1);
+  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
 
   CHECK(fixture.stats.publication_attempts.load() == 0);
   CHECK(fixture.channel->snapshot().empty());

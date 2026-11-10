@@ -39,6 +39,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -154,20 +155,6 @@ TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
   ledger arrivals;
   arrivals.record(*valid);
 
-  // Host arrivals are readable, but certification still accepts only GPU arrivals.
-  SECTION("a batch that is not GPU resident")
-  {
-    auto const spilled = fixture.make_batch(0, 10, 4);
-    auto* host = fixture.manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
-    auto const stream = fixture.gpu(0).acquire_stream();
-    {
-      auto writable = spilled->to_mutable();
-      writable.convert_to<cucascade::host_data_representation>(
-        sirius::converter_registry::get(), host, stream);
-    }
-    stream.sync();
-    arrivals.record(*spilled);
-  }
   SECTION("a batch that is mutably locked at push")
   {
     auto const locked = fixture.make_batch(0, 10, 4);
@@ -179,6 +166,64 @@ TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
   }
   REQUIRE(decline_of(arrivals.certify({.repository_batches = 2})) ==
           construction_decline::unreadable_arrival);
+}
+
+namespace {
+
+/// Spills @p batch to host memory, as the downgrade executor would.
+void spill_to_host(acc::fixture const& fixture, acc::batch_ptr const& batch)
+{
+  auto* host = fixture.manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
+  auto const stream = fixture.gpu(0).acquire_stream();
+  {
+    auto writable = batch->to_mutable();
+    writable.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), host, stream);
+  }
+  stream.sync();
+}
+
+}  // namespace
+
+TEST_CASE("a spilled host arrival certifies with the facts a GPU arrival records",
+          "[dynamic_filter][multi_partition][inventory]")
+{
+  acc::fixture fixture;
+  auto const resident = fixture.make_batch(0, 0, 4);
+  auto const spilled  = fixture.make_batch(0, 10, 6);
+  spill_to_host(fixture, spilled);
+  ledger arrivals;
+  arrivals.record(*resident);
+  arrivals.record(*spilled);
+  auto certified = arrivals.certify({.repository_batches = 2});
+  REQUIRE_FALSE(decline_of(certified));
+  auto const& complete = std::get<inventory>(certified);
+  REQUIRE(complete.total_rows() == 10);
+  auto const index =
+    static_cast<std::size_t>(complete.find(spilled->get_batch_id()) - complete.batches().data());
+  auto const host_columns = complete.batch_columns(index);
+  auto const gpu_columns  = complete.batch_columns(1 - index);
+  REQUIRE(host_columns.size() == gpu_columns.size());
+  for (std::size_t column = 0; column < host_columns.size(); ++column) {
+    CHECK(host_columns[column].carrier == gpu_columns[column].carrier);
+    CHECK(host_columns[column].null_count == gpu_columns[column].null_count);
+  }
+}
+
+TEST_CASE("after certification a late empty host arrival is ignored, one with rows throws",
+          "[dynamic_filter][multi_partition][inventory]")
+{
+  acc::fixture fixture;
+  auto const batch = fixture.make_batch(0, 0, 4);
+  ledger arrivals;
+  arrivals.record(*batch);
+  REQUIRE_FALSE(decline_of(arrivals.certify({.repository_batches = 1})));
+  auto const empty = fixture.make_batch(0, 100, 0);
+  spill_to_host(fixture, empty);
+  REQUIRE_NOTHROW(arrivals.record(*empty));
+  auto const late = fixture.make_batch(0, 200, 3);
+  spill_to_host(fixture, late);
+  REQUIRE_THROWS_AS(arrivals.record(*late), std::logic_error);
 }
 
 TEST_CASE("certified inventories need no downstream partition count and transfer on move",
@@ -278,10 +323,10 @@ class fake_compressed_representation final : public sirius::simpatico_compressed
   }
 };
 
-/// A GPU batch of @p rows rows: an all-null INT32 column and a valid DECIMAL64(-2) column.
-acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type rows)
+/// A batch of @p rows rows in GPU @p space: an all-null INT32 column and a valid DECIMAL64(-2)
+/// column.
+acc::batch_ptr make_nullable_batch(cucascade::memory::memory_space& space, cudf::size_type rows)
 {
-  auto& space       = fixture.gpu(0);
   auto const stream = space.acquire_stream();
   auto const mr     = space.get_default_allocator();
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -296,6 +341,12 @@ acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type 
   stream.sync();
   return sirius::make_data_batch(
     std::move(*table), space, stream, sirius::telemetry::batch_telemetry_info{});
+}
+
+/// `make_nullable_batch` on the first GPU of @p fixture.
+acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type rows)
+{
+  return make_nullable_batch(fixture.gpu(0), rows);
 }
 
 auto const k_int32     = cudf::data_type{cudf::type_id::INT32};
@@ -335,6 +386,75 @@ TEST_CASE("an arrival reports each column's carrier and null count from GPU and 
   CHECK(spilled.tier == cucascade::memory::Tier::HOST);
   CHECK(spilled.rows == 5);
   CHECK(spilled.columns == expected);
+}
+
+namespace {
+
+/// One GPU whose memory manager also spills to a disk tier in a temporary directory.
+struct disk_memory {
+  std::filesystem::path directory;
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+  cucascade::memory::memory_space* gpu  = nullptr;
+  cucascade::memory::memory_space* disk = nullptr;
+
+  explicit disk_memory(std::string_view name)
+    : directory{std::filesystem::temp_directory_path() / name}
+  {
+    std::filesystem::create_directories(directory);
+    sirius::converter_registry::reset_for_testing();
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(std::size_t{1} << 30)
+      .set_reservation_fraction_per_gpu(0.75)
+      .set_per_numa_region_capacity(std::size_t{1} << 30)
+      .use_gpu_id_as_host_id()
+      .set_reservation_fraction_per_numa_region(0.75)
+      .set_disk_mounting_point(0, std::size_t{4} << 30, directory.string());
+    manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+    sirius::converter_registry::initialize();
+    gpu  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+    disk = const_cast<cucascade::memory::memory_space*>(
+      manager->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).front());
+    REQUIRE(gpu != nullptr);
+  }
+  disk_memory(disk_memory const&)            = delete;
+  disk_memory& operator=(disk_memory const&) = delete;
+  ~disk_memory()
+  {
+    manager.reset();
+    std::filesystem::remove_all(directory);
+  }
+
+  /// Moves @p batch to the disk tier, as the downgrade executor would.
+  void spill(cucascade::data_batch& batch) const
+  {
+    auto const stream = gpu->acquire_stream();
+    {
+      auto writable = batch.to_mutable();
+      writable.convert_to<cucascade::disk_data_representation>(
+        sirius::converter_registry::get(), disk, stream);
+    }
+    stream.sync();
+  }
+};
+
+}  // namespace
+
+TEST_CASE("after certification a late empty disk arrival is ignored, one with rows throws",
+          "[dynamic_filter][construction][inventory]")
+{
+  disk_memory const memory{"sirius_test_late_disk_arrival"};
+  auto const batch = make_nullable_batch(*memory.gpu, 4);
+  ledger arrivals;
+  arrivals.record(*batch);
+  REQUIRE_FALSE(decline_of(arrivals.certify({.repository_batches = 1})));
+  auto const empty = make_nullable_batch(*memory.gpu, 0);
+  memory.spill(*empty);
+  REQUIRE(facts_of(*empty).tier == cucascade::memory::Tier::DISK);
+  REQUIRE_NOTHROW(arrivals.record(*empty));
+  auto const late = make_nullable_batch(*memory.gpu, 3);
+  memory.spill(*late);
+  REQUIRE_THROWS_AS(arrivals.record(*late), std::logic_error);
 }
 
 TEST_CASE("an arrival reports each column's carrier and null count from a disk table",

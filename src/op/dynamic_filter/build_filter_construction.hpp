@@ -95,16 +95,16 @@ class build_filter_construction final {
   };
 
   /**
-   * @brief The task that publishes: its GPU's memory space, stream, and allocator
+   * @brief The Publishing Task's GPU memory space, stream, and allocator
    */
   struct publication_root {
-    /** @brief The root GPU's memory space; the room left in it is checked before each root filter
-     */
-    cucascade::memory::memory_space& space;
-    /** @brief The publishing task's stream, on the root GPU */
+    /** @brief The Publishing GPU's memory space; the room left in it is checked before each filter
+     * is built there */
+    cucascade::memory::memory_space const& space;
+    /** @brief The Publishing Task's stream, on the Publishing GPU */
     ::cuda::stream_ref stream;
-    /** @brief The publishing task's allocator: publication scratch and the root filters are charged
-     * to it */
+    /** @brief The Publishing Task's allocator: the Bloom Filter merge buffers and the filters built
+     * on the Publishing GPU are charged to it */
     rmm::device_async_resource_ref scratch;
   };
 

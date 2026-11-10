@@ -303,11 +303,12 @@ TEST_CASE("an accumulated publication logs every bound key once",
   REQUIRE(fixture.channel->snapshot().terminal());
   fixture.session->finalize_input();
 
-  auto const bytes = acc::bloom_geometry(500, 2, 256 * acc::mib).raw_bytes;
+  // Each key's Bloom filter is sized on its own valid rows, which the inventory records.
+  auto const bytes = op::sirius_dynamic_bloom_filter::estimated_bytes(500);
   auto const line  = [&](std::size_t key) {
     return std::format(
       "[dynamic_filter_key] v=1 sig=0000000000000000 occ=0 join=- condition={0} build_ordinal={0} "
-       "rows=500 valid=unknown kind=bloom size={1} zone_map=0 pushed=1 reason=-",
+       "rows=500 valid=500 kind=bloom size={1} zone_map=0 pushed=1 reason=-",
       key,
       bytes);
   };
@@ -322,11 +323,14 @@ TEST_CASE("an accumulation that ends without publishing logs why per key",
   auto const first  = fixture.make_batch(0, 0, 300);
   auto const second = fixture.make_batch(0, 1000, 200);
   std::string reason;
-  std::string rows = "500";
+  std::string rows  = "500";
+  std::string valid = "500";
   SECTION("input closed before every batch contributed")
   {
     REQUIRE(fixture.begin({first, second}));
     fixture.contribute(first);
+    // An attempt that is still collecting has logged nothing yet.
+    CHECK(key_lines(sink).empty());
     reason = "attempt_skip_accumulations_incomplete";
   }
   SECTION("a cap below the arrays")
@@ -338,30 +342,31 @@ TEST_CASE("an accumulation that ends without publishing logs why per key",
   {
     REQUIRE_FALSE(fixture.begin({first, second},
                                 fixture.make_plan(256 * acc::mib,
-                                                  {cudf::data_type{cudf::type_id::INT64},
-                                                   cudf::data_type{cudf::type_id::INT32}})));
+                                                  {cudf::data_type{cudf::type_id::INT16},
+                                                   cudf::data_type{cudf::type_id::INT16}})));
     reason = "type_mismatch";
+    valid  = "unknown";
   }
   SECTION("a ledger that disagrees with its repository")
   {
     fixture.session = std::make_unique<op::dynamic_filter_publication_session>(
       fixture.make_plan(256 * acc::mib), &fixture.stats);
-    REQUIRE_FALSE(
-      fixture.session->try_begin_accumulation(op::construction_decline::inventory_mismatch));
+    fixture.session->decline(op::construction_decline::inventory_mismatch);
     reason = "declined_inventory_mismatch";
     rows   = "0";
+    valid  = "unknown";
   }
-  CHECK(key_lines(sink).empty());
   fixture.session->finalize_input();
   fixture.session->cancel();
 
   auto const line = [&](std::size_t key) {
     return std::format(
       "[dynamic_filter_key] v=1 sig=0000000000000000 occ=0 join=- condition={0} build_ordinal={0} "
-      "rows={1} valid=unknown kind=none size=0 zone_map=0 pushed=0 reason={2}",
+      "rows={1} valid={3} kind=none size=0 zone_map=0 pushed=0 reason={2}",
       key,
       rows,
-      reason);
+      reason,
+      valid);
   };
   CHECK(key_lines(sink) == std::vector<std::string>{line(0), line(1)});
 }
