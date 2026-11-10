@@ -2456,7 +2456,7 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   const cucascade::memory::memory_space& mem_space,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::shared_ptr<const expression_query_caches> expression_caches,
   expression_query_policy policy)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
@@ -2689,7 +2689,7 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
                                         policy,
                                         sirius::expression_evaluator::default_min_ast_size,
                                         like_swar_fastpath,
-                                        like_cache);
+                                        expression_caches);
       auto const data_positions = output_data_positions(*_plan);
       bool const project_output = !data_positions.empty() && can_project_during_filter();
       view = project_output ? owning_table_view{exec.select(view.view(), data_positions)}
@@ -2895,7 +2895,7 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::shared_ptr<const expression_query_caches> expression_caches,
   std::unique_ptr<cudf::column>* survivors,
   std::span<std::size_t const> elided,
   expression_query_policy policy)
@@ -2958,7 +2958,7 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
           policy,
           sirius::expression_evaluator::default_min_ast_size,
           like_swar_fastpath,
-          std::move(like_cache));
+          std::move(expression_caches));
         auto& exec = *state->evaluator;
         std::unique_ptr<cudf::table> filtered;
         auto const data_positions = output_data_positions(*_plan);

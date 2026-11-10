@@ -27,6 +27,7 @@
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/nvrtc/boundary_column_map.hpp>
+#include <expression_evaluator/nvrtc/string_constant_cache.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 
 #include <cstdint>
@@ -78,6 +79,9 @@ struct sink_options {
   bool like_swar_fastpath{false};   ///< Whether constant `%lit%...%` patterns may use the SWAR
                                     ///< matcher (the `like_swar_fastpath` setting).
   like_classifier classify_like{};  ///< The evaluator's memoized pattern classification.
+  string_constant_cache const* string_constants{
+    nullptr};  ///< The query's string-constant copies; required when a kernel has a non-empty
+               ///< string constant.
 };
 
 /** @brief Result of @c evaluate_project_sink. */
@@ -127,7 +131,7 @@ struct filter_sink_result {
  * @param input The input table view.
  * @param stream The CUDA stream on which to allocate outputs and launch the kernel.
  * @param mr The device memory resource used for output column allocations.
- * @param options Boundary map and LIKE policy.
+ * @param options Boundary map, LIKE policy, and string-constant cache.
  * @return The projected table and the translation statistics.
  */
 [[nodiscard]] project_sink_result evaluate_project_sink(
@@ -148,7 +152,7 @@ struct filter_sink_result {
  *                       `select_with_survivors`).
  * @param stream The CUDA stream on which to allocate outputs and launch the kernel.
  * @param mr The device memory resource used for output column allocations.
- * @param options Boundary map and LIKE policy.
+ * @param options Boundary map, LIKE policy, and string-constant cache.
  * @return The surviving rows of @p projected_input, the survivors when requested, and the
  *         translation statistics.
  */

@@ -107,7 +107,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
                       expression_policy(),
                       expression_evaluator::default_min_ast_size,
                       like_swar_fastpath_enabled(),
-                      like_cache());
+                      expression_caches());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;

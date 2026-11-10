@@ -430,7 +430,7 @@ std::optional<filtered_table> composite_scan_driver::materialize(
   cucascade::memory::memory_space const& space,
   ::cuda::stream_ref stream,
   bool like,
-  std::shared_ptr<sirius::like_multiliteral_cache const> cache,
+  std::shared_ptr<sirius::expression_query_caches const> cache,
   expression_query_policy policy)
 {
   if (!impl_->validator->accepts(input))

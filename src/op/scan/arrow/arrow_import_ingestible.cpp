@@ -342,7 +342,7 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
   cucascade::memory::memory_space const& space,
   ::cuda::stream_ref stream,
   bool like,
-  std::shared_ptr<sirius::like_multiliteral_cache const> cache,
+  std::shared_ptr<sirius::expression_query_caches const> cache,
   expression_query_policy policy)
 {
   impl_->check_stop();
@@ -452,7 +452,7 @@ std::unique_ptr<cudf::table> arrow_import_ingestible::post_filter_and_project(
   cucascade::memory::memory_space const& space,
   ::cuda::stream_ref stream,
   bool,
-  std::shared_ptr<sirius::like_multiliteral_cache const>,
+  std::shared_ptr<sirius::expression_query_caches const>,
   std::unique_ptr<cudf::column>*,
   std::span<size_t const> elided,
   expression_query_policy)

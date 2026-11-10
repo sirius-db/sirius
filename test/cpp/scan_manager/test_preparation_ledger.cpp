@@ -143,7 +143,7 @@ class contract_ingestible : public sirius::op::scan::gpu_ingestible {
     cucascade::memory::memory_space const&,
     ::cuda::stream_ref,
     bool,
-    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    std::shared_ptr<const sirius::expression_query_caches>,
     sirius::expression_query_policy) override
   {
     return {};
@@ -153,7 +153,7 @@ class contract_ingestible : public sirius::op::scan::gpu_ingestible {
     cucascade::memory::memory_space const&,
     ::cuda::stream_ref,
     bool,
-    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    std::shared_ptr<const sirius::expression_query_caches>,
     std::unique_ptr<cudf::column>*,
     std::span<std::size_t const>,
     sirius::expression_query_policy) override

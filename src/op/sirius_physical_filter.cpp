@@ -68,7 +68,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
                                          expression_policy(),
                                          expression_evaluator::default_min_ast_size,
                                          like_swar_fastpath_enabled(),
-                                         like_cache());
+                                         expression_caches());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

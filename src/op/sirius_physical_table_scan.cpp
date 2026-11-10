@@ -195,7 +195,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                                    expression_policy(),
                                    expression_evaluator::default_min_ast_size,
                                    like_swar_fastpath_enabled(),
-                                   like_cache());
+                                   expression_caches());
     auto filtered_table = evaluator.select(
       ro_single_batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batch = make_data_batch(

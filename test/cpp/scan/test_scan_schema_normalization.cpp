@@ -213,7 +213,7 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space&,
     ::cuda::stream_ref stream,
     bool,
-    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    std::shared_ptr<const sirius::expression_query_caches>,
     std::unique_ptr<cudf::column>* survivors,
     std::span<std::size_t const> /*elided*/,
     sirius::expression_query_policy policy) override
@@ -241,7 +241,7 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space&,
     ::cuda::stream_ref,
     bool,
-    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    std::shared_ptr<const sirius::expression_query_caches>,
     sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("stub_ingestible: a resident split never decodes scan metadata");

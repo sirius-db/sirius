@@ -46,7 +46,7 @@
 
 namespace sirius {
 
-class like_multiliteral_cache;
+struct expression_query_caches;
 
 namespace telemetry {
 struct batch_telemetry_info;
@@ -579,7 +579,7 @@ class sirius_physical_operator {
 
   [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
 
-  [[nodiscard]] std::shared_ptr<like_multiliteral_cache const> like_cache() const noexcept;
+  [[nodiscard]] std::shared_ptr<expression_query_caches const> expression_caches() const noexcept;
 
   //! Install a complete physical output schema. Callers must supply one entry per logical column;
   //! keeping this invariant local prevents a partial sidecar from silently shifting columns.

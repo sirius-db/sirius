@@ -300,7 +300,7 @@ project_sink_result evaluate_project_sink(std::span<sirius::ast::node const* con
       "cudaMemsetAsync(status_and_null_counts)");
   }
 
-  kernel_arguments args(abi, ctx, input, stream, mr);
+  kernel_arguments args(abi, ctx, input, options.string_constants, stream, mr);
   for (auto& out : outputs) {
     args.add_sink_argument(&out.data_ptr);
     args.add_sink_argument(&out.mask_ptr);

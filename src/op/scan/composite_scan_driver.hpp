@@ -57,7 +57,7 @@ class composite_scan_driver {
                                             cucascade::memory::memory_space const&,
                                             ::cuda::stream_ref,
                                             bool,
-                                            std::shared_ptr<sirius::like_multiliteral_cache const>,
+                                            std::shared_ptr<sirius::expression_query_caches const>,
                                             expression_query_policy);
 
  private:

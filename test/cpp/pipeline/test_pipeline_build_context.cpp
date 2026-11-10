@@ -47,17 +47,18 @@ TEST_CASE("Pipeline context retains explicit GPU counts for engine-free tests",
   REQUIRE(context.active_gpu_ids().empty());
 }
 
-TEST_CASE("Pipeline context copies share immutable query policy and LIKE cache",
+TEST_CASE("Pipeline context copies share immutable query policy and expression caches",
           "[sirius][pipeline][config][like_multiliteral]")
 {
-  auto operator_params = std::make_shared<sirius::operator_params>();
-  auto like_cache      = std::make_shared<sirius::like_multiliteral_cache>();
-  sirius::pipeline::pipeline_build_context context{nullptr, true, 1, operator_params, like_cache};
+  auto operator_params   = std::make_shared<sirius::operator_params>();
+  auto expression_caches = std::make_shared<sirius::expression_query_caches>();
+  sirius::pipeline::pipeline_build_context context{
+    nullptr, true, 1, operator_params, expression_caches};
 
   auto context_copy = context;
 
   REQUIRE(&context.get_operator_params() == operator_params.get());
   REQUIRE(&context_copy.get_operator_params() == operator_params.get());
-  REQUIRE(context.get_like_multiliteral_cache().get() == like_cache.get());
-  REQUIRE(context_copy.get_like_multiliteral_cache().get() == like_cache.get());
+  REQUIRE(context.get_expression_query_caches().get() == expression_caches.get());
+  REQUIRE(context_copy.get_expression_query_caches().get() == expression_caches.get());
 }

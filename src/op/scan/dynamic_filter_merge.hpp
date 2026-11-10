@@ -23,7 +23,7 @@
 #include <cuda/stream>
 
 #include <cucascade/data/data_batch.hpp>
-#include <expression_evaluator/like_multiliteral.hpp>
+#include <expression_evaluator/query_caches.hpp>
 #include <op/dynamic_filter/dynamic_filter_stats.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
@@ -384,9 +384,9 @@ class dynamic_filter_consumer {
     owning_table_view source,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
-    bool like_swar_fastpath                                           = false,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
-    expression_query_policy policy                                    = {}) const;
+    bool like_swar_fastpath                                                  = false,
+    std::shared_ptr<const sirius::expression_query_caches> expression_caches = nullptr,
+    expression_query_policy policy                                           = {}) const;
 
   /**
    * @brief Commits optional hints without producing a receipt.

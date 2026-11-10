@@ -1814,23 +1814,23 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
     auto second_expr = make_like_expression();
     REQUIRE(first_expr.get() != second_expr.get());
 
-    auto input_ro   = input->to_read_only();
-    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
-    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    auto input_ro          = input->to_read_only();
+    auto& repr             = input_ro.get_data()->cast<gpu_table_representation>();
+    auto expression_caches = std::make_shared<sirius::expression_query_caches>();
     exp_executor first_executor(*first_expr,
                                 get_resource_ref(*space),
                                 cudf::get_default_stream(),
                                 sirius::expression_query_policy{strategy},
                                 exp_executor::default_min_ast_size,
                                 /*like_swar_fastpath=*/true,
-                                like_cache);
+                                expression_caches);
     exp_executor second_executor(*second_expr,
                                  get_resource_ref(*space),
                                  cudf::get_default_stream(),
                                  sirius::expression_query_policy{strategy},
                                  exp_executor::default_min_ast_size,
                                  /*like_swar_fastpath=*/true,
-                                 like_cache);
+                                 expression_caches);
 
     auto first       = first_executor.select(repr.get_table_view());
     auto first_again = first_executor.select(repr.get_table_view());
@@ -1841,7 +1841,7 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
             copy_string_column_to_host(second->view().column(0)));
     REQUIRE(first_executor.like_shared_cache_lookup_count_for_testing() == 1);
     REQUIRE(second_executor.like_shared_cache_lookup_count_for_testing() == 1);
-    REQUIRE(like_cache->classification_count_for_testing() == 1);
+    REQUIRE(expression_caches->like_patterns.classification_count_for_testing() == 1);
   }
 
   SECTION("NOT LIKE fallback classification is memoized across evaluator batches")
@@ -1852,16 +1852,16 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
     auto expr = make_func(
       sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
 
-    auto input_ro   = input->to_read_only();
-    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
-    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    auto input_ro          = input->to_read_only();
+    auto& repr             = input_ro.get_data()->cast<gpu_table_representation>();
+    auto expression_caches = std::make_shared<sirius::expression_query_caches>();
     exp_executor executor(*expr,
                           get_resource_ref(*space),
                           cudf::get_default_stream(),
                           sirius::expression_query_policy{strategy},
                           exp_executor::default_min_ast_size,
                           /*like_swar_fastpath=*/true,
-                          like_cache);
+                          expression_caches);
 
     auto first               = executor.select(repr.get_table_view());
     auto second              = executor.select(repr.get_table_view());
@@ -1873,7 +1873,7 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
     REQUIRE(copy_string_column_to_host(first->view().column(0)) == expected);
     REQUIRE(copy_string_column_to_host(second->view().column(0)) == expected);
     REQUIRE(executor.like_shared_cache_lookup_count_for_testing() == 1);
-    REQUIRE(like_cache->classification_count_for_testing() == 1);
+    REQUIRE(expression_caches->like_patterns.classification_count_for_testing() == 1);
   }
 
   SECTION("NOT LIKE '%tr%1%' — fast path agrees with the cudf path (fast path disabled)")

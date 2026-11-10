@@ -279,10 +279,10 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
     return build_ctx_.get_operator_params();
   }
 
-  [[nodiscard]] const std::shared_ptr<const sirius::like_multiliteral_cache>&
-  get_like_multiliteral_cache() const noexcept
+  [[nodiscard]] const std::shared_ptr<const sirius::expression_query_caches>&
+  get_expression_query_caches() const noexcept
   {
-    return build_ctx_.get_like_multiliteral_cache();
+    return build_ctx_.get_expression_query_caches();
   }
 
  private:

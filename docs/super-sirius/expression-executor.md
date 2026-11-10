@@ -182,6 +182,12 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
   host synchronization of an evaluation; a projection whose outputs are statically non-null and
   cannot overflow does not synchronize at all. Binding a string column reads nothing from the
   device: the end of its characters is derived in-kernel from `offsets[num_rows]`.
+- **String constants** are passed as a device pointer and a length (`c_N_ptr`, `c_N_len`). A
+  kernel's string constants are concatenated into one pool, which the query's
+  `nvrtc::string_constant_cache` (in the `expression_query_caches` shared through the pipeline
+  build context) uploads once per device, on a stream of its own; each launch's stream waits for
+  that upload on the device, so a batch neither allocates device memory for its constants nor
+  copies them or blocks the host on them. The copies are freed when the query ends.
 - **Filters** compact survivors in a single pass for a one-tile batch, otherwise in three
   launches: the predicate kernel writes a survivor count per tile plus the per-warp ballot words,
   a one-block scan turns the counts into tile offsets, and a scatter kernel writes the surviving
@@ -190,7 +196,7 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
 - **Strings** are `str_view{ptr, len, limit}` registers; `limit` bounds word-at-a-time loads.
   `%lit1%...%litN%` LIKE patterns and `contains` use a SWAR digram matcher (the literal
   descriptor is a kernel parameter) when the `like_swar_fastpath` setting is on, classified once
-  per query through the evaluator's shared LIKE cache and capped at eight descriptors per kernel;
+  per query through the query's shared LIKE cache and capped at eight descriptors per kernel;
   other patterns use a byte-wise backtracking matcher.
 - **Compile time.** The device runtime preamble is self-contained (its own limits, traits,
   checked 128-bit arithmetic and civil-calendar helpers; no CCCL includes), because parsing

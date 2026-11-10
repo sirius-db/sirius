@@ -497,9 +497,10 @@ bool sirius_physical_operator::like_swar_fastpath_enabled() const noexcept
   return _pipeline != nullptr && _pipeline->get_operator_params().like_swar_fastpath;
 }
 
-std::shared_ptr<like_multiliteral_cache const> sirius_physical_operator::like_cache() const noexcept
+std::shared_ptr<expression_query_caches const> sirius_physical_operator::expression_caches()
+  const noexcept
 {
-  return _pipeline != nullptr ? _pipeline->get_like_multiliteral_cache() : nullptr;
+  return _pipeline != nullptr ? _pipeline->get_expression_query_caches() : nullptr;
 }
 
 telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const

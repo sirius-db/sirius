@@ -162,7 +162,7 @@ struct test_child : gpu_ingestible {
     cucascade::memory::memory_space const&,
     ::cuda::stream_ref,
     bool,
-    std::shared_ptr<sirius::like_multiliteral_cache const>,
+    std::shared_ptr<sirius::expression_query_caches const>,
     sirius::expression_query_policy) override
   {
     std::vector<std::unique_ptr<cudf::column>> cols;
@@ -176,7 +176,7 @@ struct test_child : gpu_ingestible {
     cucascade::memory::memory_space const& space,
     ::cuda::stream_ref stream,
     bool,
-    std::shared_ptr<sirius::like_multiliteral_cache const>,
+    std::shared_ptr<sirius::expression_query_caches const>,
     std::unique_ptr<cudf::column>*,
     std::span<size_t const>,
     sirius::expression_query_policy) override

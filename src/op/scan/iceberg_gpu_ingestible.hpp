@@ -106,7 +106,7 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& space,
     ::cuda::stream_ref stream,
     bool like                                                    = false,
-    std::shared_ptr<const sirius::like_multiliteral_cache> cache = nullptr,
+    std::shared_ptr<const sirius::expression_query_caches> cache = nullptr,
     std::unique_ptr<cudf::column>* survivors                     = nullptr,
     std::span<std::size_t const> elided                          = {},
     expression_query_policy policy                               = {}) override
@@ -126,7 +126,7 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    std::shared_ptr<const sirius::expression_query_caches> expression_caches,
     expression_query_policy policy = {}) override;
 
  private:

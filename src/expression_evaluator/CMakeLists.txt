@@ -13,6 +13,7 @@ target_sources(
           nvrtc/kernel_abi.cpp
           nvrtc/project_sink.cpp
           nvrtc/sink_launch.cpp
+          nvrtc/string_constant_cache.cpp
           nvrtc/supportability.cpp
           nvrtc/translation_context.cpp
           regex/regex_playground.cpp

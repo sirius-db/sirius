@@ -503,6 +503,21 @@ std::vector<bench_case> all_cases()
     return list(
       std::make_unique<ast_node>(sirius::ast::case_expr{std::move(whens), ref_mode(), t_str}));
   });
+
+  // String constants: every launch reads its kernel's string-constant bytes from the device.
+  project("S01_str_consts_project", [] {
+    return list(cmp(ct::equal, ref_mode(), make_str_const("MAIL")),
+                cmp(ct::equal, ref_mode(), make_str_const("REG AIR")),
+                bin(fid::contains, ref_comment(), make_str_const("special"), t_bool),
+                bin(fid::prefix, ref_comment(), make_str_const("ab"), t_bool));
+  });
+  filter("S02_str_consts_filter", [] {
+    return make_conj(sirius::ast::conjunction::kind::op_or,
+                     list(cmp(ct::equal, ref_mode(), make_str_const("MAIL")),
+                          cmp(ct::equal, ref_mode(), make_str_const("TRUCK")),
+                          bin(fid::contains, ref_comment(), make_str_const("special"), t_bool),
+                          bin(fid::suffix, ref_comment(), make_str_const("xyz"), t_bool)));
+  });
   return cases;
 }
 

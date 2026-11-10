@@ -195,7 +195,7 @@ struct application_result_state {
   std::unique_ptr<cudf::table> residual_result;
   std::unique_ptr<cudf::column> row_positions;
   bool like_swar_fastpath = false;
-  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache;
+  std::shared_ptr<const sirius::expression_query_caches> expression_caches;
   expression_query_policy policy;
   cudf::size_type residual_rows = 0;
   std::unique_ptr<cudf::ast::tree> tree;
@@ -954,7 +954,7 @@ void apply_cached(application_result_state& result,
       result.policy,
       sirius::expression_evaluator::default_min_ast_size,
       result.like_swar_fastpath,
-      result.like_cache);
+      result.expression_caches);
     result.residual_result = result.evaluator->evaluate(input);
     detail::check_read_checkpoint(detail::read_checkpoint::RESIDUAL);
     // The result owns its column; the evaluator's temporaries are freed in stream order.
@@ -1391,7 +1391,7 @@ application_result dynamic_filter_consumer::apply(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   bool like_swar_fastpath,
-  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+  std::shared_ptr<const sirius::expression_query_caches> expression_caches,
   expression_query_policy policy) const
 {
   if (!program._state || !program._state->cached) {
@@ -1400,7 +1400,7 @@ application_result dynamic_filter_consumer::apply(
   auto state                = std::make_unique<application_result_state>();
   state->cached_source      = std::move(source);
   state->like_swar_fastpath = like_swar_fastpath;
-  state->like_cache         = std::move(like_cache);
+  state->expression_caches  = std::move(expression_caches);
   state->policy             = policy;
   no_execution_faults faults;
   return run(std::move(program), std::move(state), std::nullopt, stream, mr, faults);

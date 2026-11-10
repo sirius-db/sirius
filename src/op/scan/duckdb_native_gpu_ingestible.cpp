@@ -508,7 +508,7 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
-  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
+  std::shared_ptr<const expression_query_caches> /*expression_caches*/,
   expression_query_policy /*policy*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
@@ -595,7 +595,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::shared_ptr<const expression_query_caches> expression_caches,
   std::unique_ptr<cudf::column>* /*survivors*/,
   std::span<std::size_t const> elided,
   expression_query_policy policy)
@@ -618,7 +618,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
                                       policy,
                                       sirius::expression_evaluator::default_min_ast_size,
                                       like_swar_fastpath,
-                                      std::move(like_cache));
+                                      std::move(expression_caches));
     if (projection_required) {
       // Fold the projection into the filter gather so pure-filter columns are never materialized.
       std::vector<cudf::size_type> output_indices(output_arity);

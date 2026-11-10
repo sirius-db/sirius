@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "util/host_observation.hpp"
-
 #include <cudf/strings/strings_column_view.hpp>
 
 #include <expression_evaluator/nvrtc/kernel_abi.hpp>
@@ -212,13 +210,13 @@ void kernel_abi::emit_kernel_prelude(std::string& out) const
 kernel_arguments::kernel_arguments(kernel_abi const& abi,
                                    translation_context const& ctx,
                                    cudf::table_view const& input,
+                                   string_constant_cache const* string_constants,
                                    ::cuda::stream_ref stream,
                                    rmm::device_async_resource_ref mr)
   : _abi(abi),
     _inputs(ctx.input_columns().size()),
     _constants(ctx.constants().size()),
-    _string_constants(ctx.constants().size()),
-    _constant_chars(0, stream, mr)
+    _string_constants(ctx.constants().size())
 {
   for (std::size_t i = 0; i < ctx.input_columns().size(); ++i) {
     auto const& binding = ctx.input_columns()[i];
@@ -243,25 +241,27 @@ kernel_arguments::kernel_arguments(kernel_abi const& abi,
     _inputs[i].bit_offset = static_cast<std::int32_t>(col_view.offset());
   }
 
-  std::string host_chars;
+  std::string pool;
   std::vector<std::size_t> string_offsets(ctx.constants().size(), 0);
   for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
     auto const& cst = ctx.constants()[i];
     if (cst.device_type.id() == cudf::type_id::STRING && cst.is_valid) {
-      string_offsets[i] = host_chars.size();
-      host_chars.append(std::get<std::string>(cst.payload));
+      string_offsets[i] = pool.size();
+      pool.append(std::get<std::string>(cst.payload));
     }
   }
-  if (!host_chars.empty()) {
-    _constant_chars.resize(host_chars.size(), stream);
-    simpatico::write_device_bytes_async(
-      _constant_chars.data(), host_chars.data(), host_chars.size(), stream);
+  char const* pool_data = nullptr;
+  if (!pool.empty()) {
+    if (string_constants == nullptr) {
+      throw internal_exception("[nvrtc] string constants need a string_constant_cache");
+    }
+    pool_data = _pool.emplace(string_constants->acquire(pool, stream, mr)).data();
   }
   for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
     auto const& cst = ctx.constants()[i];
     if (!cst.is_valid) { continue; }
     if (cst.device_type.id() == cudf::type_id::STRING) {
-      _string_constants[i].ptr = _constant_chars.data() + string_offsets[i];
+      _string_constants[i].ptr = pool_data + string_offsets[i];
       _string_constants[i].len =
         static_cast<std::int32_t>(std::get<std::string>(cst.payload).size());
     } else {

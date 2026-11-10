@@ -148,13 +148,14 @@ expression_evaluator::expression_evaluator(
   expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
-  std::shared_ptr<like_multiliteral_cache const> like_cache)
+  std::shared_ptr<expression_query_caches const> expression_caches)
   : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
     _like_swar_fastpath(like_swar_fastpath),
-    _like_cache(like_cache ? std::move(like_cache) : std::make_shared<like_multiliteral_cache>())
+    _expression_caches(expression_caches ? std::move(expression_caches)
+                                         : std::make_shared<expression_query_caches>())
 {
   _ast_expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
@@ -169,14 +170,14 @@ expression_evaluator::expression_evaluator(
   expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
-  std::shared_ptr<like_multiliteral_cache const> like_cache)
+  std::shared_ptr<expression_query_caches const> expression_caches)
   : expression_evaluator(&expression,
                          resource_ref,
                          stream,
                          policy,
                          min_ast_size,
                          like_swar_fastpath,
-                         std::move(like_cache))
+                         std::move(expression_caches))
 {
 }
 
@@ -187,13 +188,14 @@ expression_evaluator::expression_evaluator(
   expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
-  std::shared_ptr<like_multiliteral_cache const> like_cache)
+  std::shared_ptr<expression_query_caches const> expression_caches)
   : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
     _like_swar_fastpath(like_swar_fastpath),
-    _like_cache(like_cache ? std::move(like_cache) : std::make_shared<like_multiliteral_cache>())
+    _expression_caches(expression_caches ? std::move(expression_caches)
+                                         : std::make_shared<expression_query_caches>())
 {
   _ast_expressions.push_back(expression);
 }
@@ -205,14 +207,15 @@ expression_evaluator::expression_evaluator(
   expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
-  std::shared_ptr<like_multiliteral_cache const> like_cache)
+  std::shared_ptr<expression_query_caches const> expression_caches)
   : _ast_expressions(std::move(expressions)),
     _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
     _like_swar_fastpath(like_swar_fastpath),
-    _like_cache(like_cache ? std::move(like_cache) : std::make_shared<like_multiliteral_cache>())
+    _expression_caches(expression_caches ? std::move(expression_caches)
+                                         : std::make_shared<expression_query_caches>())
 {
 }
 
@@ -368,9 +371,11 @@ expression_evaluator::try_evaluate_nvrtc_with_boundaries(
 nvrtc::sink_options expression_evaluator::nvrtc_sink_options(
   nvrtc::boundary_column_map const* boundary_map)
 {
-  return nvrtc::sink_options{boundary_map, _like_swar_fastpath, [this](std::string_view pattern) {
-                               return get_or_classify_like(pattern);
-                             }};
+  return nvrtc::sink_options{
+    boundary_map,
+    _like_swar_fastpath,
+    [this](std::string_view pattern) { return get_or_classify_like(pattern); },
+    &_expression_caches->string_constants};
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)

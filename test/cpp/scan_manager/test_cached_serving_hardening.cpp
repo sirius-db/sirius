@@ -379,7 +379,7 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space& /*mem_space*/,
     ::cuda::stream_ref /*stream*/,
     bool /*like_swar_fastpath*/,
-    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
+    std::shared_ptr<const sirius::expression_query_caches> /*expression_caches*/,
     sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("stub_ingestible::materialize_metadata_to_table is unreachable");
@@ -389,7 +389,7 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space& /*mem_space*/,
     ::cuda::stream_ref /*stream*/,
     bool /*like_swar_fastpath*/,
-    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
+    std::shared_ptr<const sirius::expression_query_caches> /*expression_caches*/,
     std::unique_ptr<cudf::column>* /*survivors*/,
     std::span<std::size_t const> /*elided*/,
     sirius::expression_query_policy /*policy*/) override

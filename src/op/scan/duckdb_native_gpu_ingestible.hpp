@@ -209,7 +209,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     ::cucascade::memory::memory_space const& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    std::shared_ptr<const sirius::expression_query_caches> expression_caches,
     expression_query_policy policy = {}) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
@@ -217,7 +217,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     ::cucascade::memory::memory_space const& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    std::shared_ptr<const sirius::expression_query_caches> expression_caches,
     std::unique_ptr<cudf::column>* survivors,
     std::span<std::size_t const> elided,
     expression_query_policy policy = {}) override;

@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "expression_evaluator/like_multiliteral.hpp"
+#include "expression_evaluator/query_caches.hpp"
 #include "sirius_config.hpp"
 
 #include <memory>
@@ -50,21 +50,21 @@ class pipeline_build_context {
   //!        partitions without ids.
   //! @param operator_params Immutable per-query operator-policy snapshot. A null value installs a
   //!        fail-closed default snapshot.
-  //! @param like_cache Query-owned cache shared by all copied contexts, pipelines, and task-local
-  //!        evaluators. A null value creates a new cache.
+  //! @param expression_caches Query-owned expression caches shared by all copied contexts,
+  //! pipelines, and task-local evaluators. A null value creates new caches.
   explicit pipeline_build_context(
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-    bool preserve_insertion_order                                     = true,
-    int num_gpus                                                      = 1,
-    std::shared_ptr<const sirius::operator_params> operator_params    = nullptr,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr)
+    bool preserve_insertion_order                                            = true,
+    int num_gpus                                                             = 1,
+    std::shared_ptr<const sirius::operator_params> operator_params           = nullptr,
+    std::shared_ptr<const sirius::expression_query_caches> expression_caches = nullptr)
     : _telemetry_context(std::move(telemetry_context)),
       _preserve_insertion_order(preserve_insertion_order),
       _num_gpus(num_gpus),
       _operator_params(operator_params ? std::move(operator_params)
                                        : std::make_shared<const sirius::operator_params>()),
-      _like_cache(like_cache ? std::move(like_cache)
-                             : std::make_shared<sirius::like_multiliteral_cache>())
+      _expression_caches(expression_caches ? std::move(expression_caches)
+                                           : std::make_shared<sirius::expression_query_caches>())
   {
   }
 
@@ -77,21 +77,21 @@ class pipeline_build_context {
   //! @param active_gpu_ids GPU device ids used for execution routing
   //! @param operator_params Immutable per-query operator-policy snapshot. A null value installs a
   //!        fail-closed default snapshot.
-  //! @param like_cache Query-owned cache shared by all copied contexts, pipelines, and task-local
-  //!        evaluators. A null value creates a new cache.
+  //! @param expression_caches Query-owned expression caches shared by all copied contexts,
+  //! pipelines, and task-local evaluators. A null value creates new caches.
   pipeline_build_context(
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
     bool preserve_insertion_order,
     std::vector<int> active_gpu_ids,
-    std::shared_ptr<const sirius::operator_params> operator_params    = nullptr,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr)
+    std::shared_ptr<const sirius::operator_params> operator_params           = nullptr,
+    std::shared_ptr<const sirius::expression_query_caches> expression_caches = nullptr)
     : _telemetry_context(std::move(telemetry_context)),
       _preserve_insertion_order(preserve_insertion_order),
       _active_gpu_ids(std::move(active_gpu_ids)),
       _operator_params(operator_params ? std::move(operator_params)
                                        : std::make_shared<const sirius::operator_params>()),
-      _like_cache(like_cache ? std::move(like_cache)
-                             : std::make_shared<sirius::like_multiliteral_cache>())
+      _expression_caches(expression_caches ? std::move(expression_caches)
+                                           : std::make_shared<sirius::expression_query_caches>())
   {
     if (_active_gpu_ids.empty()) {
       throw std::invalid_argument(
@@ -119,10 +119,10 @@ class pipeline_build_context {
     return *_operator_params;
   }
 
-  [[nodiscard]] const std::shared_ptr<const sirius::like_multiliteral_cache>&
-  get_like_multiliteral_cache() const noexcept
+  [[nodiscard]] const std::shared_ptr<const sirius::expression_query_caches>&
+  get_expression_query_caches() const noexcept
   {
-    return _like_cache;
+    return _expression_caches;
   }
 
  private:
@@ -131,7 +131,7 @@ class pipeline_build_context {
   int _num_gpus                  = 1;
   std::vector<int> _active_gpu_ids;
   std::shared_ptr<const sirius::operator_params> _operator_params;
-  std::shared_ptr<const sirius::like_multiliteral_cache> _like_cache;
+  std::shared_ptr<const sirius::expression_query_caches> _expression_caches;
 };
 
 }  // namespace pipeline

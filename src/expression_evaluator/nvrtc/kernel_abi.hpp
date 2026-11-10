@@ -18,16 +18,17 @@
 
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
 
+#include <expression_evaluator/nvrtc/string_constant_cache.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -132,14 +133,24 @@ class kernel_abi {
  *        the @c void** array @c cuLaunchKernel takes.
  *
  * The translation-owned values are bound on construction from the input table and the context's
- * constants (string constants are copied to one device buffer owned here). The object, the
- * @c translation_context, and the input table must outlive the launch.
+ * constants. The string constants are concatenated, in table order, into one pool whose device copy
+ * comes from a @c string_constant_cache; the object holds a lease on that copy, so it must be
+ * destroyed only after the launch is queued. The object, the @c translation_context, and the input
+ * table must outlive the launch.
  */
 class kernel_arguments {
  public:
+  /**
+   * @param string_constants The cache that serves the device copy of the string-constant pool; may
+   * be null only when the context has no non-empty string constant.
+   * @param mr The memory resource that allocates the pool's device copy when @p string_constants
+   * does not yet hold it.
+   * @throws internal_exception if the context has a non-empty string constant but no cache
+   */
   kernel_arguments(kernel_abi const& abi,
                    translation_context const& ctx,
                    cudf::table_view const& input,
+                   string_constant_cache const* string_constants,
                    ::cuda::stream_ref stream,
                    rmm::device_async_resource_ref mr);
 
@@ -177,7 +188,7 @@ class kernel_arguments {
   std::vector<input_storage> _inputs;                      ///< The input storage.
   std::vector<constant_storage> _constants;                ///< The constant storage.
   std::vector<string_constant_storage> _string_constants;  ///< The string constant storage.
-  rmm::device_uvector<char> _constant_chars;               ///< The constant characters.
+  std::optional<string_constant_cache::lease> _pool;       ///< The string-constant pool's copy.
   std::vector<void*> _pointers;                            ///< The pointers.
   std::size_t _sink_arguments_added{0};                    ///< The number of sink arguments added.
 };

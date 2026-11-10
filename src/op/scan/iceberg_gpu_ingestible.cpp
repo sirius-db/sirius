@@ -536,7 +536,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   const cucascade::memory::memory_space& mem_space,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+  std::shared_ptr<const sirius::expression_query_caches> expression_caches,
   expression_query_policy policy)
 {
   auto const& split = dynamic_cast<parquet_split_info const&>(info);
@@ -592,7 +592,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   // reader to filter rows, positions stop identifying file rows and we refuse rather than
   // delete the wrong ones.
   auto base = _core.materialize_metadata_to_table(
-    info, mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
+    info, mem_space, stream, like_swar_fastpath, std::move(expression_caches), policy);
 
   base.required_visibility = std::move(requirements);
   if (!base.execution) throw sirius::internal_exception("Iceberg decode omitted execution facts");
