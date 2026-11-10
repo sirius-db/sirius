@@ -475,15 +475,14 @@ Complex join keys are materialized into columns before this description is const
 - **Projected sizing:** aggregate fanout can latch a projected input size under a `PARTIAL`
   ingress; measurements floor the projection. See
   [data management](data-management.md#runtime-data-size-estimation).
-- **Dynamic filters:** a hash-join build-input observer records arrivals, certifies before claims,
-  contributes before scatter, publishes after successful scatter, and closes on finalization.
+- **Dynamic filters:** on a hash join's build input, `hash_join_partition_observer` records arrivals, certifies before claims, contributes before building the output on every layout (before scatter on the hash path), publishes after the output is built and before deposit, and always leaves the join's publication session Terminal on finalization. See [build filter construction](dynamic-filters.md#build-filter-construction).
 
 ### `sirius_physical_build_filter` — `BUILD_FILTER`
 **File:** `src/op/dynamic_filter/sirius_physical_build_filter.hpp`
 
-Publishes an optional equality-key Bloom filter before a RIGHT_SEMI/RIGHT_ANTI join's probe-driven partition sizing. Both joins preserve only build-side rows, so probe rows with no matching build key can be removed safely. The stage requires dynamic filters and constructs every key type and filter kind the plan allows.
+Publishes a RIGHT_SEMI/RIGHT_ANTI join's optional equality-key filters before the join's probe-driven partition sizing. Both joins preserve only build-side rows, so probe rows with no matching build key can be removed safely. The planner inserts the stage when the join's publication plan is enabled; it is the join's sole construction site and constructs every key type and filter kind the plan allows.
 
-- **Complete input:** a FULL barrier and finished source pipeline let the arrival ledger certify every original batch before any is popped. Certification is independent of downstream partition count; accumulation inside ordinary PARTITION still requires more than one output partition.
+- **Complete input:** a FULL barrier and finished source pipeline let the arrival ledger certify every original batch before any is popped, with the same decision as the build PARTITION (`certify_decision`). A decline is final, and finalization always leaves the session Terminal.
 - **GPU execution:** scheduled tasks contribute keys to the owning join's publication session and forward the same batches unchanged. The final contribution publishes before stage completion, while partitioning and join strategies remain unchanged.
 - **Fallback:** unsupported input or an optional publication failure keeps the data path intact. Consumers never wait on filter channels, and there is no global scan barrier. See [early publication](dynamic-filters.md#early-publication-for-right-semianti-joins).
 
@@ -631,7 +630,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | UNION | Set op | N-ary identity fan-in, no data touched; distinct `UNION` is a DISTINCT over it; also merges the tagged inputs of `EXCEPT ALL` / `INTERSECT ALL` |
 | PARTITION | Pipeline | Hash/range partitioning |
-| BUILD_FILTER | Pipeline | Complete-build Bloom publication; forwards batches unchanged |
+| BUILD_FILTER | Pipeline | Complete-build dynamic-filter publication; forwards batches unchanged |
 | CONCAT | Pipeline | Partition reassembly |
 | PASSTHROUGH_SINK | Pipeline | UNION arm terminator; forwards batches unpartitioned |
 | MERGE_TOP_N | Pipeline | Merge per-partition top-N |
