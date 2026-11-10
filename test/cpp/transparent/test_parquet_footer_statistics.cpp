@@ -283,3 +283,27 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   REQUIRE_FALSE(grown->HasError());
   CHECK(collect_rows(*grown)[0][0] == "30");
 }
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - merged entries for explicit file lists are bounded",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  using sirius::transparent::detail::merged_statistics_cache_capacity;
+  using sirius::transparent::detail::merged_statistics_cache_size;
+  // Pairs of 17 files give 136 distinct lists, more than the cache keeps.
+  constexpr int files = 17;
+  for (int file = 2; file < files; ++file) {
+    write_file("f" + std::to_string(file), 100 * file, 100 * file + 100);
+  }
+  auto const path = [&](int file) {
+    return "'" + (dir / ("f" + std::to_string(file) + ".parquet")).string() + "'";
+  };
+  for (int first = 0; first < files; ++first) {
+    for (int second = first + 1; second < files; ++second) {
+      cpu_plan("SELECT count(*) FROM read_parquet([" + path(first) + ", " + path(second) +
+                 "]) WHERE x >= 100000",
+               true);
+    }
+  }
+  CHECK(merged_statistics_cache_size() <= merged_statistics_cache_capacity);
+}

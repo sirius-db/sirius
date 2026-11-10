@@ -324,6 +324,10 @@ void remember_merge(std::string const& key,
                     duckdb::Value const& statistics)
 {
   std::lock_guard guard(merge_mutex);
+  // A miss only costs a merge, so any entry may make room for a new set of paths.
+  if (!merges.contains(key) && merges.size() >= detail::merged_statistics_cache_capacity) {
+    merges.erase(merges.begin());
+  }
   merges[key] = merge_entry{files, bind.names, bind.types, statistics};
 }
 
