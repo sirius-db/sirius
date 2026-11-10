@@ -28,6 +28,8 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_context.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -38,12 +40,14 @@
 #include <duckdb/planner/planner.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
 
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -214,6 +218,40 @@ void generate_overlapping_two_key_dim(fs::path const& dir)
                       (dir / ("part." + std::to_string(parity) + ".parquet")).string()) +
                     " (FORMAT PARQUET);");
   }
+}
+
+/// Like generate_overlapping_dim, with a distinct string column `name` ahead of `k`, and a
+/// `payload` that repeats within each file, so the probe refuses it at its first chunk.
+void generate_overlapping_named_dim(fs::path const& dir)
+{
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  for (int parity = 0; parity < 2; ++parity) {
+    auto const key = "range * 2 + " + std::to_string(parity);
+    run_generator(gen,
+                  "COPY (SELECT 'name_' || lpad((" + key + ")::VARCHAR, 6, '0') AS name, " + key +
+                    " AS k, range % 100 AS payload FROM range(" + std::to_string(dim_rows / 2) +
+                    ")) TO " +
+                    sirius::test::sql_literal(
+                      (dir / ("part." + std::to_string(parity) + ".parquet")).string()) +
+                    " (FORMAT PARQUET);");
+  }
+}
+
+/// The pin's per-column uniqueness facts for the pinned entry @p name.
+std::vector<bool> proven_columns_of(duckdb::Connection& con, std::string const& name)
+{
+  std::vector<bool> out;
+  auto ctx = sirius::test::get_registered_sirius_context(con);
+  REQUIRE(ctx);
+  ctx->get_scan_manager().visit_pinned_entries(
+    [&](std::string_view entry_name, sirius::scan_manager::pinned_entry const& entry) {
+      if (entry_name != name) { return true; }
+      out = entry.proven_unique_columns;
+      return false;
+    });
+  return out;
 }
 
 std::string join_query_on(fs::path const& fact, fs::path const& dim, std::string const& dim_key)
@@ -463,6 +501,69 @@ TEST_CASE("the exact-stage byte cap is shared by every column the pin retains",
 
   set_option(con, "RESET pin_table_unique_exact_max_bytes;");
   con.Query("CALL unpin_table('pin_unique_join_two_key_dim');");
+}
+
+TEST_CASE("a proven string column ahead of an integer key neither hides nor crowds out its proof",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_named_dim"};
+  auto const& tmp       = scratch.path();
+  auto const dim_dir    = tmp / "named_dim";
+  auto const unused_dim = tmp / "unused_unique_dim.parquet";
+  auto const unused_dup = tmp / "unused_dup_dim.parquet";
+  auto const fact       = tmp / "fact.parquet";
+  fs::create_directories(dim_dir);
+  generate_parquet(unused_dim, unused_dup, fact);
+  generate_overlapping_named_dim(dim_dir);
+  auto const dim_glob = dim_dir / "*.parquet";
+
+  // Each file is its own pinned chunk, and the chunks overlap in range, so both name and k need
+  // the exact stage. One chunk of k is 80 KB; one chunk of name is about 150 KB.
+  auto const yaml_path = tmp / "pin_unique_join_named_dim.yaml";
+  write_config(yaml_path,
+               "  operator_params:\n"
+               "    scan_task_batch_size: 64KiB\n");
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+  // The subquery puts name ahead of k in the dimension scan's output.
+  auto const sql = "SELECT count(*), sum(f.v + d.payload), max(d.name) FROM read_parquet(" +
+                   sirius::test::sql_literal(fact.string()) + ") f JOIN (SELECT name, k, payload " +
+                   "FROM read_parquet(" + sirius::test::sql_literal(dim_glob.string()) +
+                   ")) d ON f.f_k = d.k";
+
+  SECTION("both are proven, and the join on k uses k's proof")
+  {
+    pin(con, dim_glob, "pin_unique_join_named_dim");
+    CHECK(proven_columns_of(con, "pin_unique_join_named_dim") ==
+          std::vector<bool>{true, true, false});
+    CHECK(join_proven_unique(con, sql));
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+  }
+
+  SECTION("a cap that holds k alone keeps k's exact check over the earlier string column")
+  {
+    // name's first chunk alone fits, but not beside k's; both of name's chunks do not fit at all.
+    set_option(con, "SET pin_table_unique_exact_max_bytes = 200000;");
+    pin(con, dim_glob, "pin_unique_join_named_dim");
+    CHECK(proven_columns_of(con, "pin_unique_join_named_dim") ==
+          std::vector<bool>{false, true, false});
+    CHECK(join_proven_unique(con, sql));
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    set_option(con, "RESET pin_table_unique_exact_max_bytes;");
+  }
+
+  con.Query("CALL unpin_table('pin_unique_join_named_dim');");
 }
 
 TEST_CASE("a Hive partition column is not proven unique by a same-named file column",

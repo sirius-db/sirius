@@ -34,6 +34,7 @@
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
@@ -56,6 +57,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -279,6 +281,11 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   std::vector<std::size_t> exact_bytes(options.probe_unique_columns.size(), 0);
   std::size_t exact_total_bytes = 0;
   std::vector<bool> exact_declined(options.probe_unique_columns.size(), false);
+  // Column positions in the order they claim the byte cap: integer columns first, then the others,
+  // each by position. A non-integer column is a candidate only while its table is small (see
+  // late_mat::unique_probe::observe), so it must not crowd out an integer key for good and then be
+  // refused itself a few chunks later. Set from the first retained chunk's types.
+  std::vector<std::size_t> exact_priority;
   // Gives back everything retained for one column: its chunks, their reservations and bytes.
   auto release_exact_column = [&](std::size_t column_pos) {
     exact_total_bytes -= exact_bytes[column_pos];
@@ -366,7 +373,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // reduce and equally conclusive.
     if (unique_probe.active()) {
       nvtx_scoped_range probe_range{"sirius::pin::unique_probe"};
-      // The probe may sort a chunk of an automatic column; hold a reservation for each sort, and
+      // The probe may sort a chunk of a column; hold a reservation for each sort, and
       // let the probe drop the column when the memory space cannot grant one.
       decltype(target->make_reservation_or_null(std::size_t{})) sort_reservation;
       unique_probe.observe(tbl->view(), stream, [&](std::size_t bytes) {
@@ -396,7 +403,15 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
         for (cudf::size_type c = 0; c < tbl->num_columns(); ++c) {
           batch_bytes += tbl->get_column(c).alloc_size();
         }
-        for (std::size_t i = 0; i < options.probe_unique_columns.size(); ++i) {
+        if (exact_priority.empty()) {
+          exact_priority.resize(options.probe_unique_columns.size());
+          std::iota(exact_priority.begin(), exact_priority.end(), std::size_t{0});
+          std::stable_partition(exact_priority.begin(), exact_priority.end(), [&](std::size_t c) {
+            return cudf::is_integral_not_bool(
+              tbl->get_column(static_cast<cudf::size_type>(c)).type());
+          });
+        }
+        for (auto const i : exact_priority) {
           // Retain only what the exact stage may still need: a column the probe already
           // refused releases what it retained so far, and so does a column that no longer fits.
           if (!unique_probe.candidate(i) || exact_declined[i]) {
@@ -412,13 +427,14 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
             unique_probe.exact_unavailable(column_pos);
           };
           auto const chunk_bytes = tbl->get_column(static_cast<cudf::size_type>(i)).alloc_size();
-          // Earlier columns take priority: make room by giving up the highest columns first, so
-          // which columns keep their check does not depend on how the chunks interleave.
-          for (std::size_t later = exact_bytes.size();
-               later-- > i + 1 && exact_total_bytes + chunk_bytes > *exact_byte_cap;) {
-            if (exact_bytes[later] > 0) {
-              decline(later,
-                      "its retained values were released for an earlier column "
+          // Make room by giving up the columns of lowest priority first, so which columns keep
+          // their check does not depend on how the chunks interleave.
+          for (auto lower = exact_priority.rbegin();
+               *lower != i && exact_total_bytes + chunk_bytes > *exact_byte_cap;
+               ++lower) {
+            if (exact_bytes[*lower] > 0) {
+              decline(*lower,
+                      "its retained values were released for a column of higher priority "
                       "(pin_table_unique_exact_max_bytes)");
             }
           }
