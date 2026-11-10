@@ -85,8 +85,8 @@ TEST_CASE_METHOD(DecimalIntegerCastFixture,
     REQUIRE(gpu->HasError());
     REQUIRE(gpu->GetError() == cpu->GetError());
     REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks + 1);
-    // The cast's invalid rows belong to the unselected branch. CPU replay must return a value.
-    expect_runtime_fallback_matches_cpu(
+    // The cast's invalid rows select ELSE, so the GPU casts only the rows that fit.
+    compare_gpu_vs_cpu(
       "SELECT CASE WHEN v BETWEEN -128.49 AND 127.49 THEN CAST(v AS TINYINT) ELSE 0::TINYINT END "
       "FROM dec_bounds;");
   }

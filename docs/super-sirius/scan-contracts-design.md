@@ -55,7 +55,7 @@ Projection and predicates are outside read identity. Iceberg also requires match
 |---|---|
 | Logical plan copy | Each scan matches its logical original; physical input sets also agree. |
 | Single-scan SQL replan | Physical inputs match; Iceberg additionally needs original logical selector evidence. |
-| Multi-scan SQL replan | Declined because scan order cannot prove correspondence. |
+| Multi-scan SQL replan | Physical inputs match, including duplicates. Each scan pairs one-to-one with its logical original by `table_index` and must match its read identity and any required snapshot selector evidence. |
 
 Missing correspondence or changed inputs prevent GPU admission. Rebuilds and repeated prepared executions validate again. File metadata is observational, not part of identity equality; overwrites at the same path may go undetected.
 

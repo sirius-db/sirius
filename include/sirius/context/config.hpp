@@ -98,6 +98,7 @@ class ContextConfig {
   ::sirius_context_config* handle_;
 
   friend class ContextConfigBuilder;
+  friend class Context;
 };
 
 }  // namespace sirius

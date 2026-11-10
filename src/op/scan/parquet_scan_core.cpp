@@ -16,6 +16,7 @@
  */
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 #include "transparent/replay_admission.hpp"
@@ -25,11 +26,7 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
-#include <io/io_context.hpp>
-#include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
-#include <io/sirius_datasource.hpp>
-#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
@@ -72,6 +69,10 @@
 #include <rmm/device_buffer.hpp>
 
 // cucascade
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // duckdb
@@ -487,8 +488,8 @@ class parquet_batch_coalescer : public batch_coalescer {
       _empty_split_fallback = fallback_file{
         file->file_metadata,
         file->file_path,
-        file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                         : std::shared_ptr<io::sirius_datasource>{},
+        file->datasource ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<cucascade::io::datasource>{},
         file->partition_values,
         file->disable_filter_pushdown,
         file->requires_row_positions,
@@ -569,9 +570,10 @@ class parquet_batch_coalescer : public batch_coalescer {
         slice.reserved_compressed_bytes =
           memory::saturating_add(slice.reserved_compressed_bytes, cur_comp);
       } else {
-        auto slice_ds = file->datasource
-                                              ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                                              : std::shared_ptr<io::sirius_datasource>{};
+        auto slice_ds =
+          file->datasource
+                                ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                                : std::shared_ptr<cucascade::io::datasource>{};
         _slices.emplace_back(file->file_metadata,
                              file->file_path,
                              std::move(cur_rgs),
@@ -748,7 +750,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   struct fallback_file {
     std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
     std::string file_path;
-    std::shared_ptr<io::sirius_datasource> datasource;
+    std::shared_ptr<cucascade::io::datasource> datasource;
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
     bool requires_row_positions;
@@ -1186,7 +1188,7 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
       throw;
     } catch (transparent::classified_execution_error const&) {
       throw;
-    } catch (io::descriptor_mismatch_error const& error) {
+    } catch (cucascade::io::descriptor_mismatch_error const& error) {
       if (_info->profiles && _info->profiles->counters) {
         _info->profiles->counters->descriptor_mismatches.fetch_add(1, std::memory_order_relaxed);
       }
@@ -1195,7 +1197,7 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
     } catch (duckdb::IOException const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
-    } catch (io::credential_error const& error) {
+    } catch (cucascade::io::credential_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
     } catch (std::system_error const& error) {
@@ -1219,7 +1221,7 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
 std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   std::string const& file_path,
   std::size_t file_index,
-  std::shared_ptr<io::ioctx> const& io_ctx,
+  std::shared_ptr<cucascade::io::ioctx> const& io_ctx,
   std::stop_token stop)
 {
   if (stop.stop_requested())
@@ -1240,13 +1242,18 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // Probe only when the footer will actually be read: once the metadata store
   // holds this file's parsed footer, a suffix GET would download bytes nothing
   // consumes, and the open only needs the size. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
-  std::shared_ptr<io::sirius_datasource> sirius_ds;
+  // The store is keyed by the normalized path, so look up what the open uses.
+  auto const normalized    = sirius::io::strip_file_scheme(file_path);
+  bool const footer_cached = io_ctx->metadata_store().has_path(normalized);
+  std::shared_ptr<cucascade::io::datasource> sirius_ds;
   {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    sirius_ds = io_ctx->open_datasource(
-      file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+    sirius_ds =
+      sirius::io::open_datasource(io_ctx,
+                                  normalized,
+                                  footer_cached ? cucascade::io::open_hint::generic
+                                                : cucascade::io::open_hint::parquet_footer_probe);
   }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
@@ -1292,7 +1299,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     throw;
   } catch (duckdb::IOException const&) {
     throw;
-  } catch (io::credential_error const&) {
+  } catch (cucascade::io::credential_error const&) {
     throw;
   } catch (std::system_error const&) {
     throw;
@@ -1302,7 +1309,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     throw;
   } catch (std::logic_error const&) {
     throw;
-  } catch (io::object_changed_error const&) {
+  } catch (cucascade::io::object_changed_error const&) {
     // Preserve the typed identity failure for the outer task handler.
     throw;
   } catch (std::exception const& error) {

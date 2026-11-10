@@ -16,11 +16,15 @@
 
 #include "planner/sirius_plan_projection_utils.hpp"
 
+#include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "op/sirius_physical_projection.hpp"
 
 #include <cstddef>
+#include <memory>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::planner {
@@ -54,18 +58,108 @@ bool select_list_is_fully_supported(
 }
 
 // Trivial expressions are free to duplicate: a bare column reference or a
-// constant literal carries no GPU work. Folding may clone these into multiple
-// outer reference sites without increasing execution cost.
+// constant literal carries no GPU work and raises no error. Folding may clone
+// these into multiple outer reference sites without increasing execution cost,
+// and into a branch that sees only some rows.
 bool is_trivial_node(sirius::ast::node const& n)
 {
   return n.holds<sirius::ast::reference>() || n.holds<sirius::ast::constant>();
 }
 
+// Marks in @p conditional_use each inner column that @p expr reads in a slot the expression
+// evaluator may evaluate on only some rows, as DuckDB does: a CASE's THEN, its ELSE and every WHEN
+// after the first; a COALESCE argument after the first; and an AND or OR operand after the first
+// where the conjunction evaluates as a predicate. @p predicate is true for a WHEN and for an
+// operand of such a conjunction. An eager CASE evaluates everything on every row.
+void mark_conditional_uses(sirius::ast::node const& expr,
+                           bool predicate,
+                           std::vector<bool>& conditional_use)
+{
+  // Every reference below a slot that skips rows is conditional, however deep it sits.
+  auto const conditional = [&](std::unique_ptr<sirius::ast::node> const& slot) {
+    if (!slot) { return; }
+    sirius::ast::visit_references(*slot, [&](sirius::ast::reference const& ref) {
+      if (ref.column_index < conditional_use.size()) { conditional_use[ref.column_index] = true; }
+    });
+  };
+  auto const descend = [&](std::unique_ptr<sirius::ast::node> const& slot, bool as_predicate) {
+    if (slot) { mark_conditional_uses(*slot, as_predicate, conditional_use); }
+  };
+  std::visit(
+    [&](auto const& alt) {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::reference> ||
+                    std::is_same_v<T, sirius::ast::constant>) {
+        // A leaf sees the rows of the slot that holds it.
+      } else if constexpr (std::is_same_v<T, sirius::ast::case_expr>) {
+        if (alt.eager) {
+          for (auto const& c : alt.cases) {
+            descend(c.when_, false);
+            descend(c.then_, false);
+          }
+          descend(alt.else_, false);
+        } else {
+          for (std::size_t i = 0; i < alt.cases.size(); i++) {
+            if (i == 0) {
+              descend(alt.cases[i].when_, true);
+            } else {
+              conditional(alt.cases[i].when_);
+            }
+            conditional(alt.cases[i].then_);
+          }
+          conditional(alt.else_);
+        }
+      } else if constexpr (std::is_same_v<T, sirius::ast::coalesce>) {
+        for (std::size_t i = 0; i < alt.children.size(); i++) {
+          if (i == 0) {
+            descend(alt.children[i], false);
+          } else {
+            conditional(alt.children[i]);
+          }
+        }
+      } else if constexpr (std::is_same_v<T, sirius::ast::conjunction>) {
+        for (std::size_t i = 0; i < alt.children.size(); i++) {
+          if (predicate && i > 0) {
+            conditional(alt.children[i]);
+          } else {
+            descend(alt.children[i], predicate);
+          }
+        }
+      } else if constexpr (std::is_same_v<T, sirius::ast::comparison>) {
+        descend(alt.left, false);
+        descend(alt.right, false);
+      } else if constexpr (std::is_same_v<T, sirius::ast::between>) {
+        descend(alt.input, false);
+        descend(alt.lower, false);
+        descend(alt.upper, false);
+      } else if constexpr (std::is_same_v<T, sirius::ast::cast> ||
+                           std::is_same_v<T, sirius::ast::unary_op>) {
+        descend(alt.child, false);
+      } else if constexpr (std::is_same_v<T, sirius::ast::in_list>) {
+        descend(alt.probe, false);
+        for (auto const& value : alt.values) {
+          descend(value, false);
+        }
+      } else if constexpr (std::is_same_v<T, sirius::ast::function_call> ||
+                           std::is_same_v<T, sirius::ast::aggregate>) {
+        for (auto const& argument : alt.arguments()) {
+          descend(argument, false);
+        }
+      } else {
+        static_assert(sizeof(T) == 0,
+                      "Unhandled sirius::ast alternative in mark_conditional_uses — add an arm "
+                      "that says which rows the new variant member evaluates its children on");
+      }
+    },
+    expr.v);
+}
+
 // Returns true when outer (parent) and inner (child) projections may be folded into one.
 // Outer references index inner's output columns; inner must be a single-child link so
 // fold_once can splice it out of the chain. Refuses null select-list slots (unsupported
-// expressions) and non-trivial inner expressions referenced more than once in the outer
-// list (substitution would re-execute GPU work at each reference site).
+// expressions), non-trivial inner expressions referenced more than once in the outer
+// list (substitution would re-execute GPU work at each reference site), and non-trivial
+// inner expressions the outer list reads in a slot that may skip rows (see below).
 bool can_combine_projections(projection const& outer, projection const& inner)
 {
   if (inner.children.size() != 1) { return false; }
@@ -79,14 +173,22 @@ bool can_combine_projections(projection const& outer, projection const& inner)
   // list references each inner column; folding is only safe when every inner
   // column referenced more than once holds a trivial (free-to-duplicate)
   // expression. Otherwise non-trivial GPU work would be re-executed per use.
+  //
+  // DuckDB also computes the inner projection on every row, while a CASE or
+  // COALESCE branch sees only the rows that reach it. An inner expression
+  // substituted into such a branch would skip the rows on which DuckDB raises its
+  // errors, so only a trivial expression may move there.
   std::vector<std::size_t> use_count(inner.select_list.size(), 0);
+  std::vector<bool> conditional_use(inner.select_list.size(), false);
   for (auto const& outer_expr : outer.select_list) {
     sirius::ast::visit_references(*outer_expr, [&](sirius::ast::reference const& ref) {
       if (ref.column_index < use_count.size()) { use_count[ref.column_index]++; }
     });
+    mark_conditional_uses(*outer_expr, /*predicate=*/false, conditional_use);
   }
   for (std::size_t i = 0; i < inner.select_list.size(); i++) {
-    if (use_count[i] > 1 && !is_trivial_node(*inner.select_list[i])) { return false; }
+    bool const stays_inner = use_count[i] > 1 || conditional_use[i];
+    if (stays_inner && !is_trivial_node(*inner.select_list[i])) { return false; }
   }
   return true;
 }

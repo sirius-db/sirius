@@ -1211,6 +1211,11 @@ namespace {
 // Only the operator boundary is supplied by the fixture.
 class arrow_task_operator final : public sirius::op::sirius_physical_operator {
  public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   arrow_import_ingestible& driver;
   cucascade::memory::memory_space& space;
   int mode;
@@ -1293,7 +1298,7 @@ TEST_CASE("Arrow outputs survive input retirement through task success and sink 
   arrow_task_operator op(*h.driver, *space, mode);
   op.operator_id = 1;
   namespace pl   = sirius::pipeline;
-  auto pipeline  = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
+  auto pipeline  = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr});
   pipeline->set_pipeline_id(71);
   pl::sirius_pipeline_build_state build;
   build.set_pipeline_source(*pipeline, op);

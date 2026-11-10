@@ -17,6 +17,7 @@
 #include "utils/connector_admission_test_utils.hpp"
 
 #include <catch.hpp>
+#include <cucascade/io/io_context.hpp>
 
 #include <typeinfo>
 
@@ -191,8 +192,8 @@ TEST_CASE("Puffin-primary required refusals still publish the cleanup observatio
   admission_fixture fixture;
   auto backend = fixture.context->get_scan_manager().planning_io_backend(remote_puffin);
   REQUIRE(backend.has_value());
-  REQUIRE((*backend == sirius::io::io_context_type::restful ||
-           *backend == sirius::io::io_context_type::kvikio));
+  REQUIRE((*backend == cucascade::io::io_context_type::restful ||
+           *backend == cucascade::io::io_context_type::kvikio));
   fixture.provider->backing.return_null = true;
   auto before                           = fixture.stats();
   auto reads = sirius::op::scan::iceberg_delete_data_uncached_read_count();

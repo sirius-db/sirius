@@ -36,6 +36,7 @@
 #include "op/sirius_physical_replicate.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
@@ -130,9 +131,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_typed_double(
   sirius::op::SiriusPhysicalOperatorType type, std::size_t width)
 {
   duckdb::vector<sirius::logical_type> types(width, int_type());
-  return duckdb::make_uniq<sirius::op::sirius_physical_operator>(type,
-                                                                 std::move(types),
-                                                                 /*estimated_cardinality=*/0);
+  return duckdb::make_uniq<sirius::op::test_physical_operator>(type,
+                                                               std::move(types),
+                                                               /*estimated_cardinality=*/0);
 }
 
 // A place_endpoint factory that records the sited operator and the endpoint it splices in, then

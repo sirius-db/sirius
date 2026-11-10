@@ -31,7 +31,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -82,6 +86,11 @@ TEST_CASE("mixed stddev partial schema includes grouping-set columns",
   auto const prefix        = local->num_output_group_columns();
   REQUIRE(prefix == (grouping_sets ? 3 : 1));
   REQUIRE(local->local_types.size() == prefix + 5);
+  auto const layout = local->partial_layout();
+  CHECK(layout.num_keys() == prefix);
+  CHECK(layout.num_partials() == 5);
+  CHECK(layout.num_carried() == 0);
+  CHECK(layout.num_columns() == local->local_types.size());
   REQUIRE(local->local_types[0].id() == sirius::type_id::DOUBLE);
   if (grouping_sets) {
     REQUIRE(local->local_types[1].id() == sirius::type_id::INTEGER);
@@ -96,6 +105,88 @@ TEST_CASE("mixed stddev partial schema includes grouping-set columns",
   REQUIRE(merge.types.size() == prefix + 4);
   REQUIRE(merge.types[prefix].id() == sirius::type_id::DOUBLE);
   REQUIRE(merge.types[prefix + 1].id() == sirius::type_id::BIGINT);
+}
+
+TEST_CASE("a FIRST before a bounded decimal SUM leaves the bound on the SUM request",
+          "[decimal_sum_overflow][unit][distinct]")
+{
+  using Traits = gpu_type_traits<decimal64_tag>;
+  auto defs =
+    sirius::test::create_aggregate_expressions<Traits>({0}, {"first", "sum", "avg"}, {1, 2, 2});
+  sirius_physical_grouped_aggregate aggregate(
+    std::move(defs.output_types),
+    std::move(defs.aggregates),
+    std::move(defs.groups),
+    {},
+    {},
+    1,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+    {std::nullopt, std::uint64_t{5000}, std::uint64_t{5000}});
+
+  // The FIRST adds no cuDF request: SUM is request 0, and AVG is requests 1 (SUM) and 2 (COUNT).
+  REQUIRE(aggregate.cudf_aggregates.size() == 3);
+  CHECK(aggregate.cudf_aggregate_input_max_abs ==
+        std::vector<std::optional<std::uint64_t>>{
+          std::uint64_t{5000}, std::uint64_t{5000}, std::nullopt});
+}
+
+TEST_CASE("grouped partial layout agrees with mixed expanded slots and carried columns",
+          "[physical_grouped_aggregate_merge][unit][distinct]")
+{
+  using Traits = gpu_type_traits<double>;
+  auto defs    = sirius::test::create_aggregate_expressions<Traits>(
+    {0}, {"first", "avg", "sum", "stddev_samp", "first"}, {1, 2, 2, 2, 3});
+  sirius_physical_grouped_aggregate aggregate(
+    std::move(defs.output_types), std::move(defs.aggregates), std::move(defs.groups), 1);
+  sirius_physical_grouped_aggregate_merge merge(&aggregate);
+  auto const layout = aggregate.partial_layout();
+
+  REQUIRE(aggregate.has_first());
+  REQUIRE(merge.has_first());
+  CHECK(layout.num_keys() == 1);
+  CHECK(layout.num_partials() == 4);
+  CHECK(layout.num_carried() == 2);
+  REQUIRE(aggregate.local_types.size() == layout.num_columns());
+  CHECK(layout.num_columns() == 7);
+  CHECK(layout.partial_column(0) == 1);
+  CHECK(layout.carried_column(0) == 5);
+  CHECK(layout.carried_column(1) == 6);
+  CHECK(aggregate.local_types[layout.partial_column(1)].id() == sirius::type_id::BIGINT);
+  CHECK(aggregate.local_types[layout.partial_column(3)].id() == sirius::type_id::STRUCT);
+  CHECK(aggregate.local_types[layout.carried_column(0)].id() == sirius::type_id::DOUBLE);
+  CHECK(aggregate.local_types[layout.carried_column(1)].id() == sirius::type_id::DOUBLE);
+  CHECK(merge.partial_layout().num_columns() == layout.num_columns());
+  CHECK_FALSE(merge.partials_are_output());
+}
+
+TEST_CASE("grouped merge returns its partials as output only when they are in output order",
+          "[physical_grouped_aggregate_merge][unit][distinct]")
+{
+  using Traits                = gpu_type_traits<int64_t>;
+  auto const partials_ordered = [](std::vector<std::string> const& aggregations) {
+    auto defs = sirius::test::create_aggregate_expressions<Traits>(
+      {0}, aggregations, std::vector<std::size_t>(aggregations.size(), 1));
+    sirius_physical_grouped_aggregate aggregate(
+      std::move(defs.output_types),
+      std::move(defs.aggregates),
+      std::move(defs.groups),
+      {},
+      {},
+      1,
+      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+    return sirius_physical_grouped_aggregate_merge(&aggregate).partials_are_output();
+  };
+
+  CHECK(partials_ordered({"sum", "min"}));
+  CHECK(partials_ordered({"first", "first"}));
+  CHECK(partials_ordered({"sum", "min", "first", "first"}));
+  // A FIRST ahead of a plain slot lands after it in the partials.
+  CHECK_FALSE(partials_ordered({"first", "sum"}));
+  CHECK_FALSE(partials_ordered({"sum", "first", "min"}));
+  CHECK_FALSE(partials_ordered({"sum", "avg", "first"}));
+  CHECK_FALSE(partials_ordered({"sum", "stddev_samp", "first"}));
 }
 
 TEST_CASE("grouped merge sizing applies the row floor to its strategy and repository",

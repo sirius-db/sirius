@@ -21,6 +21,7 @@
 
 #include <catch.hpp>
 
+#include <algorithm>
 #include <array>
 #include <iomanip>
 #include <memory>
@@ -147,7 +148,7 @@ TEST_CASE("Copy-origin read views merge identical files only for the same select
   CHECK(equal.equal);
 }
 
-TEST_CASE("Replan-origin read views admit only a single corresponding scan",
+TEST_CASE("Replan without logical originals preserves the single-scan shortcut",
           "[transparent][read_view]")
 {
   auto a = view("a.parquet");
@@ -166,6 +167,184 @@ TEST_CASE("Replan-origin read views admit only a single corresponding scan",
   CHECK(single.equal);
   CHECK(single.correspondence == "single");
   CHECK(single.reason.empty());
+}
+
+TEST_CASE("Multi-scan correspondence pairs independent identities by table index",
+          "[transparent][read_view][iceberg_multiscan]")
+{
+  auto const origin   = GENERATE(candidate_origin::copy, candidate_origin::replan);
+  auto const reversed = GENERATE(false, true);
+  std::vector<original_binding> logical;
+  std::vector<read_view_fingerprint> physical;
+  std::vector<candidate_binding> candidate;
+  for (duckdb::idx_t index = 0; index < 3; ++index) {
+    auto const path     = "data-" + std::to_string(index) + ".parquet";
+    auto const selector = "snapshot=" + std::to_string(index + 1);
+    auto original       = view(path, selector, true);
+    auto rebound        = view(path, selector, true);
+    REQUIRE(original->identity != rebound->identity);
+    logical.push_back({10 + index, original});
+    physical.push_back(fingerprint(original));
+    candidate.push_back({10 + index, rebound});
+  }
+  if (reversed) std::reverse(candidate.begin(), candidate.end());
+
+  auto const comparison = compare_read_views(origin, logical, physical, candidate);
+  REQUIRE(comparison.equal);
+  CHECK(comparison.correspondence ==
+        (origin == candidate_origin::copy ? "table_index" : "table_index_replan"));
+  CHECK(comparison.reason.empty());
+  CHECK(comparison.original_count == 3);
+  CHECK(comparison.candidate_count == 3);
+  CHECK(comparison.only_original.empty());
+  CHECK(comparison.only_candidate.empty());
+}
+
+TEST_CASE("Multi-scan correspondence rejects incomplete and permuted index maps",
+          "[transparent][read_view][iceberg_multiscan]")
+{
+  auto const origin = GENERATE(candidate_origin::copy, candidate_origin::replan);
+  auto const defect = GENERATE("permutation",
+                               "duplicate_candidate",
+                               "duplicate_original",
+                               "missing_index",
+                               "missing_original",
+                               "extra_original",
+                               "paired_identity");
+  CAPTURE(defect);
+  auto a = view("a.parquet", "snapshot=1", true);
+  auto b = view("b.parquet", "snapshot=2", true);
+  auto c = view("c.parquet", "snapshot=3", true);
+  std::vector<original_binding> logical{{10, a}, {20, b}, {30, c}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(b), fingerprint(c)};
+  std::vector<candidate_binding> candidate{{10, a}, {20, b}, {30, c}};
+  std::string const choice = defect;
+  if (choice == "permutation") {
+    std::swap(candidate[0].table_index, candidate[1].table_index);
+  } else if (choice == "duplicate_candidate") {
+    logical[1].view   = view("a.parquet", "snapshot=1", true);
+    candidate[1].view = view("a.parquet", "snapshot=1", true);
+    physical[1]       = fingerprint(a);
+    REQUIRE(logical[1].view->identity != candidate[1].view->identity);
+    REQUIRE(compare_read_views(origin, logical, physical, candidate).equal);
+    candidate[1].table_index = candidate[0].table_index;
+  } else if (choice == "duplicate_original") {
+    logical[1].table_index = logical[0].table_index;
+  } else if (choice == "missing_index") {
+    candidate[0].table_index = 99;
+  } else if (choice == "missing_original") {
+    logical.pop_back();
+  } else if (choice == "extra_original") {
+    logical.push_back({40, a});
+  } else {
+    logical[0].view = view("different.parquet", "snapshot=1", true);
+  }
+
+  auto const comparison = compare_read_views(origin, logical, physical, candidate);
+  CHECK_FALSE(comparison.equal);
+  CHECK(comparison.reason ==
+        (origin == candidate_origin::copy ? "binding_mismatch" : "no_correspondence"));
+  CHECK(comparison.correspondence == (origin == candidate_origin::copy ? "table_index" : "none"));
+  CHECK(comparison.only_original.empty());
+  CHECK(comparison.only_candidate.empty());
+}
+
+TEST_CASE("Multi-scan correspondence proves each required snapshot selector",
+          "[transparent][read_view][iceberg_multiscan]")
+{
+  auto const origin = GENERATE(candidate_origin::copy, candidate_origin::replan);
+  auto const defect = GENERATE(
+    "changed", "permuted", "missing_candidate", "missing_original", "original_not_required");
+  CAPTURE(defect);
+  // Different delete sets can share the same data inventory and schema.
+  auto a = view("shared.parquet", "snapshot=1", true);
+  auto b = view("shared.parquet", "snapshot=2", true);
+  auto c = view("other.parquet", "snapshot=3", true);
+  REQUIRE(fingerprint(a).canonical == fingerprint(b).canonical);
+  std::vector<original_binding> logical{{10, a}, {20, b}, {30, c}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(b), fingerprint(c)};
+  std::vector<candidate_binding> candidate{{10, a}, {20, b}, {30, c}};
+  std::string const choice = defect;
+  if (choice == "changed") {
+    candidate[1].view = view("shared.parquet", "snapshot=99", true);
+  } else if (choice == "permuted") {
+    std::swap(candidate[0].view, candidate[1].view);
+  } else if (choice == "missing_candidate") {
+    candidate[1].view = view("shared.parquet", std::nullopt, true);
+  } else if (choice == "missing_original") {
+    logical[1].view = view("shared.parquet", std::nullopt, true);
+  } else {
+    logical[1].view = view("shared.parquet", "snapshot=2", false);
+  }
+
+  auto const comparison = compare_read_views(origin, logical, physical, candidate);
+  CHECK_FALSE(comparison.equal);
+  CHECK(comparison.reason == "selector_unproven");
+  CHECK(comparison.correspondence ==
+        (origin == candidate_origin::copy ? "table_index" : "table_index_replan"));
+  CHECK(comparison.only_original.empty());
+  CHECK(comparison.only_candidate.empty());
+}
+
+TEST_CASE("Multi-scan replans include skipped definitions and preserve physical proof",
+          "[transparent][read_view][iceberg_multiscan]")
+{
+  auto const defect = GENERATE("none",
+                               "skipped_index",
+                               "skipped_identity",
+                               "skipped_selector",
+                               "omitted",
+                               "missing_identity",
+                               "hash_collision",
+                               "multiplicity");
+  CAPTURE(defect);
+  auto a = view("a.parquet", "snapshot=1", true);
+  auto b = view("b.parquet", "snapshot=2", true);
+  auto c = view("c.parquet", "snapshot=3", true);
+  std::vector<original_binding> logical{{10, a}, {20, b}, {30, c}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(b), fingerprint(c)};
+  std::vector<candidate_binding> planned{{10, a}, {20, b}};
+  std::vector<candidate_binding> skipped{{30, c}};
+  std::string const choice = defect;
+  std::string reason;
+  std::string token = "table_index_replan";
+  if (choice == "skipped_index") {
+    skipped[0].table_index = 99;
+    reason                 = "no_correspondence";
+    token                  = "none";
+  } else if (choice == "skipped_identity") {
+    skipped[0].view = view("different.parquet", "snapshot=3", true);
+    reason          = "fingerprint_mismatch";
+  } else if (choice == "skipped_selector") {
+    skipped[0].view = view("c.parquet", "snapshot=99", true);
+    reason          = "selector_unproven";
+  } else if (choice == "omitted") {
+    skipped.clear();
+    reason = "fingerprint_mismatch";
+  } else if (choice == "missing_identity") {
+    planned[1].view.reset();
+    reason = "missing_identity";
+  } else if (choice == "hash_collision") {
+    auto collision            = std::make_shared<bound_read_view>(*view("collision.parquet"));
+    auto identity             = *collision->identity;
+    identity.fingerprint.hash = fingerprint(c).hash;
+    collision->identity       = std::make_shared<bound_read_identity const>(std::move(identity));
+    skipped[0].view           = std::move(collision);
+    reason                    = "fingerprint_mismatch";
+  } else if (choice == "multiplicity") {
+    physical        = {fingerprint(a), fingerprint(a), fingerprint(b)};
+    logical[2].view = b;
+    skipped[0].view = b;
+    reason          = "fingerprint_mismatch";
+  }
+
+  auto const comparison =
+    compare_read_views(candidate_origin::replan, logical, physical, planned, skipped);
+  CHECK(comparison.equal == (choice == "none"));
+  CHECK(comparison.reason == reason);
+  CHECK(comparison.correspondence == token);
+  CHECK(comparison.original_count == 3);
+  CHECK(comparison.candidate_count == (choice == "omitted" ? 2 : 3));
 }
 
 TEST_CASE("Skipped CTE definition scans count toward correspondence", "[transparent][read_view]")
@@ -212,7 +391,7 @@ TEST_CASE("Skipped CTE definition scans count toward correspondence", "[transpar
   CHECK(only_skipped.correspondence == "none");
 }
 
-TEST_CASE("Read-view mismatch summaries are bounded", "[transparent][read_view]")
+TEST_CASE("Read-view mismatch summaries are bounded", "[transparent][read_view][iceberg_multiscan]")
 {
   std::vector<read_view_fingerprint> physical;
   std::vector<candidate_binding> candidate;
@@ -225,9 +404,12 @@ TEST_CASE("Read-view mismatch summaries are bounded", "[transparent][read_view]"
   auto comparison = compare_read_views(candidate_origin::replan, {}, physical, candidate);
 
   CHECK_FALSE(comparison.equal);
-  CHECK(comparison.reason == "no_correspondence");
-  CHECK(comparison.only_original.empty());
-  CHECK(comparison.only_candidate.empty());
+  CHECK(comparison.correspondence == "table_index_replan");
+  CHECK(comparison.reason == "fingerprint_mismatch");
+  CHECK(comparison.different_original_count == 5);
+  CHECK(comparison.different_candidate_count == 5);
+  CHECK(comparison.only_original.size() == 3);
+  CHECK(comparison.only_candidate.size() == 3);
 
   candidate.resize(1);
   physical.resize(1);
@@ -296,41 +478,58 @@ TEST_CASE("Selector evidence requires a same-generation logical original",
   CHECK(absent.reason == "selector_unproven");
 }
 
-TEST_CASE("Equal read-view sides share candidate identity storage", "[transparent][read_view]")
+TEST_CASE("Equal read-view sides share candidate identity storage",
+          "[transparent][read_view][iceberg_multiscan]")
 {
+  auto const origin = GENERATE(candidate_origin::copy, candidate_origin::replan);
   logical_bound_read_view_capture logical;
-  logical.views.push_back({10, *view("shared.parquet")});
-  std::vector<bound_read_view> physical{*view("shared.parquet")};
-  logical.views.front().view.evidence = std::make_shared<file_evidence_arrays>();
-  physical.front().evidence           = std::make_shared<file_evidence_arrays>();
-  auto const logical_evidence         = logical.views.front().view.evidence;
-  auto const physical_evidence        = physical.front().evidence;
+  std::vector<bound_read_view> physical;
+  std::vector<scan_contract_id> contracts;
   read_view_registry candidate;
-  auto candidate_view = view("shared.parquet");
-  auto const contract =
-    allocate_scan_contract(candidate, std::nullopt, 1, 101, candidate_view, {}, {}, {}, {}, 10);
+  for (duckdb::idx_t index = 0; index < 3; ++index) {
+    auto const path = "shared-" + std::to_string(index) + ".parquet";
+    logical.views.push_back({10 + index, *view(path)});
+    logical.views.back().view.evidence = std::make_shared<file_evidence_arrays>();
+    physical.push_back(*view(path));
+    physical.back().evidence = std::make_shared<file_evidence_arrays>();
+    physical.back().depth    = evidence_depth::path_size_and_tag;
+    contracts.push_back(allocate_scan_contract(
+      candidate, std::nullopt, 1, 101 + index, view(path), {}, {}, {}, {}, 10 + index));
+  }
+  auto const logical_before  = logical;
+  auto const physical_before = physical;
 
-  auto comparison = compare_read_views(candidate_origin::copy, &logical, physical, candidate);
+  auto comparison = compare_read_views(origin, &logical, physical, candidate);
   REQUIRE(comparison.equal);
-  CHECK(candidate.entry(contract).eligibility.verdict == eligibility_verdict::not_evaluated);
-  CHECK(candidate.entry(contract).eligibility.evidence_scope == certificate_evidence_scope::none);
+  CHECK(comparison.original_depth == evidence_depth::path_size_and_tag);
+  CHECK(comparison.candidate_depth == evidence_depth::path);
+  for (auto contract : contracts) {
+    CHECK(candidate.entry(contract).eligibility.verdict == eligibility_verdict::not_evaluated);
+    CHECK(candidate.entry(contract).eligibility.evidence_scope == certificate_evidence_scope::none);
+    CHECK(candidate.entry(contract).eligibility.correspondence.empty());
+  }
   share_equal_read_view_identities(&logical, physical, candidate);
   candidate.publish_correspondence(
     certificate_evidence_scope::binding_correspondence, comparison.correspondence, physical);
 
-  auto const& shared = candidate.entry(contract).contract.view->identity;
-  CHECK(logical.views.front().view.identity == shared);
-  CHECK(physical.front().identity == shared);
-  CHECK(logical.views.front().view.evidence == logical_evidence);
-  CHECK(physical.front().evidence == physical_evidence);
-  CHECK(logical_evidence != physical_evidence);
-  CHECK(candidate.entry(contract).eligibility.verdict == eligibility_verdict::supported);
-  CHECK(candidate.entry(contract).eligibility.evidence_scope ==
-        certificate_evidence_scope::binding_correspondence);
-  std::ostringstream expected_identity;
-  expected_identity << std::hex << std::setw(16) << std::setfill('0') << shared->fingerprint.hash;
-  CHECK(candidate.entry(contract).eligibility.cpu_gpu_view_identity == expected_identity.str());
-  CHECK(candidate.entry(contract).eligibility.correspondence == "table_index");
+  for (std::size_t index = 0; index < contracts.size(); ++index) {
+    auto const& entry  = candidate.entry(contracts[index]);
+    auto const& shared = entry.contract.view->identity;
+    CHECK(logical.views[index].view.identity == shared);
+    CHECK(physical[index].identity == shared);
+    CHECK(logical.views[index].view.evidence == logical_before.views[index].view.evidence);
+    CHECK(physical[index].evidence == physical_before[index].evidence);
+    CHECK(logical.views[index].view.evidence != physical[index].evidence);
+    CHECK(entry.physical_evidence == physical[index].evidence);
+    CHECK(entry.eligibility.depth == evidence_depth::path_size_and_tag);
+    CHECK(entry.eligibility.verdict == eligibility_verdict::supported);
+    CHECK(entry.eligibility.evidence_scope == certificate_evidence_scope::binding_correspondence);
+    std::ostringstream expected_identity;
+    expected_identity << std::hex << std::setw(16) << std::setfill('0') << shared->fingerprint.hash;
+    CHECK(entry.eligibility.cpu_gpu_view_identity == expected_identity.str());
+    CHECK(entry.eligibility.correspondence ==
+          (origin == candidate_origin::copy ? "table_index" : "table_index_replan"));
+  }
 }
 
 TEST_CASE("Correspondence preserves a recorded scan refusal", "[transparent][read_view]")

@@ -41,6 +41,12 @@ class sirius_physical_replicate : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::REPLICATE;
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    // Expansion can split one input batch into several outputs without destination positions.
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   /**
    * @brief Construct a new sirius_physical_replicate object.
    *
