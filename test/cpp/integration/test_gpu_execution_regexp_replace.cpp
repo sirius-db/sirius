@@ -17,6 +17,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
@@ -70,19 +71,17 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
                  "gpu_execution regexp_replace replaces only the first match",
                  "[integration][gpu_execution][projection][regexp_replace]")
 {
+  auto const strategy = GENERATE(sirius::test::each_expression_evaluator_strategy());
+  CAPTURE(strategy);
   create_regexp_replace_table(*this);
-  for (auto const* strategy : {"materialize", "ast_interpret", "ast_jit"}) {
-    CAPTURE(strategy);
-    run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "';");
-    for (auto const* replacement : {"", "-", "XYZ"}) {
-      CAPTURE(replacement);
-      compare_gpu_vs_cpu(std::string("SELECT id, regexp_replace(s, '[A-Z]', '") + replacement +
-                         "') FROM regex_t");
-    }
-    compare_gpu_vs_cpu("SELECT id, regexp_replace(s, '[A-Z]+', '-') FROM regex_t");
-    compare_gpu_vs_cpu("SELECT id FROM regex_t WHERE regexp_replace(s, '[A-Z]', '') = 'aB'");
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
+  for (auto const* replacement : {"", "-", "XYZ"}) {
+    CAPTURE(replacement);
+    compare_gpu_vs_cpu(std::string("SELECT id, regexp_replace(s, '[A-Z]', '") + replacement +
+                       "') FROM regex_t");
   }
-  run_ok("SET expression_evaluator_strategy = 'ast_interpret';");
+  compare_gpu_vs_cpu("SELECT id, regexp_replace(s, '[A-Z]+', '-') FROM regex_t");
+  compare_gpu_vs_cpu("SELECT id FROM regex_t WHERE regexp_replace(s, '[A-Z]', '') = 'aB'");
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,

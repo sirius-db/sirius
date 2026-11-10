@@ -41,7 +41,7 @@ struct tpch_havoc_expectation {
   std::string reason;  ///< Regex the error must contain; for `mismatch` and `skip`, a description.
   int issue = 0;       ///< Open sirius-db/sirius issue that tracks the fix.
   std::string scan;    ///< "native" or "parquet"; empty applies to both.
-  std::string evaluator;             ///< "ast_interpret" or "ast_jit"; empty applies to both.
+  std::string evaluator;  ///< An `expression_evaluator_strategy` value; empty applies to all.
   std::vector<std::string> queries;  ///< Labels, such as "Q05_V03".
 
   bool applies_to(std::string const& scan_name, std::string const& evaluator_name) const;

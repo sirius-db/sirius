@@ -8,7 +8,8 @@
 #              (mismatch, skip).
 #   issue:     the open issue that tracks the fix.
 #   scan:      optional; native or parquet. Without it, the entry applies to both.
-#   evaluator: optional; ast_interpret or ast_jit. Without it, the entry applies to both.
+#   evaluator: optional; an expression_evaluator_strategy value, such as ast_jit or nvrtc_jit.
+#              Without it, the entry applies to every evaluator.
 #   queries:   labels, such as Q05_V03.
 # A fix that makes a query pass fails the test until the query is deleted from its entry.
 

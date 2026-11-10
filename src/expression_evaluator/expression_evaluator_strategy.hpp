@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <string_view>
 
 namespace sirius {
@@ -41,6 +43,30 @@ enum class expression_evaluator_strategy {
   NVRTC_JIT,
 };
 
+/**
+ * @brief Every expression_evaluator_strategy, in declaration order.
+ *
+ * Code that must cover every strategy, such as `string_to_strategy` and the integration tests,
+ * iterates this list, so append each new enumerator here.
+ */
+inline constexpr std::array all_expression_evaluator_strategies{
+  expression_evaluator_strategy::MATERIALIZE,
+  expression_evaluator_strategy::AST_INTERPRET,
+  expression_evaluator_strategy::AST_JIT,
+  expression_evaluator_strategy::NVRTC_JIT,
+};
+
+static_assert(
+  [] {
+    for (std::size_t i = 0; i < all_expression_evaluator_strategies.size(); ++i) {
+      if (all_expression_evaluator_strategies[i] != static_cast<expression_evaluator_strategy>(i)) {
+        return false;
+      }
+    }
+    return true;
+  }(),
+  "all_expression_evaluator_strategies must list every enumerator once, in declaration order");
+
 [[nodiscard]] constexpr bool is_cudf_ast_strategy(expression_evaluator_strategy strategy) noexcept
 {
   return strategy == expression_evaluator_strategy::AST_INTERPRET ||
@@ -49,7 +75,7 @@ enum class expression_evaluator_strategy {
 
 /**
  * @brief Parse a string into an expression_evaluator_strategy.
- * Accepts "materialize", "ast_interpret", "ast_jit", "nvrtc_jit".
+ * Accepts the `strategy_to_string` spelling of each entry of `all_expression_evaluator_strategies`.
  * @return true on success; false on unrecognized input.
  */
 bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out);

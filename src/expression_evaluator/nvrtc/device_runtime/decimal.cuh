@@ -151,6 +151,20 @@ __device__ __forceinline__ reg_val<OutRep> eval_dec_mod(reg_val<L> l,
 }
 
 //===----------DECIMAL CAST----------===//
+/**
+ * @brief @p v / @p factor rounded half away from zero, as DuckDB rounds a DECIMAL cast that drops
+ * scale digits, including a cast to an integer or to HUGEINT (carried as a scale-0 DECIMAL128).
+ */
+__device__ __forceinline__ __int128_t div_round_half_away(__int128_t v, __int128_t factor)
+{
+  __int128_t const q     = v / factor;
+  __int128_t const r     = v - q * factor;  // reuses the quotient instead of a second division
+  __int128_t const abs_r = r < 0 ? -r : r;
+  // abs_r >= factor - abs_r is 2 * abs_r >= factor without overflowing for factor near 10^38.
+  if (abs_r >= factor - abs_r) { return v < 0 ? q - 1 : q + 1; }
+  return q;
+}
+
 template <typename DstRep, bool CanFitOne>
 __device__ __forceinline__ reg_val<DstRep> eval_cast_bool_to_dec(reg_val<bool> in,
                                                                  DstRep one_scaled)
@@ -183,7 +197,7 @@ __device__ __forceinline__ reg_val<DstInt> eval_cast_dec_to_int(reg_val<SrcRep> 
                                                                 __int128_t factor)
 {
   if (!in.valid || in.overflow) { return reg_val<DstInt>{DstInt{}, in.valid, in.overflow}; }
-  __int128_t const q = static_cast<__int128_t>(in.val) / factor;
+  __int128_t const q = div_round_half_away(static_cast<__int128_t>(in.val), factor);
   bool const fits    = in_range<DstInt>(q);
   return reg_val<DstInt>{fits ? static_cast<DstInt>(q) : DstInt{}, true, !fits};
 }
@@ -208,7 +222,7 @@ __device__ __forceinline__ reg_val<DstRep> eval_cast_dec_scale_down(reg_val<SrcR
                                                                     __int128_t limit)
 {
   if (!in.valid || in.overflow) { return reg_val<DstRep>{DstRep{}, in.valid, in.overflow}; }
-  __int128_t const q = static_cast<__int128_t>(in.val) / factor;
+  __int128_t const q = div_round_half_away(static_cast<__int128_t>(in.val), factor);
   if (q <= -limit || q >= limit) { return reg_val<DstRep>{DstRep{}, true, true}; }
   auto const out = overflow_cast<DstRep>(q);
   return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};

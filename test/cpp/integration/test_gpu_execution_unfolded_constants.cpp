@@ -20,6 +20,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <algorithm>
@@ -64,12 +65,11 @@ class UnfoldedConstantsFixture : public sirius::test::GpuExecutionFixture {
   {
     CAPTURE(query);
     require_coalesce_removed(query);
-    for (auto const* strategy : {"materialize", "ast_interpret", "ast_jit"}) {
+    for (auto const strategy : sirius::test::expression_evaluator_strategy_names()) {
       CAPTURE(strategy);
-      run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "';");
+      sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
       compare_gpu_vs_cpu(query);
     }
-    run_ok("SET expression_evaluator_strategy = 'ast_interpret';");
   }
 };
 

@@ -66,10 +66,11 @@ pixi run build/release/test/cpp/sirius_unittest "[TPC-Havoc]~[.]"               
 pixi run build/release/test/cpp/sirius_unittest "gpu_execution - TPC-Havoc Q05" -c Q05_V03  # one rewrite
 pixi run build/release/test/cpp/sirius_unittest "[TPC-Havoc][parquet]"                    # hidden runs
 pixi run build/release/test/cpp/sirius_unittest "[TPC-Havoc][ast_jit]"
+pixi run build/release/test/cpp/sirius_unittest "[TPC-Havoc][nvrtc_jit]"
 ```
 
 PR CI runs the native scan with the default `ast_interpret` evaluator. The parquet scan and the
-`ast_jit` evaluator run only when selected by tag.
+`ast_jit` and `nvrtc_jit` evaluators run only when selected by tag.
 
 Queries that don't pass yet are listed in `test/tpch_havoc/expectations.yaml`, grouped by root cause,
 each group with its outcome (`plan_rejected`, `runtime_failed`, `mismatch` or `skip`) and an open

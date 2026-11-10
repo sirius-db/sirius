@@ -26,6 +26,7 @@
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/config.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/log_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/tpch_queries.hpp>
@@ -47,6 +48,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -190,6 +192,31 @@ class GPUExecutionFixtureBase {
   }
 
   /**
+   * @brief Compares TPC-H query @p spec with DuckDB's CPU result on one GPU under Expression
+   * Evaluator Strategy @p strategy, retrying once when `spec.retry_once` is set.
+   */
+  void compare_tpch_query_with_strategy(sirius::test::tpch_query_spec const& spec,
+                                        std::string_view strategy)
+  {
+    auto const run = [&] {
+      if (!bind_env(1)) { return; }
+      sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
+      compare_gpu_vs_cpu(std::string{spec.sql}, spec.float_tolerance);
+    };
+    if (!spec.retry_once) {
+      run();
+      return;
+    }
+    try {
+      run();
+    } catch (std::exception const& first_err) {
+      release_env();
+      WARN("first attempt failed (known intermittent flake); retrying once: " << first_err.what());
+      run();
+    }
+  }
+
+  /**
    * @brief compare_gpu_vs_cpu_for, also checking that no warn-level log contains any of
    * @p forbidden.
    */
@@ -300,7 +327,8 @@ class GPUExecutionFixtureBase {
     }
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
-    sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
+    sirius::test::require_execution_path(
+      before_gpu_stats, after_gpu_stats, sirius::test::execution_path::gpu);
 
     // Domain evidence must remain an upper bound for every build shape exercised by this suite.
     auto after_filter_stats = sirius::test::get_dynamic_filter_stats_snapshot(*con);
@@ -4434,6 +4462,40 @@ TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
                 "gpu_execution - TPC-H Query 22 parquet",
                 "[integration][gpu_execution][parquet][TPC-H][Q22]",
                 sirius::test::kTpchQ22)
+
+// The 22 queries again under nvrtc_jit, on one GPU over the native scan. Each process compiles a
+// kernel once per expression shape; CI keeps the on-disk kernel cache (SIMPATICO_JIT_CACHE_DIR)
+// warm across runs.
+#define TPCH_NVRTC_TEST_CASE(n)                                                       \
+  TEST_CASE_METHOD(GPUExecutionDuckDBFixture,                                         \
+                   "gpu_execution - TPC-H Query " #n " nvrtc_jit",                    \
+                   "[integration][gpu_execution][TPC-H][Q" #n "][nvrtc_jit]")         \
+  {                                                                                   \
+    compare_tpch_query_with_strategy(sirius::test::kTpchQueries[n - 1], "nvrtc_jit"); \
+  }
+
+TPCH_NVRTC_TEST_CASE(1)
+TPCH_NVRTC_TEST_CASE(2)
+TPCH_NVRTC_TEST_CASE(3)
+TPCH_NVRTC_TEST_CASE(4)
+TPCH_NVRTC_TEST_CASE(5)
+TPCH_NVRTC_TEST_CASE(6)
+TPCH_NVRTC_TEST_CASE(7)
+TPCH_NVRTC_TEST_CASE(8)
+TPCH_NVRTC_TEST_CASE(9)
+TPCH_NVRTC_TEST_CASE(10)
+TPCH_NVRTC_TEST_CASE(11)
+TPCH_NVRTC_TEST_CASE(12)
+TPCH_NVRTC_TEST_CASE(13)
+TPCH_NVRTC_TEST_CASE(14)
+TPCH_NVRTC_TEST_CASE(15)
+TPCH_NVRTC_TEST_CASE(16)
+TPCH_NVRTC_TEST_CASE(17)
+TPCH_NVRTC_TEST_CASE(18)
+TPCH_NVRTC_TEST_CASE(19)
+TPCH_NVRTC_TEST_CASE(20)
+TPCH_NVRTC_TEST_CASE(21)
+TPCH_NVRTC_TEST_CASE(22)
 
 TPCH_TEST_CASES(
   compare_gpu_vs_cpu_for,

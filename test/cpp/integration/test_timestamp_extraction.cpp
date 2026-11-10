@@ -16,6 +16,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>
@@ -45,7 +46,7 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     if (gpu->HasError()) { UNSCOPED_INFO(gpu->GetError()); }
     REQUIRE_FALSE(gpu->HasError());
     // A CPU fallback must not turn this regression green.
-    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    sirius::test::require_execution_path(before, after, sirius::test::execution_path::gpu);
     REQUIRE(gpu->GetTypes() == cpu->GetTypes());
     CHECK(collect_rows(*gpu) == expected);
   }
@@ -58,10 +59,10 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
                  "[integration][gpu_execution][timestamp_extraction]")
 {
   auto const type     = GENERATE("TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP", "TIMESTAMP_NS");
-  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit", "nvrtc_jit");
+  auto const strategy = GENERATE(sirius::test::each_expression_evaluator_strategy());
   CAPTURE(type, strategy);
   run_ok("SET gpu_execution = false");
-  run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "'");
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
   run_ok(std::string("CREATE TABLE timestamps (id BIGINT, t ") + type + ")");
 
   // Materialized table columns prevent constant folding of the extraction.
@@ -111,11 +112,11 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
                  "datetime extraction composes with BETWEEN and CASE",
                  "[integration][gpu_execution][timestamp_extraction]")
 {
-  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit");
+  auto const strategy = GENERATE(sirius::test::each_expression_evaluator_strategy());
   CAPTURE(strategy);
   run_ok("SET gpu_execution = false");
   run_ok("SET enable_duckdb_fallback = false");
-  run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "'");
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
   run_ok("CREATE TABLE timestamps (id BIGINT, d DATE, t TIMESTAMP)");
   run_ok(
     "INSERT INTO timestamps VALUES "

@@ -5,6 +5,7 @@
  * See the LICENSE file at the repo root for the full text.
  */
 
+#include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <utils/tpch_havoc_queries.hpp>
 #include <yaml-cpp/yaml.h>
 
@@ -143,8 +144,9 @@ std::vector<tpch_havoc_expectation> load_tpch_havoc_expectations(std::filesystem
         expectation.scan != "parquet") {
       throw std::runtime_error(where + ": unknown scan '" + expectation.scan + "'");
     }
-    if (!expectation.evaluator.empty() && expectation.evaluator != "ast_interpret" &&
-        expectation.evaluator != "ast_jit") {
+    if (sirius::expression_evaluator_strategy parsed;
+        !expectation.evaluator.empty() &&
+        !sirius::string_to_strategy(expectation.evaluator, parsed)) {
       throw std::runtime_error(where + ": unknown evaluator '" + expectation.evaluator + "'");
     }
     try {

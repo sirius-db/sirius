@@ -26,6 +26,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>
@@ -67,30 +68,6 @@ class NullDataFixture : public sirius::test::GpuExecutionFixture {
 };
 
 const std::vector<std::string> kNullableColumns = {"i", "b", "dec", "dbl", "s", "dt"};
-
-// The integration database is shared across tests, so a strategy SET must not outlive the test.
-struct evaluator_strategy_guard {
-  evaluator_strategy_guard(duckdb::Connection& c, const std::string& strategy) : con(c)
-  {
-    auto current = con.Query("SELECT current_setting('expression_evaluator_strategy');");
-    REQUIRE(current);
-    REQUIRE_FALSE(current->HasError());
-    original    = current->Collection().GetValue(0, 0).ToString();
-    auto result = con.Query("SET expression_evaluator_strategy = '" + strategy + "';");
-    REQUIRE(result);
-    REQUIRE_FALSE(result->HasError());
-  }
-  ~evaluator_strategy_guard()
-  {
-    con.Query("SET expression_evaluator_strategy = '" + original + "';");
-  }
-
-  evaluator_strategy_guard(const evaluator_strategy_guard&)            = delete;
-  evaluator_strategy_guard& operator=(const evaluator_strategy_guard&) = delete;
-
-  duckdb::Connection& con;
-  std::string original;
-};
 
 }  // namespace
 
@@ -203,13 +180,13 @@ TEST_CASE_METHOD(NullDataFixture,
     "SELECT id, b NOT IN (NULL, i, 200) AS r FROM nt",
     "SELECT id FROM nt WHERE i IN (NULL, 10)",
     "SELECT id, CASE WHEN s IN (NULL, 'apple') THEN -906929.2003 ELSE 0.5000 END AS r FROM nt"};
-  for (auto const* strategy : {"materialize", "ast_interpret", "ast_jit"}) {
+  for (auto const strategy : sirius::test::expression_evaluator_strategy_names()) {
     for (auto const& query : queries) {
       DYNAMIC_SECTION(strategy << ": " << query)
       {
         // Keep the IN lists as IN expressions rather than letting DuckDB rewrite them.
         sirius::test::disabled_optimizers_guard optimizer_guard{*con, "in_clause"};
-        evaluator_strategy_guard strategy_guard{*con, strategy};
+        sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
         compare_gpu_vs_cpu(query);
       }
     }

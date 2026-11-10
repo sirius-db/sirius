@@ -14,6 +14,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/tpch_havoc_queries.hpp>
 
 #include <filesystem>
@@ -95,10 +96,10 @@ TEST_CASE("tpch_havoc: every expected outcome names a distinct query once", "[tp
     }
   }
   for (auto const* scan : {"native", "parquet"}) {
-    for (auto const* evaluator : {"ast_interpret", "ast_jit"}) {
+    for (auto const evaluator : sirius::test::expression_evaluator_strategy_names()) {
       for (auto const& label : labels) {
-        CHECK_NOTHROW(
-          sirius::test::find_tpch_havoc_expectation(expectations, label, scan, evaluator));
+        CHECK_NOTHROW(sirius::test::find_tpch_havoc_expectation(
+          expectations, label, scan, std::string{evaluator}));
       }
     }
   }

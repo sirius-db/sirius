@@ -18,29 +18,17 @@
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 
 // standard library
+#include <algorithm>
 #include <cassert>
 
 namespace sirius {
 
 bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out)
 {
-  if (sv == "materialize") {
-    out = expression_evaluator_strategy::MATERIALIZE;
-    return true;
-  }
-  if (sv == "ast_interpret") {
-    out = expression_evaluator_strategy::AST_INTERPRET;
-    return true;
-  }
-  if (sv == "ast_jit") {
-    out = expression_evaluator_strategy::AST_JIT;
-    return true;
-  }
-  if (sv == "nvrtc_jit") {
-    out = expression_evaluator_strategy::NVRTC_JIT;
-    return true;
-  }
-  return false;
+  auto const match = std::ranges::find(all_expression_evaluator_strategies, sv, strategy_to_string);
+  if (match == all_expression_evaluator_strategies.end()) { return false; }
+  out = *match;
+  return true;
 }
 
 std::string_view strategy_to_string(expression_evaluator_strategy s)

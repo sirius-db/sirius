@@ -261,23 +261,11 @@ class GpuExecutionFixture {
 
   /// Asserts the query is rejected during GPU plan generation and completes via DuckDB's CPU
   /// plan, returning exactly the CPU results. Distinct from expect_gpu_fallback, which asserts a
-  /// fallback *after* GPU execution started: a plan-time rejection moves `fallbacks` and never
-  /// increments `executions`. Use for shapes Sirius screens out at plan time on purpose.
+  /// fallback *after* GPU execution started. Use for shapes Sirius screens out at plan time on
+  /// purpose.
   void expect_plan_fallback_matches_cpu(const std::string& query)
   {
-    run_ok("SET gpu_execution = true;");
-    auto const before = sirius::test::get_transparent_execution_stats(*con);
-    auto gpu_result   = con->Query(query);
-    auto const after  = sirius::test::get_transparent_execution_stats(*con);
-    REQUIRE(gpu_result);
-    if (gpu_result->HasError()) { UNSCOPED_INFO("query error: " << gpu_result->GetError()); }
-    REQUIRE_FALSE(gpu_result->HasError());
-    if (after.fallbacks == before.fallbacks) {
-      UNSCOPED_INFO("expected a plan-time fallback to CPU, but none occurred");
-    }
-    REQUIRE(after.fallbacks == before.fallbacks + 1);
-    REQUIRE(after.executions == before.executions);
-    require_matches_cpu(query, *gpu_result);
+    expect_result_matches_cpu(query, execution_path::plan_time_fallback);
   }
 
   /// Asserts the query starts on the GPU, falls back to DuckDB's CPU execution at runtime, and
@@ -285,18 +273,48 @@ class GpuExecutionFixture {
   /// not compare the results.
   void expect_runtime_fallback_matches_cpu(const std::string& query)
   {
+    expect_result_matches_cpu(query, execution_path::cpu_replay);
+  }
+
+  /// Runs @p query with `gpu_execution` on, requires that it takes @p expected, and returns its
+  /// result, which may hold an error.
+  duckdb::unique_ptr<duckdb::QueryResult> run_on_path(const std::string& query,
+                                                      execution_path expected)
+  {
+    INFO(query);
     run_ok("SET gpu_execution = true;");
     auto const before = sirius::test::get_transparent_execution_stats(*con);
-    auto gpu_result   = con->Query(query);
+    auto result       = con->Query(query);
     auto const after  = sirius::test::get_transparent_execution_stats(*con);
-    REQUIRE(gpu_result);
-    if (gpu_result->HasError()) { UNSCOPED_INFO("query error: " << gpu_result->GetError()); }
-    REQUIRE_FALSE(gpu_result->HasError());
-    if (after.runtime_fallbacks == before.runtime_fallbacks) {
-      UNSCOPED_INFO("expected a runtime fallback to CPU, but none occurred");
-    }
-    REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks + 1);
-    require_matches_cpu(query, *gpu_result);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("query error: " << result->GetError()); }
+    sirius::test::require_execution_path(before, after, expected);
+    return result;
+  }
+
+  /// Requires that @p query takes @p expected and returns exactly DuckDB's CPU column types and
+  /// rows, ignoring row order.
+  void expect_result_matches_cpu(const std::string& query, execution_path expected)
+  {
+    INFO(query);
+    auto result = run_on_path(query, expected);
+    REQUIRE_FALSE(result->HasError());
+    require_matches_cpu(query, *result);
+  }
+
+  /// Requires that @p query takes @p expected and fails with DuckDB's CPU error type and message.
+  void expect_error_matches_cpu(const std::string& query, execution_path expected)
+  {
+    INFO(query);
+    auto result = run_on_path(query, expected);
+    REQUIRE(result->HasError());
+    run_ok("SET gpu_execution = false;");
+    auto cpu_result = con->Query(query);
+    run_ok("SET gpu_execution = true;");
+    REQUIRE(cpu_result);
+    REQUIRE(cpu_result->HasError());
+    CHECK(result->GetErrorType() == cpu_result->GetErrorType());
+    REQUIRE(result->GetError() == cpu_result->GetError());
   }
 
  private:
@@ -334,8 +352,7 @@ class GpuExecutionFixture {
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
     CHECK(after_gpu_stats.read_view_mismatches == before_gpu_stats.read_view_mismatches);
-    // Exactly one GPU execution, no fallback: proves the query ran on the GPU.
-    sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
+    sirius::test::require_execution_path(before_gpu_stats, after_gpu_stats, execution_path::gpu);
 
     // Run on CPU.
     con->Query("SET gpu_execution = false;");

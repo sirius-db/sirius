@@ -22,6 +22,10 @@
 
 #include <duckdb.hpp>
 
+#include <cstdint>
+#include <ostream>
+#include <string_view>
+
 namespace sirius::test {
 
 inline duckdb::shared_ptr<duckdb::SiriusContext> get_registered_sirius_context(
@@ -74,6 +78,54 @@ inline void require_transparent_execution_delta(
   REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks + expected_runtime_fallback_delta);
   REQUIRE(after.late_failure_no_replay == before.late_failure_no_replay);
   REQUIRE(after.lease_held_at_replay == before.lease_held_at_replay);
+}
+
+/**
+ * @brief How Sirius completed one transparently executed query, as the delta of
+ * `duckdb::SiriusContext::transparent_execution_stats` across it shows.
+ */
+enum class execution_path {
+  gpu,                 ///< Ran on the GPU without CPU Replay; the rows or error are the GPU's.
+  cpu_replay,          ///< Failed on the GPU at runtime; DuckDB re-ran it on the CPU.
+  plan_time_fallback,  ///< Sirius declined to plan it; DuckDB ran it on the CPU from the start.
+};
+
+[[nodiscard]] constexpr std::string_view to_string(execution_path path) noexcept
+{
+  switch (path) {
+    case execution_path::gpu: return "gpu";
+    case execution_path::cpu_replay: return "cpu_replay";
+    case execution_path::plan_time_fallback: return "plan_time_fallback";
+  }
+  return "unknown";
+}
+
+inline std::ostream& operator<<(std::ostream& os, execution_path path)
+{
+  return os << to_string(path);
+}
+
+/**
+ * @brief Requires that exactly one transparently executed query ran between @p before and @p after,
+ * and that it took @p expected.
+ */
+inline void require_execution_path(const duckdb::SiriusContext::transparent_execution_stats& before,
+                                   const duckdb::SiriusContext::transparent_execution_stats& after,
+                                   execution_path expected)
+{
+  INFO("expected execution path: " << expected);
+  switch (expected) {
+    case execution_path::gpu:
+      require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+      return;
+    case execution_path::cpu_replay:
+      require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+      return;
+    case execution_path::plan_time_fallback:
+      require_transparent_execution_delta(before, after, 0, 1, 0, 0);
+      return;
+  }
+  FAIL("unknown execution path");
 }
 
 }  // namespace sirius::test

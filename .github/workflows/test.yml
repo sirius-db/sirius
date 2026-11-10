@@ -240,6 +240,8 @@ jobs:
         env:
           SIRIUS_EXTENSION_PATH: ${{ github.workspace }}/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
           SIRIUS_TEST_REQUIRE_DUCKLAKE: "1"
+          # Kept beside CUDA_CACHE_PATH so the nvrtc_jit tests reuse kernels compiled by earlier runs.
+          SIMPATICO_JIT_CACHE_DIR: /home/runner/actions-runner/_work/.simpatico-jit-cache
         run: |
           nvidia-smi
           python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort

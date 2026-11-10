@@ -28,6 +28,7 @@
 #include <catch.hpp>
 #include <expression_evaluator/decimal_integer_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <sirius/exception.hpp>
 
@@ -38,7 +39,6 @@
 using namespace sirius::expr_test;
 using sirius::logical_type;
 using sirius::type_id;
-using strategy = sirius::expression_evaluator_strategy;
 
 namespace {
 
@@ -89,7 +89,8 @@ TEMPLATE_TEST_CASE("decimal integer casts round ties away from zero under every 
                    int64_t,
                    __int128_t)
 {
-  auto const mode = GENERATE(strategy::MATERIALIZE, strategy::AST_INTERPRET, strategy::AST_JIT);
+  auto const mode =
+    GENERATE(Catch::Generators::from_range(sirius::all_expression_evaluator_strategies));
   constexpr uint8_t width = sizeof(TestType) == 4 ? 9 : sizeof(TestType) == 8 ? 18 : 38;
   auto input =
     decimals<TestType>({-151, -150, -149, -50, -49, 0, 49, 50, 149, 150, 151, 0},
@@ -168,7 +169,7 @@ TEMPLATE_TEST_CASE("decimal integer casts preserve high scales in narrow carrier
     tiny->view(), logical_type::make(type_id::BIGINT), false, stream, mr);
   REQUIRE(integers(result->view()) == std::vector<__int128_t>{0, 0});
 
-  for (auto mode : {strategy::MATERIALIZE, strategy::AST_INTERPRET, strategy::AST_JIT}) {
+  for (auto const mode : sirius::all_expression_evaluator_strategies) {
     CAPTURE(mode);
     auto expr = make_cast(make_ref_typed(0, logical_type::make_decimal(38, 38)),
                           logical_type::make(type_id::BIGINT),
@@ -276,8 +277,9 @@ TEST_CASE("decimal integer casts handle sliced masks empty columns and all NULLs
 TEST_CASE("decimal casts compose in ASTs while standalone translation declines integer casts",
           "[expression_evaluator][expression_translator][decimal_integer_cast]")
 {
-  auto const mode = GENERATE(strategy::MATERIALIZE, strategy::AST_INTERPRET, strategy::AST_JIT);
-  auto input      = decimals<int64_t>({149, 150, -150}, 2);
+  auto const mode =
+    GENERATE(Catch::Generators::from_range(sirius::all_expression_evaluator_strategies));
+  auto input = decimals<int64_t>({149, 150, -150}, 2);
   for (auto const target : {type_id::BIGINT, type_id::UBIGINT}) {
     auto cast = make_cast(
       make_ref_typed(0, logical_type::make_decimal(18, 2)), logical_type::make(target), true);

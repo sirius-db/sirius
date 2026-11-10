@@ -17,23 +17,26 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/types/date.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace {
 class DateArithmeticFixture : public sirius::test::GpuExecutionFixture {
  public:
-  void strategy(std::string const& value)
+  void strategy(std::string_view value)
   {
     run_ok("SET gpu_execution = false");
     run_ok("SET enable_duckdb_fallback = false");
-    run_ok("SET expression_evaluator_strategy = '" + value + "'");
+    strategy_guard_.emplace(*con, value);
   }
   void seed()
   {
@@ -46,6 +49,9 @@ class DateArithmeticFixture : public sirius::test::GpuExecutionFixture {
       "(8,'-infinity','-infinity',0), (9,NULL,'2001-01-01',2147483647)");
     run_ok("CHECKPOINT");
   }
+
+ private:
+  std::optional<sirius::test::scoped_expression_evaluator_strategy> strategy_guard_;
 };
 }  // namespace
 
@@ -53,7 +59,7 @@ TEST_CASE_METHOD(DateArithmeticFixture,
                  "DATE arithmetic preserves values NULLs and infinities",
                  "[integration][gpu_execution][date_arithmetic]")
 {
-  strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  strategy(GENERATE(sirius::test::each_expression_evaluator_strategy()));
   seed();
   compare_gpu_vs_cpu("SELECT id,a+n,n+a,a-n,a-b FROM dates");
   compare_gpu_vs_cpu("SELECT id,a+5,5+a,a-5,a-DATE '1970-01-01',DATE '1970-01-01'-a FROM dates");
@@ -72,7 +78,7 @@ TEST_CASE_METHOD(DateArithmeticFixture,
                  "DATE difference widens before subtraction",
                  "[integration][gpu_execution][date_arithmetic]")
 {
-  strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  strategy(GENERATE(sirius::test::each_expression_evaluator_strategy()));
   run_ok("CREATE TABLE dates(a DATE,b DATE,n INTEGER)");
   auto const high = duckdb::Value::DATE(duckdb::date_t{std::numeric_limits<int32_t>::max() - 1});
   auto const low  = duckdb::Value::DATE(duckdb::date_t{std::numeric_limits<int32_t>::min()});
@@ -92,7 +98,7 @@ TEST_CASE_METHOD(DateArithmeticFixture,
 {
   auto const operation = GENERATE("a+n", "n+a", "a-n");
   auto const edge      = GENERATE(0, 1, 2, 3);
-  strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  strategy(GENERATE(sirius::test::each_expression_evaluator_strategy()));
   bool const subtract = std::string(operation) == "a-n";
   int32_t const days =
     edge < 2 ? std::numeric_limits<int32_t>::max() - 1 : std::numeric_limits<int32_t>::min();
@@ -107,16 +113,11 @@ TEST_CASE_METHOD(DateArithmeticFixture,
   REQUIRE_FALSE(inserted->HasError());
   run_ok("CHECKPOINT");
   auto const query = "SELECT " + std::string(operation) + " FROM dates";
-  for (bool gpu : {false, true}) {
-    run_ok(std::string("SET gpu_execution = ") + (gpu ? "true" : "false"));
-    auto before = sirius::test::get_transparent_execution_stats(*con);
-    auto result = con->Query(query);
-    REQUIRE(result);
-    REQUIRE(result->HasError());
-    REQUIRE(result->GetError().find("Date out of range") != std::string::npos);
-    auto after = sirius::test::get_transparent_execution_stats(*con);
-    REQUIRE(after.fallbacks == before.fallbacks);
-    REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
-    if (gpu) { REQUIRE(after.successful_rebinds == before.successful_rebinds + 1); }
-  }
+  auto const cpu   = con->Query(query);
+  REQUIRE(cpu->HasError());
+  REQUIRE(cpu->GetError().find("Date out of range") != std::string::npos);
+  // With CPU Replay disabled, the error must come from the GPU itself.
+  auto const gpu = run_on_path(query, sirius::test::execution_path::gpu);
+  REQUIRE(gpu->HasError());
+  REQUIRE(gpu->GetError().find("Date out of range") != std::string::npos);
 }

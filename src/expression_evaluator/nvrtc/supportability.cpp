@@ -472,6 +472,9 @@ bool is_node_supported(sirius::ast::node const& expr,
     if (cst.kind == sirius::ast::cast_kind::carrier_restore) {
       return src_type == dst_type || can_restore_to(src_type, dst_type);
     }
+    // UHUGEINT is carried in UINT64 on the GPU. A TRY_CAST row beyond that carrier is a valid
+    // UHUGEINT, so it must request CPU Replay rather than become NULL, which the kernel cannot do.
+    if (cst.try_cast && cst.target_type.id() == sirius::type_id::UHUGEINT) { return false; }
     return is_semantic_cast_supported(src_type, dst_type);
   }
 
