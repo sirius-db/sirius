@@ -182,6 +182,13 @@ fi
 if [ "$serve_only" = 1 ]; then
   # A FIFO opened read-write never reaches EOF, so the gateway serves until it is killed.
   [ -p "$logs/serve.stdin" ] || mkfifo "$logs/serve.stdin"
-  exec "$gateway" -init "$init" <> "$logs/serve.stdin"
+  # The DuckDB shell takes SIGINT as "cancel the statement" and goes on serving, so Ctrl-C would
+  # never stop a gateway without a console. This script stays as its parent and stops it.
+  "$gateway" -init "$init" <> "$logs/serve.stdin" &
+  server=$!
+  trap 'kill "$server" 2> /dev/null || true; wait "$server" || true; exit 0' INT TERM
+  rc=0
+  wait "$server" || rc=$?
+  exit "$rc"
 fi
 exec "$gateway" -init "$init"
