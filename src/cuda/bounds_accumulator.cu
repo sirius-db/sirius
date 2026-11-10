@@ -30,6 +30,7 @@
 #include <thrust/iterator/transform_iterator.h>
 
 #include <helper/numeric_narrowing.hpp>
+#include <memory/size_arithmetic.hpp>
 #include <op/dynamic_filter/detail/bounds_accumulator.hpp>
 #include <op/dynamic_filter/detail/restore_scalar.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
@@ -41,6 +42,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -267,6 +269,43 @@ std::optional<bounds_accumulator> bounds_accumulator::try_create(
   if (!partials) { return std::nullopt; }
   state->partials = std::move(*partials);
   return bounds_accumulator{std::move(state)};
+}
+
+std::size_t bounds_accumulator::contribution_scratch_bytes(std::size_t rows)
+{
+  auto const items = static_cast<cudf::size_type>(
+    std::min<std::size_t>(rows, std::numeric_limits<cudf::size_type>::max()));
+  std::size_t widest = 0;
+  for (auto const id : {cudf::type_id::INT8,
+                        cudf::type_id::INT16,
+                        cudf::type_id::INT32,
+                        cudf::type_id::INT64,
+                        cudf::type_id::BOOL8,
+                        cudf::type_id::DECIMAL128}) {
+    dispatch_bound_storage(cudf::data_type{id}, [&](auto tag) {
+      using T          = decltype(tag);
+      auto const input = thrust::make_transform_iterator(
+        thrust::counting_iterator<cudf::size_type>{0}, masked_bound<T>{nullptr, nullptr, 0, T{}});
+      std::size_t min_bytes = 0;
+      std::size_t max_bytes = 0;
+      check_cuda(cub::DeviceReduce::Min(nullptr, min_bytes, input, static_cast<T*>(nullptr), items),
+                 "cub::DeviceReduce::Min(size)");
+      check_cuda(cub::DeviceReduce::Max(nullptr, max_bytes, input, static_cast<T*>(nullptr), items),
+                 "cub::DeviceReduce::Max(size)");
+      widest = std::max({widest, min_bytes, max_bytes});
+    });
+  }
+  return tracked_replica_allocation_bytes(widest);
+}
+
+std::size_t bounds_accumulator::finish_scratch_bytes(std::size_t narrowed_carriers) noexcept
+{
+  if (narrowed_carriers == 0) { return 0; }
+  // Each held pair is two scalars of a value and a validity flag. A restore in progress holds the
+  // pair's restored minimum, the narrow scalar, `restore_scalar`'s one-row column and cast result,
+  // and the restored scalar: eight allocations. Every allocation holds at most one bound.
+  auto const allocations = memory::saturating_add(memory::saturating_mul(narrowed_carriers, 4), 8);
+  return memory::saturating_mul(allocations, tracked_replica_allocation_bytes(k_bound_bytes));
 }
 
 bool bounds_accumulator::enqueue_add(std::size_t batch_index,

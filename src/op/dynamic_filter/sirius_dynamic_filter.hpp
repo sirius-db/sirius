@@ -353,6 +353,12 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   /// Baseline footprint of a set over @p num_keys keys of @p key_type, sized at the key's rep.
   [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
                                                        cudf::data_type key_type) noexcept;
+  /// Slots of the set built over @p num_keys keys at @p capacity_factor slots per key: the
+  /// constructor's capacity rounded to a valid cuco extent.
+  [[nodiscard]] static std::size_t set_slots(std::size_t num_keys,
+                                             std::size_t capacity_factor) noexcept;
+  /// Bytes of this filter's source set.
+  [[nodiscard]] std::size_t storage_bytes() const noexcept;
 
  private:
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
@@ -574,6 +580,16 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     membership_key_domain domain, std::unique_ptr<impl> completed);
   std::unique_ptr<impl> _impl;
 };
+
+/**
+ * @brief An upper bound on the device storage either IN-list over @p num_keys keys at @p rep takes
+ *
+ * The hash IN-list's set at the largest capacity factor it may choose, rounded to a valid cuco
+ * extent exactly as its constructor rounds, plus a small IN-list's needles, each charged at the
+ * allocation alignment. Never zero.
+ */
+[[nodiscard]] std::size_t in_list_storage_upper_bound(std::size_t num_keys,
+                                                      membership_key_rep rep) noexcept;
 
 class sirius_dynamic_filter_set;
 

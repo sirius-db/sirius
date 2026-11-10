@@ -217,6 +217,13 @@ class accumulated_bloom_builder final {
   [[nodiscard]] static std::optional<accumulated_bloom_builder> try_create(
     std::vector<key> keys, std::span<dynamic_filter_replica_space const> targets);
 
+  /**
+   * @brief An upper bound on the task scratch `finish` takes for @p keys (with their blocks set)
+   * replicated on @p replicas GPUs: the direct merge's chunk slots for every non-root source.
+   */
+  [[nodiscard]] static std::size_t publication_scratch_bytes(std::span<key const> keys,
+                                                             std::size_t replicas) noexcept;
+
   ~accumulated_bloom_builder();
   accumulated_bloom_builder(accumulated_bloom_builder const&)            = delete;
   accumulated_bloom_builder& operator=(accumulated_bloom_builder const&) = delete;
