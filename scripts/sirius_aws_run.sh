@@ -9,7 +9,8 @@ usage()
 {
   cat <<'USAGE'
 usage: sirius_aws_run.sh --name NAME --data DIR --frac FRACTION --config FILE
-                         [--nodes "HOST ..."] [--ref-dir DIR] [QUERY ...]
+                         [--nodes "HOST ..."] [--ref-dir DIR]
+                         [--s3-prefix s3://BUCKET/PATH --secret-file FILE] [QUERY ...]
 
 Run it on the machine that hosts the gateway, in the Pixi environment:
   cd $WORK/sirius && pixi run bash scripts/sirius_aws_run.sh --name sf100-2m ...
@@ -21,6 +22,13 @@ Run it on the machine that hosts the gateway, in the Pixi environment:
   --nodes HOSTS    the other machines, by private address. Needs ssh without a password from
                    here, and the checkout, the build, the data and $WORK at the same paths
   --ref-dir DIR    reference answers as q<n>.csv: compares every answer with them at the end
+  --s3-prefix URL  read the tables from URL/<table>/*.parquet instead of --data. nation, region
+                   and supplier stay local: they are one file each, and a table on S3 needs at
+                   least as many files as there are ranks. --data is still needed, for those
+                   three and for the node check
+  --secret-file F  a file with the CREATE SECRET statement for that bucket, on this machine
+                   only (sirius_aws_s3_secret.sh writes it). run.sql reads it with .read, so
+                   the keys appear neither in run.sql nor in client.txt
   QUERY ...        TPC-H query numbers (default: 1 6 12)
 
   WORK             as in sirius_aws_setup.sh (default /opt/dlami/nvme/work)
@@ -47,7 +55,7 @@ sampler()
 # The other machines run the sampler from their own checkout: `<this script> --sampler DIR`.
 [ "${1:-}" = --sampler ] && sampler "$2"
 
-name='' DATA='' frac='' config='' NODES='' ref=''
+name='' DATA='' frac='' config='' NODES='' ref='' s3='' secret=''
 while [ $# -gt 0 ]; do
   case $1 in
     -h | --help) usage && exit 0 ;;
@@ -57,6 +65,8 @@ while [ $# -gt 0 ]; do
     --config) config=${2:-} ;;
     --nodes) NODES=${2:-} ;;
     --ref-dir) ref=${2:-} ;;
+    --s3-prefix) s3=${2:-} ;;
+    --secret-file) secret=${2:-} ;;
     -*) usage >&2 && exit 2 ;;
     *) break ;;
   esac
@@ -64,6 +74,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$name" ] && [ -n "$DATA" ] && [ -n "$frac" ] && [ -r "$config" ] || {
   usage >&2
+  exit 2
+}
+[ -z "$s3" ] || [ -r "$secret" ] || {
+  echo "--s3-prefix needs --secret-file FILE, readable" >&2
   exit 2
 }
 [ $# -gt 0 ] || set -- 1 6 12
@@ -77,7 +91,7 @@ if ss -ltn | grep -E ':(9494|950[0-9]|2700[0-9]) '; then
   echo "ports in use"
   exit 1
 fi
-ranks=$(nvidia-smi -L | wc -l)
+ranks=$(($(nvidia-smi -L | wc -l)))
 for n in $NODES; do
   remote=$(ssh "$n" "nvidia-smi -L | wc -l") || exit 1
   ranks=$((ranks + remote))
@@ -85,9 +99,18 @@ done
 mkdir -p "$OUT" && cp "$config" "$OUT/config.yaml" || exit 1
 q=$CHECKOUT/test/tpch_performance/tpch_queries/orig
 {
-  printf '.mode csv\n.timer on\n'
+  printf '.mode csv\n'
+  [ -z "$secret" ] || echo ".read $secret"
+  printf '.timer on\n'
   for t in customer lineitem nation orders part partsupp region supplier; do
-    echo "CREATE OR REPLACE VIEW $t AS FROM read_parquet('$DATA/$t/*.parquet');"
+    src=$DATA
+    # Remote files are dealt whole to the ranks, and a table with fewer files than ranks is
+    # refused, so the one-file tables stay local.
+    case $t in
+      nation | region | supplier) ;;
+      *) [ -z "$s3" ] || src=$s3 ;;
+    esac
+    echo "CREATE OR REPLACE VIEW $t AS FROM read_parquet('$src/$t/*.parquet');"
   done
   for n in "$@"; do
     for run in 1 2; do

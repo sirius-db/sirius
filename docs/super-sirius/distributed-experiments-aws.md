@@ -20,17 +20,18 @@ machine at SF100, not on an instance. Other `g7e` sizes were not run: check step
 
 **Also tested:** two `g6.4xlarge` (each 1 x L4 23 GB, 16 vCPUs, 64 GiB RAM, 549 GB of
 instance-store NVMe, no EFA) as one cluster over TCP, one rank per machine, at commit
-`7a5904b3`: TPC-H SF100 with all 22 answers checked, and SF1000 timings. See
-[Several machines](#several-machines).
+`7a5904b3`: TPC-H SF100 and SF1000 from the local disks and SF1000 from S3, every answer
+checked. See [Several machines](#several-machines) and [Data on S3](#data-on-s3).
 
-Two scripts do the steps below for you. They are the commands of that `g6.4xlarge` run with its
-addresses, paths and two-machine limit taken out, and **have not been run end to end in this
-form**:
+Three scripts do the steps below for you. They are the commands of that `g6.4xlarge` run with
+its addresses, paths, bucket and two-machine limit taken out, and **have not been run end to end
+in this form**:
 
 | Script | Does |
 |---|---|
 | `scripts/sirius_aws_setup.sh [SF]` | Steps 2 to 4 on one machine: work folders, Pixi, Rust, checkout, build, and the dataset when given a scale factor |
 | `scripts/sirius_aws_run.sh` | Steps 5 and 6 from a config file you give it: `run.sql`, the gateway, the ranks on this machine and on the others, a sampler of disk, network, GPU and memory, the timings, and the answer check |
+| `scripts/sirius_aws_s3_secret.sh BUCKET` | The `CREATE SECRET` file for [data on S3](#data-on-s3), from the instance's role |
 
 ## Rules
 
@@ -342,7 +343,7 @@ instances add: they share no `$HOME` and no disk.
 | The same checkout, build and data, at the same paths | Run steps 2 to 4 (`scripts/sirius_aws_setup.sh <SF>`) on every machine, at the same commit. A build does not move between GPU types. Generate the data on each machine, or copy it |
 | The environment over `ssh` | `. $WORK/env.sh` at the start of every remote command: a non-interactive `ssh` does not read `~/.bashrc` |
 | The gateway's address and token on every machine | They are in `~/.sirius/gateways/<cluster>/gateway.conf` on the gateway's machine, written when it starts. Copy the file to the same path on the others, in a folder of mode 700, for every run. Or start the ranks with `--gateway HOST:PORT --token-file FILE` ([Quick Start](distributed-quickstart.md#prerequisites)), which was not run here |
-| Disk for the whole dataset on every machine | Every rank reads every file: the scale factor is limited by one machine's instance store |
+| Disk for the whole dataset on every machine | Every rank reads every file: the scale factor is limited by one machine's instance store, unless the data is [on S3](#data-on-s3) |
 
 A cluster placement group puts the machines close together in one zone.
 
@@ -387,6 +388,53 @@ prints nothing. If the script was killed with `kill -9`,
 [stop what is left](distributed-experiments-no-slurm.md#stop-what-a-killed-run-left) on each
 machine and delete `~/.sirius/gateways/bench` there.
 
+## Data on S3
+
+The ranks can read the Parquet files from a bucket instead of the instance store. That removes
+the per-machine disk limit on the scale factor, and on a `g6.4xlarge` it is faster than the
+disk. Tested on one and two `g6.4xlarge` at SF1000; see [Reference numbers](#two-g64xlarge).
+
+**What it needs**
+
+| Need | How |
+|---|---|
+| The bucket in the instances' region | Otherwise the reads leave the region: slower, and billed |
+| An instance profile with `s3:ListBucket` and `s3:GetObject` on the bucket, attached to every machine | At launch, or later with `aws ec2 associate-iam-instance-profile`. Writing the data from an instance also needs `s3:PutObject` |
+| The data in the bucket, one folder per table | `aws s3 sync $WORK/tpch_sf1000 s3://<bucket>/<path>/` from an instance. 284 GB took 7 minutes |
+| At least as many files per table as ranks | Remote files are dealt whole to the ranks (rank, rank + ranks, ...), and a table with fewer files is refused: `distributed execution: a remote table of 1 files across 2 ranks; each rank needs one`. Keep such tables on the local disk |
+| A secret with static keys | Below |
+
+**The secret.** Sirius signs S3 requests with the keys of a `CREATE SECRET (TYPE SIRIUS_S3,
+PROVIDER CONFIG, ...)` secret and nothing else: no credential chain, no instance metadata, no
+refresh ([Scan](scan.md)). So the temporary keys of the instance's role are copied into a
+secret. On the gateway's machine:
+
+```bash
+bash scripts/sirius_aws_s3_secret.sh <bucket>          # writes /dev/shm/s3secret.sql, mode 600
+```
+
+- The keys expire after a few hours; the script prints when. Write the file again for a later
+  run.
+- One `CREATE SECRET` sent through the client reached the ranks of both machines. The gateway
+  does not write it to its log of replayed statements, so every run sends it again.
+- Keep the keys out of every file you keep. `run.sql` holds only a `.read` of the secret file,
+  and `client.txt` shows neither the statement nor the keys. `/dev/shm` is memory: the file is
+  gone after a reboot.
+
+**Run.** Add two options to the command of [Several machines](#several-machines):
+
+```bash
+  --s3-prefix s3://<bucket>/<path> --secret-file /dev/shm/s3secret.sql
+```
+
+`customer`, `lineitem`, `orders`, `part` and `partsupp` are then read from
+`s3://<bucket>/<path>/<table>/*.parquet`. `nation`, `region` and `supplier` are one file each
+and stay on the local disk, so `--data` is still the local dataset, on every machine; the node
+check reads it too. At SF100 `customer`, `part` and `partsupp` are also one file each: generate
+them in more files, or expect the queries that read them to be refused on two ranks.
+
+Watch the network instead of the disk: the sampler's third column is bytes received.
+
 ## Reference numbers
 
 `g7e.24xlarge`, TPC-H SF3000, lineitem in 180 files with row groups of about 1.06 million rows,
@@ -407,19 +455,51 @@ inside a pair 53 (peer access on), across pairs 43.
 
 ### Two g6.4xlarge
 
-Each 1 x L4 23 GB, 16 vCPUs, 64 GiB RAM, 549 GB of instance store, ranks exchanging over TCP, the config of [Several machines](#several-machines), commit `7a5904b3`.
+Each 1 x L4 23 GB, 16 vCPUs, 64 GiB RAM, 549 GB of instance store, a network of up to 25 Gbit/s,
+one rank per machine exchanging over TCP, the config of [Several machines](#several-machines),
+commit `7a5904b3`, one run each. Every answer was checked against DuckDB with
+`scripts/compare_answers.py`.
 
-- **SF100, 2 machines, 1 rank each:** all 22 queries, cold and warm, match DuckDB (44 of 44).
-- **SF1000:** one machine is bound by its disk, which reads about 1 GB/s. Two machines, each
-  reading its own copy, are 1.8 to 2.0 times faster:
+**SF100, local disks, 2 machines:** all 22 queries, cold and warm, match (44 of 44).
 
-  | Machines | Ranks | Q6 s |
-  |---|---|---|
-  | 1 | 1 | 34.6 |
-  | 2 | 2 | 17.2 |
+**SF1000** (265 GB; lineitem in 60 files, 5,640 row groups of about 1.06 million rows):
 
-That is what a second disk would give, so read it with [What we learned](#what-we-learned)
-before calling it GPU scaling. The split between disk and GPU was not measured.
+| Data | Machines | Queries | Cold s | Warm s | Answers | Read rate per machine (average) |
+|---|---|---|---|---|---|---|
+| Local disk | 1 | Q1 - Q18, and Q19 cold | stopped | stopped | 37 of 37 match | 1,001 MB/s from the disk (peak 1,149) |
+| Local disk | 2 | all 22 | 569.5 | 563.4 | 44 of 44 match | about 840 MB/s from the disk |
+| S3 | 1 | all 22 | 646.0 | 605.8 | 44 of 44 match | 12.3 Gbit/s from the network (peak 19.5) |
+| S3 | 2 | all 22 | 486.7 | 463.0 | 44 of 44 match | about 9 Gbit/s from the network (peak 19.5) |
+
+The one-machine run on the local disk was stopped by hand after Q19's first run. Nothing spilled
+in either local-disk run; GPU memory peaked at 22.5 GiB on one machine.
+
+**Local disk, 1 to 2 machines.** Over the 37 runs both finished, 1,513.9 s against 904.4 s:
+1.67 times faster. Each machine reads its own copy of the data, and cold and warm times are
+equal. Warm, per query:
+
+| Speedup | Queries |
+|---|---|
+| 1.9 to 2.0 | Q1 2.01, Q2 2.03, Q5 1.94, Q6 2.00 (34.7 s to 17.3 s), Q8 1.91, Q11 1.97, Q17 2.00, Q3 1.90 |
+| 1.6 to 1.9 | Q4 1.78, Q7 1.83, Q12 1.88, Q13 1.56, Q14 1.72, Q15 1.75 |
+| about 1.3 | Q9 1.29, Q10 1.29, Q18 1.33 |
+| slower | Q16 0.24: 2.1 s on one machine, 9.0 s on two |
+
+The network between the ranks peaked at 2.5 Gbit/s of 25. Why Q9, Q10 and Q18 gain little and
+why Q16 is slower on two machines was not diagnosed.
+
+**S3, 1 to 2 machines.** 1.31 times faster warm (605.8 s to 463.0 s). Q6 halves (20.6 s to
+10.1 s). Q9 is slower on two machines (49.7 s to 66.0 s warm), Q10 and Q13 do not change, and
+Q16 goes from 3.4 s to 9.2 s. Not diagnosed.
+
+**S3 against the local disk.** On this instance S3 is the faster source: the disk reads about
+1 GB/s, the network delivered 12 Gbit/s on average. One machine on S3 ran Q6 in 20.6 s, against
+34.7 s from its disk. Read every number here with [What we learned](#what-we-learned): these
+runs measure the storage first.
+
+**SF100 from S3 on 2 machines** ran only Q1, Q4, Q6, Q12, Q15 and Q21 (12 of 12 match). The
+other 16 queries were refused, because customer, part and partsupp are one file each at SF100:
+see [Data on S3](#data-on-s3).
 
 ## What we learned
 
@@ -492,6 +572,8 @@ document. On an instance, also:
 | `build/release/duckdb: Is a directory` | The plain DuckDB binary is `sirius-duckdb/build/release/duckdb` |
 | Adding ranks does not make scans faster | The disks are the limit: see [What we learned](#what-we-learned) |
 | Several machines: `the gateway starts once N ranks are registered ...; fewer are` | The other machines' ranks cannot reach the gateway, or it them: the security group lacks the rule allowing traffic from itself, or a machine has no copy of this run's `gateway.conf` |
+| `distributed execution: a remote table of 1 files across 2 ranks; each rank needs one` | A table on S3 has fewer files than there are ranks: see [Data on S3](#data-on-s3) |
+| S3 reads fail with an expired or invalid token | The role's temporary keys in the secret ran out: write the secret file again |
 | Several machines: `Permission denied (publickey)` or a host-key question from the run script | `ssh` from the gateway's machine to the others is not set up: see [Several machines](#several-machines) |
 | Several machines: the node check fails on another machine only | The checkout, build or data is missing there or at another path |
 | Q3 or Q18 differ from the reference | LIMIT tie: pass `--ties` |
