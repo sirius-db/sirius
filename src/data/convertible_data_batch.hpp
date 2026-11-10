@@ -208,10 +208,11 @@ class convertible_data_batch : public convertible_data {
    *
    * Never waits on the batch lock: a batch another thread holds exclusively counts as 0, since
    * a non-blocking convert() could not move it either and the caller sizing candidates must not
-   * stall behind the holder.
+   * stall behind the holder. So 0 means the batch is elsewhere or could not be inspected.
    *
    * @param space The memory space to query.
-   * @return The batch size in bytes if the batch resides in the given space, 0 otherwise.
+   * @return The batch size in bytes if it resides in the given space and could be inspected,
+   *         0 otherwise.
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
