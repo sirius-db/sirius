@@ -206,17 +206,27 @@ announce()
 [ -p "$dir/stdin" ] || mkfifo -m 600 "$dir/stdin"
 child=
 announcer=
+# Waits until child $1 is gone. Not a bare `wait`: if a trapped signal reaches bash just as the
+# child exits, bash 5.2 loses track of it, and `wait` then blocks for as long as this script has
+# another child. It always has one: the sed that sirius_node.sh attaches.
+reap()
+{
+  while kill -0 "$1" 2> /dev/null; do
+    wait "$1" 2> /dev/null || true
+  done
+}
+
 # Stops the announcer (and its registration client) and the rank, and waits for the rank, so that
 # its shared-memory mirrors can be removed.
 stop()
 {
   if [ -n "$announcer" ]; then
     kill "$announcer" 2> /dev/null || true
-    wait "$announcer" 2> /dev/null || true
+    reap "$announcer"
   fi
   if [ -n "$child" ]; then
     kill "$child" 2> /dev/null || true
-    wait "$child" 2> /dev/null || true
+    reap "$child"
     rm -f /dev/shm/sirius-exchange-"$child"-*
   fi
   exit 0
