@@ -26,7 +26,10 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/expression_evaluator_strategies.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+
+#include <string>
 
 using AbsFixture = sirius::test::GpuExecutionFixture;
 
@@ -107,6 +110,8 @@ TEST_CASE_METHOD(AbsFixture,
                  "gpu_execution abs overflow of the smallest integer raises DuckDB's error",
                  "[integration][gpu_execution][projection][abs]")
 {
+  auto const strategy = GENERATE(sirius::test::each_expression_evaluator_strategy());
+  CAPTURE(strategy);
   run_ok(
     "CREATE TABLE abs_min AS SELECT * FROM (VALUES (CAST(-128 AS TINYINT), CAST(-32768 AS "
     "SMALLINT),"
@@ -114,21 +119,18 @@ TEST_CASE_METHOD(AbsFixture,
     " (CAST(5 AS TINYINT), CAST(7 AS SMALLINT), CAST(9 AS INTEGER), CAST(11 AS BIGINT)),"
     " (NULL, NULL, NULL, NULL)) v(i8, i16, i32, i64);");
   run_ok("CHECKPOINT;");
-  for (auto const* column : {"i8", "i16", "i32", "i64"}) {
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
+  for (std::string const column : {"i8", "i16", "i32", "i64"}) {
     CAPTURE(column);
-    auto const before = sirius::test::get_transparent_execution_stats(*con);
-    auto const result = con->Query(std::string("SELECT abs(") + column + ") FROM abs_min;");
-    auto const after  = sirius::test::get_transparent_execution_stats(*con);
-    REQUIRE(result);
-    REQUIRE(result->HasError());
-    REQUIRE(result->GetErrorType() == duckdb::ExceptionType::OUT_OF_RANGE);
-    REQUIRE(result->GetError().find("Out of Range Error") != std::string::npos);
-    REQUIRE(result->GetError().find("Overflow on abs") != std::string::npos);
-    // Overflow surfaces directly from GPU execution without triggering a CPU fallback replay.
-    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+    expect_error_matches_cpu("SELECT abs(" + column + ") FROM abs_min;",
+                             sirius::test::execution_path::cpu_replay);
     // Rows that are filtered out do not raise, and NULL is not an overflow.
-    compare_gpu_vs_cpu(std::string("SELECT abs(") + column + ") AS a FROM abs_min WHERE " + column +
+    compare_gpu_vs_cpu("SELECT abs(" + column + ") AS a FROM abs_min WHERE " + column +
                        " IS NULL OR " + column + " > 0");
+    // CASE excludes the smallest value from abs.
+    expect_result_matches_cpu(
+      "SELECT CASE WHEN " + column + " > 0 THEN abs(" + column + ") ELSE 0 END AS a FROM abs_min",
+      sirius::test::guarded_error_path(strategy));
   }
 }
 

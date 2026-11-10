@@ -45,23 +45,20 @@ class not_implemented_exception : public std::runtime_error {
   }
 };
 
+/**
+ * @brief Reports a SQL error that GPU execution detected, such as an overflow or a conversion out
+ * of range.
+ *
+ * Transparent execution answers it, like any other GPU execution error, with CPU Replay, and
+ * DuckDB's result or error is final (`docs/adr/0001-cpu-replay-decides-sql-errors.md`). The
+ * exception class never selects that policy.
+ */
 class invalid_input_exception : public std::runtime_error {
  public:
   explicit invalid_input_exception(const std::string& msg) : std::runtime_error(msg) {}
 
   template <typename... Args>
   explicit invalid_input_exception(std::format_string<Args...> fmt, Args&&... args)
-    : std::runtime_error(std::format(fmt, std::forward<Args>(args)...))
-  {
-  }
-};
-
-class out_of_range_exception : public std::runtime_error {
- public:
-  explicit out_of_range_exception(const std::string& msg) : std::runtime_error(msg) {}
-
-  template <typename... Args>
-  explicit out_of_range_exception(std::format_string<Args...> fmt, Args&&... args)
     : std::runtime_error(std::format(fmt, std::forward<Args>(args)...))
   {
   }

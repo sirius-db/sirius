@@ -46,10 +46,26 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace sirius::test {
+
+/**
+ * @brief The path of a query that returns a value although a branch excluded by a Row-exact Guard
+ * raises a SQL error on some row.
+ *
+ * The fused `nvrtc_jit` kernel evaluates a branch only for the rows that select it, so the query
+ * completes on the GPU. The other Expression Evaluator Strategies evaluate the branch over every
+ * row, detect the error, and recover through CPU Replay.
+ *
+ * @param strategy One of `expression_evaluator_strategy_names()`.
+ */
+[[nodiscard]] inline execution_path guarded_error_path(std::string_view strategy)
+{
+  return strategy == "nvrtc_jit" ? execution_path::gpu : execution_path::cpu_replay;
+}
 
 /// Collects stringified result rows, sorted by default for order-insensitive comparison;
 /// pass `sort = false` to preserve emitted order (e.g. to verify ORDER BY).

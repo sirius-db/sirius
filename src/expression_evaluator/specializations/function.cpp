@@ -673,12 +673,11 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
       input = evaluate_result(
         cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
-    // cuDF wraps abs of a signed minimum; raise DuckDB's overflow error here rather than replaying
-    // the query on the CPU for it.
+    // cuDF wraps abs of a signed minimum, where DuckDB raises an overflow error.
     auto const column = input.get_column_view();
     if (holds_signed_minimum(column, _stream, _mr)) {
-      throw out_of_range_exception("Overflow on abs of signed integer minimum ({})",
-                                   cudf::type_to_name(column.type()));
+      throw invalid_input_exception("Overflow on abs of signed integer minimum ({})",
+                                    cudf::type_to_name(column.type()));
     }
     return evaluate_result(cudf::unary_operation(column, cudf::unary_operator::ABS, _stream, _mr));
   }

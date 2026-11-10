@@ -244,6 +244,18 @@ it runs on a different worker thread. It does not consult thread-local settings 
 mutable process globals. Standalone callers may omit the policy to use fixed defaults
 (`AST_INTERPRET`, regex JIT enabled), or pass an explicit policy.
 
+## SQL errors
+
+The evaluator raises `sirius::invalid_input_exception` for a SQL error it detects: an overflow, a conversion out of range, or an Overflow Poison that reaches the NVRTC Sink. Such an error is a hint. Transparent execution answers every GPU error other than a user interrupt with CPU Replay where replay is available, and DuckDB's result or error is final ([ADR 0001](../adr/0001-cpu-replay-decides-sql-errors.md)). No exception class selects that policy, so a new check throws `sirius::invalid_input_exception` and adds no handler of its own.
+
+The evaluator's contract relative to DuckDB, which new operators and tests use as their oracle:
+
+1. **Never raise for rows a Row-exact Guard excludes.** CASE, COALESCE and TRY never raise for a row on an operation in a branch that the row does not select, nor does a fused NVRTC kernel for an operand that AND or OR skips for the row. Where an evaluator computes a guarded branch over every row (the `MATERIALIZE` and cuDF AST strategies, and an NVRTC kernel compiled for a subexpression of that branch), it may detect such an error; CPU Replay then returns DuckDB's value.
+2. **Raise when an Evaluated Operation overflows** and no guard suppresses it, even if the final value is NULL.
+3. **Order- and chunk-dependent errors may return a value.** Where DuckDB's own raising depends on evaluation order or vector granularity (projection AND/OR across a vector, filter conjunct order, LIMIT), Sirius may return a value.
+
+SQL integration tests check results with `GpuExecutionFixture::expect_result_matches_cpu` and errors with `GpuExecutionFixture::expect_error_matches_cpu`, each of which also asserts whether the query completed on the GPU or through CPU Replay. Tests are tagged `[sql_errors]`.
+
 ## Supported Expression Types
 
 | Expression Type | Sirius AST alternative | Example |
@@ -380,13 +392,7 @@ DECIMAL and integer inputs and a column precision fall back to the CPU at plan t
 
 ### Absolute value
 
-`abs(x)` on FLOAT, DOUBLE, DECIMAL and the integer types other than HUGEINT maps to
-`function_id::abs` and runs `cudf::unary_operation` with `ABS`. NaN and infinities are preserved and
-`abs(-0.0)` is `0.0`. The result has the input's type. The absolute value of the smallest value of a
-signed integer type wraps in cuDF, where DuckDB raises an overflow error, so the evaluator checks
-with `cudf::contains` whether the input holds that value and throws. The query then falls back to the
-CPU, which raises DuckDB's error. Unsigned integers have no such value and are returned as they are.
-HUGEINT falls back at plan time.
+`abs(x)` on FLOAT, DOUBLE, DECIMAL and the integer types other than HUGEINT maps to `function_id::abs` and runs `cudf::unary_operation` with `ABS`. NaN and infinities are preserved and `abs(-0.0)` is `0.0`. The result has the input's type. The absolute value of the smallest value of a signed integer type wraps in cuDF, where DuckDB raises an overflow error, so the evaluator checks with `cudf::contains` whether the input holds that value and throws `sirius::invalid_input_exception`, as negation does; CPU Replay then raises DuckDB's error (see [SQL errors](#sql-errors)). Unsigned integers have no such value and are returned as they are. HUGEINT falls back at plan time.
 
 ### Logical AND/OR NULL semantics
 

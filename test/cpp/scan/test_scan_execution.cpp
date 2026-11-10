@@ -1376,7 +1376,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     CHECK(output->num_rows() == 9);
   } else {
     REQUIRE_THROWS_MATCHES(reader->post_filter_and_project(std::move(batch), *space, stream),
-                           sirius::out_of_range_exception,
+                           sirius::invalid_input_exception,
                            Catch::Matchers::Message("DATE value is out of range for TIMESTAMP"));
   }
   stream.synchronize();
