@@ -161,6 +161,8 @@ construction_plan plan_construction(
     }
 
     key_plan planned{.admitted_key_index   = index,
+                     .build_key_ordinal    = key.build_key_ordinal,
+                     .recorded_type        = recorded,
                      .construction_type    = construction_type,
                      .membership           = std::monostate{},
                      .zone_map             = zone_possible,

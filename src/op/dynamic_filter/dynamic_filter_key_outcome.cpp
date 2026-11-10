@@ -67,6 +67,8 @@ constexpr void fnv1a(std::uint64_t& hash, std::string_view bytes) noexcept
     case dynamic_filter_key_reason::unreadable_probe: return "unreadable_probe";
     case dynamic_filter_key_reason::bloom_cap: return "bloom_cap";
     case dynamic_filter_key_reason::decimal128_unfit: return "decimal128_unfit";
+    case dynamic_filter_key_reason::construction_admission: return "construction_admission";
+    case dynamic_filter_key_reason::construction_invariant: return "construction_invariant";
     case dynamic_filter_key_reason::attempt_skip: return "attempt_skip_";
     case dynamic_filter_key_reason::attempt_fail: return "attempt_fail_";
     case dynamic_filter_key_reason::attempt_cancel: return "attempt_cancel_";

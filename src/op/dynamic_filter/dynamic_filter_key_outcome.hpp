@@ -61,12 +61,14 @@ enum class dynamic_filter_key_reason : std::uint8_t {
   unsupported_type,  ///< No filter kind supports the key type
   unreadable_probe,  ///< No binding can read the key's membership filter
   bloom_cap,  ///< The accumulated Bloom arrays exceed `max_dynamic_filter_bloom_bytes_per_gpu`
-  decimal128_unfit,  ///< A DECIMAL128 build value lies outside the int64 membership rep
-  attempt_skip,      ///< The attempt ended without a filter
-  attempt_fail,      ///< The attempt failed
-  attempt_cancel,    ///< The attempt was cancelled
-  declined,          ///< The construction site declined its build input
-  not_constructed    ///< No attempt constructed this key's filters, for example an empty build
+  decimal128_unfit,        ///< A DECIMAL128 build value lies outside the int64 membership rep
+  construction_admission,  ///< The root GPU refused the memory to build the filter
+  construction_invariant,  ///< Construction found more valid rows than the inventory recorded
+  attempt_skip,            ///< The attempt ended without a filter
+  attempt_fail,            ///< The attempt failed
+  attempt_cancel,          ///< The attempt was cancelled
+  declined,                ///< The construction site declined its build input
+  not_constructed  ///< No attempt constructed this key's filters, for example an empty build
 };
 
 /**

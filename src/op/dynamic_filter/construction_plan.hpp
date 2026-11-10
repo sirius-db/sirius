@@ -92,6 +92,10 @@ using membership_plan = std::variant<std::monostate, exact_membership, bloom_mem
 struct key_plan {
   /** @brief The key's index in the plan's admitted keys */
   std::size_t admitted_key_index;
+  /** @brief The key's column in every build batch */
+  cudf::size_type build_key_ordinal;
+  /** @brief The admitted key's recorded storage type: the type its zone-map bounds carry */
+  cudf::data_type recorded_type;
   /** @brief The type the membership filter is built over: the one carrier when it lands in the
    * recorded type's family, otherwise the recorded type */
   cudf::data_type construction_type;

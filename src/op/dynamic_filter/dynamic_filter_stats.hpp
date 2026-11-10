@@ -58,7 +58,9 @@ namespace sirius::op {
  * non-GPU arrival), and `accumulations_declined_compressed_arrival` (a compressed arrival).
  * `keys_sized_on_total_rows` counts keys whose null count was unknown, so their Bloom filter was
  * sized on every row and no exact IN-list was considered. `filters_skipped_construction_invariant`
- * counts filters dropped because staging found more valid rows than the inventory recorded.
+ * counts filters dropped because staging found more valid rows than the inventory recorded;
+ * `filters_skipped_construction_admission` counts filters dropped because the root GPU refused the
+ * memory to build them.
  * `accumulations_skipped_admission` counts allocation or admission refusals before any filter is
  * published, including initialization leases, publication workspace, and a
  * contribution or publication GPU without an admitted partial. `accumulations_skipped_error` counts
@@ -96,6 +98,7 @@ struct dynamic_filter_counters {
   Counter keys_skipped_bloom_unsupported{};
   Counter keys_sized_on_total_rows{};
   Counter filters_skipped_construction_invariant{};
+  Counter filters_skipped_construction_admission{};
   Counter producers_enabled{};
 
   Counter keys_considered{};
@@ -152,6 +155,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_unsupported,
   &dynamic_filter_counters<Counter>::keys_sized_on_total_rows,
   &dynamic_filter_counters<Counter>::filters_skipped_construction_invariant,
+  &dynamic_filter_counters<Counter>::filters_skipped_construction_admission,
   &dynamic_filter_counters<Counter>::producers_enabled,
   &dynamic_filter_counters<Counter>::keys_considered,
   &dynamic_filter_counters<Counter>::keys_with_known_domain,

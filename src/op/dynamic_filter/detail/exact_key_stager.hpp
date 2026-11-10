@@ -18,7 +18,6 @@
 
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
-#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
 #include <cudf/table/table_view.hpp>
@@ -37,6 +36,8 @@
 
 namespace sirius::op::detail {
 
+struct accumulation_partial;
+
 /**
  * @brief Stages the valid keys of every build batch for the exact IN-lists, then builds each list
  * once from the complete set.
@@ -44,13 +45,15 @@ namespace sirius::op::detail {
  * Each exact key gets, on every replica GPU, one buffer that holds all of the key's valid rows at
  * its rep, leased on the untracked creator thread; a key with no valid rows gets no buffer. A batch
  * writes its valid rows into its own slice of the buffer on the GPU that holds it, at the slice's
- * offset (`prepare_build_keys`, bounded by the slice, with an overflow word). `finish` copies every
+ * offset (`prepare_build_keys`, bounded by the slice, with an overflow word). `gather` copies every
  * other GPU's written slices into the root GPU's buffer, so the root holds the valid rows of the
- * whole build in slice order, and builds the planned small or hash IN-list from it: the same list
- * the IN-list column constructors build from the whole build. Contributions never wait on the host;
- * `finish` does.
+ * whole build in slice order, and `gathered::build` builds the planned small or hash IN-list from
+ * it: the same list the IN-list column constructors build from the whole build. Contributions never
+ * wait on the host; `gather` does.
  */
 class exact_key_stager final {
+  struct impl;
+
  public:
   /**
    * @brief One exact key.
@@ -86,6 +89,12 @@ class exact_key_stager final {
   [[nodiscard]] static std::optional<exact_key_stager> try_create(
     std::vector<key> keys, std::span<dynamic_filter_replica_space const> targets);
 
+  /**
+   * @brief An upper bound on the task scratch one key's `enqueue_add` takes from a batch of up to
+   * @p rows rows: the valid-row ranks and the scan's temporaries.
+   */
+  [[nodiscard]] static std::size_t contribution_scratch_bytes(std::size_t rows);
+
   ~exact_key_stager();
   exact_key_stager(exact_key_stager const&)            = delete;
   exact_key_stager& operator=(exact_key_stager const&) = delete;
@@ -118,32 +127,55 @@ class exact_key_stager final {
                                  rmm::device_async_resource_ref scratch);
 
   /**
-   * @brief The lists built from the staged keys.
+   * @brief The whole build's staged rows on the root GPU, after `gather`: builds each key's list
+   * from them.
+   *
+   * Refers to its stager, which must outlive it and must not be moved from while it is in use.
    */
-  struct publication {
-    /** @brief One list per key, in key order; null for a key whose staging overflowed */
-    std::vector<std::shared_ptr<sirius_dynamic_filter>> filters;
-    /** @brief `filters_skipped_construction_invariant` counts the dropped keys */
-    dynamic_filter_stats_snapshot counts;
+  class gathered {
+   public:
+    /**
+     * @brief Whether key @p key_index staged more valid rows than its slices hold on some GPU, so
+     * its rows are incomplete.
+     */
+    [[nodiscard]] bool overflowed(std::size_t key_index) const;
+
+    /**
+     * @brief Enqueues the construction of key @p key_index's planned list on @p stream, with its
+     * storage from @p mr.
+     *
+     * The caller waits on @p stream before the list becomes visible or the stager is released.
+     *
+     * @pre @p stream is the stream `gather` ran on, or follows it
+     * @throw accumulation_invariant_error if the key overflowed: its list would have false
+     * negatives
+     */
+    [[nodiscard]] std::shared_ptr<sirius_dynamic_filter> build(
+      std::size_t key_index, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const;
+
+   private:
+    friend class exact_key_stager;
+    gathered(impl const& state, accumulation_partial const& root, std::vector<bool> overflowed);
+
+    impl const* _state;
+    accumulation_partial const* _root;
+    std::vector<bool> _overflowed;
   };
 
   /**
-   * @brief Gathers every GPU's written slices into @p root's buffers, checks the overflow words,
-   * and builds each key's list on @p root; waits on the host before returning.
+   * @brief Copies every other GPU's written slices into @p root's buffers and reads every overflow
+   * word.
    *
-   * A key whose overflow word is set on any GPU publishes no list: some valid row was dropped, so
-   * the list would have false negatives. That is logged as an error and counted.
+   * Waits on the host for the copies and the words together, after first waiting for any other GPU
+   * that wrote slices (their copies may be staged through the host). Afterwards the root buffers
+   * hold every staged row and are ordered before later work on @p stream.
    *
-   * @pre Every `enqueue_add` returned; this is the only `finish` call; @p root is the current
+   * @pre Every `enqueue_add` returned; this is the only `gather` call; @p root is the current
    * device
-   * @param root The GPU that builds the lists
    * @param stream A stream of @p root
-   * @param mr Resource for the lists' storage
-   * @return The lists, or nullopt when @p root holds no partial
+   * @return The gathered rows, or nullopt when @p root holds no partial
    */
-  [[nodiscard]] std::optional<publication> finish(rmm::cuda_device_id root,
-                                                  ::cuda::stream_ref stream,
-                                                  rmm::device_async_resource_ref mr);
+  [[nodiscard]] std::optional<gathered> gather(rmm::cuda_device_id root, ::cuda::stream_ref stream);
 
   /**
    * @brief True iff releasing the buffers now credits no allocation tracker.
@@ -161,7 +193,6 @@ class exact_key_stager final {
     std::size_t key_index, rmm::cuda_device_id device) const;
 
  private:
-  struct impl;
   explicit exact_key_stager(std::unique_ptr<impl> state) noexcept;
   std::unique_ptr<impl> _impl;
 };

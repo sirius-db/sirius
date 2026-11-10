@@ -15,10 +15,13 @@
  */
 
 #include <cudf/column/column_view.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
 
+#include <rmm/aligned.hpp>
+
+#include <cub/device/device_scan.cuh>
 #include <cuda/accumulation_partial.cuh>
 
-#include <log/logging.hpp>
 #include <op/dynamic_filter/detail/exact_key_stager.hpp>
 #include <op/dynamic_filter/dynamic_filter_key_domain.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
@@ -26,6 +29,7 @@
 #include <sirius/exception.hpp>
 #include <telemetry/nvtx.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -112,6 +116,22 @@ std::optional<exact_key_stager> exact_key_stager::try_create(
   return exact_key_stager{std::move(state)};
 }
 
+std::size_t exact_key_stager::contribution_scratch_bytes(std::size_t rows)
+{
+  // prepare_build_keys allocates one rank per row and the temporaries of one exclusive scan.
+  auto const items = static_cast<int>(std::min<std::size_t>(rows, std::numeric_limits<int>::max()));
+  std::size_t scan = 0;
+  check_cuda(cub::DeviceScan::ExclusiveSum(nullptr,
+                                           scan,
+                                           static_cast<cudf::size_type const*>(nullptr),
+                                           static_cast<cudf::size_type*>(nullptr),
+                                           items),
+             "cub::DeviceScan::ExclusiveSum(size)");
+  // One allocation alignment of slack covers the scan's own bookkeeping allocation.
+  return tracked_replica_allocation_bytes(rows * sizeof(cudf::size_type)) +
+         tracked_replica_allocation_bytes(scan) + rmm::CUDA_ALLOCATION_ALIGNMENT;
+}
+
 bool exact_key_stager::enqueue_add(std::span<slice const> slices,
                                    cudf::table_view const& input,
                                    rmm::cuda_device_id device,
@@ -181,41 +201,75 @@ bool exact_key_stager::enqueue_add(std::span<slice const> slices,
   return true;
 }
 
-std::optional<exact_key_stager::publication> exact_key_stager::finish(
-  rmm::cuda_device_id root_device, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
+exact_key_stager::gathered::gathered(impl const& state,
+                                     accumulation_partial const& root,
+                                     std::vector<bool> overflowed)
+  : _state{&state}, _root{&root}, _overflowed{std::move(overflowed)}
 {
-  nvtx_scoped_range range{"dynfilter::stage::finish"};
+}
+
+bool exact_key_stager::gathered::overflowed(std::size_t key_index) const
+{
+  return _overflowed.at(key_index);
+}
+
+std::shared_ptr<sirius_dynamic_filter> exact_key_stager::gathered::build(
+  std::size_t key_index, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+{
+  if (overflowed(key_index)) {
+    throw accumulation_invariant_error{"[exact_key_stager] an overflowed key builds no list"};
+  }
+  auto const& staged = _state->keys[key_index];
+  auto const& domain = _state->domains[key_index];
+  cudf::column_view const prepared{
+    membership_rep_type(domain),
+    static_cast<cudf::size_type>(staged.valid_rows),
+    staged.valid_rows == 0 ? nullptr : _root->arrays[buffer_of(key_index)]->data(),
+    nullptr,
+    0};
+  if (staged.kind == membership_filter_kind::small_in_list) {
+    return std::make_shared<sirius_dynamic_small_in_list_filter>(domain, prepared, stream, mr);
+  }
+  return std::make_shared<sirius_dynamic_in_list_filter>(domain, prepared, stream, mr);
+}
+
+std::optional<exact_key_stager::gathered> exact_key_stager::gather(rmm::cuda_device_id root_device,
+                                                                   ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range range{"dynfilter::stage::gather"};
   check_cuda(cudaGetLastError(), "pending CUDA error before staged publication");
   int current_device = -1;
   check_cuda(cudaGetDevice(&current_device), "cudaGetDevice(staged publication)");
   if (current_device != root_device.value()) {
     throw accumulation_invariant_error(
-      "[exact_key_stager::finish] the root GPU is not the current device");
+      "[exact_key_stager::gather] the root GPU is not the current device");
   }
   require_stream_on(stream,
                     root_device,
-                    "[exact_key_stager::finish] the publication stream belongs to another GPU");
+                    "[exact_key_stager::gather] the publication stream belongs to another GPU");
   auto* root = find_partial(_impl->partials, root_device.value());
   if (root == nullptr) { return std::nullopt; }
-  auto const& keys = _impl->keys;
+  auto const& keys     = _impl->keys;
+  auto const& partials = _impl->partials;
   std::vector<::cuda::stream_ref> joined{stream};
-  for (auto const& entry : _impl->partials) {
+  for (auto const& entry : partials) {
     joined.push_back(entry->stream_ref());
   }
-  publication result;
-  result.filters.resize(keys.size());
+  auto words =
+    cudf::detail::make_pinned_vector_async<std::uint32_t>(partials.size() * keys.size(), stream);
+  std::fill(words.begin(), words.end(), std::uint32_t{0});
   try {
     join_on_failure(joined, [&] {
-      // Every write is complete before any slice is read: a HOST-staged gather reads on the host.
-      for (auto const& entry : _impl->partials) {
-        check_cuda(cudaStreamSynchronize(entry->stream->value()),
+      // A copy staged through the host reads its source there, so another GPU's writes complete
+      // first. Only GPUs other than the root that wrote slices are waited for.
+      for (std::size_t partial = 0; partial < partials.size(); ++partial) {
+        auto const& source = *partials[partial];
+        bool const wrote   = std::ranges::any_of(_impl->written[partial],
+                                               [](auto const& slices) { return !slices.empty(); });
+        if (&source == root || !wrote) { continue; }
+        check_cuda(cudaStreamSynchronize(source.stream->value()),
                    "cudaStreamSynchronize(staged contributions)");
-      }
-      for (std::size_t partial = 0; partial < _impl->partials.size(); ++partial) {
-        auto const& source = *_impl->partials[partial];
-        if (&source == root) { continue; }
         for (std::size_t index = 0; index < keys.size(); ++index) {
-          if (keys[index].valid_rows == 0) { continue; }
           auto const rep_bytes = _impl->rep_bytes(index);
           for (auto const& written : _impl->written[partial][index]) {
             auto const offset = written.offset * rep_bytes;
@@ -230,10 +284,11 @@ std::optional<exact_key_stager::publication> exact_key_stager::finish(
           }
         }
       }
-      // One read of every overflow word; a set word on any GPU drops the key.
-      std::vector<std::uint32_t> words(_impl->partials.size() * keys.size(), 0);
-      for (std::size_t partial = 0; partial < _impl->partials.size(); ++partial) {
-        auto const& source = *_impl->partials[partial];
+      // Every overflow word, each read after its GPU's contributions; `stream` then follows every
+      // GPU's work, including the root's own writes that `gathered::build` reads.
+      for (std::size_t partial = 0; partial < partials.size(); ++partial) {
+        auto const& source = *partials[partial];
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{source.device_id}};
         for (std::size_t index = 0; index < keys.size(); ++index) {
           if (keys[index].valid_rows == 0) { continue; }
           check_cuda(cudaMemcpyAsync(&words[partial * keys.size() + index],
@@ -243,46 +298,25 @@ std::optional<exact_key_stager::publication> exact_key_stager::finish(
                                      source.stream->value()),
                      "cudaMemcpyAsync(overflow word)");
         }
-        check_cuda(cudaStreamSynchronize(source.stream->value()),
-                   "cudaStreamSynchronize(overflow words)");
+        cuda_event read;
+        check_cuda(cudaEventRecord(read.get(), source.stream->value()),
+                   "cudaEventRecord(overflow words)");
+        check_cuda(cudaStreamWaitEvent(stream.get(), read.get(), 0),
+                   "cudaStreamWaitEvent(overflow words)");
       }
       check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(staging gather)");
-      for (std::size_t index = 0; index < keys.size(); ++index) {
-        bool overflowed = false;
-        for (std::size_t partial = 0; partial < _impl->partials.size(); ++partial) {
-          overflowed = overflowed || words[partial * keys.size() + index] != 0;
-        }
-        if (overflowed) {
-          ++result.counts.filters_skipped_construction_invariant;
-          SIRIUS_LOG_ERROR(
-            "[exact_key_stager] key {} staged more valid rows than its inventory recorded; its "
-            "exact filter is dropped.",
-            index);
-          continue;
-        }
-        auto const& domain = _impl->domains[index];
-        cudf::column_view const prepared{
-          membership_rep_type(domain),
-          static_cast<cudf::size_type>(keys[index].valid_rows),
-          keys[index].valid_rows == 0 ? nullptr : root->arrays[buffer_of(index)]->data(),
-          nullptr,
-          0};
-        if (keys[index].kind == membership_filter_kind::small_in_list) {
-          result.filters[index] =
-            std::make_shared<sirius_dynamic_small_in_list_filter>(domain, prepared, stream, mr);
-        } else {
-          result.filters[index] =
-            std::make_shared<sirius_dynamic_in_list_filter>(domain, prepared, stream, mr);
-        }
-      }
-      // The lists have read the root buffers before they are visible or released.
-      check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(staged lists)");
     });
   } catch (unjoined_gpu_work const&) {
     _impl->leak_storage.store(true);
     throw;
   }
-  return result;
+  std::vector<bool> overflowed(keys.size(), false);
+  for (std::size_t index = 0; index < keys.size(); ++index) {
+    for (std::size_t partial = 0; partial < partials.size(); ++partial) {
+      if (words[partial * keys.size() + index] != 0) { overflowed[index] = true; }
+    }
+  }
+  return gathered{*_impl, *root, std::move(overflowed)};
 }
 
 bool exact_key_stager::releasable_here() const noexcept

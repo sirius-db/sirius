@@ -74,6 +74,19 @@ class bounds_accumulator final {
     std::size_t batches,
     std::span<dynamic_filter_replica_space const> targets);
 
+  /**
+   * @brief An upper bound on the task scratch one numeric key's `enqueue_add` takes from a batch of
+   * up to @p rows rows: the temporaries of its two reductions, for the widest storage type.
+   */
+  [[nodiscard]] static std::size_t contribution_scratch_bytes(std::size_t rows);
+
+  /**
+   * @brief An upper bound on what `finish` takes from its resource at once when @p
+   * narrowed_carriers carriers, summed over the keys, differ from their key's recorded type: the
+   * restored pairs held for one read, and the temporaries of the restore in progress.
+   */
+  [[nodiscard]] static std::size_t finish_scratch_bytes(std::size_t narrowed_carriers) noexcept;
+
   ~bounds_accumulator();
   bounds_accumulator(bounds_accumulator const&)            = delete;
   bounds_accumulator& operator=(bounds_accumulator const&) = delete;
