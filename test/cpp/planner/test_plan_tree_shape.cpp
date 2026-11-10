@@ -1171,8 +1171,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   bool const enable_filter = GENERATE(true, false);
   INFO("dynamic filters: " << enable_filter);
   sirius::test::scoped_sirius_setting filter_switch(*con, "enable_dynamic_filter", enable_filter);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   // The scalar subquery reads the EXISTS's rows, so the EXISTS would be answered from it and
   // there would be no join left to orient.
   sirius::test::scoped_sirius_setting keep_exists(*con, "enable_exists_from_aggregate", false);
@@ -1461,15 +1459,12 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                               "VARCHAR key",
                               "residual condition",
                               "plain and null-safe keys",
-                              "dynamic filters off",
-                              "Bloom accumulation off");
+                              "dynamic filters off");
   INFO(shape);
   bool const anti  = shape == "ANTI";
   bool const flips = shape == "SEMI" || anti;
   sirius::test::scoped_sirius_setting filters(
     *con, "enable_dynamic_filter", shape != "dynamic filters off");
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", shape != "Bloom accumulation off");
 
   duckdb::LogicalComparisonJoin* join = nullptr;
   auto const comparison               = anti ? duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM
@@ -2024,11 +2019,10 @@ TEST_CASE_METHOD(
   "plan tree shape - null-safe right-family filters preserve NULLs and require early publication",
   "[plan_tree_shape][isolated_context][dynamic_filter][right_family][join_key_nullability]")
 {
-  std::string const join_type    = GENERATE("SEMI", "ANTI");
-  std::string const key_type     = GENERATE("INTEGER", "BIGINT");
-  bool const enable_accumulation = GENERATE(false, true);
-  bool const probe_not_null      = GENERATE(false, true);
-  CAPTURE(join_type, key_type, enable_accumulation, probe_not_null);
+  std::string const join_type = GENERATE("SEMI", "ANTI");
+  std::string const key_type  = GENERATE("INTEGER", "BIGINT");
+  bool const probe_not_null   = GENERATE(false, true);
+  CAPTURE(join_type, key_type, probe_not_null);
   REQUIRE_FALSE(
     con->Query("CREATE TABLE right_probe(k " + key_type + (probe_not_null ? " NOT NULL" : "") + ")")
       ->HasError());
@@ -2038,8 +2032,6 @@ TEST_CASE_METHOD(
   REQUIRE_FALSE(con->Query("INSERT INTO right_build VALUES (0,0), (1,1), (NULL,0)")->HasError());
 
   dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", enable_accumulation);
   auto plan = generate_sirius_plan(*con,
                                    "SELECT r.k FROM right_build r " + join_type +
                                      " JOIN right_probe l ON r.k IS NOT DISTINCT FROM l.k "
@@ -2057,7 +2049,6 @@ TEST_CASE_METHOD(
   auto const& targets = join.dynamic_filter_plan().probe_targets();
   REQUIRE(join.children.size() == 2);
   auto* build_root = require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true);
-  // The retired multi-partition switch no longer gates right-family discovery or BUILD_FILTER.
   {
     REQUIRE(join.dynamic_filter_plan().admitted_keys().size() == 1);
     CHECK(join.dynamic_filter_plan().admitted_keys()[0].preserve_nulls == !probe_not_null);
@@ -2079,8 +2070,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "[plan_tree_shape][isolated_context][dynamic_filter][right_family][pipeline]")
 {
   dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   sirius::test::scoped_sirius_setting fusion(*con, "fuse_merge_pipelines", true);
   sirius::test::with_conversion_result(
     *con,
@@ -2130,8 +2119,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   bool const deduplicate      = GENERATE(false, true);
   CAPTURE(join_type, deduplicate);
   dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   auto const grouping = deduplicate ? " GROUP BY rid" : "";
   auto plan =
     generate_sirius_plan(*con,

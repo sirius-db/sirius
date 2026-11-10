@@ -3130,16 +3130,6 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
                    params->enable_dynamic_zone_map_filter);
 }
 
-static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
-                                                 SetScope scope,
-                                                 Value& parameter)
-{
-  auto* params                                  = get_operator_params(context, scope);
-  params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
-                   params->enable_dynamic_filter_multi_partition);
-}
-
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
@@ -3942,16 +3932,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.unique_exact_max_bytes),
     SetPinTableUniqueExactMaxBytes);
-
-  add_sirius_option(
-    config,
-    option_visibility::internal,
-    "enable_dynamic_filter_multi_partition",
-    "Enable Bloom accumulation for eligible non-broadcast hash builds with more than one "
-    "partition; requires enable_dynamic_filter",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_multi_partition),
-    SetEnableDynamicFilterMultiPartition);
 
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
