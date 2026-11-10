@@ -527,7 +527,8 @@ struct fixture {
   }
 
   /**
-   * @brief A plan whose one scan target binds key `i` of @p planned to build column `i`.
+   * @brief A plan whose one scan target binds key `i` of @p planned to build column `i`. No hash
+   * IN-list may take any L2, so every key larger than a small IN-list plans a Bloom filter.
    *
    * @param probe_types The recorded probe type of each binding; empty means the planned key types
    */
@@ -559,7 +560,9 @@ struct fixture {
       std::move(keys),
       {{channel, sirius::op::dynamic_filter_route_class::scan, false, std::move(bindings)}},
       std::move(replicas),
-      {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
+      {.inlist_max_l2_fraction  = 0.0,
+       .enable_multi_partition  = true,
+       .max_bloom_bytes_per_gpu = cap}};
   }
 
   /**
@@ -570,7 +573,12 @@ struct fixture {
   {
     session =
       std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), &stats);
-    return session->try_begin_accumulation(certify(batches));
+    auto certified = certify(batches);
+    if (auto const* decline = std::get_if<sirius::op::construction_decline>(&certified)) {
+      session->decline(*decline);
+      return false;
+    }
+    return session->begin(std::move(std::get<sirius::op::complete_build_inventory>(certified)));
   }
 
   [[nodiscard]] bool begin(std::vector<batch_ptr> const& batches, std::uint64_t cap = 256 * mib)

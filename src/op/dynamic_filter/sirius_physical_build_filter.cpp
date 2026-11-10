@@ -84,8 +84,9 @@ bool sirius_physical_build_filter::decide_accumulation()
         "[sirius_physical_build_filter] operator (id={}) early publication declined: {}.",
         has_operator_id() ? get_operator_id() : invalid_operator_id,
         op::to_string(*decline));
-    }
-    if (_session.try_begin_accumulation(std::move(certified))) {
+      // Not final yet: the build PARTITION may still construct this join's filters.
+      _session.count_decline(*decline);
+    } else if (_session.begin(std::move(std::get<complete_build_inventory>(certified)))) {
       _accumulating.store(true, std::memory_order_release);
     }
   }
@@ -110,13 +111,13 @@ std::unique_ptr<operator_data> sirius_physical_build_filter::execute(
 
   auto const ids = input.original_batch_ids();
   if (!port_directive().empty() || input.get_data_batches().size() != 1 || ids.size() != 1) {
-    _session.decline_accumulation();
+    _session.decline_task_input();
     return output;
   }
   auto const batches = input.get_read_only_batches();
   if (batches.size() != 1 || batches.front().get_memory_space() == nullptr ||
       batches.front().get_current_tier() != cucascade::memory::Tier::GPU) {
-    _session.decline_accumulation();
+    _session.decline_task_input();
     return output;
   }
   _session.contribute(ids.front(), batches.front(), stream);
@@ -136,13 +137,9 @@ std::size_t sirius_physical_build_filter::no_history_peak_memory_estimate(
   if (!port_directive().empty()) {
     return sirius_physical_operator::no_history_peak_memory_estimate(stats);
   }
-  // Partial arrays have separate leases; tasks allocate only publication scratch: at most two
-  // 8 MiB chunks per remote replica. A positive floor avoids the task's zero-to-2x fallback.
-  auto const replicas = _session.plan().replica_spaces().size();
-  auto const remote   = replicas == 0 ? 0 : replicas - 1;
-  auto const scratch  = memory::saturating_mul(
-    remote, 2 * detail::accumulated_bloom_geometry::k_max_transfer_chunk_bytes);
-  return std::max<std::size_t>(rmm::CUDA_ALLOCATION_ALIGNMENT, scratch);
+  // Accumulator storage has separate leases; tasks allocate only contribution and publication
+  // scratch and the root filters. A positive floor avoids the task's zero-to-2x fallback.
+  return std::max<std::size_t>(rmm::CUDA_ALLOCATION_ALIGNMENT, _session.task_scratch_bound());
 }
 
 }  // namespace sirius::op

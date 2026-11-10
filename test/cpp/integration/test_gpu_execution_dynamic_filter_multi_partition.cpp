@@ -239,15 +239,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     cpu_rows = sirius::test::collect_rows(*result);
   }
 
-  SECTION("disabled accumulation retains one-shot-only behavior")
+  SECTION("the build PARTITION constructs whatever the retired multi-partition switch says")
   {
     scoped_sirius_setting accumulation_off(*con, "enable_dynamic_filter_multi_partition", false);
-    auto const run = run_on_gpu(*con, query);
-    REQUIRE(run.rows == cpu_rows);
-    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
-    REQUIRE(run.after.filters_pushed == run.before.filters_pushed);
-    REQUIRE(run.after.publications_skipped_build_not_whole >
-            run.before.publications_skipped_build_not_whole);
+    require_complete_publication(run_on_gpu(*con, query), cpu_rows);
   }
 
   SECTION("enabled accumulation publishes every original contribution")
@@ -313,36 +308,29 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
   }
 
-  SECTION("disabling accumulation does not change results")
+  SECTION("a single-partition build over a lowered Bloom cap gets no Bloom and matches the CPU")
   {
-    scoped_sirius_setting accumulation_off(*con, "enable_dynamic_filter_multi_partition", false);
+    sirius::test::scoped_setting whole_partition(*con, "hash_partition_bytes", 64 * 1024 * 1024);
+    sirius::test::scoped_setting whole_build(*con, "max_build_hash_table_bytes", 64 * 1024 * 1024);
+    sirius::test::scoped_setting force_bloom(*con, "dynamic_filter_inlist_max_l2_fraction", 0);
+    sirius::test::scoped_setting lowered_cap(*con, "max_dynamic_filter_bloom_bytes_per_gpu", 1);
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
-    REQUIRE(run.after.publication_attempts == run.before.publication_attempts);
-    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
-    REQUIRE(run.after.accumulations_skipped_inventory ==
-            run.before.accumulations_skipped_inventory);
-    REQUIRE(run.after.accumulations_skipped_admission ==
-            run.before.accumulations_skipped_admission);
-    REQUIRE(run.after.keys_considered == run.before.keys_considered);
-    REQUIRE(run.after.keys_skipped_bloom_size_gate == run.before.keys_skipped_bloom_size_gate);
-    REQUIRE(run.after.keys_skipped_bloom_unsupported == run.before.keys_skipped_bloom_unsupported);
-    REQUIRE(run.after.keys_skipped_type_mismatch == run.before.keys_skipped_type_mismatch);
+    REQUIRE(run.after.keys_skipped_bloom_size_gate > run.before.keys_skipped_bloom_size_gate);
     REQUIRE(run.after.membership_filters_built == run.before.membership_filters_built);
-    REQUIRE(run.after.filters_pushed == run.before.filters_pushed);
-    REQUIRE(run.after.accumulation_publications_finished ==
-            run.before.accumulation_publications_finished);
+    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
   }
 
-  SECTION("disabling accumulation leaves one-shot Bloom publication enabled")
+  SECTION("a single-partition build constructs its filters at the PARTITION")
   {
-    scoped_sirius_setting accumulation_off(*con, "enable_dynamic_filter_multi_partition", false);
     sirius::test::scoped_setting whole_partition(*con, "hash_partition_bytes", 64 * 1024 * 1024);
     sirius::test::scoped_setting whole_build(*con, "max_build_hash_table_bytes", 64 * 1024 * 1024);
     sirius::test::scoped_setting force_bloom(*con, "dynamic_filter_inlist_max_l2_fraction", 0);
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
-    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
+    REQUIRE(run.after.accumulations_started > run.before.accumulations_started);
+    REQUIRE(run.after.publications_skipped_build_not_whole ==
+            run.before.publications_skipped_build_not_whole);
     REQUIRE(run.after.keys_skipped_bloom_size_gate == run.before.keys_skipped_bloom_size_gate);
     REQUIRE(run.after.membership_filters_built > run.before.membership_filters_built);
     REQUIRE(run.after.filters_pushed > run.before.filters_pushed);

@@ -20,6 +20,9 @@
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "memory/runtime_stream_pool.hpp"
+#include "memory/size_arithmetic.hpp"
+#include "op/dynamic_filter/build_filter_construction.hpp"
+#include "op/dynamic_filter/construction_plan.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/detail/domain_gate.hpp"
@@ -46,7 +49,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
@@ -215,6 +217,31 @@ std::vector<std::vector<cudf::data_type>> binding_probe_types(
                     binding.probe_storage_type == bound_type;
            });
   });
+}
+
+// Size exact filters for the smallest probe-device L2; return 0 if unavailable.
+std::size_t device_l2_cache_bytes(
+  std::span<dynamic_filter_replica_space const> replica_spaces) noexcept
+{
+  if (replica_spaces.empty()) {
+    int current = -1;
+    if (cudaGetDevice(&current) != cudaSuccess) { return 0; }
+    int l2 = 0;
+    return cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, current) == cudaSuccess && l2 > 0
+             ? static_cast<std::size_t>(l2)
+             : 0;
+  }
+
+  std::size_t minimum = std::numeric_limits<std::size_t>::max();
+  for (auto const& target : replica_spaces) {
+    auto const device_id = target.get_gpu_space().get_device_id();
+    int l2               = 0;
+    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device_id) != cudaSuccess || l2 <= 0) {
+      return 0;
+    }
+    minimum = std::min(minimum, static_cast<std::size_t>(l2));
+  }
+  return minimum == std::numeric_limits<std::size_t>::max() ? 0 : minimum;
 }
 
 /**
@@ -544,7 +571,7 @@ struct dynamic_filter_publication_session::state {
   /**
    * @brief Marks one contribution or publication active while claimed, and settles the session when
    * it ends. Every contribute() and publish_if_final() holds an active_operation guard. The last
-   * activer operation settles the session, transitioning it to TERMINAL. This is deliberately
+   * active operation settles the session, transitioning it to TERMINAL. This is deliberately
    * distinct from deciding the outcome: the decision (via end_attempt(result)) records the
    * accumulation_result, and then settle() ensures the producers finish.
    *
@@ -569,8 +596,8 @@ struct dynamic_filter_publication_session::state {
   };
 
   /**
-   * @brief Reduces and replicates the partials, then fans out. Runs on the task that owes the
-   * publication.
+   * @brief Constructs every planned filter on the root, replicates the exact filters and zone maps,
+   * then fans out. Runs on the task that owes the publication.
    */
   void publish(cucascade::memory::memory_space const& task_space, ::cuda::stream_ref stream)
   {
@@ -579,33 +606,64 @@ struct dynamic_filter_publication_session::state {
         std::scoped_lock lock(mutex);
         if (accumulation_result || end_if_fanout_forbidden()) { return; }
       }
-      // The reduction runs on the task's stream, so the task's GPU is the root.
+      // Construction runs on the task's stream, so the task's GPU is the root.
       if (task_space.get_tier() != cucascade::memory::Tier::GPU) {
         throw detail::accumulation_invariant_error{"publication task space must be a GPU space"};
       }
-      auto const published_filters =
-        builder->finish(rmm::cuda_device_id{task_space.get_device_id()},
-                        stream,
-                        task_space.get_default_allocator());
-      if (!published_filters) {
+      auto constructed = construction->finish(
+        {.space = task_space, .stream = stream, .scratch = task_space.get_default_allocator()});
+      if (!constructed) {
         skip_locked(attempt_counters::skipped_admission);
         return;
       }
-      auto const filters = published_filters->filters;
       bool const host_staged =
-        published_filters->transport ==
+        constructed->transport ==
         detail::accumulated_bloom_builder::publication_transport::HOST_STAGED;
+      auto const& planned = construction->plan().keys;
+      std::vector<key_filters> per_key(plan.admitted_keys().size());
+      {
+        nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
+        // Bloom filters reached every replica GPU while finishing; the root's exact filters and
+        // zone maps are copied to the others here, before any channel sees them.
+        auto const replicate = [&](std::shared_ptr<sirius_dynamic_filter> const& filter) {
+          if (!filter || filter->kind() == sirius_dynamic_filter_kind::BLOOM) { return; }
+          auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());
+          if (replicable == nullptr) {
+            throw detail::accumulation_invariant_error{
+              "a published device-backed dynamic filter must implement sirius_device_replicable"};
+          }
+          replicable->replicate_to_devices(plan.replica_spaces());
+        };
+        for (std::size_t index = 0; index < planned.size(); ++index) {
+          auto const& built = constructed->keys[index];
+          replicate(built.zone_map);
+          replicate(built.membership);
+          auto& key             = per_key[built.admitted_key_index];
+          key.zone_map          = built.zone_map;
+          key.zone_map_type     = planned[index].recorded_type;
+          key.membership        = built.membership;
+          key.membership_domain = built.domain;
+          if (auto const* exact = std::get_if<exact_membership>(&planned[index].membership)) {
+            key.membership_kind = exact->kind;
+            key.membership_size = exact->valid_rows;
+          } else if (auto const* bloom =
+                       std::get_if<bloom_membership>(&planned[index].membership)) {
+            key.membership_kind = membership_filter_kind::bloom;
+            key.membership_size = sirius_dynamic_bloom_filter::estimated_bytes(bloom->sized_rows);
+          }
+        }
+      }
       {
         std::scoped_lock lock(mutex);
-        outcome.membership_filters_built = filters.size();
+        outcome.filters_skipped_construction_admission +=
+          constructed->counts.filters_skipped_construction_admission;
+        outcome.filters_skipped_construction_invariant +=
+          constructed->counts.filters_skipped_construction_invariant;
+        outcome.membership_filters_built = static_cast<std::uint64_t>(std::ranges::count_if(
+          constructed->keys, [](auto const& built) { return built.membership != nullptr; }));
+        outcome.zone_map_filters_built   = static_cast<std::uint64_t>(std::ranges::count_if(
+          constructed->keys, [](auto const& built) { return built.zone_map != nullptr; }));
         if (end_if_fanout_forbidden()) { return; }
-      }
-      std::vector<key_filters> per_key(plan.admitted_keys().size());
-      for (std::size_t index = 0; index < active_keys.size(); ++index) {
-        auto const& filter    = filters[index];
-        auto& key             = per_key[active_keys[index]];
-        key.membership        = filter;
-        key.membership_domain = filter->domain();
       }
       std::vector<std::size_t> pushed_bindings(plan.admitted_keys().size());
       std::optional<std::chrono::steady_clock::duration> latency;
@@ -615,31 +673,43 @@ struct dynamic_filter_publication_session::state {
       });
       sirius::log::log_noexcept([&] {
         SIRIUS_LOG_INFO(
-          "[dynamic_filter_publication_session] accumulated Bloom published through {}: {} "
-          "filter(s) pushed to {} target(s), {:.1f} ms after the final contribution.",
-          host_staged ? "HOST staging" : "peer copies",
+          "[dynamic_filter_publication_session] constructed filters published{}: {} filter(s) "
+          "pushed to {} target(s), {:.1f} ms after the final contribution.",
+          host_staged ? " (Bloom through HOST staging)" : "",
           counts.pushed,
           counts.active_targets,
           latency ? std::chrono::duration<double, std::milli>(*latency).count() : 0.0);
       });
       bool const published = counts.pushed != 0;
       std::scoped_lock lock(mutex);
-      outcome.filters_pushed                        = counts.pushed;
-      outcome.bindings_skipped_incompatible_probe   = counts.incompatible_probes;
+      outcome.filters_pushed = counts.pushed;
+      outcome.bindings_skipped_incompatible_probe += counts.incompatible_probes;
       outcome.accumulation_publications_finished    = published ? 1 : 0;
       outcome.accumulation_publications_host_staged = published && host_staged ? 1 : 0;
       if (latency) {
         outcome.accumulation_publication_latency_ns = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());
       }
-      for (auto& line : key_lines) {
-        if (std::ranges::find(active_keys, line.admitted_key_index) == active_keys.end()) {
-          continue;
+      for (std::size_t index = 0; index < planned.size(); ++index) {
+        auto const key_index = planned[index].admitted_key_index;
+        auto const& built    = constructed->keys[index];
+        auto const& filters  = per_key[key_index];
+        auto const line =
+          std::ranges::find(key_lines, key_index, &dynamic_filter_key_line::admitted_key_index);
+        if (line == key_lines.end()) { continue; }
+        auto& reported = line->outcome;
+        if (filters.membership &&
+            membership_reaches_a_binding(plan, key_index, filters.membership_domain)) {
+          reported.kind = filters.membership_kind;
+          reported.size = filters.membership_size;
         }
-        line.outcome.kind   = membership_filter_kind::bloom;
-        line.outcome.size   = accumulated_bloom_bytes;
-        line.outcome.pushed = pushed_bindings[line.admitted_key_index];
-        line.outcome.reason = dynamic_filter_key_reason::published;
+        reported.zone_map = filters.zone_map && planned[index].zone_map_deliverable;
+        reported.pushed   = pushed_bindings[key_index];
+        if (built.dropped) {
+          reported.reason = *built.dropped;
+        } else if (reported.kind != membership_filter_kind::none || reported.zone_map) {
+          reported.reason = dynamic_filter_key_reason::published;
+        }
       }
       end_attempt(published ? completion::PUBLISHED : completion::SKIPPED);
     } catch (...) {
@@ -651,7 +721,7 @@ struct dynamic_filter_publication_session::state {
         end_attempt_on_failure(kind);
       }
       // Optional OOM must not escape into gpu_pipeline_task's reschedule handler after the pending
-      // publication was consumed. The builder has joined accepted work or raised a fatal cleanup
+      // publication was consumed. Construction has joined accepted work or raised a fatal cleanup
       // error.
       if (!recoverable(kind)) { std::rethrow_exception(error); }
     }
@@ -681,8 +751,7 @@ struct dynamic_filter_publication_session::state {
   // Holds a value from the start of an accumulation on.
   std::optional<complete_build_inventory> inventory;
   std::vector<bool> claimed;  // One entry per inventory batch, in inventory order
-  std::vector<std::size_t> active_keys;
-  std::optional<detail::accumulated_bloom_builder> builder;
+  std::optional<build_filter_construction> construction;
   dynamic_filter_stats_snapshot outcome;  // The accumulation's counts, recorded when it settles
   std::optional<completion> accumulation_result;
   std::chrono::steady_clock::time_point final_commit{};
@@ -695,19 +764,17 @@ struct dynamic_filter_publication_session::state {
   dynamic_filter_join_identity identity;
   // The counter that ended the accumulation attempt, named by its unpublished key lines.
   std::string_view ending_counter;
-  // Each accumulated key's Bloom array bytes.
-  std::size_t accumulated_bloom_bytes = 0;
-  phase current                       = phase::OPEN;
-  bool sealed                         = false;
-  bool input_closed                   = false;
-  bool cancelled                      = false;
-  bool fanout_started                 = false;
+  phase current       = phase::OPEN;
+  bool sealed         = false;
+  bool input_closed   = false;
+  bool cancelled      = false;
+  bool fanout_started = false;
 };
 
 //===----------------------------------------------------------------------===//
 // dynamic_filter_publication_session
 //===----------------------------------------------------------------------===//
-void dynamic_filter_publication_session::decline_accumulation() noexcept
+void dynamic_filter_publication_session::decline_task_input() noexcept
 {
   auto& operation = *_state;
   bool declined   = false;
@@ -721,8 +788,8 @@ void dynamic_filter_publication_session::decline_accumulation() noexcept
   if (declined) {
     sirius::log::log_noexcept([] {
       SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom declined: "
-        "a task input is not exactly one certified batch.");
+        "[dynamic_filter_publication_session] construction declined: a task input is not exactly "
+        "one certified batch.");
     });
   }
   operation.settle().dispatch();
@@ -731,13 +798,13 @@ void dynamic_filter_publication_session::decline_accumulation() noexcept
 void dynamic_filter_publication_session::release_retired_storage() noexcept
 {
   auto& operation = *_state;
-  std::optional<detail::accumulated_bloom_builder> released;
+  std::optional<build_filter_construction> released;
   {
     std::scoped_lock lock(operation.mutex);
     if (operation.current == state::phase::TERMINAL && operation.active_operations == 0 &&
-        operation.builder && operation.builder->releasable_here()) {
-      released = std::move(operation.builder);
-      operation.builder.reset();
+        operation.construction && operation.construction->releasable_here()) {
+      released = std::move(operation.construction);
+      operation.construction.reset();
     }
   }
 }
@@ -796,199 +863,172 @@ void dynamic_filter_publication_session::seal_plan() noexcept
   _state->seal();
 }
 
-bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_input input)
+void dynamic_filter_publication_session::decline(construction_decline reason) noexcept
 {
   auto& operation = *_state;
-  nvtx_scoped_range range{"dynfilter::accum::begin"};
-  dynamic_filter_stats_snapshot selection;
-  // Each bound key's outcome, by admitted-key index; empty until the attempt judges its keys.
-  std::vector<dynamic_filter_key_outcome> decided;
-  bool started = false;
-  // Every exit, including a failure, records the selection's counts. An attempt that did not start
-  // also leaves its key outcomes for the lines the session logs, unless another path claimed the
-  // session meanwhile; a started attempt records them when it starts.
-  absl::Cleanup const record_selection = [&] {
-    operation.record(selection);
-    if (started || decided.empty()) { return; }
+  post_unlock_actions actions;
+  {
     std::scoped_lock lock(operation.mutex);
-    if (operation.current == state::phase::OPEN) { operation.record_key_outcomes(decided); }
-  };
-  auto const end_active_keys = [&decided](std::span<std::size_t const> active_keys,
-                                          dynamic_filter_key_reason reason,
-                                          std::string_view counter = {}) {
-    for (auto const index : active_keys) {
-      decided[index].reason        = reason;
-      decided[index].reason_detail = counter;
-    }
-  };
-  try {
+    if (operation.current != state::phase::OPEN) { return; }
+    operation.seal();
+    dynamic_filter_stats_snapshot declined;
+    declined.*decline_counter(reason) = 1;
+    operation.record(declined);
+    operation.set_key_lines(
+      {.reason = dynamic_filter_key_reason::declined, .reason_detail = to_string(reason)});
+    actions.append(operation.complete(completion::SKIPPED));
+  }
+  std::move(actions).dispatch();
+}
+
+void dynamic_filter_publication_session::count_decline(construction_decline reason) noexcept
+{
+  dynamic_filter_stats_snapshot declined;
+  declined.*decline_counter(reason) = 1;
+  std::scoped_lock lock(_state->mutex);
+  _state->record(declined);
+}
+
+bool dynamic_filter_publication_session::begin(complete_build_inventory inventory)
+{
+  auto& operation = *_state;
+  nvtx_scoped_range range{"dynfilter::construction::begin"};
+  {
+    std::scoped_lock lock(operation.mutex);
+    if (operation.current != state::phase::OPEN || operation.input_closed) { return false; }
+    // Replica placement is final from here on, so the plan can be read without the mutex.
+    operation.seal();
+  }
+  auto const& plan     = operation.plan;
+  auto const& replicas = plan.replica_spaces();
+  // Ends the attempt at once: no task contributes to it.
+  auto const end_now = [&](dynamic_filter_stats_snapshot const& counts,
+                           std::span<dynamic_filter_key_line const> lines,
+                           completion result) noexcept {
+    post_unlock_actions actions;
     {
       std::scoped_lock lock(operation.mutex);
-      if (operation.current != state::phase::OPEN || operation.input_closed ||
-          !operation.plan.multi_partition_enabled()) {
-        return false;
+      operation.record(counts);
+      if (operation.current != state::phase::OPEN) { return; }
+      if (operation.stats) {
+        operation.stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
       }
-      // Replica placement is final from here on, so the plan can be read without the mutex.
-      operation.seal();
+      for (auto const& decided : lines) {
+        auto const line = std::ranges::find(operation.key_lines,
+                                            decided.admitted_key_index,
+                                            &dynamic_filter_key_line::admitted_key_index);
+        if (line != operation.key_lines.end()) { line->outcome = decided.outcome; }
+      }
+      actions.append(operation.complete(result, true));
     }
-    auto const& plan          = operation.plan;
-    auto const& admitted_keys = plan.admitted_keys();
-    decided.resize(admitted_keys.size());
-    if (auto const* decline = std::get_if<construction_decline>(&input)) {
-      selection.*decline_counter(*decline) = 1;
-      for (auto& key : decided) {
-        key = {.reason = dynamic_filter_key_reason::declined, .reason_detail = to_string(*decline)};
-      }
+    std::move(actions).dispatch();
+  };
+  construction_plan planned;
+  try {
+    planned = plan_construction(inventory.facts(),
+                                plan.admitted_keys(),
+                                binding_facts_of(plan),
+                                {.l2_bytes                  = device_l2_cache_bytes(replicas),
+                                 .inlist_max_l2_fraction    = plan.inlist_max_l2_fraction(),
+                                 .emit_zone_map_filters     = plan.emit_zone_map_filters(),
+                                 .domain_coverage_threshold = plan.domain_coverage_threshold(),
+                                 .max_bloom_bytes_per_gpu   = plan.max_bloom_bytes_per_gpu()});
+    // An empty build publishes nothing, so no filter is planned for it.
+    if (planned.keys.empty() || inventory.total_rows() == 0) {
+      end_now(planned.selection, planned.outcomes, completion::SKIPPED);
       return false;
     }
-    auto& inventory        = std::get<complete_build_inventory>(input);
-    auto const probe_types = binding_probe_types(plan);
-    auto const rows        = inventory.total_rows();
-    std::vector<detail::accumulated_bloom_builder::key> keys;
-    std::vector<std::size_t> active_keys;
-    for (std::size_t index = 0; index < probe_types.size(); ++index) {
-      auto const& bindings = probe_types[index];
-      if (bindings.empty()) { continue; }
-      auto const& key = admitted_keys[index];
-      bool const type_matches =
-        key.build_key_ordinal >= 0 &&
-        inventory.consistent_type_at(static_cast<std::size_t>(key.build_key_ordinal)) ==
-          key.storage_type;
-      bool const supported = detail::accumulated_bloom_builder::supports(key.storage_type);
-      // The fan-out's rule, applied before any array is allocated: a key whose domain can read
-      // none of its bindings' probe types would publish only filters that decline every batch.
-      auto const domain   = classify_membership_key(key.storage_type);
-      auto const readable = [&](cudf::data_type probe) {
-        return probe.id() == cudf::type_id::EMPTY ||
-               (domain && membership_probe_compatible(*domain, probe));
-      };
-      bool const has_readable_binding = std::ranges::any_of(bindings, readable);
-      bool const gated =
-        detail::consider_bound_key(selection,
-                                   key,
-                                   rows,
-                                   plan.domain_coverage_threshold(),
-                                   detail::publication_path::accumulated,
-                                   type_matches && supported && has_readable_binding);
-      auto& decision = decided[index];
-      decision.rows  = rows;
-      if (!type_matches) {
-        ++selection.keys_skipped_type_mismatch;
-        decision.reason = dynamic_filter_key_reason::type_mismatch;
-        continue;
+    auto const end_admission = [&] {
+      auto counts                            = planned.selection;
+      counts.accumulations_skipped_admission = 1;
+      for (auto& line : planned.outcomes) {
+        if (line.outcome.reason != dynamic_filter_key_reason::not_constructed) { continue; }
+        line.outcome.reason        = dynamic_filter_key_reason::attempt_skip;
+        line.outcome.reason_detail = attempt_counters::skipped_admission.name;
       }
-      if (!supported) {
-        ++selection.keys_skipped_bloom_unsupported;
-        decision.reason = dynamic_filter_key_reason::unsupported_type;
-        continue;
-      }
-      if (!has_readable_binding) {
-        selection.bindings_skipped_incompatible_probe += bindings.size();
-        decision.reason = dynamic_filter_key_reason::unreadable_probe;
-        continue;
-      }
-      if (gated) {
-        ++selection.keys_skipped_domain_gate;
-        decision.reason = dynamic_filter_key_reason::domain_gate;
-        continue;
-      }
-      if (rows == 0) { continue; }
-      active_keys.push_back(index);
-      keys.push_back({key.build_key_ordinal, key.storage_type});
-    }
-    if (keys.empty()) { return false; }
-    auto const geometry = detail::accumulated_bloom_geometry::try_create(
-      rows, keys.size(), plan.max_bloom_bytes_per_gpu());
-    if (!geometry) {
-      selection.keys_skipped_bloom_size_gate = keys.size();
-      end_active_keys(active_keys, dynamic_filter_key_reason::bloom_cap);
-      auto const required = detail::accumulated_bloom_geometry::try_create(
-        rows, keys.size(), std::numeric_limits<std::uint64_t>::max());
-      SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom refused: per-GPU cap, rows={}, "
-        "active_keys={}, required_bytes={}, cap={}",
-        rows,
-        keys.size(),
-        required ? std::to_string(required->arrays_bytes) : "overflow",
-        plan.max_bloom_bytes_per_gpu());
-      return false;
-    }
-
-    auto const& replicas = plan.replica_spaces();
+      end_now(counts, planned.outcomes, completion::SKIPPED);
+    };
     if (replicas.empty()) {
-      selection.accumulations_skipped_admission = 1;
-      end_active_keys(active_keys,
-                      dynamic_filter_key_reason::attempt_skip,
-                      attempt_counters::skipped_admission.name);
+      end_admission();
       return false;
     }
-
-    // Allocation happens outside the mutex; the builder is installed only if nothing closed the
+    // Leases are taken outside the mutex; the construction is installed only if nothing closed the
     // session meanwhile.
-    auto built = detail::accumulated_bloom_builder::try_create(keys, *geometry, replicas);
-    if (!built) {
+    auto created = build_filter_construction::try_create(planned, inventory, replicas);
+    if (!created) {
       SIRIUS_LOG_DEBUG(
-        "[dynamic_filter_publication_session] accumulated Bloom skipped: partial-array lease "
+        "[dynamic_filter_publication_session] construction skipped: an accumulator lease was "
         "refused.");
-      selection.accumulations_skipped_admission = 1;
-      end_active_keys(active_keys,
-                      dynamic_filter_key_reason::attempt_skip,
-                      attempt_counters::skipped_admission.name);
+      end_admission();
       return false;
     }
     auto const expected = inventory.batches().size();
-    std::vector<bool> claimed(expected, false);
+    auto const keys     = planned.keys.size();
     {
       std::scoped_lock lock(operation.mutex);
       if (operation.current != state::phase::OPEN || operation.input_closed) {
-        return false;  // `built` is released here, on the untracked creator thread.
+        return false;  // `created` is released here, on the untracked creator thread.
       }
-      // The active keys' lines stay unconstructed until publication or the attempt's end.
-      operation.record_key_outcomes(decided);
-      started                           = true;
-      operation.accumulated_bloom_bytes = geometry->raw_bytes;
-      operation.claimed                 = std::move(claimed);
-      operation.inventory.emplace(std::move(inventory));
-      operation.active_keys = std::move(active_keys);
-      operation.builder     = std::move(built);
-      operation.current     = state::phase::COLLECTING;
+      // Planned keys' lines stay unconstructed until publication or the attempt's end.
+      for (auto const& decided : planned.outcomes) {
+        auto const line = std::ranges::find(operation.key_lines,
+                                            decided.admitted_key_index,
+                                            &dynamic_filter_key_line::admitted_key_index);
+        if (line != operation.key_lines.end()) { line->outcome = decided.outcome; }
+      }
       // Start counters are visible at once; the attempt's outcome is recorded when it settles.
-      selection.accumulations_started               = 1;
-      selection.accumulation_expected_contributions = expected;
+      auto counts                                = planned.selection;
+      counts.accumulations_started               = 1;
+      counts.accumulation_expected_contributions = expected;
+      operation.record(counts);
+      operation.claimed.assign(expected, false);
+      operation.inventory.emplace(std::move(inventory));
+      operation.construction = std::move(created);
+      operation.current      = state::phase::COLLECTING;
       if (operation.stats) {
         operation.stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
       }
     }
     sirius::log::log_noexcept([&] {
       SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom started: {} key(s), {} batch(es), "
-        "{} array bytes per GPU on {} GPU(s), {}-byte transfer chunks.",
-        keys.size(),
+        "[dynamic_filter_publication_session] construction started: {} key(s), {} batch(es) on {} "
+        "GPU(s).",
+        keys,
         expected,
-        geometry->arrays_bytes,
-        replicas.size(),
-        geometry->chunk_bytes);
+        replicas.size());
     });
     return true;
   } catch (...) {
     auto const error = std::current_exception();
     auto const kind  = classify_failure(error);
-    count_failure(selection, kind);
-    for (auto& key : decided) {
-      if (key.reason != dynamic_filter_key_reason::not_constructed) { continue; }
-      key.reason        = recoverable(kind) ? dynamic_filter_key_reason::attempt_skip
-                                            : dynamic_filter_key_reason::attempt_fail;
-      key.reason_detail = failure_counter_name(kind);
+    auto counts      = planned.selection;
+    count_failure(counts, kind);
+    for (auto& line : planned.outcomes) {
+      if (line.outcome.reason != dynamic_filter_key_reason::not_constructed) { continue; }
+      line.outcome.reason        = recoverable(kind) ? dynamic_filter_key_reason::attempt_skip
+                                                     : dynamic_filter_key_reason::attempt_fail;
+      line.outcome.reason_detail = failure_counter_name(kind);
     }
+    end_now(counts, planned.outcomes, recoverable(kind) ? completion::SKIPPED : completion::FAILED);
     if (!recoverable(kind)) { std::rethrow_exception(error); }
     return false;
   }
 }
 
-bool dynamic_filter_publication_session::accumulation_claimed() const noexcept
+std::size_t dynamic_filter_publication_session::task_scratch_bound() const noexcept
 {
   std::scoped_lock lock(_state->mutex);
-  return _state->inventory.has_value();
+  auto const& operation = *_state;
+  // An ended attempt keeps its construction until the site finalizes, but no later task uses it.
+  if (!operation.construction || operation.accumulation_result) { return 0; }
+  return memory::saturating_add(operation.construction->task_scratch_bytes(),
+                                operation.construction->root_construction_bytes());
+}
+
+bool dynamic_filter_publication_session::terminal() const noexcept
+{
+  std::scoped_lock lock(_state->mutex);
+  return _state->current == state::phase::TERMINAL;
 }
 
 void dynamic_filter_publication_session::contribute(std::uint64_t original_id,
@@ -1001,6 +1041,7 @@ void dynamic_filter_publication_session::contribute(std::uint64_t original_id,
     auto const* gpu   = dynamic_cast<cucascade::gpu_table_representation const*>(source.get_data());
     auto const* space = source.get_memory_space();
     std::optional<cudf::table_view> view;
+    std::optional<build_filter_construction::contribution_ticket> ticket;
     {
       std::scoped_lock lock(operation.mutex);
       if (!operation.inventory) { return; }
@@ -1032,24 +1073,22 @@ void dynamic_filter_publication_session::contribute(std::uint64_t original_id,
       // A late batch without rows is not in the inventory and adds no key.
       if (entry == nullptr && view && view->num_rows() == 0) { return; }
       if (entry != nullptr) { operation.claimed[index] = true; }
-      bool const valid = entry != nullptr && view && space != nullptr &&
-                         space->get_tier() == cucascade::memory::Tier::GPU &&
-                         std::cmp_equal(view->num_rows(), entry->rows) &&
-                         std::ranges::all_of(operation.active_keys, [&](std::size_t key_index) {
-                           auto const& key = operation.plan.admitted_keys()[key_index];
-                           return key.build_key_ordinal >= 0 &&
-                                  key.build_key_ordinal < view->num_columns() &&
-                                  view->column(key.build_key_ordinal).type() == key.storage_type;
-                         });
-      if (!valid) {
+      // The claim must match what the inventory recorded for the batch: rows, carriers, and null
+      // counts. `reserve` checks them and assigns the batch's slices and bound slot.
+      if (entry != nullptr && view && space != nullptr &&
+          space->get_tier() == cucascade::memory::Tier::GPU) {
+        ticket = operation.construction->reserve(
+          index, rmm::cuda_device_id{space->get_device_id()}, batch_key_facts::of(*view));
+      }
+      if (!ticket) {
         operation.end_attempt(completion::SKIPPED, attempt_counters::skipped_inventory);
         return;
       }
       ++operation.active_operations;
       active.claimed = true;
     }
-    if (!operation.builder->enqueue_add(
-          *view, rmm::cuda_device_id{space->get_device_id()}, stream)) {
+    if (!operation.construction->contribute(
+          *ticket, *view, stream, space->get_default_allocator())) {
       operation.skip_locked(attempt_counters::skipped_admission);
       return;
     }
@@ -1215,34 +1254,6 @@ void dynamic_filter_publication_session::observe_whole_build(
     throw;
   }
 }
-
-namespace {
-// Size exact filters for the smallest probe-device L2; return 0 if unavailable.
-std::size_t device_l2_cache_bytes(
-  std::span<dynamic_filter_replica_space const> replica_spaces) noexcept
-{
-  if (replica_spaces.empty()) {
-    int current = -1;
-    if (cudaGetDevice(&current) != cudaSuccess) { return 0; }
-    int l2 = 0;
-    return cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, current) == cudaSuccess && l2 > 0
-             ? static_cast<std::size_t>(l2)
-             : 0;
-  }
-
-  std::size_t minimum = std::numeric_limits<std::size_t>::max();
-  for (auto const& target : replica_spaces) {
-    auto const device_id = target.get_gpu_space().get_device_id();
-    int l2               = 0;
-    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device_id) != cudaSuccess || l2 <= 0) {
-      return 0;
-    }
-    minimum = std::min(minimum, static_cast<std::size_t>(l2));
-  }
-  return minimum == std::numeric_limits<std::size_t>::max() ? 0 : minimum;
-}
-
-}  // namespace
 
 // 4. Whole-build publication: build the filters from one complete build, publish them to the
 // probe targets, and record the outcome.
