@@ -360,7 +360,6 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // Bind-time discovery survives failures before execution can rebuild a plan.
   // A missing plan must never grant permission to replay.
   sirius::transparent::plan_source_policy source_policy{{}, false};
-  bool enable_optimizer;
   bool statement_read_only = true;
   // Schema captured at bind time; each execution rebuilds its
   // PreparedStatementData from these (parameterized execution is not
@@ -376,10 +375,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
   {
     // First collect original options
     original_enable_optimizer = Settings::Get<EnableOptimizerSetting>(context);
-    // The user might want to disable the optimizer of the new connection.
+    // gpu_execution always plans with the optimizer on.
     // (connection-local ClientConfig — safe to toggle per execution)
-    Settings::Set<EnableOptimizerSetting>(
-      context, SetScope::LOCAL, Value::BOOLEAN(enable_optimizer));
+    Settings::Set<EnableOptimizerSetting>(context, SetScope::LOCAL, Value::BOOLEAN(true));
     // The old per-query DBConfig::disabled_optimizers save/modify/restore is
     // gone: that set is DB-global and read locklessly by every connection's
     // optimizer, so per-query mutation was an unprotected concurrent write.
@@ -451,9 +449,8 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
                                                               vector<LogicalType>& return_types,
                                                               vector<Identifier>& names)
 {
-  auto result              = make_uniq<SiriusTableFunctionData>();
-  result->query            = input.inputs[0].ToString();
-  result->enable_optimizer = true;
+  auto result   = make_uniq<SiriusTableFunctionData>();
+  result->query = input.inputs[0].ToString();
 
   std::optional<std::string> query_label = std::nullopt;
   // take any query_label that was set using sirius_set_query_label SQL call
@@ -2438,7 +2435,6 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                               SiriusRegistration::GPUExecutionBind,
                               SiriusRegistration::GPUExecutionInitGlobal);
   gpu_execution.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
-    options.Add("enable_optimizer", LogicalType::BOOLEAN);
     options.Add(QUERY_LABEL_PARAM_KEY, LogicalType::VARCHAR);
   });
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
@@ -3059,17 +3055,6 @@ static void SetEnableDecimalSumStatsBound(ClientContext& context, SetScope scope
                    params->enable_decimal_sum_stats_bound);
 }
 
-static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context, scope);
-  if (params->use_hw_decompression != BooleanValue::Get(parameter)) {
-    throw InvalidInputException(
-      "use_hw_decompression is startup-only; configure sirius.operator_params.use_hw_decompression "
-      "in YAML");
-  }
-  SIRIUS_LOG_DEBUG("Updated config USE_HW_DECOMPRESSION to {}", params->use_hw_decompression);
-}
-
 static void SetAdmissionBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes                = UBigIntValue::Get(parameter);
@@ -3672,16 +3657,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
-
-  config.AddExtensionOption(
-    "use_hw_decompression",
-    "Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default "
-    "(opt-in). When enabled and every GPU reports hardware-decompression support in cucascade "
-    "topology, Sirius exports LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context. Only "
-    "enable this on GPUs known to support hardware decompression",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.use_hw_decompression),
-    SetUseHwDecompression);
 
   config.AddExtensionOption(
     "admission_bytes_per_gpu",

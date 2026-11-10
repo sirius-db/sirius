@@ -1,4 +1,3 @@
 sirius:
   telemetry:
     enable_quent: false
-    exporter: postcard

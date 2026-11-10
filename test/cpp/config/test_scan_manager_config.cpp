@@ -906,39 +906,14 @@ TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config
                      "'uring.range_batch_slices': must be 0 or more (0 = no split), got -1");
 }
 
-TEST_CASE("uring prefetch_reactors is accepted as a deprecated no-op",
+TEST_CASE("sirius_config rejects the removed uring.prefetch_reactors key",
           "[scan_manager][config][uring]")
 {
-  // Reserving reactors for prefetch was replaced by each reactor's priority
-  // tiers.  A config that still names the key loads with a deprecation WARN
-  // and nothing is partitioned.
-  auto const baseline =
-    load_scan_manager("sirius_uring_no_prefetch_reactors.yaml", uring_yaml("        {}\n"));
+  scoped_yaml yaml("sirius_uring_prefetch_reactors.yaml",
+                   uring_yaml("        prefetch_reactors: 1\n"));
 
-  auto const value = GENERATE(as<std::string>{}, "1", "null", "auto", "[1, 2]", "-3");
-  CAPTURE(value);
-  sirius::test::scoped_recording_log_sink logs{"warn"};
-  auto const cfg = load_scan_manager("sirius_uring_prefetch_reactors.yaml",
-                                     uring_yaml("        prefetch_reactors: " + value + "\n"));
-
-  auto const io          = cfg.to_io_config().uring;
-  auto const baseline_io = baseline.to_io_config().uring;
-  CHECK(io.n_max_concurrent_scans == baseline_io.n_max_concurrent_scans);
-  CHECK(io.n_max_concurrent_scans_explicit == baseline_io.n_max_concurrent_scans_explicit);
-  CHECK(io.slices_per_pass == baseline_io.slices_per_pass);
-  CHECK(io.range_batch_slices == baseline_io.range_batch_slices);
-  CHECK(io.use_odirect == baseline_io.use_odirect);
-  CHECK(cfg.uring_n_reactors == baseline.uring_n_reactors);
-
-  std::size_t warnings = 0;
-  for (auto const& record : logs.records()) {
-    if (record.message.find("'uring.prefetch_reactors' is deprecated and ignored") !=
-        std::string::npos) {
-      ++warnings;
-      CHECK(record.level == sirius::log::level::warn);
-    }
-  }
-  CHECK(warnings == 1);
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
 TEST_CASE("Native runtime YAML rejects insufficient reader capacity",

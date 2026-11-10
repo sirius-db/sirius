@@ -44,9 +44,6 @@ quent::Context make_quent_context(const sirius::telemetry_config& config)
 
   const auto capture =
     config.enable_nvtx ? quent::NvtxCapture::Enabled : quent::NvtxCapture::Disabled;
-  if (config.exporter != QUENT_NDJSON_EXPORTER) {
-    throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
-  }
   return quent::Context::ndjson(config.output_directory, capture);
 }
 

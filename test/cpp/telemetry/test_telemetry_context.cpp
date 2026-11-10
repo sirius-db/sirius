@@ -134,9 +134,7 @@ TEST_CASE("fresh runtime startup captures the libcucascade domain only when opte
               "    enable_quent: "
            << (enable_quent ? "true" : "false") << '\n';
     if (nvtx_setting != "default") { config << "    enable_nvtx: " << nvtx_setting << '\n'; }
-    config << "    exporter: ndjson\n"
-              "    output_directory: "
-           << output.string() << '\n';
+    config << "    output_directory: " << output.string() << '\n';
     REQUIRE(config.good());
   }
 
