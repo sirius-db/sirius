@@ -74,7 +74,8 @@ double range_width(duckdb::BaseStatistics const& statistics)
          1.0;
 }
 
-/// Removes @p side's filter when it passes every value of @p other's key range.
+/// Removes @p side's filter when it passes every value of @p other's key range and that range
+/// spans at least `k_min_keep_ratio` of @p side's own.
 void drop_implied_filter(key_column const& side, key_column const& other)
 {
   if (side.statistics->GetType() != other.statistics->GetType()) { return; }
@@ -89,7 +90,9 @@ void drop_implied_filter(key_column const& side, key_column const& other)
       duckdb::FilterPropagateResult::FILTER_ALWAYS_TRUE) {
     return;
   }
-  // An implied filter keeps at least the other side's range of the column.
+  // An implied filter keeps at least the other side's range of the column. The share of the range
+  // stands in for the share of rows, which holds for unique or evenly spread keys; rows bunched
+  // on keys outside the other side's range can make the filter remove more.
   if (range_width(*other.statistics) < k_min_keep_ratio * range_width(*side.statistics)) { return; }
   SIRIUS_LOG_DEBUG("[join_implied_filters] Dropping {} on {}: the join implies it",
                    expression_filter.ToString(side.name.GetIdentifierName()),

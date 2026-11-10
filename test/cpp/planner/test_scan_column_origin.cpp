@@ -522,6 +522,14 @@ TEST_CASE("row-wise tracing crosses joins but not operators that choose rows",
     distinct->ResolveOperatorTypes();
     CHECK_FALSE(origin_of(*distinct, 0, kRowWise).has_value());
   }
+  SECTION("SINGLE joins refuse the right side")
+  {
+    auto join = make_join(duckdb::JoinType::SINGLE, make_get(0, 1), make_get(1, 1));
+    join->ResolveOperatorTypes();
+    CHECK(origin_of(*join, 0, kRowWise) == at{0, 0});
+    CHECK_FALSE(origin_of(*join, 1, kRowWise).has_value());
+    CHECK(origin_of(*join, 1, kValues) == at{1, 0});
+  }
   SECTION("DELIM joins refuse")
   {
     auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(

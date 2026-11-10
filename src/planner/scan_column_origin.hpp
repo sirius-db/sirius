@@ -42,8 +42,8 @@ enum class origin_policy {
   /// qualifies, since row multiplication and NULL padding add no values.
   value_preserving,
   /// Values are unchanged and dropping scan rows changes no output row that descends from the
-  /// remaining ones (removing a filter a join above implies): limits, DISTINCT, grouping sets and
-  /// joins that pick a match by order are refused.
+  /// remaining ones (removing a filter a join above implies): limits, DISTINCT, grouping sets,
+  /// joins that pick a match by order and the right side of a SINGLE join are refused.
   row_wise,
 };
 

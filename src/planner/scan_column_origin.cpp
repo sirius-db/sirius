@@ -74,9 +74,10 @@ std::optional<ordinal_origin> join_origin(duckdb::LogicalJoin const& join,
     case duckdb::JoinType::RIGHT_ANTI:
       return mapped_origin(1, join.right_projection_map, ordinal, right_width);
     case duckdb::JoinType::SINGLE:
-      // At most one match per left row: the left side is a row subset, the right is padded.
+      // At most one match per left row: the left side is a row subset, the right is padded, and
+      // a second right row that matches throws.
       if (ordinal < left_block) { return left(); }
-      if (policy == origin_policy::row_subset) { return std::nullopt; }
+      if (policy != origin_policy::value_preserving) { return std::nullopt; }
       return right();
     default:
       // Either side may be duplicated, so only the values survive.
