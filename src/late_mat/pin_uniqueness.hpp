@@ -128,6 +128,37 @@ inline constexpr std::size_t retention_headroom_batches = 2;
   return available_bytes >= copy_bytes + retention_headroom_batches * batch_bytes;
 }
 
+/// Column positions in the order the exact stage's retained copies claim memory, from @p types
+/// (positional with the pinned columns): integer columns first, then the others, each by position.
+/// A non-integer column is a candidate only while its table is small (see unique_probe::observe),
+/// so it must not crowd out an integer key for good and then be refused itself.
+[[nodiscard]] std::vector<std::size_t> exact_retention_priority(
+  std::span<cudf::data_type const> types);
+
+/// Makes room for a retained copy of column @p column_pos by giving up the copies of columns of
+/// lower priority in @p priority (from exact_retention_priority), lowest first, until @p fits
+/// holds. @p holds_copies(c) tells whether column c retains anything, and @p give_up(c) releases
+/// column c's copies and takes it out of the exact stage. Columns of higher priority than
+/// @p column_pos are never given up. Returns whether @p fits holds in the end.
+template <typename Fits, typename HoldsCopies, typename GiveUp>
+bool make_room_for_retained_copy(std::span<std::size_t const> priority,
+                                 std::size_t column_pos,
+                                 Fits&& fits,
+                                 HoldsCopies&& holds_copies,
+                                 GiveUp&& give_up)
+{
+  auto lower = priority.rbegin();
+  while (!fits()) {
+    while (lower != priority.rend() && *lower != column_pos && !holds_copies(*lower)) {
+      ++lower;
+    }
+    if (lower == priority.rend() || *lower == column_pos) { return false; }
+    give_up(*lower);
+    ++lower;
+  }
+  return true;
+}
+
 /// Runs @p required, work the pin cannot do without, and survives an out-of-memory failure caused
 /// by optional copies. When @p required throws std::bad_alloc (which covers rmm::out_of_memory) and
 /// @p release_optional returns true, having given the optional memory back, @p required runs once

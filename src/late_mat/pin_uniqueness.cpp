@@ -32,6 +32,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -76,6 +77,16 @@ std::optional<__int128_t> integer_scalar_value(cudf::scalar const& s, ::cuda::st
 }
 
 }  // namespace
+
+std::vector<std::size_t> exact_retention_priority(std::span<cudf::data_type const> types)
+{
+  std::vector<std::size_t> priority(types.size());
+  std::iota(priority.begin(), priority.end(), std::size_t{0});
+  std::stable_partition(priority.begin(), priority.end(), [&](std::size_t c) {
+    return cudf::is_integral_not_bool(types[c]);
+  });
+  return priority;
+}
 
 std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
                                       std::uint64_t gpu_capacity_bytes)

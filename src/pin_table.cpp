@@ -34,7 +34,6 @@
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/table/table.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
@@ -57,7 +56,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -281,10 +279,8 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   std::vector<std::size_t> exact_bytes(options.probe_unique_columns.size(), 0);
   std::size_t exact_total_bytes = 0;
   std::vector<bool> exact_declined(options.probe_unique_columns.size(), false);
-  // Column positions in the order they claim the byte cap: integer columns first, then the others,
-  // each by position. A non-integer column is a candidate only while its table is small (see
-  // late_mat::unique_probe::observe), so it must not crowd out an integer key for good and then be
-  // refused itself a few chunks later. Set from the first retained chunk's types.
+  // Order in which the retained copies claim memory (late_mat::exact_retention_priority), set from
+  // the first retained chunk's types.
   std::vector<std::size_t> exact_priority;
   // Gives back everything retained for one column: its chunks, their reservations and bytes.
   auto release_exact_column = [&](std::size_t column_pos) {
@@ -404,53 +400,62 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
           batch_bytes += tbl->get_column(c).alloc_size();
         }
         if (exact_priority.empty()) {
-          exact_priority.resize(options.probe_unique_columns.size());
-          std::iota(exact_priority.begin(), exact_priority.end(), std::size_t{0});
-          std::stable_partition(exact_priority.begin(), exact_priority.end(), [&](std::size_t c) {
-            return cudf::is_integral_not_bool(
-              tbl->get_column(static_cast<cudf::size_type>(c)).type());
-          });
+          std::vector<cudf::data_type> types;
+          types.reserve(static_cast<std::size_t>(tbl->num_columns()));
+          for (cudf::size_type c = 0; c < tbl->num_columns(); ++c) {
+            types.push_back(tbl->get_column(c).type());
+          }
+          exact_priority = late_mat::exact_retention_priority(types);
         }
+        // Retain only what the exact stage may still need: a column the probe already refused
+        // releases what it retained so far, and so does a column that no longer fits. Done for
+        // every column first, so that memory is free before any column below asks for room.
+        for (std::size_t i = 0; i < exact_chunks.size(); ++i) {
+          if (!unique_probe.candidate(i) || exact_declined[i]) { release_exact_column(i); }
+        }
+        auto const decline = [&](std::size_t column_pos, std::string const& why) {
+          SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check skipped for column {}: {}",
+                           column_pos,
+                           why);
+          exact_declined[column_pos] = true;
+          release_exact_column(column_pos);
+          unique_probe.exact_unavailable(column_pos);
+        };
         for (auto const i : exact_priority) {
-          // Retain only what the exact stage may still need: a column the probe already
-          // refused releases what it retained so far, and so does a column that no longer fits.
-          if (!unique_probe.candidate(i) || exact_declined[i]) {
-            release_exact_column(i);
-            continue;
-          }
-          auto const decline = [&](std::size_t column_pos, std::string const& why) {
-            SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check skipped for column {}: {}",
-                             column_pos,
-                             why);
-            exact_declined[column_pos] = true;
-            release_exact_column(column_pos);
-            unique_probe.exact_unavailable(column_pos);
-          };
+          if (!unique_probe.candidate(i) || exact_declined[i]) { continue; }
           auto const chunk_bytes = tbl->get_column(static_cast<cudf::size_type>(i)).alloc_size();
-          // Make room by giving up the columns of lowest priority first, so which columns keep
-          // their check does not depend on how the chunks interleave.
-          for (auto lower = exact_priority.rbegin();
-               *lower != i && exact_total_bytes + chunk_bytes > *exact_byte_cap;
-               ++lower) {
-            if (exact_bytes[*lower] > 0) {
-              decline(*lower,
-                      "its retained values were released for a column of higher priority "
-                      "(pin_table_unique_exact_max_bytes)");
-            }
-          }
-          if (exact_total_bytes + chunk_bytes > *exact_byte_cap) {
+          // Each check below makes room by giving up the copies of lower priority, lowest first,
+          // so which columns keep their check does not depend on how the chunks interleave.
+          auto const make_room = [&](auto&& fits) {
+            return late_mat::make_room_for_retained_copy(
+              exact_priority,
+              i,
+              fits,
+              [&](std::size_t c) { return exact_bytes[c] > 0; },
+              [&](std::size_t c) {
+                decline(c,
+                        "its retained values were released for column " + std::to_string(i) +
+                          ", of higher priority");
+              });
+          };
+          if (!make_room([&] { return exact_total_bytes + chunk_bytes <= *exact_byte_cap; })) {
             decline(i,
                     "more than " + std::to_string(*exact_byte_cap) +
                       " bytes retained across columns (pin_table_unique_exact_max_bytes)");
             continue;
           }
-          if (!late_mat::retention_has_headroom(
-                target->get_available_memory(), chunk_bytes, batch_bytes)) {
+          if (!make_room([&] {
+                return late_mat::retention_has_headroom(
+                  target->get_available_memory(), chunk_bytes, batch_bytes);
+              })) {
             decline(i, "not enough free GPU memory would be left for the next required batch");
             continue;
           }
-          auto reservation = target->make_reservation_or_null(chunk_bytes);
-          if (reservation == nullptr) {
+          decltype(target->make_reservation_or_null(chunk_bytes)) reservation;
+          if (!make_room([&] {
+                reservation = target->make_reservation_or_null(chunk_bytes);
+                return reservation != nullptr;
+              })) {
             decline(
               i, "no GPU memory could be reserved for " + std::to_string(chunk_bytes) + " bytes");
             continue;

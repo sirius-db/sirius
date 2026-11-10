@@ -424,6 +424,96 @@ TEST_CASE("an optional retained copy yields to the batches the pin still has to 
   REQUIRE(retention_has_headroom(8 * mib, 8 * mib, 0));
 }
 
+TEST_CASE("integer columns claim the exact stage's memory before the others",
+          "[late_mat][pin_uniqueness]")
+{
+  using cudf::data_type;
+  using cudf::type_id;
+  std::vector<data_type> const types{data_type{type_id::STRING},
+                                     data_type{type_id::INT64},
+                                     data_type{type_id::FLOAT64},
+                                     data_type{type_id::INT32},
+                                     data_type{type_id::BOOL8}};
+  REQUIRE(sirius::late_mat::exact_retention_priority(types) ==
+          std::vector<std::size_t>{1, 3, 0, 2, 4});
+}
+
+TEST_CASE("a retained copy of lower priority is given up when free memory runs short",
+          "[late_mat][pin_uniqueness]")
+{
+  // Free GPU memory is simulated: giving up a column's copies returns their bytes. Columns: a
+  // string (0), two integers (1, 2) and a float (3), so the priority is 1, 2, 0, 3.
+  using sirius::late_mat::make_room_for_retained_copy;
+  using sirius::late_mat::retention_has_headroom;
+  constexpr std::size_t mib = 1024 * 1024;
+  std::vector<cudf::data_type> const types{cudf::data_type{cudf::type_id::STRING},
+                                           cudf::data_type{cudf::type_id::INT64},
+                                           cudf::data_type{cudf::type_id::INT64},
+                                           cudf::data_type{cudf::type_id::FLOAT64}};
+  auto const priority = sirius::late_mat::exact_retention_priority(types);
+
+  std::size_t available = 0;
+  std::vector<std::size_t> held(types.size(), 0);
+  std::vector<std::size_t> given_up;
+  auto const reset = [&](std::size_t free_bytes, std::vector<std::size_t> retained) {
+    available = free_bytes;
+    held      = std::move(retained);
+    given_up.clear();
+  };
+  auto const holds_copies = [&](std::size_t c) { return held[c] > 0; };
+  auto const give_up      = [&](std::size_t c) {
+    available += held[c];
+    held[c] = 0;
+    given_up.push_back(c);
+  };
+  // The headroom check of an 8 MiB copy beside 4 MiB batches.
+  auto const fits = [&] { return retention_has_headroom(available, 8 * mib, 4 * mib); };
+
+  SECTION("an integer key's copy takes the memory a string column retained")
+  {
+    // The string's first chunk took 12 MiB, leaving 6 MiB free: too little for the key's copy and
+    // its headroom (16 MiB) until the string gives its copy up.
+    reset(6 * mib, {12 * mib, 0, 0, 0});
+    REQUIRE(make_room_for_retained_copy(priority, 1, fits, holds_copies, give_up));
+    REQUIRE(given_up == std::vector<std::size_t>{0});
+  }
+
+  SECTION("the lowest priority goes first, and no more than needed")
+  {
+    // Giving up the float's 12 MiB is enough; the string keeps its copy.
+    reset(6 * mib, {12 * mib, 0, 0, 12 * mib});
+    REQUIRE(make_room_for_retained_copy(priority, 1, fits, holds_copies, give_up));
+    REQUIRE(given_up == std::vector<std::size_t>{3});
+    REQUIRE(held[0] == 12 * mib);
+  }
+
+  SECTION("a string column never takes memory from an integer key")
+  {
+    reset(6 * mib, {0, 12 * mib, 0, 0});
+    REQUIRE_FALSE(make_room_for_retained_copy(priority, 0, fits, holds_copies, give_up));
+    REQUIRE(given_up.empty());
+    REQUIRE(held[1] == 12 * mib);
+  }
+
+  SECTION("an earlier integer key outranks a later one, not the other way round")
+  {
+    reset(6 * mib, {0, 12 * mib, 0, 0});
+    REQUIRE_FALSE(make_room_for_retained_copy(priority, 2, fits, holds_copies, give_up));
+    REQUIRE(given_up.empty());
+    reset(6 * mib, {0, 0, 12 * mib, 0});
+    REQUIRE(make_room_for_retained_copy(priority, 1, fits, holds_copies, give_up));
+    REQUIRE(given_up == std::vector<std::size_t>{2});
+  }
+
+  SECTION("when giving everything lower up is not enough, the copy is declined")
+  {
+    // Everything lower gets given up on the way; the caller then declines the column itself.
+    reset(1 * mib, {4 * mib, 0, 0, 4 * mib});
+    REQUIRE_FALSE(make_room_for_retained_copy(priority, 1, fits, holds_copies, give_up));
+    REQUIRE(given_up == std::vector<std::size_t>{3, 0});
+  }
+}
+
 TEST_CASE("required work is retried once after the optional copies are given back",
           "[late_mat][pin_uniqueness]")
 {

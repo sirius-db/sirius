@@ -149,11 +149,12 @@ The exact stage is bounded in bytes, across all the columns it retains together,
 `pin_table_unique_exact_max_bytes` (default 10% of the GPU memory space capacity), which replaces
 the former row cap `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS`. Each retained chunk holds a GPU
 reservation. The stage holds the retained chunks, the concatenation of one column and its sorted
-copy at once, so its peak is about three times the cap, on top of the pin itself. When the cap is
-short, integer columns keep their check ahead of the others (a non-integer column is a candidate
-only while its table is small, so it must not crowd out an integer key and then be refused
-itself), then earlier columns ahead of later ones, and the rest stay UNKNOWN; a copy that fails
-has the same effect, and the pin goes on.
+copy at once, so its peak is about three times the cap, on top of the pin itself. When the cap,
+the free GPU memory or a reservation is short, integer columns keep their check ahead of the
+others (a non-integer column is a candidate only while its table is small, so it must not crowd
+out an integer key and then be refused itself), then earlier columns ahead of later ones: a copy
+gives up the retained copies of lower priority to make room, and the columns that lose theirs stay
+UNKNOWN. A copy that fails has the same effect, and the pin goes on.
 
 **Absence of a fact means UNKNOWN, never "not unique."** A false positive would collapse
 distinct groups into one — wrong answers, not slow ones. Facts attach to the pinned entry BY
