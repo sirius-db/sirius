@@ -1,4 +1,4 @@
-NIXL 1.5.0: honor static linkage for common utilities and install the UCX archive.
+NIXL 1.5.2: honor static linkage for common utilities and install the UCX archive.
 
 --- a/src/utils/common/meson.build
 +++ b/src/utils/common/meson.build

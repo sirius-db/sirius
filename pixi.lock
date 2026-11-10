@@ -2,7 +2,7 @@ version: 7
 platforms:
 - name: linux-64
   virtual-packages:
-  - __unix=0=0
+  - __unix=0
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=x86_64
@@ -10,7 +10,7 @@ platforms:
   subdir: linux-64
   virtual-packages:
   - __cuda=12
-  - __unix=0=0
+  - __unix=0
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=x86_64
@@ -18,13 +18,13 @@ platforms:
   subdir: linux-64
   virtual-packages:
   - __cuda=13
-  - __unix=0=0
+  - __unix=0
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=x86_64
 - name: linux-aarch64
   virtual-packages:
-  - __unix=0=0
+  - __unix=0
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=aarch64
@@ -32,7 +32,7 @@ platforms:
   subdir: linux-aarch64
   virtual-packages:
   - __cuda=12
-  - __unix=0=0
+  - __unix=0
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=aarch64
@@ -40,13 +40,13 @@ platforms:
   subdir: linux-aarch64
   virtual-packages:
   - __cuda=13
-  - __unix=0=0
+  - __unix=0
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=aarch64
 - name: osx-arm64
   virtual-packages:
-  - __unix=0=0
+  - __unix=0
   - __osx=13.0
   - __archspec=0=m1
 environments:
@@ -333,7 +333,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tbb-2023.1.0-hfd44327_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tomlplusplus-3.3.0-hcb278e6_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.20.1-hbe80e26_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h3aa5027_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ukkonen-1.1.0-py314h9891dd4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/unzip-6.0-hb03c661_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/wget-1.25.0-h653f8fd_1.conda
@@ -617,7 +617,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tbb-2023.1.0-h33d95ba_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tomlplusplus-3.3.0-hd600fc2_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.20.1-hc4deba6_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h0499473_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ukkonen-1.1.0-py314hd7d8586_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/unzip-6.0-he30d5cf_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/wget-1.25.0-h4f42960_1.conda
@@ -909,7 +909,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tbb-2023.1.0-hfd44327_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tomlplusplus-3.3.0-hcb278e6_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.20.1-hf72d326_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h297d835_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ukkonen-1.1.0-py314h9891dd4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/unzip-6.0-hb03c661_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/wget-1.25.0-h653f8fd_1.conda
@@ -1194,7 +1194,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tbb-2023.1.0-h33d95ba_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tomlplusplus-3.3.0-hd600fc2_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.20.1-h62a42b4_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h96f4cc0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ukkonen-1.1.0-py314hd7d8586_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/unzip-6.0-he30d5cf_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/wget-1.25.0-h4f42960_1.conda
@@ -1609,7 +1609,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.18.0-h2d90d6e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tbb-2023.1.0-hfd44327_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.20.1-hf72d326_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h297d835_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ukkonen-1.1.0-py314h9891dd4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/unzip-6.0-hb03c661_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/wget-1.25.0-h653f8fd_1.conda
@@ -1841,7 +1841,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.18.0-h9b2e256_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tbb-2023.1.0-h33d95ba_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.20.1-h62a42b4_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h96f4cc0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ukkonen-1.1.0-py314hd7d8586_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/unzip-6.0-he30d5cf_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/wget-1.25.0-h4f42960_1.conda
@@ -2080,7 +2080,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/sccache-0.18.0-h2d90d6e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tbb-2023.1.0-hfd44327_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.20.1-hbe80e26_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h3aa5027_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ukkonen-1.1.0-py314h9891dd4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/unzip-6.0-hb03c661_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/wget-1.25.0-h653f8fd_1.conda
@@ -2311,7 +2311,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/sccache-0.18.0-h9b2e256_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tbb-2023.1.0-h33d95ba_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/tk-8.6.13-noxft_hf03c496_4.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.20.1-hc4deba6_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h0499473_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ukkonen-1.1.0-py314hd7d8586_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/unzip-6.0-he30d5cf_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/wget-1.25.0-h4f42960_1.conda
@@ -7410,35 +7410,15 @@ packages:
   run_exports: {}
   size: 100241
   timestamp: 1675026801832
-- conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.20.1-hbe80e26_0.conda
-  sha256: 8f0ac4a92e4674eb4c87cdfc59d2fc7c2d0d1696689202eeb62ef715d82ce711
-  md5: 7d06bc10996e75c90b8cd7631b5dcf6c
-  depends:
-  - __glibc >=2.17,<3.0.a0
-  - _openmp_mutex >=4.5
-  - libgcc >=14
-  - libstdcxx >=14
-  - rdma-core >=61.0
-  constrains:
-  - cuda-version >=12,<13.0a0
-  - cuda-cudart
-  license: BSD-3-Clause
-  license_family: BSD
-  purls: []
-  run_exports:
-    weak:
-    - ucx >=1.20.1,<1.21.0a0
-  size: 7841432
-  timestamp: 1779828197486
-- conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.20.1-hf72d326_0.conda
-  sha256: 96341dbb30e77b0c89522f850edc42572a0d7937646898bb2d57b93a5c348e0c
-  md5: 227baf40539ae6858afe99634faf883d
+- conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h297d835_0.conda
+  sha256: c8d160bd490ad9a6aef7d1e56c8fdb00e8c7fabed133cb43b67de3b9427a5bf0
+  md5: dd79df3fd3984ce1aa6e2404552e8d74
   depends:
   - __glibc >=2.28,<3.0.a0
   - _openmp_mutex >=4.5
   - libgcc >=14
   - libstdcxx >=14
-  - rdma-core >=61.0
+  - rdma-core >=63.0
   constrains:
   - cuda-cudart
   - cuda-version >=13,<14.0a0
@@ -7447,9 +7427,29 @@ packages:
   purls: []
   run_exports:
     weak:
-    - ucx >=1.20.1,<1.21.0a0
-  size: 7866533
-  timestamp: 1779828179257
+    - ucx >=1.21.0,<1.22.0a0
+  size: 8883679
+  timestamp: 1783788517867
+- conda: https://conda.anaconda.org/conda-forge/linux-64/ucx-1.21.0-h3aa5027_0.conda
+  sha256: 150fb3e61462189b018727102dd919b974d3d916f7e4b5e79d632b53b5c6836d
+  md5: 8d221356e723fdb168d3e3c12c375850
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - _openmp_mutex >=4.5
+  - libgcc >=14
+  - libstdcxx >=14
+  - rdma-core >=63.0
+  constrains:
+  - cuda-cudart
+  - cuda-version >=12,<13.0a0
+  license: BSD-3-Clause
+  license_family: BSD
+  purls: []
+  run_exports:
+    weak:
+    - ucx >=1.21.0,<1.22.0a0
+  size: 9335284
+  timestamp: 1783788498035
 - conda: https://conda.anaconda.org/conda-forge/linux-64/ukkonen-1.1.0-py314h9891dd4_0.conda
   sha256: c84034056dc938c853e4f61e72e5bd37e2ec91927a661fb9762f678cbea52d43
   md5: 5d3c008e54c7f49592fca9c32896a76f
@@ -12488,45 +12488,45 @@ packages:
   run_exports: {}
   size: 100654
   timestamp: 1676849745713
-- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.20.1-h62a42b4_0.conda
-  sha256: c74d15f5734c09a60ee0bc12c30eba325ec7d72afaa50781ec7dcc5a763f22fd
-  md5: d99452fecc606351f25b789f903c8e00
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h0499473_0.conda
+  sha256: b0e9792b548323e73b096f7ec35c1b81838b889096b24a4d9b0c0030ef181c42
+  md5: ad424667d2023c4ed2385188fb55c5eb
+  depends:
+  - _openmp_mutex >=4.5
+  - libgcc >=14
+  - libstdcxx >=14
+  - rdma-core >=63.0
+  constrains:
+  - cuda-version >=12,<13.0a0
+  - cuda-cudart
+  license: BSD-3-Clause
+  license_family: BSD
+  purls: []
+  run_exports:
+    weak:
+    - ucx >=1.21.0,<1.22.0a0
+  size: 9097251
+  timestamp: 1783788550233
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.21.0-h96f4cc0_0.conda
+  sha256: bce10bc2cff9ab474d1c09eefa5043ce3ef1aa9cc9335020286f1c4a2679b22f
+  md5: 42a80625c7a73e5fb3e6cdba7bb83484
   depends:
   - __glibc >=2.28,<3.0.a0
   - _openmp_mutex >=4.5
   - libgcc >=14
   - libstdcxx >=14
-  - rdma-core >=61.0
+  - rdma-core >=63.0
   constrains:
-  - cuda-cudart
   - cuda-version >=13,<14.0a0
-  license: BSD-3-Clause
-  license_family: BSD
-  purls: []
-  run_exports:
-    weak:
-    - ucx >=1.20.1,<1.21.0a0
-  size: 7808868
-  timestamp: 1779828229221
-- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ucx-1.20.1-hc4deba6_0.conda
-  sha256: f1af140a36e3c971e3ddbfb907da79ab0c5eef9bc78ba4853f406bc9b61ee921
-  md5: 3db915ee01a1bb59cfd1306e1210cf23
-  depends:
-  - _openmp_mutex >=4.5
-  - libgcc >=14
-  - libstdcxx >=14
-  - rdma-core >=61.0
-  constrains:
   - cuda-cudart
-  - cuda-version >=12,<13.0a0
   license: BSD-3-Clause
   license_family: BSD
   purls: []
   run_exports:
     weak:
-    - ucx >=1.20.1,<1.21.0a0
-  size: 7797581
-  timestamp: 1779828233034
+    - ucx >=1.21.0,<1.22.0a0
+  size: 9161408
+  timestamp: 1783788565428
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ukkonen-1.1.0-py314hd7d8586_0.conda
   sha256: 0a7efe469d7e2a34a1d017bc51cf6fb9a51436730256983694c5ad74a33bd4e0
   md5: f3a967efabf9cf450b7741487318ea6e

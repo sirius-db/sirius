@@ -6,14 +6,15 @@ find_package(Threads REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_program(SIRIUS_MESON_EXECUTABLE meson REQUIRED)
 find_program(SIRIUS_NINJA_EXECUTABLE ninja REQUIRED)
-pkg_check_modules(SIRIUS_UCX REQUIRED IMPORTED_TARGET "ucx>=1.20.1")
+pkg_check_modules(SIRIUS_UCX REQUIRED IMPORTED_TARGET "ucx>=1.21.0")
 pkg_get_variable(_nixl_ucx_pkgconfig_dir ucx pcfiledir)
 
 set(_nixl_port "${CMAKE_CURRENT_LIST_DIR}/../sirius-duckdb/vcpkg_ports/nixl")
 include("${_nixl_port}/nixl-source.cmake")
 set(_nixl_patches
     "${_nixl_port}/native-cpp-only.patch"
-    "${_nixl_port}/system-tomlplusplus.patch" "${_nixl_port}/static-sdk.patch")
+    "${_nixl_port}/system-tomlplusplus.patch" "${_nixl_port}/static-sdk.patch"
+    "${_nixl_port}/asio-post.patch")
 set(SIRIUS_NIXL_BUILD_JOBS
     "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}"
     CACHE STRING "Parallel NIXL jobs (empty uses Ninja's default)")

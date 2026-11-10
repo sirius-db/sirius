@@ -19,5 +19,5 @@
   "license": "Apache-2.0",
   "name": "nixl",
   "supports": "linux & (x64 | arm64) & static",
-  "version": "1.5.0"
+  "version": "1.5.2"
 }

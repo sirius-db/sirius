@@ -1,4 +1,4 @@
-UCX 1.20.1: retain static transport registration in PIC archives.
+UCX 1.22.0: retain static transport registration in PIC archives.
 
 --- a/configure.ac
 +++ b/configure.ac

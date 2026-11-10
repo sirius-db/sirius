@@ -1,4 +1,4 @@
-NIXL 1.5.0: use the installed toml++ headers without its optional shared library.
+NIXL 1.5.2: use the installed toml++ headers without its optional shared library.
 
 --- a/src/utils/common/meson.build
 +++ b/src/utils/common/meson.build

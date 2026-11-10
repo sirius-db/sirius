@@ -1,10 +1,13 @@
 # NIXL packaging
 
-This port pins NIXL 1.5.0 and links its UCX backend into the static SDK. Sirius's
+This port pins NIXL 1.5.2 and links its UCX backend into the static SDK. Sirius's
 CMake development build shares its patches and `nixl-targets.cmake`, using
 environment-provided shared UCX, Abseil, and CUDA runtime libraries. CMake's
 external project downloads, patches, and builds the pinned source during the
 build step. This port uses the static UCX overlay port.
+
+Development builds pin UCX 1.21.0, the newest version compatible with RAPIDS
+26.10 / UCXX 0.52 (which requires UCX <1.22). The static port uses UCX 1.22.0.
 
 Development builds use the transports and dynamically loaded modules provided
 by the environment's UCX package. The static build includes only the transports
@@ -29,6 +32,8 @@ The temporary patches address this pinned version:
   `native-cpp-only.patch`; apply the patches in the listed order.
 - `static-sdk.patch` honors static linkage for common utilities and installs
   the UCX archive.
+- `asio-post.patch` replaces the removed `io_context::post` member with
+  `asio::post` for compatibility with current Asio releases.
 
 Remove each backport when the pinned version provides the corresponding fix.
 CMake re-extracts the source when the pin or patches change.

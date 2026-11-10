@@ -16,7 +16,8 @@ vcpkg_from_github(
   PATCHES
   native-cpp-only.patch
   system-tomlplusplus.patch
-  static-sdk.patch)
+  static-sdk.patch
+  asio-post.patch)
 
 find_program(
   NIXL_NVCC nvcc HINTS "$ENV{CUDAToolkit_ROOT}/bin" "$ENV{CUDA_HOME}/bin"

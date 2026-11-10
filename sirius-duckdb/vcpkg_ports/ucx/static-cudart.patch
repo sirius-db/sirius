@@ -1,4 +1,4 @@
-UCX 1.20.1: use the static CUDA runtime for this static package.
+UCX 1.22.0: use the static CUDA runtime for this static package.
 
 --- a/config/m4/cuda.m4
 +++ b/config/m4/cuda.m4

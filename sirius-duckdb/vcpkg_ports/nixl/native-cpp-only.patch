@@ -1,4 +1,4 @@
-NIXL 1.5.0: build the host C++ SDK without unused bindings and components.
+NIXL 1.5.2: build the host C++ SDK without unused bindings and components.
 
 --- a/meson_options.txt
 +++ b/meson_options.txt
@@ -37,7 +37,7 @@ NIXL 1.5.0: build the host C++ SDK without unused bindings and components.
  if io_uring_dep.found()
    if io_uring_dep.type_name() == 'internal'
      # Internal (subproject) deps cannot be passed to compiler checks in meson
-@@ -230,7 +235,10 @@
+@@ -202,7 +207,10 @@
    message('Using system Abseil dependencies')
    summary({'Abseil source': 'system'}, section: 'Dependencies')
  endif
@@ -49,69 +49,8 @@ NIXL 1.5.0: build the host C++ SDK without unused bindings and components.
  
  cuda_inc_path = get_option('cudapath_inc')
  cuda_lib_path = get_option('cudapath_lib')
---- a/src/meson.build
-+++ b/src/meson.build
-@@ -22,6 +22,10 @@
- subdir('plugins')
- subdir('core')
- 
-+if native_only
-+    subdir_done()
-+endif
-+
- # Test utilities library - created after nixl_dep is available to avoid circular dependencies
- nixl_test_utils_lib = library('nixl_test_utils',
-                              'infra/test_utils.cpp',
---- a/src/api/meson.build
-+++ b/src/api/meson.build
-@@ -14,5 +14,7 @@
- # limitations under the License.
- 
- subdir('cpp')
--subdir('python')
--subdir('device')
-+if not native_only
-+    subdir('python')
-+    subdir('device')
-+endif
---- a/src/plugins/meson.build
-+++ b/src/plugins/meson.build
-@@ -131,7 +131,9 @@
-     endif
- endif
- 
--subdir('telemetry')
-+if not native_only
-+    subdir('telemetry')
-+endif
- 
- if nixl_trace_enabled
-     subdir('tracing')
---- a/src/utils/meson.build
-+++ b/src/utils/meson.build
-@@ -16,9 +16,15 @@
- subdir('common')
- subdir('serdes')
- subdir('stream')
--subdir('file')
--subdir('object')
--subdir('device')
-+if not native_only or enabled_plugins.get('POSIX') or enabled_plugins.get('HF3FS') or enabled_plugins.get('GDS') or enabled_plugins.get('GDS_MT')
-+    subdir('file')
-+endif
-+if not native_only or enabled_plugins.get('OBJ')
-+    subdir('object')
-+endif
-+if not native_only
-+    subdir('device')
-+endif
- 
- if enabled_plugins.get('LIBFABRIC') and libfabric_dep.found()
-     subdir('libfabric')
---- a/meson.build
-+++ b/meson.build
-@@ -414,26 +414,29 @@
-     rocm_dep = disabler()
+@@ -341,26 +349,29 @@
+     cuda_wheel_dir = 'nixl_' + wheel_variant
  endif
  
 -# Check for etcd-cpp-api - use multiple methods for discovery
@@ -160,3 +99,56 @@ NIXL 1.5.0: build the host C++ SDK without unused bindings and components.
  endif
  
  prefix_path = get_option('prefix')
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -22,6 +22,10 @@
+ subdir('plugins')
+ subdir('core')
+ 
++if native_only
++    subdir_done()
++endif
++
+ # Test utilities library - created after nixl_dep is available to avoid circular dependencies
+ nixl_test_utils_lib = library('nixl_test_utils',
+                              'infra/test_utils.cpp',
+--- a/src/api/meson.build
++++ b/src/api/meson.build
+@@ -14,4 +14,6 @@
+ # limitations under the License.
+ 
+ subdir('cpp')
+-subdir('python')
++if not native_only
++    subdir('python')
++endif
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -140,7 +140,9 @@
+     endif
+ endif
+ 
+-subdir('telemetry')
++if not native_only
++    subdir('telemetry')
++endif
+ 
+ if nixl_trace_enabled
+     subdir('tracing')
+--- a/src/utils/meson.build
++++ b/src/utils/meson.build
+@@ -16,8 +16,12 @@
+ subdir('common')
+ subdir('serdes')
+ subdir('stream')
+-subdir('file')
+-subdir('object')
++if not native_only or enabled_plugins.get('POSIX') or enabled_plugins.get('HF3FS') or enabled_plugins.get('GDS') or enabled_plugins.get('GDS_MT')
++    subdir('file')
++endif
++if not native_only or enabled_plugins.get('OBJ')
++    subdir('object')
++endif
+ 
+ if enabled_plugins.get('LIBFABRIC') and libfabric_dep.found()
+     subdir('libfabric')

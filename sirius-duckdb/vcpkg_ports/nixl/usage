@@ -1,6 +1,6 @@
 NIXL is built as static archives with its UCX transport built in.
 
-    find_package(nixl 1.5 CONFIG REQUIRED)
+    find_package(nixl 1.5.2 EXACT CONFIG REQUIRED)
     target_link_libraries(main PRIVATE nixl::nixl)
 
 The version-specific patches and nixl-targets.cmake are also used by Sirius's

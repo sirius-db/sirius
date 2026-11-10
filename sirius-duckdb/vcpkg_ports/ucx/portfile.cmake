@@ -9,7 +9,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  1e177fb3162d63e8172ca81951e3465673cfaed57bd28ab42fa29e5b868637a55d04c91eaac72cc3e1e57c41e5a84942adb3daca4bbfd9e43a9570597d485e9d
+  7d2b02736a19a948dd8ee83386ce21304304ba4c981fabcef8e7668c847a57ab280a66dbd4762e5282f6858950843f585b9e30cba50f36bdf62c9048bbb49580
   PATCHES
   static-pic.patch
   static-cudart.patch

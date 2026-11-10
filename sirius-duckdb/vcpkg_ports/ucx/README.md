@@ -1,6 +1,6 @@
 # Static UCX
 
-This Linux port builds UCX 1.20.1 with TCP, self, POSIX/System V shared
+This Linux port builds UCX 1.22.0 with TCP, self, POSIX/System V shared
 memory, CMA, CUDA copy and CUDA IPC transports. InfiniBand/RoCE, RDMA CM,
 GDRCopy and other optional transports are disabled explicitly.
 
