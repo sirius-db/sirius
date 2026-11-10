@@ -100,3 +100,24 @@ file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")
 
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
+
+# Code RAFT adapts from other projects, see thirdparty/README.md upstream.
+include(
+  "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/sirius-third-party-component.cmake")
+file(
+  GLOB thirdparty_licenses
+  LIST_DIRECTORIES false
+  "${SOURCE_PATH}/thirdparty/LICENSES/*")
+list(SORT thirdparty_licenses)
+sirius_third_party_component(
+  "${CURRENT_PACKAGES_DIR}/share/${PORT}/third_party/raft-derived"
+  NAME
+  "Code adapted in RAFT"
+  VERSION
+  "${VERSION}"
+  LICENSE
+  "MIT AND BSD-3-Clause AND Apache-2.0"
+  HOMEPAGE
+  "https://github.com/rapidsai/raft/tree/v${VERSION}/thirdparty"
+  FILES
+  ${thirdparty_licenses})

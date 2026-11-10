@@ -10,7 +10,7 @@
       "name": "vcpkg-cmake-config"
     }
   ],
-  "license": "Apache-2.0",
+  "license": "Apache-2.0 WITH LLVM-exception AND (NCSA OR MIT) AND Apache-2.0 AND BSL-1.0 AND BSD-2-Clause AND BSD-3-Clause",
   "name": "cccl",
   "supports": "linux",
   "version": "3.5.0"
