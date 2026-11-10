@@ -4558,6 +4558,40 @@ TEST_CASE(
   }
 }
 
+TEST_CASE("TRY is not implemented and compiles no NVRTC kernel outside nvrtc_jit",
+          "[expression_evaluator][nvrtc_jit][try]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const int_t = logical_type::make(type_id::INTEGER);
+  auto batch       = make_two_int32_batch_with_nulls(
+    *space, {10, std::numeric_limits<std::int32_t>::max()}, {true, true}, {5, 1}, {true, true});
+  auto ro = batch->to_read_only();
+  auto tv = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref_typed(0, int_t));
+  args.push_back(make_ref_typed(1, int_t));
+  auto const try_expr = make_unary(sirius::ast::unary_op::kind::op_try,
+                                   make_func(sirius::function_id::add, std::move(args), int_t));
+
+  for (auto const strategy : sirius::all_expression_evaluator_strategies) {
+    if (strategy == exp_strategy_enum::NVRTC_JIT) { continue; }
+    DYNAMIC_SECTION("strategy " << sirius::strategy_to_string(strategy))
+    {
+      // Start from an empty cache so that any NVRTC compilation, even of a kernel built by an
+      // earlier test, shows up as a cache entry.
+      codegen::jit::KernelCache::instance().clear();
+      exp_executor exec(*try_expr, mr, stream, sirius::expression_query_policy{strategy});
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::not_implemented_exception);
+      CHECK(codegen::jit::KernelCache::instance().size() == 0);
+    }
+  }
+}
+
 TEST_CASE("nvrtc_jit - comparisons, IS [NOT] DISTINCT FROM, BETWEEN, NOT, and IS [NOT] NULL",
           "[expression_evaluator][nvrtc_jit][ticket6][narrow_domain]")
 {

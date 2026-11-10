@@ -18,10 +18,8 @@
 #include "expression_evaluator/comparison_expression.hpp"
 
 #include <expression/ast/node.hpp>
-#include <expression/ast/utils.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
-#include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <helper/logical_type.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
@@ -47,7 +45,6 @@
 
 // standard library
 #include <algorithm>
-#include <array>
 #include <string>
 #include <variant>
 
@@ -261,17 +258,6 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
                                                evaluation_mode mode)
 {
   if (alt.op == sirius::ast::unary_op::kind::op_try) {
-    sirius::ast::node temp_node{sirius::ast::unary_op{alt.op, sirius::ast::clone(*alt.child)}};
-    std::array<sirius::ast::node const*, 1> exprs{&temp_node};
-    if (auto const plan = nvrtc::plan_project_sink(exprs, _input_table);
-        plan && plan->is_direct()) {
-      auto result =
-        nvrtc::evaluate_project_sink(exprs, _input_table, _stream, _mr, nvrtc_sink_options());
-      _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
-      auto col = std::move(result.table->release()[0]);
-      if (mode == evaluation_mode::AST) { return materialize_as_ast_column(std::move(col)); }
-      return evaluate_result(std::move(col));
-    }
     throw not_implemented_exception(
       "[expression_evaluator] evaluate called on an unsupported TRY operator expression.");
   }
