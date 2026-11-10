@@ -7908,6 +7908,126 @@ void expect_tables_equal(cudf::table_view const& actual, cudf::table_view const&
 }  // namespace
 
 TEST_CASE(
+  "nvrtc_jit - Materialization Boundaries are evaluated only for trees a fused kernel accepts",
+  "[expression_evaluator][nvrtc_jit][compile_planning]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const varchar_t = logical_type::make(type_id::VARCHAR);
+  auto const bigint_t  = logical_type::make(type_id::BIGINT);
+  auto const struct_t  = logical_type::make(type_id::STRUCT);
+
+  std::vector<std::string> const strs{"x", "X", "abc", "", "xx", "x", "Abc", "X"};
+  std::vector<bool> const str_valids{true, true, true, true, true, false, true, true};
+  auto const col_s = make_bulk_strings(strs, str_valids, stream, mr);
+  auto const col_a = make_bulk_column<std::int64_t>(
+    cudf::data_type{cudf::type_id::INT64}, {1, 2, 3, 4, 5, 6, 7, 8}, {}, stream, mr);
+  auto const col_b = make_bulk_column<std::int64_t>(
+    cudf::data_type{cudf::type_id::INT64}, {10, 0, 10, 0, 10, 0, 10, 0}, {}, stream, mr);
+  auto const col_c = make_bulk_column<std::int64_t>(
+    cudf::data_type{cudf::type_id::INT64}, {5, 5, 5, 5, 5, 5, 5, 5}, {}, stream, mr);
+  cudf::table_view const tv{{col_s->view(), col_a->view(), col_b->view(), col_c->view()}};
+
+  auto upper_s = [&] {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, varchar_t));
+    return make_func(sirius::function_id::upper, std::move(args), varchar_t);
+  };
+  auto upper_s_eq_x = [&] {
+    return make_cmp(sirius::comparison_type::equal, upper_s(), make_str_const("X"));
+  };
+  auto binary = [&](sirius::function_id fid,
+                    std::unique_ptr<ast_node> l,
+                    std::unique_ptr<ast_node> r,
+                    logical_type ret) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(l));
+    args.push_back(std::move(r));
+    return make_func(fid, std::move(args), ret);
+  };
+  auto make_policy = [](exp_strategy_enum s) { return sirius::expression_query_policy{s}; };
+
+  SECTION("a tree no fused kernel can compute evaluates none of its boundaries for NVRTC_JIT")
+  {
+    // row(upper(s)) is STRUCT, so neither it nor its boundary-only child compiles.
+    std::vector<std::unique_ptr<ast_node>> row_args;
+    row_args.push_back(upper_s());
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_func(sirius::function_id::row, std::move(row_args), struct_t));
+
+    exp_executor jit_exec(exprs, mr, stream, make_policy(exp_strategy_enum::NVRTC_JIT));
+    auto const out = jit_exec.evaluate(tv);
+    REQUIRE(out->num_columns() == 1);
+    CHECK(out->num_rows() == tv.num_rows());
+    CHECK(out->get_column(0).type().id() == cudf::type_id::STRUCT);
+    CHECK(jit_exec.materialization_boundary_count_for_testing() == 0);
+  }
+
+  SECTION("a boundary under an uncompilable ancestor is evaluated once")
+  {
+    // The VARCHAR CASE cannot be a fused kernel's output, but its WHEN can.
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back({upper_s_eq_x(), make_ref_typed(0, varchar_t)});
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_str_const("none"), varchar_t}));
+
+    exp_executor jit_exec(exprs, mr, stream, make_policy(exp_strategy_enum::NVRTC_JIT));
+    exp_executor mat_exec(exprs, mr, stream, make_policy(exp_strategy_enum::MATERIALIZE));
+    auto const jit_out = jit_exec.evaluate(tv);
+    auto const mat_out = mat_exec.evaluate(tv);
+    CHECK(jit_exec.materialization_boundary_count_for_testing() == 1);
+    expect_tables_equal(jit_out->view(), mat_out->view());
+  }
+
+  SECTION("a mixed VARCHAR and fixed-width projection evaluates each boundary once")
+  {
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(upper_s());
+    std::vector<std::unique_ptr<ast_node>> len_args;
+    len_args.push_back(upper_s());
+    exprs.push_back(binary(sirius::function_id::add,
+                           make_func(sirius::function_id::strlen, std::move(len_args), bigint_t),
+                           make_ref_typed(1, bigint_t),
+                           bigint_t));
+
+    exp_executor jit_exec(exprs, mr, stream, make_policy(exp_strategy_enum::NVRTC_JIT));
+    exp_executor mat_exec(exprs, mr, stream, make_policy(exp_strategy_enum::MATERIALIZE));
+    auto const jit_out = jit_exec.evaluate(tv);
+    auto const mat_out = mat_exec.evaluate(tv);
+    CHECK(jit_exec.materialization_boundary_count_for_testing() == 1);
+    expect_tables_equal(jit_out->view(), mat_out->view());
+  }
+
+  SECTION("a filter whose predicate has a boundary is accepted")
+  {
+    // upper(s) = 'X' AND a + b > c
+    std::vector<std::unique_ptr<ast_node>> and_args;
+    and_args.push_back(upper_s_eq_x());
+    and_args.push_back(make_cmp(sirius::comparison_type::gt,
+                                binary(sirius::function_id::add,
+                                       make_ref_typed(1, bigint_t),
+                                       make_ref_typed(2, bigint_t),
+                                       bigint_t),
+                                make_ref_typed(3, bigint_t)));
+    auto const pred = make_conj(sirius::ast::conjunction::kind::op_and, std::move(and_args));
+    REQUIRE(pred->return_type().id() == type_id::BOOLEAN);
+
+    exp_executor jit_exec(*pred, mr, stream, make_policy(exp_strategy_enum::NVRTC_JIT));
+    exp_executor mat_exec(*pred, mr, stream, make_policy(exp_strategy_enum::MATERIALIZE));
+    std::array<cudf::size_type, 2> const out_idx{0, 1};
+    auto const jit_out = jit_exec.select(tv, out_idx);
+    auto const mat_out = mat_exec.select(tv, out_idx);
+    CHECK(jit_exec.materialization_boundary_count_for_testing() == 1);
+    CHECK(jit_out->num_rows() == 2);
+    expect_tables_equal(jit_out->view(), mat_out->view());
+  }
+}
+
+TEST_CASE(
   "nvrtc_jit - multi-tile FilterSink compaction (scan and scatter kernels) matches MATERIALIZE",
   "[expression_evaluator][nvrtc_jit][filter_tiles]")
 {

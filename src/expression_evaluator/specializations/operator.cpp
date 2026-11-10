@@ -263,7 +263,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
   if (alt.op == sirius::ast::unary_op::kind::op_try) {
     sirius::ast::node temp_node{sirius::ast::unary_op{alt.op, sirius::ast::clone(*alt.child)}};
     std::array<sirius::ast::node const*, 1> exprs{&temp_node};
-    if (nvrtc::can_compile_project_sink(exprs, _input_table)) {
+    if (auto const plan = nvrtc::plan_project_sink(exprs, _input_table);
+        plan && plan->is_direct()) {
       auto result =
         nvrtc::evaluate_project_sink(exprs, _input_table, _stream, _mr, nvrtc_sink_options());
       _narrow_domain_comparison_count += result.narrow_domain_comparison_count;

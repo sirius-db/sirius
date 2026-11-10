@@ -484,6 +484,25 @@ std::vector<bench_case> all_cases()
   filter("F07_q6_pred_wide", q6_pred, /*all_cols=*/true);
   filter("F08_nullable_pred",
          [] { return cmp(ct::lt, ref_int32_nullable(), make_int_const(500'000)); });
+
+  // Materialization Boundaries: upper() is evaluated into a column the fused kernel reads.
+  auto upper_mode = [] { return fn1(fid::upper, ref_mode(), t_str); };
+  filter("B01_filter_upper_eq_and_add_gt", [=] {
+    return conj_and(list(cmp(ct::equal, upper_mode(), make_str_const("MAIL")),
+                         cmp(ct::gt,
+                             bin(fid::add, make_cast(ref_int32(), t_big, false), ref_qty(), t_big),
+                             make_bigint_const(500'000))));
+  });
+  project("B02_mixed_varchar_and_fixed", [=] {
+    return list(upper_mode(),
+                bin(fid::add, fn1(fid::strlen, upper_mode(), t_big), ref_qty(), t_big));
+  });
+  project("B03_boundary_under_varchar_case", [=] {
+    std::vector<sirius::ast::case_expr::when_then> whens;
+    whens.push_back({cmp(ct::equal, upper_mode(), make_str_const("MAIL")), ref_comment()});
+    return list(
+      std::make_unique<ast_node>(sirius::ast::case_expr{std::move(whens), ref_mode(), t_str}));
+  });
   return cases;
 }
 

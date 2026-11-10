@@ -27,7 +27,6 @@
 #include <expression_evaluator/nvrtc/kernel_abi.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <expression_evaluator/nvrtc/sink_launch.hpp>
-#include <expression_evaluator/nvrtc/supportability.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 #include <sirius/exception.hpp>
 
@@ -300,18 +299,6 @@ extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
 }
 
 }  // namespace
-
-bool can_compile_filter_sink(sirius::ast::node const& predicate,
-                             cudf::table_view const& input,
-                             boundary_column_map const* boundary_map) noexcept
-{
-  try {
-    return is_node_supported(predicate, input, boundary_map) &&
-           effective_node_cudf_type(predicate, input, boundary_map).id() == cudf::type_id::BOOL8;
-  } catch (...) {
-    return false;
-  }
-}
 
 filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
                                         cudf::table_view const& input,
