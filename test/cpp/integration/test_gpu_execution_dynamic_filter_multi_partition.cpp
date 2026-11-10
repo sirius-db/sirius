@@ -111,7 +111,6 @@ void check_union_all_accumulation(duckdb::Connection& con, bool host_staged = fa
 {
   scoped_sirius_setting gpu_on(con, "gpu_execution", true);
   scoped_sirius_setting master_on(con, "enable_dynamic_filter", true);
-  scoped_sirius_setting accumulation_on(con, "enable_dynamic_filter_multi_partition", true);
   scoped_sirius_setting native_keys(con, "enable_compressed_materialization", false);
   sirius::test::disabled_optimizers_guard shape(
     con, "statistics_propagation,join_order,build_side_probe_side");
@@ -237,22 +236,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     cpu_rows = sirius::test::collect_rows(*result);
   }
 
-  SECTION("the build PARTITION constructs whatever the retired multi-partition switch says")
-  {
-    scoped_sirius_setting accumulation_off(*con, "enable_dynamic_filter_multi_partition", false);
-    require_complete_publication(run_on_gpu(*con, query), cpu_rows);
-  }
-
   SECTION("enabled accumulation publishes every original contribution")
   {
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     require_complete_publication(run_on_gpu(*con, query), cpu_rows);
     require_complete_publication(run_on_gpu(*con, query), cpu_rows);
   }
 
   SECTION("a LIMIT above an ORDER BY over the accumulating join completes normally")
   {
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     std::string const limited =
       "SELECT k, payload FROM (SELECT p.k AS k, b.payload AS payload FROM df_probe p "
       "JOIN df_build b ON p.k = b.k WHERE b.marker <> 0 ORDER BY p.k) LIMIT 10";
@@ -273,7 +264,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   SECTION("the master switch disables accumulated publication")
   {
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     scoped_sirius_setting master_off(*con, "enable_dynamic_filter", false);
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
@@ -285,7 +275,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   SECTION("pinned narrow payloads retain native accumulated join keys")
   {
     scoped_sirius_setting compression_on(*con, "enable_compressed_materialization", true);
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     absl::Cleanup unpin = [&] {
       con->Query("CALL unpin_table('df_probe');");
       con->Query("CALL unpin_table('df_build');");

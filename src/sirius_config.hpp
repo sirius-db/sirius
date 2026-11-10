@@ -219,10 +219,8 @@ struct operator_params {
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
 
-  /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
-  bool enable_dynamic_filter_multi_partition = true;
-
-  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
+  /// Aggregate aligned Bloom-array budget per GPU for one join's Bloom filters; must be greater
+  /// than zero.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
 
