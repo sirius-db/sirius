@@ -2255,3 +2255,303 @@ TEST_CASE("FFI object store messages pin all remote refusals at both execution e
     published.check(fallback);
   }
 }
+
+#include "object_store/scope.hpp"
+#include "object_store/settings.hpp"
+
+#include <optional>
+
+namespace {
+
+using published_scopes = std::shared_ptr<const sirius::object_store::scope_set>;
+
+struct publication_events {
+  void collect(published_scopes set) noexcept
+  {
+    try {
+      std::lock_guard lock(mutex);
+      if (count == sets.size()) {
+        failed.store(true);
+        return;
+      }
+      threads[count] = std::this_thread::get_id();
+      sets[count++]  = std::move(set);
+    } catch (...) {
+      failed.store(true);
+    }
+  }
+
+  std::mutex mutex;
+  std::array<published_scopes, 8> sets;
+  std::array<std::thread::id, 8> threads;
+  std::size_t count{};
+  std::atomic<bool> failed{false};
+};
+
+struct publication_observer_guard {
+  explicit publication_observer_guard(publication_events& events)
+  {
+    sirius::ffi::testing::set_publication_observer(
+      [&events](published_scopes set) noexcept { events.collect(std::move(set)); });
+  }
+  ~publication_observer_guard() { sirius::ffi::testing::set_publication_observer({}); }
+};
+
+struct observer_environment {
+  observer_environment(char const* key, std::string const& value) : key(key)
+  {
+    if (auto const* previous = std::getenv(key)) { saved = previous; }
+    if (::setenv(key, value.c_str(), 1) != 0) {
+      throw std::system_error(errno, std::generic_category(), "setenv");
+    }
+  }
+  ~observer_environment()
+  {
+    if (saved) {
+      ::setenv(key, saved->c_str(), 1);
+    } else {
+      ::unsetenv(key);
+    }
+  }
+  char const* key;
+  std::optional<std::string> saved;
+};
+
+object_store_inputs observer_inputs(unsigned combination)
+{
+  object_store_inputs inputs;
+  inputs.endpoint       = "https://observer-endpoint.example.invalid:443";
+  inputs.region         = "observer-region";
+  inputs.access_key     = "OBSERVER_ACCESS_SENTINEL";
+  inputs.secret_key     = "OBSERVER_SECRET_SENTINEL";
+  inputs.session_token  = "OBSERVER_TOKEN_SENTINEL";
+  inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
+  inputs.uri_prefix     = "s3://observer-bucket/scope/";
+  inputs.transport      = combination == 0 ? Transport::kHttp : Transport::kAuto;
+  inputs.signing_mode   = combination == 0 ? SigningMode::kPresigned : SigningMode::kHeader;
+  return inputs;
+}
+
+void check_observed_settings(published_scopes const& set,
+                             object_store_inputs const& expected,
+                             unsigned combination,
+                             std::shared_ptr<ObjectStoreConfig> const& publisher)
+{
+  REQUIRE(set);
+  REQUIRE(set->size() == 1);
+  auto const& entry = set->front();
+  REQUIRE(entry);
+  REQUIRE(entry->value);
+  auto const& value = *entry->value;
+  CHECK(value.endpoint == expected.endpoint);
+  CHECK(value.region == expected.region);
+  CHECK(value.access_key == expected.access_key);
+  CHECK(value.secret_key == expected.secret_key);
+  CHECK(value.session_token == expected.session_token);
+  CHECK(value.ca_bundle_path == expected.ca_bundle_path);
+  CHECK(value.uri_prefix == expected.uri_prefix);
+  CHECK(value.transport == (combination == 0 ? 1U : 0U));
+  CHECK(value.signing_mode == (combination == 0 ? 0U : 1U));
+  CHECK(entry->owner.get() == publisher.get());
+  CHECK_FALSE(entry->owner.owner_before(publisher));
+  CHECK_FALSE(publisher.owner_before(entry->owner));
+  std::array<std::string, 7> const strings{expected.endpoint,
+                                           expected.region,
+                                           expected.access_key,
+                                           expected.secret_key,
+                                           expected.session_token,
+                                           expected.ca_bundle_path,
+                                           expected.uri_prefix};
+  for (std::size_t i = 0; i < strings.size(); ++i) {
+    CHECK_FALSE(strings[i].empty());
+    for (std::size_t j = 0; j < i; ++j) {
+      CHECK(strings[i] != strings[j]);
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("FFI object store observer receives all put fields",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  auto context = make_context_from_config(memory_config());
+  publication_events events;
+  publication_observer_guard guard(events);
+  for (unsigned combination = 0; combination < 2; ++combination) {
+    auto const inputs = observer_inputs(combination);
+    auto const config = inputs.snapshot();
+    context->put_object_store(config);
+    REQUIRE(events.count == combination + 1);
+    CHECK_FALSE(events.failed.load());
+    CHECK(events.threads[combination] == std::this_thread::get_id());
+    check_observed_settings(events.sets[combination], inputs, combination, config);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"), config);
+  }
+}
+
+TEST_CASE("FFI object store observer receives all factory fields",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  for (unsigned combination = 0; combination < 2; ++combination) {
+    publication_events events;
+    publication_observer_guard guard(events);
+    auto const inputs = observer_inputs(combination);
+    auto const config = inputs.snapshot();
+    auto context      = make_context_from_config(memory_config(), config);
+    REQUIRE(context);
+    REQUIRE(events.count == 1);
+    CHECK_FALSE(events.failed.load());
+    CHECK(events.threads[0] == std::this_thread::get_id());
+    check_observed_settings(events.sets[0], inputs, combination, config);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"), config);
+  }
+}
+
+TEST_CASE("FFI object store observer sees derived credentials only after publication",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  for (unsigned combination = 0; combination < 2; ++combination) {
+    auto inputs         = observer_inputs(combination);
+    auto const original = inputs.snapshot();
+    auto context        = make_context_from_config(memory_config(), original);
+    publication_events events;
+    publication_observer_guard guard(events);
+    inputs.access_key    = "DERIVED_ACCESS_SENTINEL";
+    inputs.secret_key    = "DERIVED_SECRET_SENTINEL";
+    inputs.session_token = "DERIVED_TOKEN_SENTINEL";
+    auto const derived =
+      original->with_credentials(inputs.access_key, inputs.secret_key, inputs.session_token);
+    CHECK(events.count == 0);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"),
+                            original);
+    context->put_object_store(derived);
+    REQUIRE(events.count == 1);
+    CHECK_FALSE(events.failed.load());
+    CHECK(events.threads[0] == std::this_thread::get_id());
+    check_observed_settings(events.sets[0], inputs, combination, derived);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"),
+                            derived);
+    CHECK(original->access_key == "OBSERVER_ACCESS_SENTINEL");
+    CHECK(original->secret_key == "OBSERVER_SECRET_SENTINEL");
+    CHECK(original->session_token == "OBSERVER_TOKEN_SENTINEL");
+  }
+}
+
+TEST_CASE("FFI object store observer ignores refused writes and absent publications",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  publication_events events;
+  publication_observer_guard guard(events);
+  auto context = make_context_from_config(memory_config(), nullptr);
+  CHECK(events.count == 0);
+  auto inputs         = observer_inputs(0);
+  auto const original = inputs.snapshot();
+  context->put_object_store(original);
+  REQUIRE(events.count == 1);
+  inputs.region.clear();
+  CHECK_THROWS_AS(context->put_object_store(inputs.snapshot()), std::invalid_argument);
+  CHECK_THROWS_AS(context->put_object_store(nullptr), std::invalid_argument);
+  CHECK_THROWS_AS(make_context_from_config(memory_config(), inputs.snapshot()),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(context->drop_object_store("invalid"), std::invalid_argument);
+  CHECK_NOTHROW(context->drop_object_store("s3://observer-bucket/absent/"));
+  CHECK_NOTHROW(context->drop_object_store(""));
+  CHECK(events.count == 1);
+  check_snapshot_identity(context->object_store_config_for(original->uri_prefix + "object"),
+                          original);
+  CHECK_NOTHROW(context->drop_object_store(original->uri_prefix));
+  REQUIRE(events.count == 2);
+  REQUIRE(events.sets[1]);
+  CHECK(events.sets[1]->empty());
+  CHECK(events.sets[0]->size() == 1);
+  CHECK_NOTHROW(context->drop_object_store(original->uri_prefix));
+  CHECK(events.count == 2);
+  CHECK_FALSE(events.failed.load());
+}
+
+TEST_CASE("FFI object store observer receives its call's set after a reentrant writer",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  operation_deadline deadline("publication observer after retired-owner reentry");
+  auto context = std::shared_ptr<sirius::ffi::Context>(make_context_from_config(memory_config()));
+  auto outer_inputs    = observer_inputs(0);
+  outer_inputs.region  = "outer-observer-region";
+  auto const outer     = outer_inputs.snapshot();
+  auto nested_inputs   = observer_inputs(1);
+  nested_inputs.region = "nested-observer-region";
+  auto const nested    = nested_inputs.snapshot();
+  struct cleanup_result {
+    unsigned calls{};
+    std::exception_ptr error;
+  };
+  auto cleanup                                     = std::make_shared<cleanup_result>();
+  std::weak_ptr<sirius::ffi::Context> weak_context = context;
+  auto retired                                     = std::shared_ptr<ObjectStoreConfig>(
+    new ObjectStoreConfig(*outer),
+    [weak_context, nested, cleanup](ObjectStoreConfig* pointer) noexcept {
+      ++cleanup->calls;
+      try {
+        if (auto current = weak_context.lock()) { current->put_object_store(nested); }
+      } catch (...) {
+        cleanup->error = std::current_exception();
+      }
+      delete pointer;
+    });
+  context->put_object_store(retired);
+  retired.reset();
+  publication_events events;
+  publication_observer_guard guard(events);
+  context->put_object_store(outer);
+  CHECK(cleanup->calls == 1);
+  CHECK_FALSE(cleanup->error);
+  REQUIRE(events.count == 2);
+  CHECK_FALSE(events.failed.load());
+  // Retirement runs before the outer publish returns. A fresh capture at notification
+  // time would incorrectly report the nested writer's set for both events.
+  check_observed_settings(events.sets[0], nested_inputs, 1, nested);
+  check_observed_settings(events.sets[1], outer_inputs, 0, outer);
+  CHECK(events.sets[0] != events.sets[1]);
+  check_snapshot_identity(context->object_store_config_for(outer_inputs.uri_prefix + "object"),
+                          nested);
+}
+
+TEST_CASE("FFI object store factory notifies before engine bring-up can fail",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  operation_deadline deadline("factory publication before failing log-sink installation");
+  message_ca_file not_a_directory;
+  REQUIRE(fs::is_regular_file(not_a_directory.path));
+  auto const inputs = observer_inputs(0);
+  auto const config = inputs.snapshot();
+  publication_events events;
+  publication_observer_guard guard(events);
+  std::string error;
+  bool returned = false;
+  {
+    // Sink installation is the first operation in bring_up. A regular file as LOG_DIR
+    // makes it fail before constructing an engine, while using the normal memory YAML.
+    observer_environment backend("SIRIUS_LOG_BACKEND", "spdlog");
+    observer_environment directory("SIRIUS_LOG_DIR", not_a_directory.path.string());
+    observer_environment level("SIRIUS_LOG_LEVEL", "info");
+    try {
+      auto context = make_context_from_config(memory_config(), config);
+      returned     = bool(context);
+    } catch (std::exception const& failure) {
+      error = failure.what();
+    }
+  }
+  CHECK_FALSE(returned);
+  CHECK(error.find(not_a_directory.path.string()) != std::string::npos);
+  CHECK(error.find("ObjectStoreConfig.") == std::string::npos);
+  REQUIRE(events.count == 1);
+  CHECK_FALSE(events.failed.load());
+  check_observed_settings(events.sets[0], inputs, 0, config);
+  // Notification of the failed attempt did not promise that a usable Context existed.
+  auto recovered = make_context_from_config(memory_config(), config);
+  REQUIRE(recovered);
+  REQUIRE(events.count == 2);
+  CHECK_FALSE(events.failed.load());
+  check_observed_settings(events.sets[1], inputs, 0, config);
+  CHECK(events.sets[0] != events.sets[1]);
+}

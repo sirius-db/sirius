@@ -243,6 +243,14 @@ jobs:
             [[ -z "$explicit" ]]
           fi
 
+      - name: Test the object-store module without GPU dependencies
+        if: >-
+          matrix.build.compiler == 'gcc' && matrix.build.build-type == 'release'
+          && matrix.build.environment == 'default' && matrix.build.cudf-channel == 'stable'
+        run: |
+          pixi run --locked cmake --build build/${{ matrix.build.build-type }} --target sirius_object_store_unittest
+          pixi run --locked build/${{ matrix.build.build-type }}/test/cpp/sirius_object_store_unittest
+
       # Compile all Rust bindings against the library on one representative entry.
       # The public configuration tests do not initialize GPUs, but sirius-ffi
       # tests do. The full suite runs in the GPU test workflow.
