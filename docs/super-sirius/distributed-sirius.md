@@ -395,7 +395,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   [gateway](distributed-gateway.md) does this restart.
 - **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
   TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
-  scripts set both by default: `UCX_TLS` in `nixl_env.sh`, and `UCX_NET_DEVICES` from the
+  scripts set both by default: `UCX_TLS` in `launcher_env.sh`, and `UCX_NET_DEVICES` from the
   rank's address ([quick start](distributed-quickstart.md)).
   More than two hosts, and RDMA between hosts, are untested (#2372).
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
