@@ -37,7 +37,7 @@
 namespace {
 using sirius::op::evaluate_ranking_window;
 using sirius::op::ranking_function;
-using sirius::op::ranking_order;
+using sirius::op::window_order;
 
 // Marks the rows where @p valid is false as NULL.
 void set_validity(cudf::column& column,
@@ -102,9 +102,9 @@ struct direction {
 };
 
 // An ORDER BY over @p columns with the direction and NULL placement of each key.
-ranking_order make_order(std::vector<cudf::size_type> columns, std::vector<direction> const& keys)
+window_order make_order(std::vector<cudf::size_type> columns, std::vector<direction> const& keys)
 {
-  ranking_order order;
+  window_order order;
   order.columns = std::move(columns);
   for (auto const& key : keys) {
     order.directions.push_back(sirius::op::to_cudf_order(key.type));
@@ -420,13 +420,13 @@ TEST_CASE("ranking evaluator handles empty input and rejects invalid requests",
   {
     auto input = make_input(stream, mr);
     auto call  = [&](std::vector<cudf::size_type> const& partitions,
-                    ranking_order const& order,
+                    window_order const& order,
                     std::vector<ranking_function> const& functions) {
       return evaluate_ranking_window(input->view(), partitions, order, functions, stream, mr);
     };
     CHECK_THROWS_AS(call({0}, spec, {}), std::invalid_argument);
     CHECK_THROWS_AS(call({7}, spec, {ranking_function::rank}), std::invalid_argument);
-    CHECK_THROWS_AS(call({0}, ranking_order{}, {ranking_function::rank}), std::invalid_argument);
+    CHECK_THROWS_AS(call({0}, window_order{}, {ranking_function::rank}), std::invalid_argument);
     spec.columns = {-1};
     CHECK_THROWS_AS(call({0}, spec, {ranking_function::rank}), std::invalid_argument);
     spec.columns = {4};

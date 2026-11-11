@@ -17,6 +17,7 @@
 #pragma once
 
 #include "expression/aggregate_id.hpp"
+#include "op/window/aggregate_types.hpp"
 #include "op/window/ranking.hpp"
 
 #include <cudf/table/table.hpp>
@@ -31,18 +32,6 @@
 #include <vector>
 
 namespace sirius::op {
-
-/**
- * @brief An aggregate over the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
- */
-struct cumulative_aggregate {
-  /// One of `sum` (`sum_no_overflow` is treated as `sum`), `count`, `count_star`, `min` and `max`.
-  /// Any other id is rejected.
-  sirius::aggregate_id function;
-  /// Index of the argument column in the input table. `count_star` counts rows including NULLs, so
-  /// any column serves as its argument.
-  cudf::size_type argument_column;
-};
 
 /**
  * @brief Evaluate running aggregates over each partition of the input.
@@ -78,7 +67,8 @@ struct cumulative_aggregate {
  * @param partition_columns Indices of the partition columns in @p input. Empty for a window without
  * `PARTITION BY`.
  * @param order The window ORDER BY.
- * @param aggregates The aggregates to evaluate. Must not be empty.
+ * @param aggregates The aggregates to evaluate: `sum` (`sum_no_overflow` is treated as `sum`),
+ * `count`, `count_star`, `min` or `max`. Must not be empty.
  * @param stream CUDA stream used for all device work.
  * @param mr Device memory resource used to allocate the result columns and the intermediate
  * columns created by the evaluator.
@@ -93,8 +83,8 @@ struct cumulative_aggregate {
 std::unique_ptr<cudf::table> evaluate_cumulative_window(
   cudf::table_view input,
   std::vector<cudf::size_type> const& partition_columns,
-  ranking_order const& order,
-  std::vector<cumulative_aggregate> const& aggregates,
+  window_order const& order,
+  std::vector<window_aggregate> const& aggregates,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 

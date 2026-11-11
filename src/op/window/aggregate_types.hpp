@@ -25,6 +25,8 @@
 
 #include <cuda/stream_ref>
 
+#include <vector>
+
 namespace sirius::op {
 
 /// 10^@p digits as a signed 128 bit integer.
@@ -36,6 +38,34 @@ constexpr __int128_t int128_pow10(int digits)
   }
   return value;
 }
+
+/**
+ * @brief One aggregate of a window: the function and the column it reads.
+ */
+struct window_aggregate {
+  /// One of `sum` (`sum_no_overflow` is treated as `sum`), `avg`, `count`, `count_star`, `min` and
+  /// `max`. Each evaluator documents the subset it accepts and rejects any other id.
+  sirius::aggregate_id function;
+  /// Index of the argument column in the input table. `count_star` counts rows including NULLs, so
+  /// any column serves as its argument.
+  cudf::size_type argument_column;
+};
+
+/**
+ * @brief The ORDER BY of a window, in cuDF terms.
+ *
+ * `directions` and `nulls` have one entry for each of `columns`.
+ */
+struct window_order {
+  /// Indices of the order key columns in the input table.
+  std::vector<cudf::size_type> columns;
+  /// Direction of each order key.
+  std::vector<cudf::order> directions;
+  /// Where NULLs sort for each order key, in the cuDF sense: applied in the ascending frame and
+  /// reversed for a descending direction. `to_cudf_null_order` converts SQL `NULLS FIRST` and
+  /// `NULLS LAST`.
+  std::vector<cudf::null_order> nulls;
+};
 
 /**
  * @brief Whether @p type is an 8 to 32 bit integer.
@@ -66,6 +96,14 @@ cudf::data_type window_sum_type(cudf::data_type input);
  * @throws std::invalid_argument for any other function, or a `sum` over an unsupported type.
  */
 cudf::data_type window_result_type(aggregate_id function, cudf::data_type input);
+
+/**
+ * @brief @p function as the window evaluators compute it: `sum_no_overflow` becomes `sum`.
+ *
+ * @throws std::invalid_argument for any id other than `sum`, `sum_no_overflow`, `avg`, `count`,
+ * `count_star`, `min` and `max`.
+ */
+aggregate_id normalize_window_aggregate(aggregate_id function);
 
 /**
  * @brief Check that every value of a DECIMAL128 sum column is below 10^38 in magnitude.

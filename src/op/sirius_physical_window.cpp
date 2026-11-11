@@ -35,7 +35,7 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
                                                duckdb::vector<logical_type> prepared_types,
                                                std::size_t input_width,
                                                std::vector<cudf::size_type> partition_columns,
-                                               std::vector<whole_partition_aggregate> aggregates,
+                                               std::vector<window_aggregate> aggregates,
                                                std::size_t estimated_cardinality)
   : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
     _prepared_types(std::move(prepared_types)),
@@ -63,7 +63,7 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
                                                duckdb::vector<logical_type> prepared_types,
                                                std::size_t input_width,
                                                std::vector<cudf::size_type> partition_columns,
-                                               ranking_order order,
+                                               window_order order,
                                                std::vector<ranking_function> ranking_functions,
                                                std::size_t estimated_cardinality)
   : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
@@ -94,8 +94,8 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
                                                duckdb::vector<logical_type> prepared_types,
                                                std::size_t input_width,
                                                std::vector<cudf::size_type> partition_columns,
-                                               ranking_order order,
-                                               std::vector<cumulative_aggregate> aggregates,
+                                               window_order order,
+                                               std::vector<window_aggregate> aggregates,
                                                std::size_t estimated_cardinality)
   : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
     _prepared_types(std::move(prepared_types)),

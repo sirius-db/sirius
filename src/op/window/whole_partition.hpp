@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "expression/aggregate_id.hpp"
+#include "op/window/aggregate_types.hpp"
 
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -29,18 +29,6 @@
 #include <vector>
 
 namespace sirius::op {
-
-/**
- * @brief One aggregate to evaluate over the whole partition.
- */
-struct whole_partition_aggregate {
-  /// One of `sum` (`sum_no_overflow` is treated as `sum`), `avg`, `count`, `count_star`, `min` and
-  /// `max`. Any other id is rejected.
-  sirius::aggregate_id function;
-  /// Index of the argument column in the input table. `count_star` counts rows including NULLs, so
-  /// any column serves as its argument.
-  cudf::size_type argument_column;
-};
 
 /**
  * @brief Evaluate aggregates over the whole partition of every row.
@@ -94,7 +82,7 @@ struct whole_partition_aggregate {
 std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   cudf::table_view input,
   std::vector<cudf::size_type> const& partition_columns,
-  std::vector<whole_partition_aggregate> const& aggregates,
+  std::vector<window_aggregate> const& aggregates,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 

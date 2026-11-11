@@ -184,30 +184,12 @@ std::unordered_set<int> sums_in_place(cudf::table_view input,
   return ret;
 }
 
-// sum_no_overflow is a SUM, and any id the evaluator does not compute is rejected.
-std::vector<whole_partition_aggregate> normalize(std::vector<whole_partition_aggregate> aggregates)
-{
-  for (auto& aggregate : aggregates) {
-    switch (aggregate.function) {
-      case aggregate_id::sum_no_overflow: aggregate.function = aggregate_id::sum; break;
-      case aggregate_id::sum:
-      case aggregate_id::avg:
-      case aggregate_id::count:
-      case aggregate_id::count_star:
-      case aggregate_id::min:
-      case aggregate_id::max: break;
-      default: throw std::invalid_argument("Unsupported whole-partition window function");
-    }
-  }
-  return aggregates;
-}
-
 }  // namespace
 
 std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   cudf::table_view input,
   std::vector<cudf::size_type> const& partition_columns,
-  std::vector<whole_partition_aggregate> const& requested,
+  std::vector<window_aggregate> const& requested,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
@@ -223,7 +205,10 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   //   6. Give every input row the value of its group.
 
   // 1. Validate the request and group the `sum` and `avg` aggregates by argument column.
-  auto const aggregates = normalize(requested);
+  auto aggregates = requested;
+  for (auto& aggregate : aggregates) {
+    aggregate.function = normalize_window_aggregate(aggregate.function);
+  }
   if (aggregates.empty()) { throw std::invalid_argument("Window requires at least one aggregate"); }
   auto check_index = [&](cudf::size_type index) {
     if (index < 0 || index >= input.num_columns()) {
@@ -298,7 +283,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     std::optional<std::size_t> flag_request;
   };
   std::vector<prepared_argument> nan_free_arguments;
-  std::vector<whole_partition_aggregate> simple_aggregates;
+  std::vector<window_aggregate> simple_aggregates;
   std::vector<std::optional<std::size_t>> nan_flag_indices(aggregates.size());
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
     auto const& agg = aggregates[i];

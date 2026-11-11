@@ -729,7 +729,7 @@ TEST_CASE("ranking window adapter ranks narrow inputs without restoring them",
     {logical_type::make(type_id::INTEGER), logical_type::make(type_id::INTEGER)},
     2,
     {0},
-    ranking_order{{1}, {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}},
+    window_order{{1}, {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}},
     {ranking_function::rank},
     4);
   pipelineable_operator_data input({batch});
@@ -790,12 +790,12 @@ TEST_CASE("ranking window adapter rejects invalid construction", "[window_adapte
   // Three prepared columns, and a ranking window that appends one BIGINT result to them.
   duckdb::vector<logical_type> const prepared{integer, integer, integer};
   duckdb::vector<logical_type> const output{integer, integer, integer, bigint};
-  ranking_order const order{{1}, {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}};
+  window_order const order{{1}, {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}};
   std::vector<ranking_function> const rank{ranking_function::rank};
   auto build = [&](duckdb::vector<logical_type> const& outputs,
                    std::size_t input_width,
                    std::vector<cudf::size_type> partitions,
-                   ranking_order const& keys,
+                   window_order const& keys,
                    std::vector<ranking_function> const& functions) {
     return sirius_physical_window(
       outputs, prepared, input_width, std::move(partitions), keys, functions, 1);
@@ -811,7 +811,7 @@ TEST_CASE("ranking window adapter rejects invalid construction", "[window_adapte
   }
   SECTION("no order keys")
   {
-    CHECK_THROWS_AS(build(output, 3, {0}, ranking_order{}, rank), std::invalid_argument);
+    CHECK_THROWS_AS(build(output, 3, {0}, window_order{}, rank), std::invalid_argument);
   }
   SECTION("a partition column outside the prepared schema")
   {
@@ -820,14 +820,14 @@ TEST_CASE("ranking window adapter rejects invalid construction", "[window_adapte
   }
   SECTION("an order column outside the prepared schema")
   {
-    CHECK_THROWS_AS(build(output, 3, {0}, ranking_order{{3}, order.directions, order.nulls}, rank),
+    CHECK_THROWS_AS(build(output, 3, {0}, window_order{{3}, order.directions, order.nulls}, rank),
                     std::invalid_argument);
   }
   SECTION("a direction or NULL placement missing for an order key")
   {
-    CHECK_THROWS_AS(build(output, 3, {0}, ranking_order{{1}, {}, order.nulls}, rank),
+    CHECK_THROWS_AS(build(output, 3, {0}, window_order{{1}, {}, order.nulls}, rank),
                     std::invalid_argument);
-    CHECK_THROWS_AS(build(output, 3, {0}, ranking_order{{1}, order.directions, {}}, rank),
+    CHECK_THROWS_AS(build(output, 3, {0}, window_order{{1}, order.directions, {}}, rank),
                     std::invalid_argument);
   }
   SECTION("an output schema that does not match the prepared input")

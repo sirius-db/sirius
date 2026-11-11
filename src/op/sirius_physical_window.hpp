@@ -55,7 +55,7 @@ class sirius_physical_window : public sirius_physical_operator {
                          duckdb::vector<logical_type> prepared_types,
                          std::size_t input_width,
                          std::vector<cudf::size_type> partition_columns,
-                         std::vector<whole_partition_aggregate> aggregates,
+                         std::vector<window_aggregate> aggregates,
                          std::size_t estimated_cardinality);
 
   /// A window of ranking functions over the window ORDER BY.
@@ -63,7 +63,7 @@ class sirius_physical_window : public sirius_physical_operator {
                          duckdb::vector<logical_type> prepared_types,
                          std::size_t input_width,
                          std::vector<cudf::size_type> partition_columns,
-                         ranking_order order,
+                         window_order order,
                          std::vector<ranking_function> ranking_functions,
                          std::size_t estimated_cardinality);
 
@@ -72,8 +72,8 @@ class sirius_physical_window : public sirius_physical_operator {
                          duckdb::vector<logical_type> prepared_types,
                          std::size_t input_width,
                          std::vector<cudf::size_type> partition_columns,
-                         ranking_order order,
-                         std::vector<cumulative_aggregate> cumulative_aggregates,
+                         window_order order,
+                         std::vector<window_aggregate> cumulative_aggregates,
                          std::size_t estimated_cardinality);
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
@@ -91,10 +91,10 @@ class sirius_physical_window : public sirius_physical_operator {
   duckdb::vector<logical_type> _prepared_types;
   std::size_t _input_width;
   std::vector<cudf::size_type> _partition_columns;
-  std::vector<whole_partition_aggregate> _aggregates;
-  ranking_order _ranking_order;
+  std::vector<window_aggregate> _aggregates;
+  window_order _ranking_order;
   std::vector<ranking_function> _ranking_functions;
-  std::vector<cumulative_aggregate> _cumulative_aggregates;
+  std::vector<window_aggregate> _cumulative_aggregates;
 };
 
 }  // namespace sirius::op

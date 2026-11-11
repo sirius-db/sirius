@@ -585,7 +585,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_stage(
     return ranked;
   }
   if (bound_plan.kind == window_kind::cumulative) {
-    std::vector<op::cumulative_aggregate> running;
+    std::vector<op::window_aggregate> running;
     for (auto const& expression : bound_plan.expressions) {
       running.push_back(
         {expression.function, static_cast<cudf::size_type>(expression.argument_slot)});
@@ -601,7 +601,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_stage(
     result->children.push_back(std::move(child));
     return result;
   }
-  std::vector<op::whole_partition_aggregate> aggregates;
+  std::vector<op::window_aggregate> aggregates;
   for (auto const& expression : bound_plan.expressions) {
     aggregates.push_back(
       {expression.function, static_cast<cudf::size_type>(expression.argument_slot)});

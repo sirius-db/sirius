@@ -61,6 +61,20 @@ cudf::data_type window_result_type(aggregate_id function, cudf::data_type input)
   }
 }
 
+aggregate_id normalize_window_aggregate(aggregate_id function)
+{
+  switch (function) {
+    case aggregate_id::sum_no_overflow: return aggregate_id::sum;
+    case aggregate_id::sum:
+    case aggregate_id::avg:
+    case aggregate_id::count:
+    case aggregate_id::count_star:
+    case aggregate_id::min:
+    case aggregate_id::max: return function;
+    default: throw std::invalid_argument("Unsupported window function");
+  }
+}
+
 void check_decimal_sum_fits(cudf::column_view sums,
                             ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)

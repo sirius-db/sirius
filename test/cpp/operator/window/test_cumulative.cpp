@@ -40,9 +40,9 @@
 #include <string>
 
 namespace {
-using sirius::op::cumulative_aggregate;
 using sirius::op::evaluate_cumulative_window;
-using sirius::op::ranking_order;
+using sirius::op::window_aggregate;
+using sirius::op::window_order;
 using function = sirius::aggregate_id;
 
 void set_validity(cudf::column& column,
@@ -139,9 +139,9 @@ constexpr direction descending_nulls_last{
   "DESC NULLS LAST", duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST};
 
 // An ORDER BY over @p columns, every key in the same direction.
-ranking_order make_order(std::vector<cudf::size_type> columns, direction const& key)
+window_order make_order(std::vector<cudf::size_type> columns, direction const& key)
 {
-  ranking_order order;
+  window_order order;
   order.columns = std::move(columns);
   for (std::size_t i = 0; i < order.columns.size(); ++i) {
     order.directions.push_back(sirius::op::to_cudf_order(key.type));
@@ -252,7 +252,7 @@ void check_against_model(cudf::data_type type,
   columns.push_back(column<T>(v, type, stream, mr, v_valid));
   cudf::table input(std::move(columns));
 
-  std::vector<cumulative_aggregate> aggregates;
+  std::vector<window_aggregate> aggregates;
   if (has_sum) { aggregates.push_back({function::sum, 2}); }
   aggregates.push_back({function::min, 2});
   aggregates.push_back({function::max, 2});
@@ -606,13 +606,13 @@ TEST_CASE("cumulative evaluator rejects invalid requests",
   cudf::table input(std::move(columns));
   auto const order = make_order({0}, ascending_nulls_last);
   auto call        = [&](std::vector<cudf::size_type> const& partitions,
-                  ranking_order const& keys,
-                  std::vector<cumulative_aggregate> const& aggregates) {
+                  window_order const& keys,
+                  std::vector<window_aggregate> const& aggregates) {
     return evaluate_cumulative_window(input.view(), partitions, keys, aggregates, stream, mr);
   };
   CHECK_NOTHROW(call({}, order, {{function::sum, 1}}));
   CHECK_THROWS_AS(call({}, order, {}), std::invalid_argument);
-  CHECK_THROWS_AS(call({}, ranking_order{}, {{function::sum, 1}}), std::invalid_argument);
+  CHECK_THROWS_AS(call({}, window_order{}, {{function::sum, 1}}), std::invalid_argument);
   CHECK_THROWS_AS(call({}, order, {{function::sum, 2}}), std::invalid_argument);
   CHECK_THROWS_AS(call({2}, order, {{function::sum, 1}}), std::invalid_argument);
   CHECK_THROWS_AS(call({}, make_order({2}, ascending_nulls_last), {{function::sum, 1}}),

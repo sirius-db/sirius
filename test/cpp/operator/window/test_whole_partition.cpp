@@ -34,7 +34,7 @@
 
 namespace {
 using sirius::op::evaluate_whole_partition_window;
-using sirius::op::whole_partition_aggregate;
+using sirius::op::window_aggregate;
 using function = sirius::aggregate_id;
 
 void set_validity(cudf::column& column,
@@ -654,7 +654,7 @@ TEST_CASE("whole-partition evaluator rejects invalid requests", "[window_evaluat
   columns.push_back(sirius::test::operator_utils::make_string_column({"a", "b", "c"}, stream, mr));
   cudf::table input(std::move(columns));
   auto const evaluate = [&](std::vector<cudf::size_type> const& partition_columns,
-                            std::vector<whole_partition_aggregate> const& aggregates) {
+                            std::vector<window_aggregate> const& aggregates) {
     return evaluate_whole_partition_window(input.view(), partition_columns, aggregates, stream, mr);
   };
 
@@ -712,7 +712,7 @@ TEST_CASE("whole-partition evaluator widens only the sum columns that could over
   columns.push_back(column<int32_t>(small_dec32, dec32, stream, mr));
   columns.push_back(column<int32_t>(large_dec32, dec32, stream, mr));
   cudf::table input(std::move(columns));
-  std::vector<whole_partition_aggregate> aggregates;
+  std::vector<window_aggregate> aggregates;
   for (cudf::size_type c = 1; c <= 6; ++c) {
     aggregates.push_back({function::sum, c});
   }

@@ -72,7 +72,7 @@ struct window_plan {
   std::vector<ranking_window_expression> rankings;
   // Order key slots, direction and NULL placement shared by all `rankings`, or by all running
   // aggregates.
-  op::ranking_order ranking_order;
+  op::window_order ranking_order;
   window_kind kind = window_kind::whole_partition;
 };
 
