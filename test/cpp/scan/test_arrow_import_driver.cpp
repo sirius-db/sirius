@@ -2560,6 +2560,109 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   CHECK(h.backing.seen->allocated_bytes == 0);
 }
 
+TEST_CASE("Arrow independent cancellation survives a later coordinator normal stop",
+          "[arrow_driver][arrow_stop]")
+{
+  auto qualified = GENERATE(false, true);
+  auto program   = qualified ? qualified_integer_program() : integer_program();
+  auto counters  = make_counters();
+  std::atomic<int> failures{0}, releases{0}, publications{0};
+  auto q = queue(counters, program, [&](auto) { ++failures; });
+  harness h(counters, q, program);
+  sirius::test::preparation::hold staging, escaped;
+  h.backing.seen->before_allocate = [&] { staging.wait(); };
+  std::exception_ptr driver_error;
+  bool token_was_live = false;
+  std::future<bool> submitting;
+  queue_guard guard{q};
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  sirius::pipeline::completion_handler completion;
+  sm::preparation_coordinator coordinator(completion, dispatcher, {1, 2, 2, 1});
+  struct unblock {
+    sirius::test::preparation::hold &staging, &escaped;
+    ~unblock()
+    {
+      staging.release();
+      escaped.release();
+    }
+  } unblocker{staging, escaped};
+  auto lane      = h.driver->make_preparation_source({});
+  auto connector = std::make_shared<sm::split_connector>();
+  sm::preparation_coordinator::source source;
+  source.execution = lane.execution;
+  source.try_claim =
+    [&, claim = std::move(lane.try_claim)]() mutable -> sm::preparation_coordinator::claim_result {
+    auto claimed = claim();
+    if (auto* work = std::get_if<sm::preparation_job>(&claimed)) {
+      *work = sm::preparation_job{[&, work = std::move(*work)](auto stop) mutable {
+        try {
+          return work.run(stop);
+        } catch (...) {
+          driver_error   = std::current_exception();
+          token_was_live = !stop.stop_requested();
+          escaped.wait();  // Hold the driver error before the coordinator classifies it.
+          throw;
+        }
+      }};
+    }
+    return claimed;
+  };
+  source.close       = std::move(lane.close);
+  source.bind_wakeup = std::move(lane.bind_wakeup);
+  source.coalescer   = std::move(lane.coalescer);
+  source.destination = connector;
+  source.construct   = [](auto metadata) {
+    auto bytes = metadata->preparation_bytes();
+    return sirius::test::preparation::make_publication(std::move(metadata), bytes);
+  };
+  coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
+  coordinator.add_source(std::move(source));
+  if (qualified) {
+    auto slot = q->acquire_offered_slot();
+    fill_slot(slot, 3, [&] { ++releases; });
+    REQUIRE(q->offer(slot) == arrow_push_queue::offer_outcome::accepted);
+  } else {
+    submitting = std::async(std::launch::async, [&] {
+      auto owner = std::make_shared<integer_tree>();
+      return q->offer(owner->offer(owner));
+    });
+    await_ready(*q);
+  }
+  coordinator.arm();
+  coordinator.start();
+  coordinator.advance();
+  REQUIRE(staging.await());
+  CHECK(h.ledger->permits_in_flight() == 1);
+  q->cancel();
+  staging.release();
+  REQUIRE(escaped.await());
+  REQUIRE(driver_error);
+  CHECK(token_was_live);
+  CHECK_THROWS_AS(std::rethrow_exception(driver_error), duckdb::InterruptException);
+  CHECK_FALSE(completion.has_error());
+  coordinator.request_stop(sm::stop_reason::normal_eos);
+  escaped.release();
+  coordinator.drain();
+  if (submitting.valid()) CHECK_FALSE(submitting.get());
+  REQUIRE(completion.has_error());
+  CHECK_THROWS_AS(std::rethrow_exception(completion.terminal_error()), duckdb::InterruptException);
+  CHECK(publications == 0);
+  CHECK(failures == 0);
+  CHECK_FALSE(h.gate->active.load());
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.ledger->tracked_units() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+  if (qualified) {
+    CHECK(releases == 1);
+    auto observed = q->observe();
+    CHECK(observed.offered == 0);
+    CHECK(observed.accepted == 0);
+    CHECK(observed.reserved_bytes == 0);
+    CHECK(observed.unique_retained_bytes == 0);
+  }
+}
+
 // A pull producer that observes the token inside next() and still reports it as an interrupt
 // must not turn normal shutdown into a query error; an interrupt without a token stop must
 // keep propagating unchanged.
