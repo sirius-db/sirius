@@ -36,7 +36,6 @@ option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
-option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
 if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")

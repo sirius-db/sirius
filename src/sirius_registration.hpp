@@ -125,10 +125,6 @@ class SiriusRegistration {
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
                                                        vector<Identifier>& names);
-
-#ifdef SIRIUS_ENABLE_LEGACY
-  static bool buffer_is_initialized;
-#endif
 };
 
 }  // namespace duckdb

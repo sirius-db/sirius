@@ -2679,10 +2679,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   if (!plan) { throw duckdb::InternalException("Physical plan generator - no plan generated"); }
 
   plan->estimated_cardinality = op.estimated_cardinality;
-#ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
-  auto verify = duckdb::make_uniq<duckdb::PhysicalVerifyVector>(std::move(plan));
-  plan        = std::move(verify);
-#endif
 
   return plan;
 }
