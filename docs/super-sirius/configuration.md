@@ -104,7 +104,7 @@ sirius:
       num_threads: 4
       backend: native
       uring_n_reactors: 4
-      cache: { mode: none, eviction: lru }
+      cache: { mode: cucs, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -498,7 +498,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | enum: `none`, `os`, `cucs` | `none` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
+| `mode` | enum: `none`, `os`, `cucs` | `cucs` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the prefetching cache. Only meaningful under `mode: cucs`. Values are lowercase. |
 | `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
@@ -506,6 +506,11 @@ sirius:
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
 through the kernel page cache instead. `mode: cucs` reads `O_DIRECT` into cuCascade's
 pinned prefetching cache (`fs_cache`).
+
+Sirius enables `mode: cucs` with `eviction: lru` by default, including when no YAML
+file is supplied. Set `cache: { mode: none }` to disable it. Cached chunks use the
+existing pinned host-memory pool. With `max_readahead_scans` unset, REST read-ahead
+uses its backend budget; local uring read-ahead remains off by default.
 
 `eviction: lru` keeps idle chunks for reuse and sweeps them, in request-creation order, once
 pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
