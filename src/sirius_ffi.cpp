@@ -38,15 +38,15 @@
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "io/s3/scope_policy.hpp"
-#include "log/logging.hpp"  // SIRIUS_LOG_INFO
+#include "log/logging.hpp"                // SIRIUS_LOG_INFO
 #include "object_store/backend_capabilities.hpp"
+#include "object_store/registry.hpp"
+#include "object_store/scope.hpp"
 #include "object_store/settings.hpp"
 #include "object_store/validation.hpp"
 #include "parquet_extension.hpp"              // duckdb::ParquetExtension
 #include "planner/substrait_scan_ranges.hpp"  // sirius::planner::scan_byte_ranges_state
 #include "planner/unsupported_optimizers.hpp"
-#include "scan_manager/config.hpp"  // sirius::scan_manager::scan_manager_config
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
@@ -141,6 +141,24 @@ void run_hook(std::mutex& mutex, std::shared_ptr<const std::function<void()>> co
 void run_capture_pause_hook() { run_hook(capture_pause_mutex, capture_pause_hook); }
 void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transaction_entry_hook); }
 
+using publication_observer_fn =
+  std::function<void(std::shared_ptr<const sirius::object_store::scope_set>)>;
+
+std::mutex publication_observer_mutex;
+std::shared_ptr<const publication_observer_fn> publication_observer;
+
+// Hands the set a publication produced to the installed observer (if any), outside the observer
+// mutex and after the registry released its locks.
+void notify_publication(const std::shared_ptr<const sirius::object_store::scope_set>& published)
+{
+  std::shared_ptr<const publication_observer_fn> observer;
+  {
+    std::lock_guard lock(publication_observer_mutex);
+    observer = publication_observer;
+  }
+  if (observer) { (*observer)(published); }
+}
+
 // --- ObjectStoreConfig checks ------------------------------------------------------------------
 //
 // Run at put_object_store() and at the object-store factory without object-store network
@@ -168,45 +186,45 @@ sirius::object_store::settings to_settings(const ObjectStoreConfig& cfg)
                               sirius::object_store::describe(refused, backend));
 }
 
-void check_uri_prefix_shape(std::string_view prefix)
+// Publishes `cfg` on `registry` for the scope its uri_prefix names; a refused field throws. The
+// registry keeps `cfg` itself as the owner of the entry, so a lookup returns the published
+// pointer. The caller keeps its own reference across the call.
+void publish_snapshot(sirius::object_store::registry& registry,
+                      const std::shared_ptr<ObjectStoreConfig>& cfg,
+                      const sirius::object_store::capabilities& backend)
 {
-  if (auto const refused = sirius::object_store::check_uri_prefix(prefix)) {
-    throw_violation(*refused, {});
-  }
+  auto result = registry.publish(
+    std::make_shared<const sirius::object_store::settings>(to_settings(*cfg)), cfg, backend);
+  if (result.refused) { throw_violation(*result.refused, backend); }
+  notify_publication(result.published);
 }
 
-using sirius::io::s3::key_defeats_prefix_match;
-using sirius::io::s3::lowercase_scheme;
-using sirius::io::s3::redacted_uri;
-
-// The published snapshots, ordered longest uri_prefix first (the default scope, empty prefix,
-// last). Immutable once published: put/drop build a new set, so a captured set never changes.
-using ObjectStoreScopeSet = std::vector<std::shared_ptr<ObjectStoreConfig>>;
-
-// The snapshot serving `uri`: the first (longest) prefix the scheme-lowered URI starts with; the
-// default scope matches every URI. nullptr when nothing matches. A key that cannot be matched
-// byte-for-byte (an empty, "." or ".." segment, or a raw `%` byte) is refused before any
-// prefix is consulted — including when only the default scope would serve it: the store or
-// libcurl may normalize such a key into a published prefix's namespace, which the default scope
-// must not serve. Key bytes are never rewritten here (only the scheme is case-folded) and a
-// refused key is never retried, so the per-URI getter and the execution guard answer alike.
-std::shared_ptr<ObjectStoreConfig> resolve_scope(const ObjectStoreScopeSet& set,
-                                                 std::string_view uri)
+// The FFI texts of the refusals; each starts with the stable reason token.
+[[noreturn]] void throw_refusal(const sirius::object_store::refusal& refused)
 {
-  if (set.empty()) { return nullptr; }
-  if (key_defeats_prefix_match(uri)) {
-    throw sirius::invalid_input_exception(
-      "object_store_scope: '{}' names a key segment that cannot be matched byte-for-byte "
-      "against the published uri_prefix set",
-      redacted_uri(uri));
+  using sirius::object_store::refusal_kind;
+  switch (refused.kind) {
+    case refusal_kind::unconfigured:
+      throw sirius::invalid_input_exception(
+        "object_store_unconfigured: the plan reads '{}' from an object store or through an Iceberg "
+        "metadata path, but this Context has no object-store snapshot (Context::put_object_store)",
+        refused.item);
+    case refusal_kind::unmatchable_key:
+      throw sirius::invalid_input_exception(
+        "object_store_scope: '{}' names a key segment that cannot be matched byte-for-byte "
+        "against the published uri_prefix set",
+        refused.item);
+    case refusal_kind::out_of_scope:
+      throw sirius::invalid_input_exception(
+        "object_store_scope: the plan reads '{}', outside every published uri_prefix",
+        refused.item);
+    case refusal_kind::route_unavailable:
+      throw sirius::invalid_input_exception(
+        "object_store_route_unavailable: the plan reads '{}' from an object store; native "
+        "object-store reads are not yet served on the FFI path",
+        refused.item);
   }
-  auto const lowered = lowercase_scheme(uri);
-  for (const auto& snapshot : set) {
-    if (snapshot->uri_prefix.empty() || lowered.starts_with(snapshot->uri_prefix)) {
-      return snapshot;
-    }
-  }
-  return nullptr;
+  throw sirius::invalid_input_exception(std::string{sirius::object_store::token_of(refused.kind)});
 }
 
 // A plan that reads from an object store is refused here, before DuckDB's consumer can bind the
@@ -216,35 +234,10 @@ std::shared_ptr<ObjectStoreConfig> resolve_scope(const ObjectStoreScopeSet& set,
 // is named in redacted form; no secret lookup and no network access happen. Each message starts
 // with a stable reason token.
 void refuse_remote_reads(const std::vector<std::string>& remote_paths,
-                         const ObjectStoreScopeSet& set)
+                         const sirius::object_store::scope_set& set)
 {
-  if (remote_paths.empty()) { return; }
-  if (set.empty()) {
-    throw sirius::invalid_input_exception(
-      "object_store_unconfigured: the plan reads '{}' from an object store or through an Iceberg "
-      "metadata path, but this Context has no object-store snapshot (Context::put_object_store)",
-      redacted_uri(remote_paths.front()));
-  }
-  // Every item is checked before any is served: a plan is refused whole.
-  for (const auto& path : remote_paths) {
-    if (!resolve_scope(set, path)) {
-      throw sirius::invalid_input_exception(
-        "object_store_scope: the plan reads '{}', outside every published uri_prefix",
-        redacted_uri(path));
-    }
-  }
-  throw sirius::invalid_input_exception(
-    "object_store_route_unavailable: the plan reads '{}' from an object store; native "
-    "object-store reads are not yet served on the FFI path",
-    redacted_uri(remote_paths.front()));
-}
-
-void check_object_store(const ObjectStoreConfig& cfg,
-                        const sirius::scan_manager::scan_manager_config& scan_manager)
-{
-  auto const backend = sirius::object_store::capabilities_of(scan_manager);
-  if (auto const refused = sirius::object_store::check_settings(to_settings(cfg), backend)) {
-    throw_violation(*refused, backend);
+  if (auto const refused = sirius::object_store::classify_remote_reads(set, remote_paths)) {
+    throw_refusal(*refused);
   }
 }
 
@@ -252,7 +245,7 @@ void check_object_store(const ObjectStoreConfig& cfg,
 // object-store snapshots the execution captured when its binding began (empty = none).
 sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
                                          const std::string& substrait_plan,
-                                         const ObjectStoreScopeSet& scopes)
+                                         const sirius::object_store::scope_set& scopes)
 {
   auto& client = *conn.context;
 
@@ -328,57 +321,10 @@ struct Context::Impl {
   duckdb::unique_ptr<duckdb::Connection> conn;
   // Serializes transactions on `conn`; see in_transaction().
   std::mutex conn_mutex;
-  // The published scope set, replaced as a whole under its own mutex (copy-on-write). An
-  // execution captures the current set when its binding begins, inside the connection
-  // transaction; object-store I/O routing is not implemented here. Writers additionally hold
-  // object_store_update_mutex across copy, edit and publish, so concurrent put/drop compose
-  // like sequential ones; captures and getters never take it. Lock order: update, then
-  // object_store_mutex; neither is held while conn_mutex is taken.
-  std::mutex object_store_update_mutex;
-  mutable std::mutex object_store_mutex;
-  std::shared_ptr<const ObjectStoreScopeSet> object_store =
-    std::make_shared<const ObjectStoreScopeSet>();
-
-  std::shared_ptr<const ObjectStoreScopeSet> capture_object_store() const
-  {
-    std::lock_guard lock(object_store_mutex);
-    return object_store;
-  }
-
-  // Replace the publication by `make(current)`; `make` returns null to leave it unchanged.
-  // The retired set is released only after both locks are gone, and callers keep an owner of
-  // any incoming configuration outside this call (`make` works on copies), so a caller-supplied
-  // deleter can never run under a mutex a getter or another writer takes, neither for a retired
-  // set nor for a candidate whose construction failed. Returns whether a new set was published.
-  template <typename Make>
-  bool update_object_store(Make&& make)
-  {
-    std::shared_ptr<const ObjectStoreScopeSet> retired;
-    {
-      std::lock_guard update(object_store_update_mutex);
-      std::shared_ptr<const ObjectStoreScopeSet> next = make(*capture_object_store());
-      if (!next) { return false; }
-      std::lock_guard lock(object_store_mutex);
-      object_store.swap(next);
-      retired = std::move(next);
-    }
-    return true;
-  }
-
-  // A sorted copy of `current` with `key` replaced by `cfg` (or removed when null).
-  static std::shared_ptr<const ObjectStoreScopeSet> with_scope(
-    const ObjectStoreScopeSet& current,
-    std::string_view key,
-    std::shared_ptr<ObjectStoreConfig> cfg)
-  {
-    auto next = std::make_shared<ObjectStoreScopeSet>(current);
-    std::erase_if(*next, [&](const auto& s) { return s->uri_prefix == key; });
-    if (cfg) { next->push_back(std::move(cfg)); }
-    std::stable_sort(next->begin(), next->end(), [](const auto& a, const auto& b) {
-      return a->uri_prefix.size() > b->uri_prefix.size();
-    });
-    return next;
-  }
+  // The published scope set. An execution captures the current set when its binding begins,
+  // inside the connection transaction; object-store I/O routing is not implemented here. No
+  // registry lock is held while conn_mutex is taken.
+  sirius::object_store::registry object_store;
 
   void bring_up(const sirius::parsed_sirius_config& config)
   {
@@ -446,31 +392,29 @@ Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 std::shared_ptr<ObjectStoreConfig> Context::object_store_config_for(std::string_view uri) const
 {
-  auto const set = impl_->capture_object_store();
-  return resolve_scope(*set, uri);
+  auto const resolved = impl_->object_store.lookup(uri);
+  if (resolved.refused) { throw_refusal(*resolved.refused); }
+  if (!resolved.hit) { return nullptr; }
+  return std::static_pointer_cast<ObjectStoreConfig>(resolved.hit->owner);
 }
 
 void Context::put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
 {
   if (!cfg) { throw std::invalid_argument("object_store: put_object_store requires a snapshot"); }
-  check_object_store(*cfg, impl_->context->get_config().get_scan_manager_config());
-  std::string const key = cfg->uri_prefix;
-  impl_->update_object_store(
-    [&](const ObjectStoreScopeSet& current) { return Impl::with_scope(current, key, cfg); });
+  publish_snapshot(
+    impl_->object_store,
+    cfg,
+    sirius::object_store::capabilities_of(impl_->context->get_config().get_scan_manager_config()));
   SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot published for {} scope",
-                  key.empty() ? "the default" : "a prefixed");
+                  cfg->uri_prefix.empty() ? "the default" : "a prefixed");
 }
 
 void Context::drop_object_store(std::string_view uri_prefix) const
 {
-  check_uri_prefix_shape(uri_prefix);
-  bool const dropped = impl_->update_object_store(
-    [&](const ObjectStoreScopeSet& current) -> std::shared_ptr<const ObjectStoreScopeSet> {
-      bool const present = std::any_of(
-        current.begin(), current.end(), [&](const auto& s) { return s->uri_prefix == uri_prefix; });
-      return present ? Impl::with_scope(current, uri_prefix, nullptr) : nullptr;
-    });
-  if (dropped) {
+  auto const result = impl_->object_store.drop(uri_prefix);
+  if (result.refused) { throw_violation(*result.refused, {}); }
+  if (result.published) {
+    notify_publication(result.published);
     SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot dropped for {} scope",
                     uri_prefix.empty() ? "the default" : "a prefixed");
   }
@@ -507,11 +451,11 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // Phase timings (lowering / physical planning / GPU execution), logged per query: the embedder
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
-  std::shared_ptr<const ObjectStoreScopeSet> snapshot;
+  std::shared_ptr<const sirius::object_store::scope_set> snapshot;
   in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
     // Captured once the transaction is held and before any binding consumes credentials: a
     // call still queued before this boundary may observe a later publication.
-    snapshot = impl_->capture_object_store();
+    snapshot = impl_->object_store.capture();
     run_capture_pause_hook();
     // The same result path as a zero-output Fragment.
     sirius::exec::fragment_spec spec;
@@ -551,18 +495,17 @@ std::unique_ptr<Context> make_context_from_config(const std::string& config_path
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path,
                                                   std::shared_ptr<ObjectStoreConfig> cfg)
 {
-  // The snapshot is checked against the parsed configuration before bring_up(), so a rejected
-  // snapshot never creates engine state.
+  // The snapshot is checked against the parsed configuration and published before bring_up(),
+  // so a rejected snapshot never creates engine state.
   auto config = config_path.empty() ? sirius::parsed_sirius_config{}
                                     : sirius::parsed_sirius_config::from_file(config_path);
-  if (cfg) { check_object_store(*cfg, config.get_scan_manager_config()); }
-  auto impl = std::make_unique<Context::Impl>();
-  impl->bring_up(config);
+  auto impl   = std::make_unique<Context::Impl>();
   if (cfg) {
-    auto set = std::make_shared<ObjectStoreScopeSet>();
-    set->push_back(std::move(cfg));
-    impl->object_store = std::move(set);
+    publish_snapshot(impl->object_store,
+                     cfg,
+                     sirius::object_store::capabilities_of(config.get_scan_manager_config()));
   }
+  impl->bring_up(config);
   return std::unique_ptr<Context>(new Context(std::move(impl)));
 }
 
@@ -594,7 +537,7 @@ struct Fragment::Impl {
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
   // Scope set captured for this execution. An empty set is unconfigured; a null handle
   // means no capture has been stored.
-  std::shared_ptr<const ObjectStoreScopeSet> object_store;
+  std::shared_ptr<const sirius::object_store::scope_set> object_store;
 
   void require_not_built(const char* what) const
   {
@@ -713,12 +656,12 @@ void Fragment::build(const std::string& substrait_plan)
   // The attempt owns its capture and its partial fragment: both outlive the transaction below
   // and are committed to the Fragment only after it succeeds, so a failed attempt never leaves
   // a stored capture behind and nothing captured earlier is released under conn_mutex.
-  std::shared_ptr<const ObjectStoreScopeSet> captured;
+  std::shared_ptr<const sirius::object_store::scope_set> captured;
   // Type-name parsing, CREATE VIEW, and Substrait lowering all need an active transaction. A
   // failure rolls back the views, so a half-declared fragment leaves nothing behind.
   in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
     // Captured once the transaction is held and before any binding consumes credentials.
-    captured = impl_->ctx.capture_object_store();
+    captured = impl_->ctx.object_store.capture();
     run_capture_pause_hook();
     sirius::exec::fragment_spec spec;
     spec.inputs      = impl_->resolve_inputs();
@@ -840,6 +783,18 @@ void set_transaction_entry_hook(std::function<void()> hook)
   {
     std::lock_guard lock(transaction_entry_mutex);
     retired = std::exchange(transaction_entry_hook, std::move(next));
+  }
+}
+
+void set_publication_observer(
+  std::function<void(std::shared_ptr<const sirius::object_store::scope_set>)> observer)
+{
+  auto next =
+    observer ? std::make_shared<const publication_observer_fn>(std::move(observer)) : nullptr;
+  std::shared_ptr<const publication_observer_fn> retired;
+  {
+    std::lock_guard lock(publication_observer_mutex);
+    retired = std::exchange(publication_observer, std::move(next));
   }
 }
 

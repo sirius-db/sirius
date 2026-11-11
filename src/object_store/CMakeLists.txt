@@ -1,1 +1,2 @@
-target_sources(sirius_objects PRIVATE backend_capabilities.cpp validation.cpp)
+target_sources(sirius_objects PRIVATE backend_capabilities.cpp registry.cpp
+                                      scope.cpp validation.cpp)
