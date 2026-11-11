@@ -33,8 +33,16 @@ are here on those machines:
   SF1000, at commit `7fe328de`: 6 of 6 answers match, and no key in `run.sql`, `client.txt`,
   `gateway.out` or the `node*.out` files.
 
-**Not run in this form:** `sirius_aws_setup.sh`, more than two machines, and a machine with
-several GPUs.
+**Also tested:** four `g7e.8xlarge` (each 1 x RTX PRO 6000 Blackwell 96 GB, 32 vCPUs, 249 GiB
+RAM, 1.7 TB of instance-store NVMe, driver 595.112.07, no EFA) in one zone without a placement
+group, one rank per machine exchanging over [TCP lanes](#exchange-between-machines), at commit
+`6084b1bc`: TPC-H SF1000, SF3000 and SF10000 from S3 on 1, 2 and 4 machines with
+`sirius_aws_run.sh` and `sirius_aws_s3_secret.sh`. Answers were checked at SF1000 and SF3000,
+not at SF10000. See [Four g7e.8xlarge](#four-g7e8xlarge).
+
+**Not run in this form:** `sirius_aws_setup.sh` as it is here (the `g7e.8xlarge` run used a copy
+that cloned another repository), more than four machines, and several machines with several GPUs
+each.
 
 | Script | Does |
 |---|---|
@@ -53,7 +61,8 @@ several GPUs.
 3. **One heavy job at a time.** Dataset generation, a CPU reference run and a benchmark compete
    for the same disks and cores. A benchmark timed next to either is not a result.
 4. **Start narrow:** Q1, Q6 and Q12, cold and warm, checked. Run all 22 only after those match.
-5. **Keep the default scan backend.** Do not set `scan_manager.backend: kvikio`.
+5. **Keep the default scan backend.** `scan_manager.backend: kvikio` and the
+   `scan_manager.kvikio` block were removed: a config that has either is refused.
 6. **Leave no rank behind.** After each run
    `nvidia-smi --query-compute-apps=pid --format=csv,noheader` must print nothing. If it does
    not, [stop what is left](distributed-experiments-no-slurm.md#stop-what-a-killed-run-left).
@@ -112,7 +121,7 @@ Everything large goes under `$WORK`. Space needed:
 |---|---|---|
 | Checkout, build and caches | about 120 GB | same |
 | Dataset | 802 GB | 2.7 TB |
-| Spill | up to 1 TB (none was used at SF3000) | not run |
+| Spill | up to 1 TB. None was used on 4 GPUs; one `g7e.8xlarge` used 55 GB | seen: 66 GB on two `g7e.8xlarge`, 97 GB on one |
 
 Check `df -h "$WORK"` against this before choosing a scale factor: smaller `g7e` sizes have less
 instance storage. A `g6.4xlarge` has 549 GB, which held the build and SF1000; at 802 GB for
@@ -144,6 +153,9 @@ instance first, since it makes the checkout:
 tmux new-session -d -s setup "bash sirius_aws_setup.sh 100"     # logs: /opt/dlami/nvme/work/logs
 ```
 
+- Between machines, build `experimental/distributed-sirius-tcp` (`BRANCH=...` for the script):
+  it has the [TCP lanes](#exchange-between-machines), without which adding machines made the
+  `g7e.8xlarge` runs slower. Its `cucascade` submodule is fetched from `aocsa/cuCascade`.
 - A non-interactive `ssh host '<command>'` does not read `~/.bashrc`: start every remote command
   with `. /opt/dlami/nvme/work/env.sh`.
 - Run long jobs in a detached `tmux` session with a log and an exit-code file, as above. Do not
@@ -392,6 +404,26 @@ That run kept its spill folder inside the run's folder; the script's sampler wat
 `$WORK/spill`, so name that one. For the reference answers on 64 GiB it used
 `SET memory_limit='46GB'; SET threads=16; SET preserve_insertion_order=false;`.
 
+### Exchange between machines
+
+Ranks on different machines exchange over **TCP lanes**: the data is staged in pinned host
+memory and sent over parallel TCP connections
+([Distributed Sirius](distributed-sirius.md)). It is the default (`exchange.host_staging: auto`,
+`exchange.tcp_lanes: 0`, which is 16 lanes); each rank's log says
+`host-staged over TCP lanes` for a peer on another machine.
+
+- **Without the lanes the exchange is the limit.** On four `g7e.8xlarge` at commit `caba1b34`,
+  NIXL over UCX's TCP transport moved about 0.25 GB/s per machine, and all 22 queries at SF1000
+  from S3 took 65.7 s warm on one machine, 197.6 s on two and 330.0 s on four. With the lanes:
+  65.7, 79.7 and 56.4 s.
+- **Keep the default of 16 lanes.** With `tcp_lanes: 2` on four machines at SF3000, Q5 and Q13
+  crashed in their warm run (a CUDA illegal address) and Q9 returned a wrong answer (546,176 rows
+  for 175). That build also held an experimental change to the lanes' idle loop, since removed,
+  so which of the two caused it is not known. Two machines with 2 lanes were correct.
+- **The lanes cost something on small data.** At SF1000 two machines (79.7 s warm) were slower
+  than one (65.7 s). One thread per rank stays busy in NIXL's worker while the rank is idle. Not
+  solved.
+
 **After the run**, on every machine: `nvidia-smi --query-compute-apps=pid --format=csv,noheader`
 prints nothing. If the script was killed with `kill -9`,
 [stop what is left](distributed-experiments-no-slurm.md#stop-what-a-killed-run-left) on each
@@ -442,7 +474,36 @@ and stay on the local disk, so `--data` is still the local dataset, on every mac
 check reads it too. At SF100 `customer`, `part` and `partsupp` are also one file each: generate
 them in more files, or expect the queries that read them to be refused on two ranks.
 
+With four ranks the same holds at SF1000 for `part` and `customer` when they have fewer than four
+files: the `g7e.8xlarge` run wrote both again in 8 files.
+
 Watch the network instead of the disk: the sampler's third column is bytes received.
+
+**The S3 settings of the `g7e.8xlarge` run**, per rank, in `executor.scan_manager`:
+
+```yaml
+num_threads: 24
+rest_n_reactors: 4
+rest: { pin_to_irq_cpus: false, max_connections: 128, min_mtu: 0 }
+max_readahead_scans: 16
+cache: { mode: cucs, eviction: lru }      # eviction: idle at SF10000
+```
+
+The rest of that config: `host.capacity_bytes: 180Gi`, a 1500Gi disk tier, `pipeline.num_threads:
+8`, and spill compression on from SF3000 up. `uring_n_reactors` is for local files only.
+
+**AWS can slow the network down without an error.** Two runs of the same SF10000 arm on four
+machines took 580.1 s and 835.8 s warm: the same bytes were read (6.2 TB per machine), at 5.04
+and 3.59 GB/s. The rank logs had no S3 retry in either. The network card counts the packets AWS
+held back for passing the instance's allowance; record them before and after every arm:
+
+```bash
+ethtool -S "$(ip -o route get 1.1.1.1 | awk '{ print $5 }')" | grep allowance_exceeded
+```
+
+On these machines the inbound counter stood at 353 million since boot, but it was not recorded
+per run, so the slow run is not explained. Not tried: an S3 gateway endpoint in the VPC (the
+traffic went through the internet gateway) and a cluster placement group.
 
 ## Reference numbers
 
@@ -509,6 +570,33 @@ runs measure the storage first.
 **SF100 from S3 on 2 machines** ran only Q1, Q4, Q6, Q12, Q15 and Q21 (12 of 12 match). The
 other 16 queries were refused, because customer, part and partsupp are one file each at SF100:
 see [Data on S3](#data-on-s3).
+
+### Four g7e.8xlarge
+
+Each 1 x RTX PRO 6000 Blackwell 96 GB, 32 vCPUs, 249 GiB RAM, one rank per machine exchanging
+over [TCP lanes](#exchange-between-machines) (16), the data on S3 with the settings of
+[Data on S3](#data-on-s3), commit `6084b1bc`, all 22 queries. Lineitem is 60, 180 and 600 files
+at SF1000, SF3000 and SF10000 (100 million rows per file, row groups of about 1 million rows).
+
+| Scale factor | Machines | Cold s | Warm s | Answers |
+|---|---|---|---|---|
+| SF1000 | 1 | 107.8 | 65.7 | 44 of 44 match |
+| SF1000 | 2 | 93.6 | 79.7 | 44 of 44 match |
+| SF1000 | 4 | 68.9 | 56.4 | 44 of 44 match |
+| SF3000 | 1 | 894.6 | 694.3 | 42 match, 2 are Q3 LIMIT ties |
+| SF3000 | 2 | 287.8 | 194.9 | 42 match, 2 are Q3 LIMIT ties |
+| SF3000 | 4 | 157.4 | 133.0 | 42 match, 2 are Q3 LIMIT ties |
+| SF10000 | 2 | 1,382.2 | 1,400.4 | not checked; Q10 failed twice |
+| SF10000 | 4 | 631.6 | 580.1 | not checked; Q10 failed warm |
+
+- **SF3000 scales past the machine count from 1 to 2** (3.56 times warm) because one machine
+  spilled 55 GB and two did not.
+- **SF10000 on four machines is the better of two runs.** The other took 880.3 s cold and
+  835.8 s warm, with Q10 failing in both: see [Data on S3](#data-on-s3).
+- **Q10 at SF10000 fails on two and four machines** with `GPU pipeline task exceeded maximum
+  retry limit (100)` after an out-of-memory in a hash join. Its time is not in the totals. On
+  one machine it ran (326.3 s cold, 371.6 s warm); that run was not complete when this was
+  written.
 
 ## What we learned
 
@@ -585,6 +673,10 @@ document. On an instance, also:
 | S3 reads fail with an expired or invalid token | The role's temporary keys in the secret ran out: write the secret file again |
 | Several machines: `Permission denied (publickey)` or a host-key question from the run script | `ssh` from the gateway's machine to the others is not set up: see [Several machines](#several-machines) |
 | Several machines: the node check fails on another machine only | The checkout, build or data is missing there or at another path |
+| Several machines are slower than one, and the rank logs do not say `host-staged over TCP lanes` | The build has no TCP lanes: see [Exchange between machines](#exchange-between-machines) |
+| Several machines: a crash with a CUDA illegal address, or a wrong answer, with `tcp_lanes: 2` | Seen at SF3000 on four machines: keep the default of 16 lanes |
+| SF10000 on several machines: Q10 ends with `GPU pipeline task exceeded maximum retry limit (100)` | Out of GPU memory in a hash join. Not solved |
+| The same arm is much slower on a second run, with no error | Maybe AWS shaping the network: see [Data on S3](#data-on-s3) |
 | Q3 or Q18 differ from the reference | LIMIT tie: pass `--ties` |
 | Q11 returns no or too few rows | Fraction must be `0.0001 / SF` |
 | Ranks killed mid-query | Host tier too large for the RAM: lower `host.capacity_bytes` |
