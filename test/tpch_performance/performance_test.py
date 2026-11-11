@@ -49,23 +49,15 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 
-# `--profile` names a cache state to measure. Each profile fixes what Sirius
-# caches, what retires it, the iteration ordering, and what is flushed between
-# runs -- setting those independently is how a "cold" number ends up measured
-# over a warm page cache. The OS page cache is dropped once at startup either
-# way; the *_between flags are about doing it again between runs.
+# `--profile` controls iteration ordering and cache flushing. Cache mode and
+# eviction remain owned by the supplied Sirius YAML. The OS page cache is
+# dropped once at startup either way; the *_between flags repeat it between runs.
 PROFILES = {
     # The connection is deliberately NOT renewed: dropping the context would
     # also throw away the GPU context and compiled plans, which is not what
     # this is measuring.
     "cold": {
         "ordering": "sequential",
-        "cache_mode": "cucs",
-        # 'lru', not 'idle': the per-query reset_sirius_cache() below is what
-        # makes this profile cold, so the evictor does not also need to drop a
-        # chunk the moment nothing is reading it. 'idle' additionally retires
-        # chunks mid-query, which measures the evictor rather than a cold scan.
-        "eviction": "lru",
         "drop_os_cache_between": True,
         "reset_cache_between": True,
         "summary": (
@@ -74,26 +66,18 @@ PROFILES = {
         ),
     },
     # Round-robin means a query's second iteration comes after every other query
-    # has run, so it finds an LRU cache under real pressure rather than its own
-    # leftovers.
+    # has run. Use LRU retention in the YAML to measure cache reuse across queries.
     "lukewarm": {
         "ordering": "sequential",
-        "cache_mode": "cucs",
-        "eviction": "lru",
         "drop_os_cache_between": False,
         "reset_cache_between": False,
         "summary": (
-            "lukewarm: OS cache dropped once at start, LRU retention, round-robin"
+            "lukewarm: OS cache dropped once at start, round-robin, YAML unchanged"
         ),
     },
     "hot": {
         "ordering": "grouped",
-        "cache_mode": "cucs",
-        # LRU, not idle: back-to-back iterations of one query leave the cache
-        # briefly idle between runs, and idle eviction would dispose exactly the
-        # chunks the next iteration is about to re-read -- measuring a cold read
-        # under the name "hot".
-        "eviction": "lru",
+        # Use LRU retention in the YAML to keep chunks between executions.
         "drop_os_cache_between": False,
         "reset_cache_between": False,
         "summary": (
@@ -104,8 +88,8 @@ PROFILES = {
 PROFILE_CHOICES = tuple(PROFILES)
 
 # `--mode` is an orthogonal knob that fixes BOTH the iteration ordering and the
-# granularity at which the cache is flushed. Unlike `--profile` (which chooses
-# a cache mode/eviction profile), `--mode` always drops the OS page cache and
+# granularity at which the cache is flushed. Unlike warm profiles, `--mode`
+# always drops the OS page cache and
 # resets the Sirius cache -- its whole purpose is to place that drop -- so the
 # only thing that varies is WHERE the drop happens relative to the query loop:
 #
@@ -136,12 +120,9 @@ MODE_PROFILES = {
 }
 MODE_CHOICES = tuple(MODE_PROFILES)
 
-# Used when --profile is absent. Inert by design: None cache settings mean
-# "override nothing", so the run measures what the user's own YAML asks for.
+# Used when --profile is absent: grouped iterations with no inter-run flushes.
 DEFAULT_PROFILE = {
     "ordering": "grouped",
-    "cache_mode": None,
-    "eviction": None,
     "drop_os_cache_between": False,
     "reset_cache_between": False,
     "summary": (
@@ -519,7 +500,7 @@ def _load_yaml(path):
         import yaml
     except ImportError as exc:  # pragma: no cover - environment problem
         raise SystemExit(
-            "--profile needs PyYAML to derive the effective Sirius config from "
+            "Reading the Sirius config requires PyYAML: "
             f"{path!r}. Run this script from the repo root via "
             "`pixi run python test/tpch_performance/performance_test.py ...`."
         ) from exc
@@ -566,7 +547,7 @@ def check_profile_sanity(
     number rather than an error.
     """
     profile = PROFILES[profile_name] if profile_name is not None else DEFAULT_PROFILE
-    label = f"--profile {profile_name}" if profile_name is not None else f"--pin {pin}"
+    label = f"--pin {pin}" if overrides else f"--profile {profile_name}"
     problems = []
     warnings = []
 
@@ -595,12 +576,14 @@ def check_profile_sanity(
                             f"config sets cache.{key}={have!r}; "
                             f"{label} overrides it to {wanted!r}"
                         )
-    else:
+    elif overrides:
         warnings.append(
             "no Sirius config given (--config / $SIRIUS_CONFIG_FILE); the cache "
             f"settings for {label} will be written into a generated config over "
             "Sirius defaults"
         )
+    else:
+        warnings.append("no Sirius config given; using Sirius defaults unchanged")
 
     if profile["reset_cache_between"] and engine == "cpu":
         warnings.append(
@@ -624,34 +607,15 @@ def check_profile_sanity(
         raise SystemExit("profile sanity check failed:\n  - " + "\n  - ".join(problems))
 
 
-def cache_overrides_for(profile_name, pin):
-    """The cache settings this run needs, or {} to leave the config alone.
-
-    Both inputs can ask for settings and --pin parquet wins where they disagree:
-    a pin the evictor immediately undoes is not a pin, whereas a profile
-    whose eviction policy shifted still measures something coherent.
-    """
-    overrides = {}
-    if profile_name is not None:
-        profile = PROFILES[profile_name]
-        overrides["mode"] = profile["cache_mode"]
-        overrides["eviction"] = profile["eviction"]
-    if pin == "parquet":
-        for key, value in PARQUET_PIN_CACHE.items():
-            if key in overrides and overrides[key] != value:
-                log(
-                    f"  WARNING: --profile {profile_name} wants cache.{key}="
-                    f"{overrides[key]!r}, but --pin parquet requires {value!r}; "
-                    "using the pin's value"
-                )
-            overrides[key] = value
-    return overrides
+def cache_overrides_for(pin):
+    """Only explicit Parquet pinning needs cache overrides; profiles never do."""
+    return dict(PARQUET_PIN_CACHE) if pin == "parquet" else {}
 
 
 def derive_profile_config(overrides, config_path, benchmark_dir):
     """Write the config this run will actually use and return its path.
 
-    The user's file is the base and only the profile's cache settings are
+    The user's file is the base and only explicit Parquet pinning's settings are
     planted over it, so everything else survives untouched. Written beside the
     results as `effective_config.yml`; the original stays as `config.yml`.
     """
@@ -1785,13 +1749,12 @@ def parse_args():
         choices=PROFILE_CHOICES,
         default=None,
         help=(
-            "Cache state to measure. Each value fixes the Sirius cache mode, the "
-            "eviction policy, the iteration ordering and what is flushed between "
-            "runs, and OVERRIDES cache.mode/cache.eviction in --config. "
-            "OMIT IT and the config is used exactly as given, with iterations "
-            "back-to-back per query and nothing flushed between runs. "
-            "cold (per-query eviction hint and GPU Sirius cache reset, round-robin), "
-            "lukewarm (startup eviction hint, LRU retention, round-robin), "
+            "Query ordering and cache flushing; leaves the Sirius YAML unchanged. "
+            "Set cache mode and eviction in --config (use LRU for warm retention). "
+            "Omit it for iterations back-to-back per query with nothing flushed "
+            "between runs. "
+            "cold (per-query dataset-file eviction hint and GPU Sirius cache "
+            "reset, round-robin), lukewarm (startup eviction hint, round-robin), "
             "hot (startup eviction hint, iterations back-to-back per query). "
             "Local dataset-file eviction uses posix_fadvise(DONTNEED), requires "
             "no sudo, and may be ignored by the filesystem; S3 is skipped. "
@@ -2116,12 +2079,10 @@ def main():
 
     config_path = (args.config or "").strip()
 
-    # No --profile means change nothing: the profile is inert and the config
-    # below is left exactly as the user wrote it.
+    # Profiles control the runner, never the contents of the Sirius config.
     profile = PROFILES[args.profile] if args.profile is not None else DEFAULT_PROFILE
     # --mode overrides ordering and the drop placement, and forces a cache drop
-    # at that placement (its defining property). Any cache mode/eviction the
-    # profile asked for is kept.
+    # at that placement (its defining property). The YAML is still unchanged.
     if args.mode is not None:
         mode_props = MODE_PROFILES[args.mode]
         profile = {
@@ -2132,11 +2093,11 @@ def main():
             "reset_cache_between": True,
             "summary": f"mode={args.mode}: {mode_props['summary']}",
         }
-    cache_overrides = {} if uses_precmd else cache_overrides_for(args.profile, args.pin)
+    cache_overrides = {} if uses_precmd else cache_overrides_for(args.pin)
     if not uses_precmd:
         label = args.mode or args.profile or "(unset)"
         log(f"Profile:       {label} — {profile['summary']}")
-        if cache_overrides:
+        if args.profile is not None or cache_overrides:
             log("Checking profile sanity")
             check_profile_sanity(
                 args.profile,
