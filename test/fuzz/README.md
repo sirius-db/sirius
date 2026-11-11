@@ -171,6 +171,15 @@ uses whatever Sirius itself would pick up (`SIRIUS_CONFIG_FILE`, `./sirius.yaml`
 `~/.sirius/sirius.yaml`, else built-in defaults). Whichever file is used is copied into the run
 and into every finding, so a replay elsewhere restores it.
 
+**Dataset layouts.** `[data.pin] tables_fraction`, `tiers`, and `compression` select a
+seeded subset of base tables to pin after `CHECKPOINT`. `[data.parquet]
+tables_fraction` and `row_group_size` replace a separate seeded subset with
+views over Parquet files after `CHECKPOINT`. Pinned and Parquet subsets do not
+overlap. The selected tables, tiers, compression choices, and row-group size are
+recorded in a comment in each saved `dataset.sql`; `fuzz replay` recreates the
+Parquet files in its own work directory and reapplies pins after loading the
+dataset. CPU-only replay omits the Sirius pin calls.
+
 ---
 
 ## Finding unsupported features
