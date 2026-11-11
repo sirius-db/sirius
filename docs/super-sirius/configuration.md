@@ -406,9 +406,16 @@ sirius:
 | `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default, and cuCascade's) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
 | `slices_per_pass` | int (**0..64**) | 4 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `4` keeps a single many-slice request (a whole-split prefetch, a wide demand read) deep — up to 4 slices per pass, bounded by the reactor's free staging slots — without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
 | `range_batch_slices` | int (**>= 0**) | 8 | Most slices one queue entry holds when a host-only multi-range read (a whole-split prefetch, the DuckDB-native decoder's column-chunk set) is dispatched to the uring reactors: a local read does not prefer bulk I/O, so the read is queued as several entries of at most this many slices instead of one per reactor. Reads with a device destination are never split. `0` = no split. |
+| `max_inflight_small_reads` | int (**>= 0**) | 0 | Most reads smaller than `small_read_bytes` that one reactor keeps in flight. `0` = no cap. Larger reads do not count against it. A reactor dispatches its planned reads in order, so a small read waiting for the cap also holds back the reads queued behind it, large ones included; reads already in flight are unaffected. |
+| `small_read_bytes` | bytes | `1MiB` | Physical read size below which a read counts against `max_inflight_small_reads`. |
 
-Sirius rejects a negative `range_batch_slices` and a `slices_per_pass` outside 0..64 when it loads the config, naming the
-key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
+Sirius rejects a negative `range_batch_slices` or `max_inflight_small_reads` and a `slices_per_pass` outside 0..64 when it
+loads the config, naming the key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
+
+On a parallel filesystem such as GPFS, dozens of concurrent small `O_DIRECT` reads into neighbouring blocks contend when the
+storage has not cached them. At TPC-H SF10000 on 4× GB200 over GPFS, `max_inflight_small_reads: 16` with
+`small_read_bytes: 4MiB` cut the 22-query cold total from 2,128 s to 807 s and the warm total from 685 s to 507 s. Local
+NVMe has not been measured with a cap, so it stays off by default.
 
 `uring.prefetch_reactors` is deprecated: the reactor priority tiers replaced prefetch-reactor partitioning, so the key is
 accepted and ignored with a warning, and will be removed.

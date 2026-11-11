@@ -283,6 +283,20 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
       opt.range_batch_slices = static_cast<std::size_t>(*batch);
     }
   }
+  {
+    // Signed for the same reason.
+    std::optional<long long> cap;
+    r.optional("max_inflight_small_reads", cap);
+    if (cap.has_value()) {
+      if (*cap < 0) {
+        throw std::runtime_error(
+          "'uring.max_inflight_small_reads': must be 0 or more (0 = no cap), got " +
+          std::to_string(*cap));
+      }
+      opt.max_inflight_small_reads = static_cast<std::size_t>(*cap);
+    }
+  }
+  r.optional("small_read_bytes", yaml::bytes(opt.small_read_bytes));
   r.reject_unknown();
 }
 

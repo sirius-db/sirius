@@ -856,6 +856,8 @@ TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 4);
     CHECK(cfg.uring.range_batch_slices == 8);
+    CHECK(cfg.uring.max_inflight_small_reads == 0);
+    CHECK(cfg.uring.small_read_bytes == (1UL << 20));
   };
 
   SECTION("default-constructed") { check_defaults(scan_manager_config{}); }
@@ -904,6 +906,21 @@ TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config
   require_load_error("sirius_uring_range_batch_slices_negative.yaml",
                      uring_yaml("        range_batch_slices: -1\n"),
                      "'uring.range_batch_slices': must be 0 or more (0 = no split), got -1");
+}
+
+TEST_CASE("sirius_config reads the uring small-read cap", "[scan_manager][config][uring]")
+{
+  auto const cfg = load_scan_manager("sirius_uring_small_read_cap.yaml",
+                                     uring_yaml("        max_inflight_small_reads: 16\n"
+                                                "        small_read_bytes: 4MiB\n"));
+  CHECK(cfg.uring.max_inflight_small_reads == 16);
+  CHECK(cfg.uring.small_read_bytes == (4UL << 20));
+  CHECK(cfg.to_io_config().uring.max_inflight_small_reads == 16);
+  CHECK(cfg.to_io_config().uring.small_read_bytes == (4UL << 20));
+
+  require_load_error("sirius_uring_max_inflight_small_reads_negative.yaml",
+                     uring_yaml("        max_inflight_small_reads: -1\n"),
+                     "'uring.max_inflight_small_reads': must be 0 or more (0 = no cap), got -1");
 }
 
 TEST_CASE("uring prefetch_reactors is accepted as a deprecated no-op",
