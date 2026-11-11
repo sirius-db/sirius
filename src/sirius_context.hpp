@@ -859,6 +859,10 @@ class SiriusContext : public ClientContextState {
   /// that numbered it).
   [[nodiscard]] uint64_t next_distributed_query(ClientContext& context, uint64_t assigned = 0);
 
+  /// \brief Shuts the exchange down, freeing its listener port and shared-memory mirrors. For a
+  /// process about to exit; release_resources() does the same on teardown.
+  void shutdown_exchange();
+
   /// \brief @p context is closing: if it runs distributed queries, the next connection to plan
   /// one takes over, and numbering continues where it stopped.
   void release_distributed_connection(ClientContext& context);

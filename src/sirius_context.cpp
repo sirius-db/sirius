@@ -1225,7 +1225,7 @@ void SiriusContext::release_resources() noexcept
   // The exchange's engine thread lands batches in memory_manager_'s spaces and calls into sources
   // and the components above: stop it while they all still exist. Plans can hold the service past
   // terminate() (a prepared statement), so dropping this reference alone would not stop it.
-  if (auto* session = distributed()) { session->shutdown(); }
+  shutdown_exchange();
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
@@ -1308,6 +1308,11 @@ uint64_t SiriusContext::next_distributed_query(ClientContext& context, uint64_t 
 void SiriusContext::release_distributed_connection(ClientContext& context)
 {
   if (auto* session = distributed()) { session->release_connection(context.GetConnectionId()); }
+}
+
+void SiriusContext::shutdown_exchange()
+{
+  if (auto* session = distributed()) { session->shutdown(); }
 }
 
 void SiriusContext::set_exchange_service_for_testing(
