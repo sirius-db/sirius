@@ -197,6 +197,16 @@ class gds_ioctx final : public cucascade::io::ioctx {
 
   /// Start time of the read each worker is in, as steady-clock nanoseconds; 0 when idle.
   std::unique_ptr<std::atomic<std::int64_t>[]> _read_started;
+  /// What that read is, for the report of a stuck read. Dereference `object`
+  /// only under `_live_mutex` and while the worker's start time is set: its
+  /// request cannot be settled, and the object released, without that mutex.
+  struct reading {
+    std::atomic<cucascade::io::io_object const*> object{nullptr};
+    std::atomic<std::size_t> offset{0};
+    std::atomic<std::size_t> size{0};
+    std::atomic<bool> device{false};
+  };
+  std::unique_ptr<reading[]> _reading;
   std::vector<std::thread> _workers;
   std::thread _watchdog;
 };

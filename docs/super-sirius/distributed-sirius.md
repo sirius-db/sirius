@@ -354,6 +354,7 @@ Without NIXL, a distributed query fails with "needs a Sirius built with -DSIRIUS
 | Variable | Default | Why |
 |---|---|---|
 | `UCX_TLS`, `UCX_NET_DEVICES` | `all` on the GPU rail NICs, if the host has them; else `cuda_copy,cuda_ipc,tcp,self` | Rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed) carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0. `UCX_NET_DEVICES=rails` asks for them. Without rail NICs, the transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout") |
+| `UCX_RCACHE_ENABLE` | `n` unless `UCX_TLS` is `all` | Without the InfiniBand transports nothing drains the list where UCX 1.21's registration cache queues every freed GPU buffer, and each free walks that list under one lock: the join after TPC-H Q14's exchange took 12 s instead of under 1 s. With a `UCX_TLS` list of your own that has `rc`, `dc` or `ud` in it, export `UCX_RCACHE_ENABLE=y` |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
 | `NIXL_PREFIX` | unset | Optional: only for a build whose RPATH does not find NIXL. When set, NIXL's libraries (and `UCX_PREFIX`'s UCX, if set) go ahead of the pixi environment's UCX on `LD_LIBRARY_PATH`, and `NIXL_PLUGIN_DIR` points at NIXL's plugins |
 
