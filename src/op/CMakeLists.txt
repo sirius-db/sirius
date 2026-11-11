@@ -7,6 +7,7 @@ target_sources(
           aggregate/gpu_aggregate_impl.cpp
           window/aggregate_types.cpp
           window/cumulative.cpp
+          window/float_extremum.cpp
           window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
