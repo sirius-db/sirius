@@ -221,8 +221,10 @@ extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
     src += body_code;
     auto const& v = pred_reg.var_name;
     if (pred_reg.can_overflow) {
+      // A NULL value's poison counts too: see the invariant on `reg_val` in
+      // `device_runtime/reg_val.cuh`.
       src += std::format(
-        "{0}row_overflow = row_overflow || ({1}.valid && {1}.overflow);\n"
+        "{0}row_overflow = row_overflow || {1}.overflow;\n"
         "{0}survives = ({1}.valid && !{1}.overflow && {1}.val);\n",
         indent,
         v);

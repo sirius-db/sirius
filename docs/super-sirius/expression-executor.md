@@ -176,6 +176,7 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
   counts are accumulated per warp in registers and reduced once per block. A column with no
   nulls in the batch, and any expression over such columns and non-NULL constants, is statically
   non-null: no mask is allocated and no null count is read back.
+- **Overflow Poison.** An operation sets a Register Value's `overflow` bit only by propagating an operand's poison, or from its own computation over operands that are all valid and unpoisoned; a NULL value's payload never decides overflow. Every function in `device_runtime/*.cuh` and every statement `translation_context.cpp` emits keeps this invariant (`reg_val` in `device_runtime/reg_val.cuh` states it for new code), so poison always comes from an Evaluated Operation. The `ProjectSink` and `FilterSink` kernels therefore report every poison that reaches them, whatever the value's final validity: `n + abs(x)` with `n` NULL raises, as rule 2 of [SQL errors](#sql-errors) requires. Row-exact Guards keep poison away instead: CASE, COALESCE and the dominance of AND/OR skip the operand for the row, and TRY and TRY_CAST clear the bit.
 - **Constants** travel as kernel parameters so one compiled kernel serves every literal value;
   only a constant's NULL-ness is baked into the source. Overflow and the null counts are read
   back once per evaluation through a pinned staging slab (`read_status_words`), which is the one

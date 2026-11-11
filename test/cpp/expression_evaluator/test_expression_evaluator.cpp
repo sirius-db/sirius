@@ -4592,6 +4592,163 @@ TEST_CASE("TRY is not implemented and compiles no NVRTC kernel outside nvrtc_jit
   }
 }
 
+TEST_CASE("nvrtc_jit - Overflow Poison raises at either sink even when the row's value is NULL",
+          "[expression_evaluator][nvrtc_jit][sql_errors]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const int_t = logical_type::make(type_id::INTEGER);
+  // `n + abs(x)` with n NULL and x = INT_MIN: abs(x) is an Evaluated Operation that overflows, and
+  // the NULL n does not stop DuckDB from raising.
+  auto batch = make_two_int32_batch_with_nulls(
+    *space, {0, 1}, {false, true}, {std::numeric_limits<std::int32_t>::min(), 5}, {true, true});
+  auto ro = batch->to_read_only();
+  auto tv = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+  auto make_n_plus_abs_x = [&] {
+    std::vector<std::unique_ptr<ast_node>> abs_args;
+    abs_args.push_back(make_ref_typed(1, int_t));
+    std::vector<std::unique_ptr<ast_node>> add_args;
+    add_args.push_back(make_ref_typed(0, int_t));
+    add_args.push_back(make_func(sirius::function_id::abs, std::move(abs_args), int_t));
+    return make_func(sirius::function_id::add, std::move(add_args), int_t);
+  };
+
+  SECTION("ProjectSink")
+  {
+    auto const expr                                  = make_n_plus_abs_x();
+    std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+    auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->is_direct());
+    exp_executor exec(
+      *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
+  }
+
+  SECTION("FilterSink")
+  {
+    auto const pred = make_cmp(sirius::comparison_type::gt, make_n_plus_abs_x(), make_int_const(0));
+    auto const plan = sirius::nvrtc::plan_filter_sink(*pred, tv);
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->is_direct());
+    exp_executor exec(
+      *pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_AS(exec.select(tv), sirius::invalid_input_exception);
+  }
+}
+
+TEST_CASE(
+  "nvrtc_jit - no overflow-capable operation poisons a NULL row whose payload would overflow",
+  "[expression_evaluator][nvrtc_jit][sql_errors]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  // Row 0 of every nullable column is NULL and carries its type's lowest value, the payload that
+  // makes each operation below overflow if it were computed; row 1 is an ordinary valid value.
+  auto make_column = [&]<typename T>(cudf::data_type type, T row0, T row1, bool nullable) {
+    auto col = cudf::make_fixed_width_column(
+      type, 2, nullable ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED, stream, mr);
+    std::array<T, 2> const payloads{row0, row1};
+    REQUIRE(cudaMemcpy(col->mutable_view().template head<T>(),
+                       payloads.data(),
+                       sizeof(payloads),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    if (nullable) {
+      cudf::set_null_mask(col->mutable_view().null_mask(), 0, 1, false, stream);
+      col->set_null_count(1);
+    }
+    return col;
+  };
+  constexpr auto int_min = std::numeric_limits<std::int32_t>::min();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_column(cudf::data_type{cudf::type_id::INT32}, int_min, 7, true));
+  columns.push_back(make_column(cudf::data_type{cudf::type_id::INT32}, -1, 1, false));
+  columns.push_back(make_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}, int_min, 0, true));
+  columns.push_back(make_column(cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS},
+                                std::numeric_limits<std::int64_t>::min(),
+                                std::int64_t{0},
+                                true));
+  columns.push_back(make_column(cudf::data_type{cudf::type_id::DECIMAL32, 0}, int_min, 1, true));
+  columns.push_back(make_column(
+    cudf::data_type{cudf::type_id::FLOAT64}, std::numeric_limits<double>::lowest(), 1.0, true));
+  std::vector<cudf::column_view> views;
+  for (auto const& col : columns) {
+    views.push_back(col->view());
+  }
+  cudf::table_view const tv{views};
+
+  auto const int_t      = logical_type::make(type_id::INTEGER);
+  auto const smallint_t = logical_type::make(type_id::SMALLINT);
+  auto const float_t    = logical_type::make(type_id::FLOAT);
+  auto const dec9_0     = logical_type::make_decimal(9, 0);
+  auto const dec9_2     = logical_type::make_decimal(9, 2);
+  auto x                = [&] { return make_ref_typed(0, int_t); };
+  auto minus_one        = [&] { return make_ref_typed(1, int_t); };
+  auto date             = [&] { return make_ref_typed(2, logical_type::make(type_id::DATE)); };
+  auto ts               = [&] { return make_ref_typed(3, logical_type::make(type_id::TIMESTAMP)); };
+  auto dec              = [&] { return make_ref_typed(4, dec9_0); };
+  auto dbl              = [&] { return make_ref_typed(5, logical_type::make(type_id::DOUBLE)); };
+  auto call             = [](sirius::function_id fid, logical_type ret, auto... operands) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    (args.push_back(std::move(operands)), ...);
+    return make_func(fid, std::move(args), ret);
+  };
+  using sirius::function_id;
+
+  std::vector<std::pair<char const*, std::unique_ptr<ast_node>>> cases;
+  cases.emplace_back("x + -1", call(function_id::add, int_t, x(), minus_one()));
+  cases.emplace_back("x - 1", call(function_id::sub, int_t, x(), make_int_const(1)));
+  cases.emplace_back("x * -1", call(function_id::mul, int_t, x(), minus_one()));
+  cases.emplace_back("x / -1", call(function_id::div, int_t, x(), minus_one()));
+  cases.emplace_back("x // -1", call(function_id::int_div, int_t, x(), minus_one()));
+  cases.emplace_back("-x", call(function_id::negate, int_t, x()));
+  cases.emplace_back("abs(x)", call(function_id::abs, int_t, x()));
+  cases.emplace_back("CAST(x AS SMALLINT)", make_cast(x(), smallint_t, false));
+  cases.emplace_back("CAST(x AS DECIMAL(9, 2))", make_cast(x(), dec9_2, false));
+  cases.emplace_back("CAST(date AS TIMESTAMP)",
+                     make_cast(date(), logical_type::make(type_id::TIMESTAMP), false));
+  cases.emplace_back("CAST(ts AS TIMESTAMP_NS)",
+                     make_cast(ts(), logical_type::make(type_id::TIMESTAMP_NS), false));
+  cases.emplace_back("dec + dec", call(function_id::add, dec9_0, dec(), dec()));
+  cases.emplace_back("dec - 1", call(function_id::sub, dec9_0, dec(), make_dec32_const(1, 9, 0)));
+  cases.emplace_back("dec * dec", call(function_id::mul, dec9_0, dec(), dec()));
+  cases.emplace_back("dec / -1", call(function_id::div, dec9_0, dec(), make_dec32_const(-1, 9, 0)));
+  cases.emplace_back("CAST(dec AS SMALLINT)", make_cast(dec(), smallint_t, false));
+  cases.emplace_back("CAST(dec AS DECIMAL(9, 2))", make_cast(dec(), dec9_2, false));
+  cases.emplace_back("CAST(dbl AS INTEGER)", make_cast(dbl(), int_t, false));
+  cases.emplace_back("CAST(dbl AS FLOAT)", make_cast(dbl(), float_t, false));
+  cases.emplace_back("CAST(dbl AS DECIMAL(9, 2))", make_cast(dbl(), dec9_2, false));
+
+  for (auto& [name, expr] : cases) {
+    CAPTURE(name);
+    std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+    auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->is_direct());
+    exp_executor project(
+      *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    std::unique_ptr<cudf::table> projected;
+    REQUIRE_NOTHROW(projected = project.evaluate(tv));
+    CHECK(copy_valids_to_host(projected->view().column(0)) == std::vector<bool>{false, true});
+
+    // `<expr> IS NULL` keeps the value valid, so the FilterSink sees any poison of row 0 as well.
+    auto const pred = make_unary(sirius::ast::unary_op::kind::op_is_null, std::move(expr));
+    REQUIRE(sirius::nvrtc::plan_filter_sink(*pred, tv).has_value());
+    exp_executor filter(
+      *pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    std::unique_ptr<cudf::table> survivors;
+    REQUIRE_NOTHROW(survivors = filter.select(tv));
+    CHECK(survivors->num_rows() == 1);
+  }
+}
+
 TEST_CASE("nvrtc_jit - comparisons, IS [NOT] DISTINCT FROM, BETWEEN, NOT, and IS [NOT] NULL",
           "[expression_evaluator][nvrtc_jit][ticket6][narrow_domain]")
 {

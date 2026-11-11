@@ -144,8 +144,10 @@ constexpr char const* project_entry = "sirius_nvrtc_project_kernel";
           reg.var_name);
       }
       if (reg.can_overflow) {
-        src += std::format(
-          "{0}row_overflow = row_overflow || ({1}.valid && {1}.overflow);\n", indent, reg.var_name);
+        // A NULL value's poison counts too: see the invariant on `reg_val` in
+        // `device_runtime/reg_val.cuh`.
+        src +=
+          std::format("{0}row_overflow = row_overflow || {1}.overflow;\n", indent, reg.var_name);
       }
     }
     if (guarded) { src += "    }\n"; }
