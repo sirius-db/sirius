@@ -32,7 +32,6 @@ set -e
 ${exports:+export$exports}
 export PATH="\$HOME/.pixi/bin:\$PATH" CUDA_VISIBLE_DEVICES=$(printf %q "$gpu")
 cd $(printf %q "$root")
-source scripts/nixl_env.sh
 init=\$(mktemp /tmp/sirius_gateway_rank.XXXXXX)
 printf '%s\n' $(printf %q "$(cat "$init")") > "\$init"
 session=\$PPID
