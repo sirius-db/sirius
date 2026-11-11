@@ -17,6 +17,7 @@
 #pragma once
 
 #include "expression/aggregate_id.hpp"
+#include "op/window/aggregate_plan.hpp"
 #include "op/window/aggregate_types.hpp"
 #include "op/window/frame.hpp"
 
@@ -56,41 +57,9 @@ struct framed_aggregate {
  * plan_framed_window() builds it from the input schema and the requested aggregates, without
  * touching device memory, so a planner can build it once, decline the window when building
  * throws, and hand the plan to the operator. evaluate_framed_window() then executes it on each
- * table. The evaluation has three stages, each a list in this struct:
- *
- * 1. `values`: the columns the rolling aggregations read, derived from input columns.
- * 2. `requests`: the cuDF rolling aggregations, each over one value column, grouped by frame in
- *    `frames`. SQL aggregates that need the same aggregation of the same values over the same
- *    frame share one request.
- * 3. `outputs`: how each SQL aggregate's result is made from the request results.
+ * table. The requests are cuDF rolling aggregations, grouped by frame in `frames`.
  */
-struct framed_window_plan {
-  /// How a value column is derived from its input column.
-  enum class preparation : std::uint8_t {
-    none,          ///< The input column itself.
-    cast,          ///< The input cast to `type`.
-    nans_to_nulls  ///< The floating point input with NaN replaced by NULL.
-  };
-
-  struct value_column {
-    cudf::size_type input_column;
-    preparation how;
-    /// The type of the column after preparation.
-    cudf::data_type type;
-  };
-
-  /// A cuDF rolling aggregation.
-  enum class aggregation : std::uint8_t { sum, count_valid, count_all, min, max };
-
-  struct request {
-    /// Index into `values`.
-    std::size_t values;
-    aggregation kind;
-    /// The type of the request's result: the value type, except INT64 for a count, which is also
-    /// never NULL (an empty frame counts 0).
-    cudf::data_type type;
-  };
-
+struct framed_window_plan : window_aggregate_plan {
   /// A frame that is empty for every row. Its requests are NULL, or 0 for a count, without
   /// calling cuDF.
   struct empty_frame {};
@@ -139,41 +108,15 @@ struct framed_window_plan {
     std::vector<std::size_t> requests;
   };
 
-  /// The output is a request result as is.
-  struct output_request {
-    std::size_t request;
-  };
-  /// The output is the sum request divided by the count request, in FLOAT64.
-  struct output_average {
-    std::size_t sum;
-    std::size_t count;
-  };
-  /// The output is a floating point `min` or `max` over NaN free values, made NaN where NaN
-  /// orders above every other value: for `max` when the frame holds a NaN, and for `min` when
-  /// every non-NULL value of the frame is NaN. A frame holds a NaN where `count` exceeds
-  /// `finite_count`.
-  struct output_float_extremum {
-    std::size_t extremum;
-    std::size_t finite_count;
-    std::size_t count;
-    bool is_min;
-  };
-  using output_recipe = std::variant<output_request, output_average, output_float_extremum>;
-
-  struct output {
-    output_recipe recipe;
-    cudf::data_type type;
-    /// Throw std::overflow_error if a value reaches 10^38 (a SUM over DECIMAL128).
-    bool check_decimal38;
-  };
-
   std::vector<cudf::size_type> group_columns;
   window_order order;
-  std::vector<value_column> values;
-  std::vector<request> requests;
   std::vector<frame> frames;
-  std::vector<output> outputs;
 };
+
+/// The input columns evaluate_framed_window() needs in their logical types, each once: the
+/// aggregate arguments, and the order key when a frame has a RANGE offset, which is in the unit of
+/// the key's type. Every other group and order column only has to keep equality and order.
+std::vector<cudf::size_type> logical_type_columns(framed_window_plan const& plan);
 
 /**
  * @brief Plan the evaluation of framed window aggregates over tables of the schema @p input_types.

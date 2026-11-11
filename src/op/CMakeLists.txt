@@ -5,6 +5,7 @@ target_sources(
           aggregate/group_key_labels.cpp
           aggregate/carried_columns.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/aggregate_plan.cpp
           window/aggregate_types.cpp
           window/cumulative.cpp
           window/float_extremum.cpp

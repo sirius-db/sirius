@@ -786,10 +786,19 @@ TEST_CASE("framed window plan shares work and is decided from types alone", "[wi
   CHECK(plan.requests[sum.request].type == cudf::data_type{type_id::DECIMAL128, 0});
   CHECK(plan.requests[cnt.request].type == cudf::data_type{type_id::INT64});
   CHECK(std::holds_alternative<plan_type::peer_range_frame>(plan.frames[0].strategy));
-  // A ROWS frame whose start is after its end is empty. A float MAX reads the NaN free values and
-  // two counts.
+  // A ROWS frame whose start is after its end is empty.
   CHECK(std::holds_alternative<plan_type::empty_frame>(plan.frames[1].strategy));
   CHECK(std::holds_alternative<plan_type::output_float_extremum>(plan.outputs[3].recipe));
+  {
+    auto const& extremum = std::get<plan_type::output_float_extremum>(plan.outputs[3].recipe);
+    // The extremum reads the NaN free values and NaN comes back from the maximum of the NaN flags.
+    CHECK(plan.values[plan.requests[extremum.extremum].values].how ==
+          plan_type::preparation::nans_to_nulls);
+    CHECK(plan.requests[extremum.any_nan].kind == plan_type::aggregation::max);
+    CHECK(plan.values[plan.requests[extremum.any_nan].values].how ==
+          plan_type::preparation::nan_flags);
+    CHECK(plan.requests[extremum.any_nan].type == cudf::data_type{type_id::BOOL8});
+  }
   // A DECIMAL128 SUM is already in its accumulator type, so it reads the input as is and checks
   // DECIMAL(38).
   auto const& decimal_sum = std::get<plan_type::output_request>(plan.outputs[4].recipe);
@@ -801,6 +810,21 @@ TEST_CASE("framed window plan shares work and is decided from types alone", "[wi
   CHECK(forward.end.delta == -1);
   CHECK_FALSE(forward.clamp_reversed);
   CHECK(std::get<plan_type::offset_range_frame>(plan.frames[3].strategy).clamp_reversed);
+  // Every value column is read by a request.
+  for (std::size_t v = 0; v < plan.values.size(); ++v) {
+    CHECK(std::any_of(plan.requests.begin(), plan.requests.end(), [&](auto const& request) {
+      return request.values == v;
+    }));
+  }
+  // The arguments need their logical types, and so does the order key of a RANGE offset frame,
+  // but not the key of a frame of peers or the group columns.
+  CHECK(plan.argument_columns == std::vector<cudf::size_type>{1, 2, 3});
+  using columns = std::vector<cudf::size_type>;
+  CHECK(sirius::op::logical_type_columns(plan) == columns{1, 2, 3});
+  CHECK(sirius::op::logical_type_columns(sirius::op::plan_framed_window(
+          types, {0}, ascending({1}), {{function::sum, 3, offset}})) == columns{3, 1});
+  CHECK(sirius::op::logical_type_columns(sirius::op::plan_framed_window(
+          types, {0}, ascending({1}), {{function::sum, 3, running}})) == columns{3});
   // Huge ROWS offsets are clamped so that cuDF's bound arithmetic cannot overflow.
   auto const huge = sirius::op::plan_framed_window(
     types,

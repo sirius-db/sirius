@@ -692,8 +692,10 @@ TEST_CASE("window adapter restores narrow inputs and removes hidden slots", "[wi
     {logical_type::make(type_id::INTEGER), logical_type::make(type_id::HUGEINT)},
     {logical_type::make(type_id::INTEGER), logical_type::make(type_id::INTEGER)},
     1,
-    {0},
-    {{aggregate_id::sum, 1}},
+    plan_whole_partition_window(
+      {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+      {0},
+      {{aggregate_id::sum, 1}}),
     4);
   pipelineable_operator_data input({batch});
   input.prepare_for_processing(&space, stream);
@@ -758,7 +760,13 @@ TEST_CASE("window source drains assembled batches across repository partition ga
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
   auto outputs = types;
   outputs.push_back(sirius::from_duckdb(duckdb::LogicalType::HUGEINT));
-  sirius_physical_window window(outputs, types, 1, {0}, {{aggregate_id::sum, 0}}, 3);
+  sirius_physical_window window(
+    outputs,
+    types,
+    1,
+    plan_whole_partition_window(
+      {cudf::data_type{cudf::type_id::INT32}}, {0}, {{aggregate_id::sum, 0}}),
+    3);
   cucascade::shared_data_repository repo;
   repo.set_num_partitions(5);
   auto first  = make_numeric_batch<int32_t>(space, {1, 2}, cudf::type_id::INT32);

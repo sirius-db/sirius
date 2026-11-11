@@ -356,6 +356,34 @@ std::vector<std::vector<classified_expression>> split_window_into_stages(
   return stages;
 }
 
+// Plans how the whole-partition evaluator computes the aggregates of @p plan, refusing the window
+// when the evaluator cannot run them. The evaluator reads the partition keys and the arguments in
+// their logical types, so only their slots need a cuDF type.
+op::whole_partition_plan plan_aggregate_evaluation(window_plan const& plan)
+{
+  std::vector<cudf::data_type> types(plan.prepared_types.size(),
+                                     cudf::data_type{cudf::type_id::EMPTY});
+  auto const read = [&](duckdb::idx_t slot) {
+    auto const type = sirius::get_cudf_type(sirius::from_duckdb(plan.prepared_types[slot]));
+    if (!type) { decline("key or argument type"); }
+    types[slot] = *type;
+    return static_cast<cudf::size_type>(slot);
+  };
+  std::vector<cudf::size_type> keys;
+  for (auto const slot : plan.partition_slots) {
+    keys.push_back(read(slot));
+  }
+  std::vector<op::window_aggregate> aggregates;
+  for (auto const& expression : plan.expressions) {
+    aggregates.push_back({expression.function, read(expression.argument_slot)});
+  }
+  try {
+    return op::plan_whole_partition_window(types, keys, aggregates);
+  } catch (std::invalid_argument const&) {
+    decline("aggregate the evaluator cannot run");
+  }
+}
+
 // Plans the expressions of one stage of `window` over an input of `input_types`. The expressions
 // come from `split_window_into_stages`, so they share their kind, partitions and window order. The
 // input starts with the window child's columns, and a later stage of the same window also holds the
@@ -446,6 +474,9 @@ window_plan plan_window_stage(duckdb::LogicalWindow const& window,
                                 expression.WindowStart(),
                                 expression.WindowEnd(),
                                 output_slot});
+  }
+  if (plan.kind == window_kind::whole_partition) {
+    plan.aggregate_plan = plan_aggregate_evaluation(plan);
   }
   return plan;
 }
@@ -601,17 +632,14 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_stage(
     result->children.push_back(std::move(child));
     return result;
   }
-  std::vector<op::window_aggregate> aggregates;
-  for (auto const& expression : bound_plan.expressions) {
-    aggregates.push_back(
-      {expression.function, static_cast<cudf::size_type>(expression.argument_slot)});
+  if (!bound_plan.aggregate_plan) {
+    throw duckdb::InternalException("Window stage of aggregates lacks its evaluation plan");
   }
   auto result =
     duckdb::make_uniq<op::sirius_physical_window>(sirius::from_duckdb_vec(bound_plan.output_types),
                                                   std::move(prepared),
                                                   bound_plan.input_width,
-                                                  std::move(keys),
-                                                  std::move(aggregates),
+                                                  *bound_plan.aggregate_plan,
                                                   estimated_cardinality);
   result->children.push_back(std::move(child));
   return result;
