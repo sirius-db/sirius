@@ -1,5 +1,4 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
-#include "io/kvikio/kvikio_context.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/detail/read_retirement.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
@@ -22,6 +21,7 @@
 #include <cuda/stream>
 
 #include <catch.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -381,11 +381,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       CHECK(facts.predicates.front().stage == sirius::op::predicate_stage::enforced);
   };
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto coalescer  = ingestible->create_batch_coalescer();
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto prepare = ingestible->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
     auto prepared = prepare({});
     auto& file    = dynamic_cast<parquet_file_scan_info&>(*prepared);
     CHECK(file.requires_row_positions == virtual_row);
@@ -628,9 +628,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   else
     ingestible = make_ingestible(std::unique_ptr<iceberg_ingestible_table_info>(
       static_cast<iceberg_ingestible_table_info*>(info.release())));
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto prepared                = prepare({});
   auto const preparation_bytes = prepared->preparation_bytes();
   if (!virtual_kind && mode != "parquet") {
@@ -764,12 +764,12 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     decoded_sources += !footer;
   };
   auto reader    = make_ingestible(std::move(info));
-  auto ioctx     = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx     = std::make_shared<cucascade::io::kvikio_context>();
   auto coalescer = reader->create_batch_coalescer();
   std::vector<std::unique_ptr<scan_info>> splits;
   std::size_t groups = 0;
   while (auto prepare = reader->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
     auto metadata = prepare({});
     groups += dynamic_cast<parquet_file_scan_info const&>(*metadata).row_groups.size();
     for (auto& split : coalescer->push(std::move(metadata)))
@@ -827,12 +827,12 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     REQUIRE(deletes);
     REQUIRE_FALSE(deletes->HasError());
   }
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(directory.file("deletes.parquet"));
   // Exercise the real V2 eager loader with unsorted, duplicate negative and valid
   // positions before either visibility implementation sees the sorted list.
-  auto payload = load_delete_payload(*con->context, "split-ranges", ioctx.get(), {}, discovery);
+  auto payload = load_delete_payload(*con->context, "split-ranges", ioctx, discovery);
   REQUIRE(payload);
   REQUIRE(payload->positional_deletes.at(path) == std::vector<int64_t>{-3, -1, -1, 11, 11});
   auto info                 = std::make_unique<iceberg_ingestible_table_info>();
@@ -880,7 +880,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   };
   auto reader  = make_ingestible(std::move(info));
   auto prepare = reader->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto metadata    = prepare({});
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
   REQUIRE(file.row_groups.size() == (pruned ? 1 : 2));
@@ -990,7 +990,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       expected_rows.push_back(row);
     }
   }
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto context = sirius::test::get_registered_sirius_context(*con);
   auto* space  = context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
@@ -1025,7 +1025,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
     iceberg_delete_discovery discovery;
     discovery.positional_delete_files.push_back(directory.file(delete_name));
-    auto payload = load_delete_payload(*con->context, delete_name, ioctx.get(), {}, discovery);
+    auto payload = load_delete_payload(*con->context, delete_name, ioctx, discovery);
     REQUIRE(payload);
     REQUIRE(payload->positional_deletes.size() == paths.size());
     for (std::size_t file = 0; file < paths.size(); ++file) {
@@ -1079,8 +1079,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     auto reader    = make_ingestible(std::move(info));
     auto coalescer = reader->create_batch_coalescer();
     std::vector<std::unique_ptr<scan_info>> splits;
-    while (auto prepare = reader->next_split_provider(
-             [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+    while (
+      auto prepare = reader->next_split_provider(
+        [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
       auto ready = coalescer->push(prepare({}));
       for (auto& split : ready)
         splits.push_back(std::move(split));
@@ -1237,7 +1238,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto reader  = make_ingestible(std::move(info));
   auto ioctx   = std::make_shared<sirius::test::tracking_kvikio_context>(bulk);
   auto prepare = reader->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto coalescer = reader->create_batch_coalescer();
   auto splits    = coalescer->push(prepare({}));
   for (auto& split : coalescer->flush())
@@ -1348,9 +1349,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       std::make_shared<std::vector<int64_t> const>(
         deleted_row < 0 ? std::vector<int64_t>{} : std::vector<int64_t>{deleted_row})));
   auto reader  = make_ingestible(std::move(info));
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare = reader->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto metadata    = prepare({});
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
   CHECK_FALSE(file.position_filter_eligible);
@@ -1498,9 +1499,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   };
   auto reader = make_ingestible(std::move(info));
   reader->attach_preparation_ledger(ledger);
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto claimed = reader->try_claim_split(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(std::holds_alternative<preparation_job>(claimed));
   auto work = std::move(std::get<preparation_job>(claimed));
   work.unit = std::make_shared<preparation_unit>(work.requirement->key, work.requirement->required);

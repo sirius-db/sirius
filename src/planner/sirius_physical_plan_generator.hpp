@@ -137,13 +137,6 @@ class sirius_physical_plan_generator {
   //! sink
   static bool use_batch_index(duckdb::ClientContext& context,
                               sirius::op::sirius_physical_operator& plan);
-  //! Whether or not we should preserve insertion order for executing the given sink
-  static bool preserve_insertion_order(duckdb::ClientContext& context,
-                                       sirius::op::sirius_physical_operator& plan);
-  //! The order preservation type of the given operator decided by recursively looking at its
-  //! children
-  static sirius::OrderPreservationType order_preservation_recursive(
-    sirius::op::sirius_physical_operator& op);
 
   //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
   //! type; @p subject names the input in the message.
@@ -257,11 +250,12 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
     duckdb::LogicalSetOperation& op);
 
-  //! A zero-aggregate grouped aggregate over @p child keyed on its @p key_columns, in that order;
-  //! its output is exactly those columns.
+  //! A grouped aggregate over @p child keyed on its @p key_columns, in that order, carrying each of
+  //! @p carried_columns through a FIRST; its output is the keys, then the carried columns.
   static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_dedup(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
     std::span<duckdb::idx_t const> key_columns,
+    std::span<duckdb::idx_t const> carried_columns,
     duckdb::idx_t estimated_cardinality);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
@@ -281,7 +275,6 @@ class sirius_physical_plan_generator {
                                         std::string_view operation);
 
   // private:
-  bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
   std::size_t delim_index = 0;

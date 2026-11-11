@@ -27,7 +27,7 @@ namespace sirius::test {
  *
  * On the first call it:
  *   1. starts a local SeaweedFS process serving HTTP and self-signed TLS,
- *   2. generates and uploads fixtures using Sirius's SigV4 signer and libcurl,
+ *   2. generates and uploads fixtures using cuCascade's SigV4 signer and libcurl,
  *   3. publishes the SIRIUS_TEST_S3_* environment variables.
  * The process is terminated by shutdown_s3_test_env(); Linux also sends it
  * SIGKILL if the test process dies. The weed binary comes from PATH (Pixi),

@@ -34,6 +34,12 @@ namespace op {
 //! the data but only add a selection vector.
 class sirius_physical_top_n : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    // Local sorting does not establish a sequence across independently completed batches.
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TOP_N;
 
  public:
@@ -53,10 +59,6 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
-  sirius::OrderPreservationType source_order() const override
-  {
-    return sirius::OrderPreservationType::FIXED_ORDER;
-  }
 
  public:
   bool is_sink() const override { return true; }

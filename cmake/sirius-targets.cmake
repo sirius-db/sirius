@@ -45,8 +45,10 @@ set(SIRIUS_LINK_LIBRARIES
     spdlog::spdlog
     cuCascade::cucascade
     cuCascade::cucascade_cudf
+    cuCascade::cucascade_io
     yaml-cpp::yaml-cpp
     roaring::roaring
+    nixl::nixl
     telemetry_bridge
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
@@ -56,9 +58,6 @@ set(SIRIUS_LINK_LIBRARIES
     OpenSSL::Crypto
     absl::any_invocable
     kvikio::kvikio)
-if(BUILD_WITH_CTRACK)
-  list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
-endif()
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -117,7 +116,8 @@ foreach(_target sirius_objects sirius_core sirius_shared)
 
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
-  # (cuCascade::cucascade) and cudf::cudf.
+  # (cuCascade::cucascade) and cudf::cudf. cuCascade::cucascade_io is the io
+  # library (uring/REST/kvikio reactors, fs_cache) Sirius consumes directly.
 
   target_link_libraries(${_target} PRIVATE ${SIRIUS_LINK_LIBRARIES})
 

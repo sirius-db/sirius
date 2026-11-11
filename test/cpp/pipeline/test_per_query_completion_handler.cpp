@@ -64,7 +64,7 @@ bool is_ready(std::future<void>& f)
 TEST_CASE("completing one query leaves another query's future unset",
           "[completion_handler][per_query]")
 {
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto handler_a = std::make_shared<completion_handler>();
   auto handler_b = std::make_shared<completion_handler>();
   auto future_a  = handler_a->get_awaitable();
@@ -85,7 +85,7 @@ TEST_CASE("completing one query leaves another query's future unset",
 TEST_CASE("one query's failure does not poison another's handler",
           "[completion_handler][per_query]")
 {
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto handler_a = std::make_shared<completion_handler>();
   auto handler_b = std::make_shared<completion_handler>();
   auto future_b  = handler_b->get_awaitable();
@@ -104,7 +104,7 @@ TEST_CASE("one query's failure does not poison another's handler",
 
 TEST_CASE("the handler outlives the engine-side reference", "[completion_handler][per_query]")
 {
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto handler = std::make_shared<completion_handler>();
   auto future  = handler->get_awaitable();
   auto gs      = make_global_state(ctx, handler);
@@ -127,7 +127,7 @@ TEST_CASE("the handler outlives the engine-side reference", "[completion_handler
 
 TEST_CASE("every pipeline of one query shares its handler", "[completion_handler][per_query]")
 {
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto handler = std::make_shared<completion_handler>();
 
   // prepare_for_query stamps the same handler onto each pipeline's global state, so whichever
@@ -142,7 +142,7 @@ TEST_CASE("every pipeline of one query shares its handler", "[completion_handler
 TEST_CASE("a global state built without a query carries no handler",
           "[completion_handler][per_query]")
 {
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(ctx);
   sirius_pipeline_task_global_state gs(pipeline, sirius::test::make_test_telemetry_context());
 

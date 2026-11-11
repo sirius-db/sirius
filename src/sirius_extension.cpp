@@ -88,6 +88,9 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
+#include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
+#include "late_mat/column_origin.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -108,15 +111,6 @@ extern "C" int cudaProfilerStop();
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
-
-// PinTableFunction routes parquet reads through the scan manager's ioctx
-// instead of cudf's bundled file_source factory (which uses kvikio internally
-// and binds to a single CUDA context). This is mandatory in multi-GPU
-// configurations (enforced by sirius_config::enforce_sirius_backend_for_multi_gpu()).
-// Single-GPU users may still opt out via backend=kvikio; the
-// pin pipeline always routes through ioctx when one is available.
-#include "io/s3/duckdb_secret_config.hpp"
-#include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 
 #include <cuda_runtime_api.h>
 
@@ -1354,19 +1348,17 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       }
     }
 
-    // Uniqueness probe: which pinned columns to observe for whole-table distinctness.
-    // SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS names columns late materialization needs; the
-    // names outlive cache_info, which every insert path moves from.
+    // Uniqueness probe: with pin_table_prove_unique_keys, every column of a parquet pin is
+    // observed for whole-table distinctness, as a join-key candidate and for late materialization.
+    // A native table's scan takes the planner's PRIMARY KEY branch and never reads pin facts for
+    // joins, so its columns are observed only when late materialization is on and could use them;
+    // otherwise it would only cost pin time and GPU memory. The names outlive cache_info, which
+    // every insert path moves from.
     auto const pinned_column_names = cache_info.column_names();
-    auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
-    // With pin_table_prove_unique_keys, every other column of a parquet pin is observed too, as a
-    // join-key candidate. A native table's scan takes the planner's PRIMARY KEY branch and never
-    // reads pin facts, so observing its columns would only cost pin time and GPU memory.
-    auto const probe_unique_automatic = sirius::late_mat::pin_unique_automatic_selection(
-      probe_unique_columns, unique_cfg->prove_unique_keys && data.args.format == "parquet");
-    for (std::size_t i = 0; i < probe_unique_columns.size(); ++i) {
-      if (probe_unique_automatic[i]) { probe_unique_columns[i] = true; }
-    }
+    auto const probe_unique_columns =
+      std::vector<bool>(pinned_column_names.size(),
+                        unique_cfg->prove_unique_keys &&
+                          (data.args.format == "parquet" || sirius::late_mat::late_mat_enabled()));
 
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                             std::vector<std::size_t> row_counts) {
@@ -1384,6 +1376,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       return metadata;
     };
 
+    // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
+    // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
+    // That is mandatory on multi-GPU.
     if (data.args.tier == "host") {
       // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
       // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
@@ -1403,7 +1398,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
          .capture_chunk_stats               = capture_chunk_stats,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
-         .probe_unique_automatic            = probe_unique_automatic,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
@@ -1437,7 +1431,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
          .capture_chunk_stats               = false,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
-         .probe_unique_automatic            = probe_unique_automatic,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
@@ -1462,7 +1455,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
          .capture_chunk_stats               = capture_chunk_stats,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
-         .probe_unique_automatic            = probe_unique_automatic,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
@@ -2675,7 +2667,7 @@ static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Val
 {
   auto* params                     = get_operator_params(context, scope);
   params->max_sort_partition_bytes = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
+  SIRIUS_LOG_DEBUG("Updated config max_sort_partition_bytes to {}",
                    params->max_sort_partition_bytes);
 }
 

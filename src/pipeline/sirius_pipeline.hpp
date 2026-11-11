@@ -193,9 +193,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! be done later.
   void notify_downstream_pipelines(bool original_pipeline);
 
-  //! Returns whether any of the operators in the pipeline care about preserving order
-  bool is_order_dependent() const;
-
   //! Registers a new batch index for a pipeline executor - returns the current minimum batch index
   std::size_t register_new_batch_index();
 
@@ -212,6 +209,9 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   void update_pipeline_status(bool original_pipeline = true);
   //! Checks if the pipeline has been finished
   virtual bool is_pipeline_finished() const;
+
+  //! True once any inline LIMIT has claimed its quota; in-flight tasks must still finish.
+  [[nodiscard]] bool is_limit_exhausted() const;
 
   //! Query-terminal sink (RESULT_COLLECTOR or STREAMING_SINK): no downstream schedule/wiring;
   //! completion signals execute().

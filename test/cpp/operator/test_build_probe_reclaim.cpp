@@ -20,6 +20,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 #include "utils/scoped_temp_directory.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -94,7 +95,7 @@ struct reclaim_join_harness {
   std::shared_ptr<finished_stub_pipeline> probe_src_pipeline;
   std::shared_ptr<finished_stub_pipeline> build_src_pipeline;
   std::shared_ptr<sirius_pipeline> dest_pipeline;
-  sirius_physical_operator probe_sink, probe_op, build_sink, build_op, dest_sink;
+  test_physical_operator probe_sink, probe_op, build_sink, build_op, dest_sink;
 };
 
 std::unique_ptr<reclaim_join_harness> make_reclaim_join_harness(duckdb::JoinType join_type)
@@ -112,12 +113,12 @@ std::unique_ptr<reclaim_join_harness> make_reclaim_join_harness(duckdb::JoinType
       duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
   }
 
-  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto left_child = duckdb::make_uniq<test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
                                                                 duckdb::LogicalType::INTEGER}),
     0);
-  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto right_child = duckdb::make_uniq<test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);

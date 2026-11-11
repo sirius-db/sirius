@@ -18,7 +18,7 @@ use quent_query_engine_analyzer::{
     OperatorEntityMut, QueryEngineModel, QueryEngineModelMut, plan_tree::PlanTree,
 };
 use quent_query_engine_ui::EntityRef;
-use quent_ui::ResourceGroupTypeDecl;
+use quent_ui::{FsmTypeSelection, ResourceGroupTypeDecl};
 use uuid::Uuid;
 
 pub use crate::boilerplate::{Engine, Operator, Plan, Port, Query, QueryGroup, Worker};
@@ -76,7 +76,7 @@ fn derive_resource_scope_types(
                 let (used_by, contains) = declarations.entry(type_name).or_default();
                 for resource_type in contained_types {
                     contains.insert(resource_type.name.clone());
-                    used_by.extend(resource_type.used_by.iter().cloned());
+                    used_by.extend(resource_type.used_by.iter().map(ToString::to_string));
                 }
             }
         }
@@ -96,7 +96,9 @@ fn derive_resource_scope_types(
                 name.clone(),
                 ResourceGroupTypeDecl {
                     name,
-                    used_by_entity_types: used_by_entity_types.into_iter().collect(),
+                    display_order: std::iter::once(FsmTypeSelection::All)
+                        .chain(used_by_entity_types.into_iter().map(FsmTypeSelection::Type))
+                        .collect(),
                     contains_resource_types: contains_resource_types.into_iter().collect(),
                 },
             )
@@ -356,11 +358,17 @@ impl SiriusModel {
                 .resource(usage.resource_id())
                 .map(Entity::type_name)?
                 .to_owned();
-            self.resource_types
+            let entity_type = entity_type_name
+                .parse()
+                .map_err(|_| AnalyzerError::InvalidTypeName(entity_type_name.to_owned()))?;
+            let used_by = &mut self
+                .resource_types
                 .get_mut(&resource_type_name)
                 .ok_or_else(|| AnalyzerError::InvalidTypeName(resource_type_name.clone()))?
-                .used_by
-                .insert(entity_type_name.to_owned());
+                .used_by;
+            if !used_by.contains(&entity_type) {
+                used_by.push(entity_type);
+            }
         }
         Ok(())
     }

@@ -19,6 +19,11 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
+if(VCPKG_BUILD)
+  find_package(nixl 1.5.2 EXACT CONFIG REQUIRED)
+else()
+  include(${CMAKE_CURRENT_LIST_DIR}/sirius-nixl-build.cmake)
+endif()
 
 # The static vcpkg build only exports cuvs::cuvs_static; shared cuvs packages
 # already provide cuvs::cuvs. Provide the canonical name when it is missing so
@@ -77,25 +82,6 @@ else()
   endif()
 endif()
 
-# CTrack is retained as an opt-in profiling dependency.
-if(BUILD_WITH_CTRACK)
-  # --- ctrack (profiling instrumentation) --- #
-  include(FetchContent)
-  FetchContent_Declare(
-    ctrack
-    GIT_REPOSITORY https://github.com/Compaile/ctrack.git
-    GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
-    SOURCE_SUBDIR do-not-build)
-  FetchContent_MakeAvailable(ctrack)
-  if(NOT TARGET ctrack::ctrack)
-    add_library(ctrack::ctrack INTERFACE IMPORTED)
-    set_target_properties(
-      ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                "${ctrack_SOURCE_DIR}/include")
-  endif()
-
-endif()
-
 if(VCPKG_BUILD)
   set(_sirius_pkg_config_path "$ENV{PKG_CONFIG_PATH}")
   set(ENV{PKG_CONFIG_PATH}
@@ -125,15 +111,28 @@ set(CUCASCADE_BUILD_SHARED_LIBS OFF)
 set(CUCASCADE_BUILD_STATIC_LIBS ON)
 set(CUCASCADE_BUILD_CUDF ON)
 set(CUCASCADE_WARNINGS_AS_ERRORS OFF)
-set(CUCASCADE_BUILD_IO OFF)
+# cuCascade io's swappable third-party backends are pointed at the copies Sirius
+# already links so both sides of the boundary share one ABI: exec::invocable is
+# absl::AnyInvocable (Sirius's type) and moodycamel is duckdb's vendored fork
+# (namespace duckdb_moodycamel, target from sirius-duckdb-provider.cmake).
+set(CUCASCADE_BUILD_IO ON)
+set(CUCASCADE_USE_ABSEIL_INVOCABLE ON)
+set(CUCASCADE_MOODYCAMEL_TARGET duckdb::moodycamel)
+set(CUCASCADE_MOODYCAMEL_NAMESPACE duckdb_moodycamel)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 endblock()
 # cuCascade has no C++ modules; scanning breaks older compiler caches.
-set_target_properties(
-  cucascade_objects cucascade_cudf_objects cucascade_topology_discovery_objects
-  PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-foreach(target cucascade_objects cucascade_cudf_objects)
-  target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+# cucascade_io_objects exists only when CUCASCADE_BUILD_IO is ON.
+foreach(target cucascade_objects cucascade_cudf_objects
+               cucascade_topology_discovery_objects cucascade_io_objects)
+  if(TARGET ${target})
+    set_target_properties(${target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+  endif()
+endforeach()
+foreach(target cucascade_objects cucascade_cudf_objects cucascade_io_objects)
+  if(TARGET ${target})
+    target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+  endif()
 endforeach()
 # Topology discovery gets NVTX only from CUDA::nvtx3, i.e. the toolkit include
 # directory. Split toolkits (e.g. conda) install the headers elsewhere. Remove

@@ -98,7 +98,9 @@ Versions 12080–12999 select `sirius_cuda12`; 13000 and newer select `sirius_cu
 When `autoinstall_known_extensions` is enabled and the selected backend is not
 installed yet, `LOAD sirius` downloads it from DuckDB's community repository (or
 the configured auto-install repository); without a usable driver it does no
-network I/O. The loader does not retry with the other CUDA version.
+network I/O. Because the backend is large, the loader prints a status line to
+stderr when this one-time install starts and another when it finishes or fails, and
+logs both at `INFO` level. The loader does not retry with the other CUDA version.
 
 If the driver is missing, supports a CUDA version below 12.8, or cannot report its
 version, or the selected backend is not installed, cannot be installed, or its
@@ -108,8 +110,12 @@ DuckDB's CPU execution untouched: it registers no optimizer hook and
 `gpu_execution(...)` table function, then fail with the recorded reason, such as
 `Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: cannot open
 libcuda.so.1 (...)`. The fallback is logged once at `INFO` level to
-`duckdb_logs`, and the loader prints nothing. The result is cached per database:
-loading the backend after a fallback needs a new database instance.
+`duckdb_logs`. When the fallback follows a failed one-time install, the loader
+adds a status line to stderr saying that queries run on DuckDB's CPU engine and
+that `sirius_status()` shows why. Every other fallback, such as no usable driver or
+a backend that is not installed or cannot be loaded without an install attempt,
+prints nothing. The result is cached per database: loading the backend after a
+fallback needs a new database instance.
 
 `LOAD sirius` still fails if the database already has the other backend loaded,
 if the loader is loaded under a backend name, or if the backend fails once its

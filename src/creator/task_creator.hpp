@@ -56,8 +56,12 @@ namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
 
-namespace sirius::memory {
+namespace cucascade::memory {
 class topology_index;
+}  // namespace cucascade::memory
+
+namespace sirius::memory {
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::parallel {
@@ -186,7 +190,7 @@ class task_creator {
   /// registered queries; unknown IDs are harmless for partial initialization/repeated cleanup.
   void reset(sirius::query_id_t query_id);
 
-  /// \brief Drop every query's state. Teardown only (SiriusContext::terminate).
+  /// \brief Drop every query's state. Teardown only (SiriusContext::release_resources).
   void reset_all();
 
   /**

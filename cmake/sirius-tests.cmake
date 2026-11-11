@@ -24,27 +24,26 @@ set_target_properties(
 add_dependencies(sirius_unittest sirius_extension_host)
 
 # Compile the public API test separately so engine tests remain C++20.
-add_library(sirius_context_config_test OBJECT
-            test/cpp/config/test_context_config.cpp)
-target_compile_features(sirius_context_config_test PRIVATE cxx_std_23)
-target_compile_definitions(sirius_context_config_test
+add_library(
+  sirius_public_api_test OBJECT test/cpp/config/test_context_config.cpp
+                                test/cpp/config/test_public_context.cpp)
+target_compile_features(sirius_public_api_test PRIVATE cxx_std_23)
+target_compile_definitions(sirius_public_api_test
                            PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
-set_target_properties(sirius_context_config_test PROPERTIES CXX_SCAN_FOR_MODULES
-                                                            OFF)
+set_target_properties(sirius_public_api_test PROPERTIES CXX_SCAN_FOR_MODULES
+                                                        OFF)
 target_include_directories(
-  sirius_context_config_test BEFORE
+  sirius_public_api_test BEFORE
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(sirius_context_config_test PRIVATE sirius_core
-                                                         Catch2::Catch2)
+target_link_libraries(sirius_public_api_test PRIVATE sirius_core Catch2::Catch2)
 if(VCPKG_BUILD)
-  set_target_properties(sirius_context_config_test
+  set_target_properties(sirius_public_api_test
                         PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
-  target_include_directories(sirius_context_config_test BEFORE
+  target_include_directories(sirius_public_api_test BEFORE
                              PRIVATE ${_VCPKG_INC})
 endif()
-target_sources(sirius_unittest
-               PRIVATE $<TARGET_OBJECTS:sirius_context_config_test>)
+target_sources(sirius_unittest PRIVATE $<TARGET_OBJECTS:sirius_public_api_test>)
 
 # Test variant of the connector registry: the same translation unit compiled
 # with the test-connector override seam. Linking the object ahead of sirius_core
@@ -225,7 +224,8 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
 
 # -----------------------------------------------------------------------------
-# test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
+# test/io/parquet_benchmark — standalone benchmark binary for
+# cucascade::io::datasource
 # -----------------------------------------------------------------------------
 add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
 
@@ -251,6 +251,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(parquet_benchmark)
@@ -290,6 +291,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(prefetch_benchmark)
@@ -332,6 +334,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(prefetch_hybrid_scan_benchmark)
@@ -371,6 +374,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(columnar_parquet_poc)
@@ -410,6 +414,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(retirer_benchmark)
@@ -450,6 +455,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(s3_throughput_test)
@@ -492,6 +498,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(s3_autotune_throughput_bench)
@@ -532,6 +539,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 sirius_link_duckdb_extensions(range_prefetch_benchmark)

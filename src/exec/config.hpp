@@ -16,24 +16,20 @@
 
 #pragma once
 
+#include <cucascade/exec/config.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <optional>
-#include <string>
-#include <vector>
 
 namespace sirius::exec {
 
-/// Default pool sizes. The scan-manager pool takes the cores these leave over
-/// (see scan_manager::default_scan_manager_num_threads).
-inline constexpr int default_gpu_pipeline_num_threads = 4;
-inline constexpr int default_downgrade_num_threads    = 1;
+using cucascade::exec::default_gpu_pipeline_num_threads;
+using cucascade::exec::thread_pool_config;
 
-struct thread_pool_config {
-  int num_threads{0};
-  std::string thread_name_prefix{"thread"};
-  std::vector<int> cpu_affinity_list;
-};
+/// Default downgrade pool size. The scan-manager pool takes the cores these leave over
+/// (see scan_manager::default_scan_manager_num_threads).
+inline constexpr int default_downgrade_num_threads = 1;
 
 /// Configuration for the downgrade executor.
 /// Embeds the thread pool config plus downgrade-specific settings.
@@ -52,11 +48,10 @@ struct downgrade_executor_config {
   std::size_t copy_chunk_bytes{1ull << 30};
 
   /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
-  /// When set, the GPU->HOST downgrade dispatch uses
-  /// cucascade::memory::any_memory_space_in_tier_with_preference{Tier::HOST, *preferred_numa_node}
-  /// so batches downgrade to the NUMA-local host memory_space when capacity is available,
-  /// with cross-NUMA fallback. When unset (nullopt), the downgrade dispatch uses the
-  /// unpreferred any_memory_space_in_tier{Tier::HOST} strategy (single-GPU default behavior).
+  /// When set, the GPU->HOST downgrade orders the matching HOST memory_space(s) first in its
+  /// target list, so batches downgrade to the NUMA-local host memory_space when capacity is
+  /// available, with cross-NUMA fallback. When unset (nullopt), HOST spaces are tried in the
+  /// reservation manager's order (single-GPU default behavior).
   /// Populated by SiriusContext from config_.get_hw_topology().gpus[device_id].numa_node.
   std::optional<int> preferred_numa_node;
 };

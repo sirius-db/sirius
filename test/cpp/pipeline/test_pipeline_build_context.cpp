@@ -25,7 +25,7 @@ TEST_CASE("Engine pipeline context derives GPU count from configured device ids"
           "[sirius][pipeline][config]")
 {
   std::vector<int> configured_gpu_ids{1, 3};
-  sirius::pipeline::pipeline_build_context context{nullptr, true, std::move(configured_gpu_ids)};
+  sirius::pipeline::pipeline_build_context context{nullptr, std::move(configured_gpu_ids)};
 
   REQUIRE(context.num_gpus() == 2);
   REQUIRE(context.active_gpu_ids() == std::vector<int>{1, 3});
@@ -34,14 +34,14 @@ TEST_CASE("Engine pipeline context derives GPU count from configured device ids"
 TEST_CASE("Engine pipeline context rejects an empty configured GPU set",
           "[sirius][pipeline][config]")
 {
-  REQUIRE_THROWS_AS(sirius::pipeline::pipeline_build_context(nullptr, true, std::vector<int>{}),
+  REQUIRE_THROWS_AS(sirius::pipeline::pipeline_build_context(nullptr, std::vector<int>{}),
                     std::invalid_argument);
 }
 
 TEST_CASE("Pipeline context retains explicit GPU counts for engine-free tests",
           "[sirius][pipeline][config]")
 {
-  sirius::pipeline::pipeline_build_context context{nullptr, true, 3};
+  sirius::pipeline::pipeline_build_context context{nullptr, 3};
 
   REQUIRE(context.num_gpus() == 3);
   REQUIRE(context.active_gpu_ids().empty());
@@ -52,7 +52,7 @@ TEST_CASE("Pipeline context copies share immutable query policy and LIKE cache",
 {
   auto operator_params = std::make_shared<sirius::operator_params>();
   auto like_cache      = std::make_shared<sirius::like_multiliteral_cache>();
-  sirius::pipeline::pipeline_build_context context{nullptr, true, 1, operator_params, like_cache};
+  sirius::pipeline::pipeline_build_context context{nullptr, 1, operator_params, like_cache};
 
   auto context_copy = context;
 

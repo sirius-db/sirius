@@ -20,7 +20,7 @@ You are analyzing GPU performance profiles for Sirius, a GPU-accelerated SQL que
 1. **Profiled runs** → Use for GPU analysis (kernels, operators, occupancy, memory, bottlenecks)
 2. **Non-profiled runs** → Use for accurate performance timing (cold/hot comparisons, regression detection)
 
-Always run both when comparing performance across code changes.
+Use both kinds of evidence when comparing performance across code changes. If non-profiled timings are unavailable, report that limitation rather than claiming a measured improvement or regression.
 
 ## Workflows
 
@@ -28,7 +28,7 @@ There are four workflows — choose based on what the user wants:
 
 ### Workflow A: Full Performance Analysis (recommended)
 
-This is the complete workflow: profile for GPU analysis, then run without profiling for accurate timings. Both runs should use the same queries, scale factor, and iteration count.
+This is the complete workflow: profile for GPU analysis, then run without profiling for accurate timings. Both runs should match the queries, dataset, scale factor, iteration count, config, and relevant cache and pin settings.
 
 **Step 1: Profiled run** (for GPU analysis data)
 ```bash
@@ -53,7 +53,7 @@ pixi run python test/tpch_performance/performance_test.py \
 
 The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,query,iteration,runtime_s`) and per-query `result.txt`. `--validation` additionally byte-compares the saved Sirius vs DuckDB results (with a small `abs_tol` on floats).
 
-**Data source (parquet or duckdb).** `--input` accepts either a parquet directory (`--data-source parquet`, the default) or a single `.duckdb` file (`--data-source duckdb`, exercising the GPU-native `seq_scan`); `--pin gpu|host` works for both. Profiling works for both sources through the **same** orchestrator — `nsys_report.sh --data-source duckdb --duckdb-file <file>.duckdb` (or just `--sf <SF>`, which defaults to `test_datasets/tpch_sf<SF>.duckdb`). See `test/tpch_performance/CLAUDE.md`.
+**Data source (parquet or duckdb).** `--input` accepts either a parquet directory (`--data-source parquet`, the default) or a single `.duckdb` file (`--data-source duckdb`, exercising the GPU-native `seq_scan`); `--pin gpu|host` works for both. Profiling works for both sources through the **same** orchestrator — `nsys_report.sh --data-source duckdb --duckdb-file <file>.duckdb` (or just `--sf <SF>`, which defaults to `test_datasets/tpch_sf<SF>.duckdb`). See `test/tpch_performance/README.md`.
 
 **When comparing across runs:**
 - Use the non-profiled timings to determine if performance actually improved or regressed
@@ -91,7 +91,7 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
     sirius/q<N>/{nsys.nsys-rep, nsys.sqlite, nsys.sql, timings.csv, log_dir/}
 ```
 
-**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
+**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/README.md` for the full layout.
 
 ### Workflow B: Generate Report from Existing Profiles
 
@@ -123,7 +123,9 @@ Default threshold is 10%. Values beyond the threshold are flagged:
 
 ## Before Running
 
-- **Ask the user** for any paths you don't know. Do NOT assume paths.
+- Use supplied paths and valid documented defaults. Look for existing profiles, datasets, and config before asking for paths; ask when the intended input remains ambiguous. Do not generate expensive datasets without authorization.
+- Check Sirius logs for GPU fallback and errors before attributing timings to GPU execution. A result file alone is not evidence of GPU execution; report when the evidence is unavailable.
+- Report the exact invocation and effective config path for new runs, including a derived config path if one was written.
 - For profiling (Workflow A without `--profile-dir`), the Sirius config must be set:
   ```bash
   export SIRIUS_CONFIG_FILE=<path_to_config>

@@ -22,7 +22,7 @@
 #include "data/sirius_converter_registry.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/io_context.hpp"
+#include "io/ioctx_resolver.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/runtime_stream_pool.hpp"
@@ -46,6 +46,7 @@
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -221,7 +222,7 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 std::vector<late_mat::unique_verdict> materialize_pin_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options,
   const pin_batch_sink& on_batch,
@@ -256,7 +257,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   // Whole-table distinctness proof, accumulated chunk by chunk. Inactive (and
   // free) unless the caller selected columns to observe.
-  late_mat::unique_probe unique_probe{options.probe_unique_columns, options.probe_unique_automatic};
+  late_mat::unique_probe unique_probe{options.probe_unique_columns};
 
   // The cheap per-chunk pass usually leaves a key UNDECIDED: chunk ranges
   // overlap, because the coalescer interleaves row groups rather than
@@ -278,6 +279,9 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   std::vector<std::size_t> exact_bytes(options.probe_unique_columns.size(), 0);
   std::size_t exact_total_bytes = 0;
   std::vector<bool> exact_declined(options.probe_unique_columns.size(), false);
+  // Order in which the retained copies claim memory (late_mat::exact_retention_priority), set from
+  // the first retained chunk's types.
+  std::vector<std::size_t> exact_priority;
   // Gives back everything retained for one column: its chunks, their reservations and bytes.
   auto release_exact_column = [&](std::size_t column_pos) {
     exact_total_bytes -= exact_bytes[column_pos];
@@ -365,7 +369,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // reduce and equally conclusive.
     if (unique_probe.active()) {
       nvtx_scoped_range probe_range{"sirius::pin::unique_probe"};
-      // The probe may sort a chunk of an automatic column; hold a reservation for each sort, and
+      // The probe may sort a chunk of a column; hold a reservation for each sort, and
       // let the probe drop the column when the memory space cannot grant one.
       decltype(target->make_reservation_or_null(std::size_t{})) sort_reservation;
       unique_probe.observe(tbl->view(), stream, [&](std::size_t bytes) {
@@ -395,45 +399,63 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
         for (cudf::size_type c = 0; c < tbl->num_columns(); ++c) {
           batch_bytes += tbl->get_column(c).alloc_size();
         }
-        for (std::size_t i = 0; i < options.probe_unique_columns.size(); ++i) {
-          // Retain only what the exact stage may still need: a column the probe already
-          // refused releases what it retained so far, and so does a column that no longer fits.
-          if (!unique_probe.candidate(i) || exact_declined[i]) {
-            release_exact_column(i);
-            continue;
+        if (exact_priority.empty()) {
+          std::vector<cudf::data_type> types;
+          types.reserve(static_cast<std::size_t>(tbl->num_columns()));
+          for (cudf::size_type c = 0; c < tbl->num_columns(); ++c) {
+            types.push_back(tbl->get_column(c).type());
           }
-          auto const decline = [&](std::size_t column_pos, std::string const& why) {
-            SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check skipped for column {}: {}",
-                             column_pos,
-                             why);
-            exact_declined[column_pos] = true;
-            release_exact_column(column_pos);
-            unique_probe.exact_unavailable(column_pos);
-          };
+          exact_priority = late_mat::exact_retention_priority(types);
+        }
+        // Retain only what the exact stage may still need: a column the probe already refused
+        // releases what it retained so far, and so does a column that no longer fits. Done for
+        // every column first, so that memory is free before any column below asks for room.
+        for (std::size_t i = 0; i < exact_chunks.size(); ++i) {
+          if (!unique_probe.candidate(i) || exact_declined[i]) { release_exact_column(i); }
+        }
+        auto const decline = [&](std::size_t column_pos, std::string const& why) {
+          SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check skipped for column {}: {}",
+                           column_pos,
+                           why);
+          exact_declined[column_pos] = true;
+          release_exact_column(column_pos);
+          unique_probe.exact_unavailable(column_pos);
+        };
+        for (auto const i : exact_priority) {
+          if (!unique_probe.candidate(i) || exact_declined[i]) { continue; }
           auto const chunk_bytes = tbl->get_column(static_cast<cudf::size_type>(i)).alloc_size();
-          // Earlier columns take priority: make room by giving up the highest columns first, so
-          // which columns keep their check does not depend on how the chunks interleave.
-          for (std::size_t later = exact_bytes.size();
-               later-- > i + 1 && exact_total_bytes + chunk_bytes > *exact_byte_cap;) {
-            if (exact_bytes[later] > 0) {
-              decline(later,
-                      "its retained values were released for an earlier column "
-                      "(pin_table_unique_exact_max_bytes)");
-            }
-          }
-          if (exact_total_bytes + chunk_bytes > *exact_byte_cap) {
+          // Each check below makes room by giving up the copies of lower priority, lowest first,
+          // so which columns keep their check does not depend on how the chunks interleave.
+          auto const make_room = [&](auto&& fits) {
+            return late_mat::make_room_for_retained_copy(
+              exact_priority,
+              i,
+              fits,
+              [&](std::size_t c) { return exact_bytes[c] > 0; },
+              [&](std::size_t c) {
+                decline(c,
+                        "its retained values were released for column " + std::to_string(i) +
+                          ", of higher priority");
+              });
+          };
+          if (!make_room([&] { return exact_total_bytes + chunk_bytes <= *exact_byte_cap; })) {
             decline(i,
                     "more than " + std::to_string(*exact_byte_cap) +
                       " bytes retained across columns (pin_table_unique_exact_max_bytes)");
             continue;
           }
-          if (!late_mat::retention_has_headroom(
-                target->get_available_memory(), chunk_bytes, batch_bytes)) {
+          if (!make_room([&] {
+                return late_mat::retention_has_headroom(
+                  target->get_available_memory(), chunk_bytes, batch_bytes);
+              })) {
             decline(i, "not enough free GPU memory would be left for the next required batch");
             continue;
           }
-          auto reservation = target->make_reservation_or_null(chunk_bytes);
-          if (reservation == nullptr) {
+          decltype(target->make_reservation_or_null(chunk_bytes)) reservation;
+          if (!make_room([&] {
+                reservation = target->make_reservation_or_null(chunk_bytes);
+                return reservation != nullptr;
+              })) {
             decline(
               i, "no GPU memory could be reserved for " + std::to_string(chunk_bytes) + " bytes");
             continue;
@@ -696,7 +718,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options)
 {
@@ -729,7 +751,7 @@ host_pin_result materialize_pin_to_host(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   scan_manager::host_pin_placement& placement,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)
@@ -864,7 +886,7 @@ host_pin_result materialize_pin_to_host(
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)

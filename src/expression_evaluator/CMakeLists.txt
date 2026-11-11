@@ -5,6 +5,7 @@ target_sources(
           expression_evaluator.cpp
           gpu_expression_translator.cpp
           regex/regex_playground.cpp
+          selective_evaluation.cpp
           specializations/between.cpp
           specializations/case.cpp
           specializations/cast.cpp

@@ -41,8 +41,6 @@ class pipeline_build_context {
   //!        when pipelines are built without an engine (tests, optimizer/bind).
   //!        Carried into each sirius_pipeline so operators can build data_batch
   //!        probes.
-  //! @param preserve_insertion_order Whether query results must preserve
-  //!        insertion order (from DuckDB's PreserveInsertionOrderSetting).
   //! @param num_gpus Number of GPUs when constructing a context without an engine (primarily unit
   //!        tests). Carries no GPU ids, so partitions stay unpinned; converting a plan with
   //!        num_gpus > 1 through this constructor is rejected by
@@ -54,12 +52,10 @@ class pipeline_build_context {
   //!        evaluators. A null value creates a new cache.
   explicit pipeline_build_context(
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-    bool preserve_insertion_order                                     = true,
     int num_gpus                                                      = 1,
     std::shared_ptr<const sirius::operator_params> operator_params    = nullptr,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr)
     : _telemetry_context(std::move(telemetry_context)),
-      _preserve_insertion_order(preserve_insertion_order),
       _num_gpus(num_gpus),
       _operator_params(operator_params ? std::move(operator_params)
                                        : std::make_shared<const sirius::operator_params>()),
@@ -73,7 +69,6 @@ class pipeline_build_context {
   //! hardware count when the Sirius config selected a subset of visible GPUs.
   //!
   //! @param telemetry_context SiriusContext-wide telemetry context
-  //! @param preserve_insertion_order Whether query results preserve insertion order
   //! @param active_gpu_ids GPU device ids used for execution routing
   //! @param operator_params Immutable per-query operator-policy snapshot. A null value installs a
   //!        fail-closed default snapshot.
@@ -81,12 +76,10 @@ class pipeline_build_context {
   //!        evaluators. A null value creates a new cache.
   pipeline_build_context(
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-    bool preserve_insertion_order,
     std::vector<int> active_gpu_ids,
     std::shared_ptr<const sirius::operator_params> operator_params    = nullptr,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr)
     : _telemetry_context(std::move(telemetry_context)),
-      _preserve_insertion_order(preserve_insertion_order),
       _active_gpu_ids(std::move(active_gpu_ids)),
       _operator_params(operator_params ? std::move(operator_params)
                                        : std::make_shared<const sirius::operator_params>()),
@@ -99,8 +92,6 @@ class pipeline_build_context {
     }
     _num_gpus = static_cast<int>(_active_gpu_ids.size());
   }
-
-  [[nodiscard]] bool preserve_insertion_order() const { return _preserve_insertion_order; }
 
   [[nodiscard]] int num_gpus() const { return _num_gpus; }
 
@@ -127,8 +118,7 @@ class pipeline_build_context {
 
  private:
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
-  bool _preserve_insertion_order = true;
-  int _num_gpus                  = 1;
+  int _num_gpus = 1;
   std::vector<int> _active_gpu_ids;
   std::shared_ptr<const sirius::operator_params> _operator_params;
   std::shared_ptr<const sirius::like_multiliteral_cache> _like_cache;
