@@ -7,7 +7,7 @@
 # The config file (see sirius_rank_node.conf.example) is sourced and may set every argument, as
 # gpu, quack_port, exchange_port, listen_host, dir; arguments given here win over it. It may also
 # set:
-#   nixl_prefix, ucx_tls, ucx_net_devices  NIXL_PREFIX, UCX_TLS, UCX_NET_DEVICES, unless exported
+#   ucx_tls, ucx_net_devices  UCX_TLS, UCX_NET_DEVICES, unless exported
 #   priority_networks  CIDRs, e.g. 10.87.140.0/24; this host's first address in them is the listen
 #                      host, and its interface UCX_NET_DEVICES, unless those are set
 #   gateway, gateway_token, gateway_fingerprint  the gateway's Quack address, client token and TLS
@@ -21,7 +21,6 @@
 # <dir>/tls, whose fingerprint the gateway pins.
 # With every rank on one host, set UCX_TLS=cuda_copy,cuda_ipc,tcp,self, as distributed_run_sql.sh
 # does: left to itself, UCX picks InfiniBand ports that GB200 hosts cannot connect through.
-# Needs a Sirius build with -DSIRIUS_WITH_NIXL=ON.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 if [ "${1:-}" = --config ]; then
@@ -36,7 +35,6 @@ if [ -z "$gpu" ] || [ -z "$port" ] || [ -z "$exchange_port" ]; then
   echo "usage: $0 [--config <file>] <gpu> <quack port> <exchange port> [listen host] [dir]" >&2
   exit 2
 fi
-[ -n "${nixl_prefix:-}" ] && export NIXL_PREFIX=${NIXL_PREFIX:-$nixl_prefix}
 [ -n "${ucx_tls:-}" ] && export UCX_TLS=${UCX_TLS:-$ucx_tls}
 [ -n "${ucx_net_devices:-}" ] && export UCX_NET_DEVICES=${UCX_NET_DEVICES:-$ucx_net_devices}
 if [ -n "${priority_networks:-}" ]; then
@@ -51,7 +49,6 @@ if [ -n "${priority_networks:-}" ]; then
 fi
 host=${4:-${listen_host:-$(hostname -f)}}
 dir=${5:-${dir:-/tmp/sirius_rank_$port}}
-source "$here/nixl_env.sh"
 build="$here/../sirius-duckdb/build/release"
 duckdb="$build/duckdb"
 export CUDA_VISIBLE_DEVICES=$gpu

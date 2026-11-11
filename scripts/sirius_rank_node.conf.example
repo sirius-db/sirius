@@ -1,6 +1,5 @@
 # Config for scripts/sirius_rank_node.sh --config <file>: one file per rank, sourced by bash.
-# Arguments given on the command line win over these; exported NIXL_PREFIX and UCX_* win over the
-# nixl_prefix and ucx_* lines.
+# Arguments given on the command line win over these; exported UCX_* win over the ucx_* lines.
 
 gpu=0
 quack_port=9500
@@ -12,7 +11,6 @@ priority_networks=10.87.140.0/24
 # listen_host=10.87.140.52
 # dir=/tmp/sirius_rank_9500
 
-nixl_prefix=$HOME/tools/nvda_nixl
 ucx_tls=cuda_copy,cuda_ipc,tcp,self
 # ucx_net_devices=bond0
 

@@ -17,13 +17,12 @@
 # sirius_gateway_add_rank lines it prints, on this console), and the first client statement
 # starts them. SIRIUS_GATEWAY_MIN_RANKS (default 1) is how many it waits for;
 # SIRIUS_GATEWAY_ALLOW_JOIN=0 refuses ranks registering themselves.
-# Needs the gateway build (make -C gateway release) and a Sirius build with -DSIRIUS_WITH_NIXL=ON.
+# Needs the gateway build (make -C gateway release).
 set -euo pipefail
 ranks=$1
 port=${2:-9494}
 logs=${3:-/tmp/sirius_gateway}
 here=$(cd "$(dirname "$0")" && pwd)
-source "$here/nixl_env.sh"
 build="$here/../sirius-duckdb/build/release"
 gateway="$here/../gateway/build/release/duckdb"
 host=${SIRIUS_GATEWAY_HOST:-}

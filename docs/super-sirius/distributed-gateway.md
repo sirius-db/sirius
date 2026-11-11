@@ -19,8 +19,7 @@ flowchart LR
 
 ## Quick path
 
-Build Sirius with `-DSIRIUS_WITH_NIXL=ON` ([Distributed Execution](distributed-sirius.md)), then
-the gateway, a CPU-only DuckDB with `httpfs`, `quack` and `sirius_gateway`:
+Build Sirius ([Distributed Execution](distributed-sirius.md)), then the gateway, a CPU-only DuckDB with `httpfs`, `quack` and `sirius_gateway`:
 
 ```bash
 pixi run make -C gateway release
@@ -58,7 +57,6 @@ gpu=0
 quack_port=9500
 exchange_port=27000
 priority_networks=10.87.140.0/24   # listen address, and UCX_NET_DEVICES
-nixl_prefix=$HOME/tools/nvda_nixl
 ucx_tls=cuda_copy,cuda_ipc,tcp,self
 source /home/me/sirius_gateway/gateway.conf
 CONF
