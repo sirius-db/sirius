@@ -82,7 +82,7 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   /// arriving batch instead of once over every rank's partials.
   bool is_sink() const override;
 
-  sirius::OrderPreservationType source_order() const override;
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override;
 
   /// The sink's port is a dependency, not a barrier.
   [[nodiscard]] MemoryBarrierType input_barrier_for(

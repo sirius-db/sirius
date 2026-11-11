@@ -87,6 +87,11 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
 
   bool is_sink() const override { return true; }
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   [[nodiscard]] exchange::stream_id stream() const noexcept { return _stream; }
   [[nodiscard]] exchange_spec const& spec() const noexcept { return _spec; }
 
