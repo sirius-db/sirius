@@ -322,7 +322,7 @@ project_sink_result evaluate_project_sink(std::span<sirius::ast::node const* con
   if (need_status_buffer) {
     // The readback waits for the kernel, so the handle outlives the launch.
     h_status.resize(status_words);
-    read_status_words(h_status, status_ptr, stream);
+    read_status_words(h_status, status_ptr, stream, ctx.overflow_sites());
   } else {
     retain_until_stream_completes(compiled, stream);
   }

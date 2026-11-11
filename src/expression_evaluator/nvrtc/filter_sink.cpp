@@ -391,7 +391,7 @@ filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
 
   // The readback waits for every launch above, so the kernel handles outlive their launches.
   std::array<std::uint32_t, status_words> h_status{};
-  read_status_words(h_status, status_ptr, stream);
+  read_status_words(h_status, status_ptr, stream, ctx.overflow_sites());
   auto const survivor_count = static_cast<cudf::size_type>(h_status[1]);
   auto const narrow_count   = ctx.narrow_domain_comparison_count();
   if (survivor_count == 0) {

@@ -24,6 +24,7 @@
 #include <expression/value.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/nvrtc/boundary_column_map.hpp>
+#include <expression_evaluator/nvrtc/overflow_site.hpp>
 #include <expression_evaluator/nvrtc/register_value.hpp>
 #include <helper/logical_type.hpp>
 
@@ -31,6 +32,7 @@
 #include <functional>
 #include <initializer_list>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -151,6 +153,15 @@ class translation_context {
     return _narrow_domain_comparison_count;
   }
   [[nodiscard]] bool has_subquery_error() const noexcept { return _has_subquery_error; }
+  /**
+   * @brief Returns the overflow sites of the produced expressions in the order their statements
+   * appear in @c body_code(), leaving out those under a TRY or TRY_CAST, which turns their overflow
+   * into NULL before it can reach an NVRTC Sink.
+   */
+  [[nodiscard]] std::span<overflow_site const> overflow_sites() const noexcept
+  {
+    return _overflow_sites;
+  }
   [[nodiscard]] std::string body_code() const { return _prelude + _body; }
 
  private:
@@ -264,6 +275,7 @@ class translation_context {
   std::vector<loaded_reference_entry> _loaded_references;
   std::vector<scalar_constant_binding> _constants;
   std::vector<like_pattern_binding> _like_patterns;
+  std::vector<overflow_site> _overflow_sites;
   std::size_t _narrow_domain_comparison_count{0};
   bool _has_subquery_error{false};
   std::string _prelude;

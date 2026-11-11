@@ -182,6 +182,11 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
   host synchronization of an evaluation; a projection whose outputs are statically non-null and
   cannot overflow does not synchronize at all. Binding a string column reads nothing from the
   device: the end of its characters is derived in-kernel from `offsets[num_rows]`.
+- **Overflow messages.** The status words say only that Overflow Poison reached the NVRTC Sink.
+  `translation_context` records each Overflow Site it emits outside TRY and TRY_CAST, and
+  `read_status_words` names it in the error (`Overflow in NVRTC evaluation of abs(INTEGER) ->
+  INTEGER`), or lists up to four candidates when the kernel holds several distinct sites. The
+  record stays on the host: the kernel source, its registers and its cache key do not change.
 - **String constants** are passed as a device pointer and a length (`c_N_ptr`, `c_N_len`). A
   kernel's string constants are concatenated into one pool, which the query's
   `nvrtc::string_constant_cache` (in the `expression_query_caches` shared through the pipeline

@@ -29,6 +29,7 @@
 #include <expression/function_id.hpp>
 #include <expression_evaluator/nvrtc/kernel_abi.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
+#include <expression_evaluator/nvrtc/overflow_site.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 #include <helper/logical_type.hpp>
 
@@ -133,6 +134,14 @@ std::unique_ptr<ast_node> make_unary_func(sirius::function_id fid,
   std::vector<std::unique_ptr<ast_node>> args;
   args.push_back(std::move(arg));
   return make_func(fid, std::move(args), ret);
+}
+
+std::string overflow_message_of(ast_node const& expr)
+{
+  fake_table table;
+  sirius::nvrtc::translation_context ctx(table.view);
+  (void)ctx.produce(expr);
+  return sirius::nvrtc::overflow_message(ctx.overflow_sites());
 }
 
 }  // namespace
@@ -541,5 +550,90 @@ TEST_CASE("nvrtc_codegen - compile planning names the Materialization Boundaries
                                         0,
                                         {int16_offsets}};
     CHECK_FALSE(sirius::nvrtc::is_supported_boundary_column(odd_strings));
+  }
+}
+
+TEST_CASE("nvrtc_codegen - an overflow message names the operations that can overflow",
+          "[expression_evaluator][nvrtc_codegen][overflow_message]")
+{
+  std::string const generic = "[expression_evaluator]: Overflow in NVRTC evaluation";
+  auto const smallint_t     = logical_type::make(type_id::SMALLINT);
+  auto const abs_of_col0    = [] {
+    return make_unary_func(sirius::function_id::abs, make_ref_typed(0, int_t), int_t);
+  };
+
+  SECTION("a single overflow site is named exactly")
+  {
+    CHECK(overflow_message_of(*abs_of_col0()) == generic + " of abs(INTEGER) -> INTEGER");
+    CHECK(overflow_message_of(*make_cast(make_ref_typed(5, dec64_2), int_t, false)) ==
+          generic + " of CAST(DECIMAL(18,2) AS INTEGER)");
+  }
+
+  SECTION("overflow sites that read the same are named once")
+  {
+    auto const sum = make_binary(
+      sirius::function_id::add,
+      make_binary(
+        sirius::function_id::add, make_ref_typed(0, int_t), make_ref_typed(0, int_t), int_t),
+      make_ref_typed(0, int_t),
+      int_t);
+    CHECK(overflow_message_of(*sum) == generic + " of INTEGER + INTEGER -> INTEGER");
+  }
+
+  SECTION("distinct overflow sites are listed as candidates in evaluation order")
+  {
+    auto const product =
+      make_binary(sirius::function_id::mul, abs_of_col0(), make_int_const(2), int_t);
+    CHECK(overflow_message_of(*product) ==
+          generic + " of one of: abs(INTEGER) -> INTEGER; INTEGER * INTEGER -> INTEGER");
+  }
+
+  SECTION("a long candidate list names the first four and counts the rest")
+  {
+    // CAST(((-abs(c0) + c0) - c0) * c0 AS SMALLINT) holds six distinct overflow sites.
+    auto expr = make_unary_func(sirius::function_id::negate, abs_of_col0(), int_t);
+    for (auto const fid :
+         {sirius::function_id::add, sirius::function_id::sub, sirius::function_id::mul}) {
+      expr = make_binary(fid, std::move(expr), make_ref_typed(0, int_t), int_t);
+    }
+    expr = make_cast(std::move(expr), smallint_t, false);
+    CHECK(overflow_message_of(*expr) ==
+          generic +
+            " of one of: abs(INTEGER) -> INTEGER; -(INTEGER) -> INTEGER; INTEGER + INTEGER -> "
+            "INTEGER; INTEGER - INTEGER -> INTEGER; and 2 more");
+  }
+
+  SECTION("operations under TRY or TRY_CAST are not candidates")
+  {
+    auto const try_cast_product = make_binary(
+      sirius::function_id::mul, make_cast(abs_of_col0(), int_t, true), make_int_const(2), int_t);
+    CHECK(overflow_message_of(*try_cast_product) == generic + " of INTEGER * INTEGER -> INTEGER");
+
+    auto const try_sum = make_binary(sirius::function_id::add,
+                                     make_unary(sirius::ast::unary_op::kind::op_try, abs_of_col0()),
+                                     make_ref_typed(0, int_t),
+                                     int_t);
+    CHECK(overflow_message_of(*try_sum) == generic + " of INTEGER + INTEGER -> INTEGER");
+
+    CHECK(overflow_message_of(*make_unary(sirius::ast::unary_op::kind::op_try, abs_of_col0())) ==
+          generic);
+  }
+
+  SECTION("operations under CASE remain candidates")
+  {
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back(
+      {make_cmp(sirius::comparison_type::gt, make_ref_typed(0, int_t), make_int_const(0)),
+       abs_of_col0()});
+    auto const case_expr = std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_int_const(0), int_t});
+    CHECK(overflow_message_of(*case_expr) == generic + " of abs(INTEGER) -> INTEGER");
+  }
+
+  SECTION("operations that cannot overflow are not candidates")
+  {
+    auto const sum = make_binary(
+      sirius::function_id::add, make_ref_typed(2, dbl_t), make_ref_typed(2, dbl_t), dbl_t);
+    CHECK(overflow_message_of(*sum) == generic);
   }
 }

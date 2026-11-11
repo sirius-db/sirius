@@ -301,7 +301,8 @@ void retain_until_stream_completes(std::shared_ptr<codegen::jit::CompiledKernel 
 
 void read_status_words(std::span<std::uint32_t> host,
                        std::uint32_t const* device,
-                       ::cuda::stream_ref stream)
+                       ::cuda::stream_ref stream,
+                       std::span<overflow_site const> overflow_sites)
 {
   simpatico::read_device_bytes_completed(host.data(), device, host.size_bytes(), stream);
   if ((host[0] & abi::status_subquery_error_bit) != 0U) {
@@ -311,7 +312,7 @@ void read_status_words(std::span<std::uint32_t> host,
   }
   if ((host[0] & abi::status_overflow_bit) != 0U) {
     // Overflow Poison reached the NVRTC Sink. CPU Replay decides whether DuckDB raises.
-    throw invalid_input_exception("[expression_evaluator]: Overflow in NVRTC evaluation");
+    throw invalid_input_exception(overflow_message(overflow_sites));
   }
 }
 

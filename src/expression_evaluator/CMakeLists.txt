@@ -11,6 +11,7 @@ target_sources(
           nvrtc/device_runtime/device_runtime_check.cu
           nvrtc/filter_sink.cpp
           nvrtc/kernel_abi.cpp
+          nvrtc/overflow_site.cpp
           nvrtc/project_sink.cpp
           nvrtc/sink_launch.cpp
           nvrtc/string_constant_cache.cpp

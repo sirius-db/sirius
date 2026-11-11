@@ -9054,6 +9054,50 @@ TEST_CASE("negate of a signed integer minimum raises like DuckDB", "[expression_
   run.template operator()<int64_t>(type_id::BIGINT, cudf::type_id::INT64);
 }
 
+TEST_CASE("nvrtc_jit - an overflow error names the operations that can overflow",
+          "[expression_evaluator][nvrtc_jit][overflow_message]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const integer = logical_type::make(type_id::INTEGER);
+  auto col           = make_nullable_rep_column<int32_t>(
+    *space, cudf::data_type{cudf::type_id::INT32}, {1, std::numeric_limits<int32_t>::min()}, 0);
+  auto const input = cudf::table_view{{col->view()}};
+  auto const abs_x = [&] {
+    std::vector<std::unique_ptr<sirius::ast::node>> args;
+    args.push_back(make_ref_typed(0, integer));
+    return make_func(sirius::function_id::abs, std::move(args), integer);
+  };
+  std::string const prefix = "[expression_evaluator]: Overflow in NVRTC evaluation of ";
+
+  SECTION("a projection with one overflow site names it exactly")
+  {
+    auto const expr = abs_x();
+    REQUIRE_THROWS_WITH(run_native_ast(*space, expr.get(), input, exp_strategy_enum::NVRTC_JIT),
+                        prefix + "abs(INTEGER) -> INTEGER");
+  }
+
+  SECTION("a projection with several overflow sites lists them as candidates")
+  {
+    std::vector<std::unique_ptr<sirius::ast::node>> args;
+    args.push_back(abs_x());
+    args.push_back(make_int_const(2));
+    auto const expr = make_func(sirius::function_id::mul, std::move(args), integer);
+    REQUIRE_THROWS_WITH(run_native_ast(*space, expr.get(), input, exp_strategy_enum::NVRTC_JIT),
+                        prefix + "one of: abs(INTEGER) -> INTEGER; INTEGER * INTEGER -> INTEGER");
+  }
+
+  SECTION("a filter names the overflow sites of its predicate")
+  {
+    auto const predicate = make_cmp(sirius::comparison_type::gt, abs_x(), make_int_const(0));
+    exp_executor executor(*predicate,
+                          get_resource_ref(*space),
+                          cudf::get_default_stream(),
+                          sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_WITH(executor.select(input), prefix + "abs(INTEGER) -> INTEGER");
+  }
+}
+
 TEMPLATE_TEST_CASE("integer to VARCHAR preserves values and validity",
                    "[expression_evaluator][integer_varchar_cast]",
                    int8_t,
