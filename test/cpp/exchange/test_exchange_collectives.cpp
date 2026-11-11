@@ -26,7 +26,7 @@
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
-#include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
+#include "op/distributed/sample_all_gather_boundaries.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -61,7 +62,6 @@ using namespace sirius::test::exchange_utils;
 using sirius::exchange::exchange_service;
 using sirius::op::exchange_spec;
 using sirius::op::pipelineable_operator_data;
-using sirius::op::sirius_physical_distributed_sort_sample;
 using sirius::op::sirius_physical_sort_sample;
 
 /// Ranks in one process, each with an exchange service over the loopback fabric.
@@ -175,10 +175,18 @@ duckdb::vector<sirius::logical_type> key_types()
   return sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
 }
 
-/// A distributed SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small
-/// enough that a rank keeps several.
+/// What a SORT_SAMPLE's sample_all_gather_boundaries is built from, besides the sort order.
+struct distributed_sampling {
+  std::shared_ptr<exchange_service> service;
+  sirius::exchange::stream_id stream{0};
+  cucascade::memory::memory_space* gpu{nullptr};
+  std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries;
+};
+
+/// A SORT_SAMPLE on column 0 that takes its boundaries from every rank's sample, ascending unless
+/// told otherwise, with partitions small enough that a rank keeps several.
 std::unique_ptr<sirius_physical_sort_sample> make_sample(
-  sirius_physical_distributed_sort_sample::distributed_sampling sampling,
+  distributed_sampling sampling,
   duckdb::OrderType order       = duckdb::OrderType::ASCENDING,
   duckdb::OrderByNullType nulls = duckdb::OrderByNullType::NULLS_FIRST)
 {
@@ -187,13 +195,19 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample(
                       nulls,
                       duckdb::make_uniq<duckdb::BoundReferenceExpression>(
                         duckdb::LogicalType::BIGINT, duckdb::idx_t{0}));
-  return std::make_unique<sirius_physical_distributed_sort_sample>(
-    key_types(),
-    std::move(orders),
-    /*estimated_cardinality=*/60'000,
-    std::move(sampling),
-    /*sort_sample_bytes=*/1 << 20,
-    /*max_partition_bytes=*/64 * KiB);
+  auto sample = std::make_unique<sirius_physical_sort_sample>(key_types(),
+                                                              std::move(orders),
+                                                              /*estimated_cardinality=*/60'000,
+                                                              /*sort_sample_bytes=*/1 << 20,
+                                                              /*max_partition_bytes=*/64 * KiB);
+  sample->set_cross_rank_boundaries(std::make_shared<sirius::op::sample_all_gather_boundaries>(
+    std::move(sampling.service),
+    sampling.stream,
+    *sampling.gpu,
+    std::vector<cudf::order>{sirius::op::to_cudf_order(order)},
+    std::vector<cudf::null_order>{sirius::op::to_cudf_null_order(order, nulls)},
+    std::move(sampling.set_exchange_boundaries)));
+  return sample;
 }
 
 using sirius::op::dynamic_filter_publish_plan;

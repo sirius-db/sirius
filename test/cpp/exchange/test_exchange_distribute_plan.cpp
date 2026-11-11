@@ -21,7 +21,6 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "exec/query_lifecycle_registry.hpp"
-#include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -460,11 +459,10 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   auto* sample = find(*plans[0], T::SORT_SAMPLE);
   REQUIRE(sample);
   CHECK(sample->runs_without_input());
-  // The planned sample was replaced by one that gathers every rank's sample. SORT_PARTITION
-  // reads its boundaries through a pointer, which must follow, and the settings carry over.
-  auto const* distributed =
-    dynamic_cast<sirius::op::sirius_physical_distributed_sort_sample const*>(sample);
-  REQUIRE(distributed);
+  // The planned sample stays, now taking its boundaries from every rank's sample: SORT_PARTITION
+  // still reads them from it, and its settings are those of the local plan.
+  auto const* distributed = &sample->Cast<sirius::op::sirius_physical_sort_sample>();
+  CHECK(distributed->cross_rank_boundaries() != nullptr);
   CHECK(partition->Cast<sirius::op::sirius_physical_sort_partition>().get_sample_op() == sample);
   auto const local = f.lowered(sql);
   auto const& planned =

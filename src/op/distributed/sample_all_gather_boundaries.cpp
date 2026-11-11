@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-#include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
+#include "op/distributed/sample_all_gather_boundaries.hpp"
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
-#include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/copying.hpp>
@@ -33,64 +33,34 @@
 
 namespace sirius::op {
 
-sirius_physical_distributed_sort_sample::sirius_physical_distributed_sort_sample(
-  duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<duckdb::BoundOrderByNode> orders,
-  std::size_t estimated_cardinality,
-  distributed_sampling sampling,
-  uint64_t sort_sample_bytes,
-  uint64_t max_partition_bytes,
-  double max_partition_memory_fraction)
-  : sirius_physical_sort_sample(std::move(types),
-                                std::move(orders),
-                                estimated_cardinality,
-                                sort_sample_bytes,
-                                max_partition_bytes,
-                                max_partition_memory_fraction),
-    _sampling(std::move(sampling))
+sample_all_gather_boundaries::sample_all_gather_boundaries(
+  std::shared_ptr<exchange::exchange_service> service,
+  exchange::stream_id stream,
+  cucascade::memory::memory_space& gpu,
+  std::vector<cudf::order> column_order,
+  std::vector<cudf::null_order> null_precedence,
+  std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries)
+  : _service(std::move(service)),
+    _stream(stream),
+    _gpu(&gpu),
+    _column_order(std::move(column_order)),
+    _null_precedence(std::move(null_precedence)),
+    _set_exchange_boundaries(std::move(set_exchange_boundaries))
 {
 }
 
-duckdb::unique_ptr<sirius_physical_distributed_sort_sample>
-sirius_physical_distributed_sort_sample::from(sirius_physical_sort_sample& local,
-                                              distributed_sampling sampling)
+sort_boundaries sample_all_gather_boundaries::make(request const& request,
+                                                   ::cuda::stream_ref stream)
 {
-  auto distributed = duckdb::make_uniq<sirius_physical_distributed_sort_sample>(
-    local.types,
-    std::move(local.orders),
-    local.estimated_cardinality,
-    std::move(sampling),
-    local.sort_sample_bytes(),
-    local.max_partition_bytes_override(),
-    local.max_partition_memory_fraction());
-  distributed->take_planning_state_from(local);
-  return distributed;
-}
-
-bool sirius_physical_distributed_sort_sample::all_ports_empty()
-{
-  if (boundary_state() == BoundaryState::NOT_DONE) { return false; }
-  return sirius_physical_sort_sample::all_ports_empty();
-}
-
-sirius_physical_sort_sample::boundaries sirius_physical_distributed_sort_sample::make_boundaries(
-  cudf::table_view sample_keys,
-  std::size_t sample_bytes,
-  std::size_t num_parts,
-  cucascade::memory::memory_space* /*space*/,
-  ::cuda::stream_ref stream)
-{
-  std::vector<cudf::order> column_order;
-  std::vector<cudf::null_order> null_precedence;
-  for (auto const& ord : orders) {
-    column_order.push_back(to_cudf_order(ord.type));
-    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
-  }
-  auto& d          = _sampling;
-  auto& gpu        = *d.gpu;
-  auto const mr    = gpu.get_default_allocator();
-  auto const world = d.service->world_size();
-  auto const rank  = d.service->rank();
+  auto const& sample_keys     = request.sample_keys;
+  auto const sample_bytes     = request.sample_bytes;
+  auto const num_parts        = request.num_parts;
+  auto const& column_order    = _column_order;
+  auto const& null_precedence = _null_precedence;
+  auto& gpu                   = *_gpu;
+  auto const mr               = gpu.get_default_allocator();
+  auto const world            = _service->world_size();
+  auto const rank             = _service->rank();
 
   if (!_gathered) {
     // A gather that failed part way left the peers past it; a retry would wait out the timeout.
@@ -105,12 +75,12 @@ sirius_physical_sort_sample::boundaries sirius_physical_distributed_sort_sample:
     // not the ones it receives.
     std::shared_ptr<::cucascade::data_batch> summary;
     if (auto const rows = sample_keys.num_rows(); rows > 0) {
-      auto const full = std::max(distributed_summary_rows, summary_rows_per_partition * num_parts);
-      auto const share =
-        sort_sample_bytes() == 0
-          ? 1.0
-          : std::min(1.0,
-                     static_cast<double>(sample_bytes) / static_cast<double>(sort_sample_bytes()));
+      auto const full  = std::max(distributed_summary_rows, summary_rows_per_partition * num_parts);
+      auto const share = request.target_sample_bytes == 0
+                           ? 1.0
+                           : std::min(1.0,
+                                      static_cast<double>(sample_bytes) /
+                                        static_cast<double>(request.target_sample_bytes));
       auto const take =
         std::clamp<std::size_t>(static_cast<std::size_t>(share * static_cast<double>(full)),
                                 1,
@@ -119,19 +89,19 @@ sirius_physical_sort_sample::boundaries sirius_physical_distributed_sort_sample:
       for (std::size_t i = 0; i < take; ++i) {
         indices[i] = static_cast<int32_t>(i * static_cast<std::size_t>(rows) / take);
       }
-      auto const column = index_column(indices, stream, mr);
+      auto const column = sirius_physical_sort_sample::index_column(indices, stream, mr);
       summary           = make_data_batch(
         cudf::gather(
           sample_keys, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr),
         gpu,
         stream,
-        batch_telemetry());
+        request.telemetry);
     }
 
     // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
     // TODO(#2375): all_gather blocks this GPU worker thread until every rank's summary arrives.
     _gather_entered = true;
-    _gathered       = exchange::all_gather(*d.service, d.stream, summary, gpu, stream.get());
+    _gathered       = exchange::all_gather(*_service, _stream, summary, gpu, stream.get());
   }
   auto const& gathered = *_gathered;
   std::vector<::cucascade::read_only_data_batch> parts;
@@ -144,7 +114,7 @@ sirius_physical_sort_sample::boundaries sirius_physical_distributed_sort_sample:
   std::shared_ptr<::cucascade::data_batch> merged;
   if (parts.size() > 1) {
     merged = gpu_merge_impl::merge_order_by(
-      parts, keys, column_order, null_precedence, stream, gpu, batch_telemetry());
+      parts, keys, column_order, null_precedence, stream, gpu, request.telemetry);
   }
   auto const global =
     merged ? get_cudf_table_view(merged->to_read_only()) : get_cudf_table_view(parts.front());
@@ -155,7 +125,7 @@ sirius_physical_sort_sample::boundaries sirius_physical_distributed_sort_sample:
   cudf::size_type hi = total;
   if (world > 1) {
     std::shared_ptr<cudf::table const> exchange_boundaries =
-      evenly_spaced(global, 0, total, world, stream, mr);
+      sirius_physical_sort_sample::evenly_spaced(global, 0, total, world, stream, mr);
     // This rank's range of the global sample: from the first row not below its lower boundary
     // to the first not below its upper one, as the exchange routes rows.
     auto const starts = cudf::lower_bound(
@@ -169,13 +139,14 @@ sirius_physical_sort_sample::boundaries sirius_physical_distributed_sort_sample:
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
     if (rank > 0) { lo = at[rank - 1]; }
     if (rank + 1 < world) { hi = at[rank]; }
-    d.set_exchange_boundaries(std::move(exchange_boundaries));
+    _set_exchange_boundaries(std::move(exchange_boundaries));
   }
 
   // 4. This rank's partition boundaries, from the part of the global sample inside its range.
   auto const parts_here = std::min<std::size_t>(num_parts, std::max<cudf::size_type>(1, hi - lo));
   if (parts_here <= 1) { return {}; }
-  return {parts_here, evenly_spaced(global, lo, hi - lo, parts_here, stream, mr)};
+  return {parts_here,
+          sirius_physical_sort_sample::evenly_spaced(global, lo, hi - lo, parts_here, stream, mr)};
 }
 
 }  // namespace sirius::op

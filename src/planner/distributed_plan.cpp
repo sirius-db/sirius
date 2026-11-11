@@ -23,7 +23,7 @@
 #include "exchange/wire.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/distributed/bloom_all_gather_merge.hpp"
-#include "op/distributed/sirius_physical_distributed_sort_sample.hpp"
+#include "op/distributed/sample_all_gather_boundaries.hpp"
 #include "op/scan/parquet_scan_types.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -35,7 +35,6 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
-#include "op/sirius_physical_sort_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
@@ -427,15 +426,14 @@ struct rewriter {
           spec.null_precedence.push_back(op::to_cudf_null_order(o.type, o.null_order));
         }
         auto* sink = &insert(partition.children[0], std::move(spec), false);
-        // The sample, now below the sink, becomes one that gathers every rank's sample.
-        // SORT_PARTITION reads its boundaries through a pointer to it, so that follows.
-        auto& slot       = sink->children[0];
-        auto distributed = op::sirius_physical_distributed_sort_sample::from(
-          sample, {service, stream(), gpu, [sink](auto boundaries) {
-                     sink->set_range_boundaries(std::move(boundaries));
-                   }});
-        partition.Cast<op::sirius_physical_sort_partition>().set_sample_op(distributed.get());
-        slot = std::move(distributed);
+        // The sample, now below the sink, takes its boundaries from every rank's sample.
+        sample.set_cross_rank_boundaries(std::make_shared<op::sample_all_gather_boundaries>(
+          service,
+          stream(),
+          *gpu,
+          sink->spec().column_order,
+          sink->spec().null_precedence,
+          [sink](auto boundaries) { sink->set_range_boundaries(std::move(boundaries)); }));
         return done(placement::ranged);
       }
 
