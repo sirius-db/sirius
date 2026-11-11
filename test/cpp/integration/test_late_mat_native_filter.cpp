@@ -20,7 +20,7 @@
 // refuse the shape rather than let the scan reach substitution with a compacted
 // batch and no record of which rows lived.
 //
-// Requires SIRIUS_EXP_LATE_MAT=1 in the ENVIRONMENT: the gate is read per process.
+// Uses the default-on enable_late_materialization query policy.
 
 #include <catch.hpp>
 #include <late_mat/defer_directive.hpp>
@@ -72,11 +72,6 @@ TEST_CASE_METHOD(NativeFilterFixture,
                  "late-mat declines a filtered duckdb-native pin and still answers correctly",
                  "[integration][gpu_execution][late_mat][native_filter]")
 {
-  if (!sirius::late_mat::late_mat_enabled()) {
-    WARN("SIRIUS_EXP_LATE_MAT unset; skipping the duckdb-native filtered-pin case");
-    return;
-  }
-
   run_ok(
     "CREATE TABLE c AS SELECT range AS c_custkey, "
     "'Customer#' || lpad(CAST(range AS VARCHAR), 12, '0') AS c_name, "

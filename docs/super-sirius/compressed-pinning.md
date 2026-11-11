@@ -111,10 +111,11 @@ filter the decode applies alongside does not change this: it is optional, so whe
 batch does not bear on the scan's own filter. With any conjunct of the scan's own filter left to
 the scan (an unsupported shape) or on any decline, every column comes back as before.
 
-It is off by default and inert when off (byte-identical to an ordinary decompress):
+It is enabled by default. Disable it per connection with
+`SET enable_fused_scan_filter = false`; YAML accepts the same name under
+`sirius.operator_params`. Diagnostics remain environment-controlled:
 
 ```bash
-SIRIUS_EXP_FUSED_SCAN_FILTER=1     # the gate
 SIRIUS_EXP_FUSED_SCAN_DIAG=1       # the decision trace — reach for this first
 ```
 

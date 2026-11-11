@@ -298,7 +298,7 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
   return selected;
 }
 
-// ── Filtering while decoding (env gate SIRIUS_EXP_FUSED_SCAN_FILTER) ────────
+// ── Filtering while decoding (query policy enable_fused_scan_filter) ────────
 //
 // Two waves inside one converter call:
 //   wave 1: ballot the filter columns into mask words, round-robin on the pool
@@ -377,8 +377,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       std::fprintf(stderr, "simpatico: filtered decode refused: %s\n", why);
     return std::nullopt;
   };
-  if (!sc::decompression_pushdown_enabled()) return refuse("env gate off");
   size_t const k_range = request.filters.size();
+  if (!request.enable_fused_scan_filter) return refuse("query policy disabled");
   size_t const k_bool8 = request.bool8_filters.size();
   // Membership cap (drop-tail, sound — see max_membership_sources).
   size_t const k_member    = std::min(request.membership_filters.size(),

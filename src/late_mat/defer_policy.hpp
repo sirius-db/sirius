@@ -16,7 +16,7 @@
 
 #pragma once
 
-// Whether a set of columns is worth deferring (env gate: SIRIUS_EXP_LATE_MAT).
+// Whether a set of columns is worth deferring (query setting: enable_late_materialization).
 //
 // Deferring replaces a column's values with an 8-byte rowid for the stretch of
 // pipeline between the scan and whatever consumes it, then materializes at the

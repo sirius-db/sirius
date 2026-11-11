@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared types for evaluating a scan's filter while decompressing
-// (env gate: SIRIUS_EXP_FUSED_SCAN_FILTER).
+// (query policy: enable_fused_scan_filter).
 //
 // Owned by the wave orchestration. Included by:
 //   - the JIT decode variants (ballot-to-mask, mask-consuming) as kernel-arg
@@ -181,6 +181,8 @@ struct bool8_filter_directive {
 // precondition and falls back to the unfiltered path when any fail.
 // Source-count cap: ranges + equalities + probes <= 8, one source per kernel.
 struct scan_filter_request {
+  /// Explicit caller policy, independent of the executing worker thread or process environment.
+  bool enable_fused_scan_filter = true;
   std::vector<filter_column_directive> filters;                 // range conjuncts
   std::vector<bool8_filter_directive> bool8_filters;            // dictionary-answered equalities
   std::vector<membership_filter_directive> membership_filters;  // dynamic probes

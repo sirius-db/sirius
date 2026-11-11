@@ -84,7 +84,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
                                                               std::string* error_out);
 
 /// Per-column decode-time row selection
-/// (`SIRIUS_EXP_FUSED_SCAN_FILTER`). Built by the wave-2 orchestrator in
+/// (`enable_fused_scan_filter`). Built by the wave-2 orchestrator in
 /// table decode orchestration AFTER the combine + CNT wave fixed the
 /// survivor count; never active on the default path (gate off ⇒ callers pass
 /// nullptr and behavior is byte-identical).
