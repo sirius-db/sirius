@@ -18,6 +18,7 @@
 #include "config.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
+#include "log/noop_sink.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
 
@@ -37,10 +38,17 @@ struct sink_restorer {
   ~sink_restorer() { sirius::log::set_sink(prev); }
 };
 
-// Restores the process-wide log backend that loading Sirius takes from the environment.
+// Restores the process-wide log settings that loading Sirius takes from the environment.
 struct log_backend_restorer {
-  std::string prev = duckdb::Config::LOG_BACKEND;
-  ~log_backend_restorer() { duckdb::Config::LOG_BACKEND = prev; }
+  std::string backend = duckdb::Config::LOG_BACKEND;
+  std::string dir     = duckdb::Config::LOG_DIR;
+  std::string level   = duckdb::Config::LOG_LEVEL;
+  ~log_backend_restorer()
+  {
+    duckdb::Config::LOG_BACKEND = backend;
+    duckdb::Config::LOG_DIR     = dir;
+    duckdb::Config::LOG_LEVEL   = level;
+  }
 };
 
 }  // namespace
@@ -113,4 +121,42 @@ TEST_CASE("duckdb backend captures messages logged while loading the configurati
     "AND message LIKE '%Sirius disabled via SIRIUS_DISABLE%'");
   REQUIRE_FALSE(result->HasError());
   CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
+}
+
+TEST_CASE("a failed load restores the previous log sink", "[log]")
+{
+  sink_restorer restore_sink;
+  log_backend_restorer restore_backend;
+  auto const previous = sirius::log::make_noop_sink();
+  sirius::log::set_sink(previous);
+  duckdb::Config::LOG_BACKEND = "noop";
+  duckdb::Config::LOG_DIR     = "previous-log-dir";
+  duckdb::Config::LOG_LEVEL   = "warn";
+  sirius::util::env_guard enable_env("SIRIUS_DISABLE", "0");
+  sirius::util::env_guard backend_env("SIRIUS_LOG_BACKEND", "duckdb");
+  sirius::util::env_guard dir_env("SIRIUS_LOG_DIR", "failed-load-log-dir");
+  sirius::util::env_guard level_env("SIRIUS_LOG_LEVEL", "debug");
+  sirius::util::env_guard config_env("SIRIUS_CONFIG_FILE", "/nonexistent/sirius.yaml");
+
+  CHECK_THROWS_WITH(
+    duckdb::DuckDB(nullptr),
+    Catch::Matchers::ContainsSubstring("SIRIUS_CONFIG_FILE points to non-existent"));
+  CHECK(sirius::log::get_sink() == previous);
+  CHECK(duckdb::Config::LOG_BACKEND == "noop");
+  CHECK(duckdb::Config::LOG_DIR == "previous-log-dir");
+  CHECK(duckdb::Config::LOG_LEVEL == "warn");
+}
+
+TEST_CASE("a successful load keeps the sink it installs", "[log]")
+{
+  sink_restorer restore_sink;
+  log_backend_restorer restore_backend;
+  auto const previous = sirius::log::make_noop_sink();
+  sirius::log::set_sink(previous);
+  sirius::util::env_guard disable_env("SIRIUS_DISABLE", "1");
+  sirius::util::env_guard backend_env("SIRIUS_LOG_BACKEND", "duckdb");
+
+  duckdb::DuckDB db(nullptr);
+  CHECK(sirius::log::get_sink() != previous);
+  CHECK(duckdb::Config::LOG_BACKEND == "duckdb");
 }

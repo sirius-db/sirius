@@ -120,7 +120,10 @@ extern "C" int cudaProfilerStop();
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -3786,8 +3789,55 @@ static void check_cuda_driver_version()
 #endif
 }
 
+/// Makes a load all-or-nothing for the process-wide logging state: loads run one at a time, and a
+/// failed load restores the log sink and Config::LOG_* values it found, so a database whose load
+/// fails does not leave its sink installed.
+class logging_load_transaction {
+ public:
+  logging_load_transaction() : load_lock_(load_mutex())
+  {
+    std::lock_guard log_lock(Config::logging_mutex);
+    previous_sink_    = sirius::log::get_sink();
+    previous_backend_ = Config::LOG_BACKEND;
+    previous_dir_     = Config::LOG_DIR;
+    previous_level_   = Config::LOG_LEVEL;
+  }
+  ~logging_load_transaction()
+  {
+    if (committed_) { return; }
+    std::lock_guard log_lock(Config::logging_mutex);
+    Config::LOG_BACKEND = std::move(previous_backend_);
+    Config::LOG_DIR     = std::move(previous_dir_);
+    Config::LOG_LEVEL   = std::move(previous_level_);
+    try {
+      if (sirius::log::get_sink() != previous_sink_) { sirius::log::set_sink(previous_sink_); }
+    } catch (...) {
+      // Flushing the discarded sink failed; the load's own error is the one to report.
+    }
+  }
+  logging_load_transaction(logging_load_transaction const&)            = delete;
+  logging_load_transaction& operator=(logging_load_transaction const&) = delete;
+
+  void commit() noexcept { committed_ = true; }
+
+ private:
+  static std::recursive_mutex& load_mutex()
+  {
+    static std::recursive_mutex mutex;
+    return mutex;
+  }
+
+  std::unique_lock<std::recursive_mutex> load_lock_;
+  std::shared_ptr<sirius::log::sink> previous_sink_;
+  std::string previous_backend_;
+  std::string previous_dir_;
+  std::string previous_level_;
+  bool committed_ = false;
+};
+
 static void LoadInternal(ExtensionLoader& loader)
 {
+  logging_load_transaction logging_transaction;
   sirius::util::install_segfault_backtrace_handler();
 
   auto& db     = loader.GetDatabaseInstance();
@@ -3852,6 +3902,7 @@ static void LoadInternal(ExtensionLoader& loader)
     default_to_explicit_delim_joins(config);
     db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
+  logging_transaction.commit();
 }
 
 }  // namespace duckdb
