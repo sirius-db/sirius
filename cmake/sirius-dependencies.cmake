@@ -187,8 +187,6 @@ endif()
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
 add_subdirectory(rust/crates/telemetry/bridge)
 
-find_package(kvikio REQUIRED CONFIG)
-
 if(SIRIUS_WITH_NIXL)
   if(NOT SIRIUS_NIXL_PREFIX)
     # $NIXL_PREFIX, else the script's default prefix (it names the pinned NIXL

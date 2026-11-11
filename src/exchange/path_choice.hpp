@@ -24,11 +24,13 @@
 
 namespace sirius::exchange {
 
-/// Whether writes to a peer go through its pinned host mirror instead of NIXL. automatic: only to
-/// peers whose GPU lacks peer access to this one (NVML).
-enum class host_staging { automatic, always, never };
+/// Whether writes to a peer go through its pinned host mirror instead of NIXL. automatic: over TCP
+/// lanes to peers on other hosts, and through shared memory to peers on this host whose GPU lacks
+/// peer access to this one (NVML). always: also to every peer on this host. never: NIXL to every
+/// peer. remote: TCP lanes to every peer, even on this host (for tests).
+enum class host_staging { automatic, always, never, remote };
 
-/// "auto", "always" or "never", as the sirius_exchange_host_staging setting takes it.
+/// "auto", "always", "never" or "remote", as the sirius_exchange_host_staging setting takes it.
 /// @throws sirius::invalid_input_exception on any other value.
 [[nodiscard]] host_staging parse_host_staging(std::string_view value);
 
@@ -45,8 +47,10 @@ enum class mnnvl_mode { automatic, require, off };
 [[nodiscard]] ring_memory ring_memory_for(mnnvl_mode mode) noexcept;
 
 /// How writes reach a peer. nixl and nvlink_fabric are the same NIXL write; nvlink_fabric goes
-/// into fabric memory, which also reaches GPUs on other nodes of the NVLink domain.
-enum class path { nixl, nvlink_fabric, shared_memory };
+/// into fabric memory, which also reaches GPUs on other nodes of the NVLink domain. shared_memory
+/// and tcp_lanes go through the peer's pinned host mirror: mapped here, or written host to host
+/// over TCP lanes.
+enum class path { nixl, nvlink_fabric, shared_memory, tcp_lanes };
 
 [[nodiscard]] char const* describe(path p) noexcept;
 
@@ -56,14 +60,18 @@ struct endpoint {
   std::string pci_bus_id;
   bool fabric_ring{false};
   nvlink_domain domain;
+  /// The host's kernel boot id: two ranks are on one host when theirs are equal.
+  std::string boot_id;
 };
 
 /**
  * @brief The path from @p me to @p peer. Both ranks see the same two endpoints, so they agree.
  *
- * A peer whose GPU is in this GPU's NVLink domain, with both receive rings in fabric memory, gets
- * nvlink_fabric unless staging is always. Otherwise: never → nixl; always, or no peer access
- * (@p peer_access, from NVML) → shared_memory; else nixl.
+ * remote → tcp_lanes. always → shared_memory on this host, tcp_lanes to another. Otherwise a peer
+ * whose GPU is in this GPU's NVLink domain, with both receive rings in fabric memory, gets
+ * nvlink_fabric, on this host or another. Otherwise: never → nixl; another host → tcp_lanes; no
+ * peer access (@p peer_access, from NVML, which knows this host's GPUs only) → shared_memory;
+ * else nixl.
  *
  * @throws sirius::invalid_input_exception when @p mnnvl is require and the peer cannot be
  *         reached over the NVLink fabric.

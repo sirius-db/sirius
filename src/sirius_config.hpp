@@ -232,7 +232,8 @@ struct operator_params {
   std::vector<std::string> exchange_peers;
   /// This process's rank among exchange_peers.
   uint32_t exchange_rank = 0;
-  /// Distributed execution: "auto", "always" or "never" host-stage the exchange's writes to peers.
+  /// Distributed execution: "auto", "always", "never" or "remote" host-stage the exchange's writes
+  /// to peers (sirius::exchange::host_staging).
   std::string exchange_host_staging = "auto";
   /// Distributed execution: "auto", "require" or "off" put the exchange's rings in fabric memory,
   /// so that GPUs on other nodes of the NVLink domain write them over NVLink.
@@ -241,8 +242,12 @@ struct operator_params {
   uint64_t exchange_frame_bytes = 16ull << 20;
   /// Distributed execution: send frames, shared by all peers.
   uint32_t exchange_send_frames = 32;
-  /// Distributed execution: receive frames (credits) each peer may fill.
+  /// Distributed execution: receive frames (credits) each peer may fill; over TCP lanes, one per
+  /// lane in flight.
   uint32_t exchange_recv_frames_per_peer = 16;
+  /// Distributed execution: TCP lanes per rank to ranks on other hosts; 0 shares 16 among the
+  /// ranks on this host.
+  uint32_t exchange_tcp_lanes = 0;
 
   /// Nonzero: the number of the next distributed query, set by a gateway that numbers every
   /// rank's queries. Must increase; zero numbers queries per process.
@@ -457,6 +462,13 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
+  /// CPUs reserved for the pinned REST reactors and kept out of every Sirius
+  /// thread pool's affinity; empty when nothing is reserved.
+  [[nodiscard]] const std::vector<int>& get_rest_reactor_cpus() const noexcept
+  {
+    return _rest_reactor_cpus;
+  }
+
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
@@ -510,6 +522,12 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
+  /// Restrict the GPU pipeline, scan manager, task creator and downgrade pools
+  /// to the CPUs the REST reactors will not pin to (see
+  /// @c scan_manager_config::reserve_rest_reactor_cpus).  Called from
+  /// @ref finalize_derived_config.
+  void reserve_rest_reactor_cpus();
+
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
@@ -521,6 +539,8 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+  /// CPUs the REST reactors will pin to, reserved from the thread pools (empty: none).
+  std::vector<int> _rest_reactor_cpus;
 };
 
 /// Validated configuration intent. Construction and parsing never discover hardware.

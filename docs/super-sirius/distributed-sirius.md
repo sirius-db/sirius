@@ -134,9 +134,28 @@ only then passes the write's own notification to the transport. Credits are unch
 frame is reused only after the transport has copied its receive frame out.
 `SET sirius_exchange_host_staging = 'always'` (or `'never'`) overrides the choice (default `auto`). Each rank logs
 its path to every peer at start. Staging maps the peer's mirror from this host's `/dev/shm`, so it
-works only between ranks on one host that share `/dev/shm`; ranks on several hosts, or in separate
-IPC namespaces, need `never` until #2372. A rank that crashes leaves its mirror in `/dev/shm`;
-the launchers in `scripts/` remove mirrors whose process is gone before they start.
+works only between ranks on one host that share `/dev/shm`; ranks in separate IPC namespaces on one
+host need `never`. A rank that crashes leaves its mirror in `/dev/shm`; the launchers in
+`scripts/` remove mirrors whose process is gone before they start.
+
+**TCP lanes.** Between hosts, UCX's TCP transport moves host memory directly but emulates a put of
+GPU memory, at about 0.2 GB/s, and one TCP connection is bound by the core that copies its socket.
+The hello therefore also carries the host's kernel boot id, and with `auto` a rank reaches a peer
+with another boot id, which the NVLink fabric does not reach (below), over *lanes*: extra NIXL agents, each with its own UCX worker, connection and
+thread, pinned to the CPUs NVML places next to the GPU. A lane's metadata travels in a notification
+of the main agent, so lanes need no listener ports. A lane initiates its own writes, into the
+peer's lane of the same number, not through the writer agent. Each lane owns pinned send slots of
+one frame, so the transport sends such a peer one frame per write instead of a run of frames.
+A write copies the frame device-to-host into a free slot (the send frame is then free), and the
+lane thread writes the slot into the peer's receive mirror; the peer lands it as a host-staged
+write. A rank makes its mirror, if it has none yet, when it first chooses this path for a peer.
+`sirius_exchange_tcp_lanes` sets the lanes per rank (default 16 shared by the ranks on the host,
+at least 2), and `sirius_exchange_recv_frames_per_peer` the frames a peer may have in flight (a
+lane carries one). Every rank must use the same `sirius_exchange_host_staging` and
+`sirius_exchange_mnnvl`; a rank offered
+lanes by a peer it reaches another way fails to connect, saying so. On gcn-17/gcn-18 over one
+200 Gb/s port (`[nixl_bandwidth]`), 1+1 ranks moved 15.2-16.4 GB/s each way instead of 0.19, and
+4+4 ranks about 8.5 GB/s per rank.
 
 ### NVLink between nodes (MNNVL)
 
@@ -153,8 +172,8 @@ fails.
 The hello also carries whether the receive ring is in fabric memory and the GPU's NVLink domain:
 the cluster UUID and clique id from NVML's fabric info (`nvidia-smi -q`, section Fabric). A peer
 whose GPU is in this GPU's domain, both rings in fabric memory, gets the path "NIXL over the
-NVLink fabric" (`choose_path()` in `src/exchange/path_choice.*`); every other peer gets the path
-it had before. `require` fails at connect for a peer that cannot be reached that way.
+NVLink fabric" (`choose_path()` in `src/exchange/path_choice.*`), on this host or another; every
+other peer gets the path described above (TCP lanes to another host). `require` fails at connect for a peer that cannot be reached that way.
 
 UCX picks its transport per endpoint and says nothing when `cuda_ipc` cannot map a peer's memory.
 So after connecting, a rank times one write, as large as the transport's largest, to each peer on

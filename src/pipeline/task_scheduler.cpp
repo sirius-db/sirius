@@ -83,7 +83,20 @@ task_scheduler::task_scheduler(
                                return std::cmp_equal(dev.id, device_id);
                              });
 
-      if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
+      if (it != sys_topology->gpus.end()) {
+        // The GPU's local cores, within the pool's own affinity when it has one (a configured
+        // list, or the CPUs left after sirius_config reserved the REST reactors' CPUs).  An
+        // empty intersection keeps the local cores.
+        std::vector<int> cores;
+        for (int const cpu : it->cpu_cores) {
+          if (config.cpu_affinity_list.empty() ||
+              std::find(config.cpu_affinity_list.begin(), config.cpu_affinity_list.end(), cpu) !=
+                config.cpu_affinity_list.end()) {
+            cores.push_back(cpu);
+          }
+        }
+        config.cpu_affinity_list = cores.empty() ? it->cpu_cores : std::move(cores);
+      }
     }
     // Find matching downgrade executor for this GPU space
     sirius::parallel::downgrade_executor* dg_exec = nullptr;

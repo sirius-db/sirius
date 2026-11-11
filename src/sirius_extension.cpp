@@ -1380,7 +1380,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     };
 
     // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
-    // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
+    // file_source factory, which binds to a single CUDA context.
     // That is mandatory on multi-GPU.
     if (data.args.tier == "host") {
       // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
@@ -1571,7 +1571,7 @@ void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
     // rebuilding a cache creates no per-query runtime state to clean up.
     duckdb::SiriusContext::SlotGuard slot(
       *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
-    sirius_ctx->get_scan_manager().reset_caches();
+    sirius_ctx->reset_caches();
   }
 
   output.data[0].Append(Value::BOOLEAN(true));
@@ -2752,6 +2752,17 @@ static void SetExchangeSendFrames(ClientContext& context, SetScope scope, Value&
     ring_frames("sirius_exchange_send_frames", parameter);
 }
 
+static void SetExchangeTcpLanes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const lanes = UBigIntValue::Get(parameter);
+  if (lanes > sirius::exchange::max_tcp_lanes) {
+    throw InvalidInputException("sirius_exchange_tcp_lanes must be 0 (automatic) to %u, not %llu",
+                                sirius::exchange::max_tcp_lanes,
+                                lanes);
+  }
+  get_operator_params(context, scope)->exchange_tcp_lanes = static_cast<uint32_t>(lanes);
+}
+
 static void SetExchangeRecvFramesPerPeer(ClientContext& context, SetScope scope, Value& parameter)
 {
   get_operator_params(context, scope)->exchange_recv_frames_per_peer =
@@ -3626,9 +3637,11 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetExchangeRank);
   config.AddExtensionOption(
     "sirius_exchange_host_staging",
-    "Distributed execution: auto, always or never send the exchange's writes to a peer through "
-    "its pinned host mirror instead of NIXL; auto does so where GPUs lack peer access. Set "
-    "before sirius_exchange_rank, which connects",
+    "Distributed execution: how the exchange's writes reach a peer. auto: over TCP lanes to "
+    "ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without "
+    "peer access; always: the mirror for every same-host peer; never: NIXL to every peer; "
+    "remote: TCP lanes to every peer. Same on every rank; set before sirius_exchange_rank, "
+    "which connects",
     LogicalType::VARCHAR,
     Value("auto"),
     SetExchangeHostStaging);
@@ -3644,7 +3657,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "sirius_exchange_frame_bytes",
     "Distributed execution: the exchange's frame size in bytes; one write covers up to half a "
-    "peer's receive frames. Same on every rank; set before sirius_exchange_rank",
+    "peer's receive frames (one frame over TCP lanes). Same on every rank; set before "
+    "sirius_exchange_rank",
     LogicalType::UBIGINT,
     Value::UBIGINT(16ull << 20),
     SetExchangeFrameBytes);
@@ -3656,9 +3670,17 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::UBIGINT(32),
     SetExchangeSendFrames);
   config.AddExtensionOption(
+    "sirius_exchange_tcp_lanes",
+    "Distributed execution: TCP lanes (connections, each with its own thread) per rank to ranks "
+    "on other hosts; 0 shares 16 among the ranks on this host. Set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(0),
+    SetExchangeTcpLanes);
+  config.AddExtensionOption(
     "sirius_exchange_recv_frames_per_peer",
     "Distributed execution: receive frames (credits) each peer may fill; GPU memory grows with "
-    "it times the peers. Same on every rank; set before sirius_exchange_rank",
+    "it times the peers, and a TCP lane carries one. Same on every rank; set before "
+    "sirius_exchange_rank",
     LogicalType::UBIGINT,
     Value::UBIGINT(16),
     SetExchangeRecvFramesPerPeer);
