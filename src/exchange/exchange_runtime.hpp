@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exchange/host_staging.hpp"
 #include "exchange/transport.hpp"
 
 #include <cstddef>
@@ -32,10 +33,6 @@ class memory_space;
 namespace sirius::exchange {
 
 class exchange_service;
-
-/// Whether writes to a peer go through its pinned host mirror instead of NIXL. automatic: only to
-/// peers whose GPU lacks peer access to this one (NVML).
-enum class host_staging { automatic, always, never };
 
 /// "auto", "always" or "never", as the sirius_exchange_host_staging setting takes it.
 /// @throws sirius::invalid_input_exception on any other value.
