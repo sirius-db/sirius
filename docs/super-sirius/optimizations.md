@@ -222,17 +222,17 @@ Parquet scans declare no PRIMARY KEY; for them, [Pin-Proven Unique Join Keys](#p
 **Motivation:** The distinct hash join needs a proof that the build keys are unique, and for a base table the only proof was a declared PRIMARY KEY. Parquet tables declare none, so every join over pinned parquet took the two-pass `cudf::hash_join` (a count pass, then a retrieve pass), even for keys such as `o_orderkey` or `s_suppkey`. The runtime distinctness check is off by default (issue #1600).
 
 **Mechanism:** Two parts:
-1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports an output column whose pinned column was proven distinct at pin time. Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
-2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column automatically, in addition to the columns late materialization names. An automatic column must be an integer, and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`.
+1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports every output column whose pinned column was proven distinct at pin time, each as a key on its own (`prove_unique_columns()` tracks alternative keys, so a join on any one of them is proven). Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
+2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column of a parquet pin (and of a native table's pin when late materialization is on). A column must be an integer (or any column of a table under one million rows, such as `nation.n_name`, which a late-materialization ride can use), and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`; when it, the free GPU memory or a reservation is short, integer columns keep their check ahead of the others.
 
 Composite keys are not covered, because the proof is per column.
 
 **Code path:**
 - `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_from_pin()`, `prove_unique_columns()`
-- `src/late_mat/pin_uniqueness.cpp` — `pin_unique_automatic_selection()`, `unique_probe`, `exact_uniqueness_byte_cap()`
-- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — selection and attaching the facts
+- `src/late_mat/pin_uniqueness.cpp` — `unique_probe`, `exact_uniqueness_byte_cap()`
+- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — which pins are observed, and attaching the facts
 
-**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the automatic probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `n_name`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
+**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
 
 ### Scan Scheduling Tuning (PR #507)
 
@@ -456,8 +456,8 @@ distinctness proof.
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
 
 **Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
-`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
-which no group-by-rowid ride is admissible. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+The pin-time uniqueness probe (`pin_table_prove_unique_keys`, on by default) supplies the proof
+that a group-by-rowid ride needs. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
 floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.

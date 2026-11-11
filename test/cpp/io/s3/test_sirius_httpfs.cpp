@@ -653,7 +653,7 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
   auto unused_equality_io = std::make_shared<cucascade::io::kvikio_context>();
   auto read               = [&] {
     return sirius::op::scan::load_delete_payload(
-      *fixture.con.context, "s3-table", unused_equality_io, {}, discovery);
+      *fixture.con.context, "s3-table", unused_equality_io, discovery);
   };
   fixture.con.BeginTransaction();
   auto result           = read();

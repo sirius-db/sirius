@@ -29,8 +29,10 @@
 #include <vector>
 
 namespace duckdb {
+class BoundTableFunction;
 class ClientContext;
 class DataTable;
+struct FunctionData;
 class LogicalGet;
 class LogicalOperator;
 class PhysicalOperator;
@@ -158,6 +160,18 @@ struct logical_bound_read_view_capture {
   uint64_t planning_generation = 0;
   std::vector<logical_bound_read_view> views;
 };
+
+struct iceberg_snapshot_binding {
+  std::string table_uuid;
+  int64_t snapshot_id;
+  int32_t schema_id;
+};
+
+/// The committed snapshot selected by a verified Iceberg filesystem scan.
+std::optional<iceberg_snapshot_binding> capture_iceberg_snapshot(
+  duckdb::BoundTableFunction const& function,
+  duckdb::FunctionData const* bind_data,
+  duckdb::ClientContext& context);
 
 // Canonical text of the Parquet reader options that change what a file reads as, including
 // the encryption configuration. Equal text means equal options.
