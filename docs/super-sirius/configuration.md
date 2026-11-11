@@ -677,7 +677,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_quent` | bool | true; false in released extensions | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
@@ -796,14 +796,15 @@ requires startup configuration.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
+| `sirius_log_backend` | `spdlog`; `duckdb` in released extensions | Log sink: `spdlog`, `duckdb`, or `noop` |
 | `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
 | `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
-- **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
-  `sirius_log_level` and `sirius_log_flush_seconds`.
-- **`duckdb`**: routes logs into DuckDB's own logging under the `Sirius` log type; enable and
+- **`spdlog`** (default in source builds): writes the daily-rotated
+  `<sirius_log_dir>/sirius_<date>.log`, honouring `sirius_log_level` and `sirius_log_flush_seconds`.
+- **`duckdb`** (default in the released `sirius_cuda12`/`sirius_cuda13` extensions, which are
+  built with `-DSIRIUS_DISTRIBUTION_DEFAULTS=ON`): routes logs into DuckDB's own logging under the `Sirius` log type; enable and
   read them with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
@@ -812,9 +813,11 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 `SIRIUS_LOG_LEVEL` environment variables.
 
 The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
-If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
-the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
-the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+If none is set, it leaves the current log sink unchanged. In source builds, if only
+`SIRIUS_LOG_LEVEL` is set, the default `spdlog` backend writes to `./log/sirius_<date>.log`; if
+only `SIRIUS_LOG_DIR` is set, the default `spdlog` backend writes there. Libraries built with
+`SIRIUS_DISTRIBUTION_DEFAULTS` default to `duckdb`, so they need `SIRIUS_LOG_BACKEND=spdlog` for
+file logs. An unknown backend leaves the current sink in
 place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
 backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
 does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB

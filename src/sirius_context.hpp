@@ -1020,7 +1020,10 @@ void install_configured_log_sink(DatabaseInstance* db);
 /// extensions
 class SiriusContextExtensionCallback : public ExtensionCallback {
  public:
-  SiriusContextExtensionCallback();
+  /// Installs the configured log sink for @p db before reading sirius.yaml, so the duckdb
+  /// backend also captures configuration and initialization messages. Without a database the
+  /// duckdb backend leaves the current sink in place.
+  explicit SiriusContextExtensionCallback(DatabaseInstance* db = nullptr);
 
   /// Finish runtime initialization after process-wide setup that must precede
   /// the first NVTX/runtime-initialization call.
@@ -1086,11 +1089,12 @@ bool like_swar_fastpath_enabled(ClientContext& context);
 /// `sirius.operator_params` entry is what a connection inherits until it sets its own.
 bool compressed_materialization_enabled(ClientContext& context);
 
-/// \brief Print the "GPU execution failed, falling back to DuckDB" banner.
+/// \brief Print the "GPU execution failed, falling back to DuckDB" banner with the GPU error.
 ///
 /// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so
 /// piped/redirected output is not corrupted. Shared by the transparent runtime
 /// fallback and the explicit gpu_execution() CALL path so the message stays in sync.
-void print_cpu_fallback_banner();
+/// Newlines in the reason are flattened so the banner keeps a fixed shape.
+void print_cpu_fallback_banner(std::string_view reason);
 
 }  // namespace duckdb

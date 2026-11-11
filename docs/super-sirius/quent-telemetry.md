@@ -26,7 +26,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | `true` | Emit Quent telemetry using the configured exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
+| `enable_quent` | bool | `true`; `false` in released extensions | Emit Quent telemetry using the configured exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
 | `enable_nvtx` | bool | `false` | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is `false`. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |

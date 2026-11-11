@@ -228,10 +228,13 @@ Sirius loads its settings from a YAML config file, searched in this order:
 If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Logging
-Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
+Source builds log with [spdlog](https://github.com/gabime/spdlog) to `log/sirius_<date>.log`, relative to the current working directory, at level `info`.
 
-Log directory and level can be initialized via environment variables before loading the extension:
+The released `sirius_cuda12` and `sirius_cuda13` extensions write no files by default: they log through DuckDB's logger and leave Quent telemetry off. Read their logs with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`, or select file logging with `SET sirius_log_backend = 'spdlog'` or `SIRIUS_LOG_BACKEND=spdlog`. When a query falls back to the CPU, the banner printed on stdout includes the GPU error.
+
+Log directory and level for the `spdlog` backend can be initialized via environment variables before loading the extension:
 ```bash
+export SIRIUS_LOG_BACKEND=spdlog  # needed for the released extensions
 export SIRIUS_LOG_DIR=/path/to/logs
 export SIRIUS_LOG_LEVEL=trace
 ```

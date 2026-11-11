@@ -18,9 +18,13 @@
 
 namespace duckdb {
 
+#ifdef SIRIUS_DISTRIBUTION_DEFAULTS
+std::string Config::LOG_BACKEND = "duckdb";
+#else
 std::string Config::LOG_BACKEND = "spdlog";
-std::string Config::LOG_LEVEL   = "info";
-std::string Config::LOG_DIR     = "log";
-int Config::LOG_FLUSH_SECONDS   = 3;
+#endif
+std::string Config::LOG_LEVEL = "info";
+std::string Config::LOG_DIR   = "log";
+int Config::LOG_FLUSH_SECONDS = 3;
 
 }  // namespace duckdb

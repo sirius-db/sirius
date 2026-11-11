@@ -509,7 +509,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       // Fall back: run the stored CPU plan on a private executor bound to the same
       // ClientContext (same transaction / MVCC snapshot).
-      duckdb::print_cpu_fallback_banner();
+      duckdb::print_cpu_fallback_banner(gpu_msg);
       SIRIUS_LOG_WARN(
         "Transparent execution: GPU execution failed at runtime; falling back to DuckDB CPU "
         "within the same transaction. GPU error: {}",

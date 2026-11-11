@@ -120,7 +120,10 @@ extern "C" int cudaProfilerStop();
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -683,7 +686,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         throw std::runtime_error("Sirius CPU replay refused: " + gpu_error.RawMessage());
       }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
-      print_cpu_fallback_banner();
+      print_cpu_fallback_banner(gpu_error.RawMessage());
       auto cpu_replay = run_internal_cpu_fallback_query(
         context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
       if (cpu_replay.policy_refused) {
@@ -3786,8 +3789,55 @@ static void check_cuda_driver_version()
 #endif
 }
 
+/// Makes a load all-or-nothing for the process-wide logging state: loads run one at a time, and a
+/// failed load restores the log sink and Config::LOG_* values it found, so a database whose load
+/// fails does not leave its sink installed.
+class logging_load_transaction {
+ public:
+  logging_load_transaction() : load_lock_(load_mutex())
+  {
+    std::lock_guard log_lock(Config::logging_mutex);
+    previous_sink_    = sirius::log::get_sink();
+    previous_backend_ = Config::LOG_BACKEND;
+    previous_dir_     = Config::LOG_DIR;
+    previous_level_   = Config::LOG_LEVEL;
+  }
+  ~logging_load_transaction()
+  {
+    if (committed_) { return; }
+    std::lock_guard log_lock(Config::logging_mutex);
+    Config::LOG_BACKEND = std::move(previous_backend_);
+    Config::LOG_DIR     = std::move(previous_dir_);
+    Config::LOG_LEVEL   = std::move(previous_level_);
+    try {
+      if (sirius::log::get_sink() != previous_sink_) { sirius::log::set_sink(previous_sink_); }
+    } catch (...) {
+      // Flushing the discarded sink failed; the load's own error is the one to report.
+    }
+  }
+  logging_load_transaction(logging_load_transaction const&)            = delete;
+  logging_load_transaction& operator=(logging_load_transaction const&) = delete;
+
+  void commit() noexcept { committed_ = true; }
+
+ private:
+  static std::recursive_mutex& load_mutex()
+  {
+    static std::recursive_mutex mutex;
+    return mutex;
+  }
+
+  std::unique_lock<std::recursive_mutex> load_lock_;
+  std::shared_ptr<sirius::log::sink> previous_sink_;
+  std::string previous_backend_;
+  std::string previous_dir_;
+  std::string previous_level_;
+  bool committed_ = false;
+};
+
 static void LoadInternal(ExtensionLoader& loader)
 {
+  logging_load_transaction logging_transaction;
   sirius::util::install_segfault_backtrace_handler();
 
   auto& db     = loader.GetDatabaseInstance();
@@ -3795,7 +3845,7 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
-  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>(&db);
   auto* callback_ptr         = callback.get();
   bool const sirius_disabled = callback_ptr->is_disabled();
 
@@ -3806,11 +3856,6 @@ static void LoadInternal(ExtensionLoader& loader)
     callback_ptr->initialize_context();
   }
   config.GetCallbackManager().Register(std::move(callback));
-
-  // The ctor already installed the db-independent backend; reinstall now that the
-  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
-  // unknown backend name is reported here rather than swallowed by the ctor.
-  install_configured_log_sink(&db);
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
@@ -3857,6 +3902,7 @@ static void LoadInternal(ExtensionLoader& loader)
     default_to_explicit_delim_joins(config);
     db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
+  logging_transaction.commit();
 }
 
 }  // namespace duckdb
