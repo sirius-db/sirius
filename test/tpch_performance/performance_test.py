@@ -14,6 +14,7 @@
 
 import argparse
 import csv
+import datetime as datetime_module
 import glob
 import json
 import math
@@ -297,7 +298,8 @@ VALIDATION_ABS_TOL = 1e-10
 _RESULT_EVAL_GLOBALS = {
     "__builtins__": {},
     "Decimal": Decimal,
-    "datetime": datetime,
+    # repr() uses module-qualified constructors such as datetime.date(...).
+    "datetime": datetime_module,
     "date": date,
     "time": dtime,
     "timedelta": timedelta,

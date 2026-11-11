@@ -175,17 +175,12 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
  * @param metadata_ioctx Routes the equality-delete parquet and footer reads. Single-GPU is
  *                       sufficient (planning-time reads). Shared because every datasource
  *                       opened on it co-owns it; nullptr throws.
- * @param snapshot_id    The snapshot the SCAN was bound to. Callers on the GPU path always pass
- *                       one: an unpinned iceberg_scan is declined at plan time precisely so that
- *                       this pass cannot resolve "current" independently and pair one snapshot's
- *                       data files with another's deletes. This function never queries the
- * inventory.
+ * The caller supplies discovery from the scan's snapshot-scoped inventory.
  */
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
   std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
-  std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery);
 
 /// Legacy payload builds. Monotonic; retained for the existing scan-local read oracle.

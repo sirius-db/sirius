@@ -41,6 +41,11 @@ enum class origin_policy {
   /// Only the values are unchanged (magnitude bounds): either side of any join or cross product
   /// qualifies, since row multiplication and NULL padding add no values.
   value_preserving,
+  /// Values are unchanged and dropping scan rows changes no output row that descends from the
+  /// remaining ones (removing a filter a join above implies): limits, DISTINCT, grouping sets,
+  /// joins that pick a match by order, SINGLE joins and operators that evaluate an expression
+  /// that can throw are refused.
+  row_wise,
 };
 
 /**
