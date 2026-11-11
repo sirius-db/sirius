@@ -222,14 +222,6 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
   });
 }
 
-std::optional<int64_t> bigint_constant(duckdb::Expression const& expr)
-{
-  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return std::nullopt; }
-  auto const& value = expr.Cast<duckdb::BoundConstantExpression>().GetValue();
-  if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) { return std::nullopt; }
-  return value.GetValue<int64_t>();
-}
-
 // The GPU evaluator applies one slice to every row, so it needs constant BIGINT bounds that
 // gpu_substring_slice can map onto DuckDB's semantics.
 bool gpu_supports_substring(duckdb::BoundFunctionExpression const& expr)
@@ -493,6 +485,14 @@ std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr)
       throw duckdb::InternalException("[sirius::ast::from_duckdb] Unknown ExpressionClass: %d",
                                       expr.GetExpressionClass());
   }
+}
+
+std::optional<int64_t> bigint_constant(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return std::nullopt; }
+  auto const& value = expr.Cast<duckdb::BoundConstantExpression>().GetValue();
+  if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) { return std::nullopt; }
+  return value.GetValue<int64_t>();
 }
 
 }  // namespace sirius::ast
