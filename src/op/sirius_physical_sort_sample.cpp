@@ -99,17 +99,8 @@ std::unique_ptr<cudf::table> sirius_physical_sort_sample::evenly_spaced(
   return cudf::gather(sorted, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
 }
 
-void sirius_physical_sort_sample::take_planning_state_from(sirius_physical_sort_sample& other)
-{
-  children = std::move(other.children);
-  set_physical_types(other.get_physical_types());
-  set_alternate_physical_types(other.get_alternate_physical_types());
-  set_owning_delim_join(other.owning_delim_join());
-}
-
-sirius_physical_sort_sample::boundaries sirius_physical_sort_sample::make_boundaries(
+sort_boundaries sirius_physical_sort_sample::local_boundaries(
   cudf::table_view sample_keys,
-  std::size_t /*sample_bytes*/,
   std::size_t num_parts,
   cucascade::memory::memory_space* space,
   ::cuda::stream_ref stream)
@@ -252,10 +243,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   }
 
   if (valid_batches.empty() || !space) {
-    auto made = _cross_rank_boundaries
-                  ? _cross_rank_boundaries->make(
-                      {{}, 0, _sort_sample_bytes, 1, batch_telemetry()}, stream)
-                  : make_boundaries({}, 0, 1, nullptr, stream);
+    auto made =
+      _cross_rank_boundaries
+        ? _cross_rank_boundaries->make({{}, 0, _sort_sample_bytes, 1, batch_telemetry()}, stream)
+        : sort_boundaries{};
     _num_partitions       = made.num_partitions;
     _partition_boundaries = std::move(made.table);
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
@@ -373,8 +364,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         ? _cross_rank_boundaries->make(
             {sort_keys_view, total_sample_bytes, _sort_sample_bytes, num_parts, batch_telemetry()},
             stream)
-        : make_boundaries(sort_keys_view, total_sample_bytes, num_parts, space, stream);
-    _num_partitions = made.num_partitions;
+        : local_boundaries(sort_keys_view, num_parts, space, stream);
+    _num_partitions       = made.num_partitions;
     _partition_boundaries = std::move(made.table);
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this

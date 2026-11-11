@@ -126,7 +126,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     return _cross_rank_boundaries != nullptr && boundary_state() != BoundaryState::DONE;
   }
 
-
   //! A device INT32 column holding @p indices.
   static std::unique_ptr<cudf::column> index_column(std::vector<int32_t> const& indices,
                                                     ::cuda::stream_ref stream,
@@ -141,32 +140,19 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
                                                     ::cuda::stream_ref stream,
                                                     rmm::device_async_resource_ref mr);
 
- protected:
-  using boundaries = sort_boundaries;
-
-  //! The boundaries for @p num_parts partitions from the sorted @p sample_keys (no columns and a
-  //! null @p space with no input); the default picks evenly spaced rows. Runs again on a retry.
-  virtual boundaries make_boundaries(cudf::table_view sample_keys,
-                                     std::size_t sample_bytes,
-                                     std::size_t num_parts,
-                                     cucascade::memory::memory_space* space,
-                                     ::cuda::stream_ref stream);
-
-  /**
-   * @brief Moves @p other's children here, and copies its planning state that no constructor
-   * argument carries (physical types, alternate physical types, owning delim join).
-   *
-   * For a sample built to replace @p other in a plan. A new planning field of the operator goes
-   * here, so no replacement drops it.
-   */
-  void take_planning_state_from(sirius_physical_sort_sample& other);
+ private:
+  //! Evenly spaced boundaries for @p num_parts partitions from this operator's own sorted
+  //! @p sample_keys.
+  sort_boundaries local_boundaries(cudf::table_view sample_keys,
+                                   std::size_t num_parts,
+                                   cucascade::memory::memory_space* space,
+                                   ::cuda::stream_ref stream);
 
   [[nodiscard]] BoundaryState boundary_state() const noexcept
   {
     return _boundary_state.load(std::memory_order_acquire);
   }
 
- private:
   //! Partition boundary rows (P-1 rows containing sort key column values)
   std::unique_ptr<cudf::table> _partition_boundaries;
 
