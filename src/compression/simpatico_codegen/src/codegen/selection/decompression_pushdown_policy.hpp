@@ -9,17 +9,9 @@
 // one reader accepted only "1" where the decode accepts anything but "0", so a
 // value like "true" turned the feature on in one layer and off in another.
 //
-// All are read once and cached: the gate check sits on the per-batch path.
-//
-// TODO: these should be Sirius parameters, not environment variables. As env
-// vars they are invisible to duckdb_settings(), cannot be set per session, and
-// — because the values cache on first read — cannot be varied within one test
-// binary, which is why some decode paths can only be reached by a unit test
-// rather than end to end. The obstacle is layering: this library has no DuckDB
-// dependency, so the values cannot be pulled from the setting registry here.
-// They would have to arrive from Sirius, either pushed down once per query or
-// passed into the decode call as a policy value. Left as env while the feature
-// is experimental; revisit before it ships.
+// Thresholds and diagnostics below remain environment-controlled and cached on first use.
+// The master enable_fused_scan_filter setting is supplied explicitly in each decode request,
+// so planning, reservation forecasts and workers use one immutable query policy.
 
 #pragma once
 
@@ -27,9 +19,7 @@
 
 namespace sirius::codegen {
 
-/// Master gate (SIRIUS_EXP_FUSED_SCAN_FILTER). Set and not exactly "0" = on.
-bool decompression_pushdown_enabled();
-
+/// The master gate is passed explicitly in scan_filter_request::enable_fused_scan_filter.
 /// Promote the decision trace to INFO / stderr (SIRIUS_EXP_FUSED_SCAN_DIAG),
 /// same "set and not exactly 0" contract.
 ///

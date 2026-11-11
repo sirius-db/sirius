@@ -1357,8 +1357,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     auto const pinned_column_names = cache_info.column_names();
     auto const probe_unique_columns =
       std::vector<bool>(pinned_column_names.size(),
-                        unique_cfg->prove_unique_keys &&
-                          (data.args.format == "parquet" || sirius::late_mat::late_mat_enabled()));
+                        unique_cfg->prove_unique_keys && (data.args.format == "parquet" ||
+                                                          unique_cfg->enable_late_materialization));
 
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                             std::vector<std::size_t> row_counts) {
@@ -3111,6 +3111,31 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                                            const sirius::compression_config& compression_defaults)
 {
   std::lock_guard log_lock(Config::logging_mutex);
+  config.AddExtensionOption(
+    "enable_late_materialization",
+    "Defer eligible pinned column materialization until its consuming operator",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_late_materialization),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      get_operator_params(context, scope)->enable_late_materialization = BooleanValue::Get(value);
+    });
+  config.AddExtensionOption("enable_fused_scan_filter",
+                            "Fuse eligible filters into compressed scan decoding",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(operator_defaults.enable_fused_scan_filter),
+                            [](ClientContext& context, SetScope scope, Value& value) {
+                              get_operator_params(context, scope)->enable_fused_scan_filter =
+                                BooleanValue::Get(value);
+                            });
+  config.AddExtensionOption(
+    "enable_low_cardinality_groupby",
+    "Use the specialized grouped aggregation path when its eligibility checks succeed",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_low_cardinality_groupby),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      get_operator_params(context, scope)->enable_low_cardinality_groupby =
+        BooleanValue::Get(value);
+    });
   config.AddExtensionOption(
     "expression_evaluator_strategy",
     "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "

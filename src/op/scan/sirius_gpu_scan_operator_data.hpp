@@ -94,6 +94,7 @@ struct membership_snapshot {
  * split's own state.
  */
 struct membership_attach_options {
+  bool enable_fused_scan_filter = true;
   /// The scan latched decode-time compaction as unprofitable, so offer no probes.
   bool selection_unprofitable = false;
   /// The split carries an MVCC keep-mask that the representation does not compose into the decode.
@@ -335,6 +336,8 @@ class scan_operator_input : public op::operator_data {
   }
 
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  /// Immutable query policy, set before estimating or preparing this split.
+  bool enable_fused_scan_filter = true;
   std::variant<std::monostate, std::shared_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
   /// Per-query MVCC keep-mask for a resident cached chunk; a default mask =

@@ -891,7 +891,6 @@ int main()
   try {
     // Policy values cache on first read; use a dedicated process, not mutations
     // of environment knobs between cases in a shared engine test binary.
-    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", 1);
     setenv("SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER", "4", 1);
     setenv("SIRIUS_EXP_FUSED_SCAN_MAX_SEL", "0.35", 1);
     setenv("SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL", "0.10", 1);

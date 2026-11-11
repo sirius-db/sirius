@@ -545,6 +545,12 @@ expression_query_policy sirius_physical_operator::expression_policy() const noex
                    : expression_query_policy{};
 }
 
+const sirius::operator_params& sirius_physical_operator::operator_options() const noexcept
+{
+  static const sirius::operator_params defaults;
+  return _pipeline ? _pipeline->get_operator_params() : defaults;
+}
+
 bool sirius_physical_operator::like_swar_fastpath_enabled() const noexcept
 {
   return _pipeline != nullptr && _pipeline->get_operator_params().like_swar_fastpath;

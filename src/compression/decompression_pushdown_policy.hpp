@@ -31,7 +31,6 @@ namespace sirius {
 // on or how selective a batch has to be. Re-exported here because this is the
 // header the scan side reaches for.
 
-using sirius::codegen::decompression_pushdown_enabled;
 using sirius::codegen::decompression_pushdown_max_selectivity;
 
 /// Promote the decision trace to INFO (SIRIUS_EXP_FUSED_SCAN_DIAG).

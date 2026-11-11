@@ -57,19 +57,13 @@
 
 namespace sirius::test::fused_scan_filter {
 
-/// Both knobs are function-local statistics latched on first use. Arm them at static-init time --
-/// before any test can latch them -- without overriding an explicit setting (overwrite=0). The
-/// filtered path's contract is byte-identical output whatever these say, so suite-wide arming is
-/// behavior-neutral for every other test.
+/// The membership cap is latched on first use. Set it before any test can latch it, without
+/// overriding an explicit setting (overwrite=0). The master SQL policy defaults to enabled.
 ///
 /// MAX_MEMBER defaults to 1, which makes the multi-probe cascade unreachable; raise it to 2 so the
 /// fold-back (each probe's survivors become the next probe's prior) is actually covered.
 struct fused_gate_armer {
-  fused_gate_armer()
-  {
-    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", /*overwrite=*/0);
-    setenv("SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER", "2", /*overwrite=*/0);
-  }
+  fused_gate_armer() { setenv("SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER", "2", /*overwrite=*/0); }
 };
 inline fused_gate_armer const arm_fused_gate{};
 
@@ -337,13 +331,6 @@ std::vector<T> column_to_host(cudf::column_view const& col,
   }
   stream.sync();
   return host;
-}
-
-/// True when the filtered attempt was declined because the env gate stayed off (an explicit
-/// SIRIUS_EXP_FUSED_SCAN_FILTER=0, or another TU latched the static before the armer ran).
-inline bool gate_stayed_off(sirius::codegen::scan_filter_result const& result)
-{
-  return !result.applied && result.status == sirius::codegen::scan_filter_status::refused;
 }
 
 }  // namespace sirius::test::fused_scan_filter

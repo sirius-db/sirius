@@ -131,8 +131,7 @@ struct manager_fixture {
 
 TEST_CASE("a replacing pin does not redirect an active query's origin", "[late_mat][pin_lifecycle]")
 {
-  // The gate decides whether handles are published at all.
-  if (!sirius::late_mat::late_mat_enabled()) { return; }
+  // Pin handles remain available regardless of the querying connection's policy.
 
   ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
@@ -165,8 +164,6 @@ TEST_CASE("a replacing pin does not redirect an active query's origin", "[late_m
 TEST_CASE("unpin keeps an active query's origin valid until its owner releases",
           "[late_mat][pin_lifecycle]")
 {
-  if (!sirius::late_mat::late_mat_enabled()) { return; }
-
   ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
   auto* space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -190,8 +187,6 @@ TEST_CASE("unpin keeps an active query's origin valid until its owner releases",
 TEST_CASE("pin, unpin, re-pin keeps active origins on distinct entries",
           "[late_mat][pin_lifecycle]")
 {
-  if (!sirius::late_mat::late_mat_enabled()) { return; }
-
   // The harness's actual rhythm: each query pins what it needs and unpins
   // after, so the same names cycle for the length of a run.
   ::cuda::stream_ref const stream{cudaStream_t{}};

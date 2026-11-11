@@ -382,6 +382,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   });
 
   sirius::codegen::scan_filter_request wave_request;
+  wave_request.enable_fused_scan_filter = request.enable_fused_scan_filter;
   wave_request.routes.reserve(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
     wave_request.routes.push_back(config.routes[i]);
@@ -519,11 +520,12 @@ std::shared_ptr<const decompression_pushdown_scan>
 decompression_pushdown_scan::without_row_selection() const
 {
   pushdown_request narrowed;
+  narrowed.enable_fused_scan_filter = _request.enable_fused_scan_filter;
   narrowed.columns.reserve(_request.columns.size());
   for (auto const& column : _request.columns) {
     narrowed.columns.push_back({column.equals_any, std::nullopt, {}});
   }
-  if (narrowed.empty()) { return nullptr; }
+  if (narrowed.empty() && narrowed.enable_fused_scan_filter) { return nullptr; }
   narrowed.row_selection_disabled = true;
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
@@ -568,7 +570,7 @@ std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::
     }
     any_asked = any_asked || !column.empty();
   }
-  if (!any_asked) { return nullptr; }
+  if (!any_asked && narrowed.enable_fused_scan_filter) { return nullptr; }
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
 
@@ -576,7 +578,7 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
   simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const
 {
   compaction_forecast forecast{};
-  if (!decompression_pushdown_enabled()) { return forecast; }
+  if (!_request.enable_fused_scan_filter) { return forecast; }
   if (_request.row_selection_disabled) { return forecast; }
   if (!_request.ranges_cover_whole_filter) { return forecast; }
 

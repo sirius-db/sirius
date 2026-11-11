@@ -1008,12 +1008,12 @@ See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authori
 
 ### Late Materialization (experimental)
 
-Off by default, and gated by environment variables rather than `sirius_config`/`SET` — this is
-still an experimental optimization, not a normal session choice.
+Enabled by default. The connection-local SQL setting is snapshotted per query. The same key
+is accepted under YAML `sirius.operator_params`; `RESET` restores the startup default.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SIRIUS_EXP_LATE_MAT` | off | The master gate. Carries a pin-order rowid instead of scanned values for a GPU-tier pinned table, restoring them at the far end. |
+| `enable_late_materialization` | true | Carries a pin-order rowid instead of scanned values for an eligible GPU-tier pinned table, restoring them at the far end. |
 
 Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
@@ -1021,11 +1021,34 @@ gate table, the mechanism, and results.
 
 ### Grouped Aggregation (experimental)
 
-Off by default, and gated by an environment variable rather than `sirius_config`/`SET`, like late materialization. The path applies only to batches it can handle and falls back to cuDF's group-by for anything else, so the variable never changes query results.
+Enabled by default, controlled by connection-local SQL `SET` or YAML `sirius.operator_params`.
+The specialized path applies only to eligible batches and otherwise uses cuDF's group-by.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SIRIUS_EXP_LOWCARD_GROUPBY` | off | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. Set to `1` to enable; any other value leaves it off. |
+| `enable_low_cardinality_groupby` | true | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. |
+
+### Fused Scan Filtering
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
+
+This is a connection-local SQL setting, also accepted under YAML `sirius.operator_params`.
+Planning, memory forecasting and decode use the same query policy, including background uploads.
+`SET GLOBAL` is rejected for all three optimization settings. Changing a setting does not alter
+an existing query. Pin metadata remains reusable by queries with different settings.
+
+The former master environment variables `SIRIUS_EXP_LATE_MAT`, `SIRIUS_EXP_FUSED_SCAN_FILTER`,
+and `SIRIUS_EXP_LOWCARD_GROUPBY` are no longer read. Migrate overrides to these settings:
+
+```sql
+SET enable_late_materialization = false;
+SET enable_fused_scan_filter = false;
+SET enable_low_cardinality_groupby = false;
+```
+
+Other experimental thresholds and diagnostic environment variables retain their existing behavior.
 
 See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
 

@@ -12,8 +12,8 @@ addressable when the far end asks for them, and that is what the pin guarantees.
 
 ## Turning it on (experimental)
 
-```bash
-SIRIUS_EXP_LATE_MAT=1   # the gate; off = nothing below exists
+```sql
+SET enable_late_materialization = true; -- enabled by default; false disables deferrals
 ```
 
 The group-by-rowid ride and the riders need a key proven distinct over the pinned table. The pin
@@ -24,13 +24,13 @@ named: on TPC-H SF1000, q10's ride is admitted through `c_custkey`, and q5's and
 `nation.n_name`, with no further configuration.
 With `pin_table_prove_unique_keys = false` no column is proven and no ride or rider is admitted.
 
-Off by default and inert when off. The census goes to the log under the `[late-mat]` tag, and
+Enabled by default and inert when disabled for the query. The census goes to the log under the `[late-mat]` tag, and
 every refusal says which refusal it was — a deferral that silently did not happen looks exactly
 like one that did nothing.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
+| `enable_late_materialization` | true | Connection-local SQL master setting; also YAML `sirius.operator_params`. |
 | `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
 | `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
