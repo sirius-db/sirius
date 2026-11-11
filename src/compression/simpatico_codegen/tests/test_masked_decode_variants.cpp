@@ -135,7 +135,10 @@ std::uint64_t splitmix64(std::uint64_t& s)
 //   chunk 4 = confined to the top quarter of the domain (zero survivors
 //             under the mid-selectivity predicate -> mask-walk early return).
 template <typename Element>
-std::vector<Element> gen_data(std::int64_t n, std::int64_t base, std::int64_t range)
+std::vector<Element> gen_data(std::int64_t n,
+                              std::int64_t base,
+                              std::int64_t range,
+                              std::int64_t step = 1)
 {
   std::vector<Element> v(static_cast<std::size_t>(n));
   for (std::int64_t i = 0; i < n; ++i) {
@@ -151,7 +154,7 @@ std::vector<Element> gen_data(std::int64_t n, std::int64_t base, std::int64_t ra
     } else {
       val = base + r;
     }
-    v[static_cast<std::size_t>(i)] = static_cast<Element>(val);
+    v[static_cast<std::size_t>(i)] = static_cast<Element>(base + (val - base) * step);
   }
   return v;
 }
@@ -276,18 +279,30 @@ std::int64_t host_cnt(const std::vector<std::uint32_t>& mask,
 }
 
 template <typename Element>
-bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t range, int arch)
+bool run_roundtrip(
+  const std::string& dtype, std::int64_t base, std::int64_t range, int arch, std::int64_t step = 1)
 {
   const std::int64_t n  = 5 * kChunk + 700;  // partial tail chunk
   const std::int64_t nc = codegen::num_chunks_for(n);
   const ::cuda::stream_ref stream{cudaStream_t{}};
 
-  const std::vector<Element> data = gen_data<Element>(n, base, range);
+  const std::vector<Element> data = gen_data<Element>(n, base, range, step);
 
   auto tree = jit::FusedTree::make(OpKind::Bitpack);
 
   GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
   if (!compact_packed_on_host(enc, nc)) return false;
+  if (step > 1) {
+    Element chunk0_divisor{};
+    cudaMemcpy(&chunk0_divisor,
+               device_ptr<Element>(enc, 0, "chunk_divisors"),
+               sizeof(Element),
+               cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(static_cast<std::int64_t>(chunk0_divisor) % step == 0,
+                "[%s] bitpack did not fold the common divisor %lld",
+                dtype.c_str(),
+                static_cast<long long>(step));
+  }
 
   // --- Plain reference through the production launcher. -------------------
   CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n) * sizeof(Element));
@@ -303,10 +318,11 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
   REQUIRE_MSG(plain == data, "[%s] plain decode != original input", dtype.c_str());
 
   // --- Range ballot -> host CNT-equivalent -> mask walk, for three selectivities. ---
+  const std::int64_t span       = range * step;
   const range_predicate preds[] = {
-    {base + range / 4, base + range / 2},  // mid (chunk 4 has zero survivors)
-    {base, base + range},                  // all pass
-    {base + 2 * range, base + 3 * range},  // none pass
+    {base + span / 4, base + span / 2},  // mid (chunk 4 has zero survivors)
+    {base, base + span},                 // all pass
+    {base + 2 * span, base + 3 * span},  // none pass
   };
   const char* pred_names[] = {"mid", "all", "none"};
 
@@ -1644,6 +1660,11 @@ int main()
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
     run_roundtrip<std::int64_t>("int64_t", 3'000'000'000LL, 5052, arch);
+    // Every value a multiple of `step`, so bitpack folds a per-chunk divisor and each
+    // variant must apply it; the mid bounds are not multiples, so rounding is exercised.
+    run_roundtrip<std::int32_t>("int32_t", 803'500, 2526, arch, 100);
+    run_roundtrip<std::int64_t>("int64_t", -3'000'000'000LL, 5052, arch, 1000);
+    run_roundtrip<std::int64_t>("int64_t", -3'000'000'000LL, 5052, arch, 100'000);
     // The ballot at open-ended / lane-typed bounds: engine lanes (int16 dates,
     // int32 decimals), negative minima, the full 32-bit int32 width, a 40-bit
     // int64 chunk and an int64 minimum next to INT64_MIN.

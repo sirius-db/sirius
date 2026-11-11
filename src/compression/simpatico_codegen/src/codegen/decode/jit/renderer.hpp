@@ -229,10 +229,14 @@ DecodeKernelSpec render_masked_char_copy();
 // `element_dtype` (e.g. "int64_t" for a DECIMAL32 column restored to DECIMAL64). Decoded values are
 // computed in `element_dtype` and widened by the store's implicit conversion. Only bitpack-rooted
 // mask/index walks request it (see decode_fused_subtree_impl in plan/decompress.cpp).
+//
+// `undivided` lists the Bitpack node ids whose `chunk_divisors` channel is empty (every
+// chunk's divisor is 1). They render without that channel, as the plain affine decode.
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
-                        DecodeShape shape            = kShapePlain,
-                        const std::string& out_dtype = {});
+                        DecodeShape shape                          = kShapePlain,
+                        const std::string& out_dtype               = {},
+                        const std::vector<std::int32_t>& undivided = {});
 
 }  // namespace codegen::decode::jit
