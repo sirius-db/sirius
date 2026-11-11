@@ -11,9 +11,9 @@
 #   SECONDS_PER_PHASE  default 1.5
 #   SIRIUS_EXCHANGE_MNNVL, SIRIUS_EXCHANGE_FRAME_BYTES, SIRIUS_EXCHANGE_SEND_FRAMES,
 #   SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER   passed to every rank (defaults: require, 16 MiB, 32, 16)
-#   UCX_TLS, UCX_NET_DEVICES  default: scripts/nixl_env.sh's, as a gateway's ranks: UCX_TLS=all on
+#   UCX_TLS, UCX_NET_DEVICES  default: scripts/launcher_env.sh's, as a gateway's ranks: UCX_TLS=all on
 #                    the node's GPU rail NICs; without rail NICs, tcp for notifications on bond0.
-# Needs a build configured with -DSIRIUS_WITH_NIXL=ON. Never run it on nodes you use outside Slurm.
+# Never run it on nodes you use outside Slurm.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
@@ -26,7 +26,7 @@ if [[ ${1:-} == --rank ]]; then
   export SIRIUS_EXCHANGE_RANK=$rank
   # Sirius writes its log to ./log: one folder per rank.
   mkdir -p "$out/rank$rank" && cd "$out/rank$rank"
-  source "$here/nixl_env.sh"
+  source "$here/launcher_env.sh"
   export UCX_NET_DEVICES=${UCX_NET_DEVICES:-bond0}
   echo "rank $rank on $(hostname): UCX_TLS=$UCX_TLS UCX_NET_DEVICES=$UCX_NET_DEVICES" >> "$out/ucx.txt"
   exec timeout -s KILL "${RANK_TIMEOUT:-900}" "$root/build/release/test/cpp/sirius_unittest" \
