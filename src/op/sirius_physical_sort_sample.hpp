@@ -126,6 +126,21 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     return _cross_rank_boundaries != nullptr && boundary_state() != BoundaryState::DONE;
   }
 
+
+  //! A device INT32 column holding @p indices.
+  static std::unique_ptr<cudf::column> index_column(std::vector<int32_t> const& indices,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr);
+
+  //! Rows i * rows / parts of @p sorted for i in [1, parts), offset by @p first: parts - 1
+  //! evenly spaced boundaries.
+  static std::unique_ptr<cudf::table> evenly_spaced(cudf::table_view sorted,
+                                                    cudf::size_type first,
+                                                    cudf::size_type rows,
+                                                    std::size_t parts,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr);
+
  protected:
   using boundaries = sort_boundaries;
 
@@ -150,20 +165,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   {
     return _boundary_state.load(std::memory_order_acquire);
   }
-
-  //! A device INT32 column holding @p indices.
-  static std::unique_ptr<cudf::column> index_column(std::vector<int32_t> const& indices,
-                                                    ::cuda::stream_ref stream,
-                                                    rmm::device_async_resource_ref mr);
-
-  //! Rows i * rows / parts of @p sorted for i in [1, parts), offset by @p first: parts - 1
-  //! evenly spaced boundaries.
-  static std::unique_ptr<cudf::table> evenly_spaced(cudf::table_view sorted,
-                                                    cudf::size_type first,
-                                                    cudf::size_type rows,
-                                                    std::size_t parts,
-                                                    ::cuda::stream_ref stream,
-                                                    rmm::device_async_resource_ref mr);
 
  private:
   //! Partition boundary rows (P-1 rows containing sort key column values)
