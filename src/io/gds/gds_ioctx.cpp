@@ -155,7 +155,11 @@ gds_ioctx::gds_ioctx(gds_config config, options opts) : _config(config), _option
   if (_config.task_size == 0) { throw std::invalid_argument("gds: task_size must be > 0"); }
   if (!_options.on_fatal_stall) {
     _options.on_fatal_stall = [] {
-      SIRIUS_LOG_ERROR("[gds] a cuFile read is stuck; exiting with status 70");
+      SIRIUS_LOG_ERROR("[gds] a read is stuck; exiting with status 70");
+      // The log may sit on the filesystem that stopped answering: the flush gets
+      // two seconds, and the exit does not wait for it.
+      std::thread([] { sirius::log::get_sink()->flush(); }).detach();
+      std::this_thread::sleep_for(std::chrono::seconds(2));
       std::_Exit(70);
     };
   }
@@ -198,6 +202,7 @@ gds_ioctx::gds_ioctx(gds_config config, options opts) : _config(config), _option
   }
 
   _read_started = std::make_unique<std::atomic<std::int64_t>[]>(_config.num_threads);
+  _reading      = std::make_unique<reading[]>(_config.num_threads);
   _workers.reserve(_config.num_threads);
   try {
     for (std::size_t i = 0; i < _config.num_threads; ++i) {
@@ -326,6 +331,10 @@ void gds_ioctx::run_piece(std::shared_ptr<request> const& req,
       auto const& object = as_local(*req->object);
       auto const offset  = slice.offset() + piece_offset;
       std::size_t done   = 0;
+      _reading[worker].object.store(req->object.get());
+      _reading[worker].offset.store(offset);
+      _reading[worker].size.store(piece_size);
+      _reading[worker].device.store(slice.has_device_request());
       if (slice.has_device_request()) {
         auto const started = now_ns();
         _read_started[worker].store(started);
@@ -550,9 +559,25 @@ void gds_ioctx::watchdog_loop()
     if (current != state::stalled && oldest != 0 && now - oldest > timeout_ns) {
       _state.store(current = state::stalled);
       SIRIUS_LOG_ERROR(
-        "[gds] a cuFile read has been in flight for {} s (limit {} s); ending the process.",
+        "[gds] a read has been in flight for {} s (limit {} s); ending the process.",
         (now - oldest) / 1'000'000'000,
         _config.read_timeout.count());
+      // A request cannot be settled, and so cannot release its object, without
+      // this mutex: the objects named below stay alive while it is held.
+      std::lock_guard live_lock{_live_mutex};
+      for (std::size_t i = 0; i < _config.num_threads; ++i) {
+        auto const started = _read_started[i].load();
+        auto const* object = _reading[i].object.load();
+        // Reads younger than a second are healthy ones caught in passing.
+        if (started == 0 || object == nullptr || now - started < 1'000'000'000) { continue; }
+        SIRIUS_LOG_ERROR("[gds] in flight: worker {} {} read for {:.1f} s, {} bytes at {} of {}",
+                         i,
+                         _reading[i].device.load() ? "cuFile" : "host",
+                         static_cast<double>(now - started) / 1e9,
+                         _reading[i].size.load(),
+                         _reading[i].offset.load(),
+                         object->object_path());
+      }
     }
     if (current == state::stalled && !fatal_reported) {
       // A stuck cuFile read cannot be cancelled and still owns its destination.
