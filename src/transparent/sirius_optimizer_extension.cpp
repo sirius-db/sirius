@@ -301,8 +301,8 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     auto copy = copy_logical_plan(*captured, context);
     if (exists_minmax_rewrite_enabled(context)) {
       try {
-        sirius::planner::rewrite_correlated_inequality_exists(
-          context, input.optimizer.binder, copy, gpu_memory_budget(context));
+        ctx->record_exists_minmax_rewrites(sirius::planner::rewrite_correlated_inequality_exists(
+          context, input.optimizer.binder, copy, gpu_memory_budget(context)));
       } catch (std::exception& e) {
         SIRIUS_LOG_WARN(
           "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",

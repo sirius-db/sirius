@@ -692,8 +692,13 @@ bool served_from_gpu_pin(duckdb::ClientContext& context, duckdb::LogicalGet cons
       table.name.GetIdentifierName(),
       sirius::duckdb_table_identity{table.oid, table.GetStorage().GetRowGroupCollection()});
   } else {
-    auto const files = resolve_parquet_scan_file_paths(
-      get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
+    // Other sources, such as Iceberg tables that map columns by field id, may refuse raw cached
+    // rows even for the same files.
+    auto const name = get.function.GetName().GetIdentifierName();
+    if (name != "read_parquet" && name != "parquet_scan" && name != "sirius_read_parquet") {
+      return false;
+    }
+    auto const files = resolve_parquet_scan_file_paths(name, get.bind_data.get(), get.parameters);
     if (files.empty()) { return false; }
     entry = scan_manager.find_pinned_entry_for_parquet_files(files);
   }
