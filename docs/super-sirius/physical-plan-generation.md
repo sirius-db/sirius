@@ -37,6 +37,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 | `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
+| `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (distinct forms) | `HASH_GROUP_BY` over `HASH_JOIN` (null-safe ANTI / SEMI) | `src/planner/sirius_plan_set_operation.cpp` |
 
 `LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
 
@@ -78,7 +79,9 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 
 **File:** `src/planner/sirius_plan_set_operation.cpp`
 
-`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. It lowers only the `ALL` forms, and it lowers them by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
+`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. The distinct forms use a hash join of the left input against the right, with one `IS NOT DISTINCT FROM` key per column, so `NULL` matches `NULL`. `INTERSECT` is a `SEMI` join and `EXCEPT` an `ANTI` join. The left input is always the probe and output side. The builder then groups by every output column with no aggregates to deduplicate the surviving rows. This keeps the node's result distinct whatever its parent is. The binder also puts a `DISTINCT` over every distinct `EXCEPT` / `INTERSECT`; `create_plan(LogicalDistinct&)` plans that `DISTINCT` as nothing when it keys every column and its input, below any identity projections, is a set operation for which `set_operation_deduplicates` holds.
+
+The `ALL` forms lower by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
 
 1. Each input is projected to its columns followed by constant `TINYINT` tags. `EXCEPT ALL` uses one tag (`1` on the left, `-1` on the right); `INTERSECT ALL` uses two (`1, 0` on the left, `0, 1` on the right).
 2. A `UNION` merges the two tagged inputs.
@@ -88,17 +91,17 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 
 The builder throws `NotImplementedException`, so the query falls back to CPU, for:
 
-- the distinct forms of `EXCEPT` and `INTERSECT`;
 - nested-type and `ARRAY` columns;
-- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values;
-- `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
-- an input whose planned column type differs from the declared type. Aggregate results retain DuckDB's `HUGEINT` type throughout the set-operation plan.
+- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values. The builder checks the operator and both logical inputs while their collation metadata is available;
+- in the `ALL` forms, `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
+- an input whose planned column type differs from the declared type. Aggregate results retain DuckDB's `HUGEINT` type throughout the set-operation plan;
+- in the distinct forms, keys the GPU hash join does not support.
 
 ### Distinct Planning
 
 **File:** `src/planner/sirius_plan_distinct.cpp`
 
-`LOGICAL_DISTINCT` becomes a single `sirius_physical_grouped_aggregate` whose group keys are the distinct targets. When every output column is a key, the aggregate list is empty and deduplication is grouping with nothing to compute per group; a column no key covers adds a `FIRST` (see *Carried columns* below). `insert_gpu_pipeline_operators` wraps the result exactly as it wraps a GROUP BY.
+`LOGICAL_DISTINCT` becomes a single `sirius_physical_grouped_aggregate` whose group keys are the distinct targets. When every output column is a key, the aggregate list is empty and deduplication is grouping with nothing to compute per group; a column no key covers adds a `FIRST` (see *Carried columns* below). `insert_gpu_pipeline_operators` wraps the result exactly as it wraps a GROUP BY. A `DISTINCT` on every column of a set operation that already deduplicates its rows plans no aggregate (see *Set Operation Planning* above).
 
 - **Reorder projection** — pushed above the aggregate only when a key sits at an output position other than its own (`SELECT DISTINCT ON (b, a) a, b`). Plain `SELECT DISTINCT a, b` never needs one: the binder synthesizes one target per select-list entry, so every output column is already a key at its own position
 - **Carried columns** — an output column that no distinct target covers (`SELECT DISTINCT ON (k) k, v`, or `SELECT DISTINCT k FROM t ORDER BY v`) becomes a `FIRST` aggregate over that column, as DuckDB's own builder does. Every `FIRST` of one operator reads the same arbitrary row of its group, so the result keeps one row per key; with no other aggregate the grouped kernels do this with `cudf::distinct`. `SELECT k, first(v) FROM t GROUP BY k` runs on the GPU the same way, and so does a `first` beside other aggregates (`SELECT k, first(v), sum(w) FROM t GROUP BY k`), provided no `first` carries an `ORDER BY` and the `GROUP BY` has one grouping set and no `GROUPING()`

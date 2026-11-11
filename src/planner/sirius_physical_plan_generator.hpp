@@ -152,8 +152,8 @@ class sirius_physical_plan_generator {
   static bool use_batch_index(duckdb::ClientContext& context,
                               sirius::op::sirius_physical_operator& plan);
 
-  //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
-  //! type; @p subject names the input in the message.
+  //! Throws sirius::not_implemented_exception (CPU fallback) unless each @p planned column is its
+  //! @p declared type; @p subject names the input in the message.
   static void require_planned_schema(std::span<sirius::logical_type const> planned,
                                      duckdb::vector<duckdb::LogicalType> const& declared,
                                      std::string_view subject);
@@ -256,8 +256,9 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
-  //! Lowers EXCEPT ALL / INTERSECT ALL to tag, UNION ALL, per-group tag sums, and
-  //! `sirius_physical_replicate`; refuses the distinct forms.
+  //! Lowers distinct EXCEPT / INTERSECT to full-row deduplication over a null-safe ANTI / SEMI hash
+  //! join, and their ALL forms to tag, UNION ALL, per-group tag sums, and
+  //! `sirius_physical_replicate`.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
     duckdb::LogicalSetOperation& op);
 
@@ -271,6 +272,21 @@ class sirius_physical_plan_generator {
     std::span<duckdb::idx_t const> key_columns,
     std::span<duckdb::idx_t const> carried_columns,
     duckdb::idx_t estimated_cardinality);
+
+  //! `plan_dedup` keyed on every column of @p child, in order, with nothing carried: the
+  //! deduplication a distinct `UNION`, `EXCEPT` or `INTERSECT` applies to its result.
+  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_full_row_dedup(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+    duckdb::idx_t estimated_cardinality);
+
+  //! Whether `plan_union` / `plan_except_intersect` end the plan of @p op with
+  //! `plan_full_row_dedup`, so its rows are already distinct. A `LogicalDistinct` over such a set
+  //! operation emits no second deduplication.
+  static bool set_operation_deduplicates(duckdb::LogicalSetOperation const& op) noexcept;
+
+  //! Whether every row @p op produces is distinct because, below any identity projections, it is
+  //! a set operation for which `set_operation_deduplicates` holds.
+  static bool input_rows_are_distinct(duckdb::LogicalOperator const& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
