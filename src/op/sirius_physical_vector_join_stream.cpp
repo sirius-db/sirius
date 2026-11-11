@@ -3053,58 +3053,120 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto seed_bound = [&] {
       std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));
       std::vector<std::int32_t> count(static_cast<std::size_t>(n_left));
+      // Every probe row shares one sample when they share a nearest cluster: a single-list join,
+      // or a batch routed to one cluster.
+      bool one_sample = true;
       for (std::int64_t r = 0; r < n_left; ++r) {
         auto const c = static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
+        one_sample   = one_sample && c == static_cast<std::size_t>(host_edges[0]);
         auto const lo                      = _lists->offsets[c];
         first[static_cast<std::size_t>(r)] = lo;
         count[static_cast<std::size_t>(r)] =
           static_cast<std::int32_t>(seed_rows(_lists->offsets[c + 1] - lo));
       }
-      // Probe rows by nearest cluster, so the kernel reads one cluster's sample at a time.
-      std::vector<std::int64_t> order(static_cast<std::size_t>(n_left));
-      {
-        std::vector<std::int64_t> at(_lists->offsets.size(), 0);
-        for (std::int64_t r = 0; r < n_left; ++r) {
-          ++at[static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]) + 1];
+      if (f16_bounded && one_sample && n_left > 0) {
+        // One sample for every probe row: cuVS half brute force over it runs on the tensor cores,
+        // 4-5x (d=96) to 25-33x (d=768) faster than seed_bound_f16's warp per probe row on an
+        // H100 (16K-1M probe rows, 1024-row sample, k = 10 and 64), with the same seeds. With
+        // several clusters it would take a cuVS call per cluster (~20 us each), so those stay on
+        // seed_bound_f16. float16_seed_upper_bound below allows any FP32 summation order, and cuVS
+        // clamping a negative distance to 0 only raises the seed.
+        if (count[0] < k_join) {
+          // As seed_bound_f16: a sample smaller than k seeds nothing.
+          vss::fill_bound(bound->data(), n_left, std::numeric_limits<float>::infinity(), stream);
+        } else {
+          auto const* x =
+            static_cast<std::uint16_t const*>(_lists->device_vectors->data()) + first[0] * dim;
+          auto const* x_sq = static_cast<float const*>(_lists->row_sq_f32->data()) + first[0];
+          // Probe rows in chunks keep the k-column outputs to ~50 MB.
+          constexpr std::int64_t seed_chunk = 65536;
+          for (std::int64_t q0 = 0; q0 < n_left; q0 += seed_chunk) {
+            auto const rows = std::min(seed_chunk, n_left - q0);
+            auto const knn  = vss::brute_force_f16_topk(res,
+                                                       x,
+                                                       x_sq,
+                                                       count[0],
+                                                       probe_f16->data() + q0 * dim,
+                                                       rows,
+                                                       dim,
+                                                       k_join,
+                                                       /*take_sqrt=*/false,
+                                                       mr);
+            CUDF_EXPECTS(knn.k == k_join, "FP16 seed: cuVS returned the wrong number of columns");
+            vss::kth_distance_bound(
+              knn.distances->view().data<float>(), rows, k_join, bound->data() + q0, stream);
+          }
         }
-        std::partial_sum(at.begin(), at.end(), at.begin());
-        for (std::int64_t r = 0; r < n_left; ++r) {
-          auto const c =
-            static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
-          order[static_cast<std::size_t>(at[c]++)] = r;
+      } else {
+        // Probe rows by nearest cluster, so the kernel reads one cluster's sample at a time.
+        std::vector<std::int64_t> order(static_cast<std::size_t>(n_left));
+        {
+          std::vector<std::int64_t> at(_lists->offsets.size(), 0);
+          for (std::int64_t r = 0; r < n_left; ++r) {
+            ++at[static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]) + 1];
+          }
+          std::partial_sum(at.begin(), at.end(), at.begin());
+          for (std::int64_t r = 0; r < n_left; ++r) {
+            auto const c =
+              static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
+            order[static_cast<std::size_t>(at[c]++)] = r;
+          }
+        }
+        rmm::device_uvector<std::int64_t> order_d(order.size(), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(order_d.data(),
+                                      order.data(),
+                                      order.size() * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.value()));
+        rmm::device_uvector<std::int64_t> first_d(first.size(), stream, mr);
+        rmm::device_uvector<std::int32_t> count_d(count.size(), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(first_d.data(),
+                                      first.data(),
+                                      first.size() * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.value()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(count_d.data(),
+                                      count.data(),
+                                      count.size() * sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.value()));
+        if (f16_bounded) {
+          vss::seed_bound_f16(static_cast<std::uint16_t const*>(_lists->device_vectors->data()),
+                              static_cast<float const*>(_lists->row_sq_f32->data()),
+                              probe_f16->data(),
+                              probe_sqf->data(),
+                              first_d.data(),
+                              count_d.data(),
+                              order_d.data(),
+                              n_left,
+                              dim,
+                              static_cast<int>(k_join),
+                              bound->data(),
+                              stream);
+        } else {
+          vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
+                               static_cast<std::int32_t const*>(_lists->row_sq->data()),
+                               probe_i8->data(),
+                               probe_sq->data(),
+                               first_d.data(),
+                               count_d.data(),
+                               order_d.data(),
+                               n_left,
+                               dim,
+                               static_cast<int>(k_join),
+                               bound->data(),
+                               stream);
+          if (codes_int8) {
+            vss::int8_seed_upper_bound(bound->data(),
+                                       probe_code_error->data(),
+                                       _lists->code_error,
+                                       _lists->code_scale,
+                                       n_left,
+                                       stream);
+          }
         }
       }
-      rmm::device_uvector<std::int64_t> order_d(order.size(), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(order_d.data(),
-                                    order.data(),
-                                    order.size() * sizeof(std::int64_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.value()));
-      rmm::device_uvector<std::int64_t> first_d(first.size(), stream, mr);
-      rmm::device_uvector<std::int32_t> count_d(count.size(), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(first_d.data(),
-                                    first.data(),
-                                    first.size() * sizeof(std::int64_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.value()));
-      CUDF_CUDA_TRY(cudaMemcpyAsync(count_d.data(),
-                                    count.data(),
-                                    count.size() * sizeof(std::int32_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.value()));
       if (f16_bounded) {
-        vss::seed_bound_f16(static_cast<std::uint16_t const*>(_lists->device_vectors->data()),
-                            static_cast<float const*>(_lists->row_sq_f32->data()),
-                            probe_f16->data(),
-                            probe_sqf->data(),
-                            first_d.data(),
-                            count_d.data(),
-                            order_d.data(),
-                            n_left,
-                            dim,
-                            static_cast<int>(k_join),
-                            bound->data(),
-                            stream);
         vss::float16_seed_upper_bound(bound->data(),
                                       probe_sqf->data(),
                                       probe_half_error->data(),
@@ -3113,27 +3175,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       dim,
                                       n_left,
                                       stream);
-      } else {
-        vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
-                             static_cast<std::int32_t const*>(_lists->row_sq->data()),
-                             probe_i8->data(),
-                             probe_sq->data(),
-                             first_d.data(),
-                             count_d.data(),
-                             order_d.data(),
-                             n_left,
-                             dim,
-                             static_cast<int>(k_join),
-                             bound->data(),
-                             stream);
-        if (codes_int8) {
-          vss::int8_seed_upper_bound(bound->data(),
-                                     probe_code_error->data(),
-                                     _lists->code_error,
-                                     _lists->code_scale,
-                                     n_left,
-                                     stream);
-        }
       }
       if (rescore) {
         code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
