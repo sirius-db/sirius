@@ -39,10 +39,10 @@ namespace sirius::op {
  * over the whole DECIMAL128 sum and INT64 count range, so the result is the correctly rounded
  * value of `sum / (count * P)` unless that quotient lies within such a distance of a midpoint
  * between two DOUBLEs, where it may round to the other neighbor. DuckDB divides in `long double`
- * (113-bit on aarch64, 64-bit on x86-64), or in DOUBLE for DECIMAL inputs of width 9 or less, so
- * the two can still differ in the last bit where DuckDB's own quotient is not correctly rounded,
- * e.g. such a narrow input whose unscaled sum exceeds 2^53. Any other sum is cast to FLOAT64 and
- * divided. A row is NULL when @p sum or @p count is.
+ * (113-bit on aarch64, 64-bit on x86-64), or in DOUBLE for DECIMAL inputs of width 4 or less, so
+ * the two can still differ in the last bit where DuckDB's own quotient is not correctly rounded.
+ * An integer AVG's sum is a DECIMAL128 with scale 0, so it takes the same path with P = 1. Any
+ * other sum is cast to FLOAT64 and divided. A row is NULL when @p sum or @p count is.
  */
 std::unique_ptr<cudf::column> average_as_double(cudf::column_view const& sum,
                                                 cudf::column_view const& count,

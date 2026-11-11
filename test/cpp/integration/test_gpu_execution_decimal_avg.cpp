@@ -101,6 +101,16 @@ TEST_CASE_METHOD(DecimalAvgFixture,
 }
 
 TEST_CASE_METHOD(DecimalAvgFixture,
+                 "decimal avg - equal grouped BIGINT averages with 128-bit sums are one value",
+                 "[integration][gpu_execution][aggregate][decimal_avg]")
+{
+  // The sums pass INT64, so AVG divides a DECIMAL128 sum with scale 0. Casting such a sum to
+  // DOUBLE before dividing gives a different average for g = 5, 10, 17 and 20.
+  create_equal_value_groups(*this, "BIGINT", "7777777777777777777");
+  compare_gpu_vs_cpu("SELECT a FROM (SELECT g, avg(v) a FROM eq GROUP BY g) GROUP BY a;");
+}
+
+TEST_CASE_METHOD(DecimalAvgFixture,
                  "decimal avg - grouped AVG over DECIMAL keeps NULLs and NULL-only groups",
                  "[integration][gpu_execution][aggregate][decimal_avg]")
 {
