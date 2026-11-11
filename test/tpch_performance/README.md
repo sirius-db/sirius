@@ -223,8 +223,8 @@ pins the **undecoded parquet column-chunk bytes** into Sirius's prefetching cach
 scan path then finds them resident and serves from them. Parquet sources only — a duckdb-native
 table has no column chunks to pin, and the bind rejects it.
 
-It forces three cache settings into the effective config, overriding both `--config` and any
-`--profile` profile (with a warning when they disagree):
+It forces three cache settings into the effective config, overriding `--config` (with a warning
+when they disagree). Profiles do not set cache options:
 
 | key | value | why |
 |---|---|---|
@@ -238,21 +238,19 @@ not required.
 
 #### Profiles (`--profile`)
 
-`--profile` names a **cache state to measure**, not just an iteration order. Each value fixes
-the Sirius cache mode, the eviction policy, the ordering, and what is flushed between runs — and
-**overrides `cache.mode` / `cache.eviction` in whatever `--config` you pass** (it warns when it
-does). The effective config is written to `<bench>/effective_config.yml`; the untouched original
-is kept beside it as `config.yml`.
+`--profile` controls query ordering and cache flushing. It uses the supplied YAML unchanged,
+including cache mode and eviction; a byte-for-byte copy is saved beside the results as
+`config.yml`. Set retention in the YAML when measuring a warm cache.
 
 | `--profile` | `cache.mode` | `cache.eviction` | ordering | between runs |
 |---|---|---|---|---|
 | *(omitted, default)* | *unchanged* | *unchanged* | back-to-back per query | nothing |
-| `cold` | `cucs` | `lru` | round-robin | request dataset-file eviction for either engine; `CALL reset_sirius_cache()` for GPU |
-| `lukewarm` | `cucs` | `lru` | round-robin | nothing |
-| `hot` | `cucs` | `lru` | back-to-back per query | nothing |
+| `cold` | *unchanged* | *unchanged* | round-robin | request dataset-file eviction for either engine; `CALL reset_sirius_cache()` for GPU |
+| `lukewarm` | *unchanged* | *unchanged* | round-robin | nothing |
+| `hot` | *unchanged* | *unchanged* | back-to-back per query | nothing |
 
-**Config overrides come from `--profile` and `--pin parquet`.** With neither, the supplied
-YAML is used unchanged; otherwise the runner can write `effective_config.yml`.
+Profiles never generate `effective_config.yml`. Explicit `--pin parquet` is the only option
+that derives a config with cache overrides. With no YAML, profiles use Sirius defaults.
 
 The runner requests dataset-file eviction once at startup, even when `--profile` is omitted. `cold` keeps the
 *connection* (and so the GPU context and compiled plans) — it targets caches, not the process.
@@ -286,7 +284,7 @@ Key flags:
 - `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
-- `--profile cold|lukewarm|hot` (optional) — cache state to measure; see "Profiles" above. When given it overrides `cache.mode` / `cache.eviction` in `--config`; when omitted the config is left alone.
+- `--profile cold|lukewarm|hot` (optional) — query ordering and cache flushing; see "Profiles" above. The supplied YAML is used unchanged.
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 - `--pin-compression` / `--compression-plan-dir <dir>` — pin the tables Simpatico-compressed (requires `--pin gpu|host`; plan dir defaults to the shipped `plans/tpch_sf1000`). Confirm engagement by grepping the run's logs for `compressing with plan`.
