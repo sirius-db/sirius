@@ -114,6 +114,15 @@ negative_zero = false
 nan_inf = false
 date_extremes = false
 
+[data.pin]
+tables_fraction = 0.0
+tiers = ["gpu", "host"]
+compression = [false, true]
+
+[data.parquet]
+tables_fraction = 0.0
+row_group_size = 256
+
 [oracle]
 float32_rel_tol = 1e-4
 float64_rel_tol = 1e-9

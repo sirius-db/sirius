@@ -468,6 +468,7 @@ class Session:
         self.stage = "evaluation"
         self.current_alias: str | None = None
         self.attached: dict[str, pathlib.Path] = {}
+        self.dataset_pins: dict[str, dict[str, dict[str, Any]]] = {}
         self._setting_defaults: dict[str, Any] = {}
         self.sqlsmith_loaded = False
         self.duckdb_version: str | None = None
@@ -547,6 +548,11 @@ class Session:
             self.execute(f"USE {self.current_alias}")
         for name, value in self.active_settings.items():
             self._set(name, value)
+        for alias, pins in self.dataset_pins.items():
+            self.execute(f"USE {alias}")
+            self._pin_tables(pins)
+        if self.current_alias:
+            self.execute(f"USE {self.current_alias}")
 
     def _disable_gpu(self) -> bool:
         """Switch GPU execution off; False when the shell has no Sirius in it."""
@@ -622,7 +628,11 @@ class Session:
     # -- datasets -------------------------------------------------------------
 
     def load_dataset(
-        self, ds: Dataset, alias: str, permutation_seed: int | None = None
+        self,
+        ds: Dataset,
+        alias: str,
+        permutation_seed: int | None = None,
+        variants: dict[str, Any] | None = None,
     ) -> None:
         self.db_dir.mkdir(parents=True, exist_ok=True)
         path = self.db_dir / f"{alias}.duckdb"
@@ -637,6 +647,39 @@ class Session:
         self.execute(ds.schema_sql())
         self.execute(ds.data_sql(permutation_seed))
         self.execute("CHECKPOINT")
+        self.apply_dataset_variants(alias, variants or {})
+
+    def _pin_tables(self, pins: dict[str, dict[str, Any]]) -> None:
+        if not self.gpu_available:
+            return
+        for name, choice in pins.items():
+            enabled = "true" if choice["compression"] else "false"
+            self.execute(f"SET pin_table_compression = {enabled}")
+            self.execute(f"SET enable_compressed_materialization = {enabled}")
+            self.execute(
+                "CALL pin_table(format = 'duckdb', "
+                f"name = {sql_literal(name)}, tier = {sql_literal(choice['tier'])})"
+            )
+
+    def apply_dataset_variants(self, alias: str, variants: dict[str, Any]) -> None:
+        """Apply saved physical layout after CHECKPOINT, also during replay."""
+        self.use(alias)
+        for name, row_group_size in variants.get("parquet", {}).items():
+            folder = self.db_dir.parent / "datasets" / alias
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{name}.parquet"
+            self.execute(
+                f"COPY \"{name}\" TO {sql_literal(str(path))} "
+                f"(FORMAT PARQUET, ROW_GROUP_SIZE {int(row_group_size)})"
+            )
+            self.execute(f'ALTER TABLE "{name}" RENAME TO "{name}__base"')
+            self.execute(
+                f'CREATE VIEW "{name}" AS SELECT * FROM read_parquet({sql_literal(str(path))})'
+            )
+        pins = variants.get("pin", {})
+        self._pin_tables(pins)
+        if pins and self.gpu_available:
+            self.dataset_pins[alias] = pins
 
     def use(self, alias: str) -> None:
         self.execute(f"USE {alias}")
@@ -647,10 +690,14 @@ class Session:
         for a in aliases:
             if self.shell.alive:
                 try:
+                    self.execute(f"USE {a}")
+                    for name in self.dataset_pins.get(a, {}):
+                        self.execute(f"CALL unpin_table({sql_literal(name)})")
                     self.execute("USE memory")
                     self.execute(f"DETACH {a}")
                 except SessionError:
                     pass
+            self.dataset_pins.pop(a, None)
             for suffix in ("", ".wal"):
                 p = self.db_dir / f"{a}.duckdb{suffix}"
                 if p.exists():

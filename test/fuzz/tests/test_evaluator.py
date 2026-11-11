@@ -58,7 +58,7 @@ class FakeSession:
     def mark_auxiliary(self, operation, input_sql):
         self.auxiliary = {"operation": operation, "input_sql": input_sql}
 
-    def load_dataset(self, ds, alias, permutation_seed=None):
+    def load_dataset(self, ds, alias, permutation_seed=None, variants=None):
         pass
 
     def use(self, alias):

@@ -37,6 +37,7 @@ from .classify import Verdict, classify_gpu_error, narrows_gap, normalize_reason
 from .artifacts import runtime_info, write_json
 from .compare import ResultSet, Tolerances, compare_mode, compare_results
 from .config import FuzzConfig
+from .dataset_variants import choose as choose_dataset_variants, comment as variant_comment
 from .query_gen import QueryGenerator
 from .reduce import reduce_query
 from .report import QueryRecord, Report, signature
@@ -233,6 +234,11 @@ class Evaluator:
                     self.dataset,
                     self.perm_alias,
                     permutation_seed=self.dataset.seed + 1,
+                    variants=choose_dataset_variants(
+                        self.cfg.data,
+                        [table.name for table in getattr(self.dataset, "tables", [])],
+                        self.dataset.seed,
+                    ),
                 )
             self.s.use(self.perm_alias)
             perm = self.s.run(sql, gpu=False, timeout=self.timeout)
@@ -541,14 +547,19 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                 break
             ds_seed = args.seed * 1000 + dataset_idx
             ds = data_gen.generate(ds_seed)
+            dataset_variants = choose_dataset_variants(
+                cfg.data, [table.name for table in ds.tables], ds_seed
+            )
             stem = f"w{w}-s{args.spawn_id}-d{dataset_idx}"
             alias = f"fz{w}_{dataset_idx}"
             (run_dir / "datasets").mkdir(parents=True, exist_ok=True)
             (run_dir / "datasets" / f"{stem}.sql").write_text(
-                f"-- siriusfuzz dataset {stem} (seed {ds_seed})\n{ds.schema_sql()}\n{ds.data_sql()}\nCHECKPOINT;\n"
+                f"-- siriusfuzz dataset {stem} (seed {ds_seed})\n"
+                + variant_comment(dataset_variants)
+                + f"{ds.schema_sql()}\n{ds.data_sql()}\nCHECKPOINT;\n"
             )
             try:
-                session.load_dataset(ds, alias)
+                session.load_dataset(ds, alias, variants=dataset_variants)
             except Exception as e:  # noqa: BLE001
                 log(f"dataset load failed: {e}")
                 send({"type": "done", "reason": f"dataset load failed: {e}"})

@@ -1,0 +1,14 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 2Gi
+    host:
+      capacity_bytes: 64Gi
+    disk:
+      disk_id: 0
+      capacity_bytes: 100Gi
+      downgrade_root_dirs: /localhome/local-akhiljn/sirius-spill
+  telemetry:
+    enable_quent: false

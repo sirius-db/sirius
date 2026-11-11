@@ -226,6 +226,19 @@ class EdgeValues:
 
 
 @dataclass
+class Pin:
+    tables_fraction: float = 0.0
+    tiers: list[str] = field(default_factory=lambda: ["gpu", "host"])
+    compression: list[bool] = field(default_factory=lambda: [False, True])
+
+
+@dataclass
+class Parquet:
+    tables_fraction: float = 0.0
+    row_group_size: int = 256
+
+
+@dataclass
 class Data:
     tables: list[int] = field(default_factory=lambda: [3, 6])
     rows: list[int] = field(default_factory=lambda: [50, 2000])
@@ -233,6 +246,8 @@ class Data:
     numeric_range: str = "small"  # small | medium | full
     strings: Strings = field(default_factory=Strings)
     edge_values: EdgeValues = field(default_factory=EdgeValues)
+    pin: Pin = field(default_factory=Pin)
+    parquet: Parquet = field(default_factory=Parquet)
 
 
 @dataclass
@@ -316,6 +331,21 @@ class FuzzConfig:
             )
         if self.data.numeric_range not in ("small", "medium", "full"):
             raise ConfigError("data.numeric_range must be small | medium | full")
+        for name, fraction in (
+            ("data.pin.tables_fraction", self.data.pin.tables_fraction),
+            ("data.parquet.tables_fraction", self.data.parquet.tables_fraction),
+        ):
+            if not 0 <= fraction <= 1:
+                raise ConfigError(f"{name} must be between 0 and 1")
+        if self.data.pin.tables_fraction and (
+            not self.data.pin.tiers
+            or any(t not in ("gpu", "host") for t in self.data.pin.tiers)
+            or not self.data.pin.compression
+            or any(not isinstance(v, bool) for v in self.data.pin.compression)
+        ):
+            raise ConfigError("data.pin needs gpu/host tiers and compression choices")
+        if self.data.parquet.row_group_size < 1:
+            raise ConfigError("data.parquet.row_group_size must be positive")
         if self.oracle.reduce_sqlsmith not in ("auto", "off", "on"):
             raise ConfigError("oracle.reduce_sqlsmith must be auto | off | on")
         for name, rng in (
@@ -376,6 +406,7 @@ _TYPE_NAMES: dict[str, type] = {
     "str": str,
     "list[str]": list,
     "list[int]": list,
+    "list[bool]": list,
     "list[Any]": list,
     "dict[str, float]": dict,
     "dict[str, list[Any]]": dict,
