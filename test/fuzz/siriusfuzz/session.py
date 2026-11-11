@@ -865,7 +865,11 @@ class Session:
         if not tables:
             return False, "dataset has no tables"
         table = tables[0]["table_name"]
-        probe = f'SELECT count(*) FROM "{table}"'
+        # A base-table COUNT can become a GPU_VALUES source backed by DuckDB's
+        # 16 KiB minimum collection, making the canary fail under micro-batch
+        # profiles before it has tested interception. A constant still executes
+        # a GPU_VALUES task and is sufficient for the injected-error check.
+        probe = "SELECT 1"
         if self.setting_supported(CANARY_SETTING):
             try:
                 self.set(CANARY_SETTING, "fuzz-canary")
