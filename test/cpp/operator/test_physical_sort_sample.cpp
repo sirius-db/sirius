@@ -106,6 +106,20 @@ void attach_port(sirius_physical_sort_sample& sample_op,
   sample_op.add_port("input", std::move(port));
 }
 
+/// Records each request and returns one partition.
+class recording_boundaries final : public cross_rank_sort_boundaries {
+ public:
+  sort_boundaries make(request const& request, ::cuda::stream_ref) override
+  {
+    key_columns.push_back(request.sample_keys.num_columns());
+    num_parts.push_back(request.num_parts);
+    return {};
+  }
+
+  std::vector<cudf::size_type> key_columns;
+  std::vector<std::size_t> num_parts;
+};
+
 std::size_t batch_count(const operator_data& data)
 {
   return dynamic_cast<const pipelineable_operator_data&>(data).get_data_batches().size();
@@ -241,6 +255,36 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
     CHECK(batch_count(*input) == 0);
     CHECK(sample.runs_without_input());
     CHECK(sample.get_next_task_input_data() == nullptr);
+  }
+
+  SECTION("with a cross-rank hook: a boundary task with no input, which asks the hook")
+  {
+    auto hook = std::make_shared<recording_boundaries>();
+    sample_op.set_cross_rank_boundaries(hook);
+    CHECK(sample_op.cross_rank_boundaries() == hook.get());
+
+    // The boundary task is owed before upstream finishes, but cannot run yet.
+    CHECK_FALSE(sample_op.all_ports_empty());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+    src_pipeline->set_finished(true);
+    auto hint = sample_op.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    CHECK(hint->hint == TaskCreationHint::READY);
+
+    auto input = sample_op.get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    CHECK(batch_count(*input) == 0);
+    CHECK(sample_op.runs_without_input());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+    (void)sample_op.execute(*input, cudf::get_default_stream());
+    CHECK(sample_op.boundaries_computed());
+    CHECK(sample_op.get_num_partitions() == 1);
+    CHECK_FALSE(sample_op.runs_without_input());
+    REQUIRE(hook->key_columns.size() == 1);
+    CHECK(hook->key_columns[0] == 0);
+    CHECK(hook->num_parts[0] == 1);
   }
 }
 
