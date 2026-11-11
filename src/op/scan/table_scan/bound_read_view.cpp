@@ -543,7 +543,21 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   }
   view.selector_evidence_required = source->selector_outside_bind_data;
   if (view.selector_evidence_required && input.named_parameters) {
-    view.logical_selector_evidence = selector_evidence(input.parameters, *input.named_parameters);
+    auto evidence                = selector_evidence(input.parameters, *input.named_parameters);
+    auto const explicit_snapshot = input.named_parameters->find("snapshot_from_id");
+    if (source->function_name == "iceberg_scan" &&
+        (explicit_snapshot == input.named_parameters->end() ||
+         explicit_snapshot->second.IsNull())) {
+      // Rebinding the same arguments can select a new snapshot with the same data files.
+      if (auto snapshot = capture_iceberg_snapshot(input.function, input.bind_data, context)) {
+        append(evidence, 'i', snapshot->table_uuid);
+        number(evidence, snapshot->snapshot_id);
+        number(evidence, snapshot->schema_id);
+        view.logical_selector_evidence = std::move(evidence);
+      }
+    } else {
+      view.logical_selector_evidence = std::move(evidence);
+    }
   }
   view.identity =
     make_bound_read_identity_preanalyzed(std::move(identity), paths, path_info, &view.metrics);
@@ -663,6 +677,33 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
   return std::make_shared<bound_read_identity const>(std::move(identity));
 }
 }  // namespace
+
+std::optional<iceberg_snapshot_binding> capture_iceberg_snapshot(
+  duckdb::BoundTableFunction const& function,
+  duckdb::FunctionData const* bind_data,
+  duckdb::ClientContext& context)
+{
+  if (!function.get_bind_info || !bind_data) return std::nullopt;
+  duckdb::TableFunctionGetBindInfoInput input(context,
+                                              const_cast<duckdb::FunctionData*>(bind_data));
+  auto const info = function.get_bind_info(input);
+  if (info.type != duckdb::ScanType::EXTERNAL) return std::nullopt;
+  auto const option = [&](char const* name, duckdb::LogicalTypeId type) -> duckdb::Value const* {
+    auto const it = info.options.find(name);
+    return it != info.options.end() && !it->second.IsNull() && it->second.type().id() == type
+             ? &it->second
+             : nullptr;
+  };
+  auto const* uuid   = option("table_uuid", duckdb::LogicalTypeId::VARCHAR);
+  auto const* id     = option("snapshot_id", duckdb::LogicalTypeId::BIGINT);
+  auto const* schema = option("schema_id", duckdb::LogicalTypeId::INTEGER);
+  if (!uuid || !id || !schema) return std::nullopt;
+  auto const& table_uuid = duckdb::StringValue::Get(*uuid);
+  auto const snapshot_id = id->GetValue<int64_t>();
+  auto const schema_id   = schema->GetValue<int32_t>();
+  if (table_uuid.empty() || snapshot_id < 0 || schema_id < 0) return std::nullopt;
+  return iceberg_snapshot_binding{table_uuid, snapshot_id, schema_id};
+}
 
 std::shared_ptr<bound_read_identity const> make_bound_read_identity(
   bound_read_identity identity,

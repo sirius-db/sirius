@@ -178,12 +178,8 @@ struct pin_materialization_options {
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
   /// Positional with the pinned columns: observe this column for whole-table
   /// distinctness (see @c late_mat::unique_probe). Empty — or all false —
-  /// leaves the probe off, which is the default; the caller derives it from
-  /// @c late_mat::pin_unique_probe_selection.
+  /// leaves the probe off.
   std::vector<bool> probe_unique_columns;
-  /// Positional with @c probe_unique_columns: true = the column is observed automatically
-  /// (see @c late_mat::pin_unique_automatic_selection). Empty = none.
-  std::vector<bool> probe_unique_automatic;
   /// Cap on the bytes retained for the exact uniqueness stage across all columns together, a shared
   /// budget rather than a per-column allowance; 0 = a share of the GPU memory space's capacity
   /// (see @c late_mat::exact_uniqueness_byte_cap).

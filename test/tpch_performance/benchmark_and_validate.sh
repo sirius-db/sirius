@@ -26,6 +26,7 @@
 #   export SIRIUS_CONFIG_FILE=...
 #   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode per-query <scale_factor>
+#   ./test/tpch_performance/benchmark_and_validate.sh --data-source iceberg <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb-native <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --report <run_dir>
@@ -308,6 +309,8 @@ fi
 # Parse optional flags
 DUCKDB_RESULTS_DIR=""
 DUCKDB_FILE=""
+ICEBERG_DIR=""
+ICEBERG_SETUP_SQL=""
 MULTI_SESSION=false
 DROP_OS_CACHE=false
 PINNING_MODE="none"
@@ -333,11 +336,11 @@ while [ $# -gt 1 ]; do
             ;;
         --data-source)
             case "$2" in
-                parquet | duckdb | duckdb-native)
+                parquet | iceberg | duckdb | duckdb-native)
                     DATA_SOURCE="$2"
                     ;;
                 *)
-                    echo "ERROR: --data-source must be 'parquet', 'duckdb', or 'duckdb-native' (got: $2)"
+                    echo "ERROR: --data-source must be 'parquet', 'iceberg', 'duckdb', or 'duckdb-native' (got: $2)"
                     exit 1
                     ;;
             esac
@@ -349,6 +352,10 @@ while [ $# -gt 1 ]; do
             ;;
         --parquet-dir)
             PARQUET_DIR="$2"
+            shift 2
+            ;;
+        --iceberg-dir)
+            ICEBERG_DIR="$2"
             shift 2
             ;;
         --engines)
@@ -393,12 +400,15 @@ case "$PINNING_MODE" in
 esac
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb|duckdb-native] [--parquet-dir <path>] [--duckdb-file <path>]"
+    echo "Usage: $0 [--config <config_file>] [--data-source parquet|iceberg|duckdb|duckdb-native]"
+    echo "          [--parquet-dir <path>] [--iceberg-dir <path>] [--duckdb-file <path>]"
     echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
     echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] [--pin-after-iteration <N>]"
     echo "          [--float-tolerance <value>] <scale_factor>"
     echo "       $0 --report [--float-tolerance <value>] <run_dir>"
     echo "  --data-source parquet       (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
+    echo "  --data-source iceberg                 → run_tpch_parquet.sh + setup SQL from test_datasets/tpch_iceberg_sf<SF> or --iceberg-dir"
+    echo "                                           Uses --parquet-dir as input if generation is needed."
     echo "  --data-source duckdb                  → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file (GPU-native scan — the default for sirius)"
     echo "  --data-source duckdb-native           → alias of 'duckdb' (GPU-native scan is the default now; kept for compatibility)"
     echo "  --pin-after-iteration N     with --pinning-mode per-query: run each query's first N iterations"
@@ -413,7 +423,12 @@ if [ $# -ne 1 ]; then
     exit 1
 fi
 
-if [ "$PINNING_MODE" != "none" ] && is_duckdb_source; then
+if [ -n "$ICEBERG_DIR" ] && [ "$DATA_SOURCE" != "iceberg" ]; then
+    echo "ERROR: --iceberg-dir requires --data-source iceberg."
+    exit 1
+fi
+
+if [ "$PINNING_MODE" != "none" ] && [ "$DATA_SOURCE" != "parquet" ]; then
     echo "ERROR: --pinning-mode is parquet-only; do not combine it with --data-source $DATA_SOURCE."
     exit 1
 fi
@@ -444,6 +459,24 @@ if [[ " $ENGINES " == *" sirius "* ]]; then
     cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.yaml"
 fi
 
+# Resolve and prepare the warehouse once, then give both engines identical setup SQL.
+if [ "$DATA_SOURCE" = "iceberg" ]; then
+    ICEBERG_DIR="${ICEBERG_DIR:-$PROJECT_DIR/test_datasets/tpch_iceberg_sf${SF}}"
+    if [ ! -e "$ICEBERG_DIR" ] && [ ! -L "$ICEBERG_DIR" ]; then
+        PARQUET_DIR="${PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
+        source "$SCRIPT_DIR/tpch_parquet_data.sh"
+        ensure_parquet_data "$SF" "$PARQUET_DIR" || exit "$?"
+        pixi run python "$SCRIPT_DIR/generate_tpch_iceberg.py" "$PARQUET_DIR" "$ICEBERG_DIR" || exit "$?"
+    fi
+    if [ ! -s "$ICEBERG_DIR/create_views.sql" ] || [ ! -s "$ICEBERG_DIR/dataset.json" ]; then
+        echo "ERROR: incomplete Iceberg warehouse at $ICEBERG_DIR. Use a new --iceberg-dir to regenerate." >&2
+        exit 1
+    fi
+    ICEBERG_DIR="$(cd -- "$ICEBERG_DIR" && pwd -P)" || exit 1
+    cp -- "$ICEBERG_DIR/create_views.sql" "$ICEBERG_DIR/dataset.json" "$RUN_DIR/" || exit 1
+    ICEBERG_SETUP_SQL="$RUN_DIR/create_views.sql"
+fi
+
 # ---------------------------------------------------------------------------
 # --duckdb-results: reuse previously stored DuckDB results for validation.
 # Resolves the path, copies results into the new run dir, and removes duckdb
@@ -460,6 +493,11 @@ if [ -n "$DUCKDB_RESULTS_DIR" ]; then
     fi
     if [ ! -d "$DUCKDB_RESULTS_DIR" ]; then
         echo "ERROR: DuckDB results directory not found: $DUCKDB_RESULTS_DIR"
+        exit 1
+    fi
+    if [ "$DATA_SOURCE" = "iceberg" ] &&
+       ! cmp -s "$ICEBERG_SETUP_SQL" "$DUCKDB_RESULTS_DIR/../create_views.sql"; then
+        echo "ERROR: --duckdb-results must have been produced with the same Iceberg setup SQL." >&2
         exit 1
     fi
     # Verify it contains at least one query result.
@@ -506,6 +544,8 @@ echo "Scale factor: SF${SF}   Iterations: ${NUM_ITERATIONS} (1 cold + $((NUM_ITE
 echo "Data source: $DATA_SOURCE   Run script: $(basename "$RUN_SCRIPT")"
 if is_duckdb_source; then
     echo "DuckDB file: $DUCKDB_FILE"
+elif [ "$DATA_SOURCE" = "iceberg" ]; then
+    echo "Iceberg dir: $ICEBERG_DIR"
 else
     echo "Parquet dir: $PARQUET_DIR"
 fi
@@ -566,6 +606,9 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo "data_source: $DATA_SOURCE"
     if is_duckdb_source; then
         echo "duckdb_file: $DUCKDB_FILE"
+    elif [ "$DATA_SOURCE" = "iceberg" ]; then
+        echo "iceberg_dir: $ICEBERG_DIR"
+        echo "setup_sql: $ICEBERG_SETUP_SQL"
     else
         echo "parquet_dir: $PARQUET_DIR"
     fi
@@ -651,6 +694,10 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo ""
 
     echo "--- Filesystem benchmark (read-only, input location) ---"
+    PROBE_PARQUET_DIR="${PARQUET_DIR:-}"
+    if [ "$DATA_SOURCE" = "iceberg" ]; then
+        PROBE_PARQUET_DIR="$ICEBERG_DIR/lineitem/data"
+    fi
     if is_duckdb_source; then
         if [ -f "$DUCKDB_FILE" ]; then
             SIZE_BYTES=$(stat -c %s "$DUCKDB_FILE" 2>/dev/null || stat -f %z "$DUCKDB_FILE" 2>/dev/null)
@@ -672,12 +719,12 @@ echo "=== Collecting run info and filesystem benchmark ==="
         else
             echo "duckdb file not found: $DUCKDB_FILE (benchmark skipped)"
         fi
-    elif [ -d "$PARQUET_DIR" ]; then
+    elif [ -d "$PROBE_PARQUET_DIR" ]; then
         FIRST_PARQUET=""
-        for f in "$PARQUET_DIR"/lineitem.parquet \
-                 "$PARQUET_DIR"/lineitem_*.parquet \
-                 "$PARQUET_DIR"/lineitem/*.parquet \
-                 "$PARQUET_DIR"/*.parquet; do
+        for f in "$PROBE_PARQUET_DIR"/lineitem.parquet \
+                 "$PROBE_PARQUET_DIR"/lineitem_*.parquet \
+                 "$PROBE_PARQUET_DIR"/lineitem/*.parquet \
+                 "$PROBE_PARQUET_DIR"/*.parquet; do
             [ -f "$f" ] && { FIRST_PARQUET="$f"; break; }
         done
         if [ -n "$FIRST_PARQUET" ]; then
@@ -699,10 +746,10 @@ echo "=== Collecting run info and filesystem benchmark ==="
                 echo "elapsed_s: $ELAPSED (could not compute throughput)"
             fi
         else
-            echo "no parquet file found in $PARQUET_DIR (benchmark skipped)"
+            echo "no parquet file found in $PROBE_PARQUET_DIR (benchmark skipped)"
         fi
     else
-        echo "input dir not present: $PARQUET_DIR (benchmark skipped)"
+        echo "input dir not present: $PROBE_PARQUET_DIR (benchmark skipped)"
     fi
 } | tee "$RUN_INFO_FILE"
 
@@ -722,6 +769,8 @@ for engine in $ENGINES; do
         # GPU-native scan (the only seq_scan path); the duckdb engine stays an
         # unaffected CPU baseline for validation.
         EXTRA_ARGS+=(--duckdb-file "$DUCKDB_FILE")
+    elif [ "$DATA_SOURCE" = "iceberg" ]; then
+        EXTRA_ARGS+=(--setup-sql "$ICEBERG_SETUP_SQL")
     elif [ -n "${PARQUET_DIR:-}" ]; then
         EXTRA_ARGS+=(--parquet-dir "$PARQUET_DIR")
     fi
@@ -748,4 +797,9 @@ for engine in $ENGINES; do
 done
 
 generate_report "$RUN_DIR" "$FLOAT_TOL" || OVERALL_STATUS=1
+if [ "$DATA_SOURCE" = "iceberg" ] && [ -d "$RUN_DIR/sirius" ] && [ -d "$RUN_DIR/duckdb" ] &&
+   ! awk -F, -v queries="${#QUERIES[@]}" \
+        'NR > 1 && $2 != "success" { failed = 1 } END { exit(failed || NR != queries + 1) }' "$RUN_DIR/validation.csv"; then
+    OVERALL_STATUS=1
+fi
 exit "$OVERALL_STATUS"
