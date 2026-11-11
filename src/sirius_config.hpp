@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "creator/config.hpp"
+#include "exchange/host_staging.hpp"
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
@@ -236,8 +237,8 @@ struct operator_params {
   std::vector<std::string> exchange_peers;
   /// This process's rank among exchange_peers.
   uint32_t exchange_rank = 0;
-  /// Distributed execution: "auto", "always" or "never" host-stage the exchange's writes to peers.
-  std::string exchange_host_staging = "auto";
+  /// Distributed execution: whether the exchange host-stages its writes to peers.
+  exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
 
   /// More than one rank: plans are split across processes and exchange rows.
   [[nodiscard]] bool distributed() const noexcept { return exchange_peers.size() > 1; }

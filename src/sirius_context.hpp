@@ -1060,7 +1060,7 @@ class SiriusContext : public ClientContextState {
   std::mutex exchange_mutex_;
   std::vector<std::string> exchange_peers_;
   uint32_t exchange_rank_{0};
-  std::string exchange_host_staging_;
+  sirius::exchange::host_staging exchange_host_staging_{};
   std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
   uint64_t distributed_queries_{0};
   /// The connection that runs this process's distributed queries.

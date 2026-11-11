@@ -2691,9 +2691,8 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
 
 static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto value = StringValue::Get(parameter);
-  static_cast<void>(sirius::exchange::parse_host_staging(value));
-  get_operator_params(context, scope)->exchange_host_staging = std::move(value);
+  get_operator_params(context, scope)->exchange_host_staging =
+    sirius::exchange::parse_host_staging(StringValue::Get(parameter));
 }
 
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)

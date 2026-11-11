@@ -969,6 +969,8 @@ surface.
 
 ### Distributed Execution
 
+Distributed execution is experimental: these settings can change or go away between releases.
+
 See [Distributed Execution](distributed-sirius.md). The exchange belongs to the process, not the
 connection: with `sirius_exchange_peers` already set, `SET sirius_exchange_rank` connects it and
 waits for every peer; set the other way round, the first distributed query connects it. Once it is
