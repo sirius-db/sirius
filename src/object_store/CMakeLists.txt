@@ -1,0 +1,1 @@
+target_sources(sirius_objects PRIVATE backend_capabilities.cpp validation.cpp)

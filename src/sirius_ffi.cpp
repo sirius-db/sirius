@@ -38,9 +38,11 @@
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "io/rest/s3/endpoint.hpp"        // sirius::io::rest::s3::parse_endpoint
 #include "io/s3/scope_policy.hpp"
-#include "log/logging.hpp"                    // SIRIUS_LOG_INFO
+#include "log/logging.hpp"  // SIRIUS_LOG_INFO
+#include "object_store/backend_capabilities.hpp"
+#include "object_store/settings.hpp"
+#include "object_store/validation.hpp"
 #include "parquet_extension.hpp"              // duckdb::ParquetExtension
 #include "planner/substrait_scan_ranges.hpp"  // sirius::planner::scan_byte_ranges_state
 #include "planner/unsupported_optimizers.hpp"
@@ -50,15 +52,11 @@
 #include "sirius_context.hpp"  // duckdb::SiriusContext
 #include "sirius_ffi_testing.hpp"
 
-#include <cucascade/io/io_errors.hpp>  // cucascade::io::credential_error
-
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -150,123 +148,31 @@ void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transactio
 // Errors name the field and a fixed reason, never its value. Authentication, TLS and
 // network failures are reported when a snapshot is used.
 
-[[noreturn]] void invalid_field(const char* field, const char* reason)
+sirius::object_store::settings to_settings(const ObjectStoreConfig& cfg)
 {
-  throw std::invalid_argument(std::string("ObjectStoreConfig.") + field + ": " + reason);
+  return {.endpoint       = cfg.endpoint,
+          .region         = cfg.region,
+          .access_key     = cfg.access_key,
+          .secret_key     = cfg.secret_key,
+          .session_token  = cfg.session_token,
+          .transport      = static_cast<std::uint32_t>(cfg.transport),
+          .signing_mode   = static_cast<std::uint32_t>(cfg.signing_mode),
+          .ca_bundle_path = cfg.ca_bundle_path,
+          .uri_prefix     = cfg.uri_prefix};
 }
 
-// Shape of an S3 service endpoint: value-free checks first, then the SigV4 authorizer's own
-// parser, so nothing admitted here is later rejected by the parser (one-way agreement).
-void check_endpoint(const std::string& endpoint)
+[[noreturn]] void throw_violation(const sirius::object_store::violation& refused,
+                                  const sirius::object_store::capabilities& backend)
 {
-  if (endpoint.empty()) { invalid_field("endpoint", "required"); }
-  auto const sep = endpoint.find("://");
-  if (sep == std::string::npos) {
-    invalid_field("endpoint", "missing scheme (expected http:// or https://)");
-  }
-  std::string scheme = endpoint.substr(0, sep);
-  for (auto& c : scheme) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  if (scheme != "http" && scheme != "https") {
-    invalid_field("endpoint", "scheme must be http or https");
-  }
-  for (unsigned char const c : endpoint) {
-    if (c <= 0x20 || c == 0x7F) {
-      invalid_field("endpoint", "must not contain control bytes or spaces");
-    }
-  }
-  auto const remainder = std::string_view{endpoint}.substr(sep + 3);
-  // A port-only authority ("https://:443") has no host either.
-  if (remainder.empty() || remainder.front() == ':') { invalid_field("endpoint", "missing host"); }
-  if (remainder.find_first_of("/?#") != std::string_view::npos) {
-    invalid_field("endpoint", "must be scheme://host[:port] with no path, query or fragment");
-  }
-  if (remainder.find('@') != std::string_view::npos) {
-    invalid_field("endpoint", "must not contain user-info");
-  }
-  // host[:port]: an optional explicit port is decimal 1..65535. An IPv6 literal keeps its colons
-  // inside the brackets; the port, if any, follows "]:".
-  auto port_sep = std::string_view::npos;
-  if (remainder.front() == '[') {
-    auto const close = remainder.find(']');
-    if (close == std::string_view::npos) { invalid_field("endpoint", "unterminated IPv6 literal"); }
-    if (close + 1 < remainder.size()) {
-      if (remainder[close + 1] != ':') { invalid_field("endpoint", "malformed"); }
-      port_sep = close + 1;
-    }
-  } else {
-    port_sep = remainder.find(':');
-  }
-  if (port_sep != std::string_view::npos) {
-    auto const port = remainder.substr(port_sep + 1);
-    bool const digits =
-      !port.empty() && port.size() <= 5 &&
-      std::all_of(port.begin(), port.end(), [](char c) { return c >= '0' && c <= '9'; });
-    if (!digits || std::stoi(std::string{port}) < 1 || std::stoi(std::string{port}) > 65535) {
-      invalid_field("endpoint", "port must be a decimal number in 1..65535");
-    }
-  }
-  try {
-    (void)sirius::io::rest::s3::parse_endpoint(endpoint);
-  } catch (cucascade::io::credential_error const&) {
-    invalid_field("endpoint", "malformed");
-  }
+  throw std::invalid_argument("ObjectStoreConfig." + std::string{refused.field} + ": " +
+                              sirius::object_store::describe(refused, backend));
 }
 
-// "s3://bucket/" or "s3://bucket/prefix/": scheme s3, a bucket, a trailing slash, no query. The
-// same rule admits a scope key to publication (put/set) and to removal (drop). A prefix no key
-// can match byte-for-byte (an empty, "." or ".." segment, or a raw `%` byte) is refused
-// with the same rule that refuses such keys at resolution, so a published scope is never dead.
 void check_uri_prefix_shape(std::string_view prefix)
 {
-  constexpr std::string_view kScheme = "s3://";
-  if (prefix.substr(0, kScheme.size()) != kScheme || prefix.size() == kScheme.size() ||
-      prefix[kScheme.size()] == '/') {
-    invalid_field("uri_prefix", "must be s3://bucket/ or s3://bucket/prefix/");
+  if (auto const refused = sirius::object_store::check_uri_prefix(prefix)) {
+    throw_violation(*refused, {});
   }
-  if (prefix.back() != '/') { invalid_field("uri_prefix", "must end with '/'"); }
-  if (prefix.find_first_of("?#") != std::string_view::npos) {
-    invalid_field("uri_prefix", "must not contain a query or fragment");
-  }
-  // Re-check the key part as a key: drop the mandatory trailing slash and let the shared rule
-  // classify the remaining segments ("s3://bucket/" has no key and is always fine).
-  auto const bucket_end = prefix.find('/', kScheme.size());
-  if (bucket_end != std::string_view::npos && bucket_end + 1 < prefix.size()) {
-    std::string const as_key{prefix.substr(0, prefix.size() - 1)};
-    if (sirius::io::s3::key_defeats_prefix_match(as_key)) {
-      invalid_field("uri_prefix",
-                    "contains a segment no key can match byte-for-byte (empty, '.', '..' or "
-                    "percent-encoded)");
-    }
-  }
-}
-
-void check_intrinsic(const ObjectStoreConfig& cfg)
-{
-  check_endpoint(cfg.endpoint);
-  if (cfg.region.empty()) { invalid_field("region", "required"); }
-  if (cfg.access_key.empty()) { invalid_field("access_key", "required"); }
-  if (cfg.secret_key.empty()) { invalid_field("secret_key", "required"); }
-  // The enums have a fixed underlying byte; a value outside the declared set (a C++ cast or a
-  // raw bridge representation) is refused here, before backend support is consulted.
-  if (cfg.transport != Transport::kAuto && cfg.transport != Transport::kHttp &&
-      cfg.transport != Transport::kRdma) {
-    invalid_field("transport", "must be one of Transport::kAuto, kHttp, kRdma");
-  }
-  if (cfg.signing_mode != SigningMode::kPresigned && cfg.signing_mode != SigningMode::kHeader) {
-    invalid_field("signing_mode", "must be one of SigningMode::kPresigned, kHeader");
-  }
-  if (!cfg.ca_bundle_path.empty()) {
-    // ifstream opens a directory on Linux; require a regular file before the readability probe.
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(cfg.ca_bundle_path, ec)) {
-      invalid_field("ca_bundle_path", "is not a regular file");
-    }
-    std::ifstream bundle(cfg.ca_bundle_path);
-    if (!bundle.good()) { invalid_field("ca_bundle_path", "file is not readable"); }
-  }
-  if (!cfg.uri_prefix.empty()) { check_uri_prefix_shape(cfg.uri_prefix); }
 }
 
 using sirius::io::s3::key_defeats_prefix_match;
@@ -333,30 +239,13 @@ void refuse_remote_reads(const std::vector<std::string>& remote_paths,
     redacted_uri(remote_paths.front()));
 }
 
-// Options the configured IO backend cannot honor are refused rather than ignored. At this tree
-// the registered backends are the Sirius stack (uring + REST) and kvikIO: no S3-over-RDMA
-// backend exists, and kvikIO's remote handle consumes endpoint/region/credentials only.
-void check_backend_support(const ObjectStoreConfig& cfg,
-                           const sirius::scan_manager::scan_manager_config& scan_manager)
-{
-  if (cfg.transport == Transport::kRdma) {
-    invalid_field("transport", "no S3-over-RDMA backend is registered in this build");
-  }
-  if (scan_manager.backend == sirius::scan_manager::io_backend::kvikio) {
-    if (cfg.signing_mode != SigningMode::kPresigned) {
-      invalid_field("signing_mode", "the configured kvikio backend does not honor a signing mode");
-    }
-    if (!cfg.ca_bundle_path.empty()) {
-      invalid_field("ca_bundle_path", "the configured kvikio backend does not honor a CA bundle");
-    }
-  }
-}
-
 void check_object_store(const ObjectStoreConfig& cfg,
                         const sirius::scan_manager::scan_manager_config& scan_manager)
 {
-  check_intrinsic(cfg);
-  check_backend_support(cfg, scan_manager);
+  auto const backend = sirius::object_store::capabilities_of(scan_manager);
+  if (auto const refused = sirius::object_store::check_settings(to_settings(cfg), backend)) {
+    throw_violation(*refused, backend);
+  }
 }
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator. `scopes` is the set of
@@ -574,7 +463,7 @@ void Context::put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
 
 void Context::drop_object_store(std::string_view uri_prefix) const
 {
-  if (!uri_prefix.empty()) { check_uri_prefix_shape(uri_prefix); }
+  check_uri_prefix_shape(uri_prefix);
   bool const dropped = impl_->update_object_store(
     [&](const ObjectStoreScopeSet& current) -> std::shared_ptr<const ObjectStoreScopeSet> {
       bool const present = std::any_of(
