@@ -49,6 +49,7 @@ if [ -n "${priority_networks:-}" ]; then
 fi
 host=${4:-${listen_host:-$(hostname -f)}}
 dir=${5:-${dir:-/tmp/sirius_rank_$port}}
+source "$here/launcher_env.sh"
 build="$here/../sirius-duckdb/build/release"
 duckdb="$build/duckdb"
 export CUDA_VISIBLE_DEVICES=$gpu

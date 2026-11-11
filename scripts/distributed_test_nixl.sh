@@ -6,8 +6,7 @@ set -euo pipefail
 ranks=${1:-2}
 port=${2:-27000}
 here=$(cd "$(dirname "$0")" && pwd)
-# Every rank is on this host; see distributed_run_sql.sh.
-export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
+source "$here/launcher_env.sh"
 test_bin="$here/../build/release/test/cpp/sirius_unittest"
 
 peers=""
