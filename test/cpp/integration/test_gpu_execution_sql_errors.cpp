@@ -22,10 +22,11 @@
  * `docs/adr/0001-cpu-replay-decides-sql-errors.md` records the policy, and the error contract in
  * `docs/super-sirius/expression-executor.md` states what it guarantees. An overflow in a branch
  * that a Row-exact Guard (CASE, COALESCE) excludes returns DuckDB's value, even where an evaluator
- * computes that branch over every row; an unguarded conversion overflow returns DuckDB's error; and
- * a check that DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value. Each case
- * asserts whether the query completed on the GPU or through CPU Replay, so a replay cannot hide a
- * broken GPU path. Overflow of abs and negation is covered beside their other cases in
+ * computes that branch over every row; an evaluated overflow returns DuckDB's error even where the
+ * row's value is NULL; an unguarded conversion overflow returns DuckDB's error; and a check that
+ * DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value. Each case asserts
+ * whether the query completed on the GPU or through CPU Replay, so a replay cannot hide a broken
+ * GPU path. Overflow of abs and negation is covered beside their other cases in
  * `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
  */
 
@@ -66,6 +67,27 @@ TEST_CASE_METHOD(SqlErrorFixture,
   expect_result_matches_cpu(
     "SELECT id, CASE WHEN x = -2147483648 THEN d ELSE d + abs(x) END FROM guarded;",
     execution_path::cpu_replay);
+}
+
+TEST_CASE_METHOD(SqlErrorFixture,
+                 "an evaluated overflow returns DuckDB's error even when the row's value is NULL",
+                 "[integration][gpu_execution][sql_errors]")
+{
+  auto const strategy = GENERATE(sirius::test::each_expression_evaluator_strategy());
+  CAPTURE(strategy);
+  run_ok(
+    "CREATE TABLE null_sums AS SELECT * FROM (VALUES"
+    " (1, NULL::INTEGER, (-2147483648)::INTEGER),"
+    " (2, 1, 5)) v(id, n, x);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
+
+  expect_error_matches_cpu("SELECT id, n + abs(x) FROM null_sums;", execution_path::cpu_replay);
+  expect_error_matches_cpu("SELECT id FROM null_sums WHERE n + abs(x) > 0;",
+                           execution_path::cpu_replay);
+  // DuckDB never evaluates the THEN branch, so nothing overflows.
+  expect_result_matches_cpu("SELECT id, CASE WHEN FALSE THEN abs(x) ELSE 1 END FROM null_sums;",
+                            execution_path::gpu);
 }
 
 TEST_CASE_METHOD(SqlErrorFixture,

@@ -465,6 +465,10 @@ std::vector<bench_case> all_cases()
   project("P18_int_mul_int64", [] {
     return list(bin(fid::mul, make_cast(ref_int32(), t_big, false), ref_qty(), t_big));
   });
+  // A nullable result that can carry Overflow Poison: the NVRTC Sink reads the poison of every row.
+  project("P19_nullable_add_abs", [] {
+    return list(bin(fid::add, ref_int32_nullable(), fn1(fid::abs, ref_int32(), t_int), t_int));
+  });
 
   auto q6_pred = [] {
     return conj_and(
@@ -484,6 +488,10 @@ std::vector<bench_case> all_cases()
   filter("F07_q6_pred_wide", q6_pred, /*all_cols=*/true);
   filter("F08_nullable_pred",
          [] { return cmp(ct::lt, ref_int32_nullable(), make_int_const(500'000)); });
+  filter("F09_nullable_overflow_pred", [] {
+    return cmp(
+      ct::gt, bin(fid::add, ref_int32_nullable(), ref_int32(), t_int), make_int_const(1'000'000));
+  });
 
   // Materialization Boundaries: upper() is evaluated into a column the fused kernel reads.
   auto upper_mode = [] { return fn1(fid::upper, ref_mode(), t_str); };
