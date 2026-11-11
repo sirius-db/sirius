@@ -26,7 +26,7 @@ export CHECKOUT=<where the checkout goes> DATA=<the dataset> OUT=<a new run fold
 git clone --branch experimental/distributed-sirius https://github.com/sirius-db/sirius.git "$CHECKOUT"
 cd "$CHECKOUT" && git submodule update --init --depth=1 --jobs 5 \
   duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
-pixi run build-distributed            # once: NIXL, Sirius with NIXL, the gateway
+pixi run build-distributed            # once: Sirius and the gateway
 ```
 
 The three paths must be absolute. The build takes 35 to 40 minutes on 144 cores. `pixi run` may
