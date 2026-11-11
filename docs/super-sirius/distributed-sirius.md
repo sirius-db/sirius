@@ -278,21 +278,9 @@ connects it. Once it is connected, none of the settings can change, on any conne
 `enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU alone would
 return a wrong answer.
 
-NIXL is an optional build dependency, linked from an out-of-tree install:
-
-```bash
-pixi run cmake --preset release -DSIRIUS_DUCKDB_SOURCE_DIR=$PWD/duckdb \
-  -DSIRIUS_WITH_NIXL=ON -DSIRIUS_NIXL_PREFIX=<NIXL install prefix>
-pixi run make
-```
-
-Without it, a distributed query fails with "needs a Sirius built with -DSIRIUS_WITH_NIXL=ON".
-`scripts/nixl_env.sh` sets the runtime paths:
-
-- NIXL's libraries and its UCX ahead of the pixi environment's own UCX;
-- `NIXL_PLUGIN_DIR`.
-
-It leaves `UCX_TLS` alone, so UCX picks its transports (NVLink, InfiniBand, TCP) from the hardware.
+Every Sirius build includes the NIXL fabric (NIXL with its UCX backend, built with Sirius), so a
+distributed query needs no extra build option or runtime path. Sirius does not set `UCX_TLS`, so UCX
+picks its transports (NVLink, InfiniBand, TCP) from the hardware.
 The single-host launchers below default `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: when UCX
 picks InfiniBand on a multi-rail host, ranks on the same host can fail to connect. Set `UCX_TLS`
 yourself to override.
@@ -364,8 +352,8 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   576 MiB at 8), allocated outside the GPU memory space's budget, which does not shrink for
   them. Reserving them from the space instead stalls any task whose request is clamped to the
   space's whole budget, so charging them waits for the budget to shrink with them (#2371).
-- **CI:** no CI job builds with `-DSIRIUS_WITH_NIXL=ON`, so the NIXL fabric and the
-  `[exchange][nixl]` tests run only on developer machines.
+- **CI:** the one-rank-per-process tests (`[nixl_multiprocess]`) need several GPUs and run only on
+  developer machines (#2480).
 
 ## Tests
 
@@ -376,7 +364,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
-| `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only; CI does not build NIXL yet) |
+| `[exchange][nixl]` | Two ranks in one process over NIXL |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
 | `[dynamic_filter][probe]` | Merging two Blooms of one capacity |
 
@@ -392,4 +380,4 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/op/sirius_physical_sort_sample.*` | Distributed sampling |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check |
 | `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | Bloom merge across ranks |
-| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh`, `nixl_env.sh` | Launchers and runtime paths |
+| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers |

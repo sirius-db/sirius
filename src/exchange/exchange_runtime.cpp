@@ -17,11 +17,8 @@
 #include "exchange/exchange_runtime.hpp"
 
 #include "exchange/exchange_service.hpp"
-#include "sirius/exception.hpp"
-
-#ifdef SIRIUS_WITH_NIXL
 #include "exchange/nixl_fabric.hpp"
-#endif
+#include "sirius/exception.hpp"
 
 #include <rmm/cuda_device.hpp>
 
@@ -46,7 +43,6 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
                                                      cucascade::memory::memory_space* host,
                                                      nixl_exchange_options opts)
 {
-#ifdef SIRIUS_WITH_NIXL
   // Torn down service first: its transport's engine uses the fabric and both rings.
   struct bundle {
     std::unique_ptr<frame_ring> send;
@@ -73,15 +69,6 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
   b->service  = std::make_unique<exchange_service>(
     *b->fabric, *b->send, *b->recv, gpu, host, std::move(opts.transport_options));
   return std::shared_ptr<exchange_service>(b, b->service.get());
-#else
-  static_cast<void>(rank);
-  static_cast<void>(peers);
-  static_cast<void>(gpu);
-  static_cast<void>(host);
-  static_cast<void>(opts);
-  throw sirius::invalid_input_exception(
-    "distributed execution needs a Sirius built with -DSIRIUS_WITH_NIXL=ON");
-#endif
 }
 
 }  // namespace sirius::exchange
