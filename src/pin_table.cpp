@@ -55,71 +55,12 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-namespace duckdb {
-
-namespace {
-
-std::mutex& recorded_calls_mutex()
-{
-  static std::mutex m;
-  return m;
-}
-
-std::vector<PinTableArgs>& recorded_calls_storage()
-{
-  static std::vector<PinTableArgs> calls;
-  return calls;
-}
-
-std::vector<std::string>& recorded_unpin_calls_storage()
-{
-  static std::vector<std::string> calls;
-  return calls;
-}
-
-}  // namespace
-
-void pin_table_to(const PinTableArgs& args)
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_calls_storage().push_back(args);
-}
-
-void unpin_table_to(const std::string& name)
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_unpin_calls_storage().push_back(name);
-}
-
-namespace pin_table_testing {
-
-const std::vector<PinTableArgs>& recorded_calls() { return recorded_calls_storage(); }
-
-void clear_recorded_calls()
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_calls_storage().clear();
-}
-
-const std::vector<std::string>& recorded_unpin_calls() { return recorded_unpin_calls_storage(); }
-
-void clear_recorded_unpin_calls()
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_unpin_calls_storage().clear();
-}
-
-}  // namespace pin_table_testing
-
-}  // namespace duckdb
 
 namespace sirius {
 
