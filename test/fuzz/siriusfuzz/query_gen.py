@@ -1050,7 +1050,12 @@ class QueryGenerator:
             arg = self._gen_expr(kind, scope, depth + 1)
             out = "float" if name == "avg" else kind
             self._note(f"agg:{name}")
-            return Agg(name, arg, kind=out)
+            agg = Agg(name, arg, kind=out)
+            if name == "sum" and kind == "int":
+                # sum(int) is HUGEINT; narrow as _gen_agg_of_kind does so the column type stays
+                # BIGINT (an EMPTY_RESULT over a HUGEINT column falls back to the CPU).
+                return Cast(agg, st.BIGINT)
+            return agg
         if name == "count":
             kind = self._pick_kind_in_scope(scope)
             self._note("agg:count" + (":distinct" if distinct else ""))

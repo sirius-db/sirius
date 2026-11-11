@@ -14,7 +14,7 @@
 [features]
 window_functions = false
 distinct = true
-grouping_sets = false
+grouping_sets = true
 full_join = false
 cross_join = false
 types = ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT",
@@ -39,8 +39,8 @@ exists = true
 in = true
 scalar = true
 correlated = true
-uncorrelated_scalar = false   # plans as a cross product
-uncorrelated_exists = false
+uncorrelated_scalar = true
+uncorrelated_exists = true
 max_depth = 2
 
 [features.cte]
@@ -48,7 +48,7 @@ materialized = true
 
 [features.aggregates]
 functions = ["sum", "count", "count_star", "min", "max", "avg"]   # first: nondeterministic
-distinct = "grouped_only"  # ungrouped COUNT(DISTINCT) runtime-falls-back (#1218)
+distinct = "on"  # off | grouped_only | on
 
 [features.scalar_functions]
 enabled = ["add", "sub", "mul", "div", "int_div", "mod",

@@ -63,9 +63,8 @@ class Subqueries:
     in_: bool = True
     scalar: bool = True
     correlated: bool = True
-    # Uncorrelated scalar / EXISTS subqueries plan as cross products, which Sirius declines.
-    uncorrelated_scalar: bool = gap_switch(False)
-    uncorrelated_exists: bool = gap_switch(False)
+    uncorrelated_scalar: bool = True
+    uncorrelated_exists: bool = True
     max_depth: int = 2
 
 
@@ -79,7 +78,7 @@ class Aggregates:
     functions: list[str] = field(
         default_factory=lambda: ["sum", "count", "count_star", "min", "max", "avg"]
     )
-    distinct: str = gap_switch("grouped_only", "on")  # off | grouped_only | on
+    distinct: str = "on"  # off | grouped_only | on
 
 
 @dataclass
@@ -164,7 +163,7 @@ class Complexity:
 class Features:
     window_functions: bool = gap_switch(False)
     distinct: bool = True
-    grouping_sets: bool = gap_switch(False)
+    grouping_sets: bool = True
     full_join: bool = gap_switch(False)
     cross_join: bool = gap_switch(False)
     set_ops: SetOps = field(default_factory=SetOps)
