@@ -44,19 +44,20 @@ std::unique_ptr<cudf::table> make_layout_fixture()
     switch (chunk) {
       case 0:
         // Zero-bit chunk: all residuals from chunk_min are zero.
-        host[static_cast<std::size_t>(i)] = 7;
+        host[static_cast<std::size_t>(i)] = 40;
         break;
       case 1:
-        // One-bit chunk.
-        host[static_cast<std::size_t>(i)] = 100 + (pos & 1);
+        // One-bit chunk, after its common divisor 20 is divided out.
+        host[static_cast<std::size_t>(i)] = 100 + 20 * (pos & 1);
         break;
       case 2:
         // Ten-bit chunk.
         host[static_cast<std::size_t>(i)] = pos;
         break;
       default:
-        // Partial final chunk with a 16-bit range.
-        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65535 : 0;
+        // Partial final chunk with a 16-bit range. The filler is 1, not 0, so the
+        // chunk's common divisor is 1 and it keeps exercising a wide bit width.
+        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65535 : 1;
         break;
     }
   }
@@ -153,6 +154,7 @@ void test_compact_persistence_and_decode()
   auto const description  = compressed.describe(stream);
   auto const& leaf        = find_bitpack_leaf(description);
   auto const& counts_desc = find_buffer(leaf, "chunk_count");
+  auto const& divs_desc   = find_buffer(leaf, "chunk_divisors");
   auto const& bits_desc   = find_buffer(leaf, "chunk_bits");
   auto const& packed_desc = find_buffer(leaf, "packed");
 
@@ -161,6 +163,11 @@ void test_compact_persistence_and_decode()
   expect(counts == std::vector<std::int32_t>({1024, 1024, 1024, kPartialRows}),
          "unexpected per-chunk counts");
   expect(bits == std::vector<std::uint8_t>({0, 1, 10, 16}), "unexpected per-chunk bit widths");
+  // The folded-in common divisor: chunk 0 is a run of 40s and chunk 1 alternates
+  // 100 and 120, so their divisors are 40 and 20. The other chunks contain odd
+  // values coprime to 5, so their divisor is the no-op 1.
+  auto const divisors = copy_buffer<std::int32_t>(divs_desc);
+  expect(divisors == std::vector<std::int32_t>({40, 20, 1, 1}), "unexpected per-chunk divisors");
 
   std::uint64_t expected_words = 0;
   for (std::size_t i = 0; i < counts.size(); ++i) {
