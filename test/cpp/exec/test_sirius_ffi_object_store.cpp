@@ -1767,3 +1767,491 @@ TEST_CASE("FFI object store successful local fragments retain captures through r
   fragment.reset();
   CHECK(retained.expired());
 }
+
+// These guards are appended so the existing suite remains an independent baseline.
+#include "sirius/exception.hpp"
+
+#include <fstream>
+#include <functional>
+#include <typeinfo>
+
+namespace {
+
+template <typename Exception, typename Operation>
+void check_exact_object_store_message(Operation&& operation, std::string_view expected)
+{
+  bool threw = false;
+  try {
+    operation();
+  } catch (std::exception const& error) {
+    threw = true;
+    INFO("expected type: " << typeid(Exception).name() << "; actual: " << typeid(error).name());
+    INFO("exception text: " << error.what());
+    CHECK(typeid(error) == typeid(Exception));
+    CHECK(std::string_view(error.what()) == expected);
+    check_no_sentinels(error.what());
+  } catch (...) {
+    FAIL_CHECK("Expected a standard exception with the pinned dynamic type");
+  }
+  CHECK(threw);
+}
+
+void check_snapshot_identity(std::shared_ptr<ObjectStoreConfig> const& actual,
+                             std::shared_ptr<ObjectStoreConfig> const& expected)
+{
+  CHECK(actual.get() == expected.get());
+  CHECK_FALSE(actual.owner_before(expected));
+  CHECK_FALSE(expected.owner_before(actual));
+}
+
+std::shared_ptr<ObjectStoreConfig> message_snapshot(std::string prefix)
+{
+  object_store_inputs inputs;
+  inputs.uri_prefix = std::move(prefix);
+  return inputs.snapshot();
+}
+
+struct message_registry {
+  explicit message_registry(std::string yaml = memory_config())
+    : config_path(std::move(yaml)),
+      first(object_store_inputs{}.snapshot()),
+      second(message_snapshot("s3://other/prefix/")),
+      context(make_context_from_config(config_path, first))
+  {
+    context->put_object_store(second);
+    check();
+  }
+
+  void check(std::shared_ptr<ObjectStoreConfig> const& fallback = {}) const
+  {
+    check_snapshot_identity(context->object_store_config_for(kFixtureUri), first);
+    check_snapshot_identity(context->object_store_config_for("s3://other/prefix/object"), second);
+    check_snapshot_identity(context->object_store_config_for("s3://missing/object"), fallback);
+    CHECK(first.use_count() == 2);
+    CHECK(second.use_count() == 2);
+  }
+
+  std::string config_path;
+  std::shared_ptr<ObjectStoreConfig> first;
+  std::shared_ptr<ObjectStoreConfig> second;
+  std::unique_ptr<sirius::ffi::Context> context;
+};
+
+void check_rejected_at_both_entries(message_registry const& published,
+                                    object_store_inputs const& inputs,
+                                    std::string_view expected)
+{
+  auto const rejected = inputs.snapshot();
+  // Invalid factory arguments must be rejected before a second engine is brought up.
+  check_exact_object_store_message<std::invalid_argument>(
+    [&] { (void)make_context_from_config(published.config_path, rejected); }, expected);
+  published.check();
+  CHECK(rejected.use_count() == 1);
+  check_exact_object_store_message<std::invalid_argument>(
+    [&] { published.context->put_object_store(rejected); }, expected);
+  published.check();
+  CHECK(rejected.use_count() == 1);
+}
+
+struct message_mutation {
+  char const* name;
+  std::function<void(object_store_inputs&)> change;
+  char const* expected;
+};
+
+void check_message_matrix(message_registry const& published,
+                          std::vector<message_mutation> const& rows)
+{
+  for (auto const& row : rows) {
+    CAPTURE(row.name);
+    object_store_inputs inputs;
+    row.change(inputs);
+    check_rejected_at_both_entries(published, inputs, row.expected);
+  }
+}
+
+struct message_ca_file {
+  message_ca_file()
+  {
+    auto pattern  = (fs::temp_directory_path() / "sirius-object-store-message-XXXXXX").string();
+    auto const fd = ::mkstemp(pattern.data());
+    if (fd < 0) { throw std::system_error(errno, std::generic_category(), "mkstemp"); }
+    ::close(fd);
+    path = std::move(pattern);
+  }
+  ~message_ca_file()
+  {
+    std::error_code ignored;
+    fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace, ignored);
+    fs::remove(path, ignored);
+  }
+  fs::path path;
+};
+
+}  // namespace
+
+TEST_CASE("FFI object store messages pin intrinsic reasons at both entries",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  auto const missing = fixture_path("missing_message_guard_ca.pem");
+  REQUIRE_FALSE(fs::exists(missing));
+  message_registry published;
+  check_message_matrix(
+    published,
+    {{"endpoint required",
+      [](auto& v) { v.endpoint.clear(); },
+      "ObjectStoreConfig.endpoint: required"},
+     {"region required", [](auto& v) { v.region.clear(); }, "ObjectStoreConfig.region: required"},
+     {"access key required",
+      [](auto& v) { v.access_key.clear(); },
+      "ObjectStoreConfig.access_key: required"},
+     {"secret key required",
+      [](auto& v) { v.secret_key.clear(); },
+      "ObjectStoreConfig.secret_key: required"},
+     {"missing scheme",
+      [](auto& v) { v.endpoint = "host:9000"; },
+      "ObjectStoreConfig.endpoint: missing scheme (expected http:// or https://)"},
+     {"bad scheme",
+      [](auto& v) { v.endpoint = "ftp://host"; },
+      "ObjectStoreConfig.endpoint: scheme must be http or https"},
+     {"control byte",
+      [](auto& v) { v.endpoint = "https://host\x01"; },
+      "ObjectStoreConfig.endpoint: must not contain control bytes or spaces"},
+     {"missing host",
+      [](auto& v) { v.endpoint = "https://"; },
+      "ObjectStoreConfig.endpoint: missing host"},
+     {"path",
+      [](auto& v) { v.endpoint = "https://host/path"; },
+      "ObjectStoreConfig.endpoint: must be scheme://host[:port] with no path, query or fragment"},
+     {"user info",
+      [](auto& v) { v.endpoint = "https://" + v.secret_key + "@host"; },
+      "ObjectStoreConfig.endpoint: must not contain user-info"},
+     {"unterminated IPv6",
+      [](auto& v) { v.endpoint = "https://[::1"; },
+      "ObjectStoreConfig.endpoint: unterminated IPv6 literal"},
+     {"malformed IPv6 suffix",
+      [](auto& v) { v.endpoint = "https://[::1]junk"; },
+      "ObjectStoreConfig.endpoint: malformed"},
+     {"bad port",
+      [](auto& v) { v.endpoint = "https://host:65536"; },
+      "ObjectStoreConfig.endpoint: port must be a decimal number in 1..65535"},
+     {"unknown transport",
+      [](auto& v) { v.transport = static_cast<Transport>(3); },
+      "ObjectStoreConfig.transport: must be one of Transport::kAuto, kHttp, kRdma"},
+     {"unknown signing mode",
+      [](auto& v) { v.signing_mode = static_cast<SigningMode>(255); },
+      "ObjectStoreConfig.signing_mode: must be one of SigningMode::kPresigned, kHeader"},
+     {"missing CA",
+      [&](auto& v) { v.ca_bundle_path = missing.string(); },
+      "ObjectStoreConfig.ca_bundle_path: is not a regular file"},
+     {"CA directory",
+      [](auto& v) { v.ca_bundle_path = fixture_path("").string(); },
+      "ObjectStoreConfig.ca_bundle_path: is not a regular file"},
+     {"prefix shape",
+      [](auto& v) { v.uri_prefix = "http://bucket/prefix/"; },
+      "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/"},
+     {"prefix terminator",
+      [](auto& v) { v.uri_prefix = "s3://bucket/prefix"; },
+      "ObjectStoreConfig.uri_prefix: must end with '/'"},
+     {"prefix query",
+      [](auto& v) { v.uri_prefix = "s3://bucket/prefix/?token=" + v.session_token + "/"; },
+      "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+     {"prefix segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/%41/"; },
+      "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+      "'.', '..' or percent-encoded)"}});
+}
+
+TEST_CASE("FFI object store messages pin unreadable CA at both entries",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  if (::geteuid() == 0) { SKIP("Unreadable CA guard requires a non-root process"); }
+  message_ca_file file;
+  fs::permissions(file.path, fs::perms::none, fs::perm_options::replace);
+  REQUIRE(fs::is_regular_file(file.path));
+  if (std::ifstream(file.path).good()) {
+    SKIP("Process can read the permission-denied CA fixture");
+  }
+  message_registry published;
+  object_store_inputs inputs;
+  inputs.ca_bundle_path = file.path.string();
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.ca_bundle_path: file is not readable");
+  inputs.uri_prefix = "http://invalid/";
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.ca_bundle_path: file is not readable");
+}
+
+TEST_CASE("FFI object store messages pin backend reasons and precedence",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  {
+    message_registry published;
+    object_store_inputs inputs;
+    inputs.transport = Transport::kRdma;
+    check_rejected_at_both_entries(
+      published,
+      inputs,
+      "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
+  }
+  // This fixture has memory_config()'s exact budgets, plus the backend selector.
+  message_registry published(fixture_path("ffi_object_store_kvikio.yaml").string());
+  object_store_inputs inputs;
+  inputs.transport      = Transport::kRdma;
+  inputs.signing_mode   = SigningMode::kHeader;
+  inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
+  REQUIRE(fs::is_regular_file(inputs.ca_bundle_path));
+  REQUIRE(std::ifstream(inputs.ca_bundle_path).good());
+  inputs.uri_prefix = "http://invalid/";
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/");
+  inputs.uri_prefix = "s3://bucket/prefix/";
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
+  inputs.transport = Transport::kHttp;
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.signing_mode: the configured kvikio backend does not honor a signing mode");
+  inputs.signing_mode = SigningMode::kPresigned;
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.ca_bundle_path: the configured kvikio backend does not honor a CA bundle");
+}
+
+TEST_CASE("FFI object store messages preserve field validation precedence",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  object_store_inputs inputs;
+  inputs.endpoint.clear();
+  inputs.region.clear();
+  inputs.access_key.clear();
+  inputs.secret_key.clear();
+  inputs.transport      = static_cast<Transport>(255);
+  inputs.signing_mode   = static_cast<SigningMode>(255);
+  inputs.ca_bundle_path = fixture_path("missing_message_guard_ca.pem").string();
+  inputs.uri_prefix     = "http://invalid/";
+  REQUIRE_FALSE(fs::exists(inputs.ca_bundle_path));
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.endpoint: required");
+  inputs.endpoint = "https://192.0.2.1:9";
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.region: required");
+  inputs.region = "fixture-region";
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.access_key: required");
+  inputs.access_key = object_store_sentinels[0];
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.secret_key: required");
+  inputs.secret_key = object_store_sentinels[1];
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.transport: must be one of Transport::kAuto, kHttp, kRdma");
+  inputs.transport = Transport::kRdma;
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.signing_mode: must be one of SigningMode::kPresigned, kHeader");
+  inputs.signing_mode = SigningMode::kHeader;
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.ca_bundle_path: is not a regular file");
+  inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/");
+  inputs.uri_prefix = "s3://bucket/prefix/";
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
+  inputs.transport    = Transport::kHttp;
+  auto const accepted = inputs.snapshot();
+  REQUIRE_NOTHROW(published.context->put_object_store(accepted));
+  check_snapshot_identity(published.context->object_store_config_for(kFixtureUri), accepted);
+  check_snapshot_identity(published.context->object_store_config_for("s3://other/prefix/object"),
+                          published.second);
+}
+
+TEST_CASE("FFI object store messages preserve endpoint and prefix validation precedence",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  check_message_matrix(
+    published,
+    {{"empty before missing scheme",
+      [](auto& v) { v.endpoint = ""; },
+      "ObjectStoreConfig.endpoint: required"},
+     {"missing delimiter before bad scheme and space",
+      [](auto& v) { v.endpoint = "ftp: bad@host/path"; },
+      "ObjectStoreConfig.endpoint: missing scheme (expected http:// or https://)"},
+     {"bad scheme before control and authority",
+      [](auto& v) { v.endpoint = "ftp:// :@host/path"; },
+      "ObjectStoreConfig.endpoint: scheme must be http or https"},
+     {"control before missing host",
+      [](auto& v) { v.endpoint = "https://:\x7f"; },
+      "ObjectStoreConfig.endpoint: must not contain control bytes or spaces"},
+     {"missing host before path and user info",
+      [](auto& v) { v.endpoint = "https://:9/path@host"; },
+      "ObjectStoreConfig.endpoint: missing host"},
+     {"path before user info and IPv6",
+      [](auto& v) { v.endpoint = "https://[user@host/path"; },
+      "ObjectStoreConfig.endpoint: must be scheme://host[:port] with no path, query or fragment"},
+     {"user info before unterminated IPv6",
+      [](auto& v) { v.endpoint = "https://[user@host"; },
+      "ObjectStoreConfig.endpoint: must not contain user-info"},
+     {"unterminated IPv6 before port",
+      [](auto& v) { v.endpoint = "https://[::1:bad"; },
+      "ObjectStoreConfig.endpoint: unterminated IPv6 literal"},
+     {"bad suffix before port",
+      [](auto& v) { v.endpoint = "https://[::1]suffix:bad"; },
+      "ObjectStoreConfig.endpoint: malformed"},
+     {"bad port",
+      [](auto& v) { v.endpoint = "https://[::1]:bad"; },
+      "ObjectStoreConfig.endpoint: port must be a decimal number in 1..65535"},
+     {"prefix shape before terminator and query",
+      [](auto& v) { v.uri_prefix = "http://bucket/../object?query"; },
+      "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/"},
+     {"prefix terminator before query and segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/../object?query"; },
+      "ObjectStoreConfig.uri_prefix: must end with '/'"},
+     {"prefix query before segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/../?query/"; },
+      "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+     {"prefix segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/../"; },
+      "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+      "'.', '..' or percent-encoded)"}});
+}
+
+TEST_CASE("FFI object store messages pin null publication without changing membership",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  check_exact_object_store_message<std::invalid_argument>(
+    [&] { published.context->put_object_store(nullptr); },
+    "object_store: put_object_store requires a snapshot");
+  published.check();
+}
+
+TEST_CASE("FFI object store messages pin drop errors and empty default semantics",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  struct row {
+    char const* prefix;
+    char const* expected;
+  };
+  for (auto const& item : std::vector<row>{
+         {"S3://bucket/prefix/",
+          "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/"},
+         {"s3://bucket/prefix", "ObjectStoreConfig.uri_prefix: must end with '/'"},
+         {"s3://bucket/prefix/?token/",
+          "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+         {"s3://bucket/prefix/#fragment/",
+          "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+         {"s3://bucket//",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"},
+         {"s3://bucket/./",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"},
+         {"s3://bucket/../",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"},
+         {"s3://bucket/%41/",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"}}) {
+    CAPTURE(item.prefix);
+    check_exact_object_store_message<std::invalid_argument>(
+      [&] { published.context->drop_object_store(item.prefix); }, item.expected);
+    published.check();
+  }
+  REQUIRE_NOTHROW(published.context->drop_object_store(""));
+  published.check();
+  REQUIRE_NOTHROW(published.context->drop_object_store("s3://missing/prefix/"));
+  published.check();
+  auto const fallback = message_snapshot("");
+  published.context->put_object_store(fallback);
+  published.check(fallback);
+  REQUIRE_NOTHROW(published.context->drop_object_store(""));
+  published.check();
+  CHECK(fallback.use_count() == 1);
+}
+
+TEST_CASE("FFI object store messages pin lookup refusal and empty registry miss",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  auto const uri = "s3://user:" + std::string(object_store_sentinels[3]) +
+                   "@bucket/prefix/../object" + authentication_suffix();
+  {
+    auto context = make_context_from_config(memory_config());
+    CHECK(context->object_store_config_for(uri) == nullptr);
+    CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
+    CHECK(context->object_store_config_for("s3://other/prefix/object") == nullptr);
+  }
+  message_registry published;
+  auto const expected =
+    "object_store_scope: 's3://bucket/prefix/../object' names a key segment that cannot be matched "
+    "byte-for-byte against the published uri_prefix set";
+  check_exact_object_store_message<sirius::invalid_input_exception>(
+    [&] { (void)published.context->object_store_config_for(uri); }, expected);
+  published.check();
+  auto const fallback = message_snapshot("");
+  published.context->put_object_store(fallback);
+  check_exact_object_store_message<sirius::invalid_input_exception>(
+    [&] { (void)published.context->object_store_config_for(uri); }, expected);
+  published.check(fallback);
+}
+
+TEST_CASE("FFI object store messages pin all remote refusals at both execution entries",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  auto const auth     = "s3://user:" + std::string(object_store_sentinels[3]) + "@";
+  auto const ordinary = auth + "bucket/prefix/object" + authentication_suffix();
+  auto const unstable = auth + "bucket/prefix/../object" + authentication_suffix();
+  {
+    auto context    = make_context_from_config(memory_config());
+    auto const plan = read_plan({{ordinary}});
+    for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
+      CAPTURE(entry == entry_point::execute);
+      check_exact_object_store_message<sirius::invalid_input_exception>(
+        [&] { invoke_plan(*context, entry, plan); },
+        "object_store_unconfigured: the plan reads 's3://bucket/prefix/object' from an object "
+        "store or through an Iceberg metadata path, but this Context has no object-store snapshot "
+        "(Context::put_object_store)");
+      CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
+      CHECK(context->object_store_config_for("s3://other/prefix/object") == nullptr);
+      CHECK(context->object_store_config_for("s3://missing/object") == nullptr);
+    }
+  }
+  message_registry published;
+  for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
+    CAPTURE(entry == entry_point::execute);
+    auto const bad_key_plan = read_plan({{unstable}});
+    check_exact_object_store_message<sirius::invalid_input_exception>(
+      [&] { invoke_plan(*published.context, entry, bad_key_plan); },
+      "object_store_scope: 's3://bucket/prefix/../object' names a key segment that cannot be "
+      "matched byte-for-byte against the published uri_prefix set");
+    published.check();
+    // A matched first item must not hide a later item outside the published set.
+    auto const outside_plan =
+      read_plan({{kFixtureUri}, {auth + "outside/object" + authentication_suffix()}});
+    check_exact_object_store_message<sirius::invalid_input_exception>(
+      [&] { invoke_plan(*published.context, entry, outside_plan); },
+      "object_store_scope: the plan reads 's3://outside/object', outside every published "
+      "uri_prefix");
+    published.check();
+  }
+  // User-info changes raw prefix matching. A default scope serves that literal URI.
+  auto const fallback = message_snapshot("");
+  published.context->put_object_store(fallback);
+  for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
+    CAPTURE(entry == entry_point::execute);
+    auto const plan = read_plan({{ordinary}});
+    check_exact_object_store_message<sirius::invalid_input_exception>(
+      [&] { invoke_plan(*published.context, entry, plan); },
+      "object_store_route_unavailable: the plan reads 's3://bucket/prefix/object' from an "
+      "object store; native object-store reads are not yet served on the FFI path");
+    published.check(fallback);
+  }
+}
