@@ -2374,8 +2374,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
-  // Before binding resolution: a MARK join under FILTER(mark) / FILTER(NOT mark) becomes SEMI /
-  // ANTI so it can publish dynamic filters (DuckDB's own conversion is off in delim CTE plans).
+  // Before binding resolution (DuckDB's own conversion is off in delim CTE plans): a MARK join
+  // under FILTER(mark) becomes SEMI, which can publish dynamic filters; one under FILTER(NOT mark)
+  // becomes ANTI, which cannot publish but no longer builds a mark.
   sirius::planner::convert_mark_joins(context, op);
 
   {
