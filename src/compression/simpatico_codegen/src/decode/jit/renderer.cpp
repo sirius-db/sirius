@@ -318,8 +318,7 @@ class Walker {
   bool warp_per_chunk_ = false;  ///< all_rows kernel maps one chunk per warp (see finalize)
   /// Passes over a chunk below a Delta: fewer bound fewer registers and less shared transpose.
   static constexpr int kWarpParts = 8;
-  std::ostringstream warp_loop_;      ///< per-part body below a Delta (emit_warp_plain)
-  std::size_t warp_stage_words_ = 0;  ///< packed-word region at the start of each warp's slice
+  std::ostringstream warp_loop_;  ///< per-part body below a Delta (emit_warp_plain)
 
   // DFS-preorder, lex-sorted children (std::map iteration) — must match
   // jit::assign_ids and the decode binder (bind_fused_subtree) so
@@ -737,15 +736,16 @@ void Walker::emit_bitpack_producer(const ::codegen::jit::FusedTree& node,
 // The block-per-chunk producers read a Bitpack value with two or three overlapping global loads,
 // and with one chunk per block too few chunks are in flight per SM to cover DRAM latency. Here
 // finalize maps one chunk per warp (kTBSize / 32 per block) and the warp:
-//   * copies the Bitpack leaf's packed words into its own shared slice (coalesced streaming loads)
-//     and reads every value from there (a chunk wider than 32 bits, possible only in an int64
-//     lane, reads global memory instead, which keeps the slice at 4 KB);
+//   * reads each Bitpack value straight from global memory: a funnel shift of two words in an
+//     int32 lane, the three-word gather in an int64 lane. Staging the packed words in
+//     shared memory is a little faster alone, but its 16 KB per block costs more than it saves
+//     beside the kernels of concurrent scan tasks (TPC-H SF1000 q17: 0.25 s staged, 0.17 s not);
 //   * applies FOR / Zigzag per position, closed-form, as the block producers do;
 //   * reconstructs a Delta in registers, one part of the chunk at a time (PARTS passes) to bound
 //     register use: each lane owns PER_PART consecutive positions, scans them serially, and adds
 //     the warp's exclusive prefix of lane totals plus the earlier parts' total. Nodes above it (FOR
 //     / Zigzag / an outer Delta) then work on those registers, and the root transposes them back
-//     through the slice so stores stay coalesced.
+//     through a small shared slice per warp so stores stay coalesced.
 // Only __syncwarp is needed, so a warp past the batch may return early.
 // =====================================================================
 bool Walker::warp_supported(const ::codegen::jit::FusedTree& node)
@@ -775,23 +775,20 @@ void Walker::emit_warp_plain(const ::codegen::jit::FusedTree& tree)
   narrow_unpack_          = true;
   const std::size_t esize = dtype_elem_size(dtype_);
   const std::size_t chunk = ::codegen::kChunkSize;
-  // The packed words of CHUNK values of at most 32 bits (wider chunks read global memory), then
-  // two zero words for the stitched read. Below a Delta, one part of results follows them,
-  // padded by one element per 32 so the lane-major writes do not conflict on a bank.
-  warp_stage_words_ = chunk * std::min<std::size_t>(esize, 4) / 4 + 2;
-  warp_stage_words_ += warp_stage_words_ & 1;  // keep the transpose region 8-byte aligned
-  std::size_t words      = warp_stage_words_;
-  const std::size_t part = chunk / kWarpParts;
-  if (warp_has_delta(tree)) words += (part + part / 32) * esize / 4;
-  words += words & 1;  // keep every slice 8-byte aligned
-  const std::size_t off = sm_.alloc(sizeof(std::uint64_t), (tbs_ / 32) * words / 2);
-  body_ << "    // --- Warp-per-chunk decode: this warp's shared slice ---\n"
+  body_ << "    // --- Warp-per-chunk decode ---\n"
         << "    constexpr int32_t PER_LANE = CHUNK / 32;\n"
         << "    constexpr int32_t PARTS    = " << kWarpParts << ";\n"
         << "    constexpr int32_t PART     = CHUNK / PARTS;\n"
-        << "    constexpr int32_t PER_PART = PART / 32;\n"
-        << "    uint32_t* const stage = reinterpret_cast<uint32_t*>(workspace + " << off
-        << ") + (tid >> 5) * " << words << ";\n";
+        << "    constexpr int32_t PER_PART = PART / 32;\n";
+  if (warp_has_delta(tree)) {
+    // One part of results per warp, padded by one element per 32 so the lane-major writes do not
+    // conflict on a bank.
+    const std::size_t slice = chunk / kWarpParts + chunk / kWarpParts / 32;
+    const std::size_t bytes = (tbs_ / 32) * slice * esize;
+    const std::size_t off   = sm_.alloc(sizeof(std::uint64_t), (bytes + 7) / 8);
+    body_ << "    " << dtype_ << "* const tr = reinterpret_cast<" << dtype_ << "*>(workspace + "
+          << off << ") + (tid >> 5) * " << slice << ";\n";
+  }
 
   warp_loop_.str({});
   const WarpValue v = warp_value(tree, "len");
@@ -808,11 +805,8 @@ void Walker::emit_warp_plain(const ::codegen::jit::FusedTree& tree)
   if (!v.regs.empty()) {
     // Below a Delta the chain runs once per part; in part h, lane l's registers hold rows
     // h * PART + l * PER_PART + [0, PER_PART). The part's rows are transposed through the slice
-    // (the staged words stay live for the later parts' reads, so this needs a separate region)
     // and stored striped.
-    body_ << "    " << dtype_ << "* const tr = reinterpret_cast<" << dtype_ << "*>(stage + "
-          << warp_stage_words_ << ");\n"
-          << "#pragma unroll 1\n"
+    body_ << "#pragma unroll 1\n"
           << "    for (int32_t h = 0; h < PARTS; ++h) {\n"
           << warp_loop_.str() << "        __syncwarp();\n"
           << "#pragma unroll\n"
@@ -875,23 +869,15 @@ Walker::WarpValue Walker::warp_value(const ::codegen::jit::FusedTree& node,
       (void)bitpack_value_source(node, T);
       const std::string bits  = "bpbits_" + idstr;
       const std::string vmask = "bpvmask_" + idstr;
-      const std::string nw    = "bpnw_" + idstr;
-      body_ << "    // --- node " << idstr << ": Bitpack, staged in the warp's slice ---\n"
-            << "    const int32_t " << nw << " = " << bits << " > 32 ? 0 : (static_cast<int32_t>("
-            << count << ") * " << bits << " + 31) >> 5;\n"
-            << "#pragma unroll 8\n"
-            << "    for (int32_t w = lane; w < " << nw << "; w += 32)\n"
-            << "        stage[w] = __ldcs(packed_" << idstr << " + bpbase_" << idstr << " + w);\n"
-            << "    if (lane < 2) stage[" << nw << " + lane] = 0;\n"
-            << "    __syncwarp();\n"
+      body_ << "    // --- node " << idstr << ": Bitpack ---\n"
             << "    const uint32_t " << vmask << " = (" << bits
             << " >= 32) ? 0xFFFFFFFFu : ((1u << " << bits << ") - 1u);\n";
-      const std::string narrow =
-        "simpatico_bp_at32(stage, " + bits + ", " + vmask + ", bpmin_" + idstr + ", (__POS__))";
+      const std::string narrow = "simpatico_bp_at32(packed_" + idstr + " + bpbase_" + idstr + ", " +
+                                 bits + ", " + vmask + ", bpmin_" + idstr + ", (__POS__))";
       if (esize <= 4) return WarpValue{narrow, {}};
-      return WarpValue{"((" + bits + " > 32) ? simpatico_bp_at(packed_" + idstr + " + bpbase_" +
-                         idstr + ", " + bits + ", bpmin_" + idstr + ", (__POS__)) : " + narrow +
-                         ")",
+      // An int64 lane may hold a chunk wider than 32 bits; one unpack serves every width.
+      return WarpValue{"simpatico_bp_at(packed_" + idstr + " + bpbase_" + idstr + ", " + bits +
+                         ", bpmin_" + idstr + ", (__POS__))",
                        {}};
     }
     case ::codegen::OpKind::For: {
