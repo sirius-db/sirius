@@ -806,6 +806,12 @@ requires startup configuration.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
 
+Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA
+error reports, and its I/O layer where enabled) go to the same sink, prefixed `[cucascade]`.
+cuCascade's own gate mirrors what the active sink accepts: `sirius_log_level` under `spdlog`,
+nothing under `noop`, and under `duckdb` every record is handed to DuckDB, which applies its own
+level exactly as it does to Sirius's records.
+
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
