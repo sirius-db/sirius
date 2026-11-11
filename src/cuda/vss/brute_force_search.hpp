@@ -213,20 +213,21 @@ knn_result gemm_int8_topk(
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
- * @brief Expanded-L2 top-k over FP16 rows, on the half-precision tensor cores with FP32
- *        accumulation.
+ * @brief cuVS brute-force expanded-L2 top-k over FP16 rows, on the half-precision tensor cores
+ *        with FP32 accumulation.
  *
- * @p x [n x d] and @p q [m x d] are row-major IEEE half bit patterns; @p x_sq and @p q_sq are
- * their squared norms. The products are exact and summed in FP32, so the ranking is that of the
- * rounded vectors: an FP32 re-score is the caller's when the rounding matters.
+ * @p x [n x d] and @p q [m x d] are row-major IEEE half bit patterns. @p x and its FP32 squared
+ * norms @p x_sq are borrowed for the call; cuVS computes the queries' norms. The products are
+ * exact and summed in FP32, so the ranking is that of the rounded vectors: an FP32 re-score is
+ * the caller's when the rounding matters. Returns exactly @p k columns per row, nearest first.
+ * Requires NVIDIA/cuvs#3041 for k <= 64 to take the tensor-core path.
  */
-knn_result gemm_f16_topk(
+knn_result brute_force_f16_topk(
   raft::device_resources const& res,
   std::uint16_t const* x,
   float const* x_sq,
   int64_t n,
   std::uint16_t const* q,
-  float const* q_sq,
   int64_t m,
   int64_t d,
   int64_t k,

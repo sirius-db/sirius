@@ -21,6 +21,7 @@
 #include <cuda/vss/cudf_raft_interop.hpp>
 
 #include <../../../src/cuda/vss/brute_force_search.hpp>
+#include <vss/bound_gemm.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
@@ -38,10 +39,15 @@
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
+#include <cuda_fp16.h>
 #include <cuvs/distance/distance.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <random>
 #include <vector>
 
 namespace {
@@ -211,5 +217,163 @@ TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
     auto bad_query = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
       q2_dev.data(), 1, dim + 1);
     REQUIRE_THROWS(brute_force_knn(res, dataset_view, bad_query, 1));
+  }
+}
+
+TEST_CASE("brute_force_f16_topk returns the exact L2 neighbors of half rows", "[vss][f16]")
+{
+  // Small integers are exact in half, and so are their norms and distances in FP32. Covers k <= 64
+  // (cuVS's fusedL2Knn before NVIDIA/cuvs#3041), k > 64, and k == n.
+  auto const shape          = GENERATE(std::array<int64_t, 4>{1, 1, 4, 1},
+                              std::array<int64_t, 4>{300, 33, 96, 10},
+                              std::array<int64_t, 4>{300, 5, 96, 100},
+                              std::array<int64_t, 4>{70, 3, 8, 70});
+  auto const [n, m, d, k]   = shape;
+  auto const take_sqrt      = GENERATE(false, true);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  raft::device_resources res{stream};
+
+  std::vector<float> x(n * d), q(m * d), x_sq(n, 0.f);
+  for (int64_t i = 0; i < n; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      x[i * d + j] = static_cast<float>((i * 13 + j * 19) % 17 - 8);
+      x_sq[i] += x[i * d + j] * x[i * d + j];
+    }
+  }
+  for (int64_t i = 0; i < m; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      q[i * d + j] = static_cast<float>((i + j * 7) % 17 - 8);
+    }
+  }
+  auto const to_half_bits = [](std::vector<float> const& v) {
+    std::vector<std::uint16_t> bits(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+      auto const h = __float2half(v[i]);
+      std::memcpy(&bits[i], &h, sizeof(bits[i]));
+    }
+    return bits;
+  };
+  auto const x_bits = to_half_bits(x);
+  auto const q_bits = to_half_bits(q);
+  rmm::device_uvector<std::uint16_t> x_dev(x_bits.size(), stream);
+  rmm::device_uvector<std::uint16_t> q_dev(q_bits.size(), stream);
+  rmm::device_uvector<float> x_sq_dev(x_sq.size(), stream);
+  cudaMemcpyAsync(x_dev.data(),
+                  x_bits.data(),
+                  sizeof(std::uint16_t) * x_bits.size(),
+                  cudaMemcpyHostToDevice,
+                  stream.get());
+  cudaMemcpyAsync(q_dev.data(),
+                  q_bits.data(),
+                  sizeof(std::uint16_t) * q_bits.size(),
+                  cudaMemcpyHostToDevice,
+                  stream.get());
+  cudaMemcpyAsync(x_sq_dev.data(),
+                  x_sq.data(),
+                  sizeof(float) * x_sq.size(),
+                  cudaMemcpyHostToDevice,
+                  stream.get());
+
+  auto result = sirius::vss::brute_force_f16_topk(
+    res, x_dev.data(), x_sq_dev.data(), n, q_dev.data(), m, d, k, take_sqrt);
+  stream.sync();
+  REQUIRE(result.n_queries == m);
+  REQUIRE(result.k == k);
+  auto const neighbors = to_host<int64_t>(result.neighbors->view());
+  auto const distances = to_host<float>(result.distances->view());
+  REQUIRE(neighbors.size() == m * k);
+  REQUIRE(distances.size() == m * k);
+  for (int64_t row = 0; row < m; ++row) {
+    std::vector<float> expected(n);
+    for (int64_t col = 0; col < n; ++col) {
+      double squared = 0;
+      for (int64_t j = 0; j < d; ++j) {
+        auto const delta = static_cast<double>(q[row * d + j]) - x[col * d + j];
+        squared += delta * delta;
+      }
+      expected[col] = static_cast<float>(take_sqrt ? std::sqrt(squared) : squared);
+    }
+    auto sorted = expected;
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<bool> seen(n, false);
+    for (int64_t col = 0; col < k; ++col) {
+      auto const id = neighbors[row * k + col];
+      REQUIRE(id >= 0);
+      REQUIRE(id < n);
+      REQUIRE_FALSE(seen[id]);
+      seen[id] = true;
+      REQUIRE(distances[row * k + col] == Approx(expected[id]));
+      REQUIRE(distances[row * k + col] == Approx(sorted[col]));
+    }
+  }
+}
+
+TEST_CASE("brute_force_f16_topk seeds the same k-th distance as seed_bound_f16", "[vss][f16]")
+{
+  // The FP16 seed of a probe batch that shares one cluster sample, as the vector join takes it:
+  // cuVS's k-th distance over the sample against seed_bound_f16's, over random half rows.
+  auto const d              = GENERATE(16, 96, 768);
+  auto const k              = GENERATE(1, 10, 64);
+  constexpr int64_t n       = sirius::vss::kSeedSample;
+  constexpr int64_t m       = 300;
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  raft::device_resources res{stream};
+
+  std::mt19937 gen(7);
+  std::uniform_real_distribution<float> unit(-1.f, 1.f);
+  // Half bits, with the FP32 norms of the rounded values.
+  auto const make = [&](int64_t rows, std::vector<std::uint16_t>& bits, std::vector<float>& sq) {
+    bits.resize(rows * d);
+    sq.assign(rows, 0.f);
+    for (int64_t i = 0; i < rows * d; ++i) {
+      auto const h = __float2half(unit(gen));
+      std::memcpy(&bits[i], &h, sizeof(bits[i]));
+      sq[i / d] += __half2float(h) * __half2float(h);
+    }
+  };
+  std::vector<std::uint16_t> x, q;
+  std::vector<float> x_sq, q_sq;
+  make(n, x, x_sq);
+  make(m, q, q_sq);
+  auto const to_device = [&](auto const& h) {
+    using T = typename std::decay_t<decltype(h)>::value_type;
+    rmm::device_uvector<T> out(h.size(), stream);
+    cudaMemcpyAsync(
+      out.data(), h.data(), sizeof(T) * h.size(), cudaMemcpyHostToDevice, stream.get());
+    return out;
+  };
+  auto const x_dev    = to_device(x);
+  auto const q_dev    = to_device(q);
+  auto const x_sq_dev = to_device(x_sq);
+  auto const q_sq_dev = to_device(q_sq);
+  auto const first    = to_device(std::vector<int64_t>(m, 0));
+  auto const count    = to_device(std::vector<int32_t>(m, static_cast<int32_t>(n)));
+
+  rmm::device_uvector<float> expected(m, stream);
+  rmm::device_uvector<float> seeded(m, stream);
+  sirius::vss::seed_bound_f16(x_dev.data(),
+                              x_sq_dev.data(),
+                              q_dev.data(),
+                              q_sq_dev.data(),
+                              first.data(),
+                              count.data(),
+                              nullptr,
+                              m,
+                              d,
+                              k,
+                              expected.data(),
+                              cudf::get_default_stream());
+  auto const knn = sirius::vss::brute_force_f16_topk(
+    res, x_dev.data(), x_sq_dev.data(), n, q_dev.data(), m, d, k, /*take_sqrt=*/false);
+  REQUIRE(knn.k == k);
+  sirius::vss::kth_distance_bound(
+    knn.distances->view().data<float>(), m, k, seeded.data(), cudf::get_default_stream());
+  stream.sync();
+
+  std::vector<float> want(m), got(m);
+  cudaMemcpy(want.data(), expected.data(), sizeof(float) * m, cudaMemcpyDeviceToHost);
+  cudaMemcpy(got.data(), seeded.data(), sizeof(float) * m, cudaMemcpyDeviceToHost);
+  for (int64_t r = 0; r < m; ++r) {
+    REQUIRE(got[r] == Approx(want[r]).epsilon(1e-5));
   }
 }
