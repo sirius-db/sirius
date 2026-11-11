@@ -112,6 +112,14 @@ run-clang-tidy -p build/clang-tidy -warnings-as-errors='-*' \
 description = "Start the local DuckDB shell with Sirius loaded."
 cmd = '''sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"'''
 
+# Distributed Sirius: docs/super-sirius/distributed-gateway.md.
+[tasks.build-distributed]
+description = "Build Sirius and the gateway."
+cmd = """
+make -C "$PIXI_PROJECT_ROOT" &&
+make -C "$PIXI_PROJECT_ROOT/gateway" release
+"""
+
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."
 cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"

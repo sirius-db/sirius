@@ -23,6 +23,7 @@ ranks=$1
 port=${2:-9494}
 logs=${3:-/tmp/sirius_gateway}
 here=$(cd "$(dirname "$0")" && pwd)
+source "$here/launcher_env.sh"
 build="$here/../sirius-duckdb/build/release"
 gateway="$here/../gateway/build/release/duckdb"
 host=${SIRIUS_GATEWAY_HOST:-}
