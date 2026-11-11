@@ -2687,16 +2687,8 @@ TEST_CASE("Sirius admission configuration has one authoritative limit",
     return cfg;
   };
   CHECK(load("sirius: {max_concurrent_queries: 4}").max_concurrent_queries() == 4);
-  CHECK(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}")
-          .max_concurrent_queries() == 2);
-  CHECK(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 2}}}")
-      .max_concurrent_queries() == 2);
-  REQUIRE_THROWS_WITH(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 3}}}"),
-    Catch::Matchers::ContainsSubstring("conflicting"));
+  REQUIRE_THROWS_WITH(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}"),
+                      Catch::Matchers::ContainsSubstring("unknown config key"));
   REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
   CHECK(load("sirius: {}").max_concurrent_queries() == 1);
 }
