@@ -51,7 +51,7 @@ logger_state& state()
   // Never destroyed: the embedded cuCascade library keeps its own sink registry alive through
   // exit and forwards into get_sink() (log/cucascade_sink.cpp), so a record from a static
   // destructor or a late thread must still find a valid slot. The last sink therefore leaks at
-  // exit instead of flushing; spdlog's registry flushes its loggers on its own.
+  // exit without being flushed or closed.
   static auto& instance = *new logger_state{};
   return instance;
 }
