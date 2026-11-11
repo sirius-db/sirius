@@ -51,5 +51,22 @@ inline cudf::null_order to_cudf_null_order(duckdb::OrderType order_type,
   return result;
 }
 
+/// A DuckDB ORDER BY direction and NULL placement.
+struct duckdb_sort_order {
+  duckdb::OrderType type;
+  duckdb::OrderByNullType null_order;
+};
+
+/// The inverse of to_cudf_order() and to_cudf_null_order(): the DuckDB direction and absolute
+/// NULLS FIRST/LAST that map to @p order and @p nulls.
+inline duckdb_sort_order to_duckdb_order(cudf::order order, cudf::null_order nulls)
+{
+  bool const descending = order == cudf::order::DESCENDING;
+  // cuDF's null_order is reversed for a descending column; undo the flip of to_cudf_null_order.
+  bool const nulls_first = (nulls == cudf::null_order::BEFORE) != descending;
+  return {descending ? duckdb::OrderType::DESCENDING : duckdb::OrderType::ASCENDING,
+          nulls_first ? duckdb::OrderByNullType::NULLS_FIRST : duckdb::OrderByNullType::NULLS_LAST};
+}
+
 }  // namespace op
 }  // namespace sirius
