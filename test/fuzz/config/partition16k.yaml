@@ -1,0 +1,20 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.8
+    host:
+      capacity_bytes: 64Gi
+    disk:
+      disk_id: 0
+      capacity_bytes: 100Gi
+      downgrade_root_dirs: /localhome/local-akhiljn/sirius-spill
+  telemetry:
+    enable_quent: false
+  operator_params:
+    scan_task_batch_size: 64Ki
+    hash_partition_bytes: 16Ki
+    concat_batch_bytes: 16Ki
+    cross_join_task_bytes: 16Ki
+    sort_sample_bytes: 16Ki
