@@ -227,6 +227,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/test_cross_join_slicing.cpp
+    test/cpp/operator/window/test_cumulative.cpp
     test/cpp/operator/window/test_ranking.cpp
     test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
@@ -285,6 +286,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_scan_column_origin.cpp
+    test/cpp/planner/test_join_implied_filters.cpp
     test/cpp/planner/test_join_key_nullability.cpp
     test/cpp/planner/test_scan_filter_projection.cpp
     test/cpp/planner/test_scan_returned_types.cpp

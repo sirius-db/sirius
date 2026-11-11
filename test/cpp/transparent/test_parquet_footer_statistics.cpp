@@ -22,6 +22,7 @@
  * filter matches nothing, drop an IS NOT NULL on a column without NULLs and estimate the rest.
  */
 
+#include "transparent/parquet_footer_statistics.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 
 #include <catch.hpp>
@@ -235,4 +236,74 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   run_ok("SET gpu_execution = true;");
   REQUIRE_FALSE(after->HasError());
   CHECK(collect_rows(*after)[0][0] == "100");
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - statistics reused across queries follow a file that "
+                 "changes",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  // Files not modified for a while are trusted by the cache, so the second plan reuses the merged
+  // statistics of the first instead of reading the footers again.
+  auto const age = [&](char const* name, int hours) {
+    fs::last_write_time(dir / (std::string(name) + ".parquet"),
+                        fs::file_time_type::clock::now() - std::chrono::hours(hours));
+  };
+  age("f0", 3);
+  age("f1", 3);
+
+  constexpr char const* query = "SELECT count(*) FROM v WHERE x >= 1000";
+  REQUIRE(cpu_plan(query, true).find("Empty Result") != std::string::npos);
+  CHECK(cpu_plan(query, true).find("Empty Result") != std::string::npos);
+
+  // A rewritten file is described by its new footer, not by the merge made from the old one.
+  write_file("f1", 1000, 1100);
+  age("f1", 2);
+  CHECK(cpu_plan(query, true).find("Empty Result") == std::string::npos);
+  compare_gpu_vs_cpu(query);
+  auto rewritten = con->Query(query);
+  REQUIRE_FALSE(rewritten->HasError());
+  CHECK(collect_rows(*rewritten)[0][0] == "100");
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - a glob that gains files keeps one merged entry",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  using sirius::transparent::detail::merged_statistics_cache_size;
+  constexpr char const* query = "SELECT count(*) FROM v WHERE x >= 1000";
+  cpu_plan(query, true);
+  auto const entries = merged_statistics_cache_size();
+  for (int file = 2; file < 5; ++file) {
+    write_file("f" + std::to_string(file), 1000 * file, 1000 * file + 10);
+    cpu_plan(query, true);
+  }
+  CHECK(merged_statistics_cache_size() == entries);
+  auto grown = con->Query(query);
+  REQUIRE_FALSE(grown->HasError());
+  CHECK(collect_rows(*grown)[0][0] == "30");
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - merged entries for explicit file lists are bounded",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  using sirius::transparent::detail::merged_statistics_cache_capacity;
+  using sirius::transparent::detail::merged_statistics_cache_size;
+  // Pairs of 17 files give 136 distinct lists, more than the cache keeps.
+  constexpr int files = 17;
+  for (int file = 2; file < files; ++file) {
+    write_file("f" + std::to_string(file), 100 * file, 100 * file + 100);
+  }
+  auto const path = [&](int file) {
+    return "'" + (dir / ("f" + std::to_string(file) + ".parquet")).string() + "'";
+  };
+  for (int first = 0; first < files; ++first) {
+    for (int second = first + 1; second < files; ++second) {
+      cpu_plan("SELECT count(*) FROM read_parquet([" + path(first) + ", " + path(second) +
+                 "]) WHERE x >= 100000",
+               true);
+    }
+  }
+  CHECK(merged_statistics_cache_size() <= merged_statistics_cache_capacity);
 }

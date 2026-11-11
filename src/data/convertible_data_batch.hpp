@@ -37,6 +37,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -74,6 +75,22 @@ class convertible_data_batch : public convertible_data {
   }
 
   /**
+   * @brief Whether a batch currently in @p cur_space is one this conversion should move.
+   *
+   * False once a source-bound batch has left its source space, or when it already sits in a
+   * target space. convertible_gpu_pipeline_task applies the same rule under a shared lock before
+   * convert() re-checks it under the exclusive one.
+   */
+  static bool should_convert(
+    cucascade::memory::memory_space const* cur_space,
+    cucascade::memory::memory_space const* source_space,
+    const std::vector<const cucascade::memory::memory_space*>& target_spaces)
+  {
+    if (source_space != nullptr && cur_space != source_space) { return false; }
+    return std::find(target_spaces.begin(), target_spaces.end(), cur_space) == target_spaces.end();
+  }
+
+  /**
    * @brief Convert this batch to reside in one of the target memory spaces.
    *
    * Acquires an exclusive (mutable) lock on the batch -- blocking if blocking=true,
@@ -106,13 +123,8 @@ class convertible_data_batch : public convertible_data {
     }
     auto& mut = *mut_opt;
 
-    // Check if the batch is already in the target space, or has left its source space.
     auto cur_space = mut.get_memory_space();
-    if (_source_space != nullptr && cur_space != _source_space) { return std::nullopt; }
-    for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
-      const auto* space = target_spaces[idx];
-      if (cur_space == space) { return std::nullopt; }
-    }
+    if (!should_convert(cur_space, _source_space, target_spaces)) { return std::nullopt; }
 
     // A batch going to the GPU needs room for its decoded form, which for a compressed
     // batch is larger than what it occupies now.
@@ -194,17 +206,19 @@ class convertible_data_batch : public convertible_data {
   /**
    * @brief Get the size in bytes of this batch in the specified memory space.
    *
-   * Acquires a shared (read-only) lock to access the memory space pointer, then
-   * compares with the provided space. Returns the batch size in bytes if the batch
-   * resides in the given space, 0 otherwise.
+   * Never waits on the batch lock: a batch another thread holds exclusively counts as 0, since
+   * a non-blocking convert() could not move it either and the caller sizing candidates must not
+   * stall behind the holder. So 0 means the batch is elsewhere or could not be inspected.
    *
    * @param space The memory space to query.
-   * @return The batch size in bytes if the batch resides in the given space, 0 otherwise.
+   * @return The batch size in bytes if it resides in the given space and could be inspected,
+   *         0 otherwise.
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    auto ro = _batch->to_read_only();
-    if (ro.get_memory_space() == space) { return ro.get_data()->get_size_in_bytes(); }
+    auto ro = _batch->try_to_read_only();
+    if (!ro) { return 0; }
+    if (ro->get_memory_space() == space) { return ro->get_data()->get_size_in_bytes(); }
     return 0;
   }
 
