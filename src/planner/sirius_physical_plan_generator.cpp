@@ -31,9 +31,12 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
@@ -146,6 +149,80 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
 
 namespace {
 std::atomic<uint64_t> next_standalone_plan_generation{1};
+
+bool is_floating_type(duckdb::LogicalType const& type)
+{
+  return type.id() == duckdb::LogicalTypeId::FLOAT || type.id() == duckdb::LogicalTypeId::DOUBLE;
+}
+
+struct floating_aggregate_key_shape {
+  bool has_floating_aggregate = false;
+  bool has_exact_floating_key = false;
+  bool needs_cpu              = false;
+};
+
+floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOperator const& op)
+{
+  floating_aggregate_key_shape shape;
+  std::optional<floating_aggregate_key_shape> producer;
+  std::optional<floating_aggregate_key_shape> consumer;
+  for (std::size_t i = 0; i < op.children.size(); ++i) {
+    auto const& child = op.children[i];
+    if (!child) continue;
+    auto const child_shape = inspect_floating_aggregate_keys(*child);
+    if (i == 0) producer = child_shape;
+    if (i == 1) consumer = child_shape;
+    shape.needs_cpu |= child_shape.needs_cpu;
+    shape.has_floating_aggregate |= child_shape.has_floating_aggregate;
+    shape.has_exact_floating_key |= child_shape.has_exact_floating_key;
+  }
+  bool const floating_aggregate_below = shape.has_floating_aggregate;
+  bool exact_key_here                 = false;
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+    auto const& aggregate = op.Cast<duckdb::LogicalAggregate>();
+    for (auto const& expression : aggregate.expressions) {
+      auto const& call = expression->Cast<duckdb::BoundAggregateExpression>();
+      auto const name  = call.Function().GetName().GetIdentifierName();
+      if ((name == "avg" || name == "sum") && call.GetChildren().size() == 1 &&
+          is_floating_type(call.GetChildren()[0]->GetReturnType())) {
+        // DuckDB may rewrite AVG into SUM/COUNT before this planner sees the logical tree.
+        shape.has_floating_aggregate = true;
+      }
+    }
+    for (auto const& group : aggregate.groups) {
+      if (is_floating_type(group->GetReturnType())) exact_key_here = true;
+    }
+  } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_DISTINCT) {
+    auto const& distinct = op.Cast<duckdb::LogicalDistinct>();
+    for (auto const& target : distinct.distinct_targets) {
+      if (is_floating_type(target->GetReturnType())) exact_key_here = true;
+    }
+  }
+  // This is conservative: the floating key may be unrelated to an aggregate below this node.
+  // Proving expression lineage through projections, joins and CTE references would need a separate
+  // pass.
+  if (exact_key_here && floating_aggregate_below) shape.needs_cpu = true;
+  shape.has_exact_floating_key |= exact_key_here;
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && producer && consumer) {
+    // The producer and consumer are sibling subtrees; the consumer's CTE_REF does not descend
+    // into the producer, so the ordinary ancestor check cannot see its aggregate.
+    if (producer->has_floating_aggregate && consumer->has_exact_floating_key)
+      shape.needs_cpu = true;
+  }
+  return shape;
+}
+
+void reject_floating_aggregate_exact_keys(duckdb::LogicalOperator const& op)
+{
+  if (inspect_floating_aggregate_keys(op).needs_cpu) {
+    // DuckDB and cuDF sum floating inputs in different orders. A low-bit result difference becomes
+    // a different number of rows when a later GROUP BY or DISTINCT uses it as an exact key.
+    throw duckdb::NotImplementedException(
+      "Floating SUM/AVG with an exact floating GROUP BY or DISTINCT key is not supported on the "
+      "GPU "
+      "(falling back to CPU)");
+  }
+}
 
 std::string_view bare_path(std::string_view path)
 {
@@ -2397,7 +2474,8 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   };
   try {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
-    plan       = create_plan(*op);
+    reject_floating_aggregate_exact_keys(*op);
+    plan = create_plan(*op);
   } catch (duckdb::NotImplementedException const&) {
     // A pre-capture refusal used to throw before parent planning. Preserve
     // that first error if a later ordinary planner decline aborts tree build.
