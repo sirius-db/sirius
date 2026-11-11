@@ -171,8 +171,9 @@ arrived. It is used three ways:
   sorted sample, and every rank merges them all in rank order. From the same global sample each
   rank derives the same world − 1 range boundaries for the exchange after it, and its own
   `SORT_PARTITION` boundaries from inside its range. A rank with no input still runs its boundary
-  task (`runs_without_input()`), since the others wait for it. `distribute_plan()` puts
-  `sirius_physical_distributed_sort_sample` in its place, which overrides `make_boundaries()`.
+  task (`runs_without_input()`), since the others wait for it. `distribute_plan()` sets a
+  `sample_all_gather_boundaries` on the plan's `SORT_SAMPLE` (`set_cross_rank_boundaries()`),
+  which the operator asks for its boundaries instead of cutting its own sample.
 - **The plan-shape check** (below).
 - **The Bloom merge** (below).
 
@@ -236,6 +237,26 @@ Running such an operator on each rank's share would return a wrong answer.
   because every rank runs the same statements.
 - **Plan-shape check.** Before running, every rank all-gathers a hash of its plan's shape, and
   every rank fails the query if any differs.
+
+### Adding a distributed behaviour
+
+A distributed plan holds the single-process operators and the two exchange operators, and nothing
+else. Where an operator needs the other ranks in the middle of its work, it asks an interface:
+
+| Operator | Interface (no `exchange/` include) | Across ranks (`src/op/distributed/`) |
+|---|---|---|
+| `SORT_SAMPLE` | `cross_rank_sort_boundaries` | `sample_all_gather_boundaries` |
+| `HASH_JOIN`'s filter publisher | `cross_rank_filter_merge` | `bloom_all_gather_merge` |
+
+- The interface sits beside its operator and speaks of samples, filters and processes, not ranks
+  or streams. With none set, the operator runs as in one process.
+- The implementation holds the `exchange_service` and its stream ids.
+- Only `distribute_plan()` builds one and sets it, and it adds to the plan shape there.
+- Two hooks on every operator cover the rest: `add_finalize_listener()` (act when an operator's
+  pipeline ends) and `runs_without_input()` (a task owed with no input).
+
+A new behaviour adds an implementation, an interface if its operator has none that fits, and a
+case in `distribute_plan()`: not an operator class.
 
 ## Dynamic filters across ranks
 
@@ -385,7 +406,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/exchange/exchange_service.*`, `exchange_runtime.*`, `all_gather.*` | A process's exchange; collectives |
 | `src/exchange/distributed_session.*` | A process's distributed state: its exchange, query numbering, each window's query, abort and retire. `SiriusContext` creates it at the first distributed use; a process that runs none has none |
 | `src/op/sirius_physical_exchange_{sink,source}.*` | The operators |
-| `src/op/distributed/sirius_physical_distributed_sort_sample.*` | Distributed sampling |
+| `src/op/cross_rank_sort_boundaries.hpp`, `src/op/distributed/sample_all_gather_boundaries.*` | `SORT_SAMPLE`'s boundary interface; boundaries from every rank's sample |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check; each rank's share of a table's files, and the scans no rank can split |
 | `src/op/dynamic_filter/cross_rank_filter_merge.hpp`, `src/op/distributed/bloom_all_gather_merge.*` | The publisher's merge interface; the Bloom merge across ranks |
 | `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers |
