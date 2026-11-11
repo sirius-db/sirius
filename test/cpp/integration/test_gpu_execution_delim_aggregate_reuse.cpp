@@ -17,6 +17,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
 #include <optional>
@@ -143,4 +144,26 @@ TEST_CASE_METHOD(DelimAggregateReuseFixture,
     "AND ps_supplycost = (SELECT min(ps_supplycost) FROM partsupp, supplier, nation, region "
     "WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND s_nationkey = n_nationkey "
     "AND n_regionkey = r_regionkey AND r_name = 'EUROPE')");
+}
+
+TEST_CASE_METHOD(DelimAggregateReuseFixture,
+                 "gpu_execution correlated AVG whose repeated sum would overflow 128 bits",
+                 "[integration][gpu_execution][delim_reuse]")
+{
+  // One 9e37 fits a 128-bit sum; the outer rows repeat it once per region, and two copies would
+  // not. A single row, because the GPU's own guard bounds a batch's sum by its row count times its
+  // largest value. Without fallback, an overflow on either path fails the query instead of being
+  // replayed on the CPU. Parquet, because the GPU scan of a native table lacks DECIMAL128 storage.
+  sirius::test::scratch_dir files{"delim_reuse_wide"};
+  run_ok(
+    "COPY (SELECT 1::BIGINT AS k, 90000000000000000000000000000000000000::DECIMAL(38, 0) AS v) "
+    "TO " +
+    files.file_literal("wide.parquet") + " (FORMAT PARQUET);");
+  run_ok("CREATE VIEW wide AS SELECT * FROM read_parquet(" + files.file_literal("wide.parquet") +
+         ");");
+  sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
+  compare_rewritten_and_not(
+    "SELECT a.k, a.v, r_name, (SELECT avg(b.v) FROM wide b WHERE b.k = a.k) AS mean "
+    "FROM wide a, region WHERE r_regionkey < 2",
+    3);
 }

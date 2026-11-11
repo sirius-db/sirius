@@ -132,7 +132,11 @@ struct delim_reuse_fixture {
           "INSERT INTO nation SELECT range, 'N' || range, range % 5 FROM range(25)",
           "CREATE TABLE region (r_regionkey INTEGER, r_name VARCHAR)",
           "INSERT INTO region VALUES (0, 'AFRICA'), (1, 'AMERICA'), (2, 'ASIA'), (3, 'EUROPE'), "
-          "(4, 'MIDDLE EAST')"}) {
+          "(4, 'MIDDLE EAST')",
+          "CREATE TABLE widths (k BIGINT, i INTEGER, b BIGINT, d9 DECIMAL(9, 2), "
+          "d18 DECIMAL(18, 2), s SMALLINT, d4 DECIMAL(4, 1), h HUGEINT, d38 DECIMAL(38, 0))",
+          "INSERT INTO widths SELECT range % 7, range, range, range, range, range, range / 10, "
+          "range, range FROM range(100)"}) {
       auto result = con->Query(sql);
       INFO(sql);
       REQUIRE_FALSE(result->HasError());
@@ -257,5 +261,31 @@ TEST_CASE_METHOD(delim_reuse_fixture,
                             "s_suppkey = ps_suppkey AND s_nationkey = n_nationkey AND "
                             "n_regionkey = r_regionkey AND r_name = 'ASIA'")) == 0);
     CHECK(rewrites(q2_shape("partsupp, supplier", "s_suppkey = ps_suppkey")) == 0);
+  }
+}
+
+TEST_CASE_METHOD(delim_reuse_fixture,
+                 "delim reuse limits AVG to inputs whose repeated sum cannot overflow",
+                 "[delim_reuse][plan]")
+{
+  // Each row of widths is repeated once per region, which scales the AVG's sum.
+  auto const repeated_avg = [](std::string const& column) {
+    return "SELECT a.k, a." + column + ", r_name, (SELECT avg(b." + column +
+           ") FROM widths b WHERE b.k = a.k) FROM widths a, region WHERE r_regionkey < 2";
+  };
+  for (bool const as_cte : {false, true}) {
+    CAPTURE(as_cte);
+    sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
+    for (char const* column : {"i", "b", "d9", "d18"}) {
+      CAPTURE(column);
+      CHECK(rewrites(repeated_avg(column)) == 1);
+    }
+    for (char const* column : {"s", "d4", "h", "d38"}) {
+      CAPTURE(column);
+      CHECK(rewrites(repeated_avg(column)) == 0);
+    }
+    // MIN and MAX do not sum, so any width is reused.
+    CHECK(rewrites("SELECT a.k, a.d38, r_name, (SELECT max(b.d38) FROM widths b WHERE b.k = a.k) "
+                   "FROM widths a, region WHERE r_regionkey < 2") == 1);
   }
 }

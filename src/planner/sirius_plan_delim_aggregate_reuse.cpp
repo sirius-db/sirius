@@ -425,7 +425,11 @@ std::optional<std::pair<ColumnBinding, ColumnBinding>> column_equality(Expressio
 /// Aggregates whose value over a group does not change when every row of the group is repeated
 /// the same number of times. AVG divides a sum by a count that both scale by that number, and is
 /// limited to exact (integer and fixed-point) inputs, whose sums do not depend on the order rows
-/// are added in.
+/// are added in. Repetition also scales the sum itself, so AVG is further limited to inputs whose
+/// sum cannot overflow at any row count: DuckDB sums INTEGER and BIGINT values, and DECIMALs
+/// stored as them, in 128 bits, where (2^64 - 1) rows of magnitude at most 2^63 stay below
+/// 2^127 - 1. A narrower input is summed in 64 bits and a 128-bit input in 128 bits, so either
+/// can overflow on repeated rows where the original aggregate does not.
 bool reusable_aggregate(Expression const& expression)
 {
   if (expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) { return false; }
@@ -438,7 +442,9 @@ bool reusable_aggregate(Expression const& expression)
   if (name == "min" || name == "max") { return true; }
   if (name != "avg") { return false; }
   auto const& type = aggregate.GetChildren()[0]->GetReturnType();
-  return type.IsIntegral() || type.id() == duckdb::LogicalTypeId::DECIMAL;
+  if (!type.IsIntegral() && type.id() != duckdb::LogicalTypeId::DECIMAL) { return false; }
+  auto const physical = type.InternalType();
+  return physical == duckdb::PhysicalType::INT32 || physical == duckdb::PhysicalType::INT64;
 }
 
 /// What the aggregate reads once rewritten, over the columns of a scan of the outer rows.
