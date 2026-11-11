@@ -1884,10 +1884,19 @@ void insert_gpu_pipeline_operators_recursive(
       auto const& window = slot->Cast<sirius::op::sirius_physical_window>();
       std::vector<duckdb::idx_t> keys(window.partition_columns().begin(),
                                       window.partition_columns().end());
-      slot->children[0] = build_window_exchange(std::move(slot->children[0]),
-                                                keys,
-                                                slot->estimated_cardinality,
-                                                op_params.hash_partition_bytes);
+      if (window.input_exchange() == sirius::op::window_exchange::sorted) {
+        slot->children[0] = sirius::planner::build_window_sort_exchange(
+          std::move(slot->children[0]),
+          keys,
+          window.order(),
+          slot->estimated_cardinality,
+          sirius::planner::sort_exchange_options::from(op_params));
+      } else {
+        slot->children[0] = build_window_exchange(std::move(slot->children[0]),
+                                                  keys,
+                                                  slot->estimated_cardinality,
+                                                  op_params.hash_partition_bytes);
+      }
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:

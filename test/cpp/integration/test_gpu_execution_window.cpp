@@ -405,6 +405,115 @@ TEST_CASE_METHOD(WindowFixture,
 }
 
 TEST_CASE_METHOD(WindowFixture,
+                 "framed SQL windows execute on GPU",
+                 "[integration][gpu_execution][window_sql][window_framed]")
+{
+  // ROWS frames order by id, which is unique, so every frame is determined. RANGE frames are
+  // determined by their peers, so they may order by keys with ties. ROWS BETWEEN UNBOUNDED
+  // PRECEDING AND CURRENT ROW is a running aggregate and is tested with those.
+  compare_window(
+    "SELECT id,p,sum(v) OVER (PARTITION BY p ORDER BY id "
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) FROM w");
+  compare_window(
+    "SELECT id,sum(d) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING),"
+    "count(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING),"
+    "min(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING),"
+    "max(d) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING) FROM w");
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN CURRENT ROW AND "
+    "UNBOUNDED FOLLOWING),count(*) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 5 FOLLOWING AND "
+    "7 FOLLOWING) FROM w");
+  // The default frame, RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, over keys with ties.
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY q),sum(d) OVER (PARTITION BY p ORDER BY q),"
+    "count(*) OVER (PARTITION BY p ORDER BY q),min(v) OVER (PARTITION BY p ORDER BY q),"
+    "max(s) OVER (PARTITION BY p ORDER BY q) FROM w");
+  compare_window(
+    "SELECT id,count(v) OVER (PARTITION BY p ORDER BY q,v RANGE BETWEEN CURRENT ROW AND "
+    "UNBOUNDED FOLLOWING) FROM w");
+  compare_window("SELECT id,avg(v) OVER (PARTITION BY p ORDER BY id ROWS 4 PRECEDING) FROM w", {1});
+  compare_window(
+    "SELECT id,avg(d) OVER (PARTITION BY p ORDER BY q),avg(f) OVER (PARTITION BY p ORDER BY q) "
+    "FROM w",
+    {1, 2});
+}
+
+TEST_CASE_METHOD(WindowFixture,
+                 "framed SQL windows order NULLs and descending keys like DuckDB",
+                 "[integration][gpu_execution][window_sql][window_framed]")
+{
+  // NULL partition keys form one partition.
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY q ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) "
+    "FROM w");
+  for (std::string const order :
+       {"v ASC NULLS FIRST", "v ASC NULLS LAST", "v DESC NULLS FIRST", "v DESC NULLS LAST"}) {
+    compare_window("SELECT id,sum(d) OVER (PARTITION BY p ORDER BY " + order +
+                   "),count(*) OVER (PARTITION BY p ORDER BY " + order + ") FROM w");
+    compare_window("SELECT id,sum(v) OVER (PARTITION BY p ORDER BY " + order +
+                   ",id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM w");
+  }
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY q,s ORDER BY id DESC ROWS BETWEEN UNBOUNDED PRECEDING "
+    "AND 1 FOLLOWING) FROM w");
+}
+
+TEST_CASE_METHOD(WindowFixture,
+                 "framed SQL windows stack with other window stages",
+                 "[integration][gpu_execution][window_sql][window_framed]")
+{
+  // Expression keys and arguments become hidden columns of the prepared input.
+  compare_window(
+    "SELECT id,sum(v+1) OVER (PARTITION BY p+1 ORDER BY id*2 ROWS 2 PRECEDING),"
+    "max(v+1) OVER (PARTITION BY p+1 ORDER BY id*2) FROM w");
+  // Several frames over one ORDER BY share a stage.
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED "
+    "FOLLOWING),sum(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),"
+    "min(v) OVER (PARTITION BY p ORDER BY id) FROM w");
+  // Framed, whole-partition, ranking and running stages, with the results restored to the SELECT
+  // order.
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),"
+    "sum(v) OVER (PARTITION BY p ORDER BY id ROWS 3 PRECEDING),sum(v) OVER (PARTITION BY p),"
+    "max(v) OVER (PARTITION BY q ORDER BY id ROWS UNBOUNDED PRECEDING) FROM w");
+  // A frame over a framed result, the shape of TPC-DS Q51 with framed instead of running windows.
+  compare_window(
+    "SELECT p,q,c,max(c) OVER (PARTITION BY p ORDER BY q ROWS 2 PRECEDING) FROM "
+    "(SELECT p,q,sum(sum(d)) OVER (PARTITION BY p ORDER BY q " +
+    std::string("ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING") +
+    ") c "
+    "FROM w GROUP BY p,q) t");
+  // ORDER BY with a frame over the whole partition needs no sort.
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND "
+    "UNBOUNDED FOLLOWING) FROM w");
+}
+
+TEST_CASE_METHOD(WindowFixture,
+                 "framed SQL windows never split a partition between sort ranges",
+                 "[integration][gpu_execution][window_sql][window_framed]")
+{
+  // Tiny ranges cut the input into many, so a partition split between two would give wrong
+  // running totals. One partition larger than the target still lands whole in one range.
+  run_ok("SET max_sort_partition_bytes=1024");
+  run_ok("SET sort_sample_bytes=1024");
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY id%101 ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 "
+    "FOLLOWING),"
+    "count(*) OVER (PARTITION BY id%101 ORDER BY id) FROM w");
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 "
+    "FOLLOWING) "
+    "FROM (SELECT * FROM w UNION ALL SELECT id+3000,p,q,v,d,f,s FROM w) t");
+  compare_window(
+    "SELECT id,sum(v) OVER (PARTITION BY id<10 ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 "
+    "FOLLOWING) FROM w");
+  run_ok("RESET max_sort_partition_bytes");
+  run_ok("RESET sort_sample_bytes");
+}
+
+TEST_CASE_METHOD(WindowFixture,
                  "unsupported SQL window semantics retain CPU fallback",
                  "[integration][gpu_execution][window_sql]")
 {
@@ -415,6 +524,12 @@ TEST_CASE_METHOD(WindowFixture,
     "SELECT id,avg(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT id,max(s) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) "
+    "FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,sum(v) OVER (PARTITION BY p ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT "
+    "ROW) FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT id,percent_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");
@@ -555,6 +670,10 @@ TEST_CASE("SQL windows on two GPUs", "[integration][window_sql][multi_gpu]")
         "CURRENT ROW),max(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND "
         "CURRENT ROW) FROM w",
         "SELECT id,sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM "
+        "w",
+        "SELECT id,sum(v) OVER (PARTITION BY id%101 ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING "
+        "AND 1 FOLLOWING),"
+        "max(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM "
         "w"}) {
     INFO(sql);
     run_ok("SET gpu_execution=false");

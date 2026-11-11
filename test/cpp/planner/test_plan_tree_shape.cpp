@@ -44,8 +44,11 @@
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
+#include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
+#include "op/sirius_physical_window.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -2927,4 +2930,49 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(boundary->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
     CHECK(limit->input_barrier_for(*boundary) == sirius::op::MemoryBarrierType::FULL);
   }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a framed window reads a sort cut on its partition keys",
+                 "[plan_tree_shape][isolated_context]")
+{
+  auto plan =
+    generate_sirius_plan(*con,
+                         "SELECT id, sum(val) OVER (PARTITION BY id % 3 ORDER BY val DESC "
+                         "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) FROM big_left",
+                         {OptimizerType::WINDOW_SELF_JOIN});
+  INFO(tree_to_string(plan.get()));
+
+  auto* window_op = find_first(plan.get(), SiriusPhysicalOperatorType::WINDOW);
+  REQUIRE(window_op != nullptr);
+  auto& window = window_op->Cast<sirius::op::sirius_physical_window>();
+  CHECK(window.input_exchange() == sirius::op::window_exchange::sorted);
+  REQUIRE(window.partition_columns().size() == 1);
+  auto const partition_slot = static_cast<duckdb::idx_t>(window.partition_columns()[0]);
+  REQUIRE(window.order().columns.size() == 1);
+  auto const order_slot = static_cast<duckdb::idx_t>(window.order().columns[0]);
+
+  REQUIRE(window.children.size() == 1);
+  auto* merge = window.children[0].get();
+  REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_SORT);
+  // MERGE_SORT ends the merge pipeline, so WINDOW sources its own and streams merged ranges.
+  CHECK(merge->is_sink());
+  CHECK_FALSE(window.is_sink());
+  CHECK(window.input_barrier_for(*merge) == sirius::op::MemoryBarrierType::PIPELINE);
+  auto* partition = merge->children[0].get();
+  REQUIRE(partition->type == SiriusPhysicalOperatorType::SORT_PARTITION);
+  auto& sample = partition->children[0]->Cast<sirius::op::sirius_physical_sort_sample>();
+  CHECK(sample.boundary_key_count() == 1);
+  auto& local_sort = sample.children[0]->Cast<sirius::op::sirius_physical_order>();
+  REQUIRE(local_sort.orders.size() == 2);
+  auto slot_of = [](duckdb::BoundOrderByNode const& node) {
+    return node.expression->Cast<duckdb::BoundReferenceExpression>().Index();
+  };
+  CHECK(slot_of(local_sort.orders[0]) == partition_slot);
+  CHECK(local_sort.orders[0].type == duckdb::OrderType::ASCENDING);
+  CHECK(local_sort.orders[0].null_order == duckdb::OrderByNullType::NULLS_FIRST);
+  CHECK(slot_of(local_sort.orders[1]) == order_slot);
+  CHECK(local_sort.orders[1].type == duckdb::OrderType::DESCENDING);
+  CHECK(local_sort.orders[1].null_order == duckdb::OrderByNullType::NULLS_LAST);
+  CHECK(local_sort.children[0]->type == SiriusPhysicalOperatorType::PROJECTION);
 }

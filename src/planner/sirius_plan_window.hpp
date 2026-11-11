@@ -20,11 +20,16 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/window/aggregate_types.hpp"
 #include "op/window/cumulative.hpp"
+#include "op/window/frame.hpp"
+#include "op/window/framed.hpp"
 #include "op/window/ranking.hpp"
 #include "op/window/whole_partition.hpp"
+#include "planner/sirius_plan_sort_exchange.hpp"
 #include "sirius_config.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -54,15 +59,28 @@ struct ranking_window_expression {
   duckdb::idx_t output_slot;
 };
 
+// An aggregate over a frame that is not the whole partition, evaluated over input sorted on the
+// partition and order keys.
+struct framed_window_expression {
+  aggregate_id function;
+  duckdb::idx_t argument_slot;
+  duckdb::LogicalType argument_type;
+  // DuckDB's exact result type, as for whole_partition_expression.
+  duckdb::LogicalType result_type;
+  op::window_frame frame;
+  duckdb::idx_t output_slot;
+};
+
 /// The kinds of window expression. A stage holds one kind.
-enum class window_kind { whole_partition, ranking, cumulative };
+enum class window_kind : std::uint8_t { whole_partition, ranking, cumulative, framed };
 
 // Planning IR only: not an executable operator. All slots index the prepared input
 // (original columns followed by hidden expressions), except output_slot, which
 // indexes the visible output (original columns followed by window results).
 // `kind` says what a window holds: `expressions` with aggregates over the whole partition,
-// `rankings` with ranking functions over `ranking_order`, or `expressions` with running aggregates
-// over `ranking_order` (the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`).
+// `rankings` with ranking functions over `order`, `expressions` with running aggregates over
+// `order` (the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`), or `framed` with
+// aggregates over other frames of `order`.
 struct window_plan {
   duckdb::idx_t input_width;
   duckdb::vector<duckdb::LogicalType> prepared_types;
@@ -70,21 +88,26 @@ struct window_plan {
   std::vector<duckdb::idx_t> partition_slots;
   std::vector<std::unique_ptr<ast::node>> hidden_expressions;
   std::vector<whole_partition_expression> expressions;
-  // How the evaluator computes `expressions`, set for a stage of aggregates over the whole
-  // partition.
+  // How the evaluator computes `expressions`, set for aggregates over the whole partition.
   std::optional<op::whole_partition_plan> aggregate_plan;
   std::vector<ranking_window_expression> rankings;
-  // Order key slots, direction and NULL placement shared by all `rankings`, or by all running
-  // aggregates.
-  op::window_order ranking_order;
+  std::vector<framed_window_expression> framed;
+  // How the framed evaluator computes `framed`, set when there are any.
+  std::optional<op::framed_window_plan> framed_plan;
+  // Order key slots, direction and NULL placement shared by all `rankings`, all running
+  // aggregates or all `framed`.
+  op::window_order order;
   window_kind kind = window_kind::whole_partition;
 };
 
 /**
  * @brief Plan all expressions of a window as one stage.
  *
- * A stage holds either aggregates over the whole partition or ranking functions. Its expressions
- * must have equivalent `PARTITION BY` keys and, for ranking functions, the same `ORDER BY`. The
+ * A stage holds aggregates over the whole partition, ranking functions, running aggregates (the
+ * frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` where the running evaluator supports
+ * the function and argument), or aggregates over other frames that are not the whole partition.
+ * Its expressions must have equivalent `PARTITION BY` keys and, except for aggregates over the
+ * whole partition, the same `ORDER BY`. Framed aggregates may each have their own frame. The
  * physical plan generator splits a window that does not fit one stage and plans each stage with
  * this rule. The tests use this function to check the plan of a single stage.
  *
@@ -93,15 +116,18 @@ struct window_plan {
  * removed when the visible output is published.
  *
  * The plan is refused, even when the input is empty, if:
- * - an expression is not a form the window evaluators run, such as a frame that is not the whole
- *   partition, `DISTINCT`, `FILTER`, or an unsupported function or result type
- * - the expressions mix aggregates and ranking functions, or do not share one specification
+ * - an expression is not a form the window evaluators run, such as `DISTINCT`, `FILTER`,
+ *   `EXCLUDE`, or an unsupported function or result type
+ * - an aggregate's frame is not the whole partition and the window has no `ORDER BY`, or is not
+ *   a running aggregate and has no `PARTITION BY`, uses `GROUPS` or `RANGE` offsets, or has a frame
+ * offset that is not a non-negative `BIGINT` constant after optimization
+ * - the expressions mix kinds, or do not share one specification
  * - a key or an argument is volatile, cannot be translated, or has an unsupported type
  *
  * @param window The window to plan. Its column references must be resolved. It must have one child
  * and at least one expression.
- * @return The plan: the prepared input schema, the partition key slots, the aggregate expressions
- * or the ranking functions with their order keys, and the output schema.
+ * @return The plan: the prepared input schema, the partition key slots, the aggregate expressions,
+ * the ranking functions or the framed aggregates with their order keys, and the output schema.
  * @throws duckdb::NotImplementedException if the window is refused. The query then falls back to
  * the CPU.
  */
@@ -139,5 +165,35 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_exchange(
   std::vector<duckdb::idx_t> const& partition_slots,
   std::size_t estimated_cardinality,
   uint64_t hash_partition_bytes);
+
+/**
+ * @brief Build the sorted input of a framed window: a distributed sort cut on the partition keys.
+ *
+ * Puts `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` on the prepared @p child, built by
+ * `build_sort_exchange`. ORDER_BY sorts on the partition keys followed by @p order. Range
+ * boundaries are sampled and compared on the partition keys only, and rows equal on the compared
+ * keys are never split between ranges, so every partition lands whole in one range. MERGE_SORT
+ * publishes each range sorted on the full key.
+ *
+ * Only adjacency of equal partition keys matters to the window, so the partition keys are sorted
+ * `ASC NULLS FIRST`. This is the only place that chooses that order.
+ *
+ * Insert after compressed-schema propagation, alongside the other pipeline wrapper insertions.
+ *
+ * @param child The prepared window input.
+ * @param partition_slots The partition key slots of the prepared input. Must not be empty.
+ * @param order The window ORDER BY over slots of the prepared input.
+ * @param estimated_cardinality Estimated number of input rows.
+ * @param options Sort sizing. Its boundary key count is replaced by the number of partition keys.
+ * @return The MERGE_SORT at the root of the input.
+ * @throws std::invalid_argument if @p child is null, @p partition_slots is empty, or a slot is
+ * outside the child's schema.
+ */
+duckdb::unique_ptr<op::sirius_physical_operator> build_window_sort_exchange(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  std::vector<duckdb::idx_t> const& partition_slots,
+  op::window_order const& order,
+  std::size_t estimated_cardinality,
+  sort_exchange_options options);
 
 }  // namespace sirius::planner

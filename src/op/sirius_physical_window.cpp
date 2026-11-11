@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
 
 namespace sirius::op {
 
@@ -40,20 +41,21 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
     _prepared_types(std::move(prepared_types)),
     _input_width(input_width),
     _partition_columns(plan.group_columns),
-    _aggregate_plan(std::move(plan))
+    _mode(std::move(plan))
 {
-  auto const valid_slot = [&](cudf::size_type slot) {
+  auto const& aggregate_plan = std::get<whole_partition_plan>(_mode);
+  auto const valid_slot      = [&](cudf::size_type slot) {
     return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
   };
-  if (_aggregate_plan->outputs.empty() ||
+  if (aggregate_plan.outputs.empty() ||
       !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
-      !std::all_of(_aggregate_plan->argument_columns.begin(),
-                   _aggregate_plan->argument_columns.end(),
+      !std::all_of(aggregate_plan.argument_columns.begin(),
+                   aggregate_plan.argument_columns.end(),
                    valid_slot)) {
     throw std::invalid_argument("Window key or argument is outside its prepared schema");
   }
   if (_input_width > _prepared_types.size() ||
-      types.size() != _input_width + _aggregate_plan->outputs.size()) {
+      types.size() != _input_width + aggregate_plan.outputs.size()) {
     throw std::invalid_argument("Window output schema does not match its prepared input");
   }
 }
@@ -70,21 +72,21 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
     _prepared_types(std::move(prepared_types)),
     _input_width(input_width),
     _partition_columns(std::move(partition_columns)),
-    _ranking_order(std::move(order)),
-    _ranking_functions(std::move(ranking_functions))
+    _mode(ranking_mode{std::move(order), std::move(ranking_functions)})
 {
+  auto const& ranking   = std::get<ranking_mode>(_mode);
   auto const valid_slot = [&](cudf::size_type slot) {
     return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
   };
-  if (_ranking_functions.empty() || _ranking_order.columns.empty() ||
-      _ranking_order.directions.size() != _ranking_order.columns.size() ||
-      _ranking_order.nulls.size() != _ranking_order.columns.size() ||
+  if (ranking.functions.empty() || ranking.order.columns.empty() ||
+      ranking.order.directions.size() != ranking.order.columns.size() ||
+      ranking.order.nulls.size() != ranking.order.columns.size() ||
       !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
-      !std::all_of(_ranking_order.columns.begin(), _ranking_order.columns.end(), valid_slot)) {
+      !std::all_of(ranking.order.columns.begin(), ranking.order.columns.end(), valid_slot)) {
     throw std::invalid_argument("Window key or order key is outside its prepared schema");
   }
   if (_input_width > _prepared_types.size() ||
-      types.size() != _input_width + _ranking_functions.size()) {
+      types.size() != _input_width + ranking.functions.size()) {
     throw std::invalid_argument("Window output schema does not match its prepared input");
   }
 }
@@ -101,29 +103,87 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
     _prepared_types(std::move(prepared_types)),
     _input_width(input_width),
     _partition_columns(std::move(partition_columns)),
-    _ranking_order(std::move(order)),
-    _cumulative_aggregates(std::move(aggregates))
+    _mode(cumulative_mode{std::move(order), std::move(aggregates)})
 {
-  auto const valid_slot = [&](cudf::size_type slot) {
+  auto const& cumulative = std::get<cumulative_mode>(_mode);
+  auto const valid_slot  = [&](cudf::size_type slot) {
     return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
   };
-  if (_cumulative_aggregates.empty() || _ranking_order.columns.empty() ||
-      _ranking_order.directions.size() != _ranking_order.columns.size() ||
-      _ranking_order.nulls.size() != _ranking_order.columns.size() ||
+  if (cumulative.aggregates.empty() || cumulative.order.columns.empty() ||
+      cumulative.order.directions.size() != cumulative.order.columns.size() ||
+      cumulative.order.nulls.size() != cumulative.order.columns.size() ||
       !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
-      !std::all_of(_ranking_order.columns.begin(), _ranking_order.columns.end(), valid_slot) ||
-      !std::all_of(_cumulative_aggregates.begin(),
-                   _cumulative_aggregates.end(),
+      !std::all_of(cumulative.order.columns.begin(), cumulative.order.columns.end(), valid_slot) ||
+      !std::all_of(cumulative.aggregates.begin(),
+                   cumulative.aggregates.end(),
                    [&](auto const& aggregate) { return valid_slot(aggregate.argument_column); })) {
     throw std::invalid_argument("Window key, order key or argument is outside its prepared schema");
   }
   if (_input_width > _prepared_types.size() ||
-      types.size() != _input_width + _cumulative_aggregates.size()) {
+      types.size() != _input_width + cumulative.aggregates.size()) {
     throw std::invalid_argument("Window output schema does not match its prepared input");
   }
 }
 
-// The next complete bucket from CONCAT, or nullptr when none is ready.
+// A window of framed aggregates over input sorted on the partition and order keys.
+sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> output_types,
+                                               duckdb::vector<logical_type> prepared_types,
+                                               std::size_t input_width,
+                                               framed_window_plan plan,
+                                               std::size_t estimated_cardinality)
+  : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
+    _prepared_types(std::move(prepared_types)),
+    _input_width(input_width),
+    _partition_columns(plan.group_columns),
+    _mode(std::move(plan))
+{
+  auto const& framed    = std::get<framed_window_plan>(_mode);
+  auto const valid_slot = [&](cudf::size_type slot) {
+    return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
+  };
+  // The sorted exchange cuts ranges on the partition keys, so a framed window needs at least one.
+  if (framed.outputs.empty() || _partition_columns.empty() ||
+      framed.order.directions.size() != framed.order.columns.size() ||
+      framed.order.nulls.size() != framed.order.columns.size() ||
+      !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
+      !std::all_of(framed.order.columns.begin(), framed.order.columns.end(), valid_slot) ||
+      !std::all_of(framed.argument_columns.begin(), framed.argument_columns.end(), valid_slot)) {
+    throw std::invalid_argument("Window key, order key or argument is outside its prepared schema");
+  }
+  if (_input_width > _prepared_types.size() ||
+      types.size() != _input_width + framed.outputs.size()) {
+    throw std::invalid_argument("Window output schema does not match its prepared input");
+  }
+}
+
+window_exchange sirius_physical_window::input_exchange() const
+{
+  return std::holds_alternative<framed_window_plan>(_mode) ? window_exchange::sorted
+                                                           : window_exchange::hash;
+}
+
+window_order const& sirius_physical_window::order() const
+{
+  static window_order const unordered{};
+  if (auto const* ranking = std::get_if<ranking_mode>(&_mode)) { return ranking->order; }
+  if (auto const* cumulative = std::get_if<cumulative_mode>(&_mode)) { return cumulative->order; }
+  if (auto const* framed = std::get_if<framed_window_plan>(&_mode)) { return framed->order; }
+  return unordered;
+}
+
+MemoryBarrierType sirius_physical_window::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  // Each merged range holds complete partitions and depends on no other range.
+  if (input_exchange() == window_exchange::sorted &&
+      producer.type == SiriusPhysicalOperatorType::MERGE_SORT) {
+    return MemoryBarrierType::PIPELINE;
+  }
+  return sirius_physical_operator::input_barrier_for(producer);
+}
+
+// The next complete bucket from CONCAT or merged range from MERGE_SORT, or nullptr when none is
+// ready.
 std::unique_ptr<operator_data> sirius_physical_window::get_next_task_input_data()
 {
   std::lock_guard<std::mutex> guard(lock);
@@ -152,16 +212,30 @@ std::size_t sirius_physical_window::workspace_bytes(std::size_t rows, std::size_
   // group per row. History refines this after execution, and native OOM follows ordinary retries.
   // A ranking window needs about 24 bytes per row for each function: the INT32 scan result, the
   // scattered result and the INT64 cast. The sort order is shared by all functions.
-  auto const aggregates = _aggregate_plan ? _aggregate_plan->outputs.size() : 0;
-  auto per_row          = memory::saturating_add(128, memory::saturating_mul(aggregates, 128));
-  per_row = memory::saturating_add(per_row, memory::saturating_mul(_ranking_functions.size(), 24));
+  // A framed window reads sorted input, so it needs no hash table or sort: a cast argument and a
+  // result per aggregate, plus the INT32 bounds pair of a RANGE frame.
+  if (auto const* framed = std::get_if<framed_window_plan>(&_mode)) {
+    auto const per_row =
+      memory::saturating_add(16, memory::saturating_mul(framed->outputs.size(), 48));
+    return memory::saturating_add(memory::saturating_mul(input_bytes, 2),
+                                  memory::saturating_mul(rows, per_row));
+  }
+  auto const* aggregate_plan = std::get_if<whole_partition_plan>(&_mode);
+  auto const* ranking        = std::get_if<ranking_mode>(&_mode);
+  auto const* cumulative     = std::get_if<cumulative_mode>(&_mode);
+  auto const aggregates      = aggregate_plan ? aggregate_plan->outputs.size() : 0;
+  auto const functions       = ranking ? ranking->functions.size() : 0;
+  auto const running         = cumulative ? cumulative->aggregates.size() : 0;
+  auto const order_keys      = ranking      ? ranking->order.columns.size()
+                               : cumulative ? cumulative->order.columns.size()
+                                            : 0;
+  auto per_row               = memory::saturating_add(128, memory::saturating_mul(aggregates, 128));
+  per_row = memory::saturating_add(per_row, memory::saturating_mul(functions, 24));
   // A running aggregate holds a widened argument, the scan result, the filled result and the
   // scattered result.
-  per_row =
-    memory::saturating_add(per_row, memory::saturating_mul(_cumulative_aggregates.size(), 128));
+  per_row = memory::saturating_add(per_row, memory::saturating_mul(running, 128));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_partition_columns.size(), 32));
-  per_row =
-    memory::saturating_add(per_row, memory::saturating_mul(_ranking_order.columns.size(), 32));
+  per_row = memory::saturating_add(per_row, memory::saturating_mul(order_keys, 32));
   return memory::saturating_add(memory::saturating_mul(input_bytes, 2),
                                 memory::saturating_mul(rows, per_row));
 }
@@ -217,36 +291,34 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
         restored.push_back(std::move(column));
       }
     };
-    // Ranking only reads the equality and the order of its keys, which an exact narrower carrier
-    // keeps, so its keys are used as they are. The same holds for the keys of a running aggregate.
-    // Its arguments, and the keys and arguments of a whole partition aggregate, are restored.
-    if (_aggregate_plan) {
-      for (auto slot : logical_type_columns(*_aggregate_plan)) {
-        restore(slot);
-      }
-    }
-    for (auto const& aggregate : _cumulative_aggregates) {
-      restore(aggregate.argument_column);
-    }
-    std::shared_ptr<cudf::table> results;
-    if (_aggregate_plan) {
-      results =
-        evaluate_whole_partition_window(*_aggregate_plan, cudf::table_view(columns), stream, mr);
-    } else if (!_cumulative_aggregates.empty()) {
-      results = evaluate_cumulative_window(cudf::table_view(columns),
-                                           _partition_columns,
-                                           _ranking_order,
-                                           _cumulative_aggregates,
-                                           stream,
-                                           mr);
-    } else {
-      results = evaluate_ranking_window(cudf::table_view(columns),
-                                        _partition_columns,
-                                        _ranking_order,
-                                        _ranking_functions,
-                                        stream,
-                                        mr);
-    }
+    // Ranking, and the partition and order keys of a running or framed window, only read the
+    // equality and the order of the keys, which an exact narrower carrier keeps, so those keys are
+    // used as they are. Arguments, and a RANGE offset's order key, are restored to their logical
+    // types.
+    std::shared_ptr<cudf::table> results = std::visit(
+      [&](auto const& mode) -> std::unique_ptr<cudf::table> {
+        using mode_type = std::decay_t<decltype(mode)>;
+        if constexpr (std::is_same_v<mode_type, ranking_mode>) {
+          return evaluate_ranking_window(
+            cudf::table_view(columns), _partition_columns, mode.order, mode.functions, stream, mr);
+        } else if constexpr (std::is_same_v<mode_type, cumulative_mode>) {
+          for (auto const& aggregate : mode.aggregates) {
+            restore(aggregate.argument_column);
+          }
+          return evaluate_cumulative_window(
+            cudf::table_view(columns), _partition_columns, mode.order, mode.aggregates, stream, mr);
+        } else {
+          for (auto slot : logical_type_columns(mode)) {
+            restore(slot);
+          }
+          if constexpr (std::is_same_v<mode_type, whole_partition_plan>) {
+            return evaluate_whole_partition_window(mode, cudf::table_view(columns), stream, mr);
+          } else {
+            return evaluate_framed_window(mode, cudf::table_view(columns), stream, mr);
+          }
+        }
+      },
+      _mode);
 
     // Forward payload in its original carrier and row order, followed by the window results. The
     // hidden columns after the payload are not published.

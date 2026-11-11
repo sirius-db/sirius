@@ -18,20 +18,43 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "op/window/cumulative.hpp"
+#include "op/window/framed.hpp"
 #include "op/window/ranking.hpp"
 #include "op/window/whole_partition.hpp"
 
-#include <optional>
+#include <cstdint>
+#include <variant>
+#include <vector>
 
 namespace sirius::op {
 
+/// The input a window needs, and so the exchange the planner puts under it.
+enum class window_exchange : std::uint8_t {
+  /// Complete hash buckets from PARTITION → CONCAT, unsorted.
+  hash,
+  /// Complete groups from MERGE_SORT, sorted on the partition keys followed by the order keys.
+  sorted,
+};
+
 /**
- * @brief Pipelineable adapter that evaluates window functions over complete hash buckets.
+ * @brief Pipelineable adapter that evaluates window functions over complete groups of partitions.
  *
- * A window evaluates aggregates over the whole partition, ranking functions over the window ORDER
- * BY, or running aggregates over the window ORDER BY. The child must publish exactly one complete
- * bucket per batch. PARTITION and CONCAT do the partition routing and apply the FULL barrier, not
- * this operator.
+ * A window evaluates one of: aggregates over the whole partition, ranking functions over the
+ * window ORDER BY, running aggregates over the window ORDER BY (the frame `ROWS BETWEEN UNBOUNDED
+ * PRECEDING AND CURRENT ROW`), or aggregates over other frames of the window ORDER BY (framed
+ * mode). The child must publish batches that each hold every row of the partitions they contain.
+ *
+ * Whole-partition, ranking and running windows read hash buckets: PARTITION and CONCAT do the
+ * routing and apply the FULL barrier, and each batch is one bucket.
+ *
+ * A framed window reads the ranges of a distributed sort on the partition keys followed by the
+ * order keys. Range boundaries are compared on the partition keys only, and the sort never splits
+ * rows equal on the compared keys between ranges, so a partition is never split between ranges,
+ * and each batch is one merged range, already sorted. MERGE_SORT must publish a
+ * range as a single batch: a range divided between batches would split a partition. A range can
+ * be windowed as soon as MERGE_SORT publishes it, so the input port is a PIPELINE barrier. Range
+ * sizing is only as good as the sort's sample and the estimated cardinality, and a range that
+ * does not fit fails in MERGE_SORT before the window runs.
  *
  * A task evaluates one bucket as one cuDF table on one GPU. A bucket holds every row of each
  * partition it contains, so a single partition is never split. Limits on a bucket:
@@ -78,6 +101,14 @@ class sirius_physical_window : public sirius_physical_operator {
                          std::vector<window_aggregate> cumulative_aggregates,
                          std::size_t estimated_cardinality);
 
+  /// A window of framed aggregates over input sorted on the partition and order keys, evaluated by
+  /// @p plan. The plan's group columns are the partition columns and must not be empty.
+  sirius_physical_window(duckdb::vector<logical_type> output_types,
+                         duckdb::vector<logical_type> prepared_types,
+                         std::size_t input_width,
+                         framed_window_plan plan,
+                         std::size_t estimated_cardinality);
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(operator_data const& input,
@@ -87,17 +118,33 @@ class sirius_physical_window : public sirius_physical_operator {
   /// The indices of the partition key columns in the prepared input.
   std::vector<cudf::size_type> const& partition_columns() const { return _partition_columns; }
 
+  /// The exchange this window's input must come from.
+  [[nodiscard]] window_exchange input_exchange() const;
+
+  /// The window ORDER BY. Empty for a window of aggregates over the whole partition.
+  [[nodiscard]] window_order const& order() const;
+
+  /// A sorted window takes merged ranges as soon as they are published.
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
+
  private:
+  struct ranking_mode {
+    window_order order;
+    std::vector<ranking_function> functions;
+  };
+
+  struct cumulative_mode {
+    window_order order;
+    std::vector<window_aggregate> aggregates;
+  };
+
   /// Cold-start estimate of the memory a task needs for a bucket.
   std::size_t workspace_bytes(std::size_t rows, std::size_t input_bytes) const;
   duckdb::vector<logical_type> _prepared_types;
   std::size_t _input_width;
   std::vector<cudf::size_type> _partition_columns;
-  /// The plan of a window of aggregates. Empty for a ranking window.
-  std::optional<whole_partition_plan> _aggregate_plan;
-  window_order _ranking_order;
-  std::vector<ranking_function> _ranking_functions;
-  std::vector<window_aggregate> _cumulative_aggregates;
+  std::variant<whole_partition_plan, ranking_mode, cumulative_mode, framed_window_plan> _mode;
 };
 
 }  // namespace sirius::op

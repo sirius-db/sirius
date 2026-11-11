@@ -26,6 +26,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
+#include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_passthrough_sink.hpp"
 #include "op/sirius_physical_projection.hpp"
@@ -149,7 +150,7 @@ TEST_CASE("whole-partition window planning shares hidden expressions", "[planner
   CHECK(plan.expressions[0].argument_slot == plan.partition_slots[0]);
 }
 
-TEST_CASE("whole-partition window planning admits only whole unordered frames",
+TEST_CASE("whole-partition window planning admits frames that cover the whole partition",
           "[planner][window_plan]")
 {
   window_fixture fixture;
@@ -157,7 +158,10 @@ TEST_CASE("whole-partition window planning admits only whole unordered frames",
     GENERATE("",
              "PARTITION BY p",
              "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
-             "PARTITION BY p RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING");
+             "PARTITION BY p RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+             // The order cannot change an aggregate over the whole partition, so none is sorted.
+             "ORDER BY p ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+             "PARTITION BY q ORDER BY p RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING");
   auto logical = fixture.bind(std::string("SELECT sum(v) OVER (") + clause + ") FROM w");
   auto plan    = plan_window(find_window(*logical));
   REQUIRE(plan.expressions.size() == 1);
@@ -169,7 +173,6 @@ TEST_CASE("whole-partition window planning rejects unsupported bound semantics",
   window_fixture fixture;
   auto const expression = GENERATE(
     "sum(v) OVER (ORDER BY p)",
-    "sum(v) OVER (ORDER BY p ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
     "sum(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)",
     "sum(v) OVER (ROWS BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING)",
     "sum(v) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)",
@@ -252,7 +255,7 @@ TEST_CASE("whole-partition window planner activates only admitted windows",
   auto logical = fixture.bind("SELECT sum(v) OVER (ORDER BY p) FROM w");
   sirius::planner::sirius_physical_plan_generator generator(*fixture.con.context);
   REQUIRE_THROWS_WITH(generator.create_plan(std::move(logical)),
-                      Catch::Matchers::ContainsSubstring("window ORDER BY"));
+                      Catch::Matchers::ContainsSubstring("framed window without PARTITION BY"));
   logical       = fixture.bind("SELECT sum(v) OVER () FROM (VALUES (1),(2)) t(v)");
   auto physical = generator.create_plan(std::move(logical));
   auto find     = [](auto&& self, sirius::op::sirius_physical_operator& op) -> bool {
@@ -343,13 +346,12 @@ TEST_CASE("ranking window planning records the order keys and bound types",
     CHECK(plan.rankings[i].result_type == duckdb::LogicalType::BIGINT);
     CHECK(plan.rankings[i].output_slot == plan.input_width + i);
   }
-  REQUIRE(plan.ranking_order.columns.size() == 1);
-  REQUIRE(plan.ranking_order.directions.size() == 1);
-  REQUIRE(plan.ranking_order.nulls.size() == 1);
-  CHECK(plan.ranking_order.directions[0] == cudf::order::DESCENDING);
-  CHECK(plan.ranking_order.nulls[0] ==
-        sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
-                                       duckdb::OrderByNullType::NULLS_LAST));
+  REQUIRE(plan.order.columns.size() == 1);
+  REQUIRE(plan.order.directions.size() == 1);
+  REQUIRE(plan.order.nulls.size() == 1);
+  CHECK(plan.order.directions[0] == cudf::order::DESCENDING);
+  CHECK(plan.order.nulls[0] == sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
+                                                              duckdb::OrderByNullType::NULLS_LAST));
 }
 
 TEST_CASE("ranking window planning evaluates order expressions once and keeps several keys",
@@ -361,10 +363,10 @@ TEST_CASE("ranking window planning evaluates order expressions once and keeps se
     "dense_rank() OVER (PARTITION BY p ORDER BY v+1, q) FROM w");
   auto plan = plan_window(find_window(*logical));
   REQUIRE(plan.hidden_expressions.size() == 1);
-  REQUIRE(plan.ranking_order.columns.size() == 2);
-  CHECK(static_cast<std::size_t>(plan.ranking_order.columns[0]) == plan.input_width);
-  CHECK(static_cast<std::size_t>(plan.ranking_order.columns[1]) < plan.input_width);
-  CHECK(plan.ranking_order.directions ==
+  REQUIRE(plan.order.columns.size() == 2);
+  CHECK(static_cast<std::size_t>(plan.order.columns[0]) == plan.input_width);
+  CHECK(static_cast<std::size_t>(plan.order.columns[1]) < plan.input_width);
+  CHECK(plan.order.directions ==
         std::vector<cudf::order>{cudf::order::ASCENDING, cudf::order::ASCENDING});
 }
 
@@ -378,7 +380,7 @@ TEST_CASE("ranking window planning accepts a window without PARTITION BY", "[pla
   CHECK(plan.partition_slots.empty());
   CHECK(plan.expressions.empty());
   CHECK(plan.rankings.size() == 3);
-  CHECK(plan.ranking_order.columns.size() == 1);
+  CHECK(plan.order.columns.size() == 1);
 }
 
 TEST_CASE("ranking window planning keeps the direction and NULL placement of each key",
@@ -388,10 +390,10 @@ TEST_CASE("ranking window planning keeps the direction and NULL placement of eac
   auto logical = fixture.bind(
     "SELECT rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST, q ASC NULLS FIRST) FROM w");
   auto plan = plan_window(find_window(*logical));
-  REQUIRE(plan.ranking_order.columns.size() == 2);
-  CHECK(plan.ranking_order.directions ==
+  REQUIRE(plan.order.columns.size() == 2);
+  CHECK(plan.order.directions ==
         std::vector<cudf::order>{cudf::order::DESCENDING, cudf::order::ASCENDING});
-  CHECK(plan.ranking_order.nulls ==
+  CHECK(plan.order.nulls ==
         std::vector<cudf::null_order>{
           sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
                                          duckdb::OrderByNullType::NULLS_LAST),
@@ -410,7 +412,7 @@ TEST_CASE("ranking window planning rejects unsupported shapes", "[planner][windo
              "rank() OVER (PARTITION BY f ORDER BY v)",
              "percent_rank() OVER (PARTITION BY p ORDER BY v)",
              "ntile(2) OVER (PARTITION BY p ORDER BY v)",
-             "sum(v) OVER (PARTITION BY p ORDER BY v)",
+             "sum(v) OVER (PARTITION BY p ORDER BY v), rank() OVER (PARTITION BY p ORDER BY v)",
              "sum(v) OVER (PARTITION BY p), rank() OVER (PARTITION BY p ORDER BY v)",
              "rank() OVER (PARTITION BY p ORDER BY v), sum(v) OVER (PARTITION BY p)");
   INFO(expression);
@@ -442,11 +444,10 @@ TEST_CASE("running aggregate planning records the order keys and bound types",
   CHECK(plan.expressions[2].function == aggregate_id::count);
   CHECK(plan.expressions[3].function == aggregate_id::count_star);
   CHECK(plan.partition_slots.size() == 1);
-  REQUIRE(plan.ranking_order.columns.size() == 1);
-  CHECK(plan.ranking_order.directions[0] == cudf::order::DESCENDING);
-  CHECK(plan.ranking_order.nulls[0] ==
-        sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
-                                       duckdb::OrderByNullType::NULLS_LAST));
+  REQUIRE(plan.order.columns.size() == 1);
+  CHECK(plan.order.directions[0] == cudf::order::DESCENDING);
+  CHECK(plan.order.nulls[0] == sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
+                                                              duckdb::OrderByNullType::NULLS_LAST));
 }
 
 TEST_CASE("running aggregate planning accepts a window without PARTITION BY and an expression key",
@@ -459,7 +460,7 @@ TEST_CASE("running aggregate planning accepts a window without PARTITION BY and 
   auto plan = plan_window(find_window(*logical));
   CHECK(plan.kind == window_kind::cumulative);
   CHECK(plan.partition_slots.empty());
-  CHECK(plan.ranking_order.columns.size() == 2);
+  CHECK(plan.order.columns.size() == 2);
   CHECK(plan.expressions[1].result_type == duckdb::LogicalType::DECIMAL(38, 2));
 }
 
@@ -468,17 +469,12 @@ TEST_CASE("running aggregate planning rejects unsupported shapes", "[planner][wi
   window_fixture fixture;
   std::string const frame = " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
   auto const expression   = GENERATE_COPY(
-    // The default frame is a RANGE frame, where peers share a result.
-    std::string("sum(v) OVER (PARTITION BY p ORDER BY q)"),
-    std::string("sum(v) OVER (PARTITION BY p ORDER BY q RANGE BETWEEN UNBOUNDED PRECEDING AND "
-                  "CURRENT ROW)"),
-    std::string("sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"),
-    std::string("sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN UNBOUNDED PRECEDING AND 1 "
-                  "FOLLOWING)"),
-    std::string("sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN CURRENT ROW AND UNBOUNDED "
-                  "FOLLOWING)"),
-    "avg(v) OVER (PARTITION BY p ORDER BY q" + frame + ")",
-    "max(s) OVER (PARTITION BY p ORDER BY q" + frame + ")",
+    // Without PARTITION BY, a frame or function the running evaluator does not take has no other
+    // GPU evaluator.
+    std::string("sum(v) OVER (ORDER BY q)"),
+    std::string("sum(v) OVER (ORDER BY q ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"),
+    "avg(v) OVER (ORDER BY q" + frame + ")",
+    "max(s) OVER (ORDER BY q" + frame + ")",
     "sum(v::UBIGINT) OVER (PARTITION BY p ORDER BY q" + frame + ")",
     "sum(DISTINCT v) OVER (PARTITION BY p ORDER BY q" + frame + ")",
     "sum(v) FILTER (WHERE v > 0) OVER (PARTITION BY p ORDER BY q" + frame + ")",
@@ -495,6 +491,33 @@ TEST_CASE("running aggregate planning rejects unsupported shapes", "[planner][wi
   INFO(expression);
   auto logical = fixture.bind("SELECT " + expression + " FROM w");
   REQUIRE_THROWS_AS(plan_window(find_window(*logical)), duckdb::NotImplementedException);
+}
+
+TEST_CASE("ordered aggregates the running evaluator does not take are framed",
+          "[planner][window_plan]")
+{
+  window_fixture fixture;
+  std::string const frame = " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+  auto const expression   = GENERATE_COPY(
+    // The default frame is a RANGE frame, where peers share a result.
+    std::string("sum(v) OVER (PARTITION BY p ORDER BY q)"),
+    std::string("sum(v) OVER (PARTITION BY p ORDER BY q RANGE BETWEEN UNBOUNDED PRECEDING AND "
+                  "CURRENT ROW)"),
+    std::string("sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"),
+    std::string("sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN UNBOUNDED PRECEDING AND 1 "
+                  "FOLLOWING)"),
+    std::string("sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN CURRENT ROW AND UNBOUNDED "
+                  "FOLLOWING)"),
+    // The running evaluator takes neither AVG nor a string MIN or MAX.
+    "avg(v) OVER (PARTITION BY p ORDER BY q" + frame + ")",
+    "max(s) OVER (PARTITION BY p ORDER BY q" + frame + ")");
+  INFO(expression);
+  auto logical = fixture.bind("SELECT " + expression + " FROM w", true);
+  auto plan    = plan_window(find_window(*logical));
+  CHECK(plan.kind == window_kind::framed);
+  CHECK(plan.expressions.empty());
+  CHECK(plan.framed.size() == 1);
+  CHECK(plan.framed_plan);
 }
 
 TEST_CASE("whole-partition window planning rejects invalid mappings and null treatment",
@@ -843,4 +866,297 @@ TEST_CASE("ranking window adapter rejects invalid construction", "[window_adapte
     CHECK_THROWS_AS(build(output, 2, {0}, order, rank), std::invalid_argument);
     CHECK_THROWS_AS(build(output, 4, {0}, order, rank), std::invalid_argument);
   }
+}
+
+TEST_CASE("framed window planning records the frame of each aggregate", "[planner][window_plan]")
+{
+  using namespace sirius::op;
+  window_fixture fixture;
+  struct expected_frame {
+    std::string clause;
+    window_frame frame;
+  };
+  auto const expected = GENERATE(
+    expected_frame{"", default_window_frame()},
+    expected_frame{"ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING",
+                   {frame_unit::rows, frame_unbounded{}, frame_row_offset{1, false}}},
+    expected_frame{"ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING",
+                   {frame_unit::rows, frame_row_offset{2, true}, frame_row_offset{1, false}}},
+    expected_frame{"ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+                   {frame_unit::rows, frame_current_row{}, frame_unbounded{}}},
+    expected_frame{"ROWS BETWEEN 1 + 1 PRECEDING AND CURRENT ROW",
+                   {frame_unit::rows, frame_row_offset{2, true}, frame_current_row{}}},
+    expected_frame{"RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+                   {frame_unit::range, frame_current_row{}, frame_unbounded{}}});
+  INFO(expected.clause);
+  // Offsets are BIGINT constants only after the optimizer folds the binder's cast.
+  auto logical = fixture.bind("SELECT sum(v) OVER (PARTITION BY p ORDER BY q DESC NULLS FIRST, v " +
+                                expected.clause + ") FROM w",
+                              true);
+  auto plan    = plan_window(find_window(*logical));
+  CHECK(plan.expressions.empty());
+  CHECK(plan.rankings.empty());
+  REQUIRE(plan.framed.size() == 1);
+  CHECK(plan.framed[0].function == aggregate_id::sum);
+  CHECK(plan.framed[0].frame == expected.frame);
+  CHECK(plan.framed[0].result_type == duckdb::LogicalType::HUGEINT);
+  CHECK(plan.framed[0].output_slot == plan.input_width);
+  REQUIRE(plan.partition_slots.size() == 1);
+  REQUIRE(plan.order.columns.size() == 2);
+  CHECK(plan.order.directions ==
+        std::vector<cudf::order>{cudf::order::DESCENDING, cudf::order::ASCENDING});
+  CHECK(plan.order.nulls[0] ==
+        to_cudf_null_order(duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_FIRST));
+  REQUIRE(plan.framed_plan);
+  CHECK(plan.framed_plan->group_columns ==
+        std::vector<cudf::size_type>{static_cast<cudf::size_type>(plan.partition_slots[0])});
+}
+
+TEST_CASE("framed window planning shares a stage across frames", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto logical = fixture.bind(
+    "SELECT count(*) OVER (PARTITION BY p ORDER BY v ROWS 1 PRECEDING),"
+    "max(d) OVER (PARTITION BY p ORDER BY v),"
+    "avg(v+1) OVER (PARTITION BY p ORDER BY v ROWS BETWEEN CURRENT ROW AND 3 FOLLOWING) FROM w",
+    true);
+  auto plan = plan_window(find_window(*logical));
+  REQUIRE(plan.framed.size() == 3);
+  CHECK(plan.framed[0].function == aggregate_id::count_star);
+  CHECK(plan.framed[1].function == aggregate_id::max);
+  CHECK(plan.framed[1].result_type == plan.framed[1].argument_type);
+  CHECK(plan.framed[2].function == aggregate_id::avg);
+  CHECK(plan.framed[2].argument_slot >= plan.input_width);
+  CHECK(plan.framed[0].frame.unit == sirius::op::frame_unit::rows);
+  CHECK(plan.framed[1].frame == sirius::op::default_window_frame());
+  REQUIRE(plan.framed_plan);
+  CHECK(plan.framed_plan->outputs.size() == 3);
+}
+
+TEST_CASE("framed window planning rejects unsupported frames", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto const expression =
+    GENERATE("sum(v) OVER (ORDER BY q ROWS 1 PRECEDING)",
+             "sum(v) OVER (ORDER BY q)",
+             "sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN v PRECEDING AND CURRENT ROW)",
+             "sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN -1 PRECEDING AND CURRENT ROW)",
+             "sum(v) OVER (PARTITION BY p ORDER BY q GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+             "sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN 1 PRECEDING AND CURRENT ROW "
+             "EXCLUDE CURRENT ROW)",
+             "sum(v) OVER (PARTITION BY p ORDER BY q RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)",
+             "sum(v) OVER (PARTITION BY p ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+             "sum(DISTINCT v) OVER (PARTITION BY p ORDER BY q)",
+             "sum(v) OVER (PARTITION BY p ORDER BY q ROWS 1 PRECEDING), "
+             "rank() OVER (PARTITION BY p ORDER BY q)");
+  INFO(expression);
+  auto logical = fixture.bind(std::string("SELECT ") + expression + " FROM w", true);
+  REQUIRE_THROWS_AS(plan_window(find_window(*logical)), duckdb::NotImplementedException);
+}
+
+TEST_CASE("framed windows split into stages by ORDER BY and kind", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  sirius::planner::sirius_physical_plan_generator generator(*fixture.con.context);
+  auto count = [](auto&& self, sirius::op::sirius_physical_operator& op) -> std::size_t {
+    std::size_t windows = op.type == sirius::op::SiriusPhysicalOperatorType::WINDOW ? 1 : 0;
+    for (auto& child : op.children) {
+      windows += self(self, *child);
+    }
+    return windows;
+  };
+  std::vector<std::pair<std::string, std::size_t>> const cases = {
+    {"SELECT sum(v) OVER (PARTITION BY p ORDER BY q ROWS 1 PRECEDING),"
+     "max(v) OVER (PARTITION BY p ORDER BY q) FROM w",
+     1},
+    {"SELECT sum(v) OVER (PARTITION BY p ORDER BY q),sum(v) OVER (PARTITION BY p ORDER BY v) "
+     "FROM w",
+     2},
+    {"SELECT sum(v) OVER (PARTITION BY p ORDER BY q),rank() OVER (PARTITION BY p ORDER BY q) "
+     "FROM w",
+     2},
+    {"SELECT sum(v) OVER (PARTITION BY p ORDER BY q),sum(v) OVER (PARTITION BY p) FROM w", 2},
+    // A running aggregate is a stage of its own kind, even with the same ORDER BY.
+    {"SELECT sum(v) OVER (PARTITION BY p ORDER BY q ROWS UNBOUNDED PRECEDING),"
+     "sum(v) OVER (PARTITION BY p ORDER BY q ROWS 1 PRECEDING) FROM w",
+     2}};
+  std::string const source = "FROM (VALUES (1,1,1)) w(p,q,v)";
+  for (auto const& [query, windows] : cases) {
+    auto sql = query;
+    for (auto at = sql.find("FROM w"); at != std::string::npos; at = sql.find("FROM w", at)) {
+      sql.replace(at, 6, source);
+    }
+    INFO(sql);
+    // Offsets are BIGINT constants only after the optimizer folds them.
+    auto physical = generator.create_plan(fixture.bind(sql, true));
+    CHECK(count(count, *physical) == windows);
+  }
+}
+
+TEST_CASE("framed window adapter restores arguments and leaves keys narrow",
+          "[window_adapter][gpu]")
+{
+  using namespace sirius::op;
+  using namespace sirius::test::operator_utils;
+  using sirius::logical_type;
+  using sirius::type_id;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto& space  = *manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  // Slot 0 is the partition key, slot 1 the order key and slot 2 a hidden argument, all
+  // compressed INTEGERs, sorted on (slot 0, slot 1).
+  auto mr     = get_resource_ref(space);
+  auto stream = space.acquire_stream();
+  auto make   = [&](std::vector<int8_t> const& values) {
+    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT8},
+                                            static_cast<cudf::size_type>(values.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mr);
+    REQUIRE(cudaMemcpy(column->mutable_view().data<int8_t>(),
+                       values.data(),
+                       values.size(),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    return column;
+  };
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make({1, 1, 1, 2, 2}));
+  columns.push_back(make({1, 2, 3, 1, 2}));
+  columns.push_back(make({10, 20, 30, 40, 50}));
+  auto batch         = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                       space,
+                                       stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  auto const integer = cudf::data_type{cudf::type_id::INT32};
+  window_order const order{{1}, {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}};
+  auto plan = plan_framed_window(
+    {integer, integer, integer},
+    {0},
+    order,
+    {{aggregate_id::sum, 2, {frame_unit::rows, frame_row_offset{2, true}, frame_current_row{}}},
+     {aggregate_id::count_star, 2, default_window_frame()}});
+  sirius_physical_window window({logical_type::make(type_id::INTEGER),
+                                 logical_type::make(type_id::INTEGER),
+                                 logical_type::make(type_id::HUGEINT),
+                                 logical_type::make(type_id::BIGINT)},
+                                {logical_type::make(type_id::INTEGER),
+                                 logical_type::make(type_id::INTEGER),
+                                 logical_type::make(type_id::INTEGER)},
+                                2,
+                                plan,
+                                5);
+  CHECK(window.input_exchange() == window_exchange::sorted);
+  CHECK(window.order().columns == order.columns);
+  pipelineable_operator_data input({batch});
+  input.prepare_for_processing(&space, stream);
+  auto result = window.execute(input, stream);
+  stream.sync();
+  auto batches = dynamic_cast<pipelineable_operator_data&>(*result).get_read_only_batches();
+  REQUIRE(batches.size() == 1);
+  auto table = sirius::get_cudf_table_view(batches[0]);
+  REQUIRE(table.num_columns() == 4);
+  CHECK(table.column(0).type().id() == cudf::type_id::INT8);
+  CHECK(table.column(1).type().id() == cudf::type_id::INT8);
+  CHECK(table.column(2).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+  // ROWS 2 PRECEDING: the frame preceding counts the current row, so it covers 2 rows back.
+  CHECK(copy_column_to_host<__int128_t>(table.column(2)) ==
+        std::vector<__int128_t>{10, 30, 60, 40, 90});
+  CHECK(copy_column_to_host<int64_t>(table.column(3)) == std::vector<int64_t>{1, 2, 3, 1, 2});
+}
+
+TEST_CASE("framed window source drains merged ranges across gaps as they arrive",
+          "[window_adapter][gpu]")
+{
+  using namespace sirius::op;
+  using namespace sirius::test::operator_utils;
+  auto manager       = sirius::test::operator_utils::initialize_memory_manager();
+  auto& space        = *manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto const integer = cudf::data_type{cudf::type_id::INT32};
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  auto outputs = types;
+  outputs.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));
+  sirius_physical_window window(
+    outputs,
+    types,
+    1,
+    plan_framed_window(
+      {integer}, {0}, window_order{}, {{aggregate_id::count_star, 0, default_window_frame()}}),
+    3);
+  // A merged range from MERGE_SORT is complete, so the window streams it.
+  sirius_physical_merge_sort merge(types, {}, {0}, 3);
+  CHECK(window.input_barrier_for(merge) == MemoryBarrierType::PIPELINE);
+  cucascade::shared_data_repository repo;
+  repo.set_num_partitions(5);
+  auto first  = make_numeric_batch<int32_t>(space, {1, 1}, cudf::type_id::INT32);
+  auto second = make_numeric_batch<int32_t>(space, {3}, cudf::type_id::INT32);
+  repo.add_data_batch(first, 1);
+  auto port  = std::make_unique<sirius_physical_operator::port>();
+  port->repo = &repo;
+  port->type = MemoryBarrierType::PIPELINE;
+  window.add_port("default", std::move(port));
+  auto take = [&] {
+    auto input = window.get_next_task_input_data();
+    REQUIRE(input);
+    auto const& batches = dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches();
+    REQUIRE(batches.size() == 1);
+    return batches[0];
+  };
+  CHECK(take() == first);
+  CHECK_FALSE(window.get_next_task_input_data());
+  repo.add_data_batch(second, 4);
+  CHECK(take() == second);
+  CHECK_FALSE(window.get_next_task_input_data());
+}
+
+TEST_CASE("framed window adapter rejects invalid construction", "[window_adapter]")
+{
+  using namespace sirius::op;
+  using sirius::logical_type;
+  using sirius::type_id;
+  auto const integer = logical_type::make(type_id::INTEGER);
+  auto const bigint  = logical_type::make(type_id::BIGINT);
+  auto const native  = cudf::data_type{cudf::type_id::INT32};
+  duckdb::vector<logical_type> const prepared{integer, integer};
+  duckdb::vector<logical_type> const output{integer, integer, bigint};
+  auto plan = [&](std::vector<cudf::size_type> groups) {
+    return plan_framed_window(
+      {native, native},
+      groups,
+      window_order{{1}, {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}},
+      {{aggregate_id::count, 1, default_window_frame()}});
+  };
+  CHECK_NOTHROW(sirius_physical_window(output, prepared, 2, plan({0}), 1));
+  SECTION("no partition columns")
+  {
+    CHECK_THROWS_AS(sirius_physical_window(output, prepared, 2, plan({}), 1),
+                    std::invalid_argument);
+  }
+  SECTION("an output schema that does not match the prepared input")
+  {
+    CHECK_THROWS_AS(sirius_physical_window(output, prepared, 1, plan({0}), 1),
+                    std::invalid_argument);
+  }
+  SECTION("a plan built for a wider schema")
+  {
+    auto wide = plan_framed_window({native, native, native},
+                                   {2},
+                                   window_order{},
+                                   {{aggregate_id::count, 1, default_window_frame()}});
+    CHECK_THROWS_AS(sirius_physical_window(output, prepared, 2, wide, 1), std::invalid_argument);
+  }
+}
+
+TEST_CASE("framed window offsets must be folded to constants", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto const sql = "SELECT sum(v) OVER (PARTITION BY p ORDER BY q ROWS 2 PRECEDING) FROM w";
+  // The binder casts the literal to BIGINT. Only DuckDB's optimizer folds the cast away.
+  auto bound = fixture.bind(sql);
+  CHECK_THROWS_WITH(plan_window(find_window(*bound)),
+                    Catch::Matchers::ContainsSubstring("non-constant frame offset"));
+  auto optimized = fixture.bind(sql, true);
+  auto plan      = plan_window(find_window(*optimized));
+  REQUIRE(plan.framed.size() == 1);
+  CHECK(plan.framed[0].frame.start ==
+        sirius::op::frame_bound{sirius::op::frame_row_offset{2, true}});
 }
