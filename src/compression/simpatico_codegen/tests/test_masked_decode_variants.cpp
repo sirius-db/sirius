@@ -1508,6 +1508,78 @@ bool decimal128_range_ballot_refused()
   return true;
 }
 
+// Selected decode of str_split with OnPair chars: the survivors' byte ranges decode only the
+// OnPair batches they reach into. Covers empty strings, strings longer than a batch, masks from
+// one row to every row, and survivors at both ends of the column.
+bool run_str_split_onpair_selected()
+{
+  rmm::cuda_stream owner;
+  ::cuda::stream_ref stream{owner.value()};
+  auto mr = rmm::mr::get_current_device_resource_ref();
+
+  constexpr std::int64_t kRows = 40000;
+  static constexpr std::array<std::string_view, 8> kWords{
+    "furiously", "carefully", "regular", "deposits", "pending", "accounts", "ironic", "slyly"};
+  std::uint64_t rng = 0x9e3779b97f4a7c15ULL;
+  auto next         = [&] {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  std::vector<std::string> values(static_cast<std::size_t>(kRows));
+  for (auto& value : values) {
+    auto const words = next() % 64 == 0 ? 400u : static_cast<unsigned>(next() % 6);
+    for (unsigned w = 0; w < words; ++w) {
+      if (w) value += ' ';
+      value += kWords[next() % kWords.size()];
+    }
+  }
+  auto strings = make_strings_table(values, {}, stream);
+  auto split =
+    simpatico::compress_with_plan(strings->view(),
+                                  "input -> str_split -> offsets, chars\nstr_split.offsets -> "
+                                  "bitpack\nstr_split.chars -> onpair\n",
+                                  stream,
+                                  mr);
+  REQUIRE_MSG(simpatico::probe_column(*split.columns[0].plan_tree).compact_route ==
+                sirius::codegen::decode_route::str_split,
+              "onpair chars did not take the str_split selected route");
+
+  auto const nc = selection_mask::ChunksFor(kRows);
+  for (std::uint64_t const one_in : std::initializer_list<std::uint64_t>{kRows, 1000, 20, 3, 1}) {
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(selection_mask::WordsFor(kRows)), 0u);
+    std::vector<std::string> expected;
+    for (std::int64_t r = 0; r < kRows; ++r) {
+      bool const keep = r == 0 || r == kRows - 1 || next() % one_in == 0;
+      if (!keep) continue;
+      words[static_cast<std::size_t>(r / 32)] |= 1u << (r % 32);
+      expected.push_back(values[static_cast<std::size_t>(r)]);
+    }
+    std::vector<std::uint32_t> chunk_offsets;
+    auto const survivors = host_cnt(words, nc, chunk_offsets);
+    rmm::device_buffer device_words(words.data(), words.size() * sizeof(words[0]), stream, mr);
+    rmm::device_buffer device_offsets(
+      chunk_offsets.data(), chunk_offsets.size() * sizeof(chunk_offsets[0]), stream, mr);
+    selection_mask mask{static_cast<std::uint32_t*>(device_words.data()),
+                        kRows,
+                        survivors,
+                        static_cast<std::uint32_t*>(device_offsets.data())};
+    std::string error;
+    auto selected = simpatico::decompress_column_compacted(split, 0, mask, stream, mr, &error);
+    auto expected_column = make_strings_column(expected, {}, stream);
+    bool const equal = selected && strings_equal(selected->view(), expected_column->view(), stream);
+    stream.sync();
+    REQUIRE_MSG(equal,
+                "onpair selected decode mismatch at 1 in %llu (%lld survivors, error: %s)",
+                static_cast<unsigned long long>(one_in),
+                static_cast<long long>(survivors),
+                error.c_str());
+  }
+  std::printf("PASS: str_split onpair selected decode\n");
+  return true;
+}
+
 }  // namespace
 
 // Widened output (out_dtype): a compacted decode of a narrow column writes its survivors straight
@@ -1689,6 +1761,7 @@ int main()
     // The str_split gather (shallow and deep offsets chains).
     run_str_split_masked(/*deep=*/false, arch);
     run_str_split_masked(/*deep=*/true, arch);
+    run_str_split_onpair_selected();
     // Compacted decode straight into a wider element type (restoring a narrow carrier).
     run_widened_output(arch);
   } catch (const std::exception& e) {

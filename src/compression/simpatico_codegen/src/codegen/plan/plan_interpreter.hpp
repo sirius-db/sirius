@@ -206,8 +206,10 @@ struct column_decode_caps {
 
   /// The plan resolves a set-membership predicate WITHOUT materialising the
   /// column — its root value is produced by a `dictionary` node, so the
-  /// predicate is answered against the keys. Pushing a predicate into any other
-  /// plan is correct but pointless: it only moves the comparison.
+  /// predicate is answered against the keys, or by a `str_split` whose chars are
+  /// an `onpair_strings` leaf, so it is answered by comparing codes. Pushing a
+  /// predicate into any other plan is correct but pointless: it only moves the
+  /// comparison.
   bool can_answer_equality = false;
 
   /// The root decodes into a lane of at most 64 bits. The range ballot compares in int64, so a

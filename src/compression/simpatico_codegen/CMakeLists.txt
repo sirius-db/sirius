@@ -69,6 +69,34 @@ add_custom_command(
   COMMENT "Embedding CCCL JIT header bundle into ${EMBED_CCCL_HEADERS_OUT}"
   VERBATIM)
 
+# onpair_train: the OnPair dictionary trainer from the reference C++ codec
+# (gargiulofrancesco/onpair_cpp, MIT), the only host step of the GPU OnPair
+# encoder. Pinned to the commit Vortex's onpair-sys uses. Only the trainer and
+# its longest-prefix matcher are compiled, with Boost's flat map patched out.
+# vcpkg builds pass the same commit as FETCHCONTENT_SOURCE_DIR_ONPAIR_CPP_SRC.
+include(FetchContent)
+FetchContent_Declare(
+  onpair_cpp_src
+  URL https://github.com/gargiulofrancesco/onpair_cpp/archive/ae590713515c7bb7893e14a757b484545e5339c3.tar.gz
+  URL_HASH
+    SHA256=175ba51d5d10f77aa67aaa872a1408a7e470fa182d7c156dc5bc135d5ba947ff
+  SOURCE_SUBDIR do-not-build)
+FetchContent_MakeAvailable(onpair_cpp_src)
+set(SRC_DIR "${onpair_cpp_src_SOURCE_DIR}")
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/onpair_std_unordered.cmake)
+unset(SRC_DIR)
+add_library(
+  onpair_train STATIC
+  ${onpair_cpp_src_SOURCE_DIR}/src/onpair/encoding/training/trainer.cpp
+  ${onpair_cpp_src_SOURCE_DIR}/src/onpair/core/dictionary_view.cpp)
+set_target_properties(
+  onpair_train
+  PROPERTIES POSITION_INDEPENDENT_CODE ON
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON)
+target_include_directories(
+  onpair_train PUBLIC $<BUILD_INTERFACE:${onpair_cpp_src_SOURCE_DIR}/include>)
+
 add_library(
   simpatico STATIC
   src/decode/decode_session.cpp
@@ -80,6 +108,8 @@ add_library(
   src/selection/chunk_row_set_build.cu
   src/selection/row_id_space.cu
   src/selection/chunk_row_set_convert.cu
+  src/operators/onpair_compressor.cu
+  src/operators/onpair_encoder.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -173,8 +203,13 @@ else()
 endif()
 target_link_libraries(
   simpatico
-  PUBLIC cudf::cudf rmm::rmm nvcomp::nvcomp ${SIMPATICO_CUDART_LIB}
-         ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver
+  PUBLIC cudf::cudf
+         rmm::rmm
+         nvcomp::nvcomp
+         ${SIMPATICO_CUDART_LIB}
+         ${SIMPATICO_NVRTC_LIB}
+         CUDA::cuda_driver
+         onpair_train
   PRIVATE simpatico_cache_identity)
 
 # Sirius already provides cuCascade. Standalone Simpatico keeps its CUDA-only

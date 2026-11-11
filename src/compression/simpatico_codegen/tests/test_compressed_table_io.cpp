@@ -28,6 +28,7 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -105,7 +106,7 @@ void io_roundtrip(char const* label,
     file.seekg(4);
     char version = 0;
     file.read(&version, 1);
-    expect(version == 15, "file version is independent of codec and nvCOMP build");
+    expect(version == 16, "file version is independent of codec and nvCOMP build");
   }
 
   // Metadata survives.
@@ -727,7 +728,7 @@ void test_nvcomp_payload_compatibility()
       bool const matches     = format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5);
       bool const unavailable = cascaded && NVCOMP_VER_MAJOR >= 6;
       if (matches && !unavailable) continue;
-      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 15};
+      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 16};
       auto append = [&](std::uint64_t value, int bytes) {
         for (int i = 0; i < bytes; ++i)
           header.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
@@ -918,6 +919,184 @@ void test_str_split_plan_shapes_roundtrip()
   std::string const bare_dsl = "input -> str_split\n";
   io_roundtrip("str_split_bare_terminal", addr_tbl->view(), bare_dsl);
   memory_roundtrip("str_split_bare_terminal_mem", addr_tbl->view(), bare_dsl);
+}
+
+// OnPair as str_split's chars codec, the comment-column shape: the four OnPair channels and
+// its leaf metadata survive both serialization paths, and the strings decode exactly.
+void test_str_split_onpair_roundtrip()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  char const* words[]       = {"carefully",
+                               "final",
+                               "deposits",
+                               "sleep",
+                               "furiously",
+                               "pending",
+                               "ironic",
+                               "requests",
+                               "boost",
+                               "quickly"};
+  std::vector<std::string> comments;
+  comments.reserve(20000);
+  for (int i = 0; i < 20000; ++i) {
+    std::string s;
+    for (int w = 0; w < 3 + i % 5; ++w) {
+      s += words[(i * 7 + w * 3) % 10];
+      s += ' ';
+    }
+    comments.push_back(s + std::to_string(i % 913));
+  }
+  auto tbl = make_strings_table(comments, {}, stream);
+  std::vector<std::string> empty_rows(64, "");
+  auto empty_tbl = make_strings_table(empty_rows, {}, stream);
+  // Random bytes parse to about one code per byte, more than a segment's scratch slot
+  // holds, so every segment takes the encoder's overflow path; the long strings make
+  // string-aligned segments longer than segment_bytes.
+  std::mt19937 rng(7);
+  std::vector<std::string> noise(4000);
+  for (std::size_t i = 0; i < noise.size(); ++i) {
+    noise[i].resize(i % 997 == 0 ? 5000 : 1 + rng() % 200);
+    for (auto& c : noise[i])
+      c = static_cast<char>(rng());
+  }
+  auto noise_tbl = make_strings_table(noise, {}, stream);
+
+  // onpair_strings parses each string on its own; the leaf records it.
+  for (std::string const op : {"onpair", "onpair_strings"}) {
+    std::string const name = "str_split_" + op;
+    std::string const dsl =
+      "input -> str_split -> offsets, chars\n"
+      "str_split.offsets -> delta -> differences\n"
+      "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+      "str_split.chars -> " +
+      op + "\n";
+    io_roundtrip(name.c_str(), tbl->view(), dsl);
+    memory_roundtrip((name + "_mem").c_str(), tbl->view(), dsl);
+
+    auto ct = simpatico::compress_with_plan(
+      tbl->view(), dsl, stream, rmm::mr::get_current_device_resource_ref());
+    bool found              = false;
+    auto const descriptions = ct.describe(stream);
+    for (auto const& ld : descriptions[0]) {
+      if (ld.kind != simpatico::OpId::OnPair) continue;
+      found         = true;
+      auto const* m = std::get_if<simpatico::leaf_meta::onpair>(&ld.meta);
+      expect(m && m->n_tokens > 0 && m->code_bits > 0 && (m->w == 8 || m->w == 16),
+             "onpair leaf records its code count, width and plane layout");
+      expect(m && m->string_aligned == (op == "onpair_strings"),
+             "onpair leaf records whether it parsed strings on their own");
+      std::vector<std::string> names;
+      for (auto const& bd : ld.buffers)
+        names.push_back(bd.name);
+      expect(names == std::vector<std::string>{"codes", "sidecar", "dict", "lens"},
+             "onpair leaf stores codes, sidecar, dict and lens");
+    }
+    expect(found, "the plan has an onpair leaf");
+
+    io_roundtrip((name + "_empty_chars").c_str(), empty_tbl->view(), dsl);
+    io_roundtrip((name + "_incompressible").c_str(), noise_tbl->view(), dsl);
+  }
+}
+
+// onpair_strings answers equality / IN from its codes: compared with a host reference over
+// repeated values, empty strings, prefixes of other values, values longer than a token or a
+// segment, literals absent from the column (one needing a byte no row has) and nulls.
+void test_onpair_strings_equality()
+{
+  ::cuda::stream_ref stream            = cudf::get_default_stream();
+  auto mr                              = rmm::mr::get_current_device_resource_ref();
+  std::vector<std::string> const kinds = {"DELIVER IN PERSON",
+                                          "COLLECT COD",
+                                          "NONE",
+                                          "TAKE BACK RETURN",
+                                          "abc",
+                                          "abcd",
+                                          "ab",
+                                          "",
+                                          "furiously regular deposits sleep carefully"};
+  std::mt19937 rng(11);
+  std::vector<std::string> values(30000);
+  std::vector<bool> valid(values.size(), true);
+  std::string const long_value(5000, 'q');
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i % 4999 == 0) {
+      values[i] = long_value;
+    } else if (i % 3 == 0) {
+      values[i] = "row " + std::to_string(rng() % 2000);
+    } else {
+      values[i] = kinds[rng() % kinds.size()];
+    }
+    valid[i] = i % 37 != 0;
+  }
+  std::vector<std::vector<std::string>> const queries = {
+    {"NONE"},
+    {"abc"},
+    {"abcd", "ab"},
+    {""},
+    {"row 7", "row 1999", "row 2001"},
+    {"NONF"},
+    {"\xff\xfe"},
+    {long_value},
+    {"DELIVER IN PERSON", "TAKE BACK RETURN", "COLLECT COD", "missing value"},
+    {"furiously regular deposits sleep carefully"},
+  };
+  std::string const plan =
+    "input -> str_split -> offsets, chars\n"
+    "str_split.offsets -> delta -> differences\n"
+    "str_split.offsets.differences -> bitpack\n"
+    "str_split.chars -> onpair_strings\n";
+  for (bool const nullable : {false, true}) {
+    auto tbl         = make_strings_table(values, nullable ? valid : std::vector<bool>{}, stream);
+    auto ct          = simpatico::compress_with_plan(tbl->view(), plan, stream, mr);
+    auto const& tree = *ct.columns[0].plan_tree;
+    expect(simpatico::probe_column(tree).can_answer_equality,
+           "onpair_strings reports that it answers equality");
+    for (auto const& query : queries) {
+      simpatico::decode_predicate pred;
+      pred.equals_any = query;
+      std::string error;
+      auto hits = simpatico::decompress_column(tree, stream, mr, &error, &pred);
+      expect(hits && hits->type().id() == cudf::type_id::BOOL8 &&
+               hits->size() == static_cast<cudf::size_type>(values.size()),
+             "onpair_strings equality returns BOOL8 per row");
+      std::vector<std::uint8_t> got(values.size());
+      cuda_check(cudaMemcpyAsync(got.data(),
+                                 hits->view().data<std::uint8_t>(),
+                                 got.size(),
+                                 cudaMemcpyDeviceToHost,
+                                 stream.get()));
+      std::vector<cudf::bitmask_type> mask(hits->nullable() ? cudf::num_bitmask_words(hits->size())
+                                                            : 0);
+      if (hits->nullable()) {
+        cuda_check(cudaMemcpyAsync(mask.data(),
+                                   hits->view().null_mask(),
+                                   mask.size() * sizeof(mask[0]),
+                                   cudaMemcpyDeviceToHost,
+                                   stream.get()));
+      }
+      stream.sync();
+      expect(hits->nullable() == nullable, "onpair_strings equality propagates nulls");
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        bool const is_valid = !nullable || ((mask[i / 32] >> (i % 32)) & 1u);
+        if (nullable && is_valid != valid[i])
+          throw std::runtime_error("equality null mask differs");
+        if (!is_valid) continue;
+        bool const want = std::find(query.begin(), query.end(), values[i]) != query.end();
+        if ((got[i] != 0) != want) {
+          throw std::runtime_error("onpair_strings equality differs at row " + std::to_string(i) +
+                                   " for '" + query.front().substr(0, 40) + "'");
+        }
+      }
+    }
+  }
+  auto plain =
+    simpatico::compress_with_plan(make_strings_table(kinds, {}, stream)->view(),
+                                  "input -> str_split -> offsets, chars\nstr_split.offsets -> "
+                                  "bitpack\nstr_split.chars -> onpair\n",
+                                  stream,
+                                  mr);
+  expect(!simpatico::probe_column(*plain.columns[0].plan_tree).can_answer_equality,
+         "plain onpair, whose tokens span rows, does not answer equality");
 }
 
 // Validity survives both serialization paths. The sidecar is not a leaf, so it
@@ -1173,6 +1352,8 @@ int main()
     {"nvcomp_reconstruction_metadata", test_nvcomp_reconstruction_metadata},
     {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
+    {"str_split_onpair", test_str_split_onpair_roundtrip},
+    {"onpair_strings_equality", test_onpair_strings_equality},
     {"validity_sidecar", test_validity_sidecar_roundtrip},
     {"validity_header_integrity", test_validity_header_integrity},
     {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},

@@ -9,6 +9,7 @@
 #include "codegen/util/nvtx.hpp"
 #include "decode/decode_session.hpp"
 #include "operators/constant_width_offsets.hpp"
+#include "operators/onpair_representation.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -140,6 +141,7 @@ class DecodeWalk {
                                                 compressed_representation const& rep);
   std::unique_ptr<cudf::column> consume(ValueId value);
   std::unique_ptr<cudf::column> decode_leaf(compressed_representation const& rep, NodeId nid);
+  std::unique_ptr<cudf::column> answer_from_codes(NodeId nid);
   void decode_bitjoin(NodeId nid);
   std::unique_ptr<cudf::column> materialize_fused_node(NodeId nid,
                                                        decode_selection const* node_sel);
@@ -180,6 +182,20 @@ std::string value_label(ValueId v)
 compressed_representation const* node_rep(NodeId nid, PlanTree const& tree)
 {
   if (nid < tree.nodes.size()) return tree.nodes[nid].rep.get();
+  return nullptr;
+}
+
+// The chars of str_split node @p nid when they are a string-aligned OnPair leaf, which
+// answers equality from its codes and the offsets without decoding.
+onpair_compressed_representation const* string_aligned_chars(PlanTree const& tree, NodeId nid)
+{
+  if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") return nullptr;
+  for (auto const& edge : tree.nodes[nid].children) {
+    if (edge.channel != "chars" || edge.child >= tree.nodes.size()) continue;
+    auto const& child = tree.nodes[edge.child];
+    auto const* rep   = dynamic_cast<onpair_compressed_representation const*>(child.rep.get());
+    return child.children.empty() && rep && rep->string_aligned ? rep : nullptr;
+  }
   return nullptr;
 }
 
@@ -697,6 +713,33 @@ std::unique_ptr<cudf::column> DecodeWalk::decode_leaf(compressed_representation 
   return decode_standalone(rep, frame);
 }
 
+// A str_split with string-aligned OnPair chars answers the predicate from the codes and
+// the decoded offsets; the chars are never decoded.
+std::unique_ptr<cudf::column> DecodeWalk::answer_from_codes(NodeId nid)
+{
+  auto const* chars = string_aligned_chars(tree, nid);
+  if (!chars) return nullptr;
+  auto const& node = tree.nodes[nid];
+  auto const port  = static_cast<std::size_t>(
+    std::find(node.output_names.begin(), node.output_names.end(), "offsets") -
+    node.output_names.begin());
+  if (port >= node.output_names.size()) return nullptr;
+  ValueId const value{nid, static_cast<ChannelId>(port)};
+  std::unique_ptr<cudf::column> offsets;
+  auto const edge = std::find_if(node.children.begin(), node.children.end(), [](PlanEdge const& e) {
+    return e.channel == "offsets";
+  });
+  if (edge != node.children.end()) {
+    if (!memo.contains(value_id_key(value))) materialize(edge->child);
+    offsets = consume(value);
+  } else {
+    auto const channel = node.channels.find(node.output_paths[port]);
+    if (channel == node.channels.end() || !channel->second) return nullptr;
+    offsets = std::move(terminal_entry(value, *channel->second));
+  }
+  return chars->equal_any(offsets->view(), pred->equals_any, frame.stream(), frame.mr());
+}
+
 // Split a bitjoin node's packed leaf back into its input field values, keyed in
 // `memo` by each input's structural ValueId. Fields sharing a source value are
 // OR-ed into one column (a source may receive several bit ranges).
@@ -786,6 +829,13 @@ void DecodeWalk::materialize(NodeId nid)
   if (node.rep) {
     store(key, decode_leaf(*node.rep, nid));
     return;
+  }
+  if (sel == nullptr && predicate_applies_to(nid)) {
+    if (auto hits = answer_from_codes(nid)) {
+      predicate_resolved = true;
+      store(key, std::move(hits));
+      return;
+    }
   }
   std::vector<std::string> names;
   std::vector<std::unique_ptr<cudf::column>> channels;
@@ -1052,11 +1102,16 @@ std::unique_ptr<cudf::column> decode_str_split_selected(PlanTree const& tree,
 {
   auto const shape = locate_str_split_shape(tree);
   if (!shape) throw std::invalid_argument("decode: unsupported selected str_split shape");
-  auto const channels = shape->chars_rep->named_channels(frame.stream());
-  if (channels.empty() || channels.front().view.type().id() != cudf::type_id::UINT8) {
-    throw std::invalid_argument("decode: selected str_split requires raw UINT8 chars");
+  auto const* onpair_chars =
+    dynamic_cast<onpair_compressed_representation const*>(shape->chars_rep);
+  cudf::column_view chars;
+  if (onpair_chars == nullptr) {
+    auto const channels = shape->chars_rep->named_channels(frame.stream());
+    if (channels.empty() || channels.front().view.type().id() != cudf::type_id::UINT8) {
+      throw std::invalid_argument("decode: selected str_split requires raw UINT8 chars");
+    }
+    chars = channels.front().view;
   }
-  auto const chars  = channels.front().view;
   auto const region = bind_fused_region(tree, shape->offsets_nid, walk, frame.stream());
   if (region.num_rows != sel.mask->num_rows + 1) {
     throw std::invalid_argument("decode: selected string mask does not match the row domain");
@@ -1104,7 +1159,13 @@ std::unique_ptr<cudf::column> decode_str_split_selected(PlanTree const& tree,
     std::move(output_chars),
     0,
     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr()));
-  if (survivors > 0 && total_chars > 0) {
+  if (survivors > 0 && total_chars > 0 && onpair_chars != nullptr) {
+    onpair_chars->copy_ranges(static_cast<std::int64_t const*>(source_offsets.data()),
+                              offset_data,
+                              static_cast<std::size_t>(survivors),
+                              static_cast<std::uint8_t*>(destination),
+                              frame.stream());
+  } else if (survivors > 0 && total_chars > 0) {
     launch_masked_char_copy(chars.head<void>(),
                             static_cast<std::int64_t const*>(source_offsets.data()),
                             offset_data,
@@ -1349,16 +1410,25 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)
   for (std::size_t i = 0; i < node.output_names.size(); ++i) {
     std::string const& name = node.output_names[i];
     if (name == "chars") {
-      bool has_edge = false;
-      for (auto const& e : node.children) {
-        if (e.channel == name) {
-          has_edge = true;
-          break;
+      auto const edge = std::find_if(node.children.begin(),
+                                     node.children.end(),
+                                     [&](auto const& e) { return e.channel == name; });
+      if (edge != node.children.end()) {
+        // An OnPair leaf decodes just the batches the byte ranges reach into, its sidecar
+        // being indexed by decoded byte.
+        if (edge->child >= tree.nodes.size()) { return std::nullopt; }
+        PlanNode const& child = tree.nodes[edge->child];
+        auto const* rep       = child.rep.get();
+        if (!child.children.empty() || rep == nullptr || rep->kind() != OpId::OnPair) {
+          return std::nullopt;
         }
+        chars_ok        = true;
+        shape.chars_rep = rep;
+        continue;
       }
-      if (has_edge) { return std::nullopt; }
       auto it = node.channels.find(node.output_paths[i]);
-      if (it != node.channels.end() && it->second && it->second->kind() == OpId::Identity &&
+      if (it != node.channels.end() && it->second &&
+          (it->second->kind() == OpId::Identity || it->second->kind() == OpId::OnPair) &&
           it->second->decoded_type().id() == cudf::type_id::UINT8) {
         chars_ok        = true;
         shape.chars_rep = it->second.get();
@@ -1431,7 +1501,8 @@ column_decode_caps probe_column(PlanTree const& tree)
   } else if (str_split_selection_root(tree)) {
     caps.compact_route = sc::decode_route::str_split;
   }
-  caps.can_answer_equality = dictionary_value_root(tree);
+  caps.can_answer_equality =
+    dictionary_value_root(tree) || string_aligned_chars(tree, root_value_producer(tree)) != nullptr;
   return caps;
 }
 
