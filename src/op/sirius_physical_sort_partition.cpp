@@ -27,6 +27,8 @@
 
 #include <cudf/search.hpp>
 
+#include <string>
+
 namespace sirius {
 namespace op {
 
@@ -71,15 +73,23 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   auto& boundaries     = _sample_op->get_partition_boundaries();
   auto boundaries_view = boundaries.view();
 
-  // Build cudf order vectors from BoundOrderByNode
+  // Compare on the leading sort keys the boundaries hold, which a batch sorted on the full key is
+  // also sorted on. lower_bound cuts before the first row not less than each boundary, so rows
+  // equal on these keys all fall on the same side of every boundary.
+  auto const key_count = static_cast<std::size_t>(boundaries_view.num_columns());
+  if (key_count == 0 || key_count > orders.size()) {
+    throw internal_exception("Sort partition boundaries have " + std::to_string(key_count) +
+                             " key columns for " + std::to_string(orders.size()) + " sort keys");
+  }
   std::vector<int> order_key_idx;
   std::vector<cudf::order> column_order;
   std::vector<cudf::null_order> null_precedence;
-  order_key_idx.reserve(orders.size());
-  column_order.reserve(orders.size());
-  null_precedence.reserve(orders.size());
+  order_key_idx.reserve(key_count);
+  column_order.reserve(key_count);
+  null_precedence.reserve(key_count);
 
-  for (auto const& ord : orders) {
+  for (std::size_t k = 0; k < key_count; ++k) {
+    auto const& ord = orders[k];
     if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("Sort partition only supports bound reference expressions");
     }
@@ -106,6 +116,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       sort_key_cols.push_back(input_table.column(idx));
     }
     cudf::table_view batch_sort_keys(sort_key_cols);
+
+    // Boundary rows were gathered from the sample batches. They can only be compared with this
+    // batch if each key column is held in the same physical type in both.
+    for (std::size_t k = 0; k < key_count; ++k) {
+      if (batch_sort_keys.column(k).type() != boundaries_view.column(k).type()) {
+        throw internal_exception("Sort partition key " + std::to_string(k) +
+                                 " has a different physical type from the sampled boundaries");
+      }
+    }
 
     // Use lower_bound: haystack=batch (sorted), needles=boundaries
     // Returns P-1 split positions in the batch
