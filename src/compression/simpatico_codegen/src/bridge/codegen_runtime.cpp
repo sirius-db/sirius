@@ -62,6 +62,7 @@
 // construction, plan-DSL walk, rmm device buffers).  Keeping these
 // includes here avoids re-parsing them for the decode-only TUs that
 // already compile fine without them.
+#include "api/compressed_table_io.hpp"
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
@@ -333,6 +334,50 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 }
 
 }  // namespace
+
+void keep_bitpack_word_offsets(compressed_table& table,
+                               ::cuda::stream_ref stream,
+                               rmm::device_async_resource_ref mr)
+{
+  for (auto& column : table.columns) {
+    if (!column.plan_tree) continue;
+    for (auto& node : column.plan_tree->nodes) {
+      auto* rep = dynamic_cast<codegen_fused_representation*>(node.rep.get());
+      if (rep == nullptr || node.op != "bitpack" || rep->word_offsets.size() != 0) continue;
+      // A tail-routed chunk_count or chunk_bits is decoded per call, so its offsets are too.
+      bool const routed =
+        std::any_of(node.children.begin(), node.children.end(), [](auto const& e) {
+          return e.channel == "chunk_count" || e.channel == "chunk_bits";
+        });
+      if (routed) continue;
+      cudf::column_view count, bits;
+      for (auto const& channel : rep->named_channels(stream)) {
+        if (channel.name == "chunk_count") count = channel.view;
+        if (channel.name == "chunk_bits") bits = channel.view;
+      }
+      if (count.size() == 0 || bits.size() < count.size()) continue;
+      rmm::device_buffer offsets(
+        (static_cast<std::size_t>(count.size()) + 1) * sizeof(std::int32_t), stream, mr);
+      rmm::device_buffer scratch;
+      auto const rc = compute_bp_offsets(
+        count.head<void>(),
+        bits.head<void>(),
+        count.size(),
+        offsets.data(),
+        [&](std::size_t bytes) {
+          scratch = rmm::device_buffer(bytes, stream, mr);
+          return scratch.data();
+        },
+        stream.get());
+      if (rc != 0) {
+        throw std::runtime_error(
+          "keep_bitpack_word_offsets: offsets scan failed (rc=" + std::to_string(rc) + ")");
+      }
+      rep->word_offsets = std::move(offsets);
+    }
+  }
+}
+
 }  // namespace simpatico
 
 namespace {

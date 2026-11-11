@@ -132,6 +132,15 @@ compressed_table read_compressed_table_from_memory(
   std::string* error_out            = nullptr,
   std::optional<rmm::device_async_resource_ref> leaf_mr = std::nullopt);
 
+/// Give every Bitpack rep of @p table that owns its chunk_count and chunk_bits the per-chunk word
+/// offsets the encoder computed but the header does not store, so each later decode skips its
+/// offsets scan. For a reconstructed table that is decoded many times, such as a pinned chunk;
+/// allocates from @p mr.
+void keep_bitpack_word_offsets(
+  compressed_table& table,
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
 /// Like @ref read_compressed_table_from_memory but reconstructs only the columns
 /// in @p selected_columns (indices into the full table's column order, in the
 /// order the caller wants them). Only those columns' payload buffers are fetched,

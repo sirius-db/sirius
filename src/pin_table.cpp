@@ -951,6 +951,8 @@ device_pin_result materialize_all_batches_compressed(
               if (!read_err.empty()) {
                 throw std::runtime_error("[materialize_all_batches_compressed] " + read_err);
               }
+              simpatico::keep_bitpack_word_offsets(
+                blob->table, stream, src_space->get_default_allocator());
               stream.sync();
 
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
