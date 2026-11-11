@@ -120,6 +120,7 @@ inline constexpr DecodeShape kShapeMaskOut{Enumerator::all_rows, Consumer::ballo
 inline constexpr DecodeShape kShapeMaskConsume{Enumerator::mask_bits, Consumer::write_column};
 inline constexpr DecodeShape kShapeIndexConsume{Enumerator::index_list, Consumer::write_column};
 inline constexpr DecodeShape kShapeDictGather{Enumerator::mask_bits, Consumer::dict_gather};
+inline constexpr DecodeShape kShapePlainDictGather{Enumerator::all_rows, Consumer::dict_gather};
 inline constexpr DecodeShape kShapeStrSplitMeta{Enumerator::mask_bits, Consumer::offsets_meta};
 inline constexpr DecodeShape kShapeSparseConsume{Enumerator::chunk_csr, Consumer::write_column};
 inline constexpr DecodeShape kShapeSparseDictGather{Enumerator::chunk_csr, Consumer::dict_gather};

@@ -1004,6 +1004,23 @@ void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
     tree, labeled, dtype, num_rows, out_chars, va, rows.by_row_set() ? nullptr : &mask, frame);
 }
 
+// Dictionary gather over every row: constant-width keys of the decoded codes (masked_launch.hpp).
+void launch_decode_fused_tree_dict_gather_all(codegen::jit::FusedTree const& tree,
+                                              codegen::jit::LabeledBuffers const& labeled,
+                                              char const* dtype,
+                                              std::int64_t num_rows,
+                                              void const* keys_chars,
+                                              std::int32_t key_width,
+                                              void* out_chars,
+                                              decode_frame& frame)
+{
+  VariantLaunchArgs va;
+  va.shape      = cdj::kShapePlainDictGather;
+  va.keys_chars = dev(keys_chars);
+  va.key_width  = key_width;
+  launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out_chars, va, nullptr, frame);
+}
+
 // str_split phase 2: fixed masked char-range copy (masked_launch.hpp).  The
 // source comes from the renderer like every other kernel's — no tree behind it,
 // so it takes no arguments — and compiles through the same JIT cache.

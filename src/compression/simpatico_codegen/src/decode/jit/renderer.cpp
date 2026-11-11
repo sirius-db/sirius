@@ -206,6 +206,7 @@ std::string shape_symbol_suffix(DecodeShape shape)
   if (shape == kShapeMaskOut) return "_mask_out";
   if (shape == kShapeMaskConsume) return "_mask_consume";
   if (shape == kShapeDictGather) return "_mask_dict";
+  if (shape == kShapePlainDictGather) return "_dict";
   if (shape == kShapeIndexConsume) return "_index_consume";
   if (shape == kShapeStrSplitMeta) return "_str_meta";
   if (shape == kShapeSparseConsume) return "_sparse_consume";
@@ -285,7 +286,18 @@ class Walker {
           emit_generic_mask_out(tree);
         }
         break;
-      case Consumer::dict_gather: emit_bitpack_mask_dict_gather(tree); break;
+      case Consumer::dict_gather:
+        if (shape_.enumerator == Enumerator::all_rows) {
+          if (dtype_elem_size(dtype_) > 8 || !warp_supported(tree)) {
+            throw RenderError(
+              "decode render: a full dictionary gather needs a bitpack, FOR, zigzag or delta code "
+              "chain");
+          }
+          emit_warp_plain(tree);
+        } else {
+          emit_bitpack_mask_dict_gather(tree);
+        }
+        break;
       case Consumer::offsets_meta: emit_str_split_meta(tree); break;
     }
     return finalize(tree);
@@ -783,7 +795,16 @@ void Walker::emit_warp_plain(const ::codegen::jit::FusedTree& tree)
 
   warp_loop_.str({});
   const WarpValue v = warp_value(tree, "len");
-  body_ << "    auto* const dst = out + chunk_start;\n";
+  // A dictionary gather stores each row's key bytes rather than its code.
+  const bool dict = shape_.consumer == Consumer::dict_gather;
+  auto store      = [&](const std::string& i, const std::string& value) -> std::string {
+    if (!dict) return "dst[" + i + "] = " + value + ";";
+    return "{ const char* _k = keys_chars + static_cast<int64_t>(" + value +
+           ") * key_width; char* _o = dst + static_cast<int64_t>(" + i +
+           ") * key_width; for (int32_t _b = 0; _b < key_width; ++_b) _o[_b] = _k[_b]; }";
+  };
+  body_ << (dict ? "    char* const dst = out + chunk_start * key_width;\n"
+                 : "    auto* const dst = out + chunk_start;\n");
   if (!v.regs.empty()) {
     // Below a Delta the chain runs once per part; in part h, lane l's registers hold rows
     // h * PART + l * PER_PART + [0, PER_PART). The part's rows are transposed through the slice
@@ -804,7 +825,7 @@ void Walker::emit_warp_plain(const ::codegen::jit::FusedTree& tree)
           << "        for (int32_t k = 0; k < PER_PART; ++k) {\n"
           << "            const int32_t r = lane + 32 * k;\n"
           << "            const int32_t i = h * PART + r;\n"
-          << "            if (i < len) dst[i] = tr[r + (r >> 5)];\n"
+          << "            if (i < len) " << store("i", "tr[r + (r >> 5)]") << "\n"
           << "        }\n"
           << "    }\n";
     return;
@@ -814,10 +835,10 @@ void Walker::emit_warp_plain(const ::codegen::jit::FusedTree& tree)
         << "#pragma unroll\n"
         << "        for (int32_t k = 0; k < PER_LANE; ++k) {\n"
         << "            const int32_t i = lane + 32 * k;\n"
-        << "            dst[i] = " << value << ";\n"
+        << "            " << store("i", value) << "\n"
         << "        }\n"
         << "    } else {\n"
-        << "        for (int32_t i = lane; i < len; i += 32) dst[i] = " << value << ";\n"
+        << "        for (int32_t i = lane; i < len; i += 32) " << store("i", value) << "\n"
         << "    }\n";
 }
 
@@ -2082,7 +2103,8 @@ bool shape_is_supported(DecodeShape shape)
   // remain unbuilt: chunk_csr covers the same two consumers for the selection
   // shape that needed them, so building them would add a second way to say it.
   return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapeMaskConsume ||
-         shape == kShapeIndexConsume || shape == kShapeDictGather || shape == kShapeStrSplitMeta ||
+         shape == kShapeIndexConsume || shape == kShapeDictGather ||
+         shape == kShapePlainDictGather || shape == kShapeStrSplitMeta ||
          shape == kShapeSparseConsume || shape == kShapeSparseDictGather ||
          shape == kShapeSparseStrSplitMeta;
 }

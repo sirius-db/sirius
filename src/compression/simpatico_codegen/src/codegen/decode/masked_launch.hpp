@@ -103,6 +103,17 @@ void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
                                           void* out_chars,
                                           decode_frame& frame);
 
+/// The unselected dictionary gather: every row's key bytes, decoded straight from ``tree``'s codes
+/// (a bitpack, FOR, zigzag or delta chain), so the code column is never materialized.
+void launch_decode_fused_tree_dict_gather_all(codegen::jit::FusedTree const& tree,
+                                              codegen::jit::LabeledBuffers const& labeled,
+                                              char const* dtype,
+                                              std::int64_t num_rows,
+                                              void const* keys_chars,
+                                              std::int32_t key_width,
+                                              void* out_chars,
+                                              decode_frame& frame);
+
 /// str_split gather, phase 1: survivor metadata.  ``tree`` is the string
 /// column's OFFSETS subtree (Bitpack- or Delta-rooted, any depth below);
 /// ``num_string_rows`` is the STRING count n, and the kernel runs over the
