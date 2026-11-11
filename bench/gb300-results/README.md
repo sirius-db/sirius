@@ -1,8 +1,10 @@
 # GB300 TPC-H benchmark snapshots
 
 These are the selected GB300 measurements at Sirius commit
-`1dbb366baaf7bd26325ede685346ecb6d5fe7692`. They use one GPU and TPC-H Parquet
-at SF1000, SF3000, and SF10000. The configs are in `bench/gb300-cold/`,
+`1dbb366baaf7bd26325ede685346ecb6d5fe7692`. The cold/hot/per-query-pin
+snapshot uses one GPU and TPC-H Parquet at SF1000, SF3000, and SF10000; the
+concurrency snapshot below covers SF100, SF300, and SF1000. The configs are in
+`bench/gb300-cold/`,
 `bench/gb300-hot/`, `bench/gb300-pin/`, and the two SF10k Q10 directories. The
 `--profile` option now preserves those YAML cache settings.
 
@@ -36,5 +38,34 @@ Each `sf*/` directory contains the selected per-query CSVs. `manifest.json`
 records the exact totals, config paths, checksums, and the SF10000 pin failure.
 CSV line endings were normalized from CRLF to LF without changing the values;
 the manifest retains both the original and repository checksums.
-Concurrency runs and the later SF10000 fresh-instance cold rerun are separate
-experiments and are not included in this snapshot.
+The later SF10000 fresh-instance cold rerun remains outside this snapshot.
+
+## Host-pinned Parquet concurrency
+
+The [concurrency results](concurrency/summary.csv) add SF100, SF300, and SF1000
+with 1, 2, 4, 8, and 10 simultaneous query streams. Each stream executes all 22
+queries in its TPC-H throughput permutation with qgen-generated, stream-specific
+predicate values. This read-only test has no refresh stream and is not an
+official TPC-H throughput score. One run was measured per case.
+
+| Scale | 1 stream | 2 streams | 4 streams | 8 streams | 10 streams |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| SF100 | 12.416 | 18.096 | 22.509 | 25.371 | 25.473 |
+| SF300 | 5.725 | 7.415 | 8.508 | 8.807 | 8.619 |
+| SF1000 | 1.955 | 2.421 | 2.465 | 2.459 | 2.451 |
+
+Values are completed queries per second (`22 × streams / wall_seconds`), with
+upfront host pinning excluded. Before each case, a fresh Sirius process pins the
+union of all query columns in host memory using the Simpatico plans in
+`bench/sf1000-repro/plans/`, then runs its streams concurrently. Approximate pin
+times were 3.4 s at SF100, 10.0 s at SF300, and 39–40 s at SF1000. Throughput
+flattens by 8 streams in this single-pass sample.
+
+The [concurrency manifest](concurrency/manifest.json) records seed `1111221257`,
+the Sirius source commit and binary checksum, config and plan checksums, and the
+generated stream SQL checksums. Streams 1–8 in the 10-stream case were
+byte-identical to those in the earlier 1/2/4/8 cases. Each scale directory
+contains five per-query timing CSVs, one for each stream-count case.
+The initial run used a runner limited to 1/2/4/8 choices; the later 10-stream
+run used the same workload logic with 10 added as an option. Both runner hashes
+are recorded in the manifest.

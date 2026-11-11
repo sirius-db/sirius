@@ -241,6 +241,29 @@ Open `http://localhost:8080` and select the captured Sirius engine/query.
 
 - `tpch_queries/orig/q*.sql` — Plain SQL queries used by both Sirius and DuckDB runners
 
+## Concurrent Parquet query streams
+
+`parquet_concurrency.py` runs 1, 2, 4, and 8 streams by default. Pass
+`--concurrencies 1 2 4 8 10` to include the 10-stream case. Each stream uses
+the TPC-H throughput permutation and its own qgen seed for substitution
+parameters; it executes Q1–Q22 once while other streams run concurrently.
+This read-only experiment has no refresh stream, so its queries-per-second
+result is not an official TPC-H throughput score.
+
+```bash
+pixi run python test/tpch_performance/parquet_concurrency.py \
+  --sf 100 --input test_datasets/tpch_parquet_sf100 \
+  --config bench/gb300-pin/config.yaml --output test_datasets/concurrency_sf100 \
+  --concurrencies 1 2 4 8 10 --seed 1111221257
+```
+
+Before timing each case, the runner pins the union of columns used by all 22
+queries in host memory with the Simpatico plans in `bench/sf1000-repro/plans`.
+It copies the base YAML and sets `max_concurrent_queries` for that case without
+editing the base. Each case uses a fresh Sirius process. The output includes
+generated SQL, per-query timings, per-case summaries, plan hashes, and a
+comparison CSV. `--prepare-only` validates the workload without loading Sirius.
+
 ## Sirius Configuration
 
 The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:

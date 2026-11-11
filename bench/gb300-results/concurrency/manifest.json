@@ -1,0 +1,230 @@
+{
+  "benchmark": "TPC-H Parquet read-only concurrency on GB300",
+  "sirius_source_commit": "1dbb366baaf7bd26325ede685346ecb6d5fe7692",
+  "extension_sha256": "b1eb334ad5ee4b581415cd0853c3205d213ff0bc2ccfb88ff51cfb782f028648",
+  "runner": "test/tpch_performance/parquet_concurrency.py",
+  "runner_sha256": {
+    "streams_1_2_4_8": "c2cc47a6600a7a0d174f418e50e0cf8aa7046c2cd069b07e188938946b230d8b",
+    "stream_10": "243da259b05f0170767e7d06648b61553d3306dec9412f48aadeebd70cb27248"
+  },
+  "base_config": "bench/gb300-pin/config.yaml",
+  "base_config_sha256": "05ee1859be0123cf8f2bf4a851953169375ce40f028a2aedcec455f565ee977c",
+  "simpatico_plans": {
+    "bench/sf1000-repro/plans/lineitem.txt": "7523e0156194273025386cd25d92e8dbbbda9daeb7db94e5d21b9f234a3114ba",
+    "bench/sf1000-repro/plans/orders.txt": "6880dd98ec1e2dac0056cd2620b233d2923e2065ebc00659385776fef468fcc5"
+  },
+  "query_seed": 1111221257,
+  "query_generator": "test/tpch_performance/generate_tpch_queries.sh",
+  "stream_queries": {
+    "100": {
+      "1": {
+        "seed": 1111221258,
+        "sql_sha256": "19a64f5a883d6bff8259a3fe1402a34ee456ac622ee5dd6c43b0321e9f364817"
+      },
+      "2": {
+        "seed": 1111221259,
+        "sql_sha256": "9ed0b7249d3ab8d9f249cc4a3cc10275d46a6dc629c969add8edbfe445f2558b"
+      },
+      "3": {
+        "seed": 1111221260,
+        "sql_sha256": "fff3a5a23e84c85b5b94a9753001c4ba26ef10b662be169279057a945f493ba5"
+      },
+      "4": {
+        "seed": 1111221261,
+        "sql_sha256": "75191fe4e256c729e08eac43fd78da9fb90d1300125f2e1d5a6fe61d970db268"
+      },
+      "5": {
+        "seed": 1111221262,
+        "sql_sha256": "d5d84916e11b8267044309fbb4136a05daa8504f351bedd500d0d4d4af33bc59"
+      },
+      "6": {
+        "seed": 1111221263,
+        "sql_sha256": "74cf0b4783a9a4246cc9edf1862749de74101bcade8089a944f96540d94dfefb"
+      },
+      "7": {
+        "seed": 1111221264,
+        "sql_sha256": "89a64e67e4e7dec88362ad1ca25b773f95a1a58f337c073002e22027bf3beb1f"
+      },
+      "8": {
+        "seed": 1111221265,
+        "sql_sha256": "871a7482166aeb3c093dd44ab468526d844d0a88e7aa25977c62b86e76767fd6"
+      },
+      "9": {
+        "seed": 1111221266,
+        "sql_sha256": "440a42181b9f5d46f0449c79c9327b27cbfba5d0b434033f4c9ac5923e210e00"
+      },
+      "10": {
+        "seed": 1111221267,
+        "sql_sha256": "ba9e4e0d7894274c79ae14fff502fd28545eb62acb56644aca0c68080eda6ef7"
+      }
+    },
+    "300": {
+      "1": {
+        "seed": 1111221258,
+        "sql_sha256": "fe287898c92a30470086d3a9ccda58765e271f5ffea370e6428b792b681ff77d"
+      },
+      "2": {
+        "seed": 1111221259,
+        "sql_sha256": "7a004e86620d1e984556552a945b81a053cfc2fe53d6bb76df0ed0fe3a071dba"
+      },
+      "3": {
+        "seed": 1111221260,
+        "sql_sha256": "c281b76ca7aa31e8277ac6c8de8a672dfa24afaae163cb1a81a9f4e2a9c7cbb6"
+      },
+      "4": {
+        "seed": 1111221261,
+        "sql_sha256": "fd9681518fbd9a906bb3a3d3e8bd2a12aca6188ca457c6327568b62e0ff27045"
+      },
+      "5": {
+        "seed": 1111221262,
+        "sql_sha256": "9f2eeb784b14274c0742304a917845daab5a935f38319a271b4771f28d096a3c"
+      },
+      "6": {
+        "seed": 1111221263,
+        "sql_sha256": "ecbec0a7d702b0ebd0584cc5fe3170588485fee2580c0d31f3112f07e33fc4f7"
+      },
+      "7": {
+        "seed": 1111221264,
+        "sql_sha256": "efadc3d9f64e910fe5032c8a41d55aa704d93df221b8c7baa7ec7fa03ee1c7e2"
+      },
+      "8": {
+        "seed": 1111221265,
+        "sql_sha256": "4008e75aa2f513c8705bee0a103a4cca962658d0aacdb49d6d3bb2b588f36b00"
+      },
+      "9": {
+        "seed": 1111221266,
+        "sql_sha256": "1e12edb4187aa43418e2abc9165beb31abb834de72e7b10872ef02fc5b8e161f"
+      },
+      "10": {
+        "seed": 1111221267,
+        "sql_sha256": "3e39da0b9e9c9a1b6f70323a5c7d3991d27836772cd7b73e6e155422c399add0"
+      }
+    },
+    "1000": {
+      "1": {
+        "seed": 1111221258,
+        "sql_sha256": "b158cc4279a778ad749d56ed021eceb91260a3897037ee944b4ad56c03abc4a6"
+      },
+      "2": {
+        "seed": 1111221259,
+        "sql_sha256": "04f78390650cd029f94d9c0ccf8ff9aa64c8b36ebdd2c28473f3f5fb44e76091"
+      },
+      "3": {
+        "seed": 1111221260,
+        "sql_sha256": "2b0c366bce3176fb108a8234d23ec139e3255d932179f664070092744a8286a3"
+      },
+      "4": {
+        "seed": 1111221261,
+        "sql_sha256": "ec55a3bd369bee46786ae3fbdf2029aca6afff06ada1c9899befb58582c5e683"
+      },
+      "5": {
+        "seed": 1111221262,
+        "sql_sha256": "65d51e802b83f3a89fa5c0e3db21a5986e91bf2301f7dd1aa4da98ef06a18cc9"
+      },
+      "6": {
+        "seed": 1111221263,
+        "sql_sha256": "9bbc662ac889268716e404479cd9059f3506b727a2b82fd3717663752b028059"
+      },
+      "7": {
+        "seed": 1111221264,
+        "sql_sha256": "e4e44fd334e7c455d8baa968e0430ae216744a5609a4156e540bed1207f32d3d"
+      },
+      "8": {
+        "seed": 1111221265,
+        "sql_sha256": "920ed9418eb202454ab59bf988bad5ab7238c7bf0c2958d8a52d6cfb5d547c13"
+      },
+      "9": {
+        "seed": 1111221266,
+        "sql_sha256": "be1938b6497683877a90d9fc15d8460572d2fe462d4a33f1f1dca8e7e63992e1"
+      },
+      "10": {
+        "seed": 1111221267,
+        "sql_sha256": "aed418f2f957d46053e8226e77f13cc4b423e4dfb1aa2c8e49b138a4973ead84"
+      }
+    }
+  },
+  "parquet_inputs": {
+    "100": "test_datasets/tpch_parquet_sf100",
+    "300": "test_datasets/tpch_parquet_sf300",
+    "1000": "test_datasets/tpch_parquet_sf1000"
+  },
+  "method": "Fresh Sirius process per case; union of Q1-Q22 columns pinned on host with Simpatico before timing; each stream runs 22 qgen-substituted queries in TPC-H throughput order; no refresh stream; pin_seconds excluded from wall_seconds and queries_per_second.",
+  "per_query_files": {
+    "sf100/c1-per-query.csv": {
+      "source_sha256": "4bf5b107dc189dcc3f133851e1653bf13cd479f353610ebbecf3defb8570f4b9",
+      "repository_sha256": "070597658cfb02de116f19321447cf417ffebb0e25f72e7cb2db0578a1b994ff",
+      "rows": 22
+    },
+    "sf100/c2-per-query.csv": {
+      "source_sha256": "df02d02ff39c4136f76e98c6367dd0402c67ed77393719ed88621ef25cf1f9ac",
+      "repository_sha256": "ca609f3514df316b191f89a11c049b675f8021331023f9e01f18b4a4b4e389b7",
+      "rows": 44
+    },
+    "sf100/c4-per-query.csv": {
+      "source_sha256": "13bc688a13e4404072f0054af9eb110af72393a1d98f5dec4bde5943d5936321",
+      "repository_sha256": "f2b63249c73d2ba01891ec8eaabbe8f49a8de216e60e5e1aacff6bb07cdec62a",
+      "rows": 88
+    },
+    "sf100/c8-per-query.csv": {
+      "source_sha256": "1017fbb0d940640e122f8b80b3da8f1d0c91936a3c40d098ec04ae5cf6820a99",
+      "repository_sha256": "18eeb43a3351e38252c2576ad1fc34d9ca2c7b18e41ab26f9cdf8d0ccd70fd45",
+      "rows": 176
+    },
+    "sf100/c10-per-query.csv": {
+      "source_sha256": "f24aef0bbd2539f91af494b010d71f297c4ed9dfeb915b54fdd0e989d782590c",
+      "repository_sha256": "1a0723137e11f4bdd5231eda7d85afb499a64004765a60d4a9b6ee928fc495c2",
+      "rows": 220
+    },
+    "sf300/c1-per-query.csv": {
+      "source_sha256": "0f86ffb5a94a1669ff2d0af3200358ecdec87042fc252f639ef8ac2165286235",
+      "repository_sha256": "0213273f8e98dc22a370151f2f32a430c15787b2231da3c9f2927039caee7e1f",
+      "rows": 22
+    },
+    "sf300/c2-per-query.csv": {
+      "source_sha256": "fd3c8ca53d495c1b27aa7159eb625a57f8a3d64afb4d03a9e423d931a169a5ce",
+      "repository_sha256": "151cb926131ad85eafc8fb51d37f67193045cf1f5726d7651e20104e5f278fcd",
+      "rows": 44
+    },
+    "sf300/c4-per-query.csv": {
+      "source_sha256": "e96aaf54b52f65dfb0ff748b89114465348bcf0747fd26354be95189f75bf344",
+      "repository_sha256": "0eb55d11cf47c8f40801b02108b7819af7b76d7b42380d5463baf1717520502c",
+      "rows": 88
+    },
+    "sf300/c8-per-query.csv": {
+      "source_sha256": "b36e17af5caf4d5ee5ae39b8c0495bee240a51688936f17d3d6a10bfc76c5d4e",
+      "repository_sha256": "edfc5c2772695c78054b4c6b8241176e3831f36f4f03ee559f872d4859b7edc1",
+      "rows": 176
+    },
+    "sf300/c10-per-query.csv": {
+      "source_sha256": "24ccbaa1e32ed2a4ade3b744aae4916204aa6a8653782fdf2b1fbf983f3af934",
+      "repository_sha256": "aa3d53836659d5e690d4cda188186a257def8b5152a4417c5918efdb9ecfec28",
+      "rows": 220
+    },
+    "sf1000/c1-per-query.csv": {
+      "source_sha256": "83235d467bcbec7d340f5dbafbe7e20b4b7c63c180404ac776892b90d892e12e",
+      "repository_sha256": "1278865b5feddb31456f6ec4da371b4f58c5a5a035ce0bbad5debbf0d475d22f",
+      "rows": 22
+    },
+    "sf1000/c2-per-query.csv": {
+      "source_sha256": "772766be5e09a15e0299c23dcbcc58c61b7c54b5931e4ee66a924eedacaf202f",
+      "repository_sha256": "7e2313021f38c53a73f875e2c1cf921913e1de8b7159e621d0be11975532dfec",
+      "rows": 44
+    },
+    "sf1000/c4-per-query.csv": {
+      "source_sha256": "0ecb28e779cc8ce1394ba0cc5e70c7bf1c1bdbf2b826b4311a414cb8103950fb",
+      "repository_sha256": "ddca3c56b917a7633b93976f7c51ea266f96baa336c0463ae2059c2074106894",
+      "rows": 88
+    },
+    "sf1000/c8-per-query.csv": {
+      "source_sha256": "2046bcb864cbd7d5b3460adcdf9b61f19a606ae4227d096c633832024837558f",
+      "repository_sha256": "47a8e4633c170f51095a5c307474c438bef096c4cc47426dac02b98a0ae52d46",
+      "rows": 176
+    },
+    "sf1000/c10-per-query.csv": {
+      "source_sha256": "785368672a814befb68d84e9431a3969ad30c30c08fcbf1db435dd58e0c1e818",
+      "repository_sha256": "bcd72d3e12260bc3be07f1558b76a3f5c0ca290441da393a4c7e421524a084a4",
+      "rows": 220
+    }
+  },
+  "summary_sha256": "2f9a941b12be30e6a1a61bda0c414da37492bb4f0cc4477a941ea8729d32d245"
+}
