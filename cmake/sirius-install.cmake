@@ -46,6 +46,7 @@ if(SIRIUS_BUILD_STATIC)
     TARGETS sirius_core
             simpatico
             simpatico_cache_identity
+            onpair_train
             duckdb_static
             core_functions_extension
             parquet_extension

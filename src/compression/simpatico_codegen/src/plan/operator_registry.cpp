@@ -10,6 +10,7 @@
 
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
+#include "operators/onpair_representation.hpp"
 
 #include <nvcomp/version.h>
 
@@ -56,6 +57,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Snappy,         "snappy",          {"output"},                                                             true,  true,  false, false},
     {OpId::Deflate,        "deflate",         {"output"},                                                             true,  true,  false, false},
     {OpId::Lz4,            "lz4",             {"output"},                                                             true,  true,  false, false},
+    {OpId::OnPair,         "onpair",          {"codes", "sidecar", "dict", "lens"},                                   true,  true,  false, false},
     {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false},
     {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false},
@@ -87,6 +89,7 @@ std::optional<OpId> op_id_from_name(std::string const& name)
   // Parameterised suffix families sharing a bare-name entry above.
   if (after_prefix(name, "bitcomp")) return OpId::Bitcomp;
   if (after_prefix(name, "nvcomp_cascaded")) return OpId::NvcompCascaded;
+  if (name == "onpair_strings") return OpId::OnPair;
   return std::nullopt;
 }
 
@@ -161,6 +164,11 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
     case OpId::AlpRd: return std::make_unique<alp_rd_compressor>();
     case OpId::Ans: return std::make_unique<ans_compressor>();
     case OpId::Snappy: return std::make_unique<snappy_compressor>();
+    case OpId::OnPair: {
+      auto onpair                   = std::make_unique<onpair_compressor>();
+      onpair->config.string_aligned = name == "onpair_strings";
+      return onpair;
+    }
     case OpId::Lz4: return std::make_unique<lz4_compressor>();
     case OpId::Deflate: return std::make_unique<deflate_compressor>();
     case OpId::Bitextract: {
