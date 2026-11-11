@@ -760,6 +760,12 @@ TEST_CASE_METHOD(DistinctFixture,
     "SELECT DISTINCT a FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
     "FROM avg_keys GROUP BY k)");
   expect_plan_fallback_matches_cpu(
+    "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
+    "FROM avg_keys GROUP BY k)");
+  expect_plan_fallback_matches_cpu(
+    "SELECT k % 2 p, COUNT(DISTINCT a) FROM (SELECT k, AVG(CAST(-12.802 AS DOUBLE)) a "
+    "FROM avg_keys GROUP BY k) GROUP BY p");
+  expect_plan_fallback_matches_cpu(
     "WITH averages AS MATERIALIZED (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
     "FROM avg_keys GROUP BY k) SELECT a FROM averages GROUP BY a");
   expect_plan_fallback_matches_cpu(

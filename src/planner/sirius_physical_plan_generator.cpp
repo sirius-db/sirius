@@ -188,6 +188,12 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
         // DuckDB may rewrite AVG into SUM/COUNT before this planner sees the logical tree.
         shape.has_floating_aggregate = true;
       }
+      if (call.IsDistinct()) {
+        // COUNT(DISTINCT x) deduplicates x by exact equality, like a grouping key.
+        for (auto const& argument : call.GetChildren()) {
+          if (is_floating_type(argument->GetReturnType())) exact_key_here = true;
+        }
+      }
     }
     for (auto const& group : aggregate.groups) {
       if (is_floating_type(group->GetReturnType())) exact_key_here = true;
