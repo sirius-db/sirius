@@ -6,14 +6,12 @@
 # One host only. Across hosts, start each rank on its own host with the same
 # sirius_exchange_peers list and its own sirius_exchange_rank.
 #   pixi run scripts/distributed_run_sql.sh <ranks> <file.sql> [base port=27000] [log dir=/tmp]
-# Needs a build configured with -DSIRIUS_WITH_NIXL=ON.
 set -euo pipefail
 ranks=$1
 sql=$2
 port=${3:-27000}
 logs=${4:-/tmp}
 here=$(cd "$(dirname "$0")" && pwd)
-source "$here/nixl_env.sh"
 # Every rank is on this host. Left to itself, UCX also picks the host's InfiniBand ports, and on
 # multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout").
 export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
@@ -50,6 +48,8 @@ status=0
 for ((i = 0; i < ranks; i++)); do
   if ! wait "${pids[$i]}"; then status=1; echo "rank $i failed: $logs/distributed_rank_$i.log"; fi
 done
-# Drop the loader's "no version information" warnings about NIXL's UCX libraries.
-grep -v -E 'no version information' "$logs/distributed_rank_0.log"
+# Drop NIXL's start-up log lines: its info lines, and the plugin directory it looks for although its
+# UCX backend is built in.
+grep -v -E '^I[0-9]{4} |nixl_plugin_manager.*Error accessing directory|absl::InitializeLog' \
+  "$logs/distributed_rank_0.log"
 exit $status

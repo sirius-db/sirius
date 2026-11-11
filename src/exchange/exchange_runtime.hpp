@@ -61,7 +61,6 @@ struct nixl_exchange_options {
  * so they outlive every plan that still holds it.
  *
  * @param peers "host:port" of every rank's listener, indexed by rank.
- * @throws sirius::invalid_input_exception when Sirius was built without SIRIUS_WITH_NIXL.
  * @throws sirius::internal_exception when NIXL fails or a peer is not reached within two minutes.
  */
 [[nodiscard]] std::shared_ptr<exchange_service> make_nixl_exchange(

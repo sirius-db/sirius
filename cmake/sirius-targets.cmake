@@ -54,12 +54,9 @@ set(SIRIUS_LINK_LIBRARIES
     simpatico
     PkgConfig::LIBURING
     OpenSSL::Crypto
-    absl::any_invocable)
-if(SIRIUS_WITH_NIXL)
-  # NVML: the NIXL fabric checks peer access between GPUs other processes own.
-  list(APPEND SIRIUS_LINK_LIBRARIES ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY}
-       CUDA::nvml)
-endif()
+    absl::any_invocable
+    # NVML: the NIXL fabric checks peer access between GPUs other processes own.
+    CUDA::nvml)
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
