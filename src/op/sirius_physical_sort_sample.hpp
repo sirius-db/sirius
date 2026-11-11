@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/cross_rank_sort_boundaries.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "sirius_config.hpp"
@@ -105,13 +106,28 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Release the partition boundaries table to free GPU memory
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
+  //! Boundaries come from @p hook instead of this operator's sample alone. Set while planning.
+  void set_cross_rank_boundaries(std::shared_ptr<cross_rank_sort_boundaries> hook)
+  {
+    _cross_rank_boundaries = std::move(hook);
+  }
+  //! The hook set by set_cross_rank_boundaries(), or null when this operator's sample stands alone.
+  [[nodiscard]] cross_rank_sort_boundaries* cross_rank_boundaries() const noexcept
+  {
+    return _cross_rank_boundaries.get();
+  }
+
+  //! With a hook the boundary task is still owed, input or not, until it has been claimed.
+  [[nodiscard]] bool all_ports_empty() override;
+  //! With a hook the boundary task runs with no input, since the other processes wait for it.
+  //! get_next_task_input_data() has already claimed it (SCHEDULED) when the task creator asks.
+  [[nodiscard]] bool runs_without_input() const override
+  {
+    return _cross_rank_boundaries != nullptr && boundary_state() != BoundaryState::DONE;
+  }
+
  protected:
-  //! Partition boundaries, as make_boundaries() derives them.
-  struct boundaries {
-    std::size_t num_partitions = 1;
-    //! num_partitions - 1 rows of the sort key columns; null for one partition.
-    std::unique_ptr<cudf::table> table;
-  };
+  using boundaries = sort_boundaries;
 
   //! The boundaries for @p num_parts partitions from the sorted @p sample_keys (no columns and a
   //! null @p space with no input); the default picks evenly spaced rows. Runs again on a retry.
@@ -170,6 +186,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Fraction of available GPU memory per partition (from sirius_config operator_params)
   double _max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+
+  //! See set_cross_rank_boundaries().
+  std::shared_ptr<cross_rank_sort_boundaries> _cross_rank_boundaries;
 };
 
 }  // namespace op
