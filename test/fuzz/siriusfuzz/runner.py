@@ -230,15 +230,20 @@ class Evaluator:
         try:
             if self.perm_alias is None:
                 self.perm_alias = f"{self.alias}p"
+                # The permuted dataset is used only by the CPU ambiguity check.
+                # Pin names are session-wide; pinning the same table name again
+                # would replace the main dataset's pin.
+                perm_variants = choose_dataset_variants(
+                    self.cfg.data,
+                    [table.name for table in getattr(self.dataset, "tables", [])],
+                    self.dataset.seed,
+                )
+                perm_variants["pin"] = {}
                 self.s.load_dataset(
                     self.dataset,
                     self.perm_alias,
                     permutation_seed=self.dataset.seed + 1,
-                    variants=choose_dataset_variants(
-                        self.cfg.data,
-                        [table.name for table in getattr(self.dataset, "tables", [])],
-                        self.dataset.seed,
-                    ),
+                    variants=perm_variants,
                 )
             self.s.use(self.perm_alias)
             perm = self.s.run(sql, gpu=False, timeout=self.timeout)
