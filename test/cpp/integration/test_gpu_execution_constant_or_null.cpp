@@ -47,10 +47,7 @@ class ConstantOrNullFixture : public sirius::test::GpuExecutionFixture {
   /// comparison below exercises it.
   void require_constant_or_null(std::string const& query)
   {
-    auto result = con->Query("EXPLAIN " + query);
-    REQUIRE(result);
-    REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->ToString().find("constant_or_null") != std::string::npos);
+    REQUIRE(cpu_plan_text(query).find("constant_or_null") != std::string::npos);
   }
 
   void compare(std::string const& query)

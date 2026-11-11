@@ -34,6 +34,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <unistd.h>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -309,7 +310,39 @@ class GpuExecutionFixture {
     require_matches_cpu(query, *gpu_result);
   }
 
+  /// DuckDB's physical plan for @p query as EXPLAIN renders it with GPU execution off, so the text
+  /// is DuckDB's CPU plan whatever the session's `gpu_execution` value.
+  std::string cpu_plan_text(std::string const& query)
+  {
+    scoped_sirius_setting const gpu_execution(*con, "gpu_execution", false);
+    return explain_text(query);
+  }
+
+  /// DuckDB's optimized logical plan for @p query (`explain_output = 'optimized_only'`) with GPU
+  /// execution on or off.
+  std::string optimized_plan_text(std::string const& query, bool gpu)
+  {
+    scoped_sirius_setting const gpu_execution(*con, "gpu_execution", gpu);
+    scoped_sirius_setting const explain_output(*con, "explain_output", "optimized_only");
+    return explain_text(query);
+  }
+
  private:
+  /// Runs `EXPLAIN` @p query and joins the rendered plans, one per line.
+  std::string explain_text(std::string const& query)
+  {
+    auto result = con->Query("EXPLAIN " + query);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("EXPLAIN error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    std::string text;
+    for (auto const& row : collect_rows(*result, /*sort=*/false)) {
+      text += row.back();
+      text += '\n';
+    }
+    return text;
+  }
+
   /// Reruns @p query on DuckDB's CPU execution and requires exactly @p gpu_result's column types
   /// and rows, ignoring row order.
   void require_matches_cpu(const std::string& query, duckdb::QueryResult& gpu_result)
