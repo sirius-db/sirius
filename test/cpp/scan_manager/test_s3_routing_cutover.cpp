@@ -960,9 +960,23 @@ TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]"
   worker.join();
 
   REQUIRE(future.valid());
-  REQUIRE(future.wait_for(5s) == std::future_status::ready);
+  // Settle the read on a worker too: getting it waits for the read.
+  std::promise<std::size_t> settled;
+  auto settled_read = settled.get_future();
+  std::thread reader([future = std::move(future), buffer, settled = std::move(settled)]() mutable {
+    try {
+      settled.set_value(future.get());
+    } catch (...) {
+      settled.set_exception(std::current_exception());
+    }
+  });
+  if (settled_read.wait_for(5s) != std::future_status::ready) {
+    reader.detach();
+    FAIL("in-flight read did not settle within 5 s of teardown");
+  }
+  reader.join();
   try {
-    auto const bytes = future.get();
+    auto const bytes = settled_read.get();
     if (bytes != 0) {
       REQUIRE(bytes == buffer->size());
       CHECK(std::equal(buffer->begin(), buffer->end(), payload.begin()));
