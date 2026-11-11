@@ -118,7 +118,7 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-/// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
+/// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
@@ -271,18 +271,18 @@ struct operator_params {
 
   /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
   /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
-  /// When on, pin_table observes every column it is not already asked to observe; an observed
-  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
-  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
-  /// late materialization asks for.
+  /// When on, pin_table observes every column of a parquet pin (and of a native table's pin when
+  /// late materialization is on); an observed column must be an integer column without a repeated
+  /// value in any chunk, or any column of a table under late_mat::small_table_max_rows rows, to
+  /// stay a candidate. When off, the planner ignores pin-time facts and the pin observes nothing,
+  /// so late materialization gets no proof either.
   bool prove_unique_keys{true};
 
   /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
-  /// sorts a whole column when its chunks overlap in range. Earlier columns take priority when the
-  /// cap is short; the check's peak GPU use is about three times the cap. A column that no longer
-  /// fits stays unproven. 0 = a share (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the
-  /// pinning GPU memory space's capacity. Applies to every observed column, whether late
-  /// materialization or join-key proofs asked for it.
+  /// sorts a whole column when its chunks overlap in range. Integer columns take priority over the
+  /// others when the cap is short, and earlier columns over later ones; the check's peak GPU use
+  /// is about three times the cap. A column that no longer fits stays unproven. 0 = a share
+  /// (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the pinning GPU memory space's capacity.
   uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
