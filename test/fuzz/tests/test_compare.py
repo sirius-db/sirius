@@ -14,7 +14,15 @@ from siriusfuzz.compare import (
     compare_results,
     is_total_order,
 )
-from siriusfuzz.sqlast import Alias, ColumnRef, OrderItem, Select, SelectItem
+from siriusfuzz.sqlast import (
+    Agg,
+    Alias,
+    ColumnRef,
+    OrderItem,
+    Select,
+    SelectItem,
+    SetOp,
+)
 
 
 def rs(rows, types):
@@ -157,6 +165,27 @@ class TotalOrder(unittest.TestCase):
         self.assertFalse(is_total_order(sel))
         sel.order_by.append(OrderItem(Alias("c1"), desc=True))
         self.assertTrue(is_total_order(sel))
+
+    def test_computed_float_key_is_not_a_total_order(self):
+        # avg() differs between CPU and GPU within tolerance, so sorting on it may permute
+        # near-ties; a stored FLOAT column is bitwise identical on both sides and sorts alike.
+        k = ColumnRef("a0", "k", st.INTEGER)
+        f = ColumnRef("a0", "c1_f", st.FLOAT)
+        avg = Agg("avg", k, kind="float")
+        order = [OrderItem(Alias("c0")), OrderItem(Alias("c1"), desc=True)]
+        stored = Select(items=[SelectItem(k, "c0"), SelectItem(f, "c1")], from_=None)
+        stored.order_by = list(order)
+        self.assertTrue(is_total_order(stored))
+        computed = Select(
+            items=[SelectItem(k, "c0"), SelectItem(avg, "c1")], from_=None
+        )
+        computed.order_by = list(order)
+        self.assertFalse(is_total_order(computed))
+        # An ORDER BY that omits an output column is still not total.
+        computed.order_by = [OrderItem(Alias("c0"))]
+        self.assertFalse(is_total_order(computed))
+        setop = SetOp("UNION ALL", [computed, computed], order_by=list(order))
+        self.assertFalse(is_total_order(setop))
 
 
 if __name__ == "__main__":

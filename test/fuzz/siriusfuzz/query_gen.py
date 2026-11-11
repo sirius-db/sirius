@@ -51,6 +51,7 @@ from .sqlast import (
     TableRef,
     Try,
     Window,
+    has_computed_float,
 )
 
 CONCRETE: dict[str, st.SqlType] = {
@@ -231,7 +232,8 @@ class QueryGenerator:
         names = arms[0].output_names()
         if self.f.order_by.enabled and self.rng.random() < 0.5:
             setop.order_by = self._order_items(names, kinds, total=True)
-            if self.f.limit.enabled and self.rng.random() < 0.5:
+            fragile = has_computed_float(arms[0].items)
+            if self.f.limit.enabled and not fragile and self.rng.random() < 0.5:
                 setop.limit = self.rng.choice([1, 5, 10, 100])
                 self._note("limit")
         return setop
@@ -405,6 +407,9 @@ class QueryGenerator:
         names = sel.output_names()
         kinds = sel.output_kinds()
         want_limit = self.f.limit.enabled and rng.random() < 0.3
+        if want_limit and self.f.limit.require_total_order:
+            # A total order over a computed float column is not stable across CPU and GPU.
+            want_limit = not has_computed_float(sel.items)
         want_order = self.f.order_by.enabled and (
             rng.random() < 0.5 or (want_limit and self.f.limit.require_total_order)
         )

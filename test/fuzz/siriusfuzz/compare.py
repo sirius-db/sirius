@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import sqltypes as st
-from .sqlast import Alias, Query, Select, SetOp
+from .sqlast import Alias, Query, Select, SetOp, has_computed_float, output_items
 
 
 @dataclass
@@ -254,6 +254,8 @@ def is_total_order(query: Query) -> bool:
     if not order:
         return False
     ordered = {o.expr.name for o in order if isinstance(o.expr, Alias)}
+    if has_computed_float(output_items(query), ordered):
+        return False
     return ordered >= names
 
 

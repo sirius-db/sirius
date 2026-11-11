@@ -120,10 +120,12 @@ left. `2` invalid setup or input, incomplete campaign, failed readiness check. `
    runs on DuckDB CPU, then on Sirius with `enable_duckdb_fallback = false`, so a fallback
    surfaces as an error instead of a silent CPU run. After a match, the query is rerun under
    randomized Sirius settings and compared with the GPU baseline.
-3. **Compare.** Rows compare as a multiset unless `ORDER BY` covers every output column.
-   FLOAT/DOUBLE use relative and absolute tolerances; everything else compares exactly, including
-   DECIMAL and NULL. A mismatch whose CPU result changes when the input rows are reordered is
-   classified as *ambiguous* rather than a bug.
+3. **Compare.** Rows compare as a multiset unless `ORDER BY` covers every output column and
+   none of its keys is a computed FLOAT/DOUBLE (an average or arithmetic result sorts near-ties
+   differently on the two sides, so such queries also get no `LIMIT`). FLOAT/DOUBLE use relative
+   and absolute tolerances; everything else compares exactly, including DECIMAL and NULL. A
+   mismatch whose CPU result changes when the input rows are reordered is classified as
+   *ambiguous* rather than a bug.
 4. **Save.** Findings are grouped by signature, shrunk, and reported with verdict counts.
 
 Generated tables live in an `ATTACH`ed file-backed database and are `CHECKPOINT`ed, because

@@ -373,6 +373,28 @@ class Alias(Expr):
         return q(self.name)
 
 
+def output_items(query: "Query") -> list[SelectItem]:
+    """The select list that defines a query's output columns."""
+    node = query
+    while isinstance(node, SetOp):
+        node = node.arms[0]
+    return node.items if isinstance(node, Select) else []
+
+
+def has_computed_float(items: list[SelectItem], names: set[str] | None = None) -> bool:
+    """True when an output column (restricted to ``names`` when given) is a FLOAT/DOUBLE
+    produced by an aggregate or arithmetic rather than read from a table. CPU and GPU agree
+    on such values only within tolerance, so sorting on them can legitimately permute
+    near-ties; they are not usable as ORDER BY keys for a positional comparison or LIMIT.
+    """
+    return any(
+        (names is None or it.alias in names)
+        and it.expr.kind == "float"
+        and not isinstance(it.expr, ColumnRef)
+        for it in items
+    )
+
+
 @dataclass
 class Cte(Node):
     name: str
