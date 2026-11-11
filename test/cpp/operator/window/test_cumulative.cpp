@@ -412,6 +412,26 @@ TEST_CASE(
   CHECK(host<int64_t>(result->view().column(2), stream) == std::vector<int64_t>{3, 3, 3, 7, 7});
 }
 
+TEST_CASE("cumulative evaluator sums 32 bit integers beyond the INT32 range",
+          "[window_evaluator][window_cumulative][gpu]")
+{
+  rmm::cuda_stream owning_stream;
+  auto stream       = static_cast<::cuda::stream_ref>(owning_stream);
+  auto mr           = cudf::get_current_device_resource_ref();
+  int32_t const big = std::numeric_limits<int32_t>::max();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(column<int32_t>({1, 2, 3}, cudf::data_type{cudf::type_id::INT32}, stream, mr));
+  columns.push_back(
+    column<int32_t>({big, big, -big}, cudf::data_type{cudf::type_id::INT32}, stream, mr));
+  cudf::table input(std::move(columns));
+  auto result = evaluate_cumulative_window(
+    input.view(), {}, make_order({0}, ascending_nulls_last), {{function::sum, 1}}, stream, mr);
+  CHECK(result->get_column(0).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+  __int128_t const wide = big;
+  CHECK(host<__int128_t>(result->view().column(0), stream) ==
+        std::vector<__int128_t>{wide, 2 * wide, wide});
+}
+
 TEST_CASE("cumulative evaluator sums floating point values",
           "[window_evaluator][window_cumulative][gpu]")
 {
@@ -447,7 +467,7 @@ TEST_CASE("cumulative evaluator reports a decimal sum that exceeds DECIMAL(38)",
   int const digit = GENERATE(6, 9, -9);
   INFO(digit);
   __int128_t const value =
-    static_cast<__int128_t>(digit) * 10'000'000'000'000'000'000LL * 1'000'000'000'000'000'000LL;
+    static_cast<__int128_t>(digit) * 10'000'000'000'000'000'000ULL * 1'000'000'000'000'000'000LL;
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(column<int32_t>({1, 2}, cudf::data_type{cudf::type_id::INT32}, stream, mr));
   columns.push_back(

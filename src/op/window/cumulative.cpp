@@ -210,13 +210,15 @@ std::unique_ptr<cudf::table> evaluate_cumulative_window(
                                 partition_directions,
                                 partition_nulls);
 
-  // A sum accumulates in a wider type than its argument, so it scans a widened copy.
+  // A sum accumulates in a wider type than its argument, so it scans a widened copy. An 8 to 32 bit
+  // integer is scanned as it is: cuDF sums it into INT64, and the result is cast to its result type
+  // at the end.
   std::vector<std::unique_ptr<cudf::column>> widened(aggregates.size());
   std::vector<cudf::groupby::scan_request> requests;
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
     auto values =
       sorted->view().column(static_cast<cudf::size_type>(partition_count + argument_position[i]));
-    if (aggregates[i].function == aggregate_id::sum) {
+    if (aggregates[i].function == aggregate_id::sum && !is_narrow_integer(values.type())) {
       auto const target = window_sum_type(values.type());
       if (values.type() != target) {
         widened[i] = cudf::cast(values, target, stream, mr);
@@ -253,11 +255,11 @@ std::unique_ptr<cudf::table> evaluate_cumulative_window(
 
   // The scan returns NULL for a row whose argument is NULL. The running value carries over such a
   // row, so fill each NULL with the closest value before it in its own partition. A NULL at the
-  // start of a partition stays NULL.
+  // start of a partition stays NULL. A result without NULLs needs no fill.
   std::vector<cudf::size_type> fill_indices;
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
     if (aggregates[i].function != aggregate_id::count &&
-        aggregates[i].function != aggregate_id::count_star) {
+        aggregates[i].function != aggregate_id::count_star && scanned_columns[i]->has_nulls()) {
       fill_indices.push_back(static_cast<cudf::size_type>(i));
     }
   }

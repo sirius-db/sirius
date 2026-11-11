@@ -38,6 +38,14 @@ constexpr __int128_t int128_pow10(int digits)
 }
 
 /**
+ * @brief Whether @p type is an 8 to 32 bit integer.
+ *
+ * Such a value has a magnitude of at most 2^31 and a column holds fewer than 2^31 rows, so any sum
+ * over one column, including every running sum, fits INT64. cuDF sums these types into INT64.
+ */
+bool is_narrow_integer(cudf::data_type type);
+
+/**
  * @brief Return the type a window `sum` over an argument of type @p input accumulates in and
  * returns.
  *

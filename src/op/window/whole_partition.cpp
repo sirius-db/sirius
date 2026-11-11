@@ -42,14 +42,6 @@ namespace sirius::op {
 
 namespace {
 
-// An 8 to 32 bit integer has a magnitude of at most 2^31 and a column holds fewer than 2^31 rows,
-// so the sum of a partition fits INT64.
-bool is_narrow_integer(cudf::data_type type)
-{
-  return type.id() == cudf::type_id::INT8 || type.id() == cudf::type_id::INT16 ||
-         type.id() == cudf::type_id::INT32;
-}
-
 // Throws unless `type` is supported as a partition column.
 void validate_key(cudf::data_type type)
 {

@@ -25,6 +25,12 @@
 
 namespace sirius::op {
 
+bool is_narrow_integer(cudf::data_type type)
+{
+  return type.id() == cudf::type_id::INT8 || type.id() == cudf::type_id::INT16 ||
+         type.id() == cudf::type_id::INT32;
+}
+
 cudf::data_type window_sum_type(cudf::data_type input)
 {
   using cudf::type_id;
