@@ -160,8 +160,8 @@ class translation_context {
   [[nodiscard]] bool has_subquery_error() const noexcept { return _has_subquery_error; }
   /**
    * @brief Returns the overflow sites of the produced expressions in the order their statements
-   * appear in @c body_code(), leaving out those under a TRY or TRY_CAST, which turns their overflow
-   * into NULL before it can reach an NVRTC Sink.
+   * appear in @c body_code(), leaving out those under a TRY and the conversion of a TRY_CAST, which
+   * turn their overflow into NULL before it can reach an NVRTC Sink.
    */
   [[nodiscard]] std::span<overflow_site const> overflow_sites() const noexcept
   {
@@ -217,8 +217,8 @@ class translation_context {
   [[nodiscard]] std::size_t overflow_site_mark() const noexcept { return _overflow_sites.size(); }
 
   /**
-   * @brief Forgets the overflow sites recorded after @p mark, under a TRY or TRY_CAST, which turns
-   * their Overflow Poison into NULL before it can reach an NVRTC Sink.
+   * @brief Forgets the overflow sites recorded after @p mark, under a TRY, which turns their
+   * Overflow Poison into NULL before it can reach an NVRTC Sink.
    */
   void drop_overflow_sites_since(std::size_t mark) noexcept;
 

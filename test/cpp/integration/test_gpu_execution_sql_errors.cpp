@@ -23,11 +23,11 @@
  * `docs/super-sirius/expression-executor.md` states what it guarantees. An overflow in a branch
  * that a Row-exact Guard (CASE, COALESCE) excludes returns DuckDB's value, even where an evaluator
  * computes that branch over every row; an evaluated overflow returns DuckDB's error even where the
- * row's value is NULL; an unguarded conversion overflow returns DuckDB's error; and a check that
- * DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value. Each case asserts
- * whether the query completed on the GPU or through CPU Replay, so a replay cannot hide a broken
- * GPU path. Overflow of abs and negation is covered beside their other cases in
- * `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
+ * row's value is NULL; an unguarded conversion overflow returns DuckDB's error, as does an overflow
+ * in a TRY_CAST's input; and a check that DuckDB does not share (a non-finite STDDEV_SAMP) returns
+ * DuckDB's value. Each case asserts whether the query completed on the GPU or through CPU Replay,
+ * so a replay cannot hide a broken GPU path. Overflow of abs and negation is covered beside their
+ * other cases in `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
  */
 
 #include <catch.hpp>
@@ -121,6 +121,26 @@ TEST_CASE_METHOD(SqlErrorFixture,
     "SELECT id, CASE WHEN id <> 2 THEN CAST(ms AS TIMESTAMP) END FROM far_millis;",
     guarded_error_path(strategy));
   expect_error_matches_cpu("SELECT id, CAST(ms AS TIMESTAMP) FROM far_millis;",
+                           execution_path::cpu_replay);
+}
+
+TEST_CASE_METHOD(SqlErrorFixture,
+                 "TRY_CAST returns NULL for its own conversion failure and DuckDB's error for an "
+                 "overflow in its input",
+                 "[integration][gpu_execution][sql_errors]")
+{
+  run_ok(
+    "CREATE TABLE try_inputs AS SELECT * FROM (VALUES"
+    " (0, 9223372036854775807::BIGINT), (1, 2), (2, NULL)) v(id, z);");
+  run_ok("CHECKPOINT;");
+  // Only `nvrtc_jit` checks BIGINT addition and narrowing integer casts: the other strategies wrap
+  // both on the GPU, so they return wrong rows for these queries rather than NULL or an error.
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{
+    *con, sirius::expression_evaluator_strategy::NVRTC_JIT};
+
+  expect_result_matches_cpu("SELECT id, TRY_CAST(z AS INTEGER) FROM try_inputs;",
+                            execution_path::gpu);
+  expect_error_matches_cpu("SELECT id, TRY_CAST(z + 1 AS INTEGER) FROM try_inputs;",
                            execution_path::cpu_replay);
 }
 

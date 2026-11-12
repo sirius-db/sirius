@@ -5781,6 +5781,42 @@ TEST_CASE(
     }
   }
 
+  SECTION("TRY_CAST turns only its own conversion failure into NULL")
+  {
+    auto const int_t             = logical_type::make(type_id::INTEGER);
+    auto const smallint_t        = logical_type::make(type_id::SMALLINT);
+    auto const try_cast_x_plus_1 = [&] {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, int_t));
+      args.push_back(make_int_const(1));
+      return make_cast(make_func(sirius::function_id::add, std::move(args), int_t),
+                       smallint_t,
+                       /*try_cast=*/true);
+    };
+    auto const evaluate = [&](std::vector<std::int32_t> const& vals,
+                              std::vector<bool> const& valids) {
+      auto batch = make_int32_batch_with_nulls(*space, vals, valids);
+      auto ro    = batch->to_read_only();
+      auto tv    = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+      auto expr  = try_cast_x_plus_1();
+      exp_executor exec(
+        *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      return exec.evaluate(tv);
+    };
+
+    // TRY_CAST(x + 1 AS SMALLINT): 40000 + 1 does not fit SMALLINT and becomes NULL, and a NULL
+    // input stays NULL.
+    auto const out = evaluate({40000, 2, 0}, {true, true, false});
+    CHECK(copy_valids_to_host(out->view().column(0)) == std::vector<bool>{false, true, false});
+    CHECK(copy_column_to_host<std::int16_t>(out->view().column(0))[1] == 3);
+
+    // The overflow of x + 1 belongs to the TRY_CAST's input, which DuckDB still raises, so the
+    // error names the addition and not the cast.
+    REQUIRE_THROWS_WITH(
+      evaluate({std::numeric_limits<std::int32_t>::max(), 2, 0}, {true, true, false}),
+      "[expression_evaluator]: Overflow in NVRTC evaluation of INTEGER + INTEGER -> INTEGER");
+  }
+
   SECTION("checked integer, float, and decimal CAST overflow throws and TRY_CAST returns NULL")
   {
     auto const int_t     = logical_type::make(type_id::INTEGER);

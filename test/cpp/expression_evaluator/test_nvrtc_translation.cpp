@@ -627,11 +627,13 @@ TEST_CASE("nvrtc_codegen - an overflow message names the operations that can ove
             "INTEGER; INTEGER - INTEGER -> INTEGER; and 2 more");
   }
 
-  SECTION("operations under TRY or TRY_CAST are not candidates")
+  SECTION("operations under TRY and the conversion of a TRY_CAST are not candidates")
   {
     auto const try_cast_product = make_binary(
       sirius::function_id::mul, make_cast(abs_of_col0(), int_t, true), make_int_const(2), int_t);
-    CHECK(overflow_message_of(*try_cast_product) == generic + " of INTEGER * INTEGER -> INTEGER");
+    // DuckDB still raises an overflow inside a TRY_CAST's input, so abs stays a candidate.
+    CHECK(overflow_message_of(*try_cast_product) ==
+          generic + " of one of: abs(INTEGER) -> INTEGER; INTEGER * INTEGER -> INTEGER");
 
     auto const try_sum = make_binary(sirius::function_id::add,
                                      make_unary(sirius::ast::unary_op::kind::op_try, abs_of_col0()),

@@ -838,7 +838,6 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
   auto const dst_type = sirius::require_cudf_type(expr.target_type);
   auto const dst_str  = cuda_type_name(dst_type);
   auto const var_name = next_var_name();
-  auto const try_mark = overflow_site_mark();
 
   // Carrier restoration: a referenced column is loaded at its raw carrier width and widened inline.
   register_value const child = [&]() {
@@ -982,16 +981,20 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
                                     cudf::type_to_name(dst_type));
   }
 
-  bool can_ovf  = record_overflow_site(&expr, op_can_ovf, child.can_overflow);
-  bool non_null = child.is_statically_non_null;
-  if (expr.try_cast && can_ovf) {
+  if (expr.try_cast && op_can_ovf) {
+    // TRY_CAST turns only its own conversion failure into NULL. DuckDB still raises an overflow
+    // inside its input, so the child's Overflow Poison and overflow sites stay.
     emit_line(format(
-      "if ({0}.overflow) {{ {0} = reg_val<{1}>{{{1}{{}}, false, false}}; }}", var_name, dst_str));
-    drop_overflow_sites_since(try_mark);
-    can_ovf  = false;
-    non_null = false;
+      "if ({0}.overflow && !{1}.overflow) {{ {0} = reg_val<{2}>{{{2}{{}}, false, false}}; }}",
+      var_name,
+      c,
+      dst_str));
+    return register_value{var_name, dst_type, /*is_statically_non_null=*/false, child.can_overflow};
   }
-  return register_value{var_name, dst_type, non_null, can_ovf};
+  return register_value{var_name,
+                        dst_type,
+                        child.is_statically_non_null,
+                        record_overflow_site(&expr, op_can_ovf, child.can_overflow)};
 }
 
 //===----------UNARY OPERATOR----------===//
