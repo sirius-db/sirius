@@ -33,6 +33,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -46,7 +47,6 @@
 #include <memory>
 #include <set>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -59,12 +59,11 @@ namespace sirius::test {
  * The fused `nvrtc_jit` kernel evaluates a branch only for the rows that select it, so the query
  * completes on the GPU. The other Expression Evaluator Strategies evaluate the branch over every
  * row, detect the error, and recover through CPU Replay.
- *
- * @param strategy One of `expression_evaluator_strategy_names()`.
  */
-[[nodiscard]] inline execution_path guarded_error_path(std::string_view strategy)
+[[nodiscard]] inline execution_path guarded_error_path(expression_evaluator_strategy strategy)
 {
-  return strategy == "nvrtc_jit" ? execution_path::gpu : execution_path::cpu_replay;
+  return strategy == expression_evaluator_strategy::NVRTC_JIT ? execution_path::gpu
+                                                              : execution_path::cpu_replay;
 }
 
 /// Collects stringified result rows, sorted by default for order-insensitive comparison;
@@ -273,23 +272,6 @@ class GpuExecutionFixture {
       UNSCOPED_INFO("expected a runtime fallback to CPU, but none occurred");
     }
     REQUIRE(after.runtime_fallbacks > before.runtime_fallbacks);
-  }
-
-  /// Asserts the query is rejected during GPU plan generation and completes via DuckDB's CPU
-  /// plan, returning exactly the CPU results. Distinct from expect_gpu_fallback, which asserts a
-  /// fallback *after* GPU execution started. Use for shapes Sirius screens out at plan time on
-  /// purpose.
-  void expect_plan_fallback_matches_cpu(const std::string& query)
-  {
-    expect_result_matches_cpu(query, execution_path::plan_time_fallback);
-  }
-
-  /// Asserts the query starts on the GPU, falls back to DuckDB's CPU execution at runtime, and
-  /// returns exactly the CPU rows and column types. Distinct from expect_gpu_fallback, which does
-  /// not compare the results.
-  void expect_runtime_fallback_matches_cpu(const std::string& query)
-  {
-    expect_result_matches_cpu(query, execution_path::cpu_replay);
   }
 
   /// Runs @p query with `gpu_execution` on, requires that it takes @p expected, and returns its

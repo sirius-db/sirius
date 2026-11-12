@@ -158,5 +158,6 @@ TEST_CASE_METHOD(AbsFixture,
                  "[integration][gpu_execution][projection][abs]")
 {
   create_abs_table(*this);
-  expect_plan_fallback_matches_cpu("SELECT id, abs(CAST(i AS HUGEINT)) AS a FROM abs_t");
+  expect_result_matches_cpu("SELECT id, abs(CAST(i AS HUGEINT)) AS a FROM abs_t",
+                            sirius::test::execution_path::plan_time_fallback);
 }

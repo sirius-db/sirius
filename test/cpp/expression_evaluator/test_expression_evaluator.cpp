@@ -4678,6 +4678,7 @@ TEST_CASE(
   columns.push_back(make_column(cudf::data_type{cudf::type_id::DECIMAL32, 0}, int_min, 1, true));
   columns.push_back(make_column(
     cudf::data_type{cudf::type_id::FLOAT64}, std::numeric_limits<double>::lowest(), 1.0, true));
+  columns.push_back(make_column(cudf::data_type{cudf::type_id::BOOL8}, true, false, true));
   std::vector<cudf::column_view> views;
   for (auto const& col : columns) {
     views.push_back(col->view());
@@ -4689,12 +4690,17 @@ TEST_CASE(
   auto const float_t    = logical_type::make(type_id::FLOAT);
   auto const dec9_0     = logical_type::make_decimal(9, 0);
   auto const dec9_2     = logical_type::make_decimal(9, 2);
+  auto const dec9_9     = logical_type::make_decimal(9, 9);
+  auto const date_t     = logical_type::make(type_id::DATE);
+  auto const ts_t       = logical_type::make(type_id::TIMESTAMP);
+  auto const ts_ns_t    = logical_type::make(type_id::TIMESTAMP_NS);
   auto x                = [&] { return make_ref_typed(0, int_t); };
   auto minus_one        = [&] { return make_ref_typed(1, int_t); };
   auto date             = [&] { return make_ref_typed(2, logical_type::make(type_id::DATE)); };
   auto ts               = [&] { return make_ref_typed(3, logical_type::make(type_id::TIMESTAMP)); };
   auto dec              = [&] { return make_ref_typed(4, dec9_0); };
   auto dbl              = [&] { return make_ref_typed(5, logical_type::make(type_id::DOUBLE)); };
+  auto flag             = [&] { return make_ref_typed(6, logical_type::make(type_id::BOOLEAN)); };
   auto call             = [](sirius::function_id fid, logical_type ret, auto... operands) {
     std::vector<std::unique_ptr<ast_node>> args;
     (args.push_back(std::move(operands)), ...);
@@ -4725,6 +4731,15 @@ TEST_CASE(
   cases.emplace_back("CAST(dbl AS INTEGER)", make_cast(dbl(), int_t, false));
   cases.emplace_back("CAST(dbl AS FLOAT)", make_cast(dbl(), float_t, false));
   cases.emplace_back("CAST(dbl AS DECIMAL(9, 2))", make_cast(dbl(), dec9_2, false));
+  cases.emplace_back("CAST(ts AS DATE)", make_cast(ts(), date_t, false));
+  cases.emplace_back("date_trunc('day', date) -> TIMESTAMP",
+                     call(function_id::date_trunc, ts_t, make_str_const("day"), date()));
+  cases.emplace_back("date_trunc('day', ts) -> TIMESTAMP_NS",
+                     call(function_id::date_trunc, ts_ns_t, make_str_const("day"), ts()));
+  cases.emplace_back("date_trunc('day', ts) -> DATE",
+                     call(function_id::date_trunc, date_t, make_str_const("day"), ts()));
+  // 1 does not fit DECIMAL(9, 9), so casting TRUE overflows.
+  cases.emplace_back("CAST(flag AS DECIMAL(9, 9))", make_cast(flag(), dec9_9, false));
 
   for (auto& [name, expr] : cases) {
     CAPTURE(name);

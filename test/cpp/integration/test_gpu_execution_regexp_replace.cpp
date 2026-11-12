@@ -208,8 +208,9 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
   // change what the rewritten $ anchor and . match.
   for (auto const* pattern : {"(?m)a$", "(?i)a$", "(?s)a.$", "(?i:a)", "(?P<x>a)$"}) {
     INFO(pattern);
-    expect_plan_fallback_matches_cpu(std::string{"SELECT id, regexp_replace(s, '"} + pattern +
-                                     "', 'X') FROM regex_t");
+    expect_result_matches_cpu(
+      std::string{"SELECT id, regexp_replace(s, '"} + pattern + "', 'X') FROM regex_t",
+      sirius::test::execution_path::plan_time_fallback);
   }
 }
 
@@ -249,10 +250,12 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
                               "$",
                               "^$"}) {
     INFO(pattern);
-    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace(s, '"} + pattern +
-                                     "', 'X') FROM regex_t");
-    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace(s, '("} + pattern +
-                                     R"()', '<\1>') FROM regex_t)");
+    expect_result_matches_cpu(
+      std::string{"SELECT regexp_replace(s, '"} + pattern + "', 'X') FROM regex_t",
+      sirius::test::execution_path::plan_time_fallback);
+    expect_result_matches_cpu(
+      std::string{"SELECT regexp_replace(s, '("} + pattern + R"()', '<\1>') FROM regex_t)",
+      sirius::test::execution_path::plan_time_fallback);
   }
   // These can consume text even though they also match empty input. The escaped pipe is
   // a literal character, unlike the empty alternation above, and should stay on the GPU.
@@ -291,10 +294,12 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
     // RE2 can match \B inside a UTF-8 sequence. A leading space keeps its first match at
     // a character boundary, so the CPU result can be materialized by the comparison helper.
     auto const subject = std::string{pattern} == R"(\B)" ? "' ' || s" : "s";
-    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace("} + subject + ", '" +
-                                     pattern + "', 'X') FROM regex_t");
-    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace("} + subject + ", '(" +
-                                     pattern + R"()', '<\1>') FROM regex_t)");
+    expect_result_matches_cpu(
+      std::string{"SELECT regexp_replace("} + subject + ", '" + pattern + "', 'X') FROM regex_t",
+      sirius::test::execution_path::plan_time_fallback);
+    expect_result_matches_cpu(std::string{"SELECT regexp_replace("} + subject + ", '(" + pattern +
+                                R"()', '<\1>') FROM regex_t)",
+                              sirius::test::execution_path::plan_time_fallback);
   }
 }
 
@@ -344,15 +349,17 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
   // retain DuckDB semantics, including global replacement and combinations of flags.
   for (auto const* options : {"", "g", "c", "i", "l", "m", "n", "p", "s", "gi", "gs"}) {
     INFO(options);
-    expect_plan_fallback_matches_cpu(std::string{"SELECT id, regexp_replace(s, 'a.', 'X', '"} +
-                                     options + "') FROM regex_t");
+    expect_result_matches_cpu(
+      std::string{"SELECT id, regexp_replace(s, 'a.', 'X', '"} + options + "') FROM regex_t",
+      sirius::test::execution_path::plan_time_fallback);
     auto const backreference_query =
       std::string{R"(SELECT id, regexp_replace(s, '(a)', '<\1>', ')"} + options + "') FROM regex_t";
     if (std::string{options} == "l") {
       // Literal mode removes the capture group, making this rewrite invalid in v2.
       expect_regex_fallback_error_matches_cpu(*this, backreference_query);
     } else {
-      expect_plan_fallback_matches_cpu(backreference_query);
+      expect_result_matches_cpu(backreference_query,
+                                sirius::test::execution_path::plan_time_fallback);
     }
   }
   for (auto const* expression : {
@@ -362,8 +369,10 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          "regexp_replace(s, 'a', s)",
        }) {
     INFO(expression);
-    expect_plan_fallback_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+    expect_result_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t",
+                              sirius::test::execution_path::plan_time_fallback);
   }
-  expect_plan_fallback_matches_cpu(
-    "SELECT regexp_replace(s, '[A-Z]', '', 'g') AS k, count(*) FROM regex_t GROUP BY k");
+  expect_result_matches_cpu(
+    "SELECT regexp_replace(s, '[A-Z]', '', 'g') AS k, count(*) FROM regex_t GROUP BY k",
+    sirius::test::execution_path::plan_time_fallback);
 }

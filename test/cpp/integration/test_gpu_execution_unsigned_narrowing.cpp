@@ -44,7 +44,7 @@ class UnsignedNarrowingFixture : public sirius::test::GpuExecutionFixture {
   void check_rejection(const std::string& query)
   {
     run_ok("SET enable_duckdb_fallback=true;");
-    expect_plan_fallback_matches_cpu(query);
+    expect_result_matches_cpu(query, sirius::test::execution_path::plan_time_fallback);
     run_ok("SET enable_duckdb_fallback=false;");
     auto result = con->Query(query);
     run_ok("SET enable_duckdb_fallback=true;");

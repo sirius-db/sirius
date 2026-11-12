@@ -92,7 +92,8 @@ TEST_CASE_METHOD(SemanticCastFixture,
 {
   create_cast_table(*this);
   // DuckDB null-cast semantics: every row is NULL -- never the int16 epoch-day value 1.
-  expect_plan_fallback_matches_cpu("SELECT TRY_CAST(d AS SMALLINT) FROM cast_t;");
+  expect_result_matches_cpu("SELECT TRY_CAST(d AS SMALLINT) FROM cast_t;",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(SemanticCastFixture,
@@ -101,7 +102,8 @@ TEST_CASE_METHOD(SemanticCastFixture,
 {
   create_cast_table(*this);
   // Every row NULL -- never DATE '1970-01-02' retagged from s = 1.
-  expect_plan_fallback_matches_cpu("SELECT TRY_CAST(s AS DATE) FROM cast_t;");
+  expect_result_matches_cpu("SELECT TRY_CAST(s AS DATE) FROM cast_t;",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(SemanticCastFixture,
@@ -158,8 +160,8 @@ TEST_CASE_METHOD(SemanticCastFixture,
   // Filter position: DuckDB pushes this predicate into the scan's table filters, so the same
   // translation declines it from reject_untranslatable_table_filter (sirius_plan_get.cpp) rather
   // than the LogicalFilter site. On the CPU the null-cast makes the predicate true for every row.
-  expect_plan_fallback_matches_cpu(
-    "SELECT count(*) FROM cast_t WHERE TRY_CAST(d AS SMALLINT) IS NULL;");
+  expect_result_matches_cpu("SELECT count(*) FROM cast_t WHERE TRY_CAST(d AS SMALLINT) IS NULL;",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(SemanticCastFixture,

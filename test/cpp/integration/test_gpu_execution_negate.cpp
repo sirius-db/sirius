@@ -174,10 +174,12 @@ TEST_CASE_METHOD(NegateFixture,
   // value. The operands themselves run on the GPU, so the negation is what falls back.
   compare_gpu_vs_cpu(
     "SELECT id, i::HUGEINT AS h, (k + 3)::UTINYINT AS u FROM neg_t WHERE id >= 100");
-  expect_plan_fallback_matches_cpu("SELECT id, -(i::HUGEINT) AS n FROM neg_t WHERE id >= 100");
+  expect_result_matches_cpu("SELECT id, -(i::HUGEINT) AS n FROM neg_t WHERE id >= 100",
+                            sirius::test::execution_path::plan_time_fallback);
   // k + 3 is zero only where k = -3, and DuckDB negates an unsigned zero to zero.
-  expect_plan_fallback_matches_cpu(
-    "SELECT id, -((k + 3)::UTINYINT) AS n FROM neg_t WHERE id >= 100 AND k = -3");
+  expect_result_matches_cpu(
+    "SELECT id, -((k + 3)::UTINYINT) AS n FROM neg_t WHERE id >= 100 AND k = -3",
+    sirius::test::execution_path::plan_time_fallback);
 
   // Other unsigned values raise on the CPU after the plan-time fallback, as without the GPU.
   auto const query = std::string("SELECT id, -((k + 3)::UTINYINT) AS n FROM neg_t WHERE id >= 100");

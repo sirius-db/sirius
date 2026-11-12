@@ -191,7 +191,8 @@ TEST_CASE_METHOD(AggNullFixture,
   compare_gpu_vs_cpu("SELECT g, stddev_samp(v) FROM agg_n WHERE g = 999 GROUP BY g");
   compare_gpu_vs_cpu_approx(
     "SELECT g, stddev_samp(v)/avg(v) FROM agg_n GROUP BY g HAVING stddev_samp(v) > 0", {1});
-  expect_plan_fallback_matches_cpu("SELECT g, stddev_samp(DISTINCT v) FROM agg_n GROUP BY g");
+  expect_result_matches_cpu("SELECT g, stddev_samp(DISTINCT v) FROM agg_n GROUP BY g",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(AggNullFixture,

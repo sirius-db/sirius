@@ -180,9 +180,9 @@ TEST_CASE_METHOD(NullDataFixture,
     "SELECT id, b NOT IN (NULL, i, 200) AS r FROM nt",
     "SELECT id FROM nt WHERE i IN (NULL, 10)",
     "SELECT id, CASE WHEN s IN (NULL, 'apple') THEN -906929.2003 ELSE 0.5000 END AS r FROM nt"};
-  for (auto const strategy : sirius::test::expression_evaluator_strategy_names()) {
+  for (auto const strategy : sirius::all_expression_evaluator_strategies) {
     for (auto const& query : queries) {
-      DYNAMIC_SECTION(strategy << ": " << query)
+      DYNAMIC_SECTION(sirius::strategy_to_string(strategy) << ": " << query)
       {
         // Keep the IN lists as IN expressions rather than letting DuckDB rewrite them.
         sirius::test::disabled_optimizers_guard optimizer_guard{*con, "in_clause"};

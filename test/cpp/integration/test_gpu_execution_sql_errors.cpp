@@ -85,9 +85,10 @@ TEST_CASE_METHOD(SqlErrorFixture,
   expect_error_matches_cpu("SELECT id, n + abs(x) FROM null_sums;", execution_path::cpu_replay);
   expect_error_matches_cpu("SELECT id FROM null_sums WHERE n + abs(x) > 0;",
                            execution_path::cpu_replay);
-  // DuckDB never evaluates the THEN branch, so nothing overflows.
-  expect_result_matches_cpu("SELECT id, CASE WHEN FALSE THEN abs(x) ELSE 1 END FROM null_sums;",
-                            execution_path::gpu);
+  // No row selects the THEN branch, so DuckDB never evaluates the overflowing abs(x). The guard
+  // depends on the row, so the optimizer cannot fold the branch away.
+  expect_result_matches_cpu("SELECT id, CASE WHEN id < 0 THEN abs(x) ELSE 1 END FROM null_sums;",
+                            guarded_error_path(strategy));
 }
 
 TEST_CASE_METHOD(SqlErrorFixture,

@@ -103,8 +103,9 @@ TEST_CASE_METHOD(SubstringFixture,
     // DuckDB's ASCII and Unicode kernels disagree on these windows for short strings.
     for (auto const* bounds : {"3, -2", "10, -2", "-5, 3", "-3, 2", "id", "1, id"}) {
       CAPTURE(bounds);
-      expect_plan_fallback_matches_cpu(std::string("SELECT id, substring(s, ") + bounds +
-                                       ") AS r FROM " + table);
+      expect_result_matches_cpu(
+        std::string("SELECT id, substring(s, ") + bounds + ") AS r FROM " + table,
+        sirius::test::execution_path::plan_time_fallback);
     }
   }
 }

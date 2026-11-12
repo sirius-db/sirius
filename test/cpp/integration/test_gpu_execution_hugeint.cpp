@@ -97,10 +97,11 @@ TEST_CASE_METHOD(HugeintFixture,
   auto result = con->Query("SELECT s::BIGINT FROM " + std::string{sums} + ";");
   REQUIRE(result->HasError());
   CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("out of range"));
-  expect_runtime_fallback_matches_cpu("SELECT k, TRY_CAST(s AS BIGINT) b FROM " +
-                                      std::string{sums} + ";");
-  expect_runtime_fallback_matches_cpu("SELECT k, TRY_CAST(s AS DECIMAL(18, 2)) b FROM " +
-                                      std::string{sums} + ";");
+  expect_result_matches_cpu("SELECT k, TRY_CAST(s AS BIGINT) b FROM " + std::string{sums} + ";",
+                            sirius::test::execution_path::cpu_replay);
+  expect_result_matches_cpu(
+    "SELECT k, TRY_CAST(s AS DECIMAL(18, 2)) b FROM " + std::string{sums} + ";",
+    sirius::test::execution_path::cpu_replay);
 }
 
 TEST_CASE_METHOD(HugeintFixture,
@@ -122,12 +123,14 @@ TEST_CASE_METHOD(HugeintFixture,
     CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("Overflow"));
   }
   // 1.2e38 fits HUGEINT but not DECIMAL(38, 0).
-  expect_runtime_fallback_matches_cpu(
+  expect_result_matches_cpu(
     "SELECT k, TRY_CAST(s * 3000000000000000000 AS DECIMAL(38, 0)) "
     "c FROM " +
-    std::string{sums} + ";");
+      std::string{sums} + ";",
+    sirius::test::execution_path::cpu_replay);
   // HUGEINT_MIN // -1 overflows, so a -1 divisor stays on the CPU.
-  expect_plan_fallback_matches_cpu("SELECT k, s // -1 q, s % -1 r FROM " + std::string{sums} + ";");
+  expect_result_matches_cpu("SELECT k, s // -1 q, s % -1 r FROM " + std::string{sums} + ";",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(HugeintFixture,
@@ -136,8 +139,10 @@ TEST_CASE_METHOD(HugeintFixture,
 {
   // cuDF leaves a zero divisor's row undefined, so only a nonzero constant divisor runs on the GPU.
   run_ok("SET enable_duckdb_fallback = true;");
-  expect_plan_fallback_matches_cpu("SELECT k, SUM(x) // COUNT(*) a FROM h GROUP BY k;");
-  expect_plan_fallback_matches_cpu("SELECT k, SUM(x) % COUNT(*) a FROM h GROUP BY k;");
+  expect_result_matches_cpu("SELECT k, SUM(x) // COUNT(*) a FROM h GROUP BY k;",
+                            sirius::test::execution_path::plan_time_fallback);
+  expect_result_matches_cpu("SELECT k, SUM(x) % COUNT(*) a FROM h GROUP BY k;",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(HugeintFixture,

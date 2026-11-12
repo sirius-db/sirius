@@ -231,5 +231,6 @@ TEST_CASE_METHOD(JoinNullFixture,
   run_ok("CREATE TABLE tuple_l AS SELECT row(id, k) AS k FROM l");
   run_ok("CREATE TABLE tuple_r AS SELECT row(id, k) AS k FROM r");
   run_ok("CHECKPOINT");
-  expect_plan_fallback_matches_cpu("SELECT count(*) FROM tuple_l l JOIN tuple_r r ON l.k = r.k");
+  expect_result_matches_cpu("SELECT count(*) FROM tuple_l l JOIN tuple_r r ON l.k = r.k",
+                            sirius::test::execution_path::plan_time_fallback);
 }

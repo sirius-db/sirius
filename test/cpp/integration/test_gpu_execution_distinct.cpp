@@ -28,8 +28,8 @@
  * -0.0, or NaN and -NaN, prints as whichever member each engine keeps.
  *
  * Every DISTINCT guard throws during `create_plan`, before any GPU work is scheduled, so the
- * guarded shapes use `expect_plan_fallback_matches_cpu` and assert the plan-time fallback counter
- * rather than the runtime one.
+ * guarded shapes call `expect_result_matches_cpu` with `execution_path::plan_time_fallback`, which
+ * asserts a Plan-time Fallback rather than CPU Replay.
  */
 
 #include <catch.hpp>
@@ -337,8 +337,8 @@ TEST_CASE_METHOD(DistinctFixture,
 {
   // This names a specific row per group, and a hash-partitioned dedup would return an arbitrary
   // one: a plausible wrong answer rather than an error.
-  expect_plan_fallback_matches_cpu(
-    "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST");
+  expect_result_matches_cpu("SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -346,7 +346,8 @@ TEST_CASE_METHOD(DistinctFixture,
                  "[integration][gpu_execution][distinct]")
 {
   // Carrying `v` out of each `k` group needs a grouped FIRST, which Sirius cannot lower yet.
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT ON (k) k, v FROM dist_fd");
+  expect_result_matches_cpu("SELECT DISTINCT ON (k) k, v FROM dist_fd",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -355,7 +356,8 @@ TEST_CASE_METHOD(DistinctFixture,
 {
   // `v` is added to the select list after the targets were synthesized from it, so the node is
   // two columns wide with a single target and `v` would need a grouped FIRST.
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT k FROM dist_fd ORDER BY v NULLS LAST");
+  expect_result_matches_cpu("SELECT DISTINCT k FROM dist_fd ORDER BY v NULLS LAST",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -372,7 +374,8 @@ TEST_CASE_METHOD(DistinctFixture,
   auto const prior = prior_result->Collection().GetValue(0, 0);
   {
     sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
-    expect_plan_fallback_matches_cpu("SELECT DISTINCT s_short FROM dist_t");
+    expect_result_matches_cpu("SELECT DISTINCT s_short FROM dist_t",
+                              sirius::test::execution_path::plan_time_fallback);
   }
   // A failed restore would leak nocase into every later integration case.
   REQUIRE(con->Query("SELECT current_setting('default_collation');")->Collection().GetValue(0, 0) ==
@@ -383,7 +386,8 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT ON an expression key falls back at plan time",
                  "[integration][gpu_execution][distinct]")
 {
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT ON (k + v) k, v FROM dist_fd");
+  expect_result_matches_cpu("SELECT DISTINCT ON (k + v) k, v FROM dist_fd",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 /// Floating-point keys carrying every value whose equality is decided by something other than

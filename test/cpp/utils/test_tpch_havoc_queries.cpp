@@ -96,10 +96,10 @@ TEST_CASE("tpch_havoc: every expected outcome names a distinct query once", "[tp
     }
   }
   for (auto const* scan : {"native", "parquet"}) {
-    for (auto const evaluator : sirius::test::expression_evaluator_strategy_names()) {
+    for (auto const evaluator : sirius::all_expression_evaluator_strategies) {
       for (auto const& label : labels) {
         CHECK_NOTHROW(sirius::test::find_tpch_havoc_expectation(
-          expectations, label, scan, std::string{evaluator}));
+          expectations, label, scan, std::string{sirius::strategy_to_string(evaluator)}));
       }
     }
   }

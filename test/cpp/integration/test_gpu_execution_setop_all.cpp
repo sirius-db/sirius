@@ -18,7 +18,7 @@
 // tagged `UNION ALL`, a grouped tag sum, a copies projection and `sirius_physical_replicate`.
 // compare_gpu_vs_cpu asserts one GPU execution and no fallback, so each case proves the lowering
 // ran. Floating-point keys are refused at plan time and checked with
-// expect_plan_fallback_matches_cpu.
+// expect_result_matches_cpu(query, execution_path::plan_time_fallback).
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -261,8 +261,10 @@ TEST_CASE_METHOD(SetOpAllFixture,
     auto const left = "SELECT " + column + " FROM sfloat";
     auto const right =
       "SELECT " + column + " FROM sfloat WHERE " + column + " IS NULL OR " + column + " <> 1.5";
-    expect_plan_fallback_matches_cpu(left + " EXCEPT ALL " + right);
-    expect_plan_fallback_matches_cpu(left + " INTERSECT ALL " + right);
+    expect_result_matches_cpu(left + " EXCEPT ALL " + right,
+                              sirius::test::execution_path::plan_time_fallback);
+    expect_result_matches_cpu(left + " INTERSECT ALL " + right,
+                              sirius::test::execution_path::plan_time_fallback);
   }
 }
 
@@ -274,7 +276,9 @@ TEST_CASE_METHOD(SetOpAllFixture,
   for (std::string const column : {"d", "i"}) {
     auto const left  = "SELECT " + column + " FROM sarray";
     auto const right = "SELECT " + column + " FROM sarray WHERE id <> 3";
-    expect_plan_fallback_matches_cpu(left + " EXCEPT ALL " + right);
-    expect_plan_fallback_matches_cpu(left + " INTERSECT ALL " + right);
+    expect_result_matches_cpu(left + " EXCEPT ALL " + right,
+                              sirius::test::execution_path::plan_time_fallback);
+    expect_result_matches_cpu(left + " INTERSECT ALL " + right,
+                              sirius::test::execution_path::plan_time_fallback);
   }
 }

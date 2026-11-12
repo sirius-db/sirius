@@ -294,6 +294,7 @@ TEST_CASE_METHOD(CrossProductFixture,
                  "[integration][gpu_execution][cross_product][any_join]")
 {
   create_cross_tables(*this);
-  expect_plan_fallback_matches_cpu(
-    "SELECT x, y FROM cp_a LEFT JOIN cp_b ON x + y = 3 OR s = 'b1' ORDER BY x, y;");
+  expect_result_matches_cpu(
+    "SELECT x, y FROM cp_a LEFT JOIN cp_b ON x + y = 3 OR s = 'b1' ORDER BY x, y;",
+    sirius::test::execution_path::plan_time_fallback);
 }

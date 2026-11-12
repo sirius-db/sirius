@@ -21,9 +21,10 @@
 // -- and again on DuckDB CPU, then compares. The zero-fallback assertion is what makes these tests
 // meaningful: a silent CPU fallback would still produce the right answer, so a plain result check
 // would pass whether or not the operator existed. The rest of the set-operation family is asserted
-// the other way round, with expect_plan_fallback_matches_cpu -- those shapes are refused during
-// plan generation, which moves `fallbacks` and leaves `executions` flat, so expect_gpu_fallback
-// (which requires the *runtime* counter to move) would never hold for them.
+// the other way round, with expect_result_matches_cpu(query, execution_path::plan_time_fallback) --
+// those shapes are refused during plan generation, which moves `fallbacks` and leaves `executions`
+// flat, so expect_gpu_fallback (which requires the *runtime* counter to move) would never hold for
+// them.
 //
 // NOT covered here (needs a fixture with a small scan_task_batch_size; the shared integration
 // config uses 100 MB, so these fixtures are one batch per arm): multi-batch streaming,
@@ -257,8 +258,10 @@ TEST_CASE_METHOD(UnionFixture,
   // (`plan_except_intersect` refuses the distinct forms), so this asserts a plan-time fallback.
   // The helper also compares against the CPU result, which is what pins "still the right answer"
   // without a hand-rolled second check.
-  expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
-  expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
+  expect_result_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub",
+                            sirius::test::execution_path::plan_time_fallback);
+  expect_result_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(UnionFixture,
@@ -437,7 +440,8 @@ TEST_CASE_METHOD(UnionFixture,
   auto const prior = prior_result->Collection().GetValue(0, 0);
   {
     sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
-    expect_plan_fallback_matches_cpu("SELECT v FROM ua UNION SELECT v FROM ub");
+    expect_result_matches_cpu("SELECT v FROM ua UNION SELECT v FROM ub",
+                              sirius::test::execution_path::plan_time_fallback);
   }
   // A failed restore would leak nocase into every later integration case.
   REQUIRE(con->Query("SELECT current_setting('default_collation');")->Collection().GetValue(0, 0) ==

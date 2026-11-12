@@ -87,7 +87,8 @@ TEST_CASE_METHOD(StringConstantsFixture,
   sirius::test::scratch_dir const dir{"string_constant_literals"};
   create_string_table(*this, dir);
   sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 16384};
-  sirius::test::scoped_expression_evaluator_strategy const strategy{*con, "nvrtc_jit"};
+  sirius::test::scoped_expression_evaluator_strategy const strategy{
+    *con, sirius::expression_evaluator_strategy::NVRTC_JIT};
 
   compare_gpu_vs_cpu("SELECT count(*), sum(i) FROM t WHERE s = 'k07' OR contains(s, chr(233))");
   auto const kernels = codegen::jit::KernelCache::instance().size();

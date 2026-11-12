@@ -105,5 +105,6 @@ TEST_CASE_METHOD(DecimalIntegerCastFixture,
   compare_gpu_vs_cpu("SELECT id, v::HUGEINT, TRY_CAST(v AS BIGINT), TRY_CAST(v AS UBIGINT) FROM " +
                      source);
   run_ok("SET enable_duckdb_fallback = true;");
-  expect_runtime_fallback_matches_cpu("SELECT id, TRY_CAST(v AS UHUGEINT) FROM " + source);
+  expect_result_matches_cpu("SELECT id, TRY_CAST(v AS UHUGEINT) FROM " + source,
+                            sirius::test::execution_path::cpu_replay);
 }

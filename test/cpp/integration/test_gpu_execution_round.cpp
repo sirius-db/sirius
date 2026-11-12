@@ -100,7 +100,7 @@ TEST_CASE_METHOD(RoundFixture,
   for (auto const* expression :
        {"round(dec, 2)", "round(dec)", "round(b)", "round(d, CAST(id % 3 AS INTEGER))"}) {
     CAPTURE(expression);
-    expect_plan_fallback_matches_cpu(std::string("SELECT id, ") + expression +
-                                     " AS r FROM round_t");
+    expect_result_matches_cpu(std::string("SELECT id, ") + expression + " AS r FROM round_t",
+                              sirius::test::execution_path::plan_time_fallback);
   }
 }

@@ -32,7 +32,7 @@
 namespace {
 class DateArithmeticFixture : public sirius::test::GpuExecutionFixture {
  public:
-  void strategy(std::string_view value)
+  void strategy(sirius::expression_evaluator_strategy value)
   {
     run_ok("SET gpu_execution = false");
     run_ok("SET enable_duckdb_fallback = false");

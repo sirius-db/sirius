@@ -48,7 +48,7 @@ TEST_CASE_METHOD(ExpressionFallbackFixture,
                             "SELECT s FROM expr_t WHERE TRY(s IS NOT NULL);",
                             "SELECT s FROM expr_t WHERE TRY(CAST(s AS INTEGER) > 0);"}) {
     CAPTURE(query);
-    expect_plan_fallback_matches_cpu(query);
+    expect_result_matches_cpu(query, sirius::test::execution_path::plan_time_fallback);
   }
 }
 
@@ -62,11 +62,14 @@ TEST_CASE_METHOD(ExpressionFallbackFixture,
     for (auto const* column : {"d", "ts"}) {
       CAPTURE(column);
       auto const expr = std::string("date_trunc('") + unit + "', " + column + ")";
-      expect_plan_fallback_matches_cpu("SELECT " + expr + " FROM expr_t;");
-      expect_plan_fallback_matches_cpu("SELECT s FROM expr_t WHERE " + expr + " IS NOT NULL;");
+      expect_result_matches_cpu("SELECT " + expr + " FROM expr_t;",
+                                sirius::test::execution_path::plan_time_fallback);
+      expect_result_matches_cpu("SELECT s FROM expr_t WHERE " + expr + " IS NOT NULL;",
+                                sirius::test::execution_path::plan_time_fallback);
     }
   }
-  expect_plan_fallback_matches_cpu("SELECT date_trunc(unit, ts) FROM expr_t;");
+  expect_result_matches_cpu("SELECT date_trunc(unit, ts) FROM expr_t;",
+                            sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(ExpressionFallbackFixture,

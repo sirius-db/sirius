@@ -288,8 +288,9 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
                  "gpu_execution mixed plain + null-safe MARK join falls back at plan time",
                  "[integration][gpu_execution][join][nulls]")
 {
-  expect_plan_fallback_matches_cpu(
-    "SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS in_b FROM mnl");
+  expect_result_matches_cpu(
+    "SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS in_b FROM mnl",
+    sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
@@ -419,7 +420,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   // Correlated IN mixes a null-safe correlation key with the plain IN key; that MARK shape is
   // rejected at plan time and runs on the CPU (unchanged by partitioning).
-  expect_plan_fallback_matches_cpu(
+  expect_result_matches_cpu(
     "SELECT in_k, count(*) FROM (SELECT ppl.k IN (SELECT ppr_nulls.k FROM ppr_nulls WHERE "
-    "ppr_nulls.g = ppl.g) AS in_k FROM ppl) GROUP BY in_k");
+    "ppr_nulls.g = ppl.g) AS in_k FROM ppl) GROUP BY in_k",
+    sirius::test::execution_path::plan_time_fallback);
 }

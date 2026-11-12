@@ -65,7 +65,7 @@ class UnfoldedConstantsFixture : public sirius::test::GpuExecutionFixture {
   {
     CAPTURE(query);
     require_coalesce_removed(query);
-    for (auto const strategy : sirius::test::expression_evaluator_strategy_names()) {
+    for (auto const strategy : sirius::all_expression_evaluator_strategies) {
       CAPTURE(strategy);
       sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
       compare_gpu_vs_cpu(query);

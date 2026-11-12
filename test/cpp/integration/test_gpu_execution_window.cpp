@@ -236,12 +236,16 @@ TEST_CASE_METHOD(WindowFixture,
                  "unsupported SQL window semantics retain CPU fallback",
                  "[integration][gpu_execution][window_sql]")
 {
-  expect_plan_fallback_matches_cpu("SELECT id,sum(v) OVER (ORDER BY id) FROM w");
-  expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");
-  expect_plan_fallback_matches_cpu("SELECT sum(v::DECIMAL(4,0)) OVER () FROM w");
-  expect_plan_fallback_matches_cpu(
+  expect_result_matches_cpu("SELECT id,sum(v) OVER (ORDER BY id) FROM w",
+                            sirius::test::execution_path::plan_time_fallback);
+  expect_result_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w",
+                            sirius::test::execution_path::plan_time_fallback);
+  expect_result_matches_cpu("SELECT sum(v::DECIMAL(4,0)) OVER () FROM w",
+                            sirius::test::execution_path::plan_time_fallback);
+  expect_result_matches_cpu(
     "SELECT sum(s) OVER (PARTITION BY p) FROM "
-    "(SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t");
+    "(SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t",
+    sirius::test::execution_path::plan_time_fallback);
 }
 
 TEST_CASE_METHOD(WindowFixture,

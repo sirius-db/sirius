@@ -196,7 +196,7 @@ class GPUExecutionFixtureBase {
    * Evaluator Strategy @p strategy, retrying once when `spec.retry_once` is set.
    */
   void compare_tpch_query_with_strategy(sirius::test::tpch_query_spec const& spec,
-                                        std::string_view strategy)
+                                        sirius::expression_evaluator_strategy strategy)
   {
     auto const run = [&] {
       if (!bind_env(1)) { return; }
@@ -4466,12 +4466,13 @@ TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
 // The 22 queries again under nvrtc_jit, on one GPU over the native scan. Each process compiles a
 // kernel once per expression shape; CI keeps the on-disk kernel cache (SIMPATICO_JIT_CACHE_DIR)
 // warm across runs.
-#define TPCH_NVRTC_TEST_CASE(n)                                                       \
-  TEST_CASE_METHOD(GPUExecutionDuckDBFixture,                                         \
-                   "gpu_execution - TPC-H Query " #n " nvrtc_jit",                    \
-                   "[integration][gpu_execution][TPC-H][Q" #n "][nvrtc_jit]")         \
-  {                                                                                   \
-    compare_tpch_query_with_strategy(sirius::test::kTpchQueries[n - 1], "nvrtc_jit"); \
+#define TPCH_NVRTC_TEST_CASE(n)                                                         \
+  TEST_CASE_METHOD(GPUExecutionDuckDBFixture,                                           \
+                   "gpu_execution - TPC-H Query " #n " nvrtc_jit",                      \
+                   "[integration][gpu_execution][TPC-H][Q" #n "][nvrtc_jit]")           \
+  {                                                                                     \
+    compare_tpch_query_with_strategy(sirius::test::kTpchQueries[n - 1],                 \
+                                     sirius::expression_evaluator_strategy::NVRTC_JIT); \
   }
 
 TPCH_NVRTC_TEST_CASE(1)

@@ -54,23 +54,27 @@ TEST_CASE_METHOD(
   create_distinct_table(*this);
   SECTION("SUM(DISTINCT)")
   {
-    expect_plan_fallback_matches_cpu("SELECT g, sum(DISTINCT v) s FROM da_t GROUP BY g;");
+    expect_result_matches_cpu("SELECT g, sum(DISTINCT v) s FROM da_t GROUP BY g;",
+                              sirius::test::execution_path::plan_time_fallback);
   }
   SECTION("SUM(DISTINCT) with a FILTER clause")
   {
-    expect_plan_fallback_matches_cpu(
-      "SELECT g, sum(DISTINCT v) FILTER (WHERE v < 2) s FROM da_t GROUP BY g;");
+    expect_result_matches_cpu(
+      "SELECT g, sum(DISTINCT v) FILTER (WHERE v < 2) s FROM da_t GROUP BY g;",
+      sirius::test::execution_path::plan_time_fallback);
   }
   SECTION("multi-column COUNT(DISTINCT) with a FILTER clause")
   {
     // The FILTER mask would need a NULL STRUCT, which the GPU evaluator cannot build.
-    expect_plan_fallback_matches_cpu(
-      "SELECT g, count(DISTINCT (v, s)) FILTER (WHERE v < 2) c FROM da_t GROUP BY g;");
+    expect_result_matches_cpu(
+      "SELECT g, count(DISTINCT (v, s)) FILTER (WHERE v < 2) c FROM da_t GROUP BY g;",
+      sirius::test::execution_path::plan_time_fallback);
   }
   SECTION("SUM(DISTINCT) and AVG(DISTINCT) next to COUNT(DISTINCT)")
   {
-    expect_plan_fallback_matches_cpu(
-      "SELECT g, count(DISTINCT v) c, sum(DISTINCT v) s, avg(DISTINCT v) a FROM da_t GROUP BY g;");
+    expect_result_matches_cpu(
+      "SELECT g, count(DISTINCT v) c, sum(DISTINCT v) s, avg(DISTINCT v) a FROM da_t GROUP BY g;",
+      sirius::test::execution_path::plan_time_fallback);
   }
 }
 
@@ -82,16 +86,18 @@ TEST_CASE_METHOD(
   create_distinct_table(*this);
   SECTION("SUM and AVG with DISTINCT")
   {
-    expect_plan_fallback_matches_cpu("SELECT sum(DISTINCT v) s, avg(DISTINCT v) a FROM da_t;");
+    expect_result_matches_cpu("SELECT sum(DISTINCT v) s, avg(DISTINCT v) a FROM da_t;",
+                              sirius::test::execution_path::plan_time_fallback);
   }
   SECTION("multi-column COUNT(DISTINCT)")
   {
-    expect_plan_fallback_matches_cpu("SELECT count(DISTINCT (g, v)) c FROM da_t;");
+    expect_result_matches_cpu("SELECT count(DISTINCT (g, v)) c FROM da_t;",
+                              sirius::test::execution_path::plan_time_fallback);
   }
   SECTION("multi-column COUNT(DISTINCT) with a FILTER clause")
   {
-    expect_plan_fallback_matches_cpu(
-      "SELECT count(DISTINCT (g, v)) FILTER (WHERE v < 2) c FROM da_t;");
+    expect_result_matches_cpu("SELECT count(DISTINCT (g, v)) FILTER (WHERE v < 2) c FROM da_t;",
+                              sirius::test::execution_path::plan_time_fallback);
   }
 }
 

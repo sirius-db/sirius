@@ -55,8 +55,9 @@ TEST_CASE_METHOD(SingleJoinFixture,
   }
   SECTION("with LIMIT 1 falls back: the correlated LIMIT decorrelates through a window")
   {
-    expect_plan_fallback_matches_cpu(
-      "SELECT a.id, (SELECT b.v FROM sj_b b WHERE b.k = a.k LIMIT 1) v FROM sj_a a;");
+    expect_result_matches_cpu(
+      "SELECT a.id, (SELECT b.v FROM sj_b b WHERE b.k = a.k LIMIT 1) v FROM sj_a a;",
+      sirius::test::execution_path::plan_time_fallback);
   }
   SECTION("in a predicate")
   {

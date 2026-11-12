@@ -119,8 +119,11 @@ class tpch_havoc_fixture {
 
   /// Runs every distinct variant of `base_query`, one DYNAMIC_SECTION per variant, so
   /// `-c Q05_V03` runs a single query.
-  void run_base_query(int base_query, std::string const& scan, std::string const& evaluator)
+  void run_base_query(int base_query,
+                      std::string const& scan,
+                      sirius::expression_evaluator_strategy strategy)
   {
+    std::string const evaluator{sirius::strategy_to_string(strategy)};
     auto const dir = sirius::test::tpch_havoc_dir();
     if (!dir) { SKIP("TPC-Havoc queries not downloaded: configured with -DSIRIUS_TPCH_HAVOC=OFF"); }
     for (auto const& query : havoc_queries()) {
@@ -128,7 +131,7 @@ class tpch_havoc_fixture {
       DYNAMIC_SECTION(query.label)
       {
         set_up(scan);
-        sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con_, evaluator};
+        sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con_, strategy};
         run_variant(query, scan, evaluator);
       }
     }
@@ -254,30 +257,32 @@ class tpch_havoc_fixture {
 // One TEST_CASE per TPC-H query keeps the CI shards balanced. PR CI runs the native scan with the
 // default evaluator; the parquet, ast_jit and nvrtc_jit runs are hidden until their runtime is
 // measured.
-#define TPCH_HAVOC_TEST_CASES(nn)                                                     \
-  TEST_CASE_METHOD(tpch_havoc_fixture,                                                \
-                   "gpu_execution - TPC-Havoc Q" #nn,                                 \
-                   "[integration][gpu_execution][TPC-Havoc][Q" #nn "]")               \
-  {                                                                                   \
-    run_base_query(std::stoi(#nn), "native", "ast_interpret");                        \
-  }                                                                                   \
-  TEST_CASE_METHOD(tpch_havoc_fixture,                                                \
-                   "gpu_execution - TPC-Havoc Q" #nn " parquet",                      \
-                   "[.][integration][gpu_execution][parquet][TPC-Havoc][Q" #nn "]")   \
-  {                                                                                   \
-    run_base_query(std::stoi(#nn), "parquet", "ast_interpret");                       \
-  }                                                                                   \
-  TEST_CASE_METHOD(tpch_havoc_fixture,                                                \
-                   "gpu_execution - TPC-Havoc Q" #nn " ast_jit",                      \
-                   "[.][integration][gpu_execution][ast_jit][TPC-Havoc][Q" #nn "]")   \
-  {                                                                                   \
-    run_base_query(std::stoi(#nn), "native", "ast_jit");                              \
-  }                                                                                   \
-  TEST_CASE_METHOD(tpch_havoc_fixture,                                                \
-                   "gpu_execution - TPC-Havoc Q" #nn " nvrtc_jit",                    \
-                   "[.][integration][gpu_execution][nvrtc_jit][TPC-Havoc][Q" #nn "]") \
-  {                                                                                   \
-    run_base_query(std::stoi(#nn), "native", "nvrtc_jit");                            \
+#define TPCH_HAVOC_TEST_CASES(nn)                                                               \
+  TEST_CASE_METHOD(tpch_havoc_fixture,                                                          \
+                   "gpu_execution - TPC-Havoc Q" #nn,                                           \
+                   "[integration][gpu_execution][TPC-Havoc][Q" #nn "]")                         \
+  {                                                                                             \
+    run_base_query(                                                                             \
+      std::stoi(#nn), "native", sirius::expression_evaluator_strategy::AST_INTERPRET);          \
+  }                                                                                             \
+  TEST_CASE_METHOD(tpch_havoc_fixture,                                                          \
+                   "gpu_execution - TPC-Havoc Q" #nn " parquet",                                \
+                   "[.][integration][gpu_execution][parquet][TPC-Havoc][Q" #nn "]")             \
+  {                                                                                             \
+    run_base_query(                                                                             \
+      std::stoi(#nn), "parquet", sirius::expression_evaluator_strategy::AST_INTERPRET);         \
+  }                                                                                             \
+  TEST_CASE_METHOD(tpch_havoc_fixture,                                                          \
+                   "gpu_execution - TPC-Havoc Q" #nn " ast_jit",                                \
+                   "[.][integration][gpu_execution][ast_jit][TPC-Havoc][Q" #nn "]")             \
+  {                                                                                             \
+    run_base_query(std::stoi(#nn), "native", sirius::expression_evaluator_strategy::AST_JIT);   \
+  }                                                                                             \
+  TEST_CASE_METHOD(tpch_havoc_fixture,                                                          \
+                   "gpu_execution - TPC-Havoc Q" #nn " nvrtc_jit",                              \
+                   "[.][integration][gpu_execution][nvrtc_jit][TPC-Havoc][Q" #nn "]")           \
+  {                                                                                             \
+    run_base_query(std::stoi(#nn), "native", sirius::expression_evaluator_strategy::NVRTC_JIT); \
   }
 
 TPCH_HAVOC_TEST_CASES(01)
