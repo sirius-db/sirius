@@ -83,6 +83,7 @@
 #include "planner/sirius_plan_window.hpp"
 #include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/preparation_ledger.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -444,19 +445,6 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   info->table_path = scan_op.parameters.front().GetValue<std::string>();
 
-  // Second line of the gate in sirius_plan_get.cpp, which already declines an unpinned scan: a
-  // caller reaching here without an id must fail loudly rather than read "current" a third time.
-  // Deriving one here is not a fallback -- see that gate for why every derivation is unsound.
-  auto const sid_it = scan_op.named_parameters.find("snapshot_from_id");
-  if (sid_it == scan_op.named_parameters.end() || sid_it->second.IsNull()) {
-    throw duckdb::NotImplementedException(
-      "iceberg_scan reached GPU physical planning without 'snapshot_from_id': the snapshot its "
-      "delete files must be read from is unknown, and reading them from whatever is current now "
-      "risks pairing one snapshot's data files with another's deletes");
-  }
-  std::optional<uint64_t> const snapshot_id =
-    static_cast<uint64_t>(sid_it->second.GetValue<int64_t>());
-
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
     throw duckdb::NotImplementedException(
@@ -482,12 +470,8 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data =
-      sirius::op::scan::load_delete_payload(context,
-                                            info->table_path,
-                                            sirius_ctx->get_scan_manager().shared_io_ctx(),
-                                            snapshot_id,
-                                            discovery);
+    info->delete_data = sirius::op::scan::load_delete_payload(
+      context, info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -739,15 +723,10 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started = std::chrono::steady_clock::now();
-      auto sid =
-        static_cast<uint64_t>(c.scan->named_parameters.at("snapshot_from_id").GetValue<int64_t>());
-      c.info->delete_data = load_delete_payload(context,
-                                                c.info->table_path,
-                                                sirius_ctx->get_scan_manager().shared_io_ctx(),
-                                                sid,
-                                                *c.discovery);
-      auto us             = std::chrono::duration_cast<std::chrono::microseconds>(
+      auto started        = std::chrono::steady_clock::now();
+      c.info->delete_data = load_delete_payload(
+        context, c.info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), *c.discovery);
+      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();
       c.scan->read_views->record_delete_preparation(c.scan->contract_id, us);
@@ -2423,8 +2402,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   };
   try {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
-    validate_window_stages(*op);
-    plan = create_plan(*op);
+    plan       = create_plan(*op);
   } catch (duckdb::NotImplementedException const&) {
     // A pre-capture refusal used to throw before parent planning. Preserve
     // that first error if a later ordinary planner decline aborts tree build.
@@ -2435,6 +2413,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
+    throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
     throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use
@@ -2475,6 +2456,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
+    throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
     throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use
@@ -2707,10 +2691,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   if (!plan) { throw duckdb::InternalException("Physical plan generator - no plan generated"); }
 
   plan->estimated_cardinality = op.estimated_cardinality;
-#ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
-  auto verify = duckdb::make_uniq<duckdb::PhysicalVerifyVector>(std::move(plan));
-  plan        = std::move(verify);
-#endif
 
   return plan;
 }

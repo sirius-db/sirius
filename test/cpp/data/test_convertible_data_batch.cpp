@@ -30,7 +30,9 @@
 #include <data/convertible_data_batch.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -339,6 +341,30 @@ TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[conver
   REQUIRE(size > 0);
   REQUIRE(size == get_batch_size(*batch));
   REQUIRE(wrapper.bytes_in_space(e.host_space) == 0);
+}
+
+// The executor sizes its candidates on its one processing thread; a batch that another thread
+// took exclusively after the snapshot must not stall it, and counts as nothing to move.
+TEST_CASE("convertible_data_batch bytes_in_space does not wait on an exclusively held batch",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  auto batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  sirius::convertible_data_batch wrapper(batch, e.gpu_space);
+
+  std::optional<cucascade::mutable_data_batch> held;
+  held.emplace(batch->to_mutable());
+
+  auto probe = std::async(std::launch::async, [&] { return wrapper.bytes_in_space(e.gpu_space); });
+  bool const returned = probe.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  CHECK(returned);
+  held.reset();  // release before joining, so a probe that blocked can still finish
+  auto const bytes = probe.get();
+  REQUIRE(returned);
+  REQUIRE(bytes == 0);
+  REQUIRE(wrapper.bytes_in_space(e.gpu_space) == get_batch_size(*batch));
 }
 
 TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",

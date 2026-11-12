@@ -425,14 +425,33 @@ else
 fi
 
 if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]} -gt 0 ]; then
+    # Date-named logs sort chronologically; a query can span the midnight rotation.
+    LOG_FILES=()
     LOG_FILE=""
     for f in "$OUTPUT_DIR"/sirius*.log; do
-        [ -f "$f" ] && LOG_FILE="$f"
+        [ -f "$f" ] && LOG_FILES+=("$f")
     done
+    if [ "${#LOG_FILES[@]}" -eq 1 ]; then
+        LOG_FILE="${LOG_FILES[0]}"
+    elif [ "${#LOG_FILES[@]}" -gt 1 ]; then
+        MERGED_LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/tpch_gpu_log_XXXXXX.log")
+        if [ -n "$MERGED_LOG_FILE" ]; then
+            trap 'rm -f -- "$MERGED_LOG_FILE"' EXIT
+        fi
+        if [ -n "$MERGED_LOG_FILE" ] && cat -- "${LOG_FILES[@]}" > "$MERGED_LOG_FILE"; then
+            LOG_FILE="$MERGED_LOG_FILE"
+        else
+            echo "WARNING: could not combine Sirius logs for per-query validation." >&2
+        fi
+    fi
     if [ -n "$LOG_FILE" ]; then
         echo ""
         echo "Splitting Sirius log per query (${NUM_ITERATIONS} iterations per query)..."
-        readarray -t QB_LINES < <(grep -n 'QueryBegin: call' "$LOG_FILE" | cut -d: -f1)
+        readarray -t QB_LINES < <(
+            grep -nE 'QueryBegin: (instance=[^ ]+ connection=[^ ]+ query=[^ ]+ )?SQL: ' "$LOG_FILE" \
+                | grep -ivE 'QueryBegin: (instance=[^ ]+ connection=[^ ]+ query=[^ ]+ )?SQL: (LOAD |SET )' \
+                | cut -d: -f1
+        )
         TOTAL_LOG_LINES=$(wc -l < "$LOG_FILE")
 
         for ((i = 0; i < ${#VALID_QUERIES[@]}; i++)); do

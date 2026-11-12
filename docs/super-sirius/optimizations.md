@@ -151,6 +151,44 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Correlated EXISTS MIN/MAX Rewrite
+
+**Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
+
+**Mechanism:** `rewrite_correlated_inequality_exists` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), before column bindings are resolved, so a replacement only has to emit the same bindings as the nodes it replaces. If it throws, the plan is copied again without it. It matches each subquery in either shape DuckDB produces:
+
+```
+delim_join_as_cte = false:  DELIM_JOIN (SEMI/ANTI, or MARK under FILTER(mark); IS NOT DISTINCT FROM)
+                             ├─ outer rows
+                             └─ [PROJECTION...] ← INNER JOIN(T, DELIM_GET) on  t.k = d.k  AND  t.x <> d.x
+delim_join_as_cte = true:   [RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = outer.k  AND  t.x <> outer.x
+```
+
+Either comparison may be null-safe (`IS NOT DISTINCT FROM` for the key, `IS DISTINCT FROM` for the value). Two or more matched joins nested through their outer rows whose scans read the same source (`capture_bound_read_view`) on the same base key column are replaced together, with one scan of `T`:
+
+```
+FILTER   EXISTS:     mn <> outer.x OR mx <> outer.x      (per subquery; projection map: the original columns)
+         NOT EXISTS: (that) IS NULL OR NOT (that)
+ └─ LEFT DELIM_JOIN on outer.k IS NOT DISTINCT FROM a.k
+     ├─ outer rows
+     └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
+          ← INNER JOIN(T, DELIM_GET(k))
+```
+
+`EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
+
+Plain SEMI/ANTI joins (`delim_join_as_cte = true`) over a table pinned in GPU memory, with every column they read, are left unmerged unless they are estimated not to fit on the GPU. Each such join scans its subquery's table and hashes its rows. That beats the merged aggregate only when the scans are cheap and the rows fit: q21 at SF1000 on a GB300 runs in 0.475 s unmerged against 0.531 s merged with `lineitem` pinned in GPU memory, but 8.2 s against 6.5 s without the pin. On a 32 GB RTX 4500 reading from S3, merging wins at SF1000 (10.7 s against 11.7 s) and at SF3000, where the unmerged joins spill (271 s against 54 s). The size estimate is the largest subquery scan's base-table row count times its key and value widths, since DuckDB's estimates of the subqueries' filters can be several times too low. The budget is the smallest GPU's downgrade threshold (`downgrade_trigger_fraction` of its capacity). Delim joins are merged regardless, as the merge was faster in every measured case.
+
+Because the merged plan reads one view fewer times than the original, `compare_read_views` (`src/transparent/read_view_registry.cpp`) accepts a candidate that reads an identical view fewer times, while still rejecting one that reads a new view, reads a view more often, or drops the only scan of a view.
+
+**Limits:**
+- Exactly one key and one value correlation, on an `INTEGER`/`BIGINT` key. The value must be an integer, fixed-point, temporal or duration type.
+- With `delim_join_as_cte = true`, plans where DuckDB keeps the delim join as a MARK join over a CTE scan (filtered or nullable subqueries) are not matched.
+
+**Code path:** `src/planner/sirius_plan_exists_rewrite.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`
+
+**Config:** `enable_exists_minmax_rewrite` (default `true`, see [Configuration](configuration.md)).
+
 ### Sorted-Key Grouped Aggregation
 
 **Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
@@ -222,17 +260,17 @@ Parquet scans declare no PRIMARY KEY; for them, [Pin-Proven Unique Join Keys](#p
 **Motivation:** The distinct hash join needs a proof that the build keys are unique, and for a base table the only proof was a declared PRIMARY KEY. Parquet tables declare none, so every join over pinned parquet took the two-pass `cudf::hash_join` (a count pass, then a retrieve pass), even for keys such as `o_orderkey` or `s_suppkey`. The runtime distinctness check is off by default (issue #1600).
 
 **Mechanism:** Two parts:
-1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports an output column whose pinned column was proven distinct at pin time. Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
-2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column automatically, in addition to the columns late materialization names. An automatic column must be an integer, and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`.
+1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports every output column whose pinned column was proven distinct at pin time, each as a key on its own (`prove_unique_columns()` tracks alternative keys, so a join on any one of them is proven). Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
+2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column of a parquet pin (and of a native table's pin when late materialization is on). A column must be an integer (or any column of a table under one million rows, such as `nation.n_name`, which a late-materialization ride can use), and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`; when it, the free GPU memory or a reservation is short, integer columns keep their check ahead of the others.
 
 Composite keys are not covered, because the proof is per column.
 
 **Code path:**
 - `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_from_pin()`, `prove_unique_columns()`
-- `src/late_mat/pin_uniqueness.cpp` — `pin_unique_automatic_selection()`, `unique_probe`, `exact_uniqueness_byte_cap()`
-- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — selection and attaching the facts
+- `src/late_mat/pin_uniqueness.cpp` — `unique_probe`, `exact_uniqueness_byte_cap()`
+- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — which pins are observed, and attaching the facts
 
-**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the automatic probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `n_name`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
+**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
 
 ### Scan Scheduling Tuning (PR #507)
 
@@ -456,8 +494,8 @@ distinctness proof.
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
 
 **Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
-`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
-which no group-by-rowid ride is admissible. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+The pin-time uniqueness probe (`pin_table_prove_unique_keys`, on by default) supplies the proof
+that a group-by-rowid ride needs. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
 floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.

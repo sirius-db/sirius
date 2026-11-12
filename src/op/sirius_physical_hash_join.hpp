@@ -34,7 +34,6 @@
 #include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
-#include "utils.hpp"
 
 #include <cudf/join/hash_join.hpp>
 #include <cudf/types.hpp>

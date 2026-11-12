@@ -49,6 +49,7 @@
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
@@ -1589,6 +1590,56 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
 }
 
+// Each distinct set operation deduplicates its own rows, so the DISTINCT the binder puts over it
+// must add no HASH_GROUP_BY. Any DISTINCT that can still remove rows keeps its own.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - DISTINCT over a deduplicating set operation plans no aggregate",
+                 "[plan_tree_shape][isolated_context]")
+{
+  auto const group_by_count = [&](std::string const& query) {
+    auto plan = generate_sirius_plan(*con, query);
+    UNSCOPED_INFO(query << '\n' << tree_to_string(plan.get()));
+    return collect(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY).size();
+  };
+
+  SECTION("distinct EXCEPT and INTERSECT deduplicate once")
+  {
+    for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
+      std::string const setop =
+        "SELECT id, val FROM big_left " + keyword + " SELECT rid, other FROM small_right";
+      CHECK(group_by_count(setop) == 1);
+      CHECK(group_by_count(setop + " ORDER BY 1") == 1);
+      // The reordering projection sits above the DISTINCT, not between it and the set operation.
+      CHECK(group_by_count("SELECT val, id FROM (" + setop + ")") == 1);
+    }
+  }
+
+  SECTION("nested set operations deduplicate once each")
+  {
+    CHECK(group_by_count("(SELECT id FROM big_left EXCEPT SELECT rid FROM small_right) "
+                         "INTERSECT SELECT id FROM big_left") == 2);
+  }
+
+  SECTION("UNION keeps its single DISTINCT")
+  {
+    // The binder plans UNION as UNION ALL under the DISTINCT, so that DISTINCT is the only dedup.
+    CHECK(group_by_count("SELECT id FROM big_left UNION SELECT rid FROM small_right") == 1);
+  }
+
+  SECTION("a DISTINCT on fewer columns than the set operation still deduplicates")
+  {
+    CHECK(group_by_count("SELECT DISTINCT id FROM (SELECT id, val FROM big_left EXCEPT "
+                         "SELECT rid, other FROM small_right)") == 2);
+  }
+
+  SECTION("a DISTINCT over an ALL form still deduplicates")
+  {
+    // One HASH_GROUP_BY counts the ALL form's rows per key; the DISTINCT adds the second.
+    CHECK(group_by_count("SELECT DISTINCT * FROM (SELECT id FROM big_left EXCEPT ALL "
+                         "SELECT rid FROM small_right)") == 2);
+  }
+}
+
 TEST_CASE_METHOD(
   plan_tree_shape_fixture,
   "plan tree shape - carried DISTINCT columns lower to an all-FIRST grouped aggregate",
@@ -2153,11 +2204,11 @@ TEST_CASE("require_planned_schema accepts only the declared type", "[plan_tree_s
     generator::require_planned_schema(std::span{&planned, 1}, {declared}, "probe");
   };
   CHECK_NOTHROW(require(hugeint, LogicalType::HUGEINT));
-  CHECK_THROWS_AS(require(bigint, LogicalType::HUGEINT), duckdb::NotImplementedException);
+  CHECK_THROWS_AS(require(bigint, LogicalType::HUGEINT), sirius::not_implemented_exception);
   CHECK_NOTHROW(require(bigint, LogicalType::BIGINT));
   CHECK_THROWS_WITH(require(hugeint, LogicalType::BIGINT),
                     Catch::Matchers::ContainsSubstring("probe: the planned input has"));
-  CHECK_THROWS_AS(require(integer, LogicalType::BIGINT), duckdb::NotImplementedException);
+  CHECK_THROWS_AS(require(integer, LogicalType::BIGINT), sirius::not_implemented_exception);
   CHECK_THROWS_WITH(generator::require_planned_schema(std::span{&bigint, 1}, {}, "probe"),
                     Catch::Matchers::ContainsSubstring("has 1 column but the node declares 0"));
 }

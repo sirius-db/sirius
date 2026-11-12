@@ -17,7 +17,8 @@
 #include "op/window/whole_partition.hpp"
 
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/aggregate/wide_integer_sum.hpp"
+#include "op/window/aggregate_types.hpp"
+#include "op/window/float_extremum.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -27,45 +28,17 @@
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/scalar/scalar_factories.hpp>
-#include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <unordered_set>
 
 namespace sirius::op {
+
 namespace {
-
-// The type a `sum` over `input` accumulates in.
-cudf::data_type accumulator_type(cudf::data_type input)
-{
-  using cudf::type_id;
-  switch (input.id()) {
-    case type_id::INT8:
-    case type_id::INT16:
-    case type_id::INT32:
-    case type_id::INT64: return wide_integer_sum_type();
-    case type_id::DECIMAL32:
-    case type_id::DECIMAL64:
-    case type_id::DECIMAL128: return cudf::data_type{type_id::DECIMAL128, input.scale()};
-    case type_id::FLOAT32:
-    case type_id::FLOAT64: return cudf::data_type{type_id::FLOAT64};
-    default: throw std::invalid_argument("Unsupported whole-partition window argument type");
-  }
-}
-
-// An 8 to 32 bit integer has a magnitude of at most 2^31 and a column holds fewer than 2^31 rows,
-// so the sum of a partition fits INT64.
-bool is_narrow_integer(cudf::data_type type)
-{
-  return type.id() == cudf::type_id::INT8 || type.id() == cudf::type_id::INT16 ||
-         type.id() == cudf::type_id::INT32;
-}
 
 // Throws unless `type` is supported as a partition column.
 void validate_key(cudf::data_type type)
@@ -132,20 +105,6 @@ std::unique_ptr<Base> simple_aggregation(aggregate_id function)
       return cudf::make_count_aggregation<Base>(cudf::null_policy::INCLUDE);
     case aggregate_id::min: return cudf::make_min_aggregation<Base>();
     case aggregate_id::max: return cudf::make_max_aggregation<Base>();
-    default: throw std::invalid_argument("Unsupported whole-partition window function");
-  }
-}
-
-// The type of the result column of `agg` over an argument of type `input`.
-cudf::data_type result_type(whole_partition_aggregate const& agg, cudf::data_type input)
-{
-  switch (agg.function) {
-    case aggregate_id::sum: return accumulator_type(input);
-    case aggregate_id::avg: return cudf::data_type{cudf::type_id::FLOAT64};
-    case aggregate_id::count:
-    case aggregate_id::count_star: return cudf::data_type{cudf::type_id::INT64};
-    case aggregate_id::min:
-    case aggregate_id::max: return input;
     default: throw std::invalid_argument("Unsupported whole-partition window function");
   }
 }
@@ -256,7 +215,8 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   //   1. Validate the request and group the `sum` and `avg` aggregates by argument column, so
   //      aggregates over one column share one sum.
   //   2. Build the group by requests: one per shared sum, then one per `count`, `count_star`,
-  //      `min` and `max`. A floating point `min` or `max` also gets counts that restore NaN.
+  //      `min` and `max`. A floating point `min` or `max` over an argument with NaN also gets the
+  //      maximum of its NaN flags, which restores NaN.
   //   3. Run the requests as a group by, or as reductions without partition columns.
   //   4. Turn the group results of each argument into its sum and average, checking overflow.
   //   5. Collect one column per aggregate in request order, restoring NaN in `min` and `max`.
@@ -278,7 +238,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   std::vector<std::size_t> argument_indices;
   for (auto const& agg : aggregates) {
     check_index(agg.argument_column);
-    (void)result_type(agg, input.column(agg.argument_column).type());
+    (void)window_result_type(agg.function, input.column(agg.argument_column).type());
     if (!uses_sum(agg.function)) {
       argument_indices.push_back(0);  // Assigned after the shared SUM/AVG requests below.
       continue;
@@ -297,7 +257,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   if (input.num_rows() == 0) {
     std::vector<std::unique_ptr<cudf::column>> empty;
     for (auto const& agg : aggregates) {
-      auto type = result_type(agg, input.column(agg.argument_column).type());
+      auto type = window_result_type(agg.function, input.column(agg.argument_column).type());
       empty.push_back(cudf::make_empty_column(type));
     }
     return std::make_unique<cudf::table>(std::move(empty));
@@ -309,7 +269,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   auto const in_place = sums_in_place(input, arguments, stream, mr);
   for (auto& arg : arguments) {
     auto values = input.column(arg.column);
-    auto type   = accumulator_type(values.type());
+    auto type   = window_sum_type(values.type());
     if (is_narrow_integer(values.type())) {
       type = cudf::data_type{cudf::type_id::INT64};
     } else if (in_place.contains(arg.column)) {
@@ -328,10 +288,18 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     requests.push_back(std::move(request));
   }
 
+  // A floating point `min` or `max` over an argument with NaN takes the extremum of a copy with NaN
+  // replaced by NULL, and the maximum of the NaN flags restores NaN in step 5 (see
+  // float_extremum.hpp). Aggregates over one column share its flags and copy.
+  struct prepared_argument {
+    cudf::size_type column;
+    nan_free_argument nan_free;
+    // The request of the maximum of the NaN flags, shared by the `min` and `max` of the column.
+    std::optional<std::size_t> flag_request;
+  };
+  std::vector<prepared_argument> nan_free_arguments;
   std::vector<whole_partition_aggregate> simple_aggregates;
-  std::vector<std::unique_ptr<cudf::column>> finite_arguments;
-  std::vector<cudf::size_type> finite_argument_columns;
-  std::vector<std::optional<std::size_t>> nan_count_indices(aggregates.size());
+  std::vector<std::optional<std::size_t>> nan_flag_indices(aggregates.size());
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
     auto const& agg = aggregates[i];
     if (uses_sum(agg.function)) { continue; }
@@ -339,37 +307,34 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     simple_aggregates.push_back(agg);
     cudf::groupby::aggregation_request request;
     request.values = input.column(agg.argument_column);
-    auto const float_extrema =
-      (agg.function == aggregate_id::min || agg.function == aggregate_id::max) &&
-      cudf::is_floating_point(request.values.type());
-    if (float_extrema) {
-      // NaN orders above every other value. Floating point extrema ignore NaN, and the NaN
-      // results are restored afterwards from the counts. Aggregates over one column share
-      // one NaN free copy.
-      auto const existing = std::find(
-        finite_argument_columns.begin(), finite_argument_columns.end(), agg.argument_column);
-      if (existing == finite_argument_columns.end()) {
-        finite_arguments.push_back(cudf::column_nans_to_nulls(request.values, stream, mr));
-        finite_argument_columns.push_back(agg.argument_column);
-        request.values = finite_arguments.back()->view();
-      } else {
-        request.values = finite_arguments[existing - finite_argument_columns.begin()]->view();
+    // Set when the argument holds NaN.
+    prepared_argument* nan_free = nullptr;
+    if ((agg.function == aggregate_id::min || agg.function == aggregate_id::max) &&
+        cudf::is_floating_point(request.values.type())) {
+      auto existing =
+        std::ranges::find(nan_free_arguments, agg.argument_column, &prepared_argument::column);
+      if (existing == nan_free_arguments.end()) {
+        nan_free_arguments.push_back(
+          {agg.argument_column, make_nan_free_argument(request.values, stream, mr)});
+        existing = std::prev(nan_free_arguments.end());
+      }
+      if (existing->nan_free.flags) {
+        nan_free       = &*existing;
+        request.values = nan_free->nan_free.finite->view();
       }
     }
     request.aggregations.push_back(simple_aggregation<cudf::groupby_aggregation>(agg.function));
-    if (float_extrema) {
-      request.aggregations.push_back(cudf::make_count_aggregation<cudf::groupby_aggregation>());
-    }
     requests.push_back(std::move(request));
-    if (float_extrema) {
-      nan_count_indices[i] = requests.size();
-      cudf::groupby::aggregation_request original_count;
-      original_count.values = input.column(agg.argument_column);
-      original_count.aggregations.push_back(
-        cudf::make_count_aggregation<cudf::groupby_aggregation>());
-      requests.push_back(std::move(original_count));
-      simple_aggregates.push_back({aggregate_id::count, agg.argument_column});
+    if (nan_free && !nan_free->flag_request) {
+      nan_free->flag_request = requests.size();
+      cudf::groupby::aggregation_request any_nan;
+      any_nan.values = nan_free->nan_free.flags->view();
+      any_nan.aggregations.push_back(
+        simple_aggregation<cudf::groupby_aggregation>(aggregate_id::max));
+      requests.push_back(std::move(any_nan));
+      simple_aggregates.push_back({aggregate_id::max, agg.argument_column});
     }
+    if (nan_free) { nan_flag_indices[i] = nan_free->flag_request; }
   }
 
   // 3. Run the requests. The group by also gives the group keys.
@@ -389,12 +354,9 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
         result.results.push_back(
           reduce_to_column(request.values,
                            *simple_aggregation<cudf::reduce_aggregation>(agg.function),
-                           result_type(agg, request.values.type()),
+                           window_result_type(agg.function, request.values.type()),
                            stream,
                            mr));
-        if (request.aggregations.size() > 1) {
-          result.results.push_back(reduce_count(request.values, stream, mr));
-        }
       } else {
         result.results.push_back(reduce_sum(request.values, stream, mr));
         if (arguments[i].needs_avg) {
@@ -405,7 +367,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     }
   }
   requests.clear();
-  finite_arguments.clear();
+  nan_free_arguments.clear();
 
   // 4. Turn the group results of each argument into its sum and average.
   auto const f64 = cudf::data_type{cudf::type_id::FLOAT64};
@@ -413,7 +375,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     auto& arg = arguments[i];
     arg.widened.reset();
     arg.sum = checked_sum(std::move(results[i].results[0]), stream, mr);
-    if (auto const target = accumulator_type(input.column(arg.column).type());
+    if (auto const target = window_sum_type(input.column(arg.column).type());
         arg.sum->type() != target) {
       arg.sum = cudf::cast(arg.sum->view(), target, stream, mr);
     }
@@ -424,19 +386,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
       std::any_of(aggregates.begin(), aggregates.end(), [&](auto const& aggregate) {
         return aggregate.argument_column == arg.column && aggregate.function == aggregate_id::sum;
       });
-    if (decimal_sum) {
-      constexpr auto limit = int128_pow10(38);
-      auto bounds          = cudf::minmax(arg.sum->view(), stream, mr);
-      for (auto const* bound : {bounds.first.get(), bounds.second.get()}) {
-        if (bound->is_valid(stream)) {
-          auto const value =
-            static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(*bound).value(stream);
-          if (value <= -limit || value >= limit) {
-            throw std::overflow_error("Whole-partition window sum exceeds DECIMAL(38)");
-          }
-        }
-      }
-    }
+    if (decimal_sum) { check_decimal_sum_fits(arg.sum->view(), stream, mr); }
     if (arg.needs_avg) {
       auto sum   = cudf::cast(arg.sum->view(), f64, stream, mr);
       auto count = cudf::cast(results[i].results[1]->view(), f64, stream, mr);
@@ -449,39 +399,15 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
     if (!uses_sum(aggregates[i].function)) {
       auto& value = results[argument_indices[i]].results[0];
-      // NaN is the result of a `max` of a group with any NaN, and of a `min` of a group whose
-      // non-NULL values are all NaN.
-      if (nan_count_indices[i]) {
-        auto const& original_count = results[*nan_count_indices[i]].results[0];
-        auto const& finite_count   = results[argument_indices[i]].results[1];
-        auto replace               = cudf::binary_operation(original_count->view(),
-                                              finite_count->view(),
-                                              cudf::binary_operator::GREATER,
-                                              cudf::data_type{cudf::type_id::BOOL8},
-                                              stream,
-                                              mr);
-        if (aggregates[i].function == aggregate_id::min) {
-          auto all_nan = cudf::is_null(value->view(), stream, mr);
-          replace      = cudf::binary_operation(replace->view(),
-                                           all_nan->view(),
-                                           cudf::binary_operator::LOGICAL_AND,
-                                           cudf::data_type{cudf::type_id::BOOL8},
-                                           stream,
-                                           mr);
-        }
-        auto nan = cudf::make_numeric_scalar(value->type(), stream, mr);
-        if (value->type().id() == cudf::type_id::FLOAT32) {
-          static_cast<cudf::numeric_scalar<float>&>(*nan).set_value(
-            std::numeric_limits<float>::quiet_NaN(), stream);
-        } else {
-          static_cast<cudf::numeric_scalar<double>&>(*nan).set_value(
-            std::numeric_limits<double>::quiet_NaN(), stream);
-        }
-        nan->set_valid_async(true, stream);
-        value = cudf::copy_if_else(*nan, value->view(), replace->view(), stream, mr);
+      if (nan_flag_indices[i]) {
+        value = restore_nan(std::move(value),
+                            results[*nan_flag_indices[i]].results[0]->view(),
+                            aggregates[i].function,
+                            stream,
+                            mr);
       }
-      auto const type =
-        result_type(aggregates[i], input.column(aggregates[i].argument_column).type());
+      auto const type = window_result_type(aggregates[i].function,
+                                           input.column(aggregates[i].argument_column).type());
       if (value->type() != type) { value = cudf::cast(value->view(), type, stream, mr); }
       output.push_back(value->view());
       continue;

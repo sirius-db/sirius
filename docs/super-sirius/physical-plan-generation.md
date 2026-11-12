@@ -37,12 +37,13 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 | `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
+| `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (distinct forms) | `HASH_GROUP_BY` over `HASH_JOIN` (null-safe ANTI / SEMI) | `src/planner/sirius_plan_set_operation.cpp` |
 
 `LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
 
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
 `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN` other than INNER, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`.
-`LOGICAL_WINDOW` is planned by `sirius_plan_window.cpp` for aggregates over the whole partition (`SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`) with or without `PARTITION BY`, and for `rank`, `dense_rank` and `row_number` with a `PARTITION BY` and a window `ORDER BY`. A window `ORDER BY` on an aggregate, ranking without `PARTITION BY`, ranking next to aggregates or another `ORDER BY`, a bounded or ordered frame, `FILTER`, `DISTINCT`, `EXCLUDE`, `IGNORE NULLS` and other window functions throw `NotImplementedException`.
+`LOGICAL_WINDOW` is planned by `sirius_plan_window.cpp` for aggregates over the whole partition (`SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`) with or without `PARTITION BY`, for `rank`, `dense_rank` and `row_number` with a window `ORDER BY`, with or without `PARTITION BY`, and for running `SUM`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` with a window `ORDER BY`, with or without `PARTITION BY`. Expressions of one `LOGICAL_WINDOW` with different kinds, partitions or `ORDER BY` become stacked `WINDOW` stages, each with its own `PARTITION` and `CONCAT`, and a projection restores the order of the output columns. A plan can hold several window operators. A window `ORDER BY` on an aggregate with any other frame (including DuckDB's default `RANGE` frame), `AVG` or string `MIN` and `MAX` over a running frame, a bounded frame, `FILTER`, `DISTINCT`, `EXCLUDE`, `IGNORE NULLS` and other window functions throw `NotImplementedException`.
 
 **Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, DISTINCT, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
 
@@ -78,7 +79,9 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 
 **File:** `src/planner/sirius_plan_set_operation.cpp`
 
-`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. It lowers only the `ALL` forms, and it lowers them by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
+`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. The distinct forms use a hash join of the left input against the right, with one `IS NOT DISTINCT FROM` key per column, so `NULL` matches `NULL`. `INTERSECT` is a `SEMI` join and `EXCEPT` an `ANTI` join. The left input is always the probe and output side. The builder then groups by every output column with no aggregates to deduplicate the surviving rows. This keeps the node's result distinct whatever its parent is. The binder also puts a `DISTINCT` over every distinct `EXCEPT` / `INTERSECT`; `create_plan(LogicalDistinct&)` plans that `DISTINCT` as nothing when it keys every column and its input, below any identity projections, is a set operation for which `set_operation_deduplicates` holds.
+
+The `ALL` forms lower by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
 
 1. Each input is projected to its columns followed by constant `TINYINT` tags. `EXCEPT ALL` uses one tag (`1` on the left, `-1` on the right); `INTERSECT ALL` uses two (`1, 0` on the left, `0, 1` on the right).
 2. A `UNION` merges the two tagged inputs.
@@ -88,17 +91,17 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 
 The builder throws `NotImplementedException`, so the query falls back to CPU, for:
 
-- the distinct forms of `EXCEPT` and `INTERSECT`;
 - nested-type and `ARRAY` columns;
-- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values;
-- `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
-- an input whose planned column type differs from the declared type. Aggregate results retain DuckDB's `HUGEINT` type throughout the set-operation plan.
+- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values. The builder checks the operator and both logical inputs while their collation metadata is available;
+- in the `ALL` forms, `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
+- an input whose planned column type differs from the declared type. Aggregate results retain DuckDB's `HUGEINT` type throughout the set-operation plan;
+- in the distinct forms, keys the GPU hash join does not support.
 
 ### Distinct Planning
 
 **File:** `src/planner/sirius_plan_distinct.cpp`
 
-`LOGICAL_DISTINCT` becomes a single `sirius_physical_grouped_aggregate` whose group keys are the distinct targets. When every output column is a key, the aggregate list is empty and deduplication is grouping with nothing to compute per group; a column no key covers adds a `FIRST` (see *Carried columns* below). `insert_gpu_pipeline_operators` wraps the result exactly as it wraps a GROUP BY.
+`LOGICAL_DISTINCT` becomes a single `sirius_physical_grouped_aggregate` whose group keys are the distinct targets. When every output column is a key, the aggregate list is empty and deduplication is grouping with nothing to compute per group; a column no key covers adds a `FIRST` (see *Carried columns* below). `insert_gpu_pipeline_operators` wraps the result exactly as it wraps a GROUP BY. A `DISTINCT` on every column of a set operation that already deduplicates its rows plans no aggregate (see *Set Operation Planning* above).
 
 - **Reorder projection** — pushed above the aggregate only when a key sits at an output position other than its own (`SELECT DISTINCT ON (b, a) a, b`). Plain `SELECT DISTINCT a, b` never needs one: the binder synthesizes one target per select-list entry, so every output column is already a key at its own position
 - **Carried columns** — an output column that no distinct target covers (`SELECT DISTINCT ON (k) k, v`, or `SELECT DISTINCT k FROM t ORDER BY v`) becomes a `FIRST` aggregate over that column, as DuckDB's own builder does. Every `FIRST` of one operator reads the same arbitrary row of its group, so the result keeps one row per key; with no other aggregate the grouped kernels do this with `cudf::distinct`. `SELECT k, first(v) FROM t GROUP BY k` runs on the GPU the same way, and so does a `first` beside other aggregates (`SELECT k, first(v), sum(w) FROM t GROUP BY k`), provided no `first` carries an `ORDER BY` and the `GROUP BY` has one grouping set and no `GROUPING()`

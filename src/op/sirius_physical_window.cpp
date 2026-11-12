@@ -76,7 +76,7 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
   auto const valid_slot = [&](cudf::size_type slot) {
     return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
   };
-  if (_ranking_functions.empty() || _partition_columns.empty() || _ranking_order.columns.empty() ||
+  if (_ranking_functions.empty() || _ranking_order.columns.empty() ||
       _ranking_order.directions.size() != _ranking_order.columns.size() ||
       _ranking_order.nulls.size() != _ranking_order.columns.size() ||
       !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
@@ -85,6 +85,40 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
   }
   if (_input_width > _prepared_types.size() ||
       types.size() != _input_width + _ranking_functions.size()) {
+    throw std::invalid_argument("Window output schema does not match its prepared input");
+  }
+}
+
+// A window of running aggregates over the window ORDER BY.
+sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> output_types,
+                                               duckdb::vector<logical_type> prepared_types,
+                                               std::size_t input_width,
+                                               std::vector<cudf::size_type> partition_columns,
+                                               ranking_order order,
+                                               std::vector<cumulative_aggregate> aggregates,
+                                               std::size_t estimated_cardinality)
+  : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
+    _prepared_types(std::move(prepared_types)),
+    _input_width(input_width),
+    _partition_columns(std::move(partition_columns)),
+    _ranking_order(std::move(order)),
+    _cumulative_aggregates(std::move(aggregates))
+{
+  auto const valid_slot = [&](cudf::size_type slot) {
+    return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
+  };
+  if (_cumulative_aggregates.empty() || _ranking_order.columns.empty() ||
+      _ranking_order.directions.size() != _ranking_order.columns.size() ||
+      _ranking_order.nulls.size() != _ranking_order.columns.size() ||
+      !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
+      !std::all_of(_ranking_order.columns.begin(), _ranking_order.columns.end(), valid_slot) ||
+      !std::all_of(_cumulative_aggregates.begin(),
+                   _cumulative_aggregates.end(),
+                   [&](auto const& aggregate) { return valid_slot(aggregate.argument_column); })) {
+    throw std::invalid_argument("Window key, order key or argument is outside its prepared schema");
+  }
+  if (_input_width > _prepared_types.size() ||
+      types.size() != _input_width + _cumulative_aggregates.size()) {
     throw std::invalid_argument("Window output schema does not match its prepared input");
   }
 }
@@ -120,6 +154,10 @@ std::size_t sirius_physical_window::workspace_bytes(std::size_t rows, std::size_
   // scattered result and the INT64 cast. The sort order is shared by all functions.
   auto per_row = memory::saturating_add(128, memory::saturating_mul(_aggregates.size(), 128));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_ranking_functions.size(), 24));
+  // A running aggregate holds a widened argument, the scan result, the filled result and the
+  // scattered result.
+  per_row =
+    memory::saturating_add(per_row, memory::saturating_mul(_cumulative_aggregates.size(), 128));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_partition_columns.size(), 32));
   per_row =
     memory::saturating_add(per_row, memory::saturating_mul(_ranking_order.columns.size(), 32));
@@ -179,8 +217,11 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
       }
     };
     // Ranking only reads the equality and the order of its keys, which an exact narrower carrier
-    // keeps, so its keys are used as they are.
-    if (_ranking_functions.empty()) {
+    // keeps, so its keys are used as they are. The same holds for the keys of a running aggregate.
+    // Its arguments, and the keys of a whole partition aggregate, are restored.
+    bool const ranking    = !_ranking_functions.empty();
+    bool const cumulative = !_cumulative_aggregates.empty();
+    if (!ranking && !cumulative) {
       for (auto slot : _partition_columns) {
         restore(slot);
       }
@@ -188,16 +229,30 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
         restore(aggregate.argument_column);
       }
     }
-    std::shared_ptr<cudf::table> results =
-      _ranking_functions.empty()
-        ? evaluate_whole_partition_window(
-            cudf::table_view(columns), _partition_columns, _aggregates, stream, mr)
-        : evaluate_ranking_window(cudf::table_view(columns),
-                                  _partition_columns,
-                                  _ranking_order,
-                                  _ranking_functions,
-                                  stream,
-                                  mr);
+    if (cumulative) {
+      for (auto const& aggregate : _cumulative_aggregates) {
+        restore(aggregate.argument_column);
+      }
+    }
+    std::shared_ptr<cudf::table> results;
+    if (ranking) {
+      results = evaluate_ranking_window(cudf::table_view(columns),
+                                        _partition_columns,
+                                        _ranking_order,
+                                        _ranking_functions,
+                                        stream,
+                                        mr);
+    } else if (cumulative) {
+      results = evaluate_cumulative_window(cudf::table_view(columns),
+                                           _partition_columns,
+                                           _ranking_order,
+                                           _cumulative_aggregates,
+                                           stream,
+                                           mr);
+    } else {
+      results = evaluate_whole_partition_window(
+        cudf::table_view(columns), _partition_columns, _aggregates, stream, mr);
+    }
 
     // Forward payload in its original carrier and row order, followed by the window results. The
     // hidden columns after the payload are not published.

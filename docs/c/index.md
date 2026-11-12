@@ -7,6 +7,7 @@ The public C API provides a C ABI for embedding Sirius. Include the headers unde
 
 - `<sirius-c/export.h>` defines visibility and C/C++ declaration helpers.
 - `<sirius-c/context/config_builder.h>` builds immutable context configurations.
+- `<sirius-c/context/context.h>` creates and owns an engine context.
 - `<sirius-c/error.h>` defines fixed-width status codes and owned diagnostics.
 - `<sirius-c/version.h>` declares the library's ABI revision.
 
@@ -56,6 +57,14 @@ Use sirius_context_config_builder_from_yaml() to load the
 [YAML configuration schema](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md).
 The file is read once; builders and built configurations retain its settings independently.
 Hardware availability and capacity are checked when initializing an engine.
+
+## Engine context
+
+Use sirius_context_create() with a built configuration and release the result
+with sirius_context_destroy(). Hardware discovery and resource allocation happen
+at creation. Only one active engine context per process is supported; callers
+must enforce that restriction. See sirius_context for process-wide settings and
+lifetime constraints.
 
 ## Ownership and errors
 

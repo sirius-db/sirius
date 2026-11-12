@@ -32,41 +32,6 @@
 #include <unordered_map>
 #include <vector>
 
-namespace duckdb {
-
-struct PinTableArgs {
-  std::string path;
-  std::string tier;
-  std::string name;
-  std::optional<std::vector<std::string>> cols;
-  /// Optional per-call request for Simpatico pin compression. When omitted,
-  /// the legacy session/config setting remains the default.
-  std::optional<bool> compression;
-  /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
-  /// `format` named parameter, else inferred from the path extension
-  /// (.parquet -> parquet, .db/.duckdb -> duckdb).
-  std::string format;
-  /// duckdb-native only: schema that contains the table named by `name`. Defaults
-  /// to "main"; the catalog search path (current/USE'd database) still applies.
-  std::string schema = "main";
-};
-
-void pin_table_to(const PinTableArgs& args);
-
-void unpin_table_to(const std::string& name);
-
-// Test-only helpers used by unit tests to verify pin_table forwards the
-// correct parameters to pin_table_to. Not part of the stable public API.
-namespace pin_table_testing {
-const std::vector<PinTableArgs>& recorded_calls();
-void clear_recorded_calls();
-
-const std::vector<std::string>& recorded_unpin_calls();
-void clear_recorded_unpin_calls();
-}  // namespace pin_table_testing
-
-}  // namespace duckdb
-
 namespace cudf {
 class table;
 class column;
@@ -178,12 +143,8 @@ struct pin_materialization_options {
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
   /// Positional with the pinned columns: observe this column for whole-table
   /// distinctness (see @c late_mat::unique_probe). Empty — or all false —
-  /// leaves the probe off, which is the default; the caller derives it from
-  /// @c late_mat::pin_unique_probe_selection.
+  /// leaves the probe off.
   std::vector<bool> probe_unique_columns;
-  /// Positional with @c probe_unique_columns: true = the column is observed automatically
-  /// (see @c late_mat::pin_unique_automatic_selection). Empty = none.
-  std::vector<bool> probe_unique_automatic;
   /// Cap on the bytes retained for the exact uniqueness stage across all columns together, a shared
   /// budget rather than a per-column allowance; 0 = a share of the GPU memory space's capacity
   /// (see @c late_mat::exact_uniqueness_byte_cap).

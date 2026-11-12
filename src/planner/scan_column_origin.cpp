@@ -18,11 +18,14 @@
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_join.hpp>
 #include <duckdb/planner/operator/logical_order.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
+
+#include <algorithm>
 
 namespace sirius::planner {
 
@@ -74,7 +77,9 @@ std::optional<ordinal_origin> join_origin(duckdb::LogicalJoin const& join,
     case duckdb::JoinType::RIGHT_ANTI:
       return mapped_origin(1, join.right_projection_map, ordinal, right_width);
     case duckdb::JoinType::SINGLE:
-      // At most one match per left row: the left side is a row subset, the right is padded.
+      // At most one match per left row: the left side is a row subset, the right is padded, and
+      // a left row that matches two right rows throws.
+      if (policy == origin_policy::row_wise) { return std::nullopt; }
       if (ordinal < left_block) { return left(); }
       if (policy == origin_policy::row_subset) { return std::nullopt; }
       return right();
@@ -86,6 +91,28 @@ std::optional<ordinal_origin> join_origin(duckdb::LogicalJoin const& join,
   }
 }
 
+/// Whether @p op evaluates an expression that can throw on some input row.
+bool evaluates_throwing_expression(duckdb::LogicalOperator const& op)
+{
+  auto const throws = [](auto const& expression) { return expression && expression->CanThrow(); };
+  if (std::ranges::any_of(op.expressions, throws)) { return true; }
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+      return std::ranges::any_of(op.Cast<duckdb::LogicalAggregate>().groups, throws);
+    case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY:
+      return std::ranges::any_of(op.Cast<duckdb::LogicalOrder>().orders,
+                                 [](auto const& order) { return order.expression->CanThrow(); });
+    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+      return std::ranges::any_of(
+        op.Cast<duckdb::LogicalComparisonJoin>().conditions, [](auto const& condition) {
+          return condition.IsComparison()
+                   ? condition.GetLHS().CanThrow() || condition.GetRHS().CanThrow()
+                   : condition.GetJoinExpression().CanThrow();
+        });
+    default: return false;
+  }
+}
+
 /// The child ordinal whose column output @p ordinal of @p op forwards, when @p op is one that
 /// forwards columns under @p policy.
 std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
@@ -93,6 +120,10 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
                                           origin_policy policy)
 {
   if (op.children.empty()) { return std::nullopt; }
+  // Rows a dropped filter lets through must not reach an expression that could fail on them.
+  if (policy == origin_policy::row_wise && evaluates_throwing_expression(op)) {
+    return std::nullopt;
+  }
   auto const child_width = op.children[0]->types.size();
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
@@ -113,11 +144,12 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
     case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
+      if (policy == origin_policy::row_wise) { return std::nullopt; }
       return mapped_origin(0, {}, ordinal, child_width);
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
       auto const& aggregate = op.Cast<duckdb::LogicalAggregate>();
       // Several grouping sets repeat rows; the keys a set omits are padded with NULL.
-      if (policy == origin_policy::row_subset && aggregate.grouping_sets.size() > 1) {
+      if (policy != origin_policy::value_preserving && aggregate.grouping_sets.size() > 1) {
         return std::nullopt;
       }
       if (ordinal >= aggregate.groups.size()) { return std::nullopt; }
@@ -131,7 +163,7 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
     case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_ASOF_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
-      if (policy == origin_policy::row_subset) { return std::nullopt; }
+      if (policy != origin_policy::value_preserving) { return std::nullopt; }
       return join_origin(op.Cast<duckdb::LogicalJoin>(), ordinal, policy);
     case duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
       if (policy == origin_policy::row_subset || op.children.size() != 2) { return std::nullopt; }
