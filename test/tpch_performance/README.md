@@ -568,6 +568,8 @@ sqrt(Power · Throughput)`.
   skipped as refresh-invariant. `--mode throughput` alone skips this with a warning (no validated
   power baseline to anchor snapshot 0); mismatches list the per-snapshot diffs in `metrics.json`
   under `throughput.validation` and exit non-zero like power validation.
+  A PASS checks membership in a collected committed state; it does not establish that the
+  matched state was visible during the query's transaction or within its timing interval.
 - Concurrency: stream count controls client submission independently of the Sirius
   `max_concurrent_queries` admission limit (default 1). Increase the engine limit to allow
   overlapping execution. Every result is fetched fully before that stream submits its next query.

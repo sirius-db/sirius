@@ -364,7 +364,9 @@ def run_refresh(cur, statements, label):
 
 
 def _is_select(stmt):
-    return stmt.lstrip().lower().startswith("select")
+    # DuckDB's parser handles CTE SELECTs (Q15), comments and legacy Q15's
+    # CREATE VIEW / SELECT / DROP sequence without mistaking writes for reads.
+    return duckdb.extract_statements(stmt)[0].type == duckdb.StatementType.SELECT
 
 
 def timed_query(cur, statements, timeout_s, label=None, nsys_tag=None):
@@ -419,6 +421,7 @@ def timed_query(cur, statements, timeout_s, label=None, nsys_tag=None):
     finally:
         if timer is not None:
             timer.cancel()
+            timer.join()
     elapsed = time.perf_counter() - start
     # Range closes after the clock stops, so the stop call costs the timing
     # nothing. On exception the range stays open — the run is aborting anyway.
