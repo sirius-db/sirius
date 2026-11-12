@@ -739,10 +739,10 @@ TEST_CASE_METHOD(DistinctFixture,
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution floating AVG used as an exact key falls back at plan time",
+                 "gpu_execution floating aggregates used as exact keys fall back at plan time",
                  "[integration][gpu_execution][distinct][avg]")
 {
-  // Reproducer B: DuckDB's serial sum gives five distinct averages for these constant-valued
+  // DuckDB's serial sum gives five distinct averages for these constant-valued
   // groups, while cuDF's parallel sum gives four. Exact DISTINCT/GROUP BY amplifies the low-bit
   // difference into a different row count.
   run_ok(

@@ -198,7 +198,6 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
         shape.has_floating_aggregate = true;
       }
       if (call.IsDistinct()) {
-        // COUNT(DISTINCT x) deduplicates x by exact equality, like a grouping key.
         for (auto const& argument : call.GetChildren()) {
           if (is_floating_type(argument->GetReturnType())) exact_key_here = true;
         }
@@ -250,8 +249,6 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
 void reject_floating_aggregate_exact_keys(duckdb::LogicalOperator const& op)
 {
   if (inspect_floating_aggregate_keys(op).needs_cpu) {
-    // DuckDB and cuDF sum floating inputs in different orders. A low-bit result difference becomes
-    // a different number of rows when a later GROUP BY or DISTINCT uses it as an exact key.
     throw duckdb::NotImplementedException(
       "Floating SUM/AVG with an exact floating GROUP BY or DISTINCT key is not supported on the "
       "GPU "
