@@ -38,6 +38,8 @@
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -196,7 +198,10 @@ struct ranks {
 
 /// Rewrites plans[r] as rank r of @p c, each on its own thread; returns each rank's error. The
 /// plans hold the ranks' services: declare @p c before them, so it outlives them.
-std::vector<std::string> distribute(std::vector<plan>& plans, ranks& c, fixture& f)
+std::vector<std::string> distribute(std::vector<plan>& plans,
+                                    ranks& c,
+                                    fixture& f,
+                                    std::uint64_t query = 7)
 {
   auto const world = static_cast<rank_t>(plans.size());
   std::vector<std::string> errors(world);
@@ -204,11 +209,9 @@ std::vector<std::string> distribute(std::vector<plan>& plans, ranks& c, fixture&
   for (rank_t r = 0; r < world; ++r) {
     threads.emplace_back([&, r] {
       try {
-        sirius::planner::distribute_plan(plans[r], c.all[r].service, f.gpu(), 7, c.lifecycle);
+        sirius::planner::distribute_plan(plans[r], c.all[r].service, f.gpu(), query, c.lifecycle);
       } catch (std::exception const& e) {
         errors[r] = e.what();
-        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
-        c.all[r].service->abort(7, e.what());
       }
     });
   }
@@ -383,6 +386,30 @@ TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")
     CHECK_THAT(refused("SELECT k FROM big UNION SELECT k FROM big2"),
                Catch::Matchers::ContainsSubstring("distributed execution does not support"));
   }
+}
+
+TEST_CASE("a rank whose rewrite fails aborts the query on every rank, and the next query plans",
+          "[exchange][planner]")
+{
+  fixture f;
+  ranks c(2, f.gpu());
+  {
+    // Rank 0 refuses its plan; rank 1 plans a supported one and waits for rank 0's shape.
+    std::vector<plan> plans;
+    plans.push_back(f.lowered("SELECT k FROM big UNION SELECT k FROM big2"));
+    plans.push_back(f.lowered("SELECT k FROM big"));
+    auto const start  = std::chrono::steady_clock::now();
+    auto const errors = distribute(plans, c, f);
+    // Not the shape all-gather's own timeout, which is minutes.
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{60});
+    CHECK_THAT(errors[0],
+               Catch::Matchers::ContainsSubstring("distributed execution does not support"));
+    CHECK_THAT(errors[1], Catch::Matchers::ContainsSubstring("failed on rank 0"));
+    CHECK_THAT(errors[1],
+               Catch::Matchers::ContainsSubstring("distributed execution does not support"));
+  }
+  auto plans = plan_on_every_rank(f, "SELECT k FROM big", 2);
+  CHECK(distribute(plans, c, f, 8) == std::vector<std::string>(2));
 }
 
 TEST_CASE("distribute_plan fails on every rank when the ranks planned differently",

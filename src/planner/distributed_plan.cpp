@@ -482,14 +482,33 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle)
 {
-  rewriter r{std::move(service), &gpu, query, &lifecycle};
-  auto const where = r.visit(plan);
-  if (where != placement::rank0) {
-    r.insert(plan,
-             exchange_spec{.routing = exchange_spec::mode::gather},
-             /*ordered=*/where == placement::ranged);
+  rewriter r{service, &gpu, query, &lifecycle};
+  try {
+    auto const where = r.visit(plan);
+    if (where != placement::rank0) {
+      r.insert(plan,
+               exchange_spec{.routing = exchange_spec::mode::gather},
+               /*ordered=*/where == placement::ranged);
+    }
+    require_same_shape(r);
+  } catch (...) {
+    // The query is numbered, so a peer that planned it may already wait for this rank in the
+    // shape all-gather, and nothing else tells it: no window runs a plan that failed here. This
+    // rank never runs the number, so it retires it too. Best effort: the failure itself goes on.
+    std::string what = "unknown error";
+    try {
+      throw;
+    } catch (std::exception const& e) {
+      what = e.what();
+    } catch (...) {
+    }
+    try {
+      service->abort(query, what);
+      service->forget(query);
+    } catch (...) {
+    }
+    throw;
   }
-  require_same_shape(r);
 }
 
 std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const> file_bytes,
