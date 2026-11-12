@@ -38,6 +38,10 @@ class ClassifyTests(unittest.TestCase):
                 "Not implemented Error: Sirius GPU execution failed: Range partitioning",
                 "Range partitioning",
             ),
+            (
+                "Invalid Input Error: Sirius GPU execution failed: Division by zero or signed division overflow; falling back to DuckDB",
+                "Division by zero or signed division overflow; falling back to DuckDB",
+            ),
         ):
             v, got = classify_gpu_error(message)
             self.assertEqual(v, Verdict.RUNTIME_FALLBACK, message)

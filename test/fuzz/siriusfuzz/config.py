@@ -263,6 +263,7 @@ class Large:
     null_fk_ratio: float = 0.03
     dangling_fk_ratio: float = 0.03
     skew: float = 0.35
+    fact_bias: float = 0.5
 
 
 @dataclass
@@ -348,7 +349,13 @@ class FuzzConfig:
     def validate(self) -> None:
         f = self.features
         large = self.data.large
-        for name in ("fraction", "null_fk_ratio", "dangling_fk_ratio", "skew"):
+        for name in (
+            "fraction",
+            "null_fk_ratio",
+            "dangling_fk_ratio",
+            "skew",
+            "fact_bias",
+        ):
             value = getattr(large, name)
             if not math.isfinite(value) or not 0 <= value <= 1:
                 raise ConfigError(f"data.large.{name} must be between 0 and 1")

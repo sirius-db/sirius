@@ -201,7 +201,8 @@ different order for ambiguity checks.
 
 `data.large.null_fk_ratio`, `dangling_fk_ratio`, and `skew` control foreign-key
 NULLs, keys absent from their dimension, and concentration on hot dimension
-keys. Large-tier joins use the `fk_tN = tN.k` relationship. The fuzzer skips
+keys. `data.large.fact_bias` is the chance that a top-level FROM clause starts
+at a fact table. Large-tier joins use the `fk_tN = tN.k` relationship. The fuzzer skips
 fact cross joins and inequality-only fact joins because they make the CPU
 reference unbounded.
 

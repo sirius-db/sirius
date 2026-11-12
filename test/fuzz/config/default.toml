@@ -132,6 +132,7 @@ dims = [2, 4]
 null_fk_ratio = 0.03
 dangling_fk_ratio = 0.03
 skew = 0.35
+fact_bias = 0.5
 
 [oracle]
 float32_rel_tol = 1e-4

@@ -1,7 +1,10 @@
 import random
 import unittest
 
-import duckdb
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
 
 from siriusfuzz.config import FuzzConfig
 from siriusfuzz.query_gen import QueryGenerator, Scope, ScopeTable
@@ -18,6 +21,7 @@ class LargeDataTests(unittest.TestCase):
         cfg.data.large.fact_rows = [1000, 1000]
         return cfg, DataGenerator(cfg, random.Random(0)).generate(20261112)
 
+    @unittest.skipIf(duckdb is None, "needs the duckdb Python package")
     def test_fact_sql_replays_and_permutation_preserves_multiset(self):
         _, ds = self._dataset()
         fact = ds.table("f0")
@@ -82,6 +86,17 @@ class LargeDataTests(unittest.TestCase):
             ):
                 self.assertIn('"k" < CAST(1000 AS BIGINT)', select.sql())
         self.assertTrue(saw_fact)
+
+    def test_fact_bias_sets_the_share_of_fact_queries(self):
+        cfg, ds = self._dataset()
+
+        def share(bias):
+            cfg.data.large.fact_bias = bias
+            gen = QueryGenerator(cfg, ds, random.Random(5))
+            sqls = [gen.generate().sql() for _ in range(300)]
+            return sum('FROM "f' in s or 'JOIN "f' in s for s in sqls) / 300
+
+        self.assertGreater(share(1.0), share(0.0) + 0.2)
 
     def test_second_fact_never_joins_through_dimension(self):
         cfg, ds = self._dataset()

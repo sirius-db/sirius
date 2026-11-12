@@ -98,9 +98,11 @@ _OOM_MARKERS = (
 )
 # Sirius operators raise plain runtime errors for operations they do not
 # implement ("Unsupported join type", "... not supported in GPU path yet"), and
-# DuckDB's own NotImplementedException prints as "Not implemented Error".
+# DuckDB's own NotImplementedException prints as "Not implemented Error". An evaluator that
+# defers an error case to the CPU says "falling back to DuckDB".
 _UNSUPPORTED_RE = re.compile(
-    r"\b(?:not (?:yet )?(?:supported|implemented)|unsupported|unimplemented)\b"
+    r"\b(?:not (?:yet )?(?:supported|implemented)|unsupported|unimplemented"
+    r"|falling back to duckdb)\b"
 )
 
 

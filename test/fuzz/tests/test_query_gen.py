@@ -163,15 +163,15 @@ class GeneratorValidity(unittest.TestCase):
     def test_generated_shapes_stay_on_the_gpu(self):
         """Shapes the planner is known to decline are not generated under the default
         configuration: date_trunc units coarser than day, regex shorthand classes, and a
-        join key column reused in the same join's inequality (cuDF mixed join needs the
-        equality and inequality columns to be disjoint)."""
+        join key column reused in the same join's inequality or second key (cuDF mixed
+        join needs the equality and inequality columns to be disjoint)."""
         cfg = load_config(None, ["data.rows=[20,50]"])
         rng = random.Random(11)
         dg = DataGenerator(cfg, rng)
         ds = dg.generate(11)
         qg = QueryGenerator(cfg, ds, random.Random(11), dg)
         units = set(cfg.features.scalar_functions.date_trunc_units)
-        seen_trunc = seen_ineq = 0
+        seen_trunc = seen_ineq = seen_keys = 0
         for _ in range(800):
             q = qg.generate()
             sql = q.sql()
@@ -200,8 +200,16 @@ class GeneratorValidity(unittest.TestCase):
                             and e.right.sql() == i.right.sql(),
                             sql,
                         )
+                for a in eq:
+                    for b in eq:
+                        if a is b:
+                            continue
+                        seen_keys += 1
+                        self.assertNotEqual(a.left.sql(), b.left.sql(), sql)
+                        self.assertNotEqual(a.right.sql(), b.right.sql(), sql)
         self.assertGreater(seen_trunc, 0)
         self.assertGreater(seen_ineq, 0)
+        self.assertGreater(seen_keys, 0)
 
     def test_deterministic_for_seed(self):
         cfg = load_config(None, ["data.rows=[20,50]"])

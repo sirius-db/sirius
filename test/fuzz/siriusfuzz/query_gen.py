@@ -503,8 +503,9 @@ class QueryGenerator:
         else:
             n = self._pick({"1": 0.4, "2": 0.35, "3": 0.15, "4": 0.1})
             n = min(int(n), max_tables)
+        allow_fact = outer is None and depth == 0
         first, first_scope = self._gen_from_item(
-            depth, ctes, force_cte, allow_fact=outer is None and depth == 0
+            depth, ctes, force_cte, allow_fact=allow_fact, prefer_fact=allow_fact
         )
         tree: Join | TableRef | Derived = first
         scope = Scope([first_scope], outer=outer)
@@ -552,9 +553,19 @@ class QueryGenerator:
         ctes: dict[str, list[ColumnRef]],
         force_cte: str | None,
         allow_fact: bool = True,
+        prefer_fact: bool = False,
     ) -> tuple[TableRef | Derived, ScopeTable]:
         rng = self.rng
         alias = self._alias()
+        if (
+            prefer_fact
+            and force_cte is None
+            and self.ds.has_facts
+            and rng.random() < self.cfg.data.large.fact_bias
+        ):
+            table = rng.choice([t for t in self.ds.tables if t.name.startswith("f")])
+            cols = [ColumnRef(alias, c.name, c.type) for c in table.columns]
+            return TableRef(table.name, alias), ScopeTable(alias, cols, table.name)
         if force_cte is not None or (ctes and rng.random() < 0.4):
             name = force_cte or rng.choice(list(ctes))
             cols = [ColumnRef(alias, c.name, c.type) for c in ctes[name]]
@@ -650,14 +661,15 @@ class QueryGenerator:
             self._note("join:null_safe")
         cond: Expr = Compare(op, l, r)
         # cuDF's mixed join needs the equality and inequality columns to be disjoint, so a
-        # key column must not reappear in the range condition.
+        # key column must not reappear in the range condition or under a second key (a
+        # null-safe key is routed into the conditional predicate).
         others = [(a, b) for a, b in pairs if a is not l and b is not r]
         if self.f.joins.inequality and rng.random() < 0.2 and others:
             l2, r2 = rng.choice(others)
             self._note("join:inequality")
             cond = Logical("AND", [cond, Compare(rng.choice(["<", ">", "<>"]), l2, r2)])
-        elif rng.random() < 0.15 and len(pairs) > 1:
-            l2, r2 = rng.choice(pairs)
+        elif rng.random() < 0.15 and others:
+            l2, r2 = rng.choice(others)
             self._note("join:multi_key")
             cond = Logical("AND", [cond, Compare("=", l2, r2)])
         return cond
