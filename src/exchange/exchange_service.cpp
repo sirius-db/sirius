@@ -163,22 +163,31 @@ void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receive
 {
   // Replayed under the lock, so nothing arriving meanwhile overtakes what was held.
   std::lock_guard lock{_mutex};
-  if (!_receivers.emplace(stream, receiver).second) {
+  auto const [slot, inserted] = _receivers.emplace(stream, receiver);
+  if (!inserted) {
     throw sirius::invalid_input_exception("exchange: stream {} already has a receiver", stream);
   }
-  if (auto it = _held.find(stream); it != _held.end()) {
-    for (auto& e : it->second) {
-      if (e.data) {
-        receiver->on_batch(e.from, e.batch, std::move(e.data));
-      } else {
-        receiver->on_end(e.from);
+  try {
+    if (auto it = _held.find(stream); it != _held.end()) {
+      for (auto& e : it->second) {
+        if (e.data) {
+          receiver->on_batch(e.from, e.batch, std::move(e.data));
+        } else {
+          receiver->on_end(e.from);
+        }
       }
+      _held.erase(it);
     }
-    _held.erase(it);
-  }
-  if (_error) { receiver->on_error(_error); }
-  if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
-    receiver->on_error(it->second);
+    if (_error) { receiver->on_error(_error); }
+    if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
+      receiver->on_error(it->second);
+    }
+  } catch (...) {
+    // The caller never got a receiver it could detach: leave the stream as detach() would.
+    _receivers.erase(slot);
+    _held.erase(stream);
+    if (!retired(query_of(stream))) { _detached.insert(stream); }
+    throw;
   }
 }
 
