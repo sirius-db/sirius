@@ -44,10 +44,32 @@ enum class expression_evaluator_strategy {
 };
 
 /**
+ * @brief Returns the canonical string representation of an expression_evaluator_strategy, or an
+ * empty view for a value that names no enumerator.
+ */
+// The switch is exhaustive by construction: leaving out an enumerator is a compile error, so every
+// enumerator has a spelling, which `all_expression_evaluator_strategies` relies on below.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+[[nodiscard]] constexpr std::string_view strategy_to_string(
+  expression_evaluator_strategy strategy) noexcept
+{
+  switch (strategy) {
+    case expression_evaluator_strategy::MATERIALIZE: return "materialize";
+    case expression_evaluator_strategy::AST_INTERPRET: return "ast_interpret";
+    case expression_evaluator_strategy::AST_JIT: return "ast_jit";
+    case expression_evaluator_strategy::NVRTC_JIT: return "nvrtc_jit";
+  }
+  return {};
+}
+#pragma GCC diagnostic pop
+
+/**
  * @brief Every expression_evaluator_strategy, in declaration order.
  *
  * Code that must cover every strategy, such as `string_to_strategy` and the integration tests,
- * iterates this list, so append each new enumerator here.
+ * iterates this list. A new enumerator that is not appended here fails to compile:
+ * `strategy_to_string` must spell it, and the list must end at the first value it cannot spell.
  */
 inline constexpr std::array all_expression_evaluator_strategies{
   expression_evaluator_strategy::MATERIALIZE,
@@ -63,7 +85,9 @@ static_assert(
         return false;
       }
     }
-    return true;
+    return strategy_to_string(
+             static_cast<expression_evaluator_strategy>(all_expression_evaluator_strategies.size()))
+      .empty();
   }(),
   "all_expression_evaluator_strategies must list every enumerator once, in declaration order");
 
@@ -79,10 +103,5 @@ static_assert(
  * @return true on success; false on unrecognized input.
  */
 bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out);
-
-/**
- * @brief Returns the canonical string representation of an expression_evaluator_strategy.
- */
-std::string_view strategy_to_string(expression_evaluator_strategy s);
 
 }  // namespace sirius

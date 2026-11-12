@@ -19,7 +19,6 @@
 
 // standard library
 #include <algorithm>
-#include <cassert>
 
 namespace sirius {
 
@@ -29,18 +28,6 @@ bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out)
   if (match == all_expression_evaluator_strategies.end()) { return false; }
   out = *match;
   return true;
-}
-
-std::string_view strategy_to_string(expression_evaluator_strategy s)
-{
-  switch (s) {
-    case expression_evaluator_strategy::MATERIALIZE: return "materialize";
-    case expression_evaluator_strategy::AST_INTERPRET: return "ast_interpret";
-    case expression_evaluator_strategy::AST_JIT: return "ast_jit";
-    case expression_evaluator_strategy::NVRTC_JIT: return "nvrtc_jit";
-  }
-  assert(false && "Unrecognized expression_evaluator_strategy");
-  __builtin_unreachable();
 }
 
 }  // namespace sirius
