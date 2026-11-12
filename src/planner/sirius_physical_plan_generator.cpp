@@ -156,6 +156,16 @@ bool is_floating_type(duckdb::LogicalType const& type)
   return type.id() == duckdb::LogicalTypeId::FLOAT || type.id() == duckdb::LogicalTypeId::DOUBLE;
 }
 
+// SUM over floating input depends on summation order. AVG with a floating result divides in FLOAT64
+// on the GPU but in long double in DuckDB, whatever its input type.
+bool may_differ_in_low_bits(std::string const& name,
+                            duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& children,
+                            duckdb::LogicalType const& return_type)
+{
+  if (name == "avg") return is_floating_type(return_type);
+  return name == "sum" && children.size() == 1 && is_floating_type(children[0]->GetReturnType());
+}
+
 struct floating_aggregate_key_shape {
   bool has_floating_aggregate = false;
   bool has_exact_floating_key = false;
@@ -184,9 +194,7 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
     for (auto const& expression : aggregate.expressions) {
       auto const& call = expression->Cast<duckdb::BoundAggregateExpression>();
       auto const name  = call.Function().GetName().GetIdentifierName();
-      if ((name == "avg" || name == "sum") && call.GetChildren().size() == 1 &&
-          is_floating_type(call.GetChildren()[0]->GetReturnType())) {
-        // DuckDB may rewrite AVG into SUM/COUNT before this planner sees the logical tree.
+      if (may_differ_in_low_bits(name, call.GetChildren(), call.GetReturnType())) {
         shape.has_floating_aggregate = true;
       }
       if (call.IsDistinct()) {
@@ -205,8 +213,7 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
       auto const& window = expression->Cast<duckdb::BoundWindowExpression>();
       if (!window.AggregateFunction()) continue;
       auto const name = window.AggregateFunction()->GetName().GetIdentifierName();
-      if ((name == "avg" || name == "sum") && window.GetChildren().size() == 1 &&
-          is_floating_type(window.GetChildren()[0]->GetReturnType())) {
+      if (may_differ_in_low_bits(name, window.GetChildren(), window.GetReturnType())) {
         shape.has_floating_aggregate = true;
       }
     }

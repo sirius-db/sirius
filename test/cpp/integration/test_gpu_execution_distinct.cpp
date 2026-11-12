@@ -784,6 +784,14 @@ TEST_CASE_METHOD(DistinctFixture,
       " SELECT a FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys "
       "GROUP BY k HAVING k > 1)");
   }
+  // Both averages are 3002399751580331 in DuckDB's long double division. The GPU rounds the sum
+  // 2^53 + 1 to FLOAT64 before dividing, so the first group's average differs in the low bit.
+  run_ok(
+    "CREATE TABLE avg_bigint AS SELECT * FROM (VALUES (1, 9007199254740991::BIGINT), (1, 1), "
+    "(1, 1), (2, 3002399751580331)) t(g, v)");
+  compare_gpu_vs_cpu_approx("SELECT g, AVG(v) a FROM avg_bigint GROUP BY g", {1});
+  expect_plan_fallback_matches_cpu(
+    "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(v) a FROM avg_bigint GROUP BY g)");
   expect_plan_fallback_matches_cpu(
     "WITH averages AS MATERIALIZED (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
     "FROM avg_keys GROUP BY k) SELECT a FROM averages GROUP BY a");
