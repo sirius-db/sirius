@@ -36,6 +36,7 @@ class preparation_slot {
   preparation_slot& operator=(preparation_slot const&) = delete;
   ~preparation_slot() { ledger_->retire_unit(key_); }
   scan_manager::unit_key key() const { return key_; }
+  std::shared_ptr<preparation_ledger> const& ledger() const { return ledger_; }
   scan_manager::w_permit try_acquire() { return ledger_->acquire_permit(key_); }
 
  private:

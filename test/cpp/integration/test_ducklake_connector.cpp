@@ -1,0 +1,2912 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "data/data_batch_utils.hpp"
+#include "ducklake/binding_bridge.hpp"
+#include "ducklake/inline_reader.hpp"
+#include "ducklake/parquet_unit_ingestible.hpp"
+#include "ducklake/scan_ingestible.hpp"
+#include "exec/streaming_fragment.hpp"
+#include "op/scan/arrow/arrow_import_ingestible.hpp"
+#include "op/scan/ready_input_coalescer.hpp"
+#include "planner/connector_registry.hpp"
+#include "scan_manager/preparation_fixture.hpp"
+#include "scan_manager/preparation_test_support.hpp"
+#include "transparent/connection_provenance.hpp"
+#include "util/env_guard.hpp"
+#include "utils/dynamic_filter_test_utils.hpp"
+#include "utils/scoped_temp_directory.hpp"
+#include "utils/sirius_test_env.hpp"
+#include "utils/transparent_execution_test_utils.hpp"
+
+#include <cuda_runtime_api.h>
+
+#include <absl/cleanup/cleanup.h>
+#include <catch.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/enums/statement_type.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/client_config.hpp>
+#include <duckdb/main/client_context_state.hpp>
+#include <duckdb/main/config.hpp>
+#include <duckdb/main/database_manager.hpp>
+#include <duckdb/main/extension_helper.hpp>
+#include <duckdb/optimizer/optimizer_extension.hpp>
+#include <duckdb/planner/extension_callback.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
+#include <yaml-cpp/yaml.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <utility>
+
+namespace {
+using sirius::test::get_transparent_execution_stats;
+using sirius::test::query;
+using sirius::transparent::connection_provenance;
+using sirius::transparent::decline_reason;
+
+std::string load_ducklake(duckdb::Connection& con)
+{
+  char const* path = std::getenv("SIRIUS_TEST_DUCKLAKE_EXTENSION");
+  if (!path || !*path) path = SIRIUS_TEST_DUCKLAKE_PATH;
+  query(con, path && *path ? "LOAD " + duckdb::Value(path).ToSQLString() : "LOAD ducklake");
+  auto version =
+    query(con,
+          "SELECT extension_version, install_path FROM duckdb_extensions() WHERE extension_name = "
+          "'ducklake' AND loaded");
+  REQUIRE(version->RowCount() == 1);
+  REQUIRE(version->Collection().GetValue(0, 0).ToString() == "417a9117f5");
+  return path && *path ? path : version->Collection().GetValue(1, 0).ToString();
+}
+
+void attach_lake(duckdb::Connection& con, std::string const& directory)
+{
+  query(con,
+        "ATTACH 'ducklake:" + directory + "/meta.ducklake' AS lake (DATA_PATH '" + directory +
+          "/data/')");
+}
+
+void populate_lake(duckdb::Connection& con)
+{
+  query(con, "CREATE TABLE lake.t(id INTEGER)");
+  query(con, "INSERT INTO lake.t SELECT i FROM range(100) r(i)");
+  query(con, "INSERT INTO lake.t VALUES (100), (101)");
+  query(con, "DELETE FROM lake.t WHERE id = 5");
+  query(con, "ALTER TABLE lake.t ADD COLUMN extra INTEGER DEFAULT 7");
+  query(con, "INSERT INTO lake.t SELECT i, 7 FROM range(102, 132) r(i)");
+  query(con, "CALL ducklake_flush_inlined_data('lake')");
+}
+
+void check_lake_rows(duckdb::Connection& con)
+{
+  auto rows = query(con, "SELECT id, extra FROM lake.t ORDER BY id");
+  REQUIRE(rows->RowCount() == 131);
+  for (int row = 0; row < 131; ++row) {
+    REQUIRE(rows->Collection().GetValue(0, row).GetValue<int32_t>() == (row < 5 ? row : row + 1));
+    REQUIRE(rows->Collection().GetValue(1, row).GetValue<int32_t>() == 7);
+  }
+  auto aggregates = query(con, "SELECT count(*), sum(id), sum(extra) FROM lake.t");
+  REQUIRE(aggregates->Collection().GetValue(0, 0).GetValue<int64_t>() == 131);
+  REQUIRE(aggregates->Collection().GetValue(1, 0).GetValue<int64_t>() == 8641);
+  REQUIRE(aggregates->Collection().GetValue(2, 0).GetValue<int64_t>() == 917);
+}
+
+struct provider_query_observer : duckdb::OptimizerExtensionInfo {
+  std::function<void(duckdb::ClientContext&)> observe;
+  std::function<void(duckdb::ClientContext&, duckdb::LogicalOperator&)> inspect_plan;
+};
+void observe_provider_query(duckdb::OptimizerExtensionInput& input,
+                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+{
+  auto& observer = static_cast<provider_query_observer&>(*input.info);
+  if (observer.observe) observer.observe(input.context);
+  if (observer.inspect_plan) observer.inspect_plan(input.context, *plan);
+}
+
+duckdb::LogicalGet* ducklake_get(duckdb::LogicalOperator& plan)
+{
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& get = plan.Cast<duckdb::LogicalGet>();
+    if (get.function.GetName() == "ducklake_scan") return &get;
+  }
+  for (auto& child : plan.children)
+    if (auto* get = ducklake_get(*child)) return get;
+  return nullptr;
+}
+
+auto lake_config() { return sirius::test::integration_config_path(); }
+
+template <typename Configure>
+auto write_lake_config(std::filesystem::path const& directory, Configure configure)
+{
+  auto config = YAML::LoadFile(lake_config().string());
+  configure(config);
+  auto path = directory / "config.yaml";
+  std::ofstream output(path);
+  output << config;
+  REQUIRE(output.good());
+  return path;
+}
+
+struct query_pause {
+  std::promise<void> arrival, continuation;
+  std::future<void> arrived       = arrival.get_future();
+  std::shared_future<void> resume = continuation.get_future().share();
+  bool released                   = false;
+
+  void arrive_and_wait(std::chrono::seconds timeout = std::chrono::seconds(15))
+  {
+    arrival.set_value();
+    if (resume.wait_for(timeout) != std::future_status::ready)
+      throw std::runtime_error("query pause timed out");
+  }
+  bool wait_until_arrived()
+  {
+    return arrived.wait_for(std::chrono::seconds(15)) == std::future_status::ready;
+  }
+  void release()
+  {
+    if (!std::exchange(released, true)) continuation.set_value();
+  }
+};
+
+std::vector<std::string> ducklake_result_rows(duckdb::QueryResult& result)
+{
+  if (result.HasError()) throw std::runtime_error(result.GetError());
+  std::vector<std::string> rows;
+  while (auto chunk = result.Fetch()) {
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      std::string value;
+      for (duckdb::idx_t column = 0; column < chunk->ColumnCount(); ++column)
+        value += chunk->GetValue(column, row).ToString() + "|";
+      rows.push_back(std::move(value));
+    }
+  }
+  return rows;
+}
+
+std::vector<std::string> ducklake_result_bag(duckdb::QueryResult& result)
+{
+  auto rows = ducklake_result_rows(result);
+  std::sort(rows.begin(), rows.end());
+  return rows;
+}
+
+// Observe real HOST backing without replacing its reservation or allocation policy.
+struct observed_host_reservations : sirius::scan_manager::reservation_provider {
+  struct observations {
+    std::mutex mutex;
+    uint64_t grants = 0, live = 0, peak_live = 0, peak_grants = 0, host_capacity = 0;
+    size_t active = 0, peak_active = 0;
+    bool exceeded = false;
+    std::function<void(uint64_t)> on_allocate;
+  };
+  struct backing : sirius::scan_manager::reservation_backing,
+                   std::enable_shared_from_this<backing> {
+    std::shared_ptr<sirius::scan_manager::reservation_backing> original;
+    std::shared_ptr<observations> seen;
+    uint64_t capacity, bound, live = 0;
+    backing(std::shared_ptr<sirius::scan_manager::reservation_backing> source,
+            std::shared_ptr<observations> stats,
+            uint64_t bytes)
+      : original(std::move(source)), seen(std::move(stats)), capacity(bytes), bound(bytes)
+    {
+      std::lock_guard lock(seen->mutex);
+      seen->grants += capacity;
+      ++seen->active;
+      seen->peak_grants = std::max(seen->peak_grants, seen->grants);
+      seen->peak_active = std::max(seen->peak_active, seen->active);
+      seen->exceeded |= seen->grants > seen->host_capacity;
+    }
+    ~backing() override
+    {
+      original.reset();
+      std::lock_guard lock(seen->mutex);
+      seen->grants -= capacity;
+      --seen->active;
+    }
+    uint64_t charge_size(uint64_t bytes) const override { return original->charge_size(bytes); }
+    sirius::scan_manager::backing_allocation allocate(uint64_t bytes) override
+    {
+      auto allocation = original->allocate(bytes);
+      if (seen->on_allocate) seen->on_allocate(bytes);
+      auto charge = charge_size(bytes);
+      {
+        std::lock_guard lock(seen->mutex);
+        live += charge;
+        seen->live += charge;
+        seen->peak_live = std::max(seen->peak_live, seen->live);
+        seen->exceeded |= live > bound || seen->live > seen->grants;
+      }
+      auto owner = std::shared_ptr<void>(
+        allocation.data,
+        [self = shared_from_this(), held = std::move(allocation.owner), charge](void*) mutable {
+          held.reset();
+          std::lock_guard lock(self->seen->mutex);
+          self->live -= charge;
+          self->seen->live -= charge;
+        });
+      return {allocation.data, std::move(owner)};
+    }
+  };
+  sirius::scan_manager::memory_space_id space{cucascade::memory::Tier::HOST, 0};
+  std::map<std::thread::id, std::weak_ptr<backing>> pending;
+  std::atomic<size_t> requests{0};
+  std::optional<size_t> request_limit;
+  sirius::scan_manager::host_reservation_provider original;
+  std::shared_ptr<observations> seen = std::make_shared<observations>();
+  explicit observed_host_reservations(cucascade::memory::memory_reservation_manager& manager)
+    : original(manager)
+  {
+    auto hosts = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (hosts.size() != 1) throw std::runtime_error("HOST observer requires one shared space");
+    seen->host_capacity = hosts.front()->get_max_memory();
+    space               = hosts.front()->get_id();
+  }
+  uint64_t allocation_granularity(sirius::scan_manager::memory_space_id space) const override
+  {
+    return original.allocation_granularity(space);
+  }
+  std::optional<sirius::scan_manager::reservation_grant> request(
+    sirius::scan_manager::memory_space_id space, uint64_t bytes) override
+  {
+    auto index = requests.fetch_add(1);
+    if (request_limit && index >= *request_limit) return {};
+    auto grant = original.request(space, bytes);
+    if (grant) {
+      auto tracked  = std::make_shared<backing>(std::move(grant->handle), seen, grant->bytes);
+      grant->handle = tracked;
+      std::lock_guard lock(seen->mutex);
+      pending[std::this_thread::get_id()] = tracked;
+    }
+    return grant;
+  }
+  void record_admission(sirius::scan_manager::admission_decision const& decision,
+                        unsigned minimum,
+                        unsigned ceiling)
+  {
+    std::lock_guard lock(seen->mutex);
+    auto tracked = pending[std::this_thread::get_id()].lock();
+    if (!decision.deferred || !tracked) throw std::runtime_error("missing HOST grant observation");
+    tracked->bound = decision.sigma_retained + decision.n_permits * decision.w;
+    seen->exceeded |= tracked->live > tracked->bound || tracked->bound > tracked->capacity ||
+                      tracked->capacity != decision.c_obtained || decision.n_permits < minimum ||
+                      decision.n_permits > ceiling;
+    pending.erase(std::this_thread::get_id());
+  }
+};
+
+// Drive the real file jobs to completion before advancing the coalescer. This
+// makes readiness deterministic without relying on worker timing or debug logs.
+void check_ready_parquet_files(std::shared_ptr<sirius::ducklake::binding_handle> binding,
+                               cucascade::memory::memory_reservation_manager& manager,
+                               bool successor_ready)
+{
+  namespace dl                              = sirius::ducklake;
+  namespace sm                              = sirius::scan_manager;
+  namespace scan                            = sirius::op::scan;
+  constexpr scan::scan_contract_id contract = 17;
+  constexpr uint64_t generation             = 1;
+  constexpr size_t files                    = 3;
+  std::array<sm::scan_envelope, 1> envelope{
+    {{{dl::scan_ingestible::envelope(1, 0)}, {}, true, 1, contract}}};
+  auto ledger = std::make_unique<sm::preparation_ledger>(
+    std::make_shared<sm::host_reservation_provider>(manager));
+  auto space = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front()->get_id();
+  auto decision = ledger->admit(envelope, space, files);
+  REQUIRE(decision.deferred);
+  auto admission = std::make_shared<sm::preparation_admission>(std::move(ledger), decision);
+  dl::scan_ingestible source(std::move(binding), contract, generation, admission, {0}, false, {});
+  source.preflight_for_query();
+  source.attach_preparation_ledger(std::shared_ptr<sm::preparation_ledger>(admission->consume()));
+  auto io    = std::make_shared<cucascade::io::kvikio_context>();
+  auto lanes = source.make_preparation_sources([&](std::string_view) { return io; });
+  REQUIRE(lanes.size() == 2);
+  for (auto& lane : lanes)
+    lane.bind_wakeup({});
+  auto run = [](auto& lane) {
+    auto claim = lane.try_claim();
+    REQUIRE(std::holds_alternative<sm::preparation_job>(claim));
+    return std::get<sm::preparation_job>(std::move(claim)).run({});
+  };
+  for (size_t i = 0; i < files; ++i)
+    REQUIRE_FALSE(run(lanes[0]));
+  std::array<std::unique_ptr<scan::scan_info>, files> inputs;
+  for (size_t i = 0; i < files; ++i) {
+    inputs[i] = run(lanes[1]);
+    REQUIRE(inputs[i]);
+    REQUIRE(inputs[i]->certificates().size() == 1);
+    REQUIRE(inputs[i]->dependencies().size() == 1);
+    REQUIRE(inputs[i]->certificates().front().split_id == i);
+  }
+  auto& coalescer = dynamic_cast<scan::ready_input_coalescer&>(*lanes[1].coalescer);
+  std::vector<std::vector<size_t>> groups;
+  size_t partial_steps = 0;
+  for (size_t i = 0; i < files; ++i) {
+    size_t cursor = 0;
+    for (;;) {
+      auto step = coalescer.advance_input(*inputs[i], cursor, 1);
+      if (step.finished) {
+        REQUIRE(coalescer.can_share(*inputs[i]));
+        coalescer.finish_input(step, successor_ready && i + 1 < files);
+      }
+      if (step.batch) {
+        auto evidence = source.materializer().validator->inspect({contract, {}, {}}, *step.batch);
+        CHECK(evidence.generation == generation);
+        auto& group = groups.emplace_back();
+        for (auto const& slice : step.batch->dependencies()) {
+          auto input = std::find_if(inputs.begin(), inputs.end(), [&](auto const& raw) {
+            return raw->dependencies().front().visibility == slice.visibility;
+          });
+          REQUIRE(input != inputs.end());
+          group.push_back((*input)->certificates().front().split_id);
+        }
+      }
+      if (step.finished) break;
+      ++partial_steps;
+    }
+  }
+  CHECK(partial_steps >= files);
+  // The first two files share a schema. The third was written after adding a column.
+  using file_groups   = std::vector<std::vector<size_t>>;
+  const auto expected = successor_ready ? file_groups{{0, 1}, {2}} : file_groups{{0}, {1}, {2}};
+  CHECK(groups == expected);
+  for (auto& lane : lanes)
+    lane.close();
+  source.finish_preparation();
+}
+
+// Exercise actual provider children with spare ledger capacity, so pending proves gate exclusion.
+void check_mixed_input_gate(std::shared_ptr<sirius::ducklake::binding_handle> const& binding,
+                            observed_host_reservations& backing,
+                            std::string const& deletion)
+{
+  namespace dl = sirius::ducklake;
+  namespace sm = sirius::scan_manager;
+  auto verify  = [](bool ok) {
+    if (!ok) throw std::runtime_error("DuckLake mixed input gate invariant failed");
+  };
+  binding->bind_execution_owner();
+  binding->configure_scan({0}, nullptr);
+  std::optional<uint64_t> parquet_index, inline_index;
+  for (uint64_t index = 0; auto unit = binding->unit_at(index); ++index) {
+    if (unit->kind == dl::unit_kind::parquet) {
+      verify(deletion == "inline"
+               ? unit->inline_delete_count > 0
+               : unit->deletes ==
+                   (deletion == "puffin" ? dl::delete_format::puffin : dl::delete_format::parquet));
+      parquet_index = index;
+    } else
+      inline_index = index;
+  }
+  verify(parquet_index && inline_index);
+  auto envelope = dl::scan_ingestible::envelope(1, 0);
+  std::vector<sm::scan_envelope> envelopes{{{envelope, envelope}, {}, true, 1}};
+  auto unique   = std::make_unique<sm::preparation_ledger>(backing);
+  auto decision = unique->admit(envelopes, backing.space, 2);
+  backing.record_admission(decision, 2, 2);
+  verify(decision.n_permits == 2);
+  auto admission  = std::make_shared<sm::preparation_admission>(std::move(unique), decision);
+  auto ledger     = std::shared_ptr<sm::preparation_ledger>(admission->consume());
+  auto identities = std::make_shared<dl::preparation_identity>();
+  auto gate       = std::make_shared<dl::preparation_gate>();
+  auto slot       = std::make_shared<dl::preparation_slot>(
+    ledger,
+    sm::unit_key{1, identities->next()},
+    envelope.retained_charge(admission->decision.allocation_granularity));
+  auto options = [&] {
+    dl::unit_scan_options result;
+    result.identities     = identities;
+    result.inline_gate    = gate;
+    result.parquet_slot   = slot;
+    result.owns_admission = false;
+    return result;
+  };
+  auto parquet = binding->make_parquet_unit(*parquet_index, 1, 1, admission, {0}, false, options());
+  auto arrow   = binding->make_inline_unit(*inline_index, 1, 1, admission, false, {0}, options());
+  parquet->attach_preparation_ledger(ledger);
+  arrow->attach_preparation_ledger(ledger);
+  auto finish = std::shared_ptr<void>(nullptr, [&](void*) {
+    arrow->finish_preparation();
+    parquet->finish_preparation();
+    ledger->close();
+  });
+  parquet->preflight_for_query();
+  arrow->preflight_for_query();
+  auto sources = parquet->make_preparation_sources(
+    [](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+      throw std::runtime_error("abandoned gate probe must not start Parquet I/O");
+    });
+  auto claim = arrow->try_claim_split({});
+  verify(std::holds_alternative<sm::preparation_job>(claim));
+  auto input = std::get<sm::preparation_job>(std::move(claim)).run({});
+  verify(input && gate->active && ledger->permits_in_flight() == 1);
+  auto extra = dynamic_cast<sirius::op::scan::owned_arrow_scan_info&>(*input).coalesced_copy();
+  input.reset();
+  verify(std::holds_alternative<sm::preparation_pending>(sources.front().try_claim()));
+  extra.reset();
+  verify(!gate->active && ledger->permits_in_flight() == 0);
+  {
+    auto delete_claim = sources.front().try_claim();
+    verify(std::holds_alternative<sm::preparation_job>(delete_claim));
+    verify(gate->active && ledger->permits_in_flight() == 1);
+    verify(std::holds_alternative<sm::preparation_pending>(arrow->try_claim_split({})));
+    // Abandon the delete job before I/O; its owner must return the same gate and permit.
+  }
+  verify(!gate->active && ledger->permits_in_flight() == 0);
+  auto next = arrow->try_claim_split({});
+  verify(std::holds_alternative<sm::preparation_job>(next));
+  std::get<sm::preparation_job>(std::move(next)).run({});
+}
+
+struct ducklake_fixture {
+  sirius::test::scoped_temp_directory disk;
+  sirius::test::shared_test_env env{lake_config()};
+  duckdb::Connection con{env.make_connection()};
+
+  ducklake_fixture() { load_ducklake(con); }
+
+  auto run(std::string const& sql) { return query(con, sql); }
+
+  void create_recovery_table(int files, bool flush_after_insert = true)
+  {
+    attach_lake(con, disk.directory);
+    run("SET gpu_execution=false");
+    run("CALL lake.set_option('data_inlining_row_limit',100)");
+    run("CREATE TABLE lake.q(id BIGINT,value BIGINT)");
+    for (int file = 0; file < files; ++file) {
+      run("INSERT INTO lake.q SELECT i,i%7 FROM range(" + std::to_string(file * 4096) + "," +
+          std::to_string((file + 1) * 4096) + ") r(i)");
+      if (flush_after_insert) run("CALL ducklake_flush_inlined_data('lake')");
+    }
+    run("INSERT INTO lake.q VALUES (20000,5),(20000,5),(20001,NULL)");
+  }
+
+  auto cpu_result(std::string const& sql)
+  {
+    run("SET gpu_execution=false");
+    auto expected = ducklake_result_bag(*run(sql));
+    run("SET gpu_execution=true");
+    return expected;
+  }
+
+  template <typename Execute>
+  void check_gpu_execution(std::vector<std::string> const& expected,
+                           Execute execute,
+                           bool explicit_entry                    = false,
+                           decltype(&ducklake_result_bag) collect = ducklake_result_bag)
+  {
+    CAPTURE(explicit_entry);
+    run("SET gpu_execution=true");
+    run("SET enable_duckdb_fallback=false");
+    auto runtime = sirius::test::get_registered_sirius_context(con);
+    auto hosts =
+      runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    REQUIRE(hosts.size() == 1);
+    auto reserved = hosts[0]->get_total_reserved_memory();
+    auto before   = get_transparent_execution_stats(con);
+    auto result   = execute();
+    INFO((result->HasError() ? result->GetError() : "GPU query completed"));
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect(*result) == expected);
+    result.reset();
+    auto after = get_transparent_execution_stats(con);
+    if (explicit_entry) {
+      CHECK(after.executions == before.executions);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      CHECK(after.certificate_incompletes == before.certificate_incompletes);
+      CHECK(after.certificate_mismatches == before.certificate_mismatches);
+    } else {
+      sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    }
+    CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  }
+
+  void check_gpu_result(std::string const& sql,
+                        std::vector<std::string> const& expected,
+                        bool explicit_entry = false)
+  {
+    CAPTURE(sql);
+    check_gpu_execution(
+      expected,
+      [&] {
+        return con.Query(
+          explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")" : sql);
+      },
+      explicit_entry);
+  }
+
+  void check_gpu_query(std::string const& sql) { check_gpu_result(sql, cpu_result(sql)); }
+};
+
+std::string ducklake_test_provider()
+{
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  return load_ducklake(con);
+}
+
+}  // namespace
+
+TEST_CASE("DuckLake verifies the loaded provider independently of its directory",
+          "[isolated_context][ducklake]")
+{
+  const bool replace = GENERATE(false, true);
+  sirius::test::scoped_temp_directory disk;
+  auto original = ducklake_test_provider();
+  sirius::test::shared_test_env env(lake_config());
+  auto con        = env.make_connection();
+  const auto root = std::filesystem::path(disk.directory);
+  auto loaded     = root / "ducklake.duckdb_extension";
+  std::filesystem::path shadow;
+  if (replace) {
+    std::filesystem::copy_file(original, loaded);
+    query(con, "LOAD " + duckdb::Value(loaded.string()).ToSQLString());
+  } else {
+    query(con,
+          "SET extension_directories=[" + duckdb::Value((root / "first").string()).ToSQLString() +
+            "," + duckdb::Value((root / "second").string()).ToSQLString() + "]");
+    const auto dirs = duckdb::ExtensionHelper::GetExtensionDirectoryPath(*con.context);
+    REQUIRE(dirs.size() == 2);
+    shadow = std::filesystem::path(dirs[0]) / loaded.filename();
+    loaded = std::filesystem::path(dirs[1]) / loaded.filename();
+    std::filesystem::create_directories(loaded.parent_path());
+    std::filesystem::copy_file(original, loaded);
+    query(con, "LOAD ducklake");
+  }
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CREATE TABLE lake.t AS SELECT 42 AS id");
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  const std::string sql = "CALL gpu_execution('SELECT id FROM lake.t')";
+  const std::vector<std::string> expected{"42|"};
+  REQUIRE(ducklake_result_bag(*query(con, sql)) == expected);
+  if (replace) {
+    std::filesystem::rename(loaded, root / "loaded-provider");
+    std::filesystem::create_symlink(std::filesystem::canonical(original), loaded);
+    auto result = con.Query(sql);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("unverified callbacks") != std::string::npos);
+  } else {
+    std::filesystem::create_directories(shadow.parent_path());
+    std::filesystem::copy_file(original, shadow);
+    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  }
+}
+
+TEST_CASE("DuckLake loaded before Sirius retains the original module across registration",
+          "[isolated_context][ducklake]")
+{
+  const bool during_load = GENERATE(false, true);
+  CAPTURE(during_load);
+  sirius::test::scoped_temp_directory disk;
+  auto original = ducklake_test_provider();
+  sirius::util::env_guard config_path("SIRIUS_CONFIG_FILE", lake_config().string());
+  sirius::util::env_guard enabled("SIRIUS_DISABLE", std::nullopt);
+  auto make_db = [] {
+    duckdb::DBConfig config;
+    config.options.load_extensions = false;
+    config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
+    auto db = std::make_unique<duckdb::DuckDB>(nullptr, &config);
+    duckdb::Connection con(*db);
+    query(con, "LOAD core_functions");
+    query(con, "LOAD parquet");
+    return db;
+  };
+  auto db = make_db();
+  duckdb::Connection loader(*db), registrar(*db);
+  const auto root = std::filesystem::path(disk.directory);
+  query(loader,
+        "SET extension_directories=[" + duckdb::Value((root / "first").string()).ToSQLString() +
+          "," + duckdb::Value((root / "second").string()).ToSQLString() + "]");
+  auto dirs = duckdb::ExtensionHelper::GetExtensionDirectoryPath(*loader.context);
+  REQUIRE(dirs.size() == 2);
+  auto shadow = std::filesystem::path(dirs[0]) / "ducklake.duckdb_extension";
+  auto loaded = std::filesystem::path(dirs[1]) / "ducklake.duckdb_extension";
+  std::filesystem::create_directories(loaded.parent_path());
+  std::filesystem::copy_file(original, loaded);
+
+  struct load_barrier final : duckdb::ExtensionCallback {
+    query_pause pause;
+    void OnExtensionLoaded(duckdb::DatabaseInstance&, const std::string& name) override
+    {
+      if (name == "ducklake") pause.arrive_and_wait();
+    }
+  };
+  auto barrier = duckdb::make_shared_ptr<load_barrier>();
+  if (during_load) duckdb::ExtensionCallback::Register(db->instance->config, barrier);
+  auto loading = std::async(std::launch::async, [&] { return loader.Query("LOAD ducklake"); });
+  absl::Cleanup release = [&] { barrier->pause.release(); };
+  if (during_load)
+    REQUIRE(barrier->pause.wait_until_arrived());
+  else
+    loading.get()->ThrowIfError();
+  std::filesystem::create_directories(shadow.parent_path());
+  std::filesystem::copy_file(original, shadow);
+  std::unique_ptr<duckdb::DuckDB> shadow_db;
+  if (during_load) {
+    // Both images are loaded in the process, each by a different database.
+    shadow_db = make_db();
+    duckdb::Connection other(*shadow_db);
+    query(other, "LOAD " + duckdb::Value(shadow.string()).ToSQLString());
+  }
+  query(registrar, "LOAD sirius");
+  if (during_load) {
+    // FinishLoad owns the native lock and has already taken its callback snapshot.
+    CHECK_FALSE(sirius::planner::registered_ducklake_provider(*db->instance));
+    barrier->pause.release();
+    loading.get()->ThrowIfError();
+  }
+  duckdb::Connection con(*db);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CREATE TABLE lake.t AS SELECT 42 AS id");
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  const std::vector<std::string> expected{"42|"};
+  REQUIRE(ducklake_result_bag(*query(con, "CALL gpu_execution('SELECT id FROM lake.t')")) ==
+          expected);
+  CHECK(sirius::planner::registered_ducklake_provider(*db->instance));
+}
+
+TEST_CASE("DuckLake provider SQL declines while ordinary user SQL remains GPU eligible",
+          "[transparent][provenance][ducklake][isolated_context]")
+{
+  sirius::test::scoped_temp_directory disk;
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  load_ducklake(con);
+  query(con, "SET GLOBAL gpu_execution = true");
+  auto before = get_transparent_execution_stats(con);
+  attach_lake(con, disk.directory);
+  populate_lake(con);
+  query(con, "SELECT id, extra FROM lake.t ORDER BY id");
+  auto after = get_transparent_execution_stats(con);
+  REQUIRE(after.provider_internal_skips > before.provider_internal_skips);
+  REQUIRE(after.successful_rebinds == before.successful_rebinds + 1);
+  REQUIRE(after.executions == before.executions + 1);
+  REQUIRE(after.classification_failures == before.classification_failures);
+  before = after;
+  query(con, "SELECT 42::INTEGER");
+  after = get_transparent_execution_stats(con);
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+  check_lake_rows(con);
+}
+
+TEST_CASE("DuckLake flush preserves rows and file paths after closing every connection",
+          "[transparent][provenance][ducklake][isolated_context]")
+{
+  sirius::test::scoped_temp_directory disk;
+  {
+    sirius::test::shared_test_env env(lake_config());
+    auto con = env.make_connection();
+    load_ducklake(con);
+    query(con, "SET GLOBAL gpu_execution = true");
+    attach_lake(con, disk.directory);
+    populate_lake(con);
+    check_lake_rows(con);
+    query(con, "DETACH lake");
+  }
+  {
+    sirius::test::shared_test_env env(lake_config());
+    auto con = env.make_connection();
+    load_ducklake(con);
+    query(con, "SET GLOBAL gpu_execution = true");
+    attach_lake(con, disk.directory);
+    check_lake_rows(con);
+    auto files = query(con, "SELECT data_file FROM ducklake_list_files('lake', 't')");
+    REQUIRE(files->RowCount() > 0);
+    for (duckdb::idx_t row = 0; row < files->RowCount(); ++row) {
+      REQUIRE_FALSE(files->Collection().GetValue(0, row).IsNull());
+      REQUIRE(std::filesystem::is_regular_file(files->Collection().GetValue(0, row).ToString()));
+    }
+    query(con, "DETACH lake");
+    query(con, "ATTACH '" + disk.directory + "/meta.ducklake' AS meta (READ_ONLY)");
+    query(con, "SET SESSION gpu_execution = false");
+    auto paths = query(
+      con,
+      "SELECT f.path, f.path_is_relative, t.path, t.path_is_relative, s.path, s.path_is_relative "
+      "FROM meta.ducklake_data_file f JOIN meta.ducklake_table t USING (table_id) "
+      "JOIN meta.ducklake_schema s USING (schema_id) "
+      "WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL");
+    REQUIRE(paths->RowCount() > 0);
+    for (duckdb::idx_t row = 0; row < paths->RowCount(); ++row) {
+      REQUIRE_FALSE(paths->Collection().GetValue(0, row).IsNull());
+      auto path = std::filesystem::path(paths->Collection().GetValue(0, row).ToString());
+      if (paths->Collection().GetValue(1, row).GetValue<bool>()) {
+        auto table_path = std::filesystem::path(paths->Collection().GetValue(2, row).ToString());
+        if (paths->Collection().GetValue(3, row).GetValue<bool>()) {
+          auto schema_path = std::filesystem::path(paths->Collection().GetValue(4, row).ToString());
+          if (paths->Collection().GetValue(5, row).GetValue<bool>()) {
+            schema_path = std::filesystem::path(disk.directory) / "data" / schema_path;
+          }
+          table_path = schema_path / table_path;
+        }
+        path = table_path / path;
+      }
+      REQUIRE(std::filesystem::is_regular_file(path));
+    }
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake borrowed bindings refuse access after their statement lifetime",
+                 "[isolated_context][ducklake][ducklake_binding_lifetime]")
+{
+  auto end = GENERATE(std::string("statement"), std::string("rollback"), std::string("context"));
+  CAPTURE(end);
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CREATE TABLE lake.q AS SELECT 42::BIGINT id");
+  auto reader = std::make_unique<duckdb::Connection>(env.database());
+  query(*reader, "SET gpu_execution=false");
+  query(*reader, "BEGIN");
+  std::shared_ptr<sirius::ducklake::binding_handle> captured;
+  auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+  observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+    if (&context != reader->context.get() || captured) return;
+    auto visit = [&](auto&& self, duckdb::LogicalOperator& op) -> void {
+      if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+        auto& get = op.Cast<duckdb::LogicalGet>();
+        if (get.function.GetName() == "ducklake_scan") {
+          captured =
+            sirius::ducklake::binding_handle::capture(get.function, get.bind_data.get(), context);
+          captured->bind_execution_owner();
+          auto unit = captured->unit_at(0);
+          REQUIRE(unit);
+          REQUIRE(unit->kind != sirius::ducklake::unit_kind::parquet);
+          auto cursor = captured->open_inline_unit(0, {0});
+          size_t rows = 0;
+          while (auto chunk = cursor->next())
+            rows += chunk->size();
+          CHECK(rows == 1);
+          cursor.reset();
+          captured->validate_statement();
+        }
+      }
+      for (auto& child : op.children)
+        self(self, *child);
+    };
+    visit(visit, plan);
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*reader->context),
+                                       std::move(hook));
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+  CHECK(query(*reader, "SELECT * FROM lake.q")->RowCount() == 1);
+  REQUIRE(captured);
+  observer->inspect_plan = {};
+  if (end == "rollback") query(*reader, "ROLLBACK");
+  if (end == "context") reader.reset();
+  auto refused = Catch::Matchers::ContainsSubstring("outside its captured statement/transaction");
+  CHECK_THROWS_WITH(captured->validate_statement(), refused);
+  CHECK_THROWS_WITH(captured->bind_execution_owner(), refused);
+  CHECK_THROWS_WITH(captured->unit_at(0), refused);
+  CHECK_THROWS_WITH(captured->open_inline_unit(0, {0}), refused);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake execution owner transfers only before provider discovery",
+                 "[isolated_context][ducklake][ducklake_owner_transfer]")
+{
+  auto discovered = GENERATE(false, true);
+  CAPTURE(discovered);
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CREATE TABLE lake.q AS SELECT 42::BIGINT id");
+  bool inspected         = false;
+  auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+  observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+    if (&context != con.context.get() || inspected) return;
+    auto visit = [&](auto&& self, duckdb::LogicalOperator& op) -> void {
+      if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+        auto& get = op.Cast<duckdb::LogicalGet>();
+        if (get.function.GetName() == "ducklake_scan") {
+          inspected = true;
+          auto binding =
+            sirius::ducklake::binding_handle::capture(get.function, get.bind_data.get(), context);
+          if (discovered) REQUIRE(binding->unit_at(0));
+          // The planning owner stays idle until the execution owner has closed its reader.
+          auto execution = std::async(std::launch::async, [&] {
+            binding->bind_execution_owner();
+            binding->bind_execution_owner();
+            auto cursor = binding->open_inline_unit(0, {0});
+            size_t rows = 0;
+            while (auto chunk = cursor->next())
+              rows += chunk->size();
+            return rows;
+          });
+          auto refused   = Catch::Matchers::ContainsSubstring("statement owner thread");
+          if (discovered) {
+            CHECK_THROWS_WITH(execution.get(), refused);
+            binding->validate_statement();
+          } else {
+            CHECK(execution.get() == 1);
+            CHECK_THROWS_WITH(binding->validate_statement(), refused);
+            CHECK_THROWS_WITH(binding->bind_execution_owner(), refused);
+            CHECK_THROWS_WITH(binding->unit_at(0), refused);
+          }
+        }
+      }
+      for (auto& child : op.children)
+        self(self, *child);
+    };
+    visit(visit, plan);
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), std::move(hook));
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+  CHECK(run("SELECT * FROM lake.q")->RowCount() == 1);
+  CHECK(inspected);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake bound deletion locality follows the selected read view",
+                 "[isolated_context][ducklake][ducklake_delete_locality]")
+{
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',10)");
+  query(con, "CREATE TABLE lake.t AS SELECT i::BIGINT id FROM range(100) r(i)");
+  query(con, "DELETE FROM lake.t WHERE id=0");
+  auto snapshot  = query(con,
+                        "SELECT snapshot_id, snapshot_time FROM ducklake_snapshots('lake') "
+                         "ORDER BY snapshot_id DESC LIMIT 1");
+  auto version   = snapshot->Collection().GetValue(0, 0).ToString();
+  auto timestamp = snapshot->Collection().GetValue(1, 0).ToSQLString();
+  query(con, "DELETE FROM lake.t WHERE id=2");
+  query(con, "CALL ducklake_flush_inlined_data('lake')");
+  query(con, "BEGIN");
+  query(con, "DELETE FROM lake.t WHERE id>=50 AND id<80");
+
+  auto observer = duckdb::make_shared_ptr<provider_query_observer>();
+  std::vector<bool> local_deletes;
+  bool inside            = false;
+  observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+    if (&context != con.context.get() || inside) return;
+    inside     = true;
+    auto leave = std::shared_ptr<void>(nullptr, [&](void*) { inside = false; });
+    auto visit = [&](auto&& self, duckdb::LogicalOperator& op) -> void {
+      if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+        auto& get = op.Cast<duckdb::LogicalGet>();
+        if (get.function.GetName() == "ducklake_scan") {
+          auto binding =
+            sirius::ducklake::binding_handle::capture(get.function, get.bind_data.get(), context);
+          for (uint64_t index = 0;; ++index) {
+            auto unit = binding->unit_at(index);
+            if (!unit) break;
+            if (unit->kind != sirius::ducklake::unit_kind::parquet) continue;
+            local_deletes.push_back(unit->transaction_local_delete);
+          }
+        }
+      }
+      for (auto& child : op.children)
+        self(self, *child);
+    };
+    visit(visit, plan);
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), std::move(hook));
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+  auto check = [&](std::string const& suffix, bool expected_local, int64_t count, int64_t sum) {
+    CAPTURE(suffix, expected_local);
+    local_deletes.clear();
+    auto result = query(con, "SELECT count(*), sum(id)::BIGINT FROM lake.t" + suffix);
+    REQUIRE_FALSE(local_deletes.empty());
+    for (auto local : local_deletes)
+      CHECK(local == expected_local);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == count);
+    CHECK(result->Collection().GetValue(1, 0).GetValue<int64_t>() == sum);
+  };
+  check("", true, 68, 3013);
+  check(" AT (VERSION => " + version + ")", false, 99, 4950);
+  check(" AT (TIMESTAMP => " + timestamp + ")", false, 99, 4950);
+  check("", true, 68, 3013);
+  query(con, "ROLLBACK");
+  check("", false, 98, 4948);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake SQL preserves snapshot and transaction visibility",
+                 "[transparent][provenance][ducklake][isolated_context]")
+{
+  query(con, "SET GLOBAL gpu_execution = true");
+  attach_lake(con, disk.directory);
+  auto inline_limit = GENERATE(0, 1000);
+  query(con,
+        "CALL lake.set_option('data_inlining_row_limit', " + std::to_string(inline_limit) + ")");
+  query(con, "CREATE TABLE lake.t(id BIGINT)");
+  query(con, "INSERT INTO lake.t VALUES (1), (2)");
+  auto snapshot  = query(con,
+                        "SELECT snapshot_id, snapshot_time FROM ducklake_snapshots('lake') ORDER "
+                         "BY snapshot_id DESC LIMIT 1");
+  auto version   = snapshot->Collection().GetValue(0, 0).ToString();
+  auto timestamp = snapshot->Collection().GetValue(1, 0).ToSQLString();
+  query(con, "INSERT INTO lake.t VALUES (3)");
+  query(con, "BEGIN");
+  query(con, "INSERT INTO lake.t VALUES (4)");
+  query(con, "DELETE FROM lake.t WHERE id = 1");
+  auto before  = get_transparent_execution_stats(con);
+  auto current = query(con, "SELECT sum(id)::BIGINT FROM lake.t");
+  REQUIRE(current->Collection().GetValue(0, 0).GetValue<int64_t>() == 9);
+  for (auto const& selector : {"VERSION => " + version, "TIMESTAMP => " + timestamp}) {
+    // Explicit snapshots exclude this transaction's uncommitted inserts and deletes.
+    auto sql = "SELECT sum(id)::BIGINT FROM lake.t AT (" + selector + ")";
+    query(con, "SET SESSION gpu_execution = false");
+    auto baseline = query(con, sql);
+    REQUIRE(baseline->Collection().GetValue(0, 0).GetValue<int64_t>() == 3);
+    query(con, "SET SESSION gpu_execution = true");
+    auto selected = query(con, sql);
+    REQUIRE(selected->Collection().GetValue(0, 0) == baseline->Collection().GetValue(0, 0));
+  }
+  auto prepared = con.Prepare("SELECT sum(id)::BIGINT FROM lake.t WHERE id >= ?");
+  REQUIRE_FALSE(prepared->HasError());
+  for (auto threshold : {2, 3}) {
+    auto result = prepared->Execute(threshold);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<int64_t>() == (threshold == 2 ? 9 : 7));
+  }
+  auto after = get_transparent_execution_stats(con);
+  REQUIRE(after.executions == before.executions + 5);
+  REQUIRE(after.successful_rebinds == before.successful_rebinds + 5);
+  query(con, "ROLLBACK");
+  auto committed = query(con, "SELECT sum(id)::BIGINT FROM lake.t");
+  REQUIRE(committed->Collection().GetValue(0, 0).GetValue<int64_t>() == 6);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake unsupported columns respect explicit and transparent fallback settings",
+                 "[transparent][provenance][ducklake][isolated_context]")
+{
+  query(con, "SET GLOBAL gpu_execution = true");
+  attach_lake(con, disk.directory);
+  query(con, "CREATE TABLE lake.t(id UUID)");
+  auto value = std::string("550e8400-e29b-41d4-a716-446655440000");
+  query(con, "INSERT INTO lake.t VALUES ('" + value + "')");
+  auto sql          = std::string("SELECT id FROM lake.t");
+  auto explicit_sql = "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")";
+  for (auto const& statement : {sql, explicit_sql}) {
+    query(con, "SET enable_duckdb_fallback = true");
+    auto result = query(con, statement);
+    REQUIRE(result->RowCount() == 1);
+    REQUIRE(result->Collection().GetValue(0, 0).ToString() == value);
+    query(con, "SET enable_duckdb_fallback = false");
+    REQUIRE(con.Query(statement)->HasError());
+  }
+}
+
+TEST_CASE("DuckLake Parquet scans honor the configured batch target",
+          "[isolated_context][ducklake][ducklake_sql]")
+{
+  auto target = GENERATE(uint64_t{1}, uint64_t{64 * 1024 * 1024});
+  INFO(target);
+  sirius::test::scoped_temp_directory disk;
+  auto path = write_lake_config(disk.directory, [&](YAML::Node& config) {
+    config["sirius"]["operator_params"]["scan_task_batch_size"] = target;
+  });
+  sirius::test::shared_test_env env(path);
+  auto con = env.make_connection();
+  load_ducklake(con);
+  attach_lake(con, disk.directory);
+  query(con, "SET gpu_execution=false");
+  query(con, "CALL lake.set_option('data_inlining_row_limit', 0)");
+  query(con, "CREATE TABLE lake.q AS SELECT i::BIGINT id FROM range(524288) r(i)");
+  auto sql              = std::string("SELECT SUM(id) FROM lake.q");
+  auto expected         = ducklake_result_bag(*query(con, sql));
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::atomic<unsigned> decoded{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer) ++decoded;
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  for (auto const& statement :
+       {sql, "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")"}) {
+    decoded = 0;
+    CHECK(ducklake_result_bag(*query(con, statement)) == expected);
+    if (target == 1) {
+      CHECK(decoded.load() > 1);
+    } else {
+      CHECK(decoded.load() == 1);
+    }
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL lowers complete bound scans",
+                 "[isolated_context][ducklake][ducklake_sql]")
+{
+  auto shape = GENERATE(std::string("parquet"), std::string("mixed"), std::string("inline"));
+  INFO(shape);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit', 100)");
+  run("CREATE TABLE lake.q(id BIGINT, value BIGINT, label VARCHAR)");
+  run("INSERT INTO lake.q VALUES (1,11,'one'),(2,22,'two'),(2,22,'two'),(3,NULL,'three')");
+  if (shape != "inline") run("CALL ducklake_flush_inlined_data('lake')");
+  run("INSERT INTO lake.q VALUES (4,44,'four'),(5,55,NULL)");
+  if (shape == "parquet") run("CALL ducklake_flush_inlined_data('lake')");
+  run("ATTACH '" + (std::filesystem::path(disk.directory) / "native.db").string() +
+      "' AS native_store");
+  run("CREATE TABLE native_store.native_keys(id BIGINT)");
+  run("INSERT INTO native_store.native_keys VALUES (2),(4)");
+  run("CHECKPOINT native_store");
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  // Admission must not depend on diagnostic counters being enabled.
+  run("SET enable_duckdb_fallback=false");
+  for (bool track : {false, true}) {
+    counters->track_units = track;
+    auto before           = runtime->get_transparent_execution_stats();
+    CHECK(run("SELECT id FROM lake.q")->RowCount() == 6);
+    CHECK(run("CALL gpu_execution('SELECT id FROM lake.q')")->RowCount() == 6);
+    auto after = runtime->get_transparent_execution_stats();
+    CHECK(after.executions == before.executions + 1);
+    CHECK(after.fallbacks == before.fallbacks);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  }
+  std::atomic<unsigned> decoded{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer) ++decoded;
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  run("SET enable_duckdb_fallback=false");
+  auto ordered_sql = "SELECT id,value FROM lake.q ORDER BY id DESC, value ASC NULLS LAST LIMIT 3";
+  std::vector<std::string> ordered_rows{"5|55|", "4|44|", "3|NULL|"};
+  run("SET gpu_execution=false");
+  CHECK(ducklake_result_rows(*run(ordered_sql)) == ordered_rows);
+  check_gpu_execution(
+    ordered_rows, [&] { return con.Query(ordered_sql); }, false, ducklake_result_rows);
+  std::vector<std::pair<std::string, bool>> queries = {
+    {"SELECT id FROM lake.q", true},
+    {"SELECT 1 FROM lake.q", true},
+    {"SELECT value,id,label FROM lake.q WHERE id>=2", false},
+    {"SELECT id FROM lake.q WHERE id=1 OR id=4", false},
+    {"SELECT COUNT(*) FROM lake.q", false},
+    {"SELECT COUNT(*) FROM lake.q WHERE id>=2", false},
+    {"SELECT COUNT(*) FROM lake.q WHERE id%2=0", false},
+    {"SELECT COUNT(*) FROM lake.q WHERE id>90", false},
+    {"SELECT id,COUNT(*) FROM lake.q GROUP BY id", true},
+    {"SELECT a.id,b.value FROM lake.q a JOIN lake.q b ON a.id=b.id WHERE b.id>=2", true},
+    {"SELECT a.id FROM lake.q a JOIN native_store.native_keys b ON a.id=b.id", false},
+    {"SELECT id FROM lake.q WHERE id>90", false}};
+  for (auto const& [sql, both_entries] : queries) {
+    INFO(sql);
+    auto expected = cpu_result(sql);
+    for (bool explicit_entry : {false, true}) {
+      if (explicit_entry && !both_entries) continue;
+      INFO(explicit_entry);
+      auto decoded_before  = decoded.load();
+      auto imported_before = counters->arrow_rows_imported.load();
+      check_gpu_result(sql, expected, explicit_entry);
+      if (sql == "SELECT id FROM lake.q" || sql == "SELECT 1 FROM lake.q") {
+        CHECK((decoded.load() > decoded_before) == (shape != "inline"));
+        CHECK((counters->arrow_rows_imported.load() > imported_before) == (shape != "parquet"));
+      }
+    }
+  }
+  auto prepared = con.Prepare("SELECT id FROM lake.q WHERE id>=?");
+  REQUIRE_FALSE(prepared->HasError());
+  for (int64_t value : {2, 4, 1}) {
+    auto expected = cpu_result("SELECT id FROM lake.q WHERE id>=" + std::to_string(value));
+    check_gpu_execution(expected, [&] { return prepared->Execute(value); });
+  }
+}
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL retires failed GPU work before replay",
+                 "[isolated_context][ducklake][ducklake_recovery]")
+{
+  auto explicit_entry = GENERATE(false, true);
+  INFO(explicit_entry);
+  auto mode = GENERATE(std::string("replay"),
+                       std::string("disabled"),
+                       std::string("replay_failure"),
+                       std::string("interrupted"));
+  INFO(mode);
+  create_recovery_table(4);
+  std::string sql = "SELECT id,value FROM lake.q WHERE id%3<>0";
+  auto expected   = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto reserved = hosts[0]->get_total_reserved_memory();
+  std::atomic<unsigned> decoded{0}, replay_checks{0};
+  uint64_t reserved_at_replay = UINT64_MAX;
+  std::string failed_file;
+  counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
+    if (!footer && ++decoded == 3) {
+      failed_file = file;
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io, "injected DuckLake decode failure");
+    }
+  };
+  runtime->cpu_replay_hook_for_testing = [&] {
+    ++replay_checks;
+    reserved_at_replay = hosts[0]->get_total_reserved_memory();
+    if (mode == "replay_failure") std::filesystem::rename(failed_file, failed_file + ".saved");
+  };
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->parquet_phase_for_testing  = {};
+    runtime->cpu_replay_hook_for_testing = {};
+    if (!failed_file.empty() && std::filesystem::exists(failed_file + ".saved"))
+      std::filesystem::rename(failed_file + ".saved", failed_file);
+  });
+  run("SET sirius_test_sync_cpu_replay=true");
+  run(std::string("SET sirius_test_interrupt_before_replay=") +
+      (mode == "interrupted" ? "true" : "false"));
+  run(std::string("SET enable_duckdb_fallback=") + (mode == "disabled" ? "false" : "true"));
+  auto before = runtime->get_transparent_execution_stats();
+  auto result = con.Query(
+    explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")" : sql);
+  INFO((result->HasError() ? result->GetError() : "replayed successfully"));
+  CHECK(decoded >= 3);
+  if (mode == "replay") {
+    REQUIRE_FALSE(result->HasError());
+    CHECK(ducklake_result_bag(*result) == expected);
+  } else
+    CHECK(result->HasError());
+  bool replayed = mode == "replay" || mode == "replay_failure";
+  CHECK(replay_checks == (mode == "disabled" ? 0 : 1));
+  if (mode != "disabled") CHECK(reserved_at_replay == reserved);
+  result.reset();
+  CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  auto after = runtime->get_transparent_execution_stats();
+  if (mode == "interrupted") {
+    auto cancelled = static_cast<size_t>(sirius::transparent::late_failure_condition::cancelled);
+    CHECK(after.late_failure_no_replay[cancelled] == before.late_failure_no_replay[cancelled] + 1);
+  }
+  CHECK(after.executions - before.executions == (explicit_entry ? 0 : 1));
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (replayed ? 1 : 0));
+  counters->parquet_phase_for_testing  = {};
+  runtime->cpu_replay_hook_for_testing = {};
+  if (mode == "replay_failure") std::filesystem::rename(failed_file + ".saved", failed_file);
+  run("SET sirius_test_sync_cpu_replay=false");
+  run("SET sirius_test_interrupt_before_replay=false");
+  run("SET enable_duckdb_fallback=false");
+  auto next = runtime->get_transparent_execution_stats();
+  CHECK(ducklake_result_bag(*run(sql)) == expected);
+  CHECK(runtime->get_transparent_execution_stats().executions == next.executions + 1);
+}
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL preserves its view across concurrent commits",
+                 "[isolated_context][ducklake][ducklake_concurrency]")
+{
+  auto mode = GENERATE(std::string("commit"), std::string("flush"));
+  INFO(mode);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit', 100)");
+
+  run("CREATE TABLE lake.q(id BIGINT)");
+  run("INSERT INTO lake.q VALUES (1),(2),(2)");
+  run("CALL ducklake_flush_inlined_data('lake')");
+  run("INSERT INTO lake.q VALUES (3),(4)");
+  std::string sql = "SELECT id FROM lake.q";
+  auto expected   = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto writer           = env.make_connection();
+  auto write            = [&](std::string const& text) {
+    auto r = writer.Query(text);
+    if (r->HasError()) throw std::runtime_error(r->GetError());
+  };
+  write("SET gpu_execution=false");
+  run("SET enable_duckdb_fallback=false");
+  query_pause pause;
+  std::atomic<bool> first{true};
+  counters->after_certify_for_testing = [&] {
+    if (first.exchange(false)) { pause.arrive_and_wait(); }
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->after_certify_for_testing = {}; });
+  auto before = runtime->get_transparent_execution_stats();
+  auto active =
+    std::async(std::launch::async, [&] { return ducklake_result_bag(*con.Query(sql)); });
+  auto unblock = std::shared_ptr<void>(nullptr, [&](void*) { pause.release(); });
+  REQUIRE(pause.wait_until_arrived());
+  write("INSERT INTO lake.q VALUES (9)");
+  if (mode == "flush") write("CALL ducklake_flush_inlined_data('lake')");
+  pause.release();
+  REQUIRE(active.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
+  CHECK(active.get() == expected);
+  counters->after_certify_for_testing = {};
+  auto after                          = runtime->get_transparent_execution_stats();
+  CHECK(after.executions == before.executions + 1);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  expected.push_back("9|");
+  std::sort(expected.begin(), expected.end());
+  CHECK(ducklake_result_bag(*run(sql)) == expected);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL cancellation drains blocked reads without replay",
+                 "[isolated_context][ducklake][ducklake_cancel]")
+{
+  auto footer = GENERATE(false, true);
+  INFO(footer);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit', 100)");
+
+  run("CREATE TABLE lake.q AS SELECT i::BIGINT id FROM range(10000) r(i)");
+  run("CALL ducklake_flush_inlined_data('lake')");
+  run("INSERT INTO lake.q VALUES (10001)");
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto reserved = hosts[0]->get_total_reserved_memory();
+  query_pause pause;
+  std::atomic<bool> first{true};
+  std::atomic<unsigned> replays{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool at_footer) {
+    if (at_footer == footer && first.exchange(false)) { pause.arrive_and_wait(); }
+  };
+  runtime->cpu_replay_hook_for_testing = [&] { ++replays; };
+  auto clear                           = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->parquet_phase_for_testing  = {};
+    runtime->cpu_replay_hook_for_testing = {};
+  });
+  run("SET sirius_test_sync_cpu_replay=true");
+  auto before = runtime->get_transparent_execution_stats();
+  auto active =
+    std::async(std::launch::async, [&] { return con.Query("SELECT id FROM lake.q WHERE id%2=0"); });
+  auto unblock = std::shared_ptr<void>(nullptr, [&](void*) { pause.release(); });
+  REQUIRE(pause.wait_until_arrived());
+  con.Interrupt();
+  pause.release();
+  REQUIRE(active.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
+  auto result = active.get();
+  REQUIRE(result->HasError());
+  INFO(result->GetError());
+  CHECK(result->GetError().find("Interrupt") != std::string::npos);
+  CHECK(replays == 0);
+  CHECK(runtime->get_transparent_execution_stats().runtime_fallbacks == before.runtime_fallbacks);
+  result.reset();
+  CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  counters->parquet_phase_for_testing = {};
+  run("SET sirius_test_sync_cpu_replay=false");
+  run("SET enable_duckdb_fallback=false");
+  CHECK(ducklake_result_bag(*run("SELECT id FROM lake.q WHERE id=10001")) ==
+        std::vector<std::string>{"10001|"});
+}
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL combines dynamic filters with local visibility",
+                 "[isolated_context][ducklake][ducklake_dynamic]")
+{
+  auto [shape, deletes] = GENERATE(table<std::string, std::string>({{"parquet", "ordinary"},
+                                                                    {"parquet", "dv"},
+                                                                    {"parquet", "inline"},
+                                                                    {"mixed", "ordinary"},
+                                                                    {"mixed", "dv"},
+                                                                    {"mixed", "inline"},
+                                                                    {"inline", "inline"}}));
+  INFO(shape);
+  INFO(deletes);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit'," +
+      std::string(shape == "inline" ? "20000" : "0") + ")");
+  run("CALL lake.set_option('parquet_row_group_size',2048)");
+  run("CALL lake.set_option('write_deletion_vectors'," +
+      std::string(deletes == "dv" ? "true" : "false") + ")");
+  run(
+    "CREATE TABLE lake.q AS SELECT range::BIGINT id, CASE WHEN range%11=0 THEN NULL ELSE range%17 "
+    "END::BIGINT value FROM range(10000)");
+  if (shape == "mixed") {
+    run("CALL lake.set_option('data_inlining_row_limit',20000)");
+    run("INSERT INTO lake.q SELECT range::BIGINT, (range%17)::BIGINT FROM range(2700,3300)");
+  }
+  run("CALL lake.set_option('data_inlining_row_limit'," +
+      std::string(deletes == "inline" ? "20000" : "0") + ")");
+  run("DELETE FROM lake.q WHERE id%7=0");
+  auto delete_files = run(
+    "SELECT format FROM __ducklake_metadata_lake.ducklake_delete_file "
+    "WHERE end_snapshot IS NULL");
+  REQUIRE(delete_files->RowCount() == (deletes == "inline" ? 0 : 1));
+  if (deletes != "inline")
+    CHECK(delete_files->Collection().GetValue(0, 0).ToString() ==
+          (deletes == "dv" ? "puffin" : "parquet"));
+  run("ATTACH '" + (std::filesystem::path(disk.directory) / "keys.db").string() +
+      "' AS native_store");
+  run("CREATE TABLE native_store.keys AS SELECT range::BIGINT k FROM range(17)");
+  run("CHECKPOINT native_store");
+  std::string sql =
+    "SELECT q.value,q.id FROM lake.q q JOIN native_store.keys b ON q.value=b.k WHERE q.id>=2048 "
+    "AND q.id<4096 AND b.k%4=1";
+  auto expected = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::atomic<unsigned> decoded{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer) ++decoded;
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  run("SET enable_duckdb_fallback=false");
+  run("SET enable_dynamic_filter=true");
+  run("SET dynamic_filter_domain_coverage_threshold=2.0");
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    auto dynamic_before = runtime->get_dynamic_filter_stats_snapshot();
+    check_gpu_result(sql, expected);
+    auto dynamic_after = runtime->get_dynamic_filter_stats_snapshot();
+    CHECK(dynamic_after.producers_enabled > dynamic_before.producers_enabled);
+    CHECK(dynamic_after.filters_pushed > dynamic_before.filters_pushed);
+    CHECK(dynamic_after.publications_failed == dynamic_before.publications_failed);
+  }
+  CHECK((decoded.load() > 0) == (shape != "inline"));
+  CHECK((counters->arrow_rows_imported.load() > 0) == (shape != "parquet"));
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL refuses a grant that cannot progress both join scans",
+                 "[isolated_context][ducklake][ducklake_admission]")
+{
+  auto fallback = GENERATE(false, true);
+  INFO(fallback);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit', 100)");
+
+  run("CREATE TABLE lake.q(id BIGINT)");
+  run("INSERT INTO lake.q VALUES (1),(2),(2),(3)");
+  std::string sql = "SELECT a.id,b.id FROM lake.q a JOIN lake.q b ON a.id=b.id";
+  auto expected   = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  auto envelope         = sirius::ducklake::scan_ingestible::envelope(1, 0);
+  provider->grant_bytes = 2 * envelope.retained_charge(provider->quantum);
+  for (auto bytes : envelope.temporary)
+    provider->grant_bytes += bytes;
+  counters->preparation_provider_for_testing = provider;
+  auto clear                                 = std::shared_ptr<void>(
+    nullptr, [&](void*) { counters->preparation_provider_for_testing.reset(); });
+  run(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+  auto result = con.Query(sql);
+  if (fallback) {
+    REQUIRE_FALSE(result->HasError());
+    CHECK(ducklake_result_bag(*result) == expected);
+  } else
+    CHECK(result->HasError());
+  CHECK(provider->seen->requests == 1);
+  CHECK(provider->seen->allocations == 0);
+  CHECK(provider->outstanding() == 0);
+  CHECK(counters->arrow_batches_imported == 0);
+}
+
+TEST_CASE("DuckLake reserves optional preparation permits for discovered files",
+          "[isolated_context][ducklake][ducklake_dv_slots]")
+{
+  auto [file_count, limit, deny_extra] = GENERATE(table<unsigned, unsigned, bool>(
+    {{1, 0, false}, {2, 0, false}, {3, 1, false}, {3, 2, false}, {3, 2, true}}));
+  CAPTURE(file_count, limit, deny_extra);
+  sirius::test::scoped_temp_directory disk;
+  auto path = write_lake_config(disk.directory, [&](YAML::Node& config) {
+    auto manager                          = config["sirius"]["executor"]["scan_manager"];
+    manager["num_threads"]                = 3;
+    manager["preparation"]["max_permits"] = limit;
+  });
+  sirius::test::shared_test_env env(path);
+  auto con = env.make_connection();
+  load_ducklake(con);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',0)");
+  query(con, "CALL lake.set_option('write_deletion_vectors',true)");
+  query(con, "CALL lake.set_option('parquet_row_group_size',2048)");
+  query(con, "CREATE TABLE lake.q(id BIGINT)");
+  for (unsigned i = 0; i < file_count; ++i) {
+    if (i == 2) query(con, "ALTER TABLE lake.q ADD COLUMN extra BIGINT DEFAULT 0");
+    query(con,
+          "INSERT INTO lake.q SELECT i+" + std::to_string(i * 8192) + (i == 2 ? ", i" : "") +
+            " FROM range(8192) t(i)");
+  }
+  if (file_count > 1) query(con, "DELETE FROM lake.q WHERE id%8192=(id//8192)+1");
+  auto sql             = "SELECT id FROM lake.q WHERE id%8192<5 ORDER BY id";
+  auto runtime         = sirius::test::get_registered_sirius_context(con);
+  auto observer        = duckdb::make_shared_ptr<provider_query_observer>();
+  bool checked_batches = false;
+  if (file_count == 3 && limit == 2 && !deny_extra) {
+    observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+      if (&context != con.context.get() || checked_batches) return;
+      auto* get = ducklake_get(plan);
+      if (!get) return;
+      checked_batches = true;
+      for (bool successor_ready : {false, true}) {
+        CAPTURE(successor_ready);
+        auto binding =
+          sirius::ducklake::binding_handle::capture(get->function, get->bind_data.get(), context);
+        REQUIRE(binding);
+        check_ready_parquet_files(
+          std::move(binding), runtime->get_memory_manager(), successor_ready);
+      }
+    };
+    duckdb::OptimizerExtension ext;
+    ext.optimizer_info    = observer;
+    ext.optimize_function = observe_provider_query;
+    duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), ext);
+  }
+  auto expected = ducklake_result_bag(*query(con, sql));
+  if (observer->inspect_plan) REQUIRE(checked_batches);
+  observer->inspect_plan = {};
+
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto backing = std::make_shared<observed_host_reservations>(runtime->get_memory_manager());
+  if (deny_extra) backing->request_limit = 1;
+  counters->preparation_provider_for_testing = backing;
+  uint32_t permits                           = 0;
+  counters->iceberg_statement_route_for_testing =
+    [&](std::string_view, const sirius::scan_manager::admission_decision& decision) {
+      permits = decision.n_permits;
+    };
+  const auto slots = std::min(file_count, limit ? limit : 3u);
+  const auto width = deny_extra ? 1u : slots;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::set<std::string> files;
+  counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
+    if (!footer) return;
+    std::unique_lock lock(mutex);
+    files.insert(file);
+    cv.notify_all();
+    // Keep the first footer in flight until another worker reaches a different
+    // file of this same scan. A serial discovery path cannot pass at width two.
+    if (!cv.wait_for(lock, std::chrono::seconds(10), [&] { return files.size() >= width; }))
+      throw std::runtime_error("DuckLake did not use its admitted DV preparation slots");
+  };
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->preparation_provider_for_testing.reset();
+    counters->iceberg_statement_route_for_testing = {};
+    counters->parquet_phase_for_testing           = {};
+  });
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  CHECK(permits == 1);
+  CHECK(files.size() == file_count);
+  CHECK(backing->requests == slots);
+  CHECK(backing->seen->peak_active == width);
+  CHECK(backing->seen->active == 0);
+}
+
+TEST_CASE("DuckLake joins refuse an insufficient preparation permit ceiling before data work",
+          "[isolated_context][ducklake][ducklake_admission_minimum]")
+{
+  sirius::test::scoped_temp_directory disk;
+  auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
+    config["sirius"]["executor"]["scan_manager"]["preparation"]["max_permits"] = 1;
+  });
+  sirius::test::shared_test_env env(config_path);
+  auto con = env.make_connection();
+  load_ducklake(con);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CREATE TABLE lake.q AS SELECT 42::BIGINT id");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  bool refused          = false;
+  counters->iceberg_statement_route_for_testing =
+    [&](std::string_view route, sirius::scan_manager::admission_decision const& decision) {
+      CHECK(route == "provider_admission_refused");
+      refused =
+        !decision.deferred && decision.reason == sirius::scan_manager::admission_reason::capacity;
+    };
+  auto clear = std::shared_ptr<void>(
+    nullptr, [&](void*) { counters->iceberg_statement_route_for_testing = {}; });
+  auto imported = counters->arrow_batches_imported.load();
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  auto result = con.Query("SELECT count(*) FROM lake.q a JOIN lake.q b ON a.id=b.id");
+  REQUIRE(result->HasError());
+  CHECK(refused);
+  CHECK(counters->arrow_batches_imported.load() == imported);
+  CHECK(runtime->get_scan_manager().num_active_queries() == 0);
+}
+
+TEST_CASE("Production DuckLake SQL isolates concurrent prepared executions",
+          "[isolated_context][ducklake][ducklake_concurrency]")
+{
+  sirius::test::scoped_temp_directory disk;
+  auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
+    config["sirius"]["max_concurrent_queries"] = 2;
+    if (config["sirius"]["executor"]["scan_manager"]["max_concurrent_queries"])
+      config["sirius"]["executor"]["scan_manager"]["max_concurrent_queries"] = 2;
+  });
+  sirius::test::shared_test_env env(config_path);
+  auto con = env.make_connection();
+  load_ducklake(con);
+  auto run = [&](std::string const& sql) { return query(con, sql); };
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit', 100)");
+
+  run("CREATE TABLE lake.q AS SELECT range::BIGINT id,(range%17)::BIGINT value FROM range(2048)");
+  run("CALL ducklake_flush_inlined_data('lake')");
+  run("INSERT INTO lake.q VALUES (7,70),(8,80)");
+  std::array<int64_t, 4> limits{0, 500, 1000, 1500};
+  std::vector<std::vector<std::string>> expected;
+  for (auto v : limits)
+    expected.push_back(
+      ducklake_result_bag(*run("SELECT value,id FROM lake.q WHERE id>=" + std::to_string(v) +
+                               " AND id<" + std::to_string(v + 300))));
+  run("SET gpu_execution=true");
+  auto runtime  = sirius::test::get_registered_sirius_context(con);
+  auto observed = std::make_shared<observed_host_reservations>(runtime->get_memory_manager());
+  runtime->physical_counters()->track_units                      = true;
+  runtime->physical_counters()->preparation_provider_for_testing = observed;
+  runtime->physical_counters()->iceberg_statement_route_for_testing =
+    [&](std::string_view, sirius::scan_manager::admission_decision const& decision) {
+      if (!decision.deferred) return;
+      std::lock_guard lock(observed->seen->mutex);
+      observed->seen->exceeded |=
+        decision.sigma_retained + decision.n_permits * decision.w > decision.c_obtained ||
+        decision.n_permits < 1;
+    };
+  auto clear_provider   = std::shared_ptr<void>(nullptr, [&](void*) {
+    runtime->physical_counters()->preparation_provider_for_testing.reset();
+    runtime->physical_counters()->iceberg_statement_route_for_testing = {};
+  });
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  auto sibling = env.make_connection();
+  run("SET enable_duckdb_fallback=false");
+  auto setting = sibling.Query("SET enable_duckdb_fallback=false");
+  REQUIRE_FALSE(setting->HasError());
+  REQUIRE(runtime->get_config().max_concurrent_queries() == 2);
+  std::mutex rendezvous_mutex;
+  std::condition_variable rendezvous;
+  unsigned arrived = 0;
+  std::atomic<unsigned> first_footers{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer || first_footers.fetch_add(1) >= 2) return;
+    std::unique_lock lock(rendezvous_mutex);
+    ++arrived;
+    rendezvous.notify_all();
+    if (!rendezvous.wait_for(lock, std::chrono::seconds(15), [&] { return arrived == 2; }))
+      throw std::runtime_error("two DuckLake queries did not reach preparation concurrently");
+  };
+  auto before = runtime->get_transparent_execution_stats();
+  std::promise<void> release;
+  auto ready   = release.get_future().share();
+  auto execute = [&](duckdb::Connection& con, int shift) {
+    ready.wait();
+    auto prepared = con.Prepare("SELECT value,id FROM lake.q WHERE id>=? AND id<?");
+    if (prepared->HasError()) throw std::runtime_error(prepared->GetError());
+    for (int repeat = 0; repeat < 8; ++repeat) {
+      auto index  = (repeat + shift) % limits.size();
+      auto v      = limits[index];
+      auto result = prepared->Execute(v, v + 300);
+      if (ducklake_result_bag(*result) != expected[index]) return false;
+    }
+    return true;
+  };
+  auto a = std::async(std::launch::async, [&] { return execute(con, 0); });
+  auto b = std::async(std::launch::async, [&] { return execute(sibling, 2); });
+  release.set_value();
+  REQUIRE(a.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+  REQUIRE(b.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+  CHECK(a.get());
+  CHECK(b.get());
+  auto after = runtime->get_transparent_execution_stats();
+  CHECK(after.executions == before.executions + 16);
+  CHECK(after.fallbacks == before.fallbacks);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(arrived == 2);
+  CHECK_FALSE(observed->seen->exceeded);
+  CHECK(observed->seen->peak_live > 0);
+  CHECK(observed->seen->live == 0);
+  CHECK(observed->seen->grants == 0);
+  CHECK(observed->seen->peak_active >= 2);
+}
+
+TEST_CASE("Concurrent DuckLake scans release input budgets while GPU outputs remain retained",
+          "[isolated_context][ducklake][ducklake_budget_retention]")
+{
+  auto deletion = GENERATE(std::string("inline"), std::string("parquet"), std::string("puffin"));
+  auto join     = GENERATE(false, true);
+  CAPTURE(deletion, join);
+  sirius::test::scoped_temp_directory disk;
+  auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
+    config["sirius"]["max_concurrent_queries"]                                 = 2;
+    config["sirius"]["executor"]["scan_manager"]["max_concurrent_queries"]     = 2;
+    config["sirius"]["executor"]["scan_manager"]["preparation"]["max_permits"] = 2;
+  });
+  sirius::test::shared_test_env env(config_path);
+  auto con = env.make_connection();
+  load_ducklake(con);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.q(id BIGINT)");
+  for (int file = 0; file < 4; ++file)
+    query(con,
+          "INSERT INTO lake.q SELECT i FROM range(" + std::to_string(file * 4096) + "," +
+            std::to_string((file + 1) * 4096) + ") r(i)");
+  query(con,
+        "CALL lake.set_option('write_deletion_vectors'," +
+          std::string(deletion == "puffin" ? "true" : "false") + ")");
+  query(con,
+        "CALL lake.set_option('data_inlining_row_limit'," +
+          std::string(deletion == "inline" ? "20000" : "0") + ")");
+  query(con, "DELETE FROM lake.q WHERE id%7=0");
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "INSERT INTO lake.q VALUES (-1),(-2),(NULL)");
+  auto const sql = std::string(join ? "SELECT a.id FROM lake.q a JOIN lake.q b ON a.id=b.id"
+                                    : "SELECT id FROM lake.q");
+  auto expected  = ducklake_result_bag(*query(con, sql));
+  auto sibling   = env.make_connection();
+  for (auto* connection : {&con, &sibling}) {
+    query(*connection, "SET gpu_execution=false");
+    query(*connection, "SET enable_duckdb_fallback=false");
+    connection->context->registered_state->Insert(
+      sirius::exec::stream_bind_catalog::kStateKey,
+      duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
+  }
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto observed = std::make_shared<observed_host_reservations>(runtime->get_memory_manager());
+  counters->preparation_provider_for_testing = observed;
+  std::atomic<unsigned> admissions{0}, decoded{0}, first_footers{0}, visits{0}, gate_checks{0};
+  std::atomic<size_t> retained_batches{0};
+  counters->iceberg_statement_route_for_testing =
+    [&](std::string_view, sirius::scan_manager::admission_decision const& decision) {
+      if (!decision.deferred) throw std::runtime_error("mixed scan admission was refused");
+      ++admissions;
+      observed->record_admission(decision, join ? 2 : 1, 2);
+    };
+  std::mutex mutex;
+  std::condition_variable cv;
+  unsigned footers = 0, round_arrivals = 0, round = 0, probes_arrived = 0;
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer) {
+      ++decoded;
+      return;
+    }
+    if (first_footers.fetch_add(1) >= 2) return;
+    std::unique_lock lock(mutex);
+    ++footers;
+    cv.notify_all();
+    if (!cv.wait_for(lock, std::chrono::seconds(15), [&] { return footers == 2; }))
+      throw std::runtime_error("mixed scans did not prepare concurrently");
+  };
+  auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+  auto clear             = std::shared_ptr<void>(nullptr, [&](void*) {
+    observer->inspect_plan = {};
+    counters->preparation_provider_for_testing.reset();
+    counters->iceberg_statement_route_for_testing = {};
+    counters->parquet_phase_for_testing           = {};
+  });
+  observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+    // Provider SQL may reuse the statement context; only the outer binding starts a fragment.
+    if (&context != con.context.get() && &context != sibling.context.get()) return;
+    static thread_local bool inside = false;
+    if (inside) return;
+    inside     = true;
+    auto leave = std::shared_ptr<void>(nullptr, [&](void*) { inside = false; });
+    ++visits;
+    auto inspect = [&](auto&& self, duckdb::LogicalOperator& node) -> void {
+      if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+        auto& get = node.Cast<duckdb::LogicalGet>();
+        if (get.function.GetName() == "ducklake_scan") {
+          check_mixed_input_gate(
+            sirius::ducklake::binding_handle::capture(get.function, get.bind_data.get(), context),
+            *observed,
+            deletion);
+          ++gate_checks;
+        }
+      }
+      for (auto& child : node.children)
+        self(self, *child);
+    };
+    inspect(inspect, plan);
+    {
+      std::unique_lock lock(mutex);
+      if (++probes_arrived == 2) {
+        std::lock_guard charges(observed->seen->mutex);
+        observed->seen->exceeded |= observed->seen->live != 0 || observed->seen->grants != 0;
+        observed->seen->peak_active = 0;
+        observed->seen->peak_live   = 0;
+        observed->seen->peak_grants = 0;
+        cv.notify_all();
+      } else if (!cv.wait_for(
+                   lock, std::chrono::seconds(15), [&] { return probes_arrived == 2; })) {
+        throw std::runtime_error("mixed gate probes did not finish");
+      }
+    }
+    // Keep the fragment resources and all prior GPU outputs alive through later scans.
+    std::vector<std::unique_ptr<sirius::exec::streaming_fragment>> retained;
+    for (unsigned repeat = 0; repeat < 3; ++repeat) {
+      sirius::exec::fragment_spec spec;
+      spec.outputs     = {0};
+      spec.plan_source = [&](duckdb::ClientContext& current) {
+        return sirius::exec::bound_plan{plan.Copy(current), nullptr};
+      };
+      auto fragment = std::make_unique<sirius::exec::streaming_fragment>(context, std::move(spec));
+      fragment->build();
+      fragment->run();
+      if (fragment->output_row_count(0) != expected.size() || fragment->output_batch_count(0) == 0)
+        throw std::runtime_error("mixed fragment did not retain the expected GPU output");
+      retained_batches += fragment->output_batch_count(0);
+      retained.push_back(std::move(fragment));
+      std::unique_lock lock(mutex);
+      if (++round_arrivals == 2) {
+        // Both queries have completed, but neither has consumed any GPU output.
+        std::lock_guard charges(observed->seen->mutex);
+        observed->seen->exceeded |= observed->seen->live != 0 || observed->seen->grants != 0;
+        round_arrivals = 0;
+        ++round;
+        cv.notify_all();
+      } else if (!cv.wait_for(lock, std::chrono::seconds(30), [&] { return round > repeat; })) {
+        throw std::runtime_error("mixed scan stalled while earlier GPU outputs were retained");
+      }
+    }
+    // Validate values after later scans reused the input capacity, not just row counts.
+    for (auto& fragment : retained) {
+      std::vector<std::string> actual;
+      while (auto batch = fragment->pull(0)) {
+        auto column = sirius::get_cudf_table_view(**batch).column(0);
+        std::vector<int64_t> values(column.size());
+        std::vector<cudf::bitmask_type> mask((column.offset() + column.size() + 31) / 32);
+        if (cudaMemcpy(values.data(),
+                       column.data<int64_t>(),
+                       values.size() * sizeof(int64_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+          throw std::runtime_error("retained output copy failed");
+        if (column.nullable() && cudaMemcpy(mask.data(),
+                                            column.null_mask(),
+                                            mask.size() * sizeof(cudf::bitmask_type),
+                                            cudaMemcpyDeviceToHost) != cudaSuccess)
+          throw std::runtime_error("retained output validity copy failed");
+        for (size_t i = 0; i < values.size(); ++i) {
+          auto bit   = column.offset() + i;
+          auto valid = !column.nullable() || (mask[bit / 32] & (uint32_t{1} << (bit % 32)));
+          actual.push_back(valid ? std::to_string(values[i]) + "|" : "NULL|");
+        }
+      }
+      std::sort(actual.begin(), actual.end());
+      if (actual != expected || !fragment->drained(0))
+        throw std::runtime_error("retained GPU values differ from native DuckLake");
+    }
+  };
+  duckdb::OptimizerExtension extension;
+  extension.optimizer_info    = observer;
+  extension.optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), extension);
+  auto imported = counters->arrow_rows_imported.load();
+  auto before   = runtime->get_transparent_execution_stats();
+  auto execute  = [&](duckdb::Connection& connection) {
+    auto result = connection.Query(sql);
+    return ducklake_result_bag(*result) == expected;
+  };
+  auto a = std::async(std::launch::async, [&] { return execute(con); });
+  auto b = std::async(std::launch::async, [&] { return execute(sibling); });
+  CHECK(a.get());
+  CHECK(b.get());
+  INFO("peak charged bytes=" << observed->seen->peak_live
+                             << ", peak grants=" << observed->seen->peak_grants
+                             << ", retained GPU batches=" << retained_batches.load());
+  CHECK(retained_batches >= 6);
+  CHECK(visits == 2);
+  CHECK(admissions == 6);
+  CHECK(gate_checks == (join ? 4 : 2));
+  CHECK(round == 3);
+  CHECK(decoded >= (join ? 48 : 24));
+  CHECK(counters->arrow_rows_imported.load() == imported + (join ? 36 : 18));
+  CHECK_FALSE(observed->seen->exceeded);
+  CHECK(observed->seen->peak_active >= 2);  // both statements held their progress grants
+  CHECK(observed->seen->peak_active <= (join ? 2 : 4));
+  CHECK(observed->seen->peak_live > 0);
+  CHECK(observed->seen->live == 0);
+  CHECK(observed->seen->grants == 0);
+  auto after = runtime->get_transparent_execution_stats();
+  CHECK(after.fallbacks == before.fallbacks);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+}
+
+TEST_CASE_METHOD(
+  ducklake_fixture,
+  "Production DuckLake SQL preserves transaction local changes and new statement identities",
+  "[isolated_context][ducklake][ducklake_transaction]")
+{
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit', 100)");
+
+  run("CREATE TABLE lake.q(id BIGINT,value BIGINT)");
+  run("INSERT INTO lake.q VALUES (1,10),(2,20),(3,30)");
+  run("CALL ducklake_flush_inlined_data('lake')");
+  run("INSERT INTO lake.q VALUES (4,40),(5,50)");
+  run("BEGIN");
+  run("INSERT INTO lake.q VALUES (6,60),(6,60)");
+  run("DELETE FROM lake.q WHERE id IN (1,4)");
+  auto expected = ducklake_result_bag(*run("SELECT value,id FROM lake.q"));
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  check_gpu_result("SELECT value,id FROM lake.q", expected);
+  run("ROLLBACK");
+  run("SET gpu_execution=false");
+  expected = ducklake_result_bag(*run("SELECT value,id FROM lake.q"));
+  run("SET gpu_execution=true");
+  auto prepared = con.Prepare("SELECT value,id FROM lake.q");
+  REQUIRE_FALSE(prepared->HasError());
+  check_gpu_execution(expected, [&] { return prepared->Execute(); });
+  run("SET gpu_execution=false");
+  run("DELETE FROM lake.q WHERE id=2");
+  run("INSERT INTO lake.q VALUES (7,70)");
+  expected = ducklake_result_bag(*run("SELECT value,id FROM lake.q"));
+  run("SET gpu_execution=true");
+  check_gpu_execution(expected, [&] { return prepared->Execute(); });
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL drains publication races before deciding replay",
+                 "[isolated_context][ducklake][ducklake_publication]")
+{
+  auto explicit_entry = GENERATE(false, true);
+  auto hold_batch     = GENERATE(false, true);
+  auto fallback       = GENERATE(false, true);
+  CAPTURE(explicit_entry, hold_batch, fallback);
+  create_recovery_table(3);
+  std::string sql = "SELECT value,COUNT(*),SUM(id) FROM lake.q WHERE id%3<>0 GROUP BY value";
+  auto expected   = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto reserved = hosts[0]->get_total_reserved_memory();
+  std::atomic<unsigned> footers{0}, replays{0};
+  query_pause pause;
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (footer && ++footers == 2) {
+      pause.arrive_and_wait(std::chrono::seconds(20));
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io,
+        "injected later DuckLake footer failure");
+    }
+  };
+  uint64_t reserved_at_replay          = UINT64_MAX;
+  runtime->cpu_replay_hook_for_testing = [&] {
+    ++replays;
+    reserved_at_replay = hosts[0]->get_total_reserved_memory();
+  };
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->parquet_phase_for_testing  = {};
+    runtime->cpu_replay_hook_for_testing = {};
+  });
+  run("SET sirius_test_sync_cpu_replay=true");
+  run("SET scan_task_batch_size=1");
+  // Enable the shared publication observer without holding a real footer.
+  run("SET sirius_test_hold_footer_index=" + std::to_string(UINT64_MAX));
+  run(std::string("SET sirius_test_hold_published_batch=") + (hold_batch ? "true" : "false"));
+  run(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+  auto before    = runtime->get_transparent_execution_stats();
+  auto active    = std::async(std::launch::async, [&] {
+    return con.Query(explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")"
+                                    : sql);
+  });
+  bool reached   = pause.wait_until_arrived();
+  bool published = reached && runtime->get_scan_manager().wait_for_publication_for_testing(
+                                std::chrono::seconds(15));
+  pause.release();
+  auto result = active.get();
+  REQUIRE(reached);
+  REQUIRE(published);
+  INFO((result->HasError() ? result->GetError() : "replayed successfully"));
+  CHECK(result->HasError() == !fallback);
+  if (fallback) CHECK(ducklake_result_bag(*result) == expected);
+  CHECK(replays == (fallback ? 1 : 0));
+  if (fallback) CHECK(reserved_at_replay == reserved);
+  result.reset();
+  CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  auto after = runtime->get_transparent_execution_stats();
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (fallback ? 1 : 0));
+  if (hold_batch) CHECK(after.discarded_speculative_work > before.discarded_speculative_work);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL refuses replay when native checkpoint cleanup fails",
+                 "[isolated_context][ducklake][ducklake_cleanup]")
+{
+  auto explicit_entry = GENERATE(false, true);
+  CAPTURE(explicit_entry);
+  create_recovery_table(4, /*flush_after_insert=*/false);
+  run("ATTACH '" + (std::filesystem::path(disk.directory) / "keys.db").string() +
+      "' AS native_store");
+  run("CREATE TABLE native_store.keys AS SELECT range::BIGINT k FROM range(7)");
+  run("CHECKPOINT native_store");
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::atomic<unsigned> decoded{0}, replays{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer && ++decoded == 3)
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io, "injected DuckLake decode failure");
+  };
+  runtime->cpu_replay_hook_for_testing = [&] { ++replays; };
+  auto clear                           = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->parquet_phase_for_testing  = {};
+    runtime->cpu_replay_hook_for_testing = {};
+    // The injection happens after worker drains. Release retained test keys before teardown.
+    runtime->get_scan_manager().reset_all();
+  });
+  run("SET enable_duckdb_fallback=true");
+  run("SET sirius_test_sync_cpu_replay=true");
+  run("SET sirius_test_inject_checkpoint_cleanup_failure=true");
+  auto before     = runtime->get_transparent_execution_stats();
+  std::string sql = "SELECT q.id,b.k FROM lake.q q JOIN native_store.keys b ON q.value=b.k";
+  auto result     = con.Query(
+    explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")" : sql);
+  REQUIRE(result->HasError());
+  INFO(result->GetError());
+  CHECK(decoded >= 3);
+  CHECK(replays == 0);
+  CHECK(runtime->get_transparent_execution_stats().runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(runtime->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE);
+  CHECK(runtime->get_scan_manager().checkpoint_key_count() > 0);
+}
+
+TEST_CASE_METHOD(
+  ducklake_fixture,
+  "Production DuckLake SQL does not reuse rows after replacing a file at the same path",
+  "[isolated_context][ducklake][ducklake_object_identity]")
+{
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  run("CREATE TABLE lake.q AS SELECT i::BIGINT id,(i%7)::BIGINT value FROM range(2048) r(i)");
+  std::string sql = "SELECT value,id FROM lake.q";
+  auto original   = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::atomic<unsigned> decoded{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer) ++decoded;
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  run("SET enable_duckdb_fallback=false");
+  for (int repeat = 0; repeat < 2; ++repeat)
+    CHECK(ducklake_result_bag(*run(sql)) == original);
+  REQUIRE(decoded >= 2);
+  run("SET gpu_execution=false");
+  auto files = run("SELECT data_file FROM ducklake_list_files('lake', 'q')");
+  REQUIRE(files->RowCount() == 1);
+  auto path        = files->Collection().GetValue(0, 0).ToString();
+  auto replacement = (std::filesystem::path(disk.directory) / "replacement.parquet").string();
+  run("COPY (SELECT id+10000 AS id,value+100 AS value FROM read_parquet(" +
+      duckdb::Value(path).ToSQLString() + ")) TO " + duckdb::Value(replacement).ToSQLString() +
+      " (FORMAT PARQUET, FIELD_IDS {id:1,value:2})");
+  std::filesystem::rename(replacement, path);
+  auto expected = ducklake_result_bag(*run(sql));
+  REQUIRE(expected != original);
+  run("SET gpu_execution=true");
+  auto before = runtime->get_transparent_execution_stats();
+  auto result = con.Query(sql);
+  if (result->HasError()) {
+    // Catalog file evidence may reject external replacement; replay must read the new object.
+    run("SET enable_duckdb_fallback=true");
+    result = con.Query(sql);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(runtime->get_transparent_execution_stats().runtime_fallbacks ==
+          before.runtime_fallbacks + 1);
+  } else {
+    CHECK(runtime->get_transparent_execution_stats().executions == before.executions + 1);
+    CHECK(runtime->get_transparent_execution_stats().runtime_fallbacks == before.runtime_fallbacks);
+  }
+  CHECK(ducklake_result_bag(*result) == expected);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake SQL cancellation waits for its blocked provider query",
+                 "[isolated_context][ducklake][ducklake_provider_cancel]")
+{
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit',20000)");
+  run("CREATE TABLE lake.q AS SELECT i::BIGINT id,(i%7)::BIGINT value FROM range(4096) r(i)");
+  std::string sql = "SELECT value,id FROM lake.q WHERE id%3<>0";
+  auto expected   = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto reserved = hosts[0]->get_total_reserved_memory();
+  run("SET enable_duckdb_fallback=true");
+  run("SET sirius_test_sync_cpu_replay=true");
+  std::atomic<unsigned> replay_checks{0};
+  runtime->cpu_replay_hook_for_testing = [&] { ++replay_checks; };
+  query_pause pause;
+  std::atomic<bool> first{true};
+  std::thread::id provider_owner;
+  auto observer     = duckdb::make_shared_ptr<provider_query_observer>();
+  observer->observe = [&](duckdb::ClientContext& provider) {
+    auto state = duckdb::get_sirius_connection_state(provider);
+    // Admission distinguishes reader work from metadata SQL used while binding the user query.
+    if (!state || state->provenance() != connection_provenance::provider_internal ||
+        hosts[0]->get_total_reserved_memory() <= reserved || !first.exchange(false))
+      return;
+    provider_owner = std::this_thread::get_id();
+    pause.arrive_and_wait(std::chrono::seconds(20));
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), std::move(hook));
+  auto clear   = std::shared_ptr<void>(nullptr, [&](void*) {
+    observer->observe                    = {};
+    runtime->cpu_replay_hook_for_testing = {};
+  });
+  auto before  = runtime->get_transparent_execution_stats();
+  auto active  = std::async(std::launch::async, [&] { return con.Query(sql); });
+  bool reached = pause.wait_until_arrived();
+  con.Interrupt();
+  auto while_blocked    = active.wait_for(std::chrono::milliseconds(50));
+  auto held_reservation = hosts[0]->get_total_reserved_memory();
+  auto held_scans       = runtime->get_scan_manager().num_active_queries();
+  pause.release();
+  auto result = active.get();
+  REQUIRE(reached);
+  auto after = runtime->get_transparent_execution_stats();
+  REQUIRE(after.publications_by_query.size() == before.publications_by_query.size() + 1);
+  for (const auto& [token, observation] : after.publications_by_query) {
+    if (before.publications_by_query.contains(token)) continue;
+    CHECK(provider_owner == observation.execute_owner);
+    CHECK(provider_owner == observation.preparation_owner);
+  }
+  CHECK(while_blocked == std::future_status::timeout);
+  CHECK(held_reservation > reserved);
+  CHECK(held_scans > 0);
+  REQUIRE(result->HasError());
+  CHECK(replay_checks == 0);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  result.reset();
+  CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  observer->observe = {};
+  run("SET enable_duckdb_fallback=false");
+  auto next = runtime->get_transparent_execution_stats();
+  CHECK(ducklake_result_bag(*run(sql)) == expected);
+  CHECK(runtime->get_transparent_execution_stats().executions == next.executions + 1);
+}
+
+TEST_CASE("Production DuckLake mixed scans execute and recover across two GPUs",
+          "[isolated_context][ducklake_multi_gpu][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) SKIP("DuckLake device placement requires two GPUs");
+  sirius::test::scoped_temp_directory disk;
+  auto config_path = write_lake_config(disk.directory, [](YAML::Node& config) {
+    config["sirius"]["topology"]["num_gpus"]                    = 2;
+    config["sirius"]["operator_params"]["scan_task_batch_size"] = 128 * 1024;
+  });
+  sirius::test::shared_test_env env(config_path);
+  auto con = env.make_connection();
+  load_ducklake(con);
+  auto run = [&](std::string const& sql) { return query(con, sql); };
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  auto use_dv = GENERATE(false, true);
+  run(std::string("CALL lake.set_option('write_deletion_vectors',") + (use_dv ? "true" : "false") +
+      ")");
+  run("CREATE TABLE lake.q(id BIGINT,value BIGINT)");
+  for (int batch = 0; batch < 16; ++batch) {
+    run(
+      "INSERT INTO lake.q SELECT i,CASE WHEN i%7=0 THEN NULL ELSE i%17 END "
+      "FROM range(" +
+      std::to_string(batch * 32768) + "," + std::to_string((batch + 1) * 32768) + ") r(i)");
+  }
+  run("DELETE FROM lake.q WHERE id%13=0");
+  run("ALTER TABLE lake.q RENAME id TO renamed_id");
+  run("CALL lake.set_option('data_inlining_row_limit',100)");
+  run("INSERT INTO lake.q VALUES (42,2),(42,2),(43,NULL)");
+  std::string sql =
+    "SELECT value,COUNT(*),SUM(renamed_id) FROM lake.q WHERE renamed_id%3=0 OR renamed_id%7=0 "
+    "GROUP BY value";
+  auto expected = ducklake_result_bag(*run(sql));
+  run("SET gpu_execution=true");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::mutex mutex;
+  std::set<int> devices;
+  bool inject = false, fired = false;
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (footer) return;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess)
+      throw std::runtime_error("cannot observe GPU device");
+    std::lock_guard lock(mutex);
+    devices.insert(device);
+    if (inject && devices.size() == 2 && !std::exchange(fired, true))
+      throw std::runtime_error("DuckLake test failure after both devices decoded");
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto reserved = hosts[0]->get_total_reserved_memory();
+  for (bool explicit_entry : {false, true}) {
+    for (bool fail : {false, true, false}) {
+      CAPTURE(use_dv, explicit_entry, fail);
+      devices.clear();
+      inject = fail;
+      fired  = false;
+      run(std::string("SET enable_duckdb_fallback=") + (fail ? "true" : "false"));
+      auto before   = runtime->get_transparent_execution_stats();
+      auto imported = counters->arrow_rows_imported.load();
+      auto result =
+        run(explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")" : sql);
+      CHECK(ducklake_result_bag(*result) == expected);
+      result.reset();
+      CHECK(devices.size() == 2);
+      CHECK(fired == fail);
+      auto after = runtime->get_transparent_execution_stats();
+      CAPTURE(before.executions, after.executions);
+      CHECK(after.executions - before.executions == (explicit_entry ? 0 : 1));
+      CHECK(after.runtime_fallbacks - before.runtime_fallbacks == (fail ? 1 : 0));
+      if (!fail) CHECK(counters->arrow_rows_imported.load() > imported);
+      CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+    }
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Production DuckLake inline batch sizing preserves wide nullable rows",
+                 "[isolated_context][ducklake][ducklake_inline_batches]")
+{
+  auto width = GENERATE(2, 5, 32);
+  INFO(width);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit',20000)");
+  std::string fields = "i::BIGINT id";
+  for (int col = 1; col < width; ++col) {
+    fields += ",CASE WHEN i%13=0 THEN NULL ELSE ";
+    fields += col % 3 == 0 ? "i%2=0" : "'value_'||CAST(i%17 AS VARCHAR)";
+    fields += " END AS c" + std::to_string(col);
+  }
+  run("CREATE TABLE lake.q AS SELECT " + fields + " FROM range(4097) r(i)");
+  auto expected         = ducklake_result_bag(*run("SELECT * FROM lake.q"));
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  for (bool explicit_entry : {false, true}) {
+    auto batches = counters->arrow_batches_imported.load();
+    auto rows    = counters->arrow_rows_imported.load();
+    check_gpu_result("SELECT * FROM lake.q", expected, explicit_entry);
+    CHECK(counters->arrow_rows_imported.load() - rows == 4097);
+    auto imported = counters->arrow_batches_imported.load() - batches;
+    CHECK(imported > 0);
+    // Provider chunk boundaries affect the exact count.
+    // A narrow scan must still need fewer imports than 256-row data batches alone.
+    if (width == 2) CHECK(imported < 17);
+    if (width == 32) CHECK(imported >= 17);
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake inline completion does not import empty Arrow batches",
+                 "[isolated_context][ducklake][ducklake_inline_completion]")
+{
+  auto mixed             = GENERATE(false, true);
+  auto transaction_local = GENERATE(false, true);
+  CAPTURE(mixed, transaction_local);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.q(id BIGINT, s VARCHAR)");
+  if (mixed) {
+    query(con, "INSERT INTO lake.q VALUES (1,'parquet'),(2,NULL)");
+    query(con, "CALL ducklake_flush_inlined_data('lake')");
+  }
+  if (transaction_local) query(con, "BEGIN");
+  query(con, "INSERT INTO lake.q VALUES (3,'inline'),(4,NULL),(NULL,'value')");
+  auto expected         = ducklake_result_bag(*query(con, "SELECT * FROM lake.q"));
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  for (bool explicit_entry : {false, true}) {
+    auto prepared = con.Prepare(explicit_entry ? "CALL gpu_execution('SELECT * FROM lake.q')"
+                                               : "SELECT * FROM lake.q");
+    REQUIRE_FALSE(prepared->HasError());
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      auto batches = counters->arrow_batches_imported.load();
+      auto rows    = counters->arrow_rows_imported.load();
+      check_gpu_execution(expected, [&] { return prepared->Execute(); }, explicit_entry);
+      CHECK(counters->arrow_rows_imported.load() - rows == 3);
+      CHECK(counters->arrow_batches_imported.load() - batches == 1);
+    }
+  }
+  if (transaction_local) query(con, "ROLLBACK");
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake result fragments execute original bindings without CPU replay",
+                 "[isolated_context][ducklake][ducklake_fragment]")
+{
+  auto shape       = GENERATE(std::string("parquet"),
+                        std::string("mixed"),
+                        std::string("inline"),
+                        std::string("failed_parquet"));
+  bool fail_decode = shape == "failed_parquet";
+  INFO(shape);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.q(id BIGINT)");
+  query(con, "INSERT INTO lake.q VALUES (1),(2),(2)");
+  if (shape != "inline") query(con, "CALL ducklake_flush_inlined_data('lake')");
+  query(con, "INSERT INTO lake.q VALUES (3),(NULL)");
+  if (shape == "parquet" || fail_decode) query(con, "CALL ducklake_flush_inlined_data('lake')");
+  auto sql              = std::string("SELECT id FROM lake.q");
+  auto expected         = ducklake_result_bag(*query(con, sql));
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  con.context->registered_state->Insert(
+    sirius::exec::stream_bind_catalog::kStateKey,
+    duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
+  std::atomic<unsigned> decoded{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer) {
+      ++decoded;
+      if (fail_decode) throw std::runtime_error("fragment decode failure");
+    }
+  };
+  auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+  unsigned visits        = 0;
+  bool inside            = false;
+  observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+    if (&context != con.context.get() || inside) return;
+    inside     = true;
+    auto leave = std::shared_ptr<void>(nullptr, [&](void*) { inside = false; });
+    ++visits;
+    sirius::exec::fragment_spec spec;
+    spec.plan_source = [&](duckdb::ClientContext& current) {
+      REQUIRE(&current == &context);
+      auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+        duckdb::StatementType::SELECT_STATEMENT);
+      prepared->types = {duckdb::LogicalType::BIGINT};
+      prepared->names = {"id"};
+      return sirius::exec::bound_plan{plan.Copy(current), std::move(prepared)};
+    };
+    sirius::exec::streaming_fragment fragment(context, std::move(spec));
+    fragment.build();
+    if (fail_decode) {
+      REQUIRE_THROWS_WITH(fragment.run(),
+                          Catch::Matchers::ContainsSubstring("fragment decode failure"));
+      REQUIRE_THROWS(fragment.take_result());
+    } else {
+      fragment.run();
+      CHECK(ducklake_result_bag(*fragment.take_result()) == expected);
+    }
+  };
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) {
+    observer->inspect_plan              = {};
+    counters->parquet_phase_for_testing = {};
+  });
+  duckdb::OptimizerExtension extension;
+  extension.optimizer_info    = observer;
+  extension.optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), extension);
+  auto imported = counters->arrow_rows_imported.load();
+  auto before   = runtime->get_transparent_execution_stats();
+  CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  CHECK(visits == 1);
+  CHECK((decoded.load() > 0) == (shape != "inline"));
+  CHECK((counters->arrow_rows_imported.load() > imported) == (shape != "parquet" && !fail_decode));
+  auto after = runtime->get_transparent_execution_stats();
+  CHECK(after.fallbacks == before.fallbacks);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake scalar subqueries match CPU results",
+                 "[isolated_context][ducklake][ducklake_scalar_subqueries]")
+{
+  auto parquet = GENERATE(false, true);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.scalar_value AS SELECT 42::BIGINT AS x");
+  if (parquet) query(con, "CALL ducklake_flush_inlined_data('lake')");
+  for (auto const* sql : {"SELECT (SELECT x FROM lake.scalar_value)",
+                          "SELECT (SELECT x FROM lake.scalar_value WHERE x%2=1)"})
+    check_gpu_query(sql);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake preserves discovery errors when GPU fallback is refused",
+                 "[isolated_context][ducklake][ducklake_discovery_error]")
+{
+  query(con, "SET gpu_execution=false");
+  auto attach = "ATTACH 'ducklake:" + disk.directory + "/meta.db' AS lake (DATA_PATH '" +
+                disk.directory + "/data', METADATA_CATALOG 'meta', DATA_INLINING_ROW_LIMIT 0)";
+  query(con, attach);
+  query(con, "CREATE TABLE lake.t(id INTEGER)");
+  query(con, "INSERT INTO lake.t VALUES (1), (2)");
+  query(con, "DELETE FROM lake.t WHERE id=2");
+  std::vector<std::string> statements{
+    "SELECT * FROM lake.t",
+    "SELECT * FROM ducklake_table_insertions('lake','main','t',0,2)",
+    "SELECT * FROM ducklake_table_deletions('lake','main','t',2,3)"};
+  for (auto const& sql : statements) {
+    query(con, "SET gpu_execution=false");
+    auto expected = ducklake_result_bag(*query(con, sql));
+    query(con, "SET gpu_execution=true");
+    query(con, "SET enable_duckdb_fallback=true");
+    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  }
+  query(con, "SET gpu_execution=false");
+  query(con, "UPDATE meta.ducklake_data_file SET file_format='foo'");
+  query(con, "DETACH lake");
+  query(con, attach);
+  for (auto const& sql : statements) {
+    query(con, "SET gpu_execution=false");
+    auto cpu = con.Query(sql);
+    REQUIRE(cpu->HasError());
+    REQUIRE(cpu->GetError().find("Unsupported data file format: foo") != std::string::npos);
+    query(con, "SET gpu_execution=true");
+    for (bool fallback : {true, false}) {
+      query(con, std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+      for (auto const& statement :
+           {sql, "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")"}) {
+        auto result = con.Query(statement);
+        REQUIRE(result->HasError());
+        INFO(result->GetError());
+        if (fallback) {
+          CHECK(result->GetError().find("Unsupported data file format: foo") != std::string::npos);
+          CHECK(result->GetError().find("source discovery incomplete") == std::string::npos);
+        } else {
+          CHECK((result->GetError().find("GPU") != std::string::npos ||
+                 result->GetError().find("SiriusExecuteQuery error:") != std::string::npos));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake reuses delete preparation capacity across files and scans",
+                 "[isolated_context][ducklake][ducklake_delete_budget]")
+{
+  auto files = GENERATE(1, 2, 8);
+  INFO(files);
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',10)");
+  run("CREATE TABLE lake.q(i BIGINT)");
+  for (int file = 0; file < files; ++file) {
+    run("INSERT INTO lake.q SELECT i FROM range(" + std::to_string(file * 100) + "," +
+        std::to_string((file + 1) * 100) + ") t(i)");
+  }
+  run("DELETE FROM lake.q WHERE i%100=0");
+  run("INSERT INTO lake.q VALUES (-1),(-2)");
+  std::vector<std::string> sql{"SELECT count(*),sum(i) FROM lake.q",
+                               "SELECT count(*) FROM lake.q",
+                               "SELECT i FROM lake.q WHERE i=50 OR i%10=9",
+                               "SELECT count(*),sum(a.i) FROM lake.q a JOIN lake.q b ON a.i=b.i"};
+  std::vector<std::vector<std::string>> expected;
+  for (auto const& text : sql)
+    expected.push_back(ducklake_result_bag(*run(text)));
+  auto runtime  = sirius::test::get_registered_sirius_context(con);
+  auto observed = std::make_shared<observed_host_reservations>(runtime->get_memory_manager());
+  runtime->physical_counters()->track_units                      = true;
+  runtime->physical_counters()->preparation_provider_for_testing = observed;
+  runtime->physical_counters()->iceberg_statement_route_for_testing =
+    [&](std::string_view, sirius::scan_manager::admission_decision const& decision) {
+      if (!decision.deferred) return;
+      std::lock_guard lock(observed->seen->mutex);
+      observed->seen->exceeded |=
+        decision.sigma_retained + decision.n_permits * decision.w > decision.c_obtained ||
+        decision.n_permits < 1;
+    };
+  auto clear_provider = std::shared_ptr<void>(nullptr, [&](void*) {
+    runtime->physical_counters()->preparation_provider_for_testing.reset();
+    runtime->physical_counters()->iceberg_statement_route_for_testing = {};
+  });
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto const reserved = hosts[0]->get_total_reserved_memory();
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    for (size_t i = 0; i < sql.size(); ++i) {
+      INFO(sql[i]);
+      check_gpu_result(sql[i], expected[i]);
+      CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+    }
+  }
+  if (files > 1) {
+    auto counters = runtime->physical_counters();
+    std::atomic<unsigned> decoded{0};
+    counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+      if (!footer && ++decoded == 2) throw std::runtime_error("delete visibility decode failure");
+    };
+    auto clear =
+      std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+    run("SET enable_duckdb_fallback=true");
+    auto before = get_transparent_execution_stats(con);
+    CHECK(ducklake_result_bag(*run(sql[0])) == expected[0]);
+    CHECK(decoded.load() >= 2);
+    CHECK(get_transparent_execution_stats(con).runtime_fallbacks == before.runtime_fallbacks + 1);
+    CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+    clear.reset();
+    run("SET enable_duckdb_fallback=false");
+    CHECK(ducklake_result_bag(*run(sql[0])) == expected[0]);
+    CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  }
+  CHECK_FALSE(observed->seen->exceeded);
+  CHECK(observed->seen->peak_live > 0);
+  CHECK(observed->seen->live == 0);
+  CHECK(observed->seen->grants == 0);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake empty scans preserve scalar aggregate results",
+                 "[isolated_context][ducklake][ducklake_empty_aggregate]")
+{
+  auto shape = GENERATE(
+    std::string("empty"), std::string("inline"), std::string("parquet"), std::string("mixed"));
+  INFO(shape);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.q(x BIGINT, s VARCHAR)");
+  if (shape != "empty") query(con, "INSERT INTO lake.q VALUES (NULL,NULL),(42,'value')");
+  if (shape == "parquet" || shape == "mixed")
+    query(con, "CALL ducklake_flush_inlined_data('lake')");
+  if (shape == "mixed") query(con, "INSERT INTO lake.q VALUES (NULL,NULL)");
+  for (auto suffix : {"", " WHERE x>1000", " WHERE x%3=1"}) {
+    if (shape == "empty" && *suffix) continue;
+    auto sql =
+      std::string(
+        "SELECT COUNT(*),COUNT(x),SUM(x),FIRST(x),FIRST(s),AVG(x),MIN(x),MAX(x) FROM lake.q") +
+      suffix;
+    CAPTURE(sql);
+    auto expected = cpu_result(sql);
+    auto prepared = con.Prepare(sql);
+    REQUIRE_FALSE(prepared->HasError());
+    for (int repeat = 0; repeat < 2; ++repeat)
+      check_gpu_execution(expected, [&] { return prepared->Execute(); });
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake inline projection reads only required columns",
+                 "[isolated_context][ducklake][ducklake_projection]")
+{
+  auto local = GENERATE(false, true);
+  CAPTURE(local);
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit', 20000)");
+  query(con, "CREATE TABLE lake.q(id BIGINT, unused VARCHAR, label VARCHAR, flag BOOLEAN)");
+  if (local) query(con, "BEGIN");
+  query(con,
+        "INSERT INTO lake.q SELECT i, repeat('unused', 16), "
+        "CASE WHEN i%7=0 THEN NULL ELSE 'value_'||CAST(i%13 AS VARCHAR) END, i%2=0 "
+        "FROM range(4097) r(i)");
+  auto observer = duckdb::make_shared_ptr<provider_query_observer>();
+  // Keep COUNT on the scan path instead of replacing it with catalog statistics.
+  sirius::test::disabled_optimizers_guard const scan_count(con, "statistics_propagation");
+  std::vector<size_t> read_widths;
+
+  observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+    if (&context != con.context.get() &&
+        context.GetCurrentQuery().find(" inlined_data") != std::string::npos)
+      read_widths.push_back(plan.GetColumnBindings().size());
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), std::move(hook));
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+  for (auto const& [sql, width] : std::vector<std::pair<std::string, size_t>>{
+         {"SELECT id FROM lake.q", 1},
+         {"SELECT COUNT(*) FROM lake.q", 1},
+         {"SELECT label,id,label FROM lake.q WHERE flag AND id>10", 3},
+         {"SELECT id FROM lake.q WHERE label='value_2'", 2}}) {
+    read_widths.clear();
+    check_gpu_query(sql);
+    if (!local) REQUIRE_FALSE(read_widths.empty());
+    for (auto read_width : read_widths)
+      CHECK(read_width <= width);
+  }
+  if (local) query(con, "ROLLBACK");
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake validates local Parquet deletes across parallel row group boundaries",
+                 "[ducklake][ducklake_parallel_deletes][isolated_context]")
+{
+  run("SET gpu_execution=false");
+  run("SET threads=1");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  run("CALL lake.set_option('write_deletion_vectors',false)");
+  run("CREATE TABLE lake.q AS SELECT i::BIGINT id FROM range(16384) t(i)");
+  run("DELETE FROM lake.q WHERE id % 2 = 0");
+  auto files = run("SELECT delete_file FROM ducklake_list_files('lake','q')");
+  REQUIRE(files->RowCount() == 1);
+  auto source           = files->Collection().GetValue(0, 0).ToSQLString();
+  const std::string sql = "SELECT sum(id) FROM lake.q";
+  auto expected         = ducklake_result_bag(*run(sql));
+  for (int delta : {0, 2, 4}) {
+    CAPTURE(delta);
+    run("SET gpu_execution=false");
+    run("SET threads=1");
+    auto path =
+      std::filesystem::path(disk.directory) / ("deletes-" + std::to_string(delta) + ".parquet");
+    auto dest       = duckdb::Value(path.string()).ToSQLString();
+    std::string pos = "CASE WHEN pos=4096 THEN pos-" + std::to_string(delta) + " ELSE pos END";
+    run("COPY (SELECT file_path," + pos + " AS pos FROM read_parquet(" + source +
+        ") t ORDER BY t.pos) TO " + dest + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE(run("SELECT count(DISTINCT row_group_id) FROM parquet_metadata(" + dest + ")")
+              ->Collection()
+              .GetValue(0, 0)
+              .GetValue<int64_t>() == 4);
+    run("UPDATE __ducklake_metadata_lake.ducklake_delete_file SET path=" + dest +
+        ",path_is_relative=false,footer_size=NULL,file_size_bytes=" +
+        std::to_string(std::filesystem::file_size(path)));
+    run("SET threads=4");
+    run("SET enable_duckdb_fallback=false");
+    run("SET gpu_execution=true");
+    if (delta) {
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      REQUIRE(result->HasError());
+      CHECK(result->GetError().find("strictly increasing") != std::string::npos);
+    } else {
+      check_gpu_result(sql, expected);
+    }
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Interrupting a DuckLake Parquet delete read preserves cancellation",
+                 "[isolated_context][ducklake][ducklake_delete_interrupt]")
+{
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  run("CALL lake.set_option('write_deletion_vectors',false)");
+  run("CREATE TABLE lake.q AS SELECT range id FROM range(4096)");
+  run("DELETE FROM lake.q WHERE id < 1234");
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=true");
+  run("SET sirius_test_sync_cpu_replay=true");
+  auto runtime  = sirius::test::get_registered_sirius_context(con);
+  auto counters = runtime->physical_counters();
+  auto observed = std::make_shared<observed_host_reservations>(runtime->get_memory_manager());
+  std::atomic<unsigned> interrupts{0}, replays{0};
+  // The delete reader has bound the footer and is reserving its position vector.
+  observed->seen->on_allocate = [&](uint64_t bytes) {
+    if (bytes == 1234 * sizeof(int64_t)) {
+      ++interrupts;
+      con.Interrupt();
+    }
+  };
+  counters->track_units                      = true;
+  counters->preparation_provider_for_testing = observed;
+  runtime->cpu_replay_hook_for_testing       = [&] { ++replays; };
+  auto cleanup                               = std::shared_ptr<void>(nullptr, [&](void*) {
+    counters->preparation_provider_for_testing.reset();
+    runtime->cpu_replay_hook_for_testing = {};
+  });
+  SECTION("the query returns cancellation without replay")
+  {
+    auto result = con.Query("SELECT sum(id) FROM lake.q");
+    REQUIRE(interrupts == 1);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetErrorObject().Type() == duckdb::ExceptionType::INTERRUPT);
+    CHECK(replays == 0);
+  }
+  SECTION("the delete preparation job preserves the original exception")
+  {
+    namespace dl = sirius::ducklake;
+    namespace sm = sirius::scan_manager;
+    run("SET gpu_execution=false");
+    auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+    bool interrupted_job   = false;
+    observer->inspect_plan = [&](duckdb::ClientContext& ctx, duckdb::LogicalOperator& plan) {
+      if (&ctx != con.context.get()) return;
+      auto visit = [&](auto&& self, duckdb::LogicalOperator& node) -> void {
+        if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+          auto& get = node.Cast<duckdb::LogicalGet>();
+          if (get.function.GetName() == "ducklake_scan") {
+            auto binding = dl::binding_handle::capture(get.function, get.bind_data.get(), ctx);
+            binding->bind_execution_owner();
+            binding->configure_scan({0}, nullptr);
+            auto budget = std::make_unique<sm::preparation_ledger>(*observed);
+            std::vector<sm::scan_envelope> envelopes{
+              {{dl::scan_ingestible::envelope(1, 0)}, {}, true, 1}};
+            auto decision = budget->admit(envelopes, observed->space);
+            auto admission =
+              std::make_shared<sm::preparation_admission>(std::move(budget), decision);
+            auto source = binding->make_parquet_unit(0, 1, 1, admission, {0});
+            source->attach_preparation_ledger(
+              std::shared_ptr<sm::preparation_ledger>(admission->consume()));
+            auto lanes = source->make_preparation_sources({});
+            auto claim = lanes.front().try_claim();
+            auto job   = std::get<sm::preparation_job>(std::move(claim));
+            try {
+              job.run({});
+            } catch (duckdb::InterruptException const&) {
+              interrupted_job = true;
+              throw;
+            }
+          }
+        }
+        for (auto& child : node.children)
+          self(self, *child);
+      };
+      visit(visit, plan);
+    };
+    duckdb::OptimizerExtension hook;
+    hook.optimizer_info        = observer;
+    hook.pre_optimize_function = observe_provider_query;
+    duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context),
+                                         std::move(hook));
+    auto detach = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+    auto result = con.Query("SELECT sum(id) FROM lake.q");
+    REQUIRE(result->HasError());
+    REQUIRE(interrupts == 1);
+    CHECK(interrupted_job);
+  }
+  CHECK(observed->seen->live == 0);
+  CHECK(observed->seen->grants == 0);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake lookup rejects foreign transaction and reader bindings",
+                 "[ducklake][ducklake_binding_lookup][isolated_context]")
+{
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CREATE TABLE lake.q(i INTEGER)");
+  auto sibling = env.make_connection();
+  query(sibling, "SET gpu_execution=false");
+  run("BEGIN");
+  query(sibling, "BEGIN");
+  auto first = con.ExtractPlan("SELECT i FROM lake.q");
+  auto same  = con.ExtractPlan("SELECT i FROM lake.q");
+  auto other = sibling.ExtractPlan("SELECT i FROM lake.q");
+  auto* a    = ducklake_get(*first);
+  auto* b    = ducklake_get(*same);
+  auto* c    = ducklake_get(*other);
+  REQUIRE(a);
+  REQUIRE(b);
+  REQUIRE(c);
+  using sirius::planner::lookup_connector;
+  REQUIRE(lookup_connector(*a, *con.context));
+  REQUIRE(lookup_connector(*b, *con.context));
+  REQUIRE(lookup_connector(*c, *sibling.context));
+  using sirius::planner::lookup_connector_classified;
+  using sirius::planner::lookup_decline;
+  CHECK(lookup_connector_classified(*a, *sibling.context).decline ==
+        lookup_decline::bind_data_mismatch);
+
+  REQUIRE(a->function.function_info.get() != b->function.function_info.get());
+  // Keep the reader and its original transaction; change only the function-info owner.
+  std::swap(a->function.function_info, b->function.function_info);
+  auto mismatched = lookup_connector_classified(*a, *con.context);
+  std::swap(a->function.function_info, b->function.function_info);
+  CHECK(mismatched.decline == lookup_decline::bind_data_mismatch);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "Normal EOS retires an in-flight DuckLake Parquet metadata job",
+                 "[ducklake][ducklake_parquet_eos][isolated_context]")
+{
+  namespace dl   = sirius::ducklake;
+  namespace sm   = sirius::scan_manager;
+  namespace prep = sirius::test::preparation;
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',0)");
+  run("CREATE TABLE lake.q AS SELECT 42 AS i");
+  auto observer          = duckdb::make_shared_ptr<provider_query_observer>();
+  bool exercised         = false;
+  observer->inspect_plan = [&](duckdb::ClientContext& ctx, duckdb::LogicalOperator& plan) {
+    if (&ctx != con.context.get()) return;
+    auto* get = ducklake_get(plan);
+    if (!get) return;
+    auto binding = dl::binding_handle::capture(get->function, get->bind_data.get(), ctx);
+    binding->bind_execution_owner();
+    binding->configure_scan({0}, nullptr);
+    sm::test::test_reservation_provider backing;
+    auto budget = std::make_unique<sm::preparation_ledger>(backing);
+    auto env    = dl::parquet_unit_ingestible::envelope(binding->unit_at(0).value());
+    std::vector<sm::scan_envelope> scans{{{env}, {}, true, 1}};
+    backing.grant_bytes = std::max<uint64_t>(1, env.retained_charge(1) + env.temporary_charge(1));
+    auto decision  = budget->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0});
+    auto admission = std::make_shared<sm::preparation_admission>(std::move(budget), decision);
+    auto ledger    = std::shared_ptr<sm::preparation_ledger>(admission->consume());
+    auto parquet   = binding->make_parquet_unit(0, 1, 1, admission, {0});
+    parquet->attach_preparation_ledger(ledger);
+    auto claim =
+      parquet->try_claim_split([](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+        throw std::logic_error("stopped job reached Parquet I/O");
+      });
+    auto job = std::get<sm::preparation_job>(std::move(claim));
+    prep::fixture f;
+    auto hold  = f.make_hold();
+    auto out   = std::make_shared<prep::sink>();
+    auto guard = f.shutdown_guard();
+    f.source(std::make_shared<prep::accumulator>(),
+             out,
+             [claimed = false,
+              work    = std::move(job),
+              hold]() mutable -> sm::preparation_coordinator::claim_result {
+               if (std::exchange(claimed, true)) return {};
+               return sm::preparation_job{
+                 [job = std::move(work), hold](sm::preparation_stop_token stop) mutable {
+                   hold->wait();
+                   return job.run(stop);
+                 }};
+             });
+    f.start();
+    REQUIRE(hold->await());
+    f.coordinator.request_stop(sm::stop_reason::normal_eos);
+    hold->release();
+    f.finish();
+    CHECK_FALSE(f.completion.has_error());
+    CHECK_FALSE(f.owner_error);
+    CHECK(ledger->permits_in_flight() == 0);
+    exercised = true;
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), std::move(hook));
+  auto detach = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+  run("SELECT i FROM lake.q");
+  CHECK(exercised);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake decimals preserve precision across inline Parquet and mixed scans",
+                 "[ducklake][ducklake_decimal][isolated_context]")
+{
+  auto mode       = GENERATE(std::string("inline"), std::string("parquet"), std::string("mixed"));
+  auto precision  = GENERATE(5, 9, 10, 18, 19, 38);
+  auto scale_mode = GENERATE(0, 1, 2);
+  auto scale      = scale_mode == 0 ? 0 : scale_mode == 1 ? 2 : precision;
+  CAPTURE(mode, precision, scale);
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  auto limit = mode == "inline" ? 10000 : mode == "parquet" ? 0 : 10;
+  run("CALL lake.set_option('data_inlining_row_limit'," + std::to_string(limit) + ")");
+  auto type    = "DECIMAL(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+  auto maximum = (precision == scale ? std::string("0") : std::string(precision - scale, '9')) +
+                 (scale ? "." + std::string(scale, '9') : "");
+  std::string small = precision == scale ? "0.23" : "1.23";
+  run("CREATE TABLE lake.decimals(id BIGINT, value " + type + ")");
+  run("INSERT INTO lake.decimals SELECT i, CASE i%4 WHEN 0 THEN '" + maximum + "' WHEN 1 THEN '-" +
+      maximum + "' WHEN 2 THEN '0' ELSE NULL END::" + type + " FROM range(4097) t(i)");
+  run("ALTER TABLE lake.decimals ADD COLUMN initial " + type + " DEFAULT -" + small);
+  run("ALTER TABLE lake.decimals ADD COLUMN missing " + type);
+  run("INSERT INTO lake.decimals VALUES (5000, " + small + ", -" + small + ", NULL), (5001, -" +
+      small + ", -" + small + ", NULL)");
+  auto counters         = sirius::test::get_registered_sirius_context(con)->physical_counters();
+  counters->track_units = true;
+  auto inline_rows      = counters->arrow_rows_imported.load();
+  check_gpu_query("SELECT id, value, initial, missing FROM lake.decimals");
+  CHECK(counters->arrow_rows_imported.load() - inline_rows == (mode == "inline"  ? 4099
+                                                               : mode == "mixed" ? 2
+                                                                                 : 0));
+  check_gpu_query("SELECT id, value FROM lake.decimals WHERE value > 0::" + type +
+                  " OR value IS NULL");
+  check_gpu_query("SELECT count(*), min(value), max(value) FROM lake.decimals");
+  if (scale != precision) check_gpu_query("SELECT sum(initial) FROM lake.decimals");
+  check_gpu_query("SELECT initial, missing FROM lake.decimals WHERE id < 4097");
+  // Exercise lifecycle behavior once per physical width and storage mode.
+  if (scale == 2 && (precision == 9 || precision == 18 || precision == 38)) {
+    check_gpu_query("SELECT value, initial FROM lake.decimals WHERE id < 0");
+    auto expected = cpu_result("SELECT value, initial FROM lake.decimals WHERE id >= 5000");
+    run("PREPARE decimal_query AS SELECT value, initial FROM lake.decimals WHERE id >= 5000");
+    check_gpu_result("EXECUTE decimal_query", expected);
+    check_gpu_result("EXECUTE decimal_query", expected);
+  }
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake wide decimal inline batches fit their preparation envelope",
+                 "[ducklake][ducklake_decimal][isolated_context]")
+{
+  attach_lake(con, disk.directory);
+  run("SET gpu_execution=false");
+  run("CALL lake.set_option('data_inlining_row_limit',10000)");
+  std::string columns;
+  for (int i = 0; i < 31; ++i) {
+    if (i) columns += ",";
+    columns +=
+      "CASE WHEN i%3=0 THEN NULL ELSE '-12345678901234567890.1234567890'::DECIMAL(38,10) END AS d" +
+      std::to_string(i);
+  }
+  columns += ",CASE WHEN i%2=0 THEN 'decimal payload' ELSE NULL END AS label";
+  run("CREATE TABLE lake.wide AS SELECT " + columns + " FROM range(601) t(i)");
+  auto counters         = sirius::test::get_registered_sirius_context(con)->physical_counters();
+  counters->track_units = true;
+  auto inline_rows      = counters->arrow_rows_imported.load();
+  check_gpu_query("SELECT * FROM lake.wide");
+  CHECK(counters->arrow_rows_imported.load() - inline_rows == 601);
+  check_gpu_query("SELECT d0, d30, label FROM lake.wide WHERE d15 IS NOT NULL");
+}

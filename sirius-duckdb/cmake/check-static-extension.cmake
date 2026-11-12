@@ -22,3 +22,11 @@ endforeach()
 if(dynamic MATCHES "\\((RPATH|RUNPATH)\\)")
   message(FATAL_ERROR "Distribution extension contains a runtime search path")
 endif()
+
+execute_process(COMMAND "${READELF}" --dyn-syms --wide "${EXTENSION}"
+                OUTPUT_VARIABLE symbols COMMAND_ERROR_IS_FATAL ANY)
+if(symbols MATCHES "UND[^\n]*_Z[^ \n]*[0-9]DuckLake")
+  message(
+    FATAL_ERROR
+      "Distribution extension has unresolved DuckLake provider symbols")
+endif()

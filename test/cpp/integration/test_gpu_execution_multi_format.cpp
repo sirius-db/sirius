@@ -4613,21 +4613,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Production preparation admission reports its HOST grant and scan route",
                  "[integration][scan_preparation][iceberg][prepared_admission]")
 {
-  auto scarce   = GENERATE(false, true);
-  auto three    = GENERATE(false, true);
-  auto context  = sirius::test::get_registered_sirius_context(*con);
-  auto counters = context->physical_counters();
-  auto dv_limit = GENERATE(std::optional<size_t>{},
-                           std::optional<size_t>{0},
-                           std::optional<size_t>{1},
-                           std::optional<size_t>{8});
+  auto scarce       = GENERATE(false, true);
+  auto three        = GENERATE(false, true);
+  auto context      = sirius::test::get_registered_sirius_context(*con);
+  auto counters     = context->physical_counters();
+  auto permit_limit = GENERATE(std::optional<size_t>{},
+                               std::optional<size_t>{0},
+                               std::optional<size_t>{1},
+                               std::optional<size_t>{8});
   struct config_restore {
     sirius::sirius_config& config;
     sirius::scan_manager::scan_manager_config saved;
     ~config_restore() { config.set_scan_manager_config(saved); }
   } restore{context->get_config(), context->get_config().get_scan_manager_config()};
-  auto scan_config                             = restore.saved;
-  scan_config.preparation.max_inflight_dv_jobs = dv_limit;
+  auto scan_config                    = restore.saved;
+  scan_config.preparation.max_permits = permit_limit;
   context->get_config().set_scan_manager_config(scan_config);
   REQUIRE_FALSE(counters->preparation_provider_for_testing);
   auto spaces =
@@ -4666,8 +4666,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto const& config    = context->get_config().get_scan_manager_config();
   auto limits           = config.preparation.resolve(config.thread_pool.num_threads);
   auto expected_permits = std::min<size_t>(three ? 3u : 1u, config.thread_pool.num_threads);
-  if (limits.max_inflight_dv_jobs)
-    expected_permits = std::min(expected_permits, limits.max_inflight_dv_jobs);
+  if (limits.max_permits) expected_permits = std::min(expected_permits, limits.max_permits);
   CHECK(d.c_requested == d.sigma_retained + (scarce ? 1 : expected_permits) * d.w);
   CHECK(d.c_requested % d.allocation_granularity == 0);
   REQUIRE(observed.routes.size() == 1);

@@ -68,6 +68,12 @@ class dynamic_filter_snapshot;
 
 namespace sirius::op::scan {
 
+// A mapped adapter can share a decoder across files only while each slice still
+// owns the field mapping compiled against its own footer and object version.
+struct mapped_parquet_visibility : prepared_visibility {
+  std::shared_ptr<field_id_mapping const> mapping;
+};
+
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info
 //===----------------------------------------------------------------------===//

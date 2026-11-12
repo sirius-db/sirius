@@ -32,6 +32,7 @@ struct arrow_import_binding {
   // Trusted binding hook, never carried by a produced input. Also checks rootless EOS.
   std::function<void(owned_arrow_scan_info const&)> validate_provenance;
   std::shared_ptr<scan_manager::preparation_admission> admission;
+  // A supplied gate belongs to the caller, which binds its wakeup before registering children.
   std::shared_ptr<arrow_input_gate> gate;
   // For a shared contract, use the same preparation_identity as every sibling
   // Arrow source and retained slot. Use the default local sequence only for an isolated contract.

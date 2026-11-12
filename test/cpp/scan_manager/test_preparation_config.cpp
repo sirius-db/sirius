@@ -28,10 +28,10 @@ TEST_CASE("Preparation options bound metadata jobs and preserve post-resolution 
   config.thread_pool.num_threads = 3;
   auto defaults                  = config.preparation.resolve(3);
   CHECK(defaults.max_inflight_metadata_jobs == 4096);
-  CHECK(defaults.max_inflight_dv_jobs == 0);
+  CHECK(defaults.max_permits == 0);
   config.preparation.max_inflight_metadata_jobs = 0;
-  config.preparation.max_inflight_dv_jobs       = 0;
-  CHECK(config.preparation.resolve(3).max_inflight_dv_jobs == 0);
+  config.preparation.max_permits                = 0;
+  CHECK(config.preparation.resolve(3).max_permits == 0);
   CHECK(config.preparation.resolve(3).max_inflight_metadata_jobs == 0);
   CHECK(defaults.lookahead_batches == 2);
   CHECK(defaults.max_control_work > 0);
@@ -40,7 +40,7 @@ TEST_CASE("Preparation options bound metadata jobs and preserve post-resolution 
   CHECK(defaults.partial_batch);
   config.preparation.interrupt_check_interval   = std::chrono::milliseconds(3);
   config.preparation.max_inflight_metadata_jobs = 2;
-  config.preparation.max_inflight_dv_jobs       = 7;
+  config.preparation.max_permits                = 7;
   config.preparation.lookahead_batches          = 7;
   config.preparation.max_control_work           = 4;
   config.preparation.drain_quantum              = 5;
@@ -59,7 +59,7 @@ TEST_CASE("Preparation options bound metadata jobs and preserve post-resolution 
   REQUIRE(resolved.thread_pool.num_threads == 3);
   auto snapshot = resolved.preparation.resolve(resolved.thread_pool.num_threads);
   CHECK(snapshot.max_inflight_metadata_jobs == 2);
-  CHECK(snapshot.max_inflight_dv_jobs == 7);
+  CHECK(snapshot.max_permits == 7);
   CHECK(snapshot.lookahead_batches == 7);
   CHECK(snapshot.max_control_work == 4);
   CHECK(snapshot.drain_quantum == 5);

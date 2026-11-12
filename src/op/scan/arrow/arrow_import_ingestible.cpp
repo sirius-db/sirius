@@ -129,6 +129,8 @@ class import_coalescer final : public batch_coalescer {
 }  // namespace
 struct arrow_import_ingestible::impl {
   arrow_import_binding binding;
+  const std::shared_ptr<arrow_input_gate> gate =
+    binding.gate ? binding.gate : std::make_shared<arrow_input_gate>();
   std::shared_ptr<arrow_batch_producer> producer;
   arrow_producer_limits limits;
   arrow_table_info info;
@@ -136,7 +138,7 @@ struct arrow_import_ingestible::impl {
   std::shared_ptr<sm::preparation_ledger> ledger;
   std::shared_ptr<source_state> state = std::make_shared<source_state>();
   std::optional<uint64_t> pending_identity;
-  uint64_t sequence = 0, bytes = 0, temporary_limit = 0;
+  uint64_t sequence = 0, bytes = 0, temporary_limit = 0, retained_limit = 0;
   impl(arrow_import_binding b, std::shared_ptr<arrow_batch_producer> p)
     : binding(std::move(b)), producer(std::move(p))
   {
@@ -164,10 +166,11 @@ struct arrow_import_ingestible::impl {
     }
     temporary_limit =
       limits.envelope.temporary_charge(binding.admission->decision.allocation_granularity);
+    retained_limit =
+      limits.envelope.retained_charge(binding.admission->decision.allocation_granularity);
     if (!bytes || temporary_limit > binding.admission->decision.w ||
-        limits.envelope.retained > binding.admission->decision.sigma_retained)
+        retained_limit > binding.admission->decision.sigma_retained)
       throw std::invalid_argument("Arrow producer exceeds sealed admission");
-    if (!binding.gate) binding.gate = std::make_shared<arrow_input_gate>();
     info.contract_id = binding.program.contract;
     info.profiles    = binding.profiles;
     info.names       = binding.column_names;
@@ -261,18 +264,18 @@ arrow_import_ingestible::metadata_claim arrow_import_ingestible::try_claim_split
   impl_->check_stop();
   if (!impl_->ledger) throw std::logic_error("Arrow ledger is not attached");
   if (impl_->state->eos) return sm::preparation_exhausted{};
-  if (impl_->binding.gate->active || impl_->producer->readiness() == arrow_readiness::pending)
+  if (impl_->gate->active || impl_->producer->readiness() == arrow_readiness::pending)
     return sm::preparation_pending{};
   if (impl_->sequence == UINT64_MAX) throw std::overflow_error("Arrow sequence exhausted");
   auto claim    = std::make_shared<input_claim>();
   claim->ledger = impl_->ledger;
-  claim->gate   = impl_->binding.gate;
+  claim->gate   = impl_->gate;
   if (!impl_->pending_identity)
     impl_->pending_identity =
       impl_->binding.next_unit_id ? impl_->binding.next_unit_id() : impl_->sequence;
-  claim->key    = {impl_->info.contract_id, *impl_->pending_identity};
-  claim->permit = claim->ledger->try_acquire_unit(
-    claim->key, impl_->limits.envelope.retained, impl_->temporary_limit);
+  claim->key = {impl_->info.contract_id, *impl_->pending_identity};
+  claim->permit =
+    claim->ledger->try_acquire_unit(claim->key, impl_->retained_limit, impl_->temporary_limit);
   if (!claim->permit) return sm::preparation_pending{};
   claim->acquired     = true;
   claim->gate->active = true;
@@ -311,7 +314,7 @@ void arrow_import_ingestible::attach_preparation_ledger(
 }
 void arrow_import_ingestible::bind_preparation_wakeup(sm::preparation_wakeup wake)
 {
-  impl_->binding.gate->wake = wake;
+  if (!impl_->binding.gate) impl_->gate->wake = wake;
   impl_->producer->bind_wakeup(wake);
   if (impl_->ledger) impl_->ledger->bind_wakeup(wake);
 }

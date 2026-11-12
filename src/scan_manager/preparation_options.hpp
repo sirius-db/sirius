@@ -36,12 +36,12 @@ struct partial_batch_options {
 struct preparation_options {
   size_t max_inflight_metadata_jobs, lookahead_batches, max_control_work, drain_quantum;
   std::chrono::milliseconds interrupt_check_interval = k_interrupt_check_interval;
-  size_t max_inflight_dv_jobs                        = 0;
+  size_t max_permits                                 = 0;
   std::optional<partial_batch_options> partial_batch;
 };
-// YAML and C++ overrides; zero job limits are unlimited.
+// Zero disables the configured cap for metadata jobs or preparation permits.
 struct preparation_config {
-  std::optional<size_t> max_inflight_metadata_jobs, max_inflight_dv_jobs, lookahead_batches,
+  std::optional<size_t> max_inflight_metadata_jobs, max_permits, lookahead_batches,
     max_control_work, drain_quantum;
   // Runtime-wide limits, independent of per-attempt metadata credits and GPU count.
   std::optional<size_t> native_reader_workers, max_native_readers, coordinator_workers;
@@ -62,7 +62,7 @@ struct preparation_config {
                                 max_control_work.value_or(jobs),
                                 drain_quantum.value_or(jobs),
                                 interrupt_check_interval,
-                                max_inflight_dv_jobs.value_or(0),
+                                max_permits.value_or(0),
                                 partial_batch};
     if (interrupt_check_interval.count() <= 0)
       throw std::invalid_argument("interrupt check interval must be positive");

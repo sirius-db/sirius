@@ -16,10 +16,12 @@
 
 #include "op/scan/composite_scan_driver.hpp"
 
+#include "op/scan/ready_input_coalescer.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <system_error>
 #include <utility>
 
@@ -45,6 +47,7 @@ struct unit_state {
   std::shared_ptr<scan::gpu_ingestible> source;
   std::shared_ptr<scan::split_validator const> validator;
   scan::later_check_set checks;
+  bool (*share_batches)(scan::scan_info const&) = nullptr;
   std::vector<std::unique_ptr<lane>> lanes;
   std::atomic<size_t> jobs{0};
   std::atomic<bool> exhausted{false};
@@ -131,13 +134,22 @@ struct scan_emission_state {
   std::atomic<bool> produced{false};
   explicit scan_emission_state(size_t lanes) : remaining(lanes) {}
 };
-class unit_coalescer final : public scan::batch_coalescer {
+class unit_coalescer final : public scan::ready_input_coalescer {
   std::shared_ptr<scan_owner const> owner_;
   std::shared_ptr<scan_emission_state> emission_;
   size_t target_batch_bytes_;
   bool flushed_ = false;
   std::shared_ptr<unit_state> active_;
   scan::batch_coalescer* inner_ = nullptr;
+  std::unique_ptr<scan::batch_coalescer> shared_;
+
+  void finish_shared()
+  {
+    inner_ = nullptr;
+    active_.reset();
+    shared_.reset();
+    clear_retained();
+  }
 
  public:
   unit_coalescer(std::shared_ptr<scan_owner const> o,
@@ -157,11 +169,51 @@ class unit_coalescer final : public scan::batch_coalescer {
     emission_->produced = true;
     return std::make_unique<unit_split>(owner_, active_, std::move(output), nullptr, true);
   }
-  cursor_step advance(scan::scan_info& input, size_t& cursor, size_t quantum) override
+  bool can_share(scan::scan_info const& input) const override
+  {
+    auto const* split = dynamic_cast<unit_split const*>(&input);
+    return split && split->owner == owner_ && !split->coalesced && split->input &&
+           split->unit->share_batches && split->unit->share_batches(*split->input);
+  }
+  void finish_input(cursor_step& step, bool successor_ready) override
+  {
+    if (successor_ready) return;
+    if (step.batch && inner_->first_retained_time()) {
+      step.finished = false;  // Return the tail in the next bounded step.
+      return;
+    }
+    if (!step.batch) step.batch = partial_emit();
+    finish_shared();
+  }
+  cursor_step advance_input(scan::scan_info& input, size_t& cursor, size_t quantum) override
   {
     auto& split = dynamic_cast<unit_split&>(input);
     if (split.owner != owner_ || split.coalesced || !split.coalescer)
       throw std::logic_error("Composite scan coalescer input ownership mismatch");
+    if (can_share(split)) {
+      if (!shared_) shared_ = split.unit->source->create_batch_coalescer();
+      active_              = split.unit;
+      inner_               = shared_.get();
+      auto step            = split.input_finished ? cursor_step{nullptr, true}
+                                                  : inner_->advance(*split.input, cursor, quantum);
+      split.input_finished = step.finished;
+      if (inner_->retained_bytes()) {
+        note_retained();
+      } else {
+        clear_retained();
+      }
+      if (step.batch) {
+        emission_->produced = true;
+        step.batch =
+          std::make_unique<unit_split>(owner_, split.unit, std::move(step.batch), nullptr, true);
+      }
+      return step;
+    }
+    if (shared_) {
+      auto tail = partial_emit();
+      finish_shared();
+      if (tail) return {std::move(tail), false};
+    }
     active_ = split.unit;
     inner_  = split.coalescer;
     std::unique_ptr<scan::scan_info> output;
@@ -209,6 +261,10 @@ class unit_coalescer final : public scan::batch_coalescer {
   std::vector<std::unique_ptr<scan::scan_info>> flush() override
   {
     std::vector<std::unique_ptr<scan::scan_info>> result;
+    if (shared_) {
+      if (auto tail = partial_emit()) result.push_back(std::move(tail));
+      finish_shared();
+    }
     // Only the final lane can establish that the entire scan had no output.
     if (!std::exchange(flushed_, true) && emission_->remaining.fetch_sub(1) == 1 &&
         !emission_->produced.load())
@@ -224,8 +280,12 @@ struct composite_scan_driver::impl : std::enable_shared_from_this<impl> {
   size_t target;
   std::shared_ptr<sm::preparation_ledger> ledger;
   std::shared_ptr<pipeline::completion_handler> completion;
-  std::atomic<std::shared_ptr<unit_state>> current;
-  std::atomic<bool> done{false}, owner_busy{false};
+  struct cursor {
+    std::atomic<std::shared_ptr<unit_state>> current;
+    std::atomic<bool> done{false}, owner_busy{false};
+  };
+  std::deque<cursor> cursors;
+  size_t next_owner = 0, next_metadata = 0;
   bool started = false;
   sm::preparation_wakeup wake;
   impl(scan_contract_id contract,
@@ -255,23 +315,25 @@ struct composite_scan_driver::impl : std::enable_shared_from_this<impl> {
     }
     if (error) std::rethrow_exception(error);
   }
-  std::shared_ptr<unit_state> discover(io::ioctx_resolver resolve)
+  std::shared_ptr<unit_state> discover(size_t slot, io::ioctx_resolver resolve)
   {
-    auto child = discover_next();
+    auto& cursor = cursors[slot];
+    auto child   = discover_next(slot);
     if (!child) {
-      done = true;
+      cursor.done = true;
       return {};
     }
-    auto state       = std::make_shared<unit_state>();
-    state->source    = std::move(child->source);
-    state->validator = std::move(child->validator);
-    state->checks    = child->checks;
+    auto state           = std::make_shared<unit_state>();
+    state->source        = std::move(child->source);
+    state->validator     = std::move(child->validator);
+    state->checks        = child->checks;
+    state->share_batches = child->share_batches;
     // Publish before initialization so failed setup is cleaned up through source close/drain.
-    current.store(state);
+    cursor.current.store(state);
     if (!state->source || !state->validator || (state->checks & ~owner->supported).any())
       throw std::invalid_argument("Composite child requires a source and supported validator");
     state->source->preflight_for_query();
-    state->source->attach_preparation_ledger(ledger);
+    state->source->attach_preparation_ledger(child->ledger ? std::move(child->ledger) : ledger);
     state->source->set_execution_completion(completion);
     auto sources      = state->source->make_preparation_sources(resolve);
     bool has_metadata = false;
@@ -291,35 +353,38 @@ struct composite_scan_driver::impl : std::enable_shared_from_this<impl> {
     }
     return state;
   }
-  scan::gpu_ingestible::metadata_claim claim(sm::preparation_execution_domain domain,
-                                             io::ioctx_resolver resolve)
+  scan::gpu_ingestible::metadata_claim claim_child(size_t slot,
+                                                   sm::preparation_execution_domain domain,
+                                                   io::ioctx_resolver resolve)
   {
-    using job = scan::gpu_ingestible::metadata_job;
-    if (done) return sm::preparation_exhausted{};
-    auto state = current.load();
-    if (domain == sm::preparation_execution_domain::query_owner && !owner_busy &&
+    using job    = scan::gpu_ingestible::metadata_job;
+    auto& cursor = cursors[slot];
+    if (cursor.done) return sm::preparation_exhausted{};
+    auto state = cursor.current.load();
+    if (domain == sm::preparation_execution_domain::query_owner && !cursor.owner_busy &&
         (!state || (state->exhausted && !state->jobs && state->metadata_closed))) {
-      owner_busy = true;
+      cursor.owner_busy = true;
       struct release_owner {
         std::shared_ptr<impl> self;
-        explicit release_owner(std::shared_ptr<impl> s) : self(std::move(s)) {}
+        size_t slot;
+        release_owner(std::shared_ptr<impl> s, size_t i) : self(std::move(s)), slot(i) {}
         ~release_owner()
         {
-          self->owner_busy = false;
+          self->cursors[slot].owner_busy = false;
           self->wake();
         }
       };
-      auto pending = std::make_shared<release_owner>(shared_from_this());
-      return job{[this, state, resolve, pending](
+      auto pending = std::make_shared<release_owner>(shared_from_this(), slot);
+      return job{[this, slot, state, resolve, pending](
                    sm::preparation_stop_token stop) -> std::unique_ptr<scan::scan_info> {
         if (stop.stop_requested())
           throw std::system_error(std::make_error_code(std::errc::operation_canceled));
         if (state) close_lanes(state, sm::preparation_execution_domain::query_owner);
-        current.store(discover(resolve));
+        cursors[slot].current.store(discover(slot, resolve));
         return {};
       }};
     }
-    if (!state || owner_busy) return sm::preparation_pending{};
+    if (!state || cursor.owner_busy) return sm::preparation_pending{};
     for (auto& lane : state->lanes) {
       if (lane->source.execution != domain || lane->exhausted) continue;
       auto claim = lane->source.try_claim();
@@ -365,6 +430,36 @@ struct composite_scan_driver::impl : std::enable_shared_from_this<impl> {
     }
     return sm::preparation_pending{};
   }
+  scan::gpu_ingestible::metadata_claim claim(sm::preparation_execution_domain domain,
+                                             io::ioctx_resolver const& resolve)
+  {
+    auto& next =
+      domain == sm::preparation_execution_domain::query_owner ? next_owner : next_metadata;
+    bool pending = false;
+    for (size_t i = 0; i < cursors.size(); ++i) {
+      size_t slot = (next + i) % cursors.size();
+      auto result = claim_child(slot, domain, resolve);
+      if (std::holds_alternative<scan::gpu_ingestible::metadata_job>(result)) {
+        next = (slot + 1) % cursors.size();
+        return result;
+      }
+      pending |= std::holds_alternative<sm::preparation_pending>(result);
+    }
+    if (pending) return sm::preparation_pending{};
+    return sm::preparation_exhausted{};
+  }
+  void close(sm::preparation_execution_domain domain)
+  {
+    std::exception_ptr error;
+    for (auto& cursor : cursors) {
+      try {
+        if (auto unit = cursor.current.load()) close_lanes(unit, domain);
+      } catch (...) {
+        if (!error) error = std::current_exception();
+      }
+    }
+    if (error) std::rethrow_exception(error);
+  }
 };
 composite_scan_driver::composite_scan_driver(scan_contract_id contract,
                                              uint64_t generation,
@@ -382,7 +477,8 @@ std::vector<gpu_ingestible::preparation_source> composite_scan_driver::make_prep
   std::function<void(sm::preparation_wakeup)> bind_wakeup)
 {
   if (impl_->started || !ledger) throw std::logic_error("Composite scan registration invalid");
-  impl_->started    = true;
+  impl_->started = true;
+  impl_->cursors.resize(ledger->reusable_slot_limit(impl_->owner->contract));
   impl_->ledger     = std::move(ledger);
   impl_->completion = std::move(completion);
   std::vector<gpu_ingestible::preparation_source> result;
@@ -397,9 +493,7 @@ std::vector<gpu_ingestible::preparation_source> composite_scan_driver::make_prep
       state->ledger->bind_wakeup(wake);
       if (bind_wakeup) bind_wakeup(wake);
     };
-    source.close = [state = impl_, domain] {
-      if (auto unit = state->current.load()) state->close_lanes(unit, domain);
-    };
+    source.close     = [state = impl_, domain] { state->close(domain); };
     source.coalescer = std::make_unique<unit_coalescer>(impl_->owner, emission, impl_->target);
     result.push_back(std::move(source));
   }
@@ -414,16 +508,24 @@ std::shared_ptr<split_validator const> composite_scan_driver::validator() const
 {
   return impl_->validator;
 }
-bool composite_scan_driver::exhausted() const { return impl_->done; }
+bool composite_scan_driver::exhausted() const
+{
+  return !impl_->cursors.empty() && std::all_of(impl_->cursors.begin(),
+                                                impl_->cursors.end(),
+                                                [](auto const& c) { return c.done.load(); });
+}
 void composite_scan_driver::stop_preparation() noexcept
 {
-  if (auto state = impl_->current.load(); state && state->source) state->source->stop_preparation();
+  for (auto& cursor : impl_->cursors)
+    if (auto state = cursor.current.load(); state && state->source)
+      state->source->stop_preparation();
   impl_->ledger.reset();
 }
 void composite_scan_driver::finish_preparation() noexcept
 {
   stop_preparation();
-  impl_->current.store({});
+  for (auto& cursor : impl_->cursors)
+    cursor.current.store({});
 }
 std::optional<filtered_table> composite_scan_driver::materialize(
   scan_info const& input,

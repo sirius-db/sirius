@@ -21,6 +21,7 @@
 #include <cucascade/memory/common.hpp>
 
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,9 @@ struct unit_envelope {
   // Independently allocated blocks are rounded separately by the backing allocator.
   std::vector<uint64_t> temporary;
   uint64_t retained = 0;
+  // The first retained allocation and any additional live blocks round independently.
+  std::vector<uint64_t> additional_retained_blocks = {};
+  uint64_t retained_charge(uint64_t allocation_granularity) const;
   // Sum independently rounded blocks, matching admission and runtime accounting.
   uint64_t temporary_charge(uint64_t allocation_granularity) const;
 };
@@ -53,6 +57,8 @@ struct scan_envelope {
   // Output may retain temporary credit while waiting for another scan to run.
   // Such scans contribute a minimum that admission must not reduce.
   uint32_t minimum_permits = 0;
+  // This scan discovers files on demand and reuses one unit budget per admitted slot.
+  std::optional<op::scan::scan_contract_id> reusable_slot_contract = {};
 };
 struct admission_decision {
   bool deferred           = false;
@@ -176,7 +182,13 @@ class charging_allocator {
 };
 class preparation_ledger {
  public:
+  // Only an owned provider can fund optional slots after initial admission.
   explicit preparation_ledger(reservation_provider& provider) : provider_(&provider) {}
+  explicit preparation_ledger(std::shared_ptr<reservation_provider> provider)
+    : provider_(provider.get()), slot_provider_(std::move(provider))
+  {
+    if (!provider_) throw std::invalid_argument("preparation requires a reservation provider");
+  }
   ~preparation_ledger() { close(); }
   preparation_ledger(preparation_ledger const&)            = delete;
   preparation_ledger& operator=(preparation_ledger const&) = delete;
@@ -188,6 +200,11 @@ class preparation_ledger {
   void register_unit(unit_key, uint64_t retained_limit);
   void retire_unit(unit_key key) noexcept;
   size_t tracked_units() const;
+  // One progress slot is funded at admission. A discovered file can fund another
+  // slot up to this scan's share of the statement ceiling. A denied slot is optional.
+  uint32_t reusable_slot_limit(op::scan::scan_contract_id contract) const;
+  std::shared_ptr<preparation_ledger> try_reserve_reusable_slot(op::scan::scan_contract_id,
+                                                                size_t slot);
   w_permit acquire_permit(
     unit_key);  // Nonblocking; empty means coordinator must wait for an event.
   // Atomically register and acquire. Pending leaves neither registration nor budget changes.
@@ -208,7 +225,8 @@ class preparation_ledger {
   uint64_t allocation_failures() const;
   void close() noexcept;  // Stops admission; existing backing remains alive through its last user.
  private:
-  reservation_provider* provider_;  // Cleared by admit; runtime owns only reservation backing.
+  reservation_provider* provider_;                       // Used only for initial admission.
+  std::shared_ptr<reservation_provider> slot_provider_;  // Owns the provider for optional grants.
   bool admitted_ = false;
   std::shared_ptr<ledger_state> state_;
 };
@@ -225,7 +243,7 @@ class preparation_admission {
   bool consumed_ = false;
   std::unique_ptr<preparation_ledger> ledger_;
 };
-// Planning-only provider request. No callback or provider reference survives admission.
+// Planning request. Its callbacks are consumed during statement admission.
 struct preparation_request {
   scan_envelope envelope;
   std::function<void(preparation_ledger&)> prepare;
@@ -236,7 +254,7 @@ struct preparation_request {
 // Collect all requests before reserving. Prepare arenas before binding the sealed admission;
 // any preparation/binding exception rolls back every participating provider.
 // The optional receipt is cleared on entry and set after that rollback completes.
-admission_decision prepare_statement_resources(reservation_provider&,
+admission_decision prepare_statement_resources(std::shared_ptr<reservation_provider>,
                                                std::span<preparation_request>,
                                                memory_space_id,
                                                uint32_t max_permits     = 1,
