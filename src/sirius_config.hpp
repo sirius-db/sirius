@@ -120,6 +120,10 @@ constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
 constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
 
+/// Merge sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same
+/// table into one scan and a per-key MIN/MAX aggregate.
+constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
+
 /// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
@@ -295,6 +299,11 @@ struct operator_params {
   /// same. See `reuse_delim_rows_for_subquery_aggregates`.
   bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
 
+  /// Rewrite sibling correlated `[NOT] EXISTS (... t.k = outer.k AND t.x <> outer.x)` over the
+  /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
+  /// `rewrite_correlated_inequality_exists`.
+  bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
+
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
@@ -398,10 +407,7 @@ struct sirius_config {
   /// Replace all settings with hardware-resolved defaults. Apply programmatic
   /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
-  [[nodiscard]] int max_concurrent_queries() const noexcept
-  {
-    return _scan_manager_config.max_concurrent_queries;
-  }
+  [[nodiscard]] int max_concurrent_queries() const noexcept { return _max_concurrent_queries; }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -492,6 +498,8 @@ struct sirius_config {
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
+  /// Query admission limit (`sirius.max_concurrent_queries`).
+  int _max_concurrent_queries{1};
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};

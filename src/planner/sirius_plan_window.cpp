@@ -108,6 +108,8 @@ bool is_cumulative_extremum_argument(duckdb::LogicalType const& type)
     case LogicalTypeId::SMALLINT:
     case LogicalTypeId::INTEGER:
     case LogicalTypeId::BIGINT:
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
     case LogicalTypeId::DATE:
     case LogicalTypeId::TIMESTAMP:
     case LogicalTypeId::TIMESTAMP_MS:
@@ -209,8 +211,8 @@ void plan_ranking_order(window_plan& plan,
  *   take a numeric argument. `COUNT`, `MIN` and `MAX` also take the types allowed as partition
  *   keys, and `MIN` and `MAX` keep the argument type.
  * - With a window `ORDER BY`, over `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, for `SUM`,
- *   `COUNT`, `COUNT(*)`, `MIN` and `MAX`. `MIN` and `MAX` take an integer, decimal, date or
- *   timestamp argument.
+ *   `COUNT`, `COUNT(*)`, `MIN` and `MAX`. `MIN` and `MAX` take an integer, decimal, floating
+ *   point, date or timestamp argument.
  */
 aggregate_id build_aggregate(duckdb::BoundWindowExpression const& expression)
 {

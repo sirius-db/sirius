@@ -406,7 +406,6 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("backend", opt.backend);
-  r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
@@ -479,6 +478,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("pin_table_prove_unique_keys", opt.prove_unique_keys);
   // 0 is meaningful here: it selects the share of GPU memory space capacity.
   r.optional("pin_table_unique_exact_max_bytes", yaml::bytes(opt.unique_exact_max_bytes));
+  r.optional("enable_exists_minmax_rewrite", opt.enable_exists_minmax_rewrite);
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
@@ -930,32 +930,18 @@ try {
     mr.reject_unknown();
   }
 
-  int query_limit            = 1;
-  bool const has_query_limit = r.has_value("max_concurrent_queries");
-  r.optional("max_concurrent_queries", query_limit, yaml::greater_than<int>{0});
-  bool has_scan_limit = false;
+  r.optional(
+    "max_concurrent_queries", settings._max_concurrent_queries, yaml::greater_than<int>{0});
   // Executors
   if (auto exec_node = r.optional_node("executor")) {
     yaml::reader er(*exec_node, "sirius.executor");
     if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
-    if (auto n = er.optional_node("scan_manager")) {
-      yaml::reader scan_reader(*n, "sirius.executor.scan_manager");
-      has_scan_limit = scan_reader.has_value("max_concurrent_queries");
-      from_yaml(*n, settings._scan_manager_config);
-    }
+    if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
     if (auto n = er.optional_node("pipeline"))
       from_yaml(*n, settings._gpu_pipeline_executor_config);
     if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
     er.reject_unknown();
   }
-
-  if (has_query_limit && has_scan_limit &&
-      query_limit != settings._scan_manager_config.max_concurrent_queries)
-    throw std::runtime_error(
-      "conflicting sirius.max_concurrent_queries and deprecated "
-      "executor.scan_manager.max_concurrent_queries");
-  if (has_query_limit) settings._scan_manager_config.max_concurrent_queries = query_limit;
-  // Both YAML names share one stored authority.
 
   // Parse operator settings below and record which batch sizes are explicit,
   // so hardware resolution only fills in omitted values.

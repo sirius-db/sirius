@@ -746,6 +746,23 @@ static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
   return nullptr;
 }
 
+struct PinTableArgs {
+  std::string path;
+  std::string tier;
+  std::string name;
+  std::optional<std::vector<std::string>> cols;
+  /// Optional per-call request for Simpatico pin compression. When omitted,
+  /// the legacy session/config setting remains the default.
+  std::optional<bool> compression;
+  /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
+  /// `format` named parameter, else inferred from the path extension
+  /// (.parquet -> parquet, .db/.duckdb -> duckdb).
+  std::string format;
+  /// duckdb-native only: schema that contains the table named by `name`. Defaults
+  /// to "main"; the catalog search path (current/USE'd database) still applies.
+  std::string schema = "main";
+};
+
 struct PinTableFunctionData : public TableFunctionData {
   PinTableArgs args;
   bool finished = false;
@@ -2601,18 +2618,6 @@ static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scop
   ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
 }
 
-// Deprecated alias for `expression_evaluator_strategy`. Kept so existing
-// `SET expression_executor_strategy=...` statements keep working; remove in a future release.
-static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
-                                                    SetScope scope,
-                                                    Value& parameter)
-{
-  SIRIUS_LOG_WARN(
-    "The 'expression_executor_strategy' setting is deprecated; use "
-    "'expression_evaluator_strategy' instead.");
-  ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
-}
-
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
                                     Value& /*parameter*/)
@@ -2748,8 +2753,9 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
       level_name);
   }
   Config::LOG_LEVEL = std::move(level_name);
-  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
-  sirius::log::get_sink()->set_level(*parsed_level);
+  // Only re-targets the current sink and re-mirrors it onto cuCascade's gate; no
+  // rebuild (the duckdb sink ignores the level, and so does the mirror for it).
+  sirius::log::set_level(*parsed_level);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
@@ -2935,6 +2941,14 @@ static void SetEnableDelimAggregateReuse(ClientContext& context, SetScope scope,
   params->enable_delim_aggregate_reuse = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DELIM_AGGREGATE_REUSE to {}",
                    params->enable_delim_aggregate_reuse);
+}
+
+static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_exists_minmax_rewrite = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_EXISTS_MINMAX_REWRITE to {}",
+                   params->enable_exists_minmax_rewrite);
 }
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -3126,15 +3140,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
-
-  // Deprecated alias for `expression_evaluator_strategy`; remove in a future release.
-  config.AddExtensionOption(
-    "expression_executor_strategy",
-    "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
-    "'materialize', 'ast_interpret', or 'ast_jit'",
-    LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
-    SetExpressionExecutorStrategyDeprecated);
 
   add_sirius_option(
     config,
@@ -3426,6 +3431,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_delim_aggregate_reuse),
                     SetEnableDelimAggregateReuse);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_exists_minmax_rewrite",
+                    "runtime override for the correlated EXISTS MIN/MAX rewrite",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_exists_minmax_rewrite),
+                    SetEnableExistsMinmaxRewrite);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

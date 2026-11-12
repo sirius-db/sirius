@@ -76,6 +76,7 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <sirius/exception.hpp>
+#include <transparent/replay_admission.hpp>
 #include <utils/table_filter_test_utils.hpp>
 
 #include <atomic>
@@ -1502,8 +1503,8 @@ TEST_CASE("resident Parquet checkpoint counts a program it cannot prepare as mis
   CHECK(counts.cached_declined_no_membership == 1);
 }
 
-TEST_CASE("resident Parquet split on another device passes the checkpoint without a decline",
-          "[scan_normalization][cached_scan]")
+TEST_CASE("resident Parquet split on another device is refused before assembly",
+          "[scan_normalization][cached_scan][multi_gpu]")
 {
   int devices = 0;
   int current = -1;
@@ -1518,8 +1519,8 @@ TEST_CASE("resident Parquet split on another device passes the checkpoint withou
   columns.push_back(resident_column<std::int64_t>({901, 404, 208}, cudf::type_id::INT64));
   auto source = resident_columns(std::move(columns));
   auto input  = f.split(source, false);
-  // Names the other GPU but allocates on this one, so only the device the program is prepared for
-  // differs.
+  // Deliberately mislabel the prepared input's GPU space. The allocation stays local;
+  // the guard must refuse before assembly uses this space.
   cucascade::memory::memory_space elsewhere(cucascade::memory::gpu_memory_space_config{
     .device_id       = current == 0 ? 1 : 0,
     .memory_capacity = f.e.gpu_space->get_max_memory(),
@@ -1528,13 +1529,19 @@ TEST_CASE("resident Parquet split on another device passes the checkpoint withou
         f.e.gpu_space->get_default_allocator()};
     }});
   input->gpu_memory_space = &elsewhere;
-  auto output             = f.op.execute(*input, f.e.stream());
-  auto const& scanned     = dynamic_cast<scan::scan_output_operator_data const&>(*output);
-  CHECK(scanned.receipt().applied.empty());
-  auto leases = scanned.get_read_only_batches();
-  CHECK(sirius::get_cudf_table_view(leases.at(0)).num_rows() == 3);
+  // Refuse before entering the optional cached-filter checkpoint.
+  bool refused = false;
+  try {
+    (void)f.op.execute(*input, f.e.stream());
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    refused = true;
+    CHECK(error.cause == sirius::transparent::late_failure_cause::gpu_error);
+    CHECK(error.reason.empty());
+    CHECK_THAT(error.what(), Catch::Matchers::ContainsSubstring("but the scan executes on GPU"));
+  }
+  REQUIRE(refused);
   auto const counts = f.stats.snapshot();
-  CHECK(counts.applications_skipped_other_device == 1);
+  CHECK(counts.applications_skipped_other_device == 0);
   CHECK(counts.cached_placements == 0);
   CHECK(counts.cached_declined_no_membership == 0);
 }

@@ -416,7 +416,8 @@ in what DuckDB's binder puts around it. `UNION ALL` is the node alone, and
 `a UNION ALL b UNION ALL c` binds to one node with three children. `UNION` and `UNION BY NAME` are
 a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate.
 The `EXCEPT ALL` / `INTERSECT ALL` lowering also uses `UNION` to merge its two tagged inputs.
-Distinct `EXCEPT` and `INTERSECT` fall back to CPU.
+Distinct `EXCEPT` and `INTERSECT` do not use `UNION`: they lower to a null-safe ANTI or SEMI hash
+join, then deduplicate its rows with a grouped aggregate (see `plan_except_intersect`).
 
 The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends two more
 shapes to the CPU. The first is `allow_out_of_order = false`, which requires output in arm order.
@@ -518,7 +519,7 @@ sizing partitions have run.
 ### Whole-partition window evaluator
 **File:** `src/op/window/whole_partition.hpp`, `src/op/window/whole_partition.cpp`
 
-`evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. It runs a `cudf::groupby()` (a reduction when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow.
+`evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. It runs a `cudf::groupby()` (a reduction when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow. A floating point `MIN` or `MAX` orders NaN above every other value, as in DuckDB, with the helpers in `src/op/window/float_extremum.hpp`.
 
 ### Ranking window evaluator
 **File:** `src/op/window/ranking.hpp`, `src/op/window/ranking.cpp`
@@ -528,7 +529,7 @@ sizing partitions have run.
 ### Cumulative window evaluator
 **File:** `src/op/window/cumulative.hpp`, `src/op/window/cumulative.cpp`
 
-`evaluate_cumulative_window()` computes `SUM`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` of one table. It sorts like the ranking evaluator, gathers the partition columns and the argument columns, runs a sorted `cudf::groupby` scan with the sum (with overflow detection for `DECIMAL128`), count, min or max aggregation, fills the NULL results of rows with a NULL argument from the closest value before them in the same partition (`groupby::replace_nulls` with `PRECEDING`), and scatters the results back to the input row order. `SUM` accumulates like the whole-partition `SUM` and throws on overflow. `MIN` and `MAX` take integer, decimal, date and timestamp arguments. A window without `PARTITION BY` is one partition on one GPU. The input, the results and the scratch memory must then fit on that GPU, and the input must have fewer than 2^31 rows.
+`evaluate_cumulative_window()` computes `SUM`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` of one table. It sorts like the ranking evaluator, gathers the partition columns and the argument columns, runs a sorted `cudf::groupby` scan with the sum (with overflow detection for `DECIMAL128`), count, min or max aggregation, fills the NULL results of rows with a NULL argument from the closest value before them in the same partition (`groupby::replace_nulls` with `PRECEDING`), and scatters the results back to the input row order. `SUM` accumulates like the whole-partition `SUM` and throws on overflow. `MIN` and `MAX` take integer, decimal, floating point, date and timestamp arguments. Over floating point they order NaN above every other value with the same helpers as the whole-partition evaluator: an argument without NaN is scanned as it is, and an argument with NaN is scanned with NaN replaced by NULL, then NaN is restored from a running NaN flag. A window without `PARTITION BY` is one partition on one GPU. The input, the results and the scratch memory must then fit on that GPU, and the input must have fewer than 2^31 rows.
 
 ## Pipeline Breakers (Sirius-Specific)
 

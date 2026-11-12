@@ -243,8 +243,13 @@ read_view_comparison compare_read_views_impl(
     return result;
   };
   // A candidate never reads more scans than the logical plan had. It may read fewer when a planner
-  // pass merged scans of one identical view into a single scan; that is checked below.
-  if (candidate.size() > logical_original.size()) return pairing_failed();
+  // pass merged scans of one identical view into a single scan, which is checked below, but only
+  // when the original physical plan read every logical scan.
+  if (candidate.size() > logical_original.size() ||
+      (candidate.size() < logical_original.size() &&
+       physical_original.size() != logical_original.size())) {
+    return pairing_failed();
+  }
   std::unordered_set<duckdb::idx_t> matched_table_indexes;
   matched_table_indexes.reserve(candidate.size());
   for (auto const& candidate_binding : candidate) {
@@ -262,21 +267,16 @@ read_view_comparison compare_read_views_impl(
     }
   }
   // Every logical scan the candidate does not read must be a duplicate of one it does: the same
-  // view read once instead of twice. A scan of any other view going missing is a mismatch, and so
-  // is a logical scan the original plan never physically read: only those reads can be merged.
-  std::size_t unmatched = 0;
+  // view, selecting the same rows, read once instead of twice. A scan of any other view going
+  // missing is a mismatch.
   for (auto const& original : logical_original) {
     if (matched_table_indexes.contains(original.table_index)) { continue; }
     bool const duplicates_a_read_view =
       std::any_of(candidate.begin(), candidate.end(), [&](auto const& candidate_binding) {
-        return same_identity(original.view, candidate_binding.view);
+        return same_identity(original.view, candidate_binding.view) &&
+               op::scan::same_selector(*original.view, *candidate_binding.view);
       });
     if (!duplicates_a_read_view) return pairing_failed();
-    ++unmatched;
-  }
-  if (physical_original.size() < candidate.size() ||
-      unmatched != physical_original.size() - candidate.size()) {
-    return pairing_failed();
   }
   result.equal = true;
   return result;

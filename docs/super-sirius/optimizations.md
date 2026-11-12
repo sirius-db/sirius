@@ -166,6 +166,44 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_delim_aggregate_reuse` (default: `true`, see [Configuration](configuration.md)).
 
+### Correlated EXISTS MIN/MAX Rewrite
+
+**Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
+
+**Mechanism:** `rewrite_correlated_inequality_exists` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), before column bindings are resolved, so a replacement only has to emit the same bindings as the nodes it replaces. If it throws, the plan is copied again without it. It matches each subquery in either shape DuckDB produces:
+
+```
+delim_join_as_cte = false:  DELIM_JOIN (SEMI/ANTI, or MARK under FILTER(mark); IS NOT DISTINCT FROM)
+                             ├─ outer rows
+                             └─ [PROJECTION...] ← INNER JOIN(T, DELIM_GET) on  t.k = d.k  AND  t.x <> d.x
+delim_join_as_cte = true:   [RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = outer.k  AND  t.x <> outer.x
+```
+
+Either comparison may be null-safe (`IS NOT DISTINCT FROM` for the key, `IS DISTINCT FROM` for the value). Two or more matched joins nested through their outer rows whose scans read the same source (`capture_bound_read_view`) on the same base key column are replaced together, with one scan of `T`:
+
+```
+FILTER   EXISTS:     mn <> outer.x OR mx <> outer.x      (per subquery; projection map: the original columns)
+         NOT EXISTS: (that) IS NULL OR NOT (that)
+ └─ LEFT DELIM_JOIN on outer.k IS NOT DISTINCT FROM a.k
+     ├─ outer rows
+     └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
+          ← INNER JOIN(T, DELIM_GET(k))
+```
+
+`EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
+
+Plain SEMI/ANTI joins (`delim_join_as_cte = true`) over a table pinned in GPU memory, with every column they read, are left unmerged unless they are estimated not to fit on the GPU. Each such join scans its subquery's table and hashes its rows. That beats the merged aggregate only when the scans are cheap and the rows fit: q21 at SF1000 on a GB300 runs in 0.475 s unmerged against 0.531 s merged with `lineitem` pinned in GPU memory, but 8.2 s against 6.5 s without the pin. On a 32 GB RTX 4500 reading from S3, merging wins at SF1000 (10.7 s against 11.7 s) and at SF3000, where the unmerged joins spill (271 s against 54 s). The size estimate is the largest subquery scan's base-table row count times its key and value widths, since DuckDB's estimates of the subqueries' filters can be several times too low. The budget is the smallest GPU's downgrade threshold (`downgrade_trigger_fraction` of its capacity). Delim joins are merged regardless, as the merge was faster in every measured case.
+
+Because the merged plan reads one view fewer times than the original, `compare_read_views` (`src/transparent/read_view_registry.cpp`) accepts a candidate that reads an identical view fewer times, while still rejecting one that reads a new view, reads a view more often, or drops the only scan of a view.
+
+**Limits:**
+- Exactly one key and one value correlation, on an `INTEGER`/`BIGINT` key. The value must be an integer, fixed-point, temporal or duration type.
+- With `delim_join_as_cte = true`, plans where DuckDB keeps the delim join as a MARK join over a CTE scan (filtered or nullable subqueries) are not matched.
+
+**Code path:** `src/planner/sirius_plan_exists_rewrite.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`
+
+**Config:** `enable_exists_minmax_rewrite` (default `true`, see [Configuration](configuration.md)).
+
 ### Sorted-Key Grouped Aggregation
 
 **Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.

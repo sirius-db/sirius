@@ -12,7 +12,7 @@ else()
   message(FATAL_ERROR "Unsupported architecture: ${VCPKG_TARGET_ARCHITECTURE}")
 endif()
 
-# Pinned NVIDIA CUDA 12.9.1 / 13.3.0 redistributables.
+# Pinned NVIDIA CUDA 12.9.2 / 13.5.0 redistributables.
 file(READ "${CMAKE_CURRENT_LIST_DIR}/redistrib.json" _redistrib)
 string(JSON _version GET "${_redistrib}" "${VCPKG_CUDA_VERSION}" version)
 string(JSON _sha512 GET "${_redistrib}" "${VCPKG_CUDA_VERSION}" "${_platform}"

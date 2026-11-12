@@ -18,6 +18,7 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_delim_aggregate_reuse.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
@@ -37,10 +38,13 @@
 #include <log/logging.hpp>
 #include <util/duckdb_error_message.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::transparent {
@@ -75,6 +79,36 @@ bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
   }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
+}
+
+/// The option as `query_operator_options` resolves it, without creating the session's overrides.
+bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_exists_minmax_rewrite;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_exists_minmax_rewrite;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+}
+
+/// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
+/// off it. 0 when no GPU capacity is configured.
+std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
+{
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!runtime) { return 0; }
+  std::uint64_t budget = 0;
+  for (auto const& space : runtime->get_config().get_memory_space_configs()) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
+    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
+    budget                        = budget == 0 ? threshold : std::min(budget, threshold);
+  }
+  return budget;
 }
 
 using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
@@ -280,6 +314,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
     auto copy = copy_logical_plan(*captured, context);
+    // Runs before the EXISTS rewrite, whose recorded count a failure here would otherwise discard.
     if (delim_aggregate_reuse_enabled(context)) {
       try {
         sirius::planner::reuse_delim_rows_for_subquery_aggregates(
@@ -287,6 +322,17 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
       } catch (std::exception& e) {
         SIRIUS_LOG_WARN(
           "Transparent execution: delim aggregate reuse failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy = copy_logical_plan(*captured, context);
+      }
+    }
+    if (exists_minmax_rewrite_enabled(context)) {
+      try {
+        ctx->record_exists_minmax_rewrites(sirius::planner::rewrite_correlated_inequality_exists(
+          context, input.optimizer.binder, copy, gpu_memory_budget(context)));
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",
           sirius::sanitized_message(e));
         copy = copy_logical_plan(*captured, context);
       }

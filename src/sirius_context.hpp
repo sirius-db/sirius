@@ -374,6 +374,8 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
+    // Subqueries the EXISTS MIN/MAX rewrite replaced in captured plans.
+    uint64_t exists_minmax_rewrites = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
     uint64_t provider_internal_skips          = 0;
     uint64_t hidden_catalog_skips             = 0;
@@ -828,6 +830,9 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record @p count subqueries replaced by the EXISTS MIN/MAX rewrite.
+  void record_exists_minmax_rewrites(uint64_t count) noexcept;
+
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
   void record_transparent_certificate_incomplete() noexcept;
@@ -974,6 +979,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> exists_minmax_rewrite_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =

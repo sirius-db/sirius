@@ -370,6 +370,17 @@ TEST_CASE_METHOD(WindowFixture,
                  "),min(d) OVER (PARTITION BY p ORDER BY id" + frame +
                  "),max(d) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
   compare_window("SELECT id,sum(f) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  compare_window("SELECT id,min(f) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),max(f::FLOAT) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  // NaN orders above every other value, and NULL rows keep the running value.
+  compare_window("SELECT id,min(x) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),max(x) OVER (PARTITION BY p ORDER BY id" + frame +
+                 ") FROM (SELECT id,p,CASE WHEN id%11=0 THEN 'nan'::DOUBLE WHEN id%13=0 THEN NULL "
+                 "ELSE f END x FROM w)");
+  // Q51 over floating point sales: a running max of a running sum.
+  compare_window("SELECT p,q,max(r) OVER (PARTITION BY p ORDER BY q" + frame +
+                 ") FROM (SELECT p,q,sum(sum(f)) OVER (PARTITION BY p ORDER BY q" + frame +
+                 ") r FROM w WHERE q IS NOT NULL GROUP BY p,q)");
   compare_window("SELECT id,min(DATE '2020-01-01'+v) OVER (PARTITION BY p ORDER BY id" + frame +
                  "),max(DATE '2020-01-01'+v) OVER (PARTITION BY p ORDER BY id" + frame +
                  ") FROM w");
@@ -403,7 +414,7 @@ TEST_CASE_METHOD(WindowFixture,
   expect_plan_fallback_matches_cpu(
     "SELECT id,avg(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
   expect_plan_fallback_matches_cpu(
-    "SELECT id,min(f) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
+    "SELECT id,max(s) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT id,percent_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");
