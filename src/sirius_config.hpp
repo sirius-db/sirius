@@ -28,9 +28,12 @@
 
 #include <cmath>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace YAML {
 class Node;
@@ -396,6 +399,27 @@ class configuration_input_error : public std::runtime_error {
 };
 
 class parsed_sirius_config;
+
+/// The CPUs a REST pool built from (@c rest_n_reactors, @c rest) would pin to, sorted:
+/// cuCascade's @c planned_reactor_cpus in production.  May throw.
+using rest_reactor_cpu_planner =
+  std::function<std::vector<int>(std::size_t n_reactors, cucascade::io::rest::config const& rest)>;
+
+/**
+ * @brief Remove the CPUs the pinned REST reactors will take from each of @p pools.
+ *
+ * A pool without an affinity starts from @p allowed (the configuring thread's mask); a pool
+ * whose affinity lies entirely on reactor CPUs keeps it rather than losing every CPU.
+ *
+ * @return The reserved CPUs, sorted; empty when nothing is reserved (the switch is off, planning
+ * failed, the reactors run unpinned, or they would take every allowed CPU), and the pools are
+ * then left untouched.
+ */
+[[nodiscard]] std::vector<int> reserve_cpus_for_rest_reactors(
+  scan_manager::scan_manager_config const& scan_manager,
+  rest_reactor_cpu_planner const& plan,
+  std::vector<int> const& allowed,
+  std::span<exec::thread_pool_config* const> pools);
 
 struct sirius_config {
   sirius_config()  = default;

@@ -31,6 +31,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::scan_manager {
 
@@ -258,6 +259,13 @@ struct scan_manager_config {
   /// @c rest.pin_to_irq_cpus is on), so those CPUs carry only the NIC's
   /// interrupts and the reactors.  No effect when the reactors run unpinned.
   bool reserve_rest_reactor_cpus{true};
+
+  /// Engine-owned (not YAML): the CPU mask REST contexts are built and started
+  /// from, set to the configuring thread's affinity when the reactor CPUs are
+  /// reserved.  A routed REST context built lazily on a pool thread (whose mask
+  /// excludes the reserved CPUs) is built on a helper thread with this mask, so
+  /// it plans and pins exactly as at startup.  Empty: the caller's own mask.
+  std::vector<int> rest_placement_cpus;
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:

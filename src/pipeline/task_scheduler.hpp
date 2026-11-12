@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::parallel {
 class downgrade_executor;
@@ -52,6 +53,17 @@ class task_creator;
 }
 
 namespace pipeline {
+
+/**
+ * @brief The CPUs a GPU's pipeline executor runs on: its GPU's @p local_cores within
+ * @p pool_affinity.
+ *
+ * An empty @p pool_affinity places the executor on all of @p local_cores.  When
+ * @p pool_affinity holds none of them, it is kept as is: it already excludes CPUs reserved
+ * elsewhere (e.g. for pinned REST reactors), which the local cores may not.
+ */
+[[nodiscard]] std::vector<int> gpu_executor_cpu_affinity(std::vector<int> const& local_cores,
+                                                         std::vector<int> const& pool_affinity);
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.

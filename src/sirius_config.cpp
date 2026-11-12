@@ -1310,28 +1310,26 @@ void sirius_config::finalize_derived_config()
   reserve_rest_reactor_cpus();
 }
 
-void sirius_config::reserve_rest_reactor_cpus()
+std::vector<int> reserve_cpus_for_rest_reactors(
+  scan_manager::scan_manager_config const& scan_manager,
+  rest_reactor_cpu_planner const& plan,
+  std::vector<int> const& allowed,
+  std::span<exec::thread_pool_config* const> pools)
 {
-  // Pinned REST reactors share their CPUs with the NIC's interrupt handling (they are pinned to
-  // the steered IRQ CPUs).  Every other Sirius thread placed there competes with both, so the
-  // pools are restricted to the remaining CPUs.  The REST pool is built lazily, after the pools,
-  // so the CPUs come from cuCascade's planning rather than from the pool.
-  _rest_reactor_cpus.clear();
-  if (!_scan_manager_config.reserve_rest_reactor_cpus) { return; }
+  if (!scan_manager.reserve_rest_reactor_cpus) { return {}; }
   std::vector<int> reactor_cpus;
   try {
-    reactor_cpus = cucascade::io::rest::planned_reactor_cpus(_scan_manager_config.rest_n_reactors,
-                                                             _scan_manager_config.rest);
+    reactor_cpus = plan(scan_manager.rest_n_reactors, scan_manager.rest);
   } catch (const std::exception& e) {
     SIRIUS_LOG_WARN(
       "sirius_config: cannot plan the REST reactor CPUs ({}); thread pools keep "
       "their affinity",
       e.what());
-    return;
+    return {};
   }
-  if (reactor_cpus.empty()) { return; }
+  if (reactor_cpus.empty()) { return {}; }
+  std::ranges::sort(reactor_cpus);
 
-  auto const allowed          = cucascade::exec::thread_util::get_current_thread_affinity();
   auto const without_reactors = [&](std::vector<int> const& cpus) {
     std::vector<int> kept;
     for (int const cpu : cpus) {
@@ -1347,23 +1345,38 @@ void sirius_config::reserve_rest_reactor_cpus()
       "sirius_config: the REST reactors would take every allowed CPU ({}); thread "
       "pools keep their affinity",
       cucascade::memory::format_cpu_list(allowed));
-    return;
+    return {};
   }
-  auto const restrict_pool = [&](exec::thread_pool_config& pool) {
-    auto kept = without_reactors(pool.cpu_affinity_list.empty() ? allowed : pool.cpu_affinity_list);
+  for (auto* pool : pools) {
+    auto kept =
+      without_reactors(pool->cpu_affinity_list.empty() ? allowed : pool->cpu_affinity_list);
     // A pool configured onto reactor CPUs only keeps its configuration rather than losing all
     // its CPUs.
-    if (!kept.empty()) { pool.cpu_affinity_list = std::move(kept); }
-  };
-  restrict_pool(_gpu_pipeline_executor_config);
-  restrict_pool(_scan_manager_config.thread_pool);
-  restrict_pool(_task_creator_config.thread_pool);
-  restrict_pool(_downgrade_executor_config.thread_pool);
+    if (!kept.empty()) { pool->cpu_affinity_list = std::move(kept); }
+  }
   SIRIUS_LOG_INFO(
     "sirius_config: REST reactors pin to CPUs {}; Sirius thread pools restricted to CPUs {}",
     cucascade::memory::format_cpu_list(reactor_cpus),
     cucascade::memory::format_cpu_list(pool_cpus));
-  _rest_reactor_cpus = std::move(reactor_cpus);
+  return reactor_cpus;
+}
+
+void sirius_config::reserve_rest_reactor_cpus()
+{
+  // Pinned REST reactors share their CPUs with the NIC's interrupt handling (they are pinned to
+  // the steered IRQ CPUs).  Every other Sirius thread placed there competes with both, so the
+  // pools are restricted to the remaining CPUs.  The REST pool is built lazily, after the pools,
+  // so the CPUs come from cuCascade's planning rather than from the pool.
+  exec::thread_pool_config* const pools[] = {&_gpu_pipeline_executor_config,
+                                             &_scan_manager_config.thread_pool,
+                                             &_task_creator_config.thread_pool,
+                                             &_downgrade_executor_config.thread_pool};
+  auto allowed       = cucascade::exec::thread_util::get_current_thread_affinity();
+  _rest_reactor_cpus = reserve_cpus_for_rest_reactors(
+    _scan_manager_config, cucascade::io::rest::planned_reactor_cpus, allowed, pools);
+  // A REST context built later on a restricted pool thread must plan from this mask, not its own.
+  _scan_manager_config.rest_placement_cpus =
+    _rest_reactor_cpus.empty() ? std::vector<int>{} : std::move(allowed);
 }
 
 void sirius_config::derive_rest_scan_budget()

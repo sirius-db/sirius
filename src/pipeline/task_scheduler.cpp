@@ -46,6 +46,19 @@
 namespace sirius {
 namespace pipeline {
 
+std::vector<int> gpu_executor_cpu_affinity(std::vector<int> const& local_cores,
+                                           std::vector<int> const& pool_affinity)
+{
+  if (pool_affinity.empty()) { return local_cores; }
+  std::vector<int> cores;
+  for (int const cpu : local_cores) {
+    if (std::find(pool_affinity.begin(), pool_affinity.end(), cpu) != pool_affinity.end()) {
+      cores.push_back(cpu);
+    }
+  }
+  return cores.empty() ? pool_affinity : cores;
+}
+
 task_scheduler::task_scheduler(
   sirius::exec::query_lifecycle_registry& lifecycle,
   const exec::thread_pool_config& gpu_executor_config,
@@ -84,18 +97,10 @@ task_scheduler::task_scheduler(
                              });
 
       if (it != sys_topology->gpus.end()) {
-        // The GPU's local cores, within the pool's own affinity when it has one (a configured
-        // list, or the CPUs left after sirius_config reserved the REST reactors' CPUs).  An
-        // empty intersection keeps the local cores.
-        std::vector<int> cores;
-        for (int const cpu : it->cpu_cores) {
-          if (config.cpu_affinity_list.empty() ||
-              std::find(config.cpu_affinity_list.begin(), config.cpu_affinity_list.end(), cpu) !=
-                config.cpu_affinity_list.end()) {
-            cores.push_back(cpu);
-          }
-        }
-        config.cpu_affinity_list = cores.empty() ? it->cpu_cores : std::move(cores);
+        // The pool's own affinity is a configured list, or the CPUs left after sirius_config
+        // reserved the REST reactors' CPUs.
+        config.cpu_affinity_list =
+          gpu_executor_cpu_affinity(it->cpu_cores, config.cpu_affinity_list);
       }
     }
     // Find matching downgrade executor for this GPU space

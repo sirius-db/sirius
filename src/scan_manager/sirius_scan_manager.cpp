@@ -20,6 +20,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
+#include "exec/thread_util.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/ioctx_resolver.hpp"
@@ -2367,15 +2368,28 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // failure must not leave the backend unavailable for the manager's lifetime.
   auto const failed = _failed_io_ctxs.find(cache_key);
   if (failed != _failed_io_ctxs.end() && failed->second) { return nullptr; }
-  auto [io_ctx, failure] = make_ioctx_or_explain(type,
-                                                 snapshot ? snapshot->config.get() : nullptr,
-                                                 /*explain=*/failed == _failed_io_ctxs.end());
+  ioctx_build build;
+  auto const build_and_start = [&] {
+    build = make_ioctx_or_explain(type,
+                                  snapshot ? snapshot->config.get() : nullptr,
+                                  /*explain=*/failed == _failed_io_ctxs.end());
+    if (build.io_ctx) { build.io_ctx->start(); }
+  };
+  // A REST pool plans its reactor placement from the building thread's mask and its reactors
+  // inherit it. First use may come from a pool thread whose mask excludes the CPUs reserved for
+  // the reactors (e.g. a deferred Puffin read on a metadata worker), so build from the mask the
+  // reservation was planned from.
+  if (type == cucascade::io::io_context_type::restful && !_config.rest_placement_cpus.empty()) {
+    exec::run_with_affinity(_config.rest_placement_cpus, build_and_start);
+  } else {
+    build_and_start();
+  }
+  auto& [io_ctx, failure] = build;
   if (!io_ctx) {
     _failed_io_ctxs.insert_or_assign(cache_key, failure.by_configuration);
     return nullptr;
   }
   _failed_io_ctxs.erase(cache_key);
-  io_ctx->start();
   init_cache_for(*io_ctx);
   std::lock_guard lk{_routed_io_ctxs_mtx};
   auto [it, inserted] =

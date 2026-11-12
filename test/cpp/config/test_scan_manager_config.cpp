@@ -35,6 +35,8 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -752,14 +754,109 @@ TEST_CASE("reserve_rest_reactor_cpus keeps the thread pools off the planned reac
   });
   if (planned.empty() || !room) {
     CHECK(on.get_rest_reactor_cpus().empty());
+    CHECK(on.get_scan_manager_config().rest_placement_cpus.empty());
   } else {
     CHECK(on.get_rest_reactor_cpus() == planned);
+    // REST contexts built later, from restricted pool threads, plan from the configuring mask.
+    CHECK(on.get_scan_manager_config().rest_placement_cpus == allowed);
     for (auto const& affinity : pool_affinities(on)) {
       CHECK_FALSE(affinity.empty());
       for (int const cpu : planned) {
         CHECK(std::find(affinity.begin(), affinity.end(), cpu) == affinity.end());
       }
     }
+  }
+}
+
+TEST_CASE("reserve_cpus_for_rest_reactors restricts pools to an injected plan",
+          "[scan_manager][config][rest_placement]")
+{
+  using sirius::exec::thread_pool_config;
+  std::vector<int> const allowed{0, 1, 2, 3, 4, 5, 6, 7};
+  auto const plan_of = [](std::vector<int> cpus) {
+    return [cpus](std::size_t, cucascade::io::rest::config const&) { return cpus; };
+  };
+  struct pools_t {
+    thread_pool_config unset, overlapping, disjoint, all_reserved;
+    std::array<thread_pool_config*, 4> all()
+    {
+      return {&unset, &overlapping, &disjoint, &all_reserved};
+    }
+  };
+  auto const fresh = [] {
+    pools_t pools;
+    pools.overlapping.cpu_affinity_list  = {0, 4, 5};
+    pools.disjoint.cpu_affinity_list     = {5, 6};
+    pools.all_reserved.cpu_affinity_list = {1, 0};
+    return pools;
+  };
+  scan_manager_config cfg;
+
+  SECTION("an unsorted plan is reserved from every pool")
+  {
+    auto pools = fresh();
+    auto const reserved =
+      sirius::reserve_cpus_for_rest_reactors(cfg, plan_of({1, 0}), allowed, pools.all());
+    CHECK(reserved == std::vector<int>{0, 1});
+    CHECK(pools.unset.cpu_affinity_list == std::vector<int>{2, 3, 4, 5, 6, 7});
+    CHECK(pools.overlapping.cpu_affinity_list == std::vector<int>{4, 5});
+    CHECK(pools.disjoint.cpu_affinity_list == std::vector<int>{5, 6});
+    // A pool configured onto reactor CPUs only keeps its configuration.
+    CHECK(pools.all_reserved.cpu_affinity_list == std::vector<int>{1, 0});
+  }
+
+  auto const untouched = [](pools_t& pools) {
+    CHECK(pools.unset.cpu_affinity_list.empty());
+    CHECK(pools.overlapping.cpu_affinity_list == std::vector<int>{0, 4, 5});
+    CHECK(pools.disjoint.cpu_affinity_list == std::vector<int>{5, 6});
+    CHECK(pools.all_reserved.cpu_affinity_list == std::vector<int>{1, 0});
+  };
+
+  SECTION("a plan covering every allowed CPU reserves nothing")
+  {
+    auto pools = fresh();
+    CHECK(
+      sirius::reserve_cpus_for_rest_reactors(cfg, plan_of(allowed), allowed, pools.all()).empty());
+    untouched(pools);
+  }
+
+  SECTION("unpinned reactors (an empty plan) reserve nothing")
+  {
+    auto pools = fresh();
+    CHECK(sirius::reserve_cpus_for_rest_reactors(cfg, plan_of({}), allowed, pools.all()).empty());
+    untouched(pools);
+  }
+
+  SECTION("the opt-out never consults the planner")
+  {
+    cfg.reserve_rest_reactor_cpus = false;
+    bool planned                  = false;
+    auto pools                    = fresh();
+    auto const reserved           = sirius::reserve_cpus_for_rest_reactors(
+      cfg,
+      [&](std::size_t, cucascade::io::rest::config const&) {
+        planned = true;
+        return std::vector<int>{0};
+      },
+      allowed,
+      pools.all());
+    CHECK(reserved.empty());
+    CHECK_FALSE(planned);
+    untouched(pools);
+  }
+
+  SECTION("a discovery failure leaves the pools alone")
+  {
+    auto pools          = fresh();
+    auto const reserved = sirius::reserve_cpus_for_rest_reactors(
+      cfg,
+      [](std::size_t, cucascade::io::rest::config const&) -> std::vector<int> {
+        throw std::runtime_error("no sysfs");
+      },
+      allowed,
+      pools.all());
+    CHECK(reserved.empty());
+    untouched(pools);
   }
 }
 
