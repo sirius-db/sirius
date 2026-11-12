@@ -15,17 +15,12 @@
  */
 
 #include "catch.hpp"
-#include "data/data_batch_utils.hpp"
-#include "data/sirius_converter_registry.hpp"
-#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "operator/operator_test_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "utils/test_physical_operator.hpp"
-#include "utils/utils.hpp"
-
-#include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
@@ -35,12 +30,9 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
-#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 
-#include <cstdint>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -56,78 +48,11 @@ using sirius::pipeline::materialize_repository_wiring;
 using sirius::pipeline::repository_wiring;
 using sirius::pipeline::sirius_pipeline;
 using sirius::pipeline::sirius_pipeline_build_state;
+using sirius::test::operator_utils::tiered_memory_fixture;
 
 namespace {
 
-constexpr std::size_t kNumRows   = 4096;
 constexpr std::string_view kPort = "default";
-
-/// Memory manager fixture over one GPU space plus NUMA host spaces.
-struct residency_fixture {
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu0  = nullptr;
-  cucascade::memory::memory_space* host0 = nullptr;
-
-  bool setup()
-  {
-    sirius::converter_registry::reset_for_testing();
-    try {
-      cucascade::memory::reservation_manager_configurator builder;
-      builder.set_number_of_gpus(1)
-        .set_gpu_usage_limit(256ULL << 20)
-        .set_reservation_fraction_per_gpu(0.75)
-        .set_per_numa_region_capacity(1ULL << 30)
-        .use_numa_id_as_host_id()
-        .track_reservation_per_stream(false)
-        .set_reservation_fraction_per_numa_region(0.75);
-      manager =
-        std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    } catch (cucascade::cuda_error const&) {
-      throw;
-    } catch (const std::exception&) {
-      return false;
-    }
-    sirius::converter_registry::initialize();
-
-    auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    if (gpu_spaces.empty()) { return false; }
-    gpu0             = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
-    auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (host_spaces.empty()) { return false; }
-    host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
-    return true;
-  }
-
-  ~residency_fixture()
-  {
-    // The registry is initialized right after the manager is built, so both exist or neither.
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
-  }
-
-  /// Single INT64 column of random data, converted in place to the host representation
-  /// (spilled-batch shape).
-  std::shared_ptr<cucascade::data_batch> make_host_batch(::cuda::stream_ref stream)
-  {
-    auto table = sirius::create_cudf_table_with_random_data(kNumRows,
-                                                            {cudf::data_type{cudf::type_id::INT64}},
-                                                            {std::make_pair(0, 1000000)},
-                                                            stream,
-                                                            gpu0->get_default_allocator());
-    stream.sync();
-    auto batch = sirius::make_data_batch(
-      std::move(table), *gpu0, stream, sirius::telemetry::batch_telemetry_info{});
-    {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(
-        sirius::converter_registry::get(), host0, stream);
-    }
-    stream.sync();
-    return batch;
-  }
-};
 
 /// Opts every input port into on-demand residency and downgrade-first.
 class opted_in_operator : public test_physical_operator {
@@ -182,7 +107,7 @@ struct wired_consumer {
 /// Push a HOST batch into the wired port and build the task local state around the operator's
 /// default task input, as the task creator does.
 struct task_under_test {
-  task_under_test(residency_fixture& f,
+  task_under_test(tiered_memory_fixture& f,
                   sirius_physical_operator& consumer,
                   wired_consumer& wired,
                   ::cuda::stream_ref stream)
@@ -211,7 +136,7 @@ struct task_under_test {
 TEST_CASE("an opted-in operator's host input stays in its tier from wiring to reservation",
           "[residency_policy_e2e]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
 
@@ -249,7 +174,7 @@ TEST_CASE("an opted-in operator's host input stays in its tier from wiring to re
 TEST_CASE("a default operator's host input is sized for and converted to the GPU",
           "[residency_policy_e2e]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
 

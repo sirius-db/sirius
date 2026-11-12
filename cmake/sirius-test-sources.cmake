@@ -244,6 +244,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
+    test/cpp/operator/test_input_residency_policy.cpp
     test/cpp/operator/test_physical_concat.cpp
     test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
@@ -326,6 +327,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_per_query_completion_handler.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
+    test/cpp/pipeline/test_residency_policy_e2e.cpp
     test/cpp/pipeline/test_streaming_sink_root.cpp
     test/cpp/pipeline/test_task_index_keys.cpp
     test/cpp/pipeline/test_task_scheduler.cpp

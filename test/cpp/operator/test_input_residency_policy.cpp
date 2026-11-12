@@ -15,15 +15,16 @@
  */
 
 #include "catch.hpp"
-#include "data/data_batch_utils.hpp"
-#include "data/sirius_converter_registry.hpp"
-#include "memory/sirius_memory_reservation_manager.hpp"
+#include "data/data_repository_manager_registry.hpp"
+#include "downgrade/downgrade_executor.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "operator/operator_test_utils.hpp"
+#include "query_id.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/test_physical_operator.hpp"
-#include "utils/utils.hpp"
 
-#include <cudf/table/table.hpp>
-
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <cuda/stream>
@@ -31,94 +32,23 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <exception>
+#include <future>
 #include <memory>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 using namespace sirius::op;
+using namespace std::chrono_literals;
+using sirius::test::operator_utils::tiered_memory_fixture;
 
 namespace {
-
-constexpr std::size_t kNumRows = 4096;
-
-/// Memory manager fixture over one GPU space plus NUMA host spaces.
-struct residency_fixture {
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu0  = nullptr;
-  cucascade::memory::memory_space* host0 = nullptr;
-
-  bool setup()
-  {
-    sirius::converter_registry::reset_for_testing();
-    try {
-      cucascade::memory::reservation_manager_configurator builder;
-      builder.set_number_of_gpus(1)
-        .set_gpu_usage_limit(256ULL << 20)
-        .set_reservation_fraction_per_gpu(0.75)
-        .set_per_numa_region_capacity(1ULL << 30)
-        .use_numa_id_as_host_id()
-        .track_reservation_per_stream(false)
-        .set_reservation_fraction_per_numa_region(0.75);
-      manager =
-        std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    } catch (cucascade::cuda_error const&) {
-      throw;
-    } catch (const std::exception&) {
-      return false;
-    }
-    sirius::converter_registry::initialize();
-
-    auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    if (gpu_spaces.empty()) { return false; }
-    gpu0             = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
-    auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (host_spaces.empty()) { return false; }
-    host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
-    return true;
-  }
-
-  ~residency_fixture()
-  {
-    // The registry is initialized right after the manager is built, so both exist or neither.
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
-  }
-
-  /// Single INT64 column of random data, resident on the GPU space.
-  std::shared_ptr<cucascade::data_batch> make_gpu_batch(::cuda::stream_ref stream)
-  {
-    auto table = sirius::create_cudf_table_with_random_data(kNumRows,
-                                                            {cudf::data_type{cudf::type_id::INT64}},
-                                                            {std::make_pair(0, 1000000)},
-                                                            stream,
-                                                            gpu0->get_default_allocator());
-    stream.sync();
-    return sirius::make_data_batch(
-      std::move(table), *gpu0, stream, sirius::telemetry::batch_telemetry_info{});
-  }
-
-  /// GPU batch converted in place to the host representation (spilled-batch shape).
-  std::shared_ptr<cucascade::data_batch> make_host_batch(::cuda::stream_ref stream)
-  {
-    auto batch     = make_gpu_batch(stream);
-    auto& registry = sirius::converter_registry::get();
-    {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, host0, stream);
-    }
-    stream.sync();
-    return batch;
-  }
-};
 
 /// Attach a port backed by @p repo, with the residency policy set by hand (no wiring involved).
 void attach_port(sirius_physical_operator& op,
@@ -149,7 +79,7 @@ std::unique_ptr<pipelineable_operator_data> next_input(sirius_physical_operator&
 TEST_CASE("default ports build a task input that materializes on the GPU",
           "[input_residency_policy]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
 
@@ -167,7 +97,7 @@ TEST_CASE("default ports build a task input that materializes on the GPU",
 TEST_CASE("a single opted-in port builds a task input that does not materialize on the GPU",
           "[input_residency_policy]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
 
@@ -185,7 +115,7 @@ TEST_CASE("a single opted-in port builds a task input that does not materialize 
 
 TEST_CASE("mixed ports build a task input that materializes on the GPU", "[input_residency_policy]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
 
@@ -216,7 +146,7 @@ TEST_CASE("mixed ports build a task input that materializes on the GPU", "[input
 TEST_CASE("prepare locks a host batch in place when the input does not materialize on the GPU",
           "[input_residency_policy]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
   auto batch           = f.make_host_batch(stream);
@@ -252,10 +182,169 @@ TEST_CASE("prepare locks a host batch in place when the input does not materiali
   REQUIRE(batch->try_to_mutable().has_value());
 }
 
+TEST_CASE("prepare locks a GPU batch in place when the input does not materialize on the GPU",
+          "[input_residency_policy]")
+{
+  tiered_memory_fixture f;
+  REQUIRE(f.setup());
+  rmm::cuda_stream stream;
+  auto batch           = f.make_gpu_batch(stream);
+  const auto source_id = batch->get_batch_id();
+
+  pipelineable_operator_data input(std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
+  input.set_materialize_on_gpu(false);
+
+  const auto gpu_available_before = f.gpu0->get_available_memory();
+  input.prepare_for_processing(f.gpu0, stream);
+  stream.synchronize();
+
+  // Same batch, already where the task runs, read-locked; no copy was made of it.
+  REQUIRE(input.get_data_batches().size() == 1);
+  REQUIRE(input.get_data_batches()[0] == batch);
+  REQUIRE(input.original_batch_ids() == std::vector<std::uint64_t>{source_id});
+  REQUIRE(batch->get_state() == cucascade::batch_state::read_only);
+  REQUIRE(f.gpu0->get_available_memory() == gpu_available_before);
+  {
+    auto ro_batches = input.get_read_only_batches();
+    REQUIRE(ro_batches.size() == 1);
+    REQUIRE(ro_batches[0].get_batch_id() == source_id);
+    REQUIRE(ro_batches[0].get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro_batches[0].get_memory_space()->get_id() == f.gpu0->get_id());
+  }
+  REQUIRE_FALSE(batch->try_to_mutable().has_value());
+
+  input.remove_read_only_lock();
+  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE(
+  "prepare leaves a batch on another GPU in place when the input does not materialize on "
+  "the GPU",
+  "[input_residency_policy][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  tiered_memory_fixture f;
+  REQUIRE(f.setup(2));
+  rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+  rmm::cuda_stream source_stream;
+  auto batch           = f.make_gpu_batch(*f.gpu1, source_stream);
+  const auto source_id = batch->get_batch_id();
+  source_stream.synchronize();
+
+  pipelineable_operator_data input(std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
+  input.set_materialize_on_gpu(false);
+
+  // The task runs on GPU 0 with a stream of that device.
+  rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+  rmm::cuda_stream target_stream;
+  const auto gpu0_available_before = f.gpu0->get_available_memory();
+  const auto gpu1_available_before = f.gpu1->get_available_memory();
+  input.prepare_for_processing(f.gpu0, target_stream);
+  target_stream.synchronize();
+
+  // Same batch, still on GPU 1, read-locked; it was not cloned and GPU 0 holds nothing for it.
+  REQUIRE(input.get_data_batches().size() == 1);
+  REQUIRE(input.get_data_batches()[0] == batch);
+  REQUIRE(input.original_batch_ids() == std::vector<std::uint64_t>{source_id});
+  REQUIRE(batch->get_state() == cucascade::batch_state::read_only);
+  REQUIRE(f.gpu0->get_available_memory() == gpu0_available_before);
+  REQUIRE(f.gpu1->get_available_memory() == gpu1_available_before);
+  {
+    auto ro_batches = input.get_read_only_batches();
+    REQUIRE(ro_batches.size() == 1);
+    REQUIRE(ro_batches[0].get_batch_id() == source_id);
+    REQUIRE(ro_batches[0].get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro_batches[0].get_memory_space()->get_id() == f.gpu1->get_id());
+  }
+  REQUIRE_FALSE(batch->try_to_mutable().has_value());
+
+  input.remove_read_only_lock();
+  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE("prepare of an input that does not materialize on the GPU races a downgrade safely",
+          "[input_residency_policy]")
+{
+  tiered_memory_fixture f;
+  REQUIRE(f.setup());
+  rmm::cuda_stream stream;
+
+  const auto query_id = sirius::make_query_id(1);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(query_id);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr  = *repo_registry.create_for_query(query_id);
+  auto owned_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto* repo      = owned_repo.get();
+  repo_mgr.add_new_repository(1, "out", std::move(owned_repo));
+
+  // monitor_period 0: the executor downgrades only on request. It joins its threads on
+  // destruction, before the repositories and the memory manager above go away.
+  sirius::parallel::downgrade_executor executor(
+    lifecycle,
+    sirius::exec::downgrade_executor_config{
+      .thread_pool = {.num_threads = 1, .thread_name_prefix = "downgrade"}, .monitor_period = 0ms},
+    repo_registry,
+    f.gpu0->get_id(),
+    f.gpu0,
+    *f.manager);
+  executor.start();
+
+  constexpr std::size_t free_everything = std::size_t{1} << 30;
+  constexpr int iterations              = 40;
+  for (int i = 0; i < iterations; ++i) {
+    CAPTURE(i);
+    auto batch = f.make_gpu_batch(stream);
+    repo->add_data_batch(batch);
+    pipelineable_operator_data input(std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
+    input.set_materialize_on_gpu(false);
+
+    // The executor's threads downgrade the batch while this thread prepares it. The head start
+    // the downgrade gets grows with i, so the prepare lands before, during and after it.
+    auto downgrade        = executor.request_free_memory(free_everything);
+    const auto head_start = std::chrono::steady_clock::now() + i * 10us;
+    while (std::chrono::steady_clock::now() < head_start) {}
+    std::exception_ptr prepare_error;
+    try {
+      input.prepare_for_processing(f.gpu0, stream);
+    } catch (...) {
+      prepare_error = std::current_exception();
+    }
+    REQUIRE(downgrade.wait_for(30s) == std::future_status::ready);
+    REQUIRE_NOTHROW(downgrade.get());
+    REQUIRE(prepare_error == nullptr);
+
+    // Whichever side won, the input holds a lock on the batch in the tier it ended up in.
+    REQUIRE(input.get_data_batches().at(0) == batch);
+    cucascade::memory::Tier locked_tier{};
+    {
+      auto ro_batches = input.get_read_only_batches();
+      REQUIRE(ro_batches.size() == 1);
+      REQUIRE(ro_batches[0].get_memory_space() != nullptr);
+      locked_tier = ro_batches[0].get_current_tier();
+    }
+    const bool on_gpu = locked_tier == cucascade::memory::Tier::GPU;
+    REQUIRE((on_gpu || locked_tier == cucascade::memory::Tier::HOST));
+
+    // While the lock is held the batch cannot be taken exclusively, so a downgrade skips it.
+    REQUIRE_FALSE(batch->try_to_mutable().has_value());
+    const auto freed_while_locked = executor.request_free_memory_and_wait(free_everything);
+    REQUIRE(freed_while_locked == 0);
+    REQUIRE(input.get_read_only_batches().at(0).get_current_tier() == locked_tier);
+
+    // Released, it is downgradable again; this also leaves the repository with nothing on the
+    // GPU for the next iteration.
+    input.remove_read_only_lock();
+    REQUIRE((executor.request_free_memory_and_wait(free_everything) > 0) == on_gpu);
+    REQUIRE(batch->to_read_only().get_current_tier() == cucascade::memory::Tier::HOST);
+  }
+  executor.stop();
+}
+
 TEST_CASE("prepare converts a host batch to the GPU when the input materializes on the GPU",
           "[input_residency_policy]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
   auto batch           = f.make_host_batch(stream);
@@ -274,7 +363,7 @@ TEST_CASE("prepare converts a host batch to the GPU when the input materializes 
 
 TEST_CASE("a row-preserving replacement keeps the materialize flag", "[input_residency_policy]")
 {
-  residency_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
   auto original    = f.make_gpu_batch(stream);

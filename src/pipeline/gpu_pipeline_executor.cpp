@@ -504,6 +504,13 @@ void gpu_pipeline_executor::process_task(
               ex.what());
 
             auto intermediate_data = ex.release_intermediate_data();
+            if (auto pipelineable_data =
+                  dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
+              // We want to release the read-only lock on the data so that when its added back to
+              // the task queue it could be downgraded if needed. This comes before
+              // shrink_for_retry(): the input can only spill or drop batches it no longer pins.
+              pipelineable_data->remove_read_only_lock();
+            }
             // On OOM, let the input shrink its own working set; a retry that shrank keeps the
             // reservation floor it had before this OOM instead of the raised one. The retry
             // count still increments, so the retry cap bounds a run of shrinks.
@@ -516,12 +523,6 @@ void gpu_pipeline_executor::process_task(
                 gpu_task->get_task_id(),
                 orig_task_id,
                 next_retry_count);
-            }
-            if (auto pipelineable_data =
-                  dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
-              // We want to release the read-only lock on the data so that when its added back to
-              // the task queue it could be downgraded if needed.
-              pipelineable_data->remove_read_only_lock();
             }
 
             // Build the rescheduled task via virtual factory (preserves derived type).

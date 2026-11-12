@@ -250,7 +250,9 @@ class operator_data {
   /// Lets a task input shrink its own working set before an OOM retry. Called by the GPU
   /// pipeline executor's reschedule path on the input object that will be retried. Returns true
   /// if it shrank; the retry then keeps the reservation floor it had before this OOM instead of
-  /// raising it. Default: false (no change to today's behaviour).
+  /// raising it. A pipelineable input's read-only locks from prepare_for_processing() are
+  /// released before the call, so an override may lock, spill or drop its batches; other holders
+  /// of a batch may still have it locked. Default: false (no change to today's behaviour).
   virtual bool shrink_for_retry() { return false; }
 
  private:

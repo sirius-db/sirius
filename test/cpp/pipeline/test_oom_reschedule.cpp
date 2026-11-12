@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
+#include "data/data_batch_utils.hpp"
 #include "exec/config.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -27,7 +28,13 @@
 #include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"  // IWYU pragma: keep
 #include "utils/telemetry_utils.hpp"
+#include "utils/utils.hpp"
 
+#include <cudf/types.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
@@ -646,12 +653,17 @@ struct retry_probe {
   std::vector<attempt_action> script;                      ///< One action per attempt
   attempt_action after_script = attempt_action::complete;  ///< Action once the script ends
   std::size_t shrinks_allowed = 0;                         ///< Shrinks before the input's floor
+  /// When set, an OOM attempt first read-locks its input here, as the real task flow does.
+  const cucascade::memory::memory_space* prepare_space = nullptr;
 
   std::atomic<int> shrink_calls{0};
   std::atomic<std::size_t> shrinks_done{0};
   std::atomic<std::size_t> window{0};
   std::atomic<int> oom_count{0};
   std::atomic<bool> done{false};
+  std::atomic<int> read_locked_ooms{0};       ///< OOMs thrown with every input batch read-locked
+  std::atomic<int> shrinks_with_locks{0};     ///< Shrink calls that could lock every input batch
+  std::atomic<int> shrinks_without_locks{0};  ///< Shrink calls that found a batch still locked
 
   std::mutex mutex;
   std::vector<std::size_t> floors;  ///< Retry reservation floor seen by each attempt
@@ -688,6 +700,32 @@ class shrinking_operator_data : public sirius::op::pipelineable_operator_data {
   std::shared_ptr<retry_probe> _probe;
 };
 
+// Input whose shrink_for_retry() needs exclusive access to its batches, as a spill or drop would.
+class lock_probing_operator_data : public sirius::op::pipelineable_operator_data {
+ public:
+  lock_probing_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                             std::shared_ptr<retry_probe> probe)
+    : pipelineable_operator_data(std::move(batches)), _probe(std::move(probe))
+  {
+  }
+
+  bool shrink_for_retry() override
+  {
+    _probe->shrink_calls.fetch_add(1, std::memory_order_relaxed);
+    bool locked_all = true;
+    for (auto const& batch : get_data_batches()) {
+      // Non-blocking, and released at once: a batch that is still locked must not hang the test.
+      locked_all = batch->try_to_mutable().has_value() && locked_all;
+    }
+    (locked_all ? _probe->shrinks_with_locks : _probe->shrinks_without_locks)
+      .fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+ private:
+  std::shared_ptr<retry_probe> _probe;
+};
+
 class scripted_retry_task : public oom_test_task_base {
  public:
   scripted_retry_task(uint64_t task_id,
@@ -699,7 +737,7 @@ class scripted_retry_task : public oom_test_task_base {
   {
   }
 
-  void execute(::cuda::stream_ref) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& local       = _local_state->cast<sirius::pipeline::gpu_pipeline_task_local_state>();
     auto const floor  = local.get_retry_reservation_floor();
@@ -718,6 +756,7 @@ class scripted_retry_task : public oom_test_task_base {
         local.update_retry_reservation_floor_after_oom(
           std::max(kReservationSize, floor), 0, std::nullopt);
         _probe->oom_count.fetch_add(1, std::memory_order_relaxed);
+        if (_probe->prepare_space != nullptr) { read_lock_input(local, stream); }
         throw sirius::pipeline::oom_reschedule_exception(
           std::move(local._input_data), 0, "scripted OOM");
       case attempt_action::launch_failure:
@@ -728,6 +767,24 @@ class scripted_retry_task : public oom_test_task_base {
           "scripted CUDA launch failure");
       case attempt_action::complete: _probe->done.store(true, std::memory_order_relaxed); break;
     }
+  }
+
+  // A compute OOM carries an input that prepare_for_processing() has read-locked.
+  void read_lock_input(sirius::pipeline::gpu_pipeline_task_local_state& local,
+                       ::cuda::stream_ref stream)
+  {
+    local._input_data->prepare_for_processing(_probe->prepare_space, stream);
+    stream.sync();
+    auto const* input =
+      dynamic_cast<const sirius::op::pipelineable_operator_data*>(local._input_data.get());
+    if (input == nullptr || input->get_data_batches().empty()) { return; }
+    for (auto const& batch : input->get_data_batches()) {
+      if (batch->get_state() != cucascade::batch_state::read_only ||
+          batch->try_to_mutable().has_value()) {
+        return;
+      }
+    }
+    _probe->read_locked_ooms.fetch_add(1, std::memory_order_relaxed);
   }
 
   std::unique_ptr<gpu_pipeline_task> create_rescheduled_task(
@@ -816,6 +873,42 @@ TEST_CASE("GPU pipeline executor raises the retry floor for inputs that do not s
   // max(old floor, 2 x reservation, live + requested): 2 x 50 MB, then 2 x 100 MB.
   CHECK(probe->observed_floors() ==
         std::vector<std::size_t>{0, 2 * kReservationSize, 4 * kReservationSize});
+}
+
+TEST_CASE("GPU pipeline executor releases the input's read-only locks before shrink_for_retry",
+          "[gpu_pipeline_executor][oom][shrink_for_retry]")
+{
+  oom_test_fixture f;
+  if (!f.setup(1, "oom-shrink-lock")) { SKIP("No GPU available"); }
+
+  rmm::cuda_stream stream;
+  auto table = sirius::create_cudf_table_with_random_data(1024,
+                                                          {cudf::data_type{cudf::type_id::INT64}},
+                                                          {std::make_pair(0, 1000000)},
+                                                          stream,
+                                                          f.mem_space->get_default_allocator());
+  stream.synchronize();
+  auto batch = sirius::make_data_batch(
+    std::move(table), *f.mem_space, stream, sirius::telemetry::batch_telemetry_info{});
+
+  auto probe           = std::make_shared<retry_probe>();
+  probe->script        = {attempt_action::oom, attempt_action::oom};
+  probe->prepare_space = f.mem_space;
+
+  REQUIRE(run_scripted_task(f,
+                            probe,
+                            std::make_unique<lock_probing_operator_data>(
+                              std::vector<std::shared_ptr<cucascade::data_batch>>{batch}, probe)));
+  REQUIRE_FALSE(f.completion->has_error());
+
+  // Both OOMs were thrown with the batch read-locked by the input (no exclusive lock possible).
+  REQUIRE(probe->oom_count.load() == 2);
+  REQUIRE(probe->read_locked_ooms.load() == 2);
+  // By the time the input is asked to shrink, it can lock the batch exclusively.
+  CHECK(probe->shrink_calls.load() == 2);
+  CHECK(probe->shrinks_with_locks.load() == 2);
+  CHECK(probe->shrinks_without_locks.load() == 0);
+  CHECK(batch->get_state() == cucascade::batch_state::idle);
 }
 
 TEST_CASE("GPU pipeline executor does not shrink the input on a non-OOM reschedule",

@@ -155,23 +155,12 @@ void pipelineable_operator_data::prepare_for_processing(
         "pipelineable_operator_data: null batch encountered during prepare_for_processing");
     }
     try {
-      if (!_materialize_on_gpu) {
-        // The consumer reads this input itself: read-lock the batch where it is, in whatever tier
-        // and memory space it currently has. No conversion, no cross-GPU clone, and
-        // requested_memory_space is ignored. This is the lock lock_and_prepare_batch takes when
-        // the batch is already in the requested space, so the batch-state handling is the same.
-        cucascade::read_only_data_batch ro_lock = batch->to_read_only();
-        if (ro_lock.get_memory_space() == nullptr) {
-          throw sirius::internal_exception(
-            "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
-            batch->get_batch_id(),
-            static_cast<int>(batch->get_state()));
-        }
-        ro_batches.push_back(std::move(ro_lock));
-        continue;
-      }
+      // An input the consumer reads itself is read-locked where it is: no conversion, no
+      // cross-GPU clone.
       if (std::optional<pipeline::lock_and_prepare_batch_result> maybe_result =
-            pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
+            _materialize_on_gpu
+              ? pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)
+              : pipeline::lock_batch_in_place(batch, requested_memory_space, stream)) {
         pipeline::lock_and_prepare_batch_result result = *maybe_result;
 
         std::visit(
