@@ -389,11 +389,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
       if (!pending.left || !pending.right) {
         throw std::logic_error("Nested loop join lost an input batch before scheduling its pair");
       }
-      pending.slice      = 0;
+      pending.slice = 0;
       // Here when we call get_batch_rows_and_bytes we need to get read_only lock on the batch.
-      // Simulatenously we also have a lock on task creation. 
-      // This is not ideal, but it only happens once per pair, only for cross joins and it is a bounded lock.
-      // We should make all data_batches be able to report size in bytes and num rows without locking the batch.
+      // Simultaneously we also have a lock on task creation.
+      // This is not ideal, but it only happens once per pair, only for cross joins and it is a
+      // bounded lock. We should make all data_batches be able to report size in bytes and num rows
+      // without locking the batch.
       pending.num_slices = conditions.empty()
                              ? cross_join_num_slices(get_batch_rows_and_bytes(*pending.left),
                                                      get_batch_rows_and_bytes(*pending.right),
