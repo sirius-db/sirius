@@ -1,3 +1,0 @@
-sirius:
-  compression:
-    spill_encode_reserve_fraction: 1.5

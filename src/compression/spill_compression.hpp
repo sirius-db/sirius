@@ -53,9 +53,10 @@ struct spill_compression_settings {
   /// the batch's device size (compression.spill_max_compressed_fraction).
   double max_compressed_fraction{0.75};
   /// Encode only when this fraction of the batch's size could be reserved in its GPU
-  /// memory space -- the headroom the encoder needs. Not grantable means the batch
-  /// spills uncompressed. 0 skips the check (compression.spill_encode_reserve_fraction).
-  double encode_reserve_fraction{0.5};
+  /// memory space -- the headroom the encoder needs beyond the batch. Not grantable
+  /// means the batch spills uncompressed. 0 skips the check
+  /// (compression.spill_encode_reserve_fraction).
+  double encode_reserve_fraction{1.5};
 };
 
 /// Install the process-wide settings. The converters run on downgrade threads with no
@@ -80,8 +81,9 @@ void apply_spill_compression_config(compression_config const& config);
  * or delta -> rle -> bitpack when a size estimate on a prefix sample says that saves at
  * least 10%. A string
  * column of at least 4096 rows is dictionary-encoded, with bitpacked indices, when a
- * sample of it has few distinct values; otherwise it is split into ans-coded chars and
- * delta-bitpacked offsets. Shorter string columns and every other type are stored as is.
+ * sample of it has few distinct values and its values average more than one byte;
+ * otherwise it is split into ans-coded chars and delta-bitpacked offsets. Shorter string columns
+ * and every other type are stored as is.
  */
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
                                              ::cuda::stream_ref stream);

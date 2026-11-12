@@ -310,6 +310,13 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
   }
   CHECK(plan(utils::make_string_column(repeated, stream, mr)->view()).find("dictionary") !=
         std::string::npos);
+  // One-byte values skip the dictionary, whose encode scratch is 4x such a column.
+  std::vector<std::string> flags(10'000);
+  for (std::size_t i = 0; i < flags.size(); ++i) {
+    flags[i] = std::string(1, "ANR"[i % 3]);
+  }
+  CHECK(plan(utils::make_string_column(flags, stream, mr)->view()).find("str_split") !=
+        std::string::npos);
   CHECK(plan(utils::make_string_column(unique, stream, mr)->view()).find("str_split") !=
         std::string::npos);
   // Too short for a dictionary to pay for its keys.

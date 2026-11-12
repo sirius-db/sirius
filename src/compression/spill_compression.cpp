@@ -21,8 +21,13 @@
 #include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/reduction/distinct_count.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/attributes.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -122,6 +127,9 @@ constexpr cudf::size_type kMinDictionaryRows = 4096;
 constexpr cudf::size_type kDictionarySampleRows = 64 * 1024;
 /// Dictionary-encode when at most this fraction of the sampled values are distinct.
 constexpr double kMaxDictionaryDistinctFraction = 0.1;
+/// Strings averaging at most this many bytes skip the dictionary: its encode needs about
+/// 20 bytes of scratch per row, 4x a 1-byte column, and ans compresses them as well.
+constexpr double kMaxAnsOnlyAverageBytes = 1.0;
 /// Largest fixed-width column bitpack accepts. Its encode scratch holds the column at
 /// full width as 32-bit words in a cudf column, which caps it at 2^31 words.
 constexpr std::size_t kMaxBitpackColumnBytes = std::size_t{1} << 33;  // 8 GiB
@@ -239,7 +247,20 @@ std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_r
     // sample; a wrong guess costs ratio, never correctness.
     auto const sample_rows = std::min(column.size(), kDictionarySampleRows);
     auto const sample      = cudf::slice(column, {0, sample_rows}, stream).front();
-    auto const distinct    = cudf::distinct_count(
+    auto const valid_rows  = sample_rows - sample.null_count();
+    if (valid_rows > 0) {
+      auto const lengths = cudf::strings::count_bytes(cudf::strings_column_view(sample), stream);
+      auto const total   = cudf::reduce(lengths->view(),
+                                      *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+                                      cudf::data_type{cudf::type_id::INT64},
+                                      stream);
+      auto const bytes =
+        static_cast<cudf::numeric_scalar<std::int64_t> const&>(*total).value(stream);
+      if (static_cast<double>(bytes) <= kMaxAnsOnlyAverageBytes * valid_rows) {
+        return kStringSplitPlan;
+      }
+    }
+    auto const distinct = cudf::distinct_count(
       sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
     return static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
              ? kDictionaryPlan
@@ -318,10 +339,11 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
   // The encoder allocates from the same GPU pool the batch is being evicted from, so
   // it runs only under a reservation of its headroom, which keeps it from taking
   // memory that other tasks are about to reserve.
-  bool reserved = false;
+  bool reserved                   = false;
+  std::size_t const reserve_bytes = static_cast<std::size_t>(
+    settings.encode_reserve_fraction * static_cast<double>(out.uncompressed_bytes));
   if (settings.encode_reserve_fraction > 0.0) {
-    auto const bytes = static_cast<std::size_t>(settings.encode_reserve_fraction *
-                                                static_cast<double>(out.uncompressed_bytes));
+    auto const bytes = reserve_bytes;
     auto reservation = space.make_reservation_or_null(bytes);
     if (!reservation) {
       throw spill_compression_declined("no GPU headroom for a " + std::to_string(bytes) +
@@ -357,6 +379,8 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
   } else {
     out.table = simpatico::compress_with_plan(view, plan, stream, mr, {});
   }
+  // The tracker counts from the attach, so this is the encode's own peak.
+  std::size_t const encode_peak = reserved ? gpu_mr->get_peak_allocated_bytes(stream) : 0;
 
   auto const error = simpatico::build_compressed_table_header(
     out.table, out.header, out.buffers, out.payload_bytes, stream);
@@ -368,11 +392,15 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
     throw spill_compression_declined("compressed " + std::to_string(compressed_bytes) +
                                      " bytes of " + std::to_string(out.uncompressed_bytes));
   }
-  SIRIUS_LOG_DEBUG("[spill_compression] compressed {} bytes to {} ({} rows, {} columns)",
-                   out.uncompressed_bytes,
-                   compressed_bytes,
-                   out.num_rows,
-                   view.num_columns());
+  SIRIUS_LOG_DEBUG(
+    "[spill_compression] compressed {} bytes to {} ({} rows, {} columns); encode peak {} bytes "
+    "against a {} byte reservation",
+    out.uncompressed_bytes,
+    compressed_bytes,
+    out.num_rows,
+    view.num_columns(),
+    encode_peak,
+    reserve_bytes);
   return out;
 }
 

@@ -369,9 +369,11 @@ struct compression_config {
   double spill_max_compressed_fraction{0.75};
 
   /// Encode a spilled batch only when this fraction of its size could be reserved in
-  /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
-  /// In [0, 1]; 0 skips the check.
-  double spill_encode_reserve_fraction{0.5};
+  /// its GPU memory space (the encoder's headroom, beyond the batch itself); otherwise
+  /// it spills uncompressed. Finite and non-negative; 0 skips the check. Multi-column
+  /// batches peak at about 0.7-1.1x of their size, a batch of one string column at up
+  /// to about 2.9x.
+  double spill_encode_reserve_fraction{1.5};
 };
 
 class configuration_input_error : public std::runtime_error {

@@ -882,7 +882,7 @@ TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][con
                         data_dir / "invalid_spill_max_compressed_fraction_negative.yaml"),
                       Catch::Matchers::ContainsSubstring("spill_max_compressed_fraction"));
 
-  for (auto const* fixture : {"invalid_spill_encode_reserve_fraction_above_one.yaml",
+  for (auto const* fixture : {"invalid_spill_encode_reserve_fraction_infinite.yaml",
                               "invalid_spill_encode_reserve_fraction_negative.yaml",
                               "invalid_spill_encode_reserve_fraction_nan.yaml"}) {
     INFO("fixture=" << fixture);
