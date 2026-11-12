@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "object_store/settings.hpp"
+#include "object_store_scope/settings.hpp"
 
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 
-namespace sirius::object_store {
+namespace sirius::object_store_scope {
 
 /// Why a settings value or a scope key was refused.
 enum class reason : std::uint8_t {
@@ -56,4 +56,4 @@ struct violation {
 /// The fixed reason text of @p refused, without the field name.
 [[nodiscard]] std::string describe(const violation& refused, const capabilities& backend);
 
-}  // namespace sirius::object_store
+}  // namespace sirius::object_store_scope

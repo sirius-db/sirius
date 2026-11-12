@@ -1,12 +1,12 @@
 // Copyright 2026 Sirius Contributors
 // SPDX-License-Identifier: Apache-2.0
-#include "object_store/registry.hpp"
+#include "object_store_scope/registry.hpp"
 
 #include <algorithm>
 #include <utility>
 #include <vector>
 
-namespace sirius::object_store {
+namespace sirius::object_store_scope {
 
 namespace {
 
@@ -82,4 +82,4 @@ registry::outcome registry::drop(std::string_view uri_prefix)
   return {.refused = std::nullopt, .published = std::move(published)};
 }
 
-}  // namespace sirius::object_store
+}  // namespace sirius::object_store_scope

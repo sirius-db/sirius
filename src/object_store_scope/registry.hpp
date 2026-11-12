@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "object_store/scope.hpp"
-#include "object_store/settings.hpp"
-#include "object_store/validation.hpp"
+#include "object_store_scope/scope.hpp"
+#include "object_store_scope/settings.hpp"
+#include "object_store_scope/validation.hpp"
 
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string_view>
 
-namespace sirius::object_store {
+namespace sirius::object_store_scope {
 
 /// The published scope set of one context, replaced as a whole (copy-on-write). Writers hold an
 /// update lock across copy, edit and publish, so concurrent `publish()` / `drop()` compose like
@@ -55,4 +55,4 @@ class registry {
   std::shared_ptr<const scope_set> _set;
 };
 
-}  // namespace sirius::object_store
+}  // namespace sirius::object_store_scope

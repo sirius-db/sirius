@@ -1,12 +1,12 @@
 // Copyright 2026 Sirius Contributors
 // SPDX-License-Identifier: Apache-2.0
-#include "object_store/scope.hpp"
+#include "object_store_scope/scope.hpp"
 
 #include "io/s3/scope_policy.hpp"
 
 #include <utility>
 
-namespace sirius::object_store {
+namespace sirius::object_store_scope {
 
 using sirius::io::s3::key_defeats_prefix_match;
 using sirius::io::s3::lowercase_scheme;
@@ -57,4 +57,4 @@ std::optional<refusal> classify_remote_reads(const scope_set& set,
                  .item = redacted_uri(remote_items.front())};
 }
 
-}  // namespace sirius::object_store
+}  // namespace sirius::object_store_scope

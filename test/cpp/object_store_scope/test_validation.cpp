@@ -1,6 +1,6 @@
 // Copyright 2026 Sirius Contributors
 // SPDX-License-Identifier: Apache-2.0
-#include "object_store/validation.hpp"
+#include "object_store_scope/validation.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_message.hpp>

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "object_store/settings.hpp"
+#include "object_store_scope/settings.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -12,7 +12,7 @@
 #include <string_view>
 #include <vector>
 
-namespace sirius::object_store {
+namespace sirius::object_store_scope {
 
 /// One published scope: its settings and the publisher's own object, which is kept alive with
 /// the entry and handed back on lookup. The module never looks inside `owner`.
@@ -66,4 +66,4 @@ struct resolution {
 [[nodiscard]] std::optional<refusal> classify_remote_reads(
   const scope_set& set, std::span<const std::string> remote_items);
 
-}  // namespace sirius::object_store
+}  // namespace sirius::object_store_scope

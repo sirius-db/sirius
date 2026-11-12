@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-namespace sirius::object_store {
+namespace sirius::object_store_scope {
 
 inline constexpr std::uint32_t transport_auto = 0;
 inline constexpr std::uint32_t transport_http = 1;
@@ -40,4 +40,4 @@ struct capabilities {
   std::string_view backend_name{"native"};
 };
 
-}  // namespace sirius::object_store
+}  // namespace sirius::object_store_scope

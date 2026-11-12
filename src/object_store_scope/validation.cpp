@@ -1,6 +1,6 @@
 // Copyright 2026 Sirius Contributors
 // SPDX-License-Identifier: Apache-2.0
-#include "object_store/validation.hpp"
+#include "object_store_scope/validation.hpp"
 
 #include "io/rest/s3/endpoint.hpp"  // sirius::io::rest::s3::parse_endpoint
 #include "io/s3/scope_policy.hpp"
@@ -13,7 +13,7 @@
 #include <fstream>
 #include <system_error>
 
-namespace sirius::object_store {
+namespace sirius::object_store_scope {
 
 namespace {
 
@@ -185,4 +185,4 @@ std::string describe(const violation& refused, const capabilities& backend)
   return {};
 }
 
-}  // namespace sirius::object_store
+}  // namespace sirius::object_store_scope

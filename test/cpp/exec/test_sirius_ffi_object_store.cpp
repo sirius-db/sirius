@@ -2256,14 +2256,14 @@ TEST_CASE("FFI object store messages pin all remote refusals at both execution e
   }
 }
 
-#include "object_store/scope.hpp"
-#include "object_store/settings.hpp"
+#include "object_store_scope/scope.hpp"
+#include "object_store_scope/settings.hpp"
 
 #include <optional>
 
 namespace {
 
-using published_scopes = std::shared_ptr<const sirius::object_store::scope_set>;
+using published_scopes = std::shared_ptr<const sirius::object_store_scope::scope_set>;
 
 struct publication_events {
   void collect(published_scopes set) noexcept

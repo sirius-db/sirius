@@ -2,7 +2,7 @@
 // unit tests include this header directly to make otherwise racy interleavings deterministic.
 #pragma once
 
-#include "object_store/scope.hpp"
+#include "object_store_scope/scope.hpp"
 
 #include <functional>
 #include <memory>
@@ -30,6 +30,6 @@ void set_transaction_entry_hook(std::function<void()> hook);
 /// published. Installation and re-entry follow the capture-pause hook; this observer must not
 /// throw. An empty observer clears the installed slot.
 void set_publication_observer(
-  std::function<void(std::shared_ptr<const sirius::object_store::scope_set>)> observer);
+  std::function<void(std::shared_ptr<const sirius::object_store_scope::scope_set>)> observer);
 
 }  // namespace sirius::ffi::testing

@@ -1,7 +1,7 @@
 // Copyright 2026 Sirius Contributors
 // SPDX-License-Identifier: Apache-2.0
 #include "allocation_fault.hpp"
-#include "object_store/registry.hpp"
+#include "object_store_scope/registry.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_message.hpp>

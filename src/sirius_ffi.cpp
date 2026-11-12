@@ -39,11 +39,11 @@
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "log/logging.hpp"                // SIRIUS_LOG_INFO
-#include "object_store/backend_capabilities.hpp"
-#include "object_store/registry.hpp"
-#include "object_store/scope.hpp"
-#include "object_store/settings.hpp"
-#include "object_store/validation.hpp"
+#include "object_store_scope/backend_capabilities.hpp"
+#include "object_store_scope/registry.hpp"
+#include "object_store_scope/scope.hpp"
+#include "object_store_scope/settings.hpp"
+#include "object_store_scope/validation.hpp"
 #include "parquet_extension.hpp"              // duckdb::ParquetExtension
 #include "planner/substrait_scan_ranges.hpp"  // sirius::planner::scan_byte_ranges_state
 #include "planner/unsupported_optimizers.hpp"
@@ -142,14 +142,15 @@ void run_capture_pause_hook() { run_hook(capture_pause_mutex, capture_pause_hook
 void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transaction_entry_hook); }
 
 using publication_observer_fn =
-  std::function<void(std::shared_ptr<const sirius::object_store::scope_set>)>;
+  std::function<void(std::shared_ptr<const sirius::object_store_scope::scope_set>)>;
 
 std::mutex publication_observer_mutex;
 std::shared_ptr<const publication_observer_fn> publication_observer;
 
 // Hands the set a publication produced to the installed observer (if any), outside the observer
 // mutex and after the registry released its locks.
-void notify_publication(const std::shared_ptr<const sirius::object_store::scope_set>& published)
+void notify_publication(
+  const std::shared_ptr<const sirius::object_store_scope::scope_set>& published)
 {
   std::shared_ptr<const publication_observer_fn> observer;
   {
@@ -166,7 +167,7 @@ void notify_publication(const std::shared_ptr<const sirius::object_store::scope_
 // Errors name the field and a fixed reason, never its value. Authentication, TLS and
 // network failures are reported when a snapshot is used.
 
-sirius::object_store::settings to_settings(const ObjectStoreConfig& cfg)
+sirius::object_store_scope::settings to_settings(const ObjectStoreConfig& cfg)
 {
   return {.endpoint       = cfg.endpoint,
           .region         = cfg.region,
@@ -179,30 +180,30 @@ sirius::object_store::settings to_settings(const ObjectStoreConfig& cfg)
           .uri_prefix     = cfg.uri_prefix};
 }
 
-[[noreturn]] void throw_violation(const sirius::object_store::violation& refused,
-                                  const sirius::object_store::capabilities& backend)
+[[noreturn]] void throw_violation(const sirius::object_store_scope::violation& refused,
+                                  const sirius::object_store_scope::capabilities& backend)
 {
   throw std::invalid_argument("ObjectStoreConfig." + std::string{refused.field} + ": " +
-                              sirius::object_store::describe(refused, backend));
+                              sirius::object_store_scope::describe(refused, backend));
 }
 
 // Publishes `cfg` on `registry` for the scope its uri_prefix names; a refused field throws. The
 // registry keeps `cfg` itself as the owner of the entry, so a lookup returns the published
 // pointer. The caller keeps its own reference across the call.
-void publish_snapshot(sirius::object_store::registry& registry,
+void publish_snapshot(sirius::object_store_scope::registry& registry,
                       const std::shared_ptr<ObjectStoreConfig>& cfg,
-                      const sirius::object_store::capabilities& backend)
+                      const sirius::object_store_scope::capabilities& backend)
 {
   auto result = registry.publish(
-    std::make_shared<const sirius::object_store::settings>(to_settings(*cfg)), cfg, backend);
+    std::make_shared<const sirius::object_store_scope::settings>(to_settings(*cfg)), cfg, backend);
   if (result.refused) { throw_violation(*result.refused, backend); }
   notify_publication(result.published);
 }
 
 // The FFI texts of the refusals; each starts with the stable reason token.
-[[noreturn]] void throw_refusal(const sirius::object_store::refusal& refused)
+[[noreturn]] void throw_refusal(const sirius::object_store_scope::refusal& refused)
 {
-  using sirius::object_store::refusal_kind;
+  using sirius::object_store_scope::refusal_kind;
   switch (refused.kind) {
     case refusal_kind::unconfigured:
       throw sirius::invalid_input_exception(
@@ -224,7 +225,8 @@ void publish_snapshot(sirius::object_store::registry& registry,
         "object-store reads are not yet served on the FFI path",
         refused.item);
   }
-  throw sirius::invalid_input_exception(std::string{sirius::object_store::token_of(refused.kind)});
+  throw sirius::invalid_input_exception(
+    std::string{sirius::object_store_scope::token_of(refused.kind)});
 }
 
 // A plan that reads from an object store is refused here, before DuckDB's consumer can bind the
@@ -234,9 +236,9 @@ void publish_snapshot(sirius::object_store::registry& registry,
 // is named in redacted form; no secret lookup and no network access happen. Each message starts
 // with a stable reason token.
 void refuse_remote_reads(const std::vector<std::string>& remote_paths,
-                         const sirius::object_store::scope_set& set)
+                         const sirius::object_store_scope::scope_set& set)
 {
-  if (auto const refused = sirius::object_store::classify_remote_reads(set, remote_paths)) {
+  if (auto const refused = sirius::object_store_scope::classify_remote_reads(set, remote_paths)) {
     throw_refusal(*refused);
   }
 }
@@ -245,7 +247,7 @@ void refuse_remote_reads(const std::vector<std::string>& remote_paths,
 // object-store snapshots the execution captured when its binding began (empty = none).
 sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
                                          const std::string& substrait_plan,
-                                         const sirius::object_store::scope_set& scopes)
+                                         const sirius::object_store_scope::scope_set& scopes)
 {
   auto& client = *conn.context;
 
@@ -324,7 +326,7 @@ struct Context::Impl {
   // The published scope set. An execution captures the current set when its binding begins,
   // inside the connection transaction; object-store I/O routing is not implemented here. No
   // registry lock is held while conn_mutex is taken.
-  sirius::object_store::registry object_store;
+  sirius::object_store_scope::registry object_store;
 
   void bring_up(const sirius::parsed_sirius_config& config)
   {
@@ -401,10 +403,10 @@ std::shared_ptr<ObjectStoreConfig> Context::object_store_config_for(std::string_
 void Context::put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
 {
   if (!cfg) { throw std::invalid_argument("object_store: put_object_store requires a snapshot"); }
-  publish_snapshot(
-    impl_->object_store,
-    cfg,
-    sirius::object_store::capabilities_of(impl_->context->get_config().get_scan_manager_config()));
+  publish_snapshot(impl_->object_store,
+                   cfg,
+                   sirius::object_store_scope::capabilities_of(
+                     impl_->context->get_config().get_scan_manager_config()));
   SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot published for {} scope",
                   cfg->uri_prefix.empty() ? "the default" : "a prefixed");
 }
@@ -451,7 +453,7 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // Phase timings (lowering / physical planning / GPU execution), logged per query: the embedder
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
-  std::shared_ptr<const sirius::object_store::scope_set> snapshot;
+  std::shared_ptr<const sirius::object_store_scope::scope_set> snapshot;
   in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
     // Captured once the transaction is held and before any binding consumes credentials: a
     // call still queued before this boundary may observe a later publication.
@@ -503,7 +505,7 @@ std::unique_ptr<Context> make_context_from_config(const std::string& config_path
   if (cfg) {
     publish_snapshot(impl->object_store,
                      cfg,
-                     sirius::object_store::capabilities_of(config.get_scan_manager_config()));
+                     sirius::object_store_scope::capabilities_of(config.get_scan_manager_config()));
   }
   impl->bring_up(config);
   return std::unique_ptr<Context>(new Context(std::move(impl)));
@@ -537,7 +539,7 @@ struct Fragment::Impl {
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
   // Scope set captured for this execution. An empty set is unconfigured; a null handle
   // means no capture has been stored.
-  std::shared_ptr<const sirius::object_store::scope_set> object_store;
+  std::shared_ptr<const sirius::object_store_scope::scope_set> object_store;
 
   void require_not_built(const char* what) const
   {
@@ -656,7 +658,7 @@ void Fragment::build(const std::string& substrait_plan)
   // The attempt owns its capture and its partial fragment: both outlive the transaction below
   // and are committed to the Fragment only after it succeeds, so a failed attempt never leaves
   // a stored capture behind and nothing captured earlier is released under conn_mutex.
-  std::shared_ptr<const sirius::object_store::scope_set> captured;
+  std::shared_ptr<const sirius::object_store_scope::scope_set> captured;
   // Type-name parsing, CREATE VIEW, and Substrait lowering all need an active transaction. A
   // failure rolls back the views, so a half-declared fragment leaves nothing behind.
   in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
@@ -787,7 +789,7 @@ void set_transaction_entry_hook(std::function<void()> hook)
 }
 
 void set_publication_observer(
-  std::function<void(std::shared_ptr<const sirius::object_store::scope_set>)> observer)
+  std::function<void(std::shared_ptr<const sirius::object_store_scope::scope_set>)> observer)
 {
   auto next =
     observer ? std::make_shared<const publication_observer_fn>(std::move(observer)) : nullptr;

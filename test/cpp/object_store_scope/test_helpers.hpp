@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "object_store/scope.hpp"
-#include "object_store/settings.hpp"
+#include "object_store_scope/scope.hpp"
+#include "object_store_scope/settings.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -22,7 +22,7 @@
 
 namespace sirius::test::object_store_test {
 
-namespace core = sirius::object_store;
+namespace core = sirius::object_store_scope;
 
 inline core::settings valid_settings(std::string prefix = "s3://bucket/prefix/")
 {
