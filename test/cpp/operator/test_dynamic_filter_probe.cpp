@@ -300,6 +300,92 @@ TEST_CASE("Bloom filter has no false negatives across probe carriers", "[dynamic
   }
 }
 
+TEST_CASE("Bloom filters of the same capacity merge into one holding both key sets",
+          "[dynamic_filter][probe]")
+{
+  // Distributed execution: each rank builds from its share of the keys, and every rank ORs all.
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  std::vector<std::int64_t> mine(1000);
+  std::vector<std::int64_t> theirs(1000);
+  for (std::size_t i = 0; i < mine.size(); ++i) {
+    mine[i]   = static_cast<std::int64_t>(i) * 2;      // even keys
+    theirs[i] = static_cast<std::int64_t>(i) * 2 + 1;  // odd keys
+  }
+  auto const mine_keys   = make_int64(mine, stream);
+  auto const theirs_keys = make_int64(theirs, stream);
+  // Sized for 4096 keys whatever each one holds, so their storage lines up.
+  sirius_dynamic_bloom_filter merged{mine_keys->view(), 4096, stream, mr};
+  sirius_dynamic_bloom_filter other{theirs_keys->view(), 4096, stream, mr};
+  REQUIRE(merged.storage_bytes() == other.storage_bytes());
+
+  merged.merge_from(other.storage(), other.storage_bytes(), stream);
+  auto both = mine;
+  both.insert(both.end(), theirs.begin(), theirs.end());
+  auto const probe = make_int64(both, stream);
+  auto const mask  = merged.compute_mask(probe->view(), kDevice, stream, mr);
+  REQUIRE(mask != nullptr);
+  auto const host = mask_to_host(mask->view(), stream);
+  CHECK(std::all_of(host.begin(), host.end(), [](std::uint8_t keep) { return keep == 1; }));
+
+  // Unmerged, the odd keys are mostly absent: the merge is what added them.
+  auto const before = sirius_dynamic_bloom_filter{mine_keys->view(), 4096, stream, mr}.compute_mask(
+    theirs_keys->view(), kDevice, stream, mr);
+  REQUIRE(before != nullptr);
+  auto const absent   = mask_to_host(before->view(), stream);
+  auto const positive = std::count(absent.begin(), absent.end(), std::uint8_t{1});
+  CHECK(positive < 100);
+
+  sirius_dynamic_bloom_filter smaller{theirs_keys->view(), 64, stream, mr};
+  CHECK_THROWS_AS(merged.merge_from(smaller.storage(), smaller.storage_bytes(), stream),
+                  std::invalid_argument);
+}
+
+TEST_CASE("Bloom filters of one requested capacity line up whatever their local key counts",
+          "[dynamic_filter][probe]")
+{
+  // One rank's share of the build can be far smaller than another's.
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  constexpr std::size_t capacity  = 4096;
+  auto const capacity_bytes       = sirius_dynamic_bloom_filter::estimated_bytes(capacity);
+  // Else a filter sized for its local key count would pass as well.
+  REQUIRE(sirius_dynamic_bloom_filter::estimated_bytes(1000) != capacity_bytes);
+  REQUIRE(sirius_dynamic_bloom_filter::estimated_bytes(10) != capacity_bytes);
+
+  std::vector<std::int64_t> many(1000);
+  for (std::size_t i = 0; i < many.size(); ++i) {
+    many[i] = static_cast<std::int64_t>(i) * 2;
+  }
+  std::vector<std::int64_t> const few{1, 3, 5, 7, 9, 11, 13, 15, 17, 19};
+  auto const many_keys = make_int64(many, stream);
+  auto const few_keys  = make_int64(few, stream);
+  sirius_dynamic_bloom_filter merged{many_keys->view(), capacity, stream, mr};
+  sirius_dynamic_bloom_filter other{few_keys->view(), capacity, stream, mr};
+  REQUIRE(merged.storage_bytes() == capacity_bytes);
+  REQUIRE(other.storage_bytes() == capacity_bytes);
+
+  merged.merge_from(other.storage(), other.storage_bytes(), stream);
+  auto both = many;
+  both.insert(both.end(), few.begin(), few.end());
+  auto const present      = make_int64(both, stream);
+  auto const present_mask = merged.compute_mask(present->view(), kDevice, stream, mr);
+  REQUIRE(present_mask != nullptr);
+  auto const kept = mask_to_host(present_mask->view(), stream);
+  CHECK(std::all_of(kept.begin(), kept.end(), [](std::uint8_t keep) { return keep == 1; }));
+
+  // Keys neither filter holds are mostly absent.
+  std::vector<std::int64_t> missing(1000);
+  for (std::size_t i = 0; i < missing.size(); ++i) {
+    missing[i] = 1'000'001 + static_cast<std::int64_t>(i) * 2;
+  }
+  auto const absent      = make_int64(missing, stream);
+  auto const absent_mask = merged.compute_mask(absent->view(), kDevice, stream, mr);
+  REQUIRE(absent_mask != nullptr);
+  auto const false_positives = mask_to_host(absent_mask->view(), stream);
+  CHECK(std::count(false_positives.begin(), false_positives.end(), std::uint8_t{1}) < 50);
+}
+
 // A decimal probe against an *integer* set is a semantic mismatch even though its unscaled
 // storage is an int64: the family boundary, not the width, decides. Decimal sets accept decimal
 // probes below ("Decimal keys").

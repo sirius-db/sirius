@@ -25,6 +25,9 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+
 #include <algorithm>
 
 namespace sirius {
@@ -63,6 +66,52 @@ bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
 
 }  // namespace
 
+std::unique_ptr<cudf::column> sirius_physical_sort_sample::index_column(
+  std::vector<int32_t> const& indices, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
+{
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          static_cast<cudf::size_type>(indices.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<int32_t>(),
+                                indices.data(),
+                                indices.size() * sizeof(int32_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
+  return column;
+}
+
+std::unique_ptr<cudf::table> sirius_physical_sort_sample::evenly_spaced(
+  cudf::table_view sorted,
+  cudf::size_type first,
+  cudf::size_type rows,
+  std::size_t parts,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<int32_t> indices;
+  for (std::size_t i = 1; i < parts; ++i) {
+    auto const at = static_cast<std::size_t>(rows) * i / parts;
+    indices.push_back(first + static_cast<int32_t>(std::min<std::size_t>(at, rows - 1)));
+  }
+  auto const column = index_column(indices, stream, mr);
+  return cudf::gather(sorted, column->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+}
+
+sort_boundaries sirius_physical_sort_sample::local_boundaries(
+  cudf::table_view sample_keys,
+  std::size_t num_parts,
+  cucascade::memory::memory_space* space,
+  ::cuda::stream_ref stream)
+{
+  auto const rows = sample_keys.num_rows();
+  // Single partition — no boundaries needed
+  if (num_parts <= 1 || rows == 0) { return {}; }
+  return {num_parts,
+          evenly_spaced(sample_keys, 0, rows, num_parts, stream, space->get_default_allocator())};
+}
+
 sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
                                                          uint64_t sort_sample_bytes,
                                                          uint64_t max_partition_bytes,
@@ -90,6 +139,12 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
     _max_partition_bytes_override(max_partition_bytes),
     _max_partition_memory_fraction(max_partition_memory_fraction)
 {
+}
+
+bool sirius_physical_sort_sample::all_ports_empty()
+{
+  if (_cross_rank_boundaries && boundary_state() == BoundaryState::NOT_DONE) { return false; }
+  return sirius_physical_operator::all_ports_empty();
 }
 
 std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
@@ -150,7 +205,11 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
     if (accumulated_bytes >= _sort_sample_bytes) { break; }
   }
 
-  if (input_batch.empty()) { return nullptr; }
+  if (input_batch.empty()) {
+    // An operator that owes its boundary task without input takes it once its input has ended.
+    bool const upstream_finished = p->src_pipeline && p->src_pipeline->is_pipeline_finished();
+    if (!runs_without_input() || !upstream_finished) { return nullptr; }
+  }
 
   _boundary_state.store(BoundaryState::SCHEDULED, std::memory_order_release);
   return std::make_unique<pipelineable_operator_data>(std::move(input_batch));
@@ -184,6 +243,12 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   }
 
   if (valid_batches.empty() || !space) {
+    auto made =
+      _cross_rank_boundaries
+        ? _cross_rank_boundaries->make({{}, 0, _sort_sample_bytes, 1, batch_telemetry()}, stream)
+        : sort_boundaries{};
+    _num_partitions       = made.num_partitions;
+    _partition_boundaries = std::move(made.table);
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -289,48 +354,19 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     }
 
     // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)
-    if (num_parts <= 1 || total_rows == 0) {
-      // Single partition — no boundaries needed
-      _num_partitions = 1;
-      _partition_boundaries.reset();
-    } else {
-      // Compute boundary row indices: [total_rows/P, 2*total_rows/P, ..., (P-1)*total_rows/P]
-      size_t num_boundaries = num_parts - 1;
-      std::vector<int32_t> boundary_indices_host;
-      boundary_indices_host.reserve(num_boundaries);
-      for (size_t i = 1; i <= num_boundaries; i++) {
-        auto idx = static_cast<int32_t>((i * total_rows) / num_parts);
-        if (idx >= static_cast<int32_t>(total_rows)) { idx = static_cast<int32_t>(total_rows) - 1; }
-        boundary_indices_host.push_back(idx);
-      }
-
-      // Create a device column with the boundary indices
-      auto indices_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                                   static_cast<cudf::size_type>(num_boundaries),
-                                                   cudf::mask_state::UNALLOCATED,
-                                                   stream,
-                                                   space->get_default_allocator());
-      CUDF_CUDA_TRY(cudaMemcpyAsync(indices_col->mutable_view().data<int32_t>(),
-                                    boundary_indices_host.data(),
-                                    num_boundaries * sizeof(int32_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-
-      // Extract only the sort key columns from merged sample for the boundaries
-      std::vector<cudf::column_view> sort_key_cols;
-      for (int idx : order_key_idx) {
-        sort_key_cols.push_back(merged_sample_view.column(idx));
-      }
-      cudf::table_view sort_keys_view(sort_key_cols);
-
-      // Gather boundary rows
-      _partition_boundaries = cudf::gather(sort_keys_view,
-                                           indices_col->view(),
-                                           cudf::out_of_bounds_policy::DONT_CHECK,
-                                           stream,
-                                           space->get_default_allocator());
-      _num_partitions       = num_parts;
+    std::vector<cudf::column_view> sort_key_cols;
+    for (int idx : order_key_idx) {
+      sort_key_cols.push_back(merged_sample_view.column(idx));
     }
+    cudf::table_view const sort_keys_view(sort_key_cols);
+    auto made =
+      _cross_rank_boundaries
+        ? _cross_rank_boundaries->make(
+            {sort_keys_view, total_sample_bytes, _sort_sample_bytes, num_parts, batch_telemetry()},
+            stream)
+        : local_boundaries(sort_keys_view, num_parts, space, stream);
+    _num_partitions       = made.num_partitions;
+    _partition_boundaries = std::move(made.table);
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this
     // execute() returns, so _partition_boundaries is visible before partition runs.

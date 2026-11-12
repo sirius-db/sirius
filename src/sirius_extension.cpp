@@ -18,6 +18,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
+#include "exchange/exchange_runtime.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -2691,6 +2692,46 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
                    params->max_sort_partition_memory_fraction);
 }
 
+static void SetExchangePeers(ClientContext& context, SetScope scope, Value& parameter)
+{
+  std::vector<std::string> peers;
+  auto const list = StringValue::Get(parameter);
+  for (std::size_t at = 0; at < list.size();) {
+    auto const comma = std::min(list.find(',', at), list.size());
+    auto peer        = list.substr(at, comma - at);
+    StringUtil::Trim(peer);
+    if (!peer.empty()) { peers.push_back(std::move(peer)); }
+    at = comma + 1;
+  }
+  get_operator_params(context, scope)->exchange_peers = std::move(peers);
+}
+
+static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->exchange_host_staging =
+    sirius::exchange::parse_host_staging(StringValue::Get(parameter));
+}
+
+static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const rank = UBigIntValue::Get(parameter);
+  if (rank > std::numeric_limits<uint32_t>::max()) {
+    throw InvalidInputException("sirius_exchange_rank %llu does not fit 32 bits", rank);
+  }
+  auto* params       = get_operator_params(context, scope);
+  auto next          = *params;
+  next.exchange_rank = static_cast<uint32_t>(rank);
+  // Peers set first: connect now, during session setup, rather than inside the first
+  // distributed query, which would otherwise wait for every peer's process to reach it. The rank
+  // is kept only once that succeeds.
+  if (next.distributed()) {
+    if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+      static_cast<void>(sirius_ctx->get_exchange_service(next));
+    }
+  }
+  params->exchange_rank = next.exchange_rank;
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -3527,6 +3568,26 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
+
+  config.AddExtensionOption("sirius_exchange_peers",
+                            "Distributed execution: host:port of every rank's exchange listener, "
+                            "comma-separated in rank order; empty runs in one process",
+                            LogicalType::VARCHAR,
+                            Value(""),
+                            SetExchangePeers);
+  config.AddExtensionOption("sirius_exchange_rank",
+                            "Distributed execution: this process's rank in sirius_exchange_peers",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0),
+                            SetExchangeRank);
+  config.AddExtensionOption(
+    "sirius_exchange_host_staging",
+    "Distributed execution: auto, always or never send the exchange's writes to a peer through "
+    "its pinned host mirror instead of NIXL; auto does so where GPUs lack peer access. Set "
+    "before sirius_exchange_rank, which connects",
+    LogicalType::VARCHAR,
+    Value("auto"),
+    SetExchangeHostStaging);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

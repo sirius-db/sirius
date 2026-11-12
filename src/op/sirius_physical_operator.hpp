@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <list>
 #include <memory>
@@ -795,11 +796,22 @@ class sirius_physical_operator {
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
   //! Called when the pipeline this operator belongs to finishes. Sets finalized=true, then
-  //! dispatches to on_finalize_operator(). Do not override this; override on_finalize_operator().
+  //! dispatches to on_finalize_operator(), then to each finalize listener. Do not override this;
+  //! override on_finalize_operator().
   void finalize_operator()
   {
     finalized.store(true);
     on_finalize_operator();
+    for (auto const& listener : _finalize_listeners) {
+      listener();
+    }
+  }
+
+  //! Adds @p listener, which finalize_operator() calls after on_finalize_operator(). Register it
+  //! while planning; it runs under the pipeline's status lock, so it must not block or throw.
+  void add_finalize_listener(std::function<void()> listener)
+  {
+    _finalize_listeners.push_back(std::move(listener));
   }
 
   //! True after finalize_operator() has been called on this operator.
@@ -924,6 +936,10 @@ class sirius_physical_operator {
 
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
+
+  //! Whether the task creator may hand this operator a task with no input batches. A distributed
+  //! collective needs one on a rank whose input is empty, since the other ranks wait for it.
+  [[nodiscard]] virtual bool runs_without_input() const { return false; }
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
 
@@ -973,6 +989,9 @@ class sirius_physical_operator {
   //! the two halves cannot be installed apart.
   late_mat::deferred_scan_output _deferred_output;
   late_mat::port_materialize_directive _port_directive;
+
+  //! See add_finalize_listener().
+  std::vector<std::function<void()>> _finalize_listeners;
 
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }

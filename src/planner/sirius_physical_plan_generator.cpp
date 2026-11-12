@@ -78,6 +78,7 @@
 #include "op/sirius_physical_union.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
@@ -340,7 +341,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    info->resolved_file_paths = std::move(resolved_file_paths);
+    assign_files_to_rank(*info, std::move(resolved_file_paths), op_params);
   }
 
   info->approximate_batch_size = op_params.scan_task_batch_size;
@@ -1351,6 +1352,7 @@ void lower_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& 
                  ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                  : nullptr;
   if (state) state->record_scan_lowering(scan.contract_id);
+  if (params.distributed()) { check_distributed_scan(scan, *entry, context); }
   slot = entry->lower(scan, params, context, entry->filter_mode);
 }
 
@@ -2366,6 +2368,19 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_scan_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
+  if (op_params.distributed()) {
+    // The scans above took this rank's share; without the exchanges each rank's answer is partial.
+    if (!sirius_ctx) {
+      throw sirius::internal_exception(
+        "distributed execution: sirius_exchange_peers set on a connection without Sirius state");
+    }
+    auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+    sirius::planner::distribute_plan(plan,
+                                     sirius_ctx->get_exchange_service(op_params),
+                                     *gpu,
+                                     sirius_ctx->next_distributed_query(context),
+                                     sirius_ctx->get_query_lifecycle_registry());
+  }
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>

@@ -71,6 +71,8 @@ target_sources(
           dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp
+          sirius_physical_exchange_sink.cpp
+          sirius_physical_exchange_source.cpp
           sirius_physical_streaming_sink.cpp
           sirius_physical_streaming_source.cpp
           sirius_physical_concat.cpp
@@ -98,6 +100,8 @@ target_sources(
           sirius_physical_result_collector.cpp
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
+          distributed/sample_all_gather_boundaries.cpp
+          distributed/bloom_all_gather_merge.cpp
           sirius_physical_table_scan.cpp
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp

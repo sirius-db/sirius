@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "creator/config.hpp"
+#include "exchange/host_staging.hpp"
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
@@ -31,6 +32,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace YAML {
 class Node;
@@ -231,6 +233,17 @@ struct operator_params {
   /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Distributed execution: "host:port" of every rank's exchange listener, indexed by rank.
+  /// Fewer than two run in one process. Every rank runs the same SQL over every file of each table
+  /// and scans its own share of the files; rank 0 returns the result.
+  std::vector<std::string> exchange_peers;
+  /// This process's rank among exchange_peers.
+  uint32_t exchange_rank = 0;
+  /// Distributed execution: whether the exchange host-stages its writes to peers.
+  exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
+
+  /// More than one rank: plans are split across processes and exchange rows.
+  [[nodiscard]] bool distributed() const noexcept { return exchange_peers.size() > 1; }
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;

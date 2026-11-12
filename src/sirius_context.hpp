@@ -78,6 +78,11 @@ namespace sirius {
 class sirius_engine;
 }  // namespace sirius
 
+namespace sirius::exchange {
+class distributed_session;
+class exchange_service;
+}  // namespace sirius::exchange
+
 namespace duckdb {
 
 class Connection;
@@ -115,6 +120,7 @@ class SiriusConnectionState : public ClientContextState {
     if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    planned_distributed_query = 0;
     // DuckDB has finished/abandoned the previous statement before starting another.
     // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
     pinned_update_guard_.reset();
@@ -134,6 +140,11 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<sirius::compression_config> compression_overrides;
   std::shared_ptr<const sirius::operator_params> execution_options;
   bool execution_window_active{false};
+  /// The execution window open on this connection, 0 when none.
+  uint64_t active_window{0};
+  /// The distributed query this connection planned before its execution window opened; the
+  /// window adopts it. Cleared at each statement's start, so a plan that never ran leaves nothing.
+  uint64_t planned_distributed_query{0};
 
   /// \brief Report @p error, not the interrupt it raised, when the CPU replay failed.
   ///
@@ -794,6 +805,47 @@ class SiriusContext : public ClientContextState {
   /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
   [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
 
+  /// \brief This process's exchange for distributed execution, connected to every peer of the
+  /// current settings on first use.
+  /// @throws sirius::invalid_input_exception when the settings change after it connected, or
+  ///         Sirius was built without NIXL.
+  [[nodiscard]] std::shared_ptr<sirius::exchange::exchange_service> get_exchange_service(
+    sirius::operator_params const& params);
+
+  /// \brief Numbers a distributed query planned on @p context, from 1, and ties it to the
+  /// connection's execution window. Every rank runs the same statements, so the same query gets
+  /// the same number, and its exchanges the same stream ids. That holds for one statement stream
+  /// only, so one connection per process runs distributed queries.
+  /// @throws sirius::invalid_input_exception when another connection already runs them.
+  [[nodiscard]] uint64_t next_distributed_query(ClientContext& context);
+
+  /// \brief @p context is closing: if it runs distributed queries, the next connection to plan
+  /// one takes over, and numbering continues where it stopped.
+  void release_distributed_connection(ClientContext& context);
+
+  /// \brief The distributed query execution window @p window runs, or 0.
+  [[nodiscard]] uint64_t distributed_query_of(sirius::query_id_t window);
+
+  /// \brief Test hook: @p service becomes this process's exchange, as if connected; null drops it.
+  void set_exchange_service_for_testing(
+    std::shared_ptr<sirius::exchange::exchange_service> service);
+
+  /// \brief This process's distributed session, or null until its first distributed use (a
+  /// distributed plan, or SET sirius_exchange_rank with the peers set). Once set, it stays until
+  /// this context is destroyed.
+  [[nodiscard]] sirius::exchange::distributed_session* distributed() const noexcept
+  {
+    return distributed_.load(std::memory_order_acquire);
+  }
+
+  /// \brief @p context's open execution window runs distributed query @p query, which an earlier
+  /// statement planned (a prepared statement's validated plan). No-op for 0 or without a window.
+  void adopt_distributed_query(ClientContext& context, uint64_t query);
+
+  /// \brief Window @p window's query failed with @p error: if it is a distributed query, every
+  /// peer's run of it fails too, rather than waiting for this rank's batches.
+  void abort_distributed_query(sirius::query_id_t window, std::exception_ptr const& error) noexcept;
+
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
 
@@ -1012,6 +1064,16 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> lease_held_at_replay_count_{0};
   std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
     semantic_decline_counts_{};
+
+  /// distributed(), created on first use.
+  sirius::exchange::distributed_session& distributed_session_for_use();
+  std::mutex distributed_create_mutex_;
+  /// The session behind distributed(). It stays until this context is destroyed, so after the
+  /// first distributed use each execution window takes the session's lock twice: when its query
+  /// work retires and when the window ends. terminate() shuts its exchange down before the memory
+  /// manager: its transport uses the memory spaces.
+  std::unique_ptr<sirius::exchange::distributed_session> distributed_owner_;
+  std::atomic<sirius::exchange::distributed_session*> distributed_{nullptr};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

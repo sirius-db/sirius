@@ -121,6 +121,8 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::DENSE_COUNT_JOIN: return "DENSE_COUNT_JOIN";
     case SiriusPhysicalOperatorType::BUILD_FILTER: return "BUILD_FILTER";
     case SiriusPhysicalOperatorType::REPLICATE: return "REPLICATE";
+    case SiriusPhysicalOperatorType::EXCHANGE_SINK: return "EXCHANGE_SINK";
+    case SiriusPhysicalOperatorType::EXCHANGE_SOURCE: return "EXCHANGE_SOURCE";
     case SiriusPhysicalOperatorType::INVALID: break;
   }
   return "INVALID";

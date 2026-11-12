@@ -245,6 +245,12 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
     REQUIRE_FALSE(fixture.begin({batch}, 256));
     REQUIRE(fixture.stats.snapshot().keys_skipped_bloom_size_gate == 2);
   }
+  SECTION("a build whose arrays exceed the cap")
+  {
+    // 1000 rows need 2 KiB per key, 4 KiB for both: a 1 KiB cap refuses rather than cut them.
+    REQUIRE_FALSE(fixture.begin({batch}, 1024));
+    REQUIRE(fixture.stats.snapshot().keys_skipped_bloom_size_gate == 2);
+  }
   SECTION("no active key")
   {
     REQUIRE_FALSE(fixture.begin({batch},

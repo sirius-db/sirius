@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/dynamic_filter/config.hpp"
+#include "op/dynamic_filter/cross_rank_filter_merge.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 #include <cudf/types.hpp>
@@ -25,6 +26,10 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+
+namespace cucascade::memory {
+class memory_space;
+}
 
 namespace sirius::op {
 
@@ -60,6 +65,13 @@ struct dynamic_filter_publication_policy {
   double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
   bool enable_multi_partition           = false;
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
+  //! Membership filters are Blooms only, never IN-lists.
+  bool bloom_only = false;
+  //! Non-zero: every Bloom, whole-build or accumulated, is sized for this many keys whatever the
+  //! build's rows, and max_bloom_bytes_per_gpu does not cut it. Zero: sized from the build.
+  std::size_t fixed_bloom_keys = 0;
+  //! Publish even an empty build, or with every target drained, rather than skip the publication.
+  bool publish_when_empty_or_drained = false;
 };
 
 /**
@@ -157,6 +169,7 @@ class dynamic_filter_publish_plan final {
   {
     return _policy.max_bloom_bytes_per_gpu;
   }
+  [[nodiscard]] dynamic_filter_publication_policy const& policy() const noexcept { return _policy; }
 
   /**
    * @brief Retains replicas on the listed GPUs
@@ -165,11 +178,31 @@ class dynamic_filter_publish_plan final {
    */
   void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
 
+  /**
+   * @brief Merges this join's filters with the same join's in other processes, under @p policy,
+   * which must make every process build filters that @p merge can combine.
+   *
+   * Only before the plan runs: dynamic_filter_publication_session::set_cross_rank_merge() refuses
+   * a sealed plan. Tests that build a plan directly call this one.
+   */
+  void set_cross_rank_merge(std::shared_ptr<cross_rank_filter_merge> merge,
+                            dynamic_filter_publication_policy policy)
+  {
+    _cross_rank_merge = std::move(merge);
+    _policy           = policy;
+  }
+  //! The merge set by set_cross_rank_merge(), or null when this process's filters stand alone.
+  [[nodiscard]] cross_rank_filter_merge* cross_rank_merge() const noexcept
+  {
+    return _cross_rank_merge.get();
+  }
+
  private:
   std::vector<admitted_key> _admitted_keys;
   std::vector<probe_target> _probe_targets;
   dynamic_filter_publication_policy _policy{};
   std::vector<dynamic_filter_replica_space> _replica_spaces;
+  std::shared_ptr<cross_rank_filter_merge> _cross_rank_merge;
 };
 
 }  // namespace sirius::op
