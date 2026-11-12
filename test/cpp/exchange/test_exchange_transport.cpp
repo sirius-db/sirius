@@ -227,6 +227,62 @@ TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everythi
   CHECK(got.batches[{0, 5}].size() == 2);
 }
 
+TEST_CASE("a cancelled query's sender stops waiting for room, and the transport carries on",
+          "[exchange][transport]")
+{
+  // About 1.2 MB a batch against a 64 KiB cap and a receiver with no room: the second send waits
+  // for room that the first never frees.
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  auto& sender           = *c.ranks[0].t;
+  auto& got              = *c.ranks[1].got;
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  auto const query       = sirius::exchange::query_of(stream);
+  auto first             = gpu_batch(sample_table(30'000));
+  auto second            = gpu_batch(sample_table(30'001));
+  {
+    auto const hold = hold_gpu();
+    sender.send(stream, 1, std::move(first));
+    auto blocked =
+      std::async(std::launch::async, [&] { sender.send(stream, 1, std::move(second)); });
+    CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+    // The receiver still has no room: only the cancellation can wake the sender.
+    sender.cancel(query);
+    REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    CHECK_NOTHROW(blocked.get());
+    // Nothing more is queued for the query, with or without room in the queue.
+    CHECK_NOTHROW(sender.send(stream, 1, gpu_batch(sample_table(1'000))));
+  }
+  // What was queued before the cancellation still goes, and its end counts only that.
+  sender.close(stream, 1);
+  REQUIRE(got.wait_for([&] { return got.error != nullptr || got.ended.size() == 1; }));
+  {
+    std::lock_guard lock{got.mutex};
+    REQUIRE_FALSE(got.error);
+    CHECK(got.batches[{0, stream}].size() == 1);
+  }
+  CHECK(sender.wait_sent(query, std::chrono::seconds{30}));
+
+  stream_id const next = sirius::exchange::make_stream_id(6, 1);
+  sender.send(next, 1, gpu_batch(sample_table(5'000)));
+  sender.close(next, 1);
+  REQUIRE(got.wait_for([&] { return got.error != nullptr || got.ended.size() == 2; }));
+  {
+    std::lock_guard lock{got.mutex};
+    REQUIRE_FALSE(got.error);
+    CHECK(got.batches[{0, next}].size() == 1);
+  }
+
+  // Once forgotten, the number carries batches again.
+  sender.forget(query);
+  stream_id const again = sirius::exchange::make_stream_id(5, 2);
+  sender.send(again, 1, gpu_batch(sample_table(5'000)));
+  sender.close(again, 1);
+  REQUIRE(got.wait_for([&] { return got.error != nullptr || got.ended.size() == 3; }));
+  std::lock_guard lock{got.mutex};
+  REQUIRE_FALSE(got.error);
+  CHECK(got.batches[{0, again}].size() == 1);
+}
+
 TEST_CASE("a batch with no room asks for it once, and lands once it has it",
           "[exchange][transport]")
 {

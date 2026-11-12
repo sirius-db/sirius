@@ -82,9 +82,12 @@ exchange_service::exchange_service(fabric& fabric,
                               std::make_exception_ptr(sirius::internal_exception(
                                 "exchange: query {} failed on rank {}: {}", query, from, what)));
                           }};
-  _transport  = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
-  _rank       = _transport->rank();
-  _world_size = _transport->world_size();
+  auto started = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
+  _rank        = started->rank();
+  _world_size  = started->world_size();
+  // Under the lock: the engine thread may already be in a callback that reads _transport.
+  std::lock_guard lock{_mutex};
+  _transport = std::move(started);
 }
 
 std::shared_ptr<inbound> exchange_service::receiver_of(stream_id stream, held event)
@@ -104,6 +107,8 @@ bool exchange_service::end_query(distributed_query_id query, std::exception_ptr 
   {
     std::lock_guard lock{_mutex};
     if (retired(query) || !_aborted.emplace(query, error).second) { return false; }
+    // Senders of this query waiting for room in the transport stop waiting: cleanup waits for them.
+    if (_transport) { _transport->cancel(query); }
     for (auto const& [stream, r] : _receivers) {
       if (query_of(stream) == query) { receivers.push_back(r); }
     }
@@ -187,6 +192,13 @@ void exchange_service::send(stream_id stream,
     }
   }
   _transport->send(stream, to, std::move(batch));
+  // An abort that arrived meanwhile may have woken this sender without queueing its batch: it
+  // fails like one that started after the abort.
+  std::lock_guard lock{_mutex};
+  if (_error) { std::rethrow_exception(_error); }
+  if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
+    std::rethrow_exception(it->second);
+  }
 }
 
 void exchange_service::close(stream_id stream, rank_t to)
@@ -227,6 +239,7 @@ void exchange_service::forget(distributed_query_id query)
   std::erase_if(_detached, [query](stream_id stream) { return query_of(stream) == query; });
   std::erase_if(_held, [query](auto const& h) { return query_of(h.first) == query; });
   _aborted.erase(query);
+  if (_transport) { _transport->forget(query); }
 }
 
 }  // namespace sirius::exchange

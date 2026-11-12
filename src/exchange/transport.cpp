@@ -550,10 +550,13 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   std::unique_lock lock{_mutex};
   _room.wait(lock, [&] {
     // A batch larger than the cap goes alone, else it would never fit.
-    return _error || _stop || e.queued_bytes == 0 ||
+    return _error || _stop || _cancelled.contains(query) || e.queued_bytes == 0 ||
            e.queued_bytes + bytes <= e.opts.max_queued_bytes;
   });
   if (_error) { std::rethrow_exception(_error); }
+  // Nothing more is queued for a cancelled query, so its senders do not wait for room that only
+  // its own cleanup frees. `held` is dropped after `lock`, as below.
+  if (_cancelled.contains(query)) { return; }
   // A copy, not a move: if the push throws, `held` stays the last owner and is dropped after `lock`
   // is released, since its deleter takes _mutex.
   auto& next = e.sent[to][stream];
@@ -602,6 +605,21 @@ void transport::abort(distributed_query_id query, std::string what)
   std::lock_guard lock{_mutex};
   if (_error) { return; }
   _aborts.push_back({query, std::move(what)});
+}
+
+void transport::cancel(distributed_query_id query)
+{
+  {
+    std::lock_guard lock{_mutex};
+    _cancelled.insert(query);
+  }
+  _room.notify_all();
+}
+
+void transport::forget(distributed_query_id query)
+{
+  std::lock_guard lock{_mutex};
+  _cancelled.erase(query);
 }
 
 void transport::run()

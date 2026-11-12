@@ -45,6 +45,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -77,15 +78,19 @@ struct ranks {
   loopback_hub hub;
   std::vector<one> all;
 
-  ranks(rank_t world, loopback_hub::options opts) : hub(world, opts), all(world)
+  ranks(rank_t world,
+        loopback_hub::options opts,
+        cucascade::memory::memory_space* host               = env().host,
+        sirius::exchange::transport::options transport_opts = {})
+    : hub(world, opts), all(world)
   {
     for (rank_t r = 0; r < world; ++r) {
-      auto& o = all[r];
-      o.send  = std::make_unique<frame_ring>(4, 64 * KiB);
-      o.recv  = std::make_unique<frame_ring>(8, 64 * KiB);
-      o.fab   = hub.attach(r, *o.send, *o.recv);
-      o.service =
-        std::make_shared<exchange_service>(*o.fab, *o.send, *o.recv, *env().gpu, env().host);
+      auto& o   = all[r];
+      o.send    = std::make_unique<frame_ring>(4, 64 * KiB);
+      o.recv    = std::make_unique<frame_ring>(8, 64 * KiB);
+      o.fab     = hub.attach(r, *o.send, *o.recv);
+      o.service = std::make_shared<exchange_service>(
+        *o.fab, *o.send, *o.recv, *env().gpu, host, transport_opts);
     }
   }
   explicit ranks(rank_t world) : ranks(world, loopback_hub::options{}) {}
@@ -529,6 +534,29 @@ TEST_CASE("an aborted query fails its streams on every rank, and only its stream
   sirius_physical_exchange_source late(
     key_value_types(), 0, c.all[1].service, aborted + 1, {0, 1}, false);
   CHECK_THROWS(late.get_next_task_input_data());
+}
+
+TEST_CASE("a peer's abort wakes a sender waiting for room, which fails with the abort",
+          "[exchange][operators]")
+{
+  // About 1.2 MB a batch against a 64 KiB cap and a receiver with no room: rank 0's second send
+  // waits for room that the first never frees.
+  ranks c(2, loopback_hub::options{}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  auto& service          = *c.all[0].service;
+  auto first             = gpu_batch(sample_table(30'000));
+  auto second            = gpu_batch(sample_table(30'001));
+  auto const hold        = hold_gpu();
+  service.send(stream, 1, std::move(first));
+  auto blocked =
+    std::async(std::launch::async, [&] { service.send(stream, 1, std::move(second)); });
+  CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+
+  c.all[1].service->abort(sirius::exchange::query_of(stream), "injected failure");
+
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  CHECK_THROWS_WITH(blocked.get(),
+                    Catch::Matchers::ContainsSubstring("failed on rank 1: injected failure"));
 }
 
 TEST_CASE("a receiver that throws aborts its query on every rank, and the next query runs",
