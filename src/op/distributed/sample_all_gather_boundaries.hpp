@@ -22,6 +22,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -57,12 +58,15 @@ class sample_all_gather_boundaries final : public cross_rank_sort_boundaries {
   static constexpr std::size_t distributed_summary_rows = 1024;
   //! Sample rows each of a rank's partitions gets from the global sample.
   static constexpr std::size_t summary_rows_per_partition = 32;
+  //! all_gather's default: the sort cannot go on without every rank's sample.
+  static constexpr std::chrono::milliseconds default_timeout{std::chrono::minutes{10}};
 
   /**
    * @param stream The all-gather's stream id, the same on every rank.
    * @param gpu Where gathered summaries are merged.
    * @param column_order The order of each sort key column.
    * @param set_exchange_boundaries Receives the range exchange's boundaries.
+   * @param timeout The query fails when a rank has not sent its sample by then.
    */
   sample_all_gather_boundaries(
     std::shared_ptr<exchange::exchange_service> service,
@@ -70,7 +74,8 @@ class sample_all_gather_boundaries final : public cross_rank_sort_boundaries {
     cucascade::memory::memory_space& gpu,
     std::vector<cudf::order> column_order,
     std::vector<cudf::null_order> null_precedence,
-    std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries);
+    std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries,
+    std::chrono::milliseconds timeout = default_timeout);
 
   //! Shares the request's sample (sorted, possibly empty), then sets the range exchange's
   //! boundaries and returns this rank's, from the global sample; this rank keeps up to
@@ -84,6 +89,7 @@ class sample_all_gather_boundaries final : public cross_rank_sort_boundaries {
   std::vector<cudf::order> _column_order;
   std::vector<cudf::null_order> _null_precedence;
   std::function<void(std::shared_ptr<cudf::table const>)> _set_exchange_boundaries;
+  std::chrono::milliseconds _timeout;
   //! The all-gather's result, kept for an OOM retry of the boundary task, since the peers will
   //! not gather on that stream again. Only one boundary task runs at a time.
   std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _gathered;

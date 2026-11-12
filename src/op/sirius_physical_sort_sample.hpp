@@ -30,6 +30,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius {
@@ -107,8 +108,14 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
   //! Boundaries come from @p hook instead of this operator's sample alone. Set while planning.
+  //! @throws std::logic_error once the boundary task has been claimed.
   void set_cross_rank_boundaries(std::shared_ptr<cross_rank_sort_boundaries> hook)
   {
+    if (boundary_state() != BoundaryState::NOT_DONE) {
+      throw std::logic_error(
+        "[sirius_physical_sort_sample::set_cross_rank_boundaries] the plan cannot change during "
+        "execution");
+    }
     _cross_rank_boundaries = std::move(hook);
   }
   //! The hook set by set_cross_rank_boundaries(), or null when this operator's sample stands alone.
