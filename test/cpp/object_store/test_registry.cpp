@@ -483,6 +483,9 @@ TEST_CASE("Object-store registry concurrent writers compose and readers see comp
 
 TEST_CASE("Object-store registry survives each reached allocation failure", "[object_store_core]")
 {
+  if (!fault::supported()) {
+    SKIP("ThreadSanitizer owns the allocation functions; allocation injection is disabled");
+  }
   operation_deadline deadline("allocation failure sweep");
   for (auto const op : {operation::insert_empty,
                         operation::insert,
@@ -540,6 +543,9 @@ TEST_CASE("Object-store registry survives each reached allocation failure", "[ob
 
 TEST_CASE("Object-store allocation faults disarm before nothrow recovery", "[object_store_core]")
 {
+  if (!fault::supported()) {
+    SKIP("ThreadSanitizer owns the allocation functions; allocation injection is disabled");
+  }
   for (unsigned form = 0; form < 4; ++form) {
     auto allocate = [form]() -> void* {
       switch (form) {
@@ -575,6 +581,9 @@ TEST_CASE("Object-store allocation faults disarm before nothrow recovery", "[obj
 TEST_CASE("Object-store allocation failures release transferred owners outside registry locks",
           "[object_store_core]")
 {
+  if (!fault::supported()) {
+    SKIP("ThreadSanitizer owns the allocation functions; allocation injection is disabled");
+  }
   operation_deadline deadline("allocation failure with reentrant candidate cleanup");
   allocation_fixture baseline(operation::insert);
   auto counted = invoke_with_fault(0, [&] { return baseline.perform(); });

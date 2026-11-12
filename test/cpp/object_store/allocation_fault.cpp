@@ -6,6 +6,17 @@
 #include <cstdlib>
 #include <new>
 
+#if defined(__SANITIZE_THREAD__)
+#define SIRIUS_TEST_ALLOCATION_FAULTS 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define SIRIUS_TEST_ALLOCATION_FAULTS 0
+#endif
+#endif
+#ifndef SIRIUS_TEST_ALLOCATION_FAULTS
+#define SIRIUS_TEST_ALLOCATION_FAULTS 1
+#endif
+
 namespace {
 
 struct allocation_state {
@@ -17,6 +28,7 @@ struct allocation_state {
 
 thread_local allocation_state state;
 
+#if SIRIUS_TEST_ALLOCATION_FAULTS
 void* allocate(std::size_t size, std::size_t alignment)
 {
   if (state.enabled) {
@@ -37,10 +49,13 @@ void* allocate(std::size_t size, std::size_t alignment)
   if (!result) { throw std::bad_alloc{}; }
   return result;
 }
+#endif
 
 }  // namespace
 
 namespace sirius::test::allocation_fault {
+
+bool supported() noexcept { return SIRIUS_TEST_ALLOCATION_FAULTS; }
 
 void arm(std::size_t ordinal) noexcept
 {
@@ -55,6 +70,7 @@ observation disarm() noexcept
 
 }  // namespace sirius::test::allocation_fault
 
+#if SIRIUS_TEST_ALLOCATION_FAULTS
 void* operator new(std::size_t size) { return allocate(size, alignof(std::max_align_t)); }
 void* operator new[](std::size_t size) { return ::operator new(size); }
 void* operator new(std::size_t size, std::align_val_t alignment)
@@ -118,3 +134,4 @@ void operator delete[](void* pointer, std::align_val_t, std::nothrow_t const&) n
 {
   ::operator delete(pointer);
 }
+#endif

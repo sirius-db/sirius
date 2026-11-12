@@ -11,6 +11,8 @@ struct observation {
   bool hit;
 };
 
+bool supported() noexcept;
+
 // Zero counts without failing. A nonzero ordinal fails once, then disables interception
 // before unwinding or a nothrow allocation's fallback can run.
 void arm(std::size_t ordinal = 0) noexcept;
