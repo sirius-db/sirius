@@ -21,7 +21,7 @@
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
-#include <expression_evaluator/nvrtc/register_value.hpp>
+#include <expression_evaluator/nvrtc/supportability.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 #include <telemetry/nvtx.hpp>
@@ -345,24 +345,36 @@ expression_evaluator::evaluate_materialization_boundaries(
   return state;
 }
 
-std::optional<std::unique_ptr<cudf::table>>
+template <typename Run>
+std::optional<std::invoke_result_t<Run&, cudf::table_view, nvrtc::boundary_column_map const*>>
+expression_evaluator::run_compile_plan(nvrtc::compile_plan const& plan, Run&& run)
+{
+  if (plan.is_direct()) { return run(_input_table, nullptr); }
+  auto const state = evaluate_materialization_boundaries(plan.boundaries);
+  if (!state) { return std::nullopt; }
+  return run(state->combined_table(), &state->boundary_map);
+}
+
+std::optional<expression_evaluator::nvrtc_projection>
 expression_evaluator::try_evaluate_nvrtc_with_boundaries(
   std::span<sirius::ast::node const* const> expressions)
 {
-  auto const plan = nvrtc::plan_project_sink(expressions, _input_table);
+  auto plan = nvrtc::plan_project_sink(expressions, _input_table);
   if (!plan) { return std::nullopt; }
-  auto const run = [&](cudf::table_view kernel_input,
-                       nvrtc::boundary_column_map const* boundary_map) {
-    auto result = nvrtc::evaluate_project_sink(
-      expressions, kernel_input, _stream, _mr, nvrtc_sink_options(boundary_map));
-    _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
-    return std::move(result.table);
-  };
-  if (plan->is_direct()) { return run(_input_table, nullptr); }
-
-  auto const state = evaluate_materialization_boundaries(plan->boundaries);
-  if (!state) { return std::nullopt; }
-  return run(state->combined_table(), &state->boundary_map);
+  std::vector<sirius::ast::node const*> roots;
+  roots.reserve(plan->roots.size());
+  for (auto const position : plan->roots) {
+    roots.push_back(expressions[position]);
+  }
+  auto table = run_compile_plan(
+    *plan, [&](cudf::table_view kernel_input, nvrtc::boundary_column_map const* boundary_map) {
+      auto result = nvrtc::evaluate_project_sink(
+        roots, kernel_input, _stream, _mr, nvrtc_sink_options(boundary_map));
+      _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+      return std::move(result.table);
+    });
+  if (!table) { return std::nullopt; }
+  return nvrtc_projection{std::move(plan->roots), std::move(*table)};
 }
 
 nvrtc::sink_options expression_evaluator::nvrtc_sink_options(
@@ -410,46 +422,24 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   }
 
   //===----------NVRTC_JIT mode----------===//
+  // One fused kernel computes every root it can; a mixed projection list (e.g. top-level VARCHAR
+  // or STRUCT expressions beside fixed-width ones) evaluates the remaining roots through the
+  // materialized path.
   if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
-    if (auto table = try_evaluate_nvrtc_with_boundaries(_ast_expressions)) {
+    if (auto projected = try_evaluate_nvrtc_with_boundaries(_ast_expressions)) {
+      _output_columns.resize(_ast_expressions.size());
+      auto compiled_columns = projected->table->release();
+      for (std::size_t k = 0; k < projected->roots.size(); ++k) {
+        _output_columns[projected->roots[k]] = std::move(compiled_columns[k]);
+      }
+      for (std::size_t i = 0; i < _ast_expressions.size(); ++i) {
+        if (_output_columns[i]) { continue; }
+        auto result        = evaluate(*_ast_expressions[i], evaluation_mode::MATERIALIZE);
+        _output_columns[i] = materialize_result_column(*_ast_expressions[i], std::move(result));
+      }
       _temp_scalars.clear();
       _temp_columns.clear();
-      return std::move(*table);
-    }
-
-    // Mixed projection list (e.g. top-level VARCHAR / STRUCT expressions alongside fixed-width
-    // compilable expressions): batch all fixed-width compilable root expressions into one fused
-    // NVRTC_JIT kernel and evaluate the remaining root expressions through the materialized path.
-    std::vector<sirius::ast::node const*> compilable_exprs;
-    std::vector<std::size_t> compilable_indices;
-    for (std::size_t i = 0; i < _ast_expressions.size(); ++i) {
-      auto const* expr          = _ast_expressions[i];
-      auto const opt_type       = sirius::get_cudf_type(expr->return_type());
-      bool const is_untyped_ref = expr->holds<sirius::ast::reference>() &&
-                                  (expr->return_type().id() == sirius::type_id::INVALID ||
-                                   expr->return_type().id() == sirius::type_id::SQLNULL);
-      if ((opt_type && nvrtc::is_supported_fixed_width(*opt_type)) || is_untyped_ref) {
-        compilable_exprs.push_back(expr);
-        compilable_indices.push_back(i);
-      }
-    }
-
-    if (!compilable_exprs.empty() && compilable_exprs.size() < _ast_expressions.size()) {
-      if (auto compiled_table = try_evaluate_nvrtc_with_boundaries(compilable_exprs)) {
-        _output_columns.resize(_ast_expressions.size());
-        auto compiled_cols = (*compiled_table)->release();
-        for (std::size_t k = 0; k < compilable_indices.size(); ++k) {
-          _output_columns[compilable_indices[k]] = std::move(compiled_cols[k]);
-        }
-        for (std::size_t i = 0; i < _ast_expressions.size(); ++i) {
-          if (_output_columns[i]) { continue; }
-          auto result        = evaluate(*_ast_expressions[i], evaluation_mode::MATERIALIZE);
-          _output_columns[i] = materialize_result_column(*_ast_expressions[i], std::move(result));
-        }
-        _temp_scalars.clear();
-        _temp_columns.clear();
-        return std::make_unique<cudf::table>(std::move(_output_columns));
-      }
+      return std::make_unique<cudf::table>(std::move(_output_columns));
     }
   }
 
@@ -492,21 +482,16 @@ std::optional<std::unique_ptr<cudf::table>> expression_evaluator::try_select_nvr
   };
   auto const plan = nvrtc::plan_filter_sink(*pred, _input_table);
   if (!plan) { return std::nullopt; }
-  auto const run = [&](cudf::table_view kernel_input,
-                       nvrtc::boundary_column_map const* boundary_map) {
-    return finish(nvrtc::evaluate_filter_sink(*pred,
-                                              kernel_input,
-                                              projected_input,
-                                              out_survivors != nullptr,
-                                              _stream,
-                                              _mr,
-                                              nvrtc_sink_options(boundary_map)));
-  };
-  if (plan->is_direct()) { return run(_input_table, nullptr); }
-
-  auto const state = evaluate_materialization_boundaries(plan->boundaries);
-  if (!state) { return std::nullopt; }
-  return run(state->combined_table(), &state->boundary_map);
+  return run_compile_plan(
+    *plan, [&](cudf::table_view kernel_input, nvrtc::boundary_column_map const* boundary_map) {
+      return finish(nvrtc::evaluate_filter_sink(*pred,
+                                                kernel_input,
+                                                projected_input,
+                                                out_survivors != nullptr,
+                                                _stream,
+                                                _mr,
+                                                nvrtc_sink_options(boundary_map)));
+    });
 }
 
 std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_view input)
@@ -598,8 +583,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::node const& expr, ev
       mode == evaluation_mode::MATERIALIZE && !expr.holds<sirius::ast::reference>() &&
       !expr.holds<sirius::ast::constant>()) {
     std::array<sirius::ast::node const*, 1> single_expr{&expr};
-    if (auto table = try_evaluate_nvrtc_with_boundaries(single_expr)) {
-      return evaluate_result(std::move((*table)->release()[0]));
+    if (auto projected = try_evaluate_nvrtc_with_boundaries(single_expr)) {
+      return evaluate_result(std::move(projected->table->release()[0]));
     }
   }
 

@@ -161,12 +161,14 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
 
 - **Compile planning.** Before any GPU work, `plan_project_sink` / `plan_filter_sink` walk the
   expressions once and return either no plan (the expressions take the materialize path) or a
-  `compile_plan`: compile directly, or first evaluate the named Materialization Boundaries
-  (`upper`, `concat`, string and temporal casts, ...) into columns appended to the input. Each
-  boundary is planned as a column of its declared type, which its evaluated column has, so after
-  evaluation only a STRING column's offset width is checked (`is_supported_boundary_column`). The
-  projection, mixed-projection and filter paths share the planner, and the per-subexpression retry
-  in `evaluate(node, MATERIALIZE)` costs one host walk when it fails.
+  `compile_plan`: the roots one kernel computes (a projection's other roots, such as a VARCHAR
+  output, take the materialize path), compiled directly, or after first evaluating the named
+  Materialization Boundaries (`upper`, `concat`, string and temporal casts, ...) into columns
+  appended to the input. Each boundary is planned as a column of its declared type, which its
+  evaluated column has, so after evaluation only a STRING column's offset width is checked
+  (`is_supported_boundary_column`). A projection list is planned once, whether or not every root
+  compiles, and the per-subexpression retry in `evaluate(node, MATERIALIZE)` costs one host walk
+  when it fails.
 - **Kernel shape.** Blocks of 256 threads process a tile of rows, each thread handling several
   rows strided by the block width (4 per thread for projections, 16 for filters) so loads and
   stores stay coalesced and every thread has several memory requests in flight. Full tiles run an

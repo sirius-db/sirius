@@ -22,6 +22,7 @@
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
+#include <expression_evaluator/nvrtc/supportability.hpp>
 #include <expression_evaluator/query_caches.hpp>
 
 // cudf
@@ -48,6 +49,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace sirius {
@@ -511,10 +513,23 @@ class expression_evaluator {
   [[nodiscard]] nvrtc::sink_options nvrtc_sink_options(
     nvrtc::boundary_column_map const* boundary_map = nullptr);
 
-  // Attempt to evaluate a batch of fixed-width expressions via a single fused NVRTC_JIT kernel,
-  // evaluating the Materialization Boundaries of its plan first. Returns std::nullopt without any
-  // GPU work when no kernel can compute the expressions.
-  std::optional<std::unique_ptr<cudf::table>> try_evaluate_nvrtc_with_boundaries(
+  // Runs `run` over the kernel input of `plan`: the input table, with the plan's evaluated
+  // Materialization Boundaries appended when it has any. Returns std::nullopt, without running
+  // `run`, when a kernel cannot read one of those columns.
+  template <typename Run>
+  std::optional<std::invoke_result_t<Run&, cudf::table_view, nvrtc::boundary_column_map const*>>
+  run_compile_plan(nvrtc::compile_plan const& plan, Run&& run);
+
+  // The output of the fused NVRTC_JIT kernel of a projection list: one column per computed root.
+  struct nvrtc_projection {
+    std::vector<std::size_t> roots;  // The positions in the list of the roots the kernel computed.
+    std::unique_ptr<cudf::table> table;  // One column per entry of `roots`, in the same order.
+  };
+
+  // Attempt to evaluate, via a single fused NVRTC_JIT kernel, every expression of `expressions`
+  // that such a kernel can compute, evaluating the Materialization Boundaries of its plan first.
+  // Returns std::nullopt without any GPU work when no kernel can compute any of the expressions.
+  std::optional<nvrtc_projection> try_evaluate_nvrtc_with_boundaries(
     std::span<sirius::ast::node const* const> expressions);
 
   // Attempt to evaluate a single boolean filter predicate via the NVRTC_JIT FilterSink kernel

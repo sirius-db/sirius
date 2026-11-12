@@ -21,7 +21,6 @@
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
 #include <expression/substring_slice.hpp>
-#include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <expression_evaluator/nvrtc/register_value.hpp>
 #include <expression_evaluator/nvrtc/supportability.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -148,7 +147,7 @@ using boundary_list = std::vector<sirius::ast::node const*>;
  * @brief Records @p boundary in @p boundaries and returns whether a kernel can read its evaluated
  *        column, whose type is the boundary's declared return type.
  */
-[[nodiscard]] bool bind_placeholder(sirius::ast::node const& boundary, boundary_list& boundaries)
+[[nodiscard]] bool record_boundary(sirius::ast::node const& boundary, boundary_list& boundaries)
 {
   auto const opt_cudf = sirius::get_cudf_type(boundary.return_type());
   if (!opt_cudf || !is_supported_register_type(*opt_cudf)) { return false; }
@@ -422,7 +421,7 @@ bool is_node_supported(sirius::ast::node const& expr,
 
   //===----------CAST----------===//
   if (expr.holds<sirius::ast::cast>()) {
-    if (is_materialization_boundary(expr, input)) { return bind_placeholder(expr, boundaries); }
+    if (is_materialization_boundary(expr, input)) { return record_boundary(expr, boundaries); }
     auto const& cst = expr.get<sirius::ast::cast>();
     if (!cst.child || !is_node_supported(*cst.child, input, boundaries)) { return false; }
     auto const opt_dst = sirius::get_cudf_type(cst.target_type);
@@ -456,7 +455,7 @@ bool is_node_supported(sirius::ast::node const& expr,
 
   //===----------FUNCTION_CALL----------===//
   if (expr.holds<sirius::ast::function_call>()) {
-    if (is_materialization_boundary(expr, input)) { return bind_placeholder(expr, boundaries); }
+    if (is_materialization_boundary(expr, input)) { return record_boundary(expr, boundaries); }
     return is_function_call_supported(expr.get<sirius::ast::function_call>(), input, boundaries);
   }
 
@@ -464,8 +463,8 @@ bool is_node_supported(sirius::ast::node const& expr,
 }
 
 /**
- * @brief Plans one kernel whose outputs are @p roots; @p is_output_type tells which root types
- *        the kernel can write.
+ * @brief Plans one kernel whose outputs are the entries of @p roots it can compute; @p
+ * is_output_type tells which root types the kernel can write.
  */
 template <typename OutputTypePredicate>
 [[nodiscard]] std::optional<compile_plan> plan_sink(std::span<sirius::ast::node const* const> roots,
@@ -473,19 +472,22 @@ template <typename OutputTypePredicate>
                                                     OutputTypePredicate is_output_type) noexcept
 {
   try {
-    if (roots.empty()) { return std::nullopt; }
     compile_plan plan;
-    for (auto const* root : roots) {
-      if (root == nullptr || !is_output_type(effective_node_cudf_type(*root, input))) {
-        return std::nullopt;
-      }
+    for (std::size_t i = 0; i < roots.size(); ++i) {
+      auto const* root          = roots[i];
+      auto const boundary_count = plan.boundaries.size();
       // A root that is itself a boundary stays on the caller's path: a kernel that only copied its
       // evaluated column would gain nothing.
-      if (is_materialization_boundary(*root, input) ||
-          !is_node_supported(*root, input, plan.boundaries)) {
-        return std::nullopt;
+      if (root != nullptr && is_output_type(effective_node_cudf_type(*root, input)) &&
+          !is_materialization_boundary(*root, input) &&
+          is_node_supported(*root, input, plan.boundaries)) {
+        plan.roots.push_back(i);
+      } else {
+        // The kernel reads no boundary of a root it does not compute.
+        plan.boundaries.resize(boundary_count);
       }
     }
+    if (plan.roots.empty()) { return std::nullopt; }
     return plan;
   } catch (...) {
     return std::nullopt;

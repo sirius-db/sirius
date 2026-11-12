@@ -32,43 +32,20 @@
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <span>
 #include <vector>
 
 /**
  * @file
- * @brief The `NVRTC_JIT` entry points of @c expression_evaluator: plan whether a projection list or
- * filter predicate compiles to one fused kernel, and run it.
+ * @brief The `NVRTC_JIT` entry points of @c expression_evaluator that run one fused kernel:
+ * `evaluate_project_sink` for a projection list and `evaluate_filter_sink` for a filter predicate.
  *
- * `expression_evaluator` plans each kernel with `plan_project_sink` or `plan_filter_sink` before it
- * does any GPU work. A `compile_plan` either runs directly over the input table, or names the
- * Materialization Boundaries to evaluate first: the evaluator appends their columns to the input in
- * plan order, checks each with `is_supported_boundary_column`, and binds them through a
- * `boundary_column_map` in `sink_options`. The planners never throw: any failure to decide is
- * reported as "no plan", which routes the expressions to the materialize path.
+ * `expression_evaluator` first plans each kernel with `plan_project_sink` or `plan_filter_sink`
+ * (`supportability.hpp`), evaluates the plan's Materialization Boundaries, and passes their columns
+ * through the `boundary_column_map` in `sink_options`.
  */
 
 namespace sirius::nvrtc {
-
-/**
- * @brief How one fused kernel computes its expressions over an input table.
- *
- * A Materialization Boundary is a sub-tree the kernel cannot compute but can read as an input
- * column once it has been evaluated: `concat`, `||`, `upper`, `lower`, `regexp_replace`, and CASTs
- * to a register type that the in-kernel cast gate refuses (between STRING and non-STRING, or
- * between temporal and non-temporal types). `LIKE`, `NOT LIKE` and `contains` are compiled
- * in-kernel and are not boundaries.
- */
-struct compile_plan {
-  /**
-   * @brief The maximal boundaries below the kernel's roots, in the order their columns follow the
-   * input table's columns; empty when the kernel reads only the input table.
-   */
-  std::vector<sirius::ast::node const*> boundaries;
-
-  [[nodiscard]] bool is_direct() const noexcept { return boundaries.empty(); }
-};
 
 /** @brief Per-evaluation options shared by both @c evaluate_project_sink and @c
  * evaluate_filter_sink. */
@@ -96,32 +73,6 @@ struct filter_sink_result {
   std::unique_ptr<cudf::column> survivors;  ///< Ascending INT32 indices of the surviving rows.
   std::size_t narrow_domain_comparison_count{0};  ///< Comparisons emitted at a narrowed carrier.
 };
-
-/**
- * @brief Plans one `ProjectSink` kernel with one fixed-width output per expression of `expressions`
- * over `input`.
- *
- * @return The plan, or nullopt when no such kernel can compute every expression.
- */
-[[nodiscard]] std::optional<compile_plan> plan_project_sink(
-  std::span<sirius::ast::node const* const> expressions, cudf::table_view const& input) noexcept;
-
-/**
- * @brief Plans one `FilterSink` kernel for the boolean @p predicate over @p input.
- *
- * @return The plan, or nullopt when no such kernel can compute @p predicate.
- */
-[[nodiscard]] std::optional<compile_plan> plan_filter_sink(sirius::ast::node const& predicate,
-                                                           cudf::table_view const& input) noexcept;
-
-/**
- * @brief Returns whether a kernel can read `column`, the evaluated column of one of a
- * `compile_plan`'s boundaries.
- *
- * The plan already accepted the boundary's declared type, which its evaluated column has; only the
- * width of a STRING column's offsets is unknown until the column exists.
- */
-[[nodiscard]] bool is_supported_boundary_column(cudf::column_view const& column) noexcept;
 
 /**
  * @brief Compiles (or fetches from `codegen::jit::KernelCache`) and executes a single fused

@@ -30,6 +30,7 @@
 #include <expression_evaluator/nvrtc/kernel_abi.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <expression_evaluator/nvrtc/overflow_site.hpp>
+#include <expression_evaluator/nvrtc/supportability.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 #include <helper/logical_type.hpp>
 
@@ -507,9 +508,32 @@ TEST_CASE("nvrtc_codegen - compile planning names the Materialization Boundaries
 
     auto const plan = sirius::nvrtc::plan_project_sink(exprs, table.view);
     REQUIRE(plan);
+    CHECK(plan->roots == std::vector<std::size_t>{0, 1});
     REQUIRE(plan->boundaries.size() == 2);
     CHECK(plan->boundaries[0] == lower_upper_ptr);
     CHECK(plan->boundaries[1] == upper_ptr);
+  }
+
+  SECTION("a projection plans the roots one kernel computes, and only their boundaries")
+  {
+    // Neither a VARCHAR CASE nor a VARCHAR reference is a kernel output, so the CASE's boundary
+    // must not be evaluated for the kernel.
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back({make_cmp(sirius::comparison_type::equal, upper_s(), make_str_const("X")),
+                     make_ref_typed(3, varchar_t)});
+    auto const varchar_case = std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_str_const("none"), varchar_t});
+    auto upper            = upper_s();
+    auto const* upper_ptr = upper.get();
+    auto const length = make_unary_func(sirius::function_id::strlen, std::move(upper), bigint_t);
+    auto const varchar_ref = make_ref_typed(3, varchar_t);
+    std::array<ast_node const*, 3> exprs{varchar_case.get(), length.get(), varchar_ref.get()};
+
+    auto const plan = sirius::nvrtc::plan_project_sink(exprs, table.view);
+    REQUIRE(plan);
+    CHECK(plan->roots == std::vector<std::size_t>{1});
+    REQUIRE(plan->boundaries.size() == 1);
+    CHECK(plan->boundaries[0] == upper_ptr);
   }
 
   SECTION("a boundary under an uncompilable ancestor yields no plan")
