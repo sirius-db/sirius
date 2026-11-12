@@ -20,6 +20,8 @@
 
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 namespace sirius::op {
@@ -33,7 +35,9 @@ namespace sirius::op {
  */
 class input_free_operator_data final : public operator_data {
  public:
-  explicit input_free_operator_data(std::size_t estimated_bytes) : _estimated_bytes(estimated_bytes)
+  explicit input_free_operator_data(std::size_t estimated_bytes,
+                                    std::optional<std::uint64_t> sequence = std::nullopt)
+    : _estimated_bytes(estimated_bytes), _sequence(sequence)
   {
   }
 
@@ -67,9 +71,14 @@ class input_free_operator_data final : public operator_data {
     return *_gpu_memory_space;
   }
 
+  /// Caller-defined sequence number (e.g. the generator's batch index); survives OOM retries
+  /// because the same object is retried.
+  [[nodiscard]] std::optional<std::uint64_t> sequence() const noexcept { return _sequence; }
+
  private:
   cucascade::memory::memory_space* _gpu_memory_space = nullptr;
   std::size_t _estimated_bytes;
+  std::optional<std::uint64_t> _sequence;
 };
 
 }  // namespace sirius::op

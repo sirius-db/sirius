@@ -28,6 +28,9 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_contracts.cpp
     test/cpp/scan/test_scan_verdicts.cpp
     test/cpp/scan/test_certification_cost.cpp
+    test/cpp/scan/test_generator_distributions.cpp
+    test/cpp/scan/test_generator_strings.cpp
+    test/cpp/scan/test_generate_bind.cpp
     test/cpp/integration/test_transparent_verdicts.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/compression/test_decode_reservation.cpp
@@ -249,6 +252,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
+    test/cpp/operator/test_physical_generator.cpp
     test/cpp/operator/test_physical_gpu_values.cpp
     test/cpp/operator/test_output_order.cpp
     test/cpp/operator/test_physical_limit.cpp
@@ -284,6 +288,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
+    test/cpp/planner/test_generator_plan.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
@@ -377,6 +382,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/scan/test_stream_lineage_item5.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
+    test/cpp/sirius_extension/test_sirius_generate.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp

@@ -44,6 +44,9 @@ target_sources(
           scan/materialization_contract.cpp
           scan/positional_visibility.cpp
           scan/positional_visibility.cu
+          scan/generator/generator_batch.cu
+          scan/generator/generator_strings.cu
+          scan/generator/generate_function.cpp
           scan/field_id_mapping.cpp
           scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
@@ -76,6 +79,7 @@ target_sources(
           sirius_physical_dummy_scan.cpp
           sirius_physical_empty_result.cpp
           sirius_physical_filter.cpp
+          sirius_physical_generator.cpp
           sirius_physical_gpu_values.cpp
           sirius_physical_grouped_aggregate.cpp
           sirius_physical_grouped_aggregate_merge.cpp

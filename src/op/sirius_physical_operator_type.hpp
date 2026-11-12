@@ -148,6 +148,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   SORT_PARTITION,
   SORT_SAMPLE,
   GPU_VALUES,
+  GENERATOR,
   GPU_SCAN,
   DYNAMIC_FILTER,
   STREAMING_SOURCE,
