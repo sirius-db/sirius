@@ -217,7 +217,7 @@ uncompressed.
 | `enable_spill_compression` | `spill_compression` | bool | false | Compress spilled batches. The setting applies to the whole process. |
 | `spill_min_batch_bytes` | — | bytes | 64Mi | Spill batches smaller than this uncompressed. |
 | `spill_max_compressed_fraction` | — | finite double >= 0 | 0.75 | A spilled batch stays compressed only at or below this fraction of its device size. Independent of the input-table `max_compressed_fraction`. |
-| `spill_encode_reserve_fraction` | — | double in [0, 1] | 0.5 | Encode only when this fraction of the batch's size could be reserved in its GPU memory space; otherwise the batch spills uncompressed. `0` skips the check. |
+| `spill_encode_reserve_fraction` | — | double ≥ 0 | 1.5 | Encode only when this fraction of the batch's size could be reserved in its GPU memory space, as headroom beyond the batch itself; otherwise the batch spills uncompressed. Multi-column batches peak at about 0.7–1.1x of their size, a batch of one string column at up to about 2.9x. `0` skips the check. |
 
 ### How Downgrade Thresholds Work
 
