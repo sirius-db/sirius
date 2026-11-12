@@ -939,6 +939,7 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.sort_sample_bytes == batch);
   REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
   REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
+  REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu == 4 * batch);
 }
 
 fs::path config_fixture(std::string const& name)
@@ -1109,6 +1110,54 @@ TEST_CASE("startup BUILD_PROBE budgets remain independent through SET and RESET"
   execute("RESET hash_partition_bytes");
   REQUIRE(duckdb::session_operator_params(*con.context).hash_partition_bytes == 3 * mib);
   require_budgets(index_default, resident_default);
+}
+
+TEST_CASE("dynamic-filter Bloom budget uses the startup scan size through SET and RESET",
+          "[sirius][config][operator_defaults][dynamic_filter][isolated_context]")
+{
+  std::optional<std::string> original_test_options;
+  if (auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS")) {
+    original_test_options = value;
+  }
+  finally cleanup_env{[&]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+    if (original_test_options) {
+      setenv("SIRIUS_ENABLE_TEST_OPTIONS", original_test_options->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+    }
+  }};
+  auto const cfg = config_fixture("operator_defaults_scan_only.yaml");
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto execute = [&](char const* sql) {
+    auto result = con.Query(sql);
+    REQUIRE(result != nullptr);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto require_budget = [&](uint64_t expected) {
+    auto result =
+      con.Query("SELECT current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected);
+    CHECK(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
+          expected);
+  };
+  constexpr uint64_t startup_budget = 32ULL << 20;
+  require_budget(startup_budget);
+  execute("SET scan_task_batch_size = 99");
+  require_budget(startup_budget);
+  execute("SET max_dynamic_filter_bloom_bytes_per_gpu = 123");
+  require_budget(123);
+  execute("RESET max_dynamic_filter_bloom_bytes_per_gpu");
+  require_budget(startup_budget);
+  CHECK(duckdb::session_operator_params(*con.context).scan_task_batch_size == 99);
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",

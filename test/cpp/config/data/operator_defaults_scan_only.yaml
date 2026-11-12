@@ -1,0 +1,10 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 256MiB
+    host:
+      capacity_bytes: 512MiB
+  operator_params:
+    scan_task_batch_size: 8MiB

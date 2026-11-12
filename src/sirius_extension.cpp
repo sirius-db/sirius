@@ -3655,7 +3655,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     option_visibility::internal,
     "max_dynamic_filter_bloom_bytes_per_gpu",
     "Aggregate aligned Bloom-array budget in bytes per GPU for multi-partition accumulation; "
-    "must be greater than zero",
+    "defaults to 4x startup scan_task_batch_size; must be greater than zero",
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
     SetMaxDynamicFilterBloomBytesPerGpu);

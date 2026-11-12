@@ -63,6 +63,7 @@ TEST_CASE("operator parameters start with hardware-independent defaults", "[conf
   CHECK(params.sort_sample_bytes == config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_build_hash_table_bytes == 8 * config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_build_probe_resident_bytes == 8 * config::DEFAULT_BATCH_SIZE);
+  CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu == 4 * params.scan_task_batch_size);
 }
 
 TEST_CASE("yaml reader basic types", "[config_opt][basic]")
@@ -854,7 +855,8 @@ TEST_CASE("multi-partition dynamic-filter settings preserve defaults and parse b
 
   sirius_config cfg;
   CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
-  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+        4 * cfg.get_operator_params().scan_task_batch_size);
   cfg.load_from_file(path);
   CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == expected_bytes);
@@ -862,7 +864,8 @@ TEST_CASE("multi-partition dynamic-filter settings preserve defaults and parse b
   CHECK(cfg.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.9));
   cfg.apply_defaults();
   CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
-  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+        4 * cfg.get_operator_params().scan_task_batch_size);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

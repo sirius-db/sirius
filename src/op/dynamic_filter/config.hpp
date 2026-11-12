@@ -21,9 +21,13 @@
 namespace sirius::op {
 
 /**
- * @brief Default per-GPU cap on one join's accumulated Bloom arrays
- * (`max_dynamic_filter_bloom_bytes_per_gpu`).
+ * @brief Fallback per-GPU cap on one join's accumulated Bloom arrays.
+ *
+ * Four times the hardware-independent 800 MiB scan batch fallback. Startup
+ * resolution replaces this with 4x the resolved scan_task_batch_size unless
+ * max_dynamic_filter_bloom_bytes_per_gpu is explicitly configured.
  */
-inline constexpr std::uint64_t default_max_dynamic_filter_bloom_bytes_per_gpu = 256ULL << 20;
+inline constexpr std::uint64_t default_max_dynamic_filter_bloom_bytes_per_gpu =
+  4ULL * (800ULL << 20);
 
 }  // namespace sirius::op

@@ -25,6 +25,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <type_traits>
 
 namespace {
@@ -178,6 +179,8 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
     CHECK(gpu.memory_capacity == capacity);
     CHECK(gpu.reservation_limit_fraction == 0.7);
     CHECK(config.get_operator_params().scan_task_batch_size == capacity / 40);
+    CHECK(config.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+          4 * (capacity / 40));
     CHECK(config.get_operator_params().hash_partition_bytes == (32ULL << 20));
   }
   SECTION("oversized byte limits fail resolution with source context")
@@ -207,4 +210,32 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
       CHECK(gpu_space(config).memory_capacity == static_cast<std::size_t>(total * fraction));
     }
   }
+}
+
+TEST_CASE("dynamic-filter Bloom budget follows resolved scan size unless explicitly configured",
+          "[context_config][config][dynamic_filter]")
+{
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  auto root            = YAML::Load("sirius: {topology: {num_gpus: 1}}");
+  auto params          = root["sirius"]["operator_params"];
+  auto const max_bytes = std::numeric_limits<std::uint64_t>::max();
+  for (auto const scan_bytes : {std::uint64_t{1}, std::uint64_t{8} << 20, max_bytes}) {
+    CAPTURE(scan_bytes);
+    params["scan_task_batch_size"] = scan_bytes;
+    auto const parsed              = sirius::parsed_sirius_config::from_node(root);
+    auto const resolved            = parsed.resolve(discovery.get_topology());
+    auto const expected            = scan_bytes > max_bytes / 4 ? max_bytes : 4 * scan_bytes;
+    CHECK(resolved.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == expected);
+
+    // Resolution is repeatable and does not mutate the parsed settings.
+    CHECK(parsed.resolve(discovery.get_topology())
+            .get_operator_params()
+            .max_dynamic_filter_bloom_bytes_per_gpu == expected);
+  }
+  params["max_dynamic_filter_bloom_bytes_per_gpu"] = "17MiB";
+  auto const resolved =
+    sirius::parsed_sirius_config::from_node(root).resolve(discovery.get_topology());
+  CHECK(resolved.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == (17ULL << 20));
 }

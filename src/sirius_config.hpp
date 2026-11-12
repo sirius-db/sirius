@@ -152,7 +152,7 @@ constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
-  /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
+  /// Construct defaults with a shared batch size, 8x BUILD_PROBE budgets, and a 4x Bloom budget.
   static operator_params with_batch_size(uint64_t batch_size);
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
@@ -229,6 +229,8 @@ struct operator_params {
   bool enable_dynamic_filter_multi_partition = true;
 
   /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
+  /// Defaults to 4x startup-resolved scan_task_batch_size, including a YAML scan-size override.
+  /// Explicit YAML/SET budgets win; later scan-size SETs do not re-derive the budget.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
 
