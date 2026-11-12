@@ -46,9 +46,12 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace simpatico {
@@ -526,17 +529,28 @@ __global__ void __launch_bounds__(kSmallDictThreads)
 }
 
 // Blocks that fit on the device at once; the small-dictionary kernels loop over tiles from there.
+// Cached per device, kernel and shared-memory size, which take few distinct values.
 template <typename Kernel>
 int64_t resident_blocks(Kernel kernel, std::size_t dynamic_smem)
 {
-  int device = 0, sms = 0, per_sm = 0;
+  int device = 0;
   throw_if_cuda_error(cudaGetDevice(&device), "dictionary decode: current device");
+  auto const key = std::tuple{device, reinterpret_cast<void const*>(kernel), dynamic_smem};
+  static std::mutex mu;
+  static std::map<std::tuple<int, void const*, std::size_t>, int64_t> cache;
+  {
+    std::lock_guard lock{mu};
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+  }
+  int sms = 0, per_sm = 0;
   throw_if_cuda_error(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device),
                       "dictionary decode: SM count");
   throw_if_cuda_error(
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kSmallDictThreads, dynamic_smem),
     "dictionary decode: occupancy");
-  return int64_t{sms} * std::max(per_sm, 1);
+  auto const blocks = int64_t{sms} * std::max(per_sm, 1);
+  std::lock_guard lock{mu};
+  return cache.emplace(key, blocks).first->second;
 }
 
 // Null-free decode of a small variable-width dictionary: per-tile byte counts and their scan give
