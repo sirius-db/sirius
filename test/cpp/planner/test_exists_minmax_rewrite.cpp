@@ -123,6 +123,9 @@ struct exists_rewrite_fixture {
     db  = sirius::test::open_sirius_db(db_dir.file("exists_rewrite.db").c_str(), cfg);
     con = std::make_unique<Connection>(*db);
     set_flag(true);
+    // The delim-join shapes are the baseline here; the tests of the plain-join shapes turn
+    // `delim_join_as_cte` on themselves.
+    REQUIRE_FALSE(con->Query("SET delim_join_as_cte = false")->HasError());
 
     con->Query("CREATE TABLE dim (id BIGINT, tag INTEGER)");
     con->Query("INSERT INTO dim SELECT range, range % 5 FROM range(1, 30)");
