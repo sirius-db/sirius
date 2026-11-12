@@ -255,10 +255,18 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
     CHECK(sample_op.runs_without_input());
     CHECK(sample_op.get_next_task_input_data() == nullptr);
 
+    // The boundary task is claimed: the hook can no longer change.
+    CHECK_THROWS_AS(sample_op.set_cross_rank_boundaries(std::make_shared<recording_boundaries>()),
+                    std::logic_error);
+    CHECK_THROWS_AS(sample_op.set_cross_rank_boundaries(nullptr), std::logic_error);
+    CHECK(sample_op.cross_rank_boundaries() == hook.get());
+
     (void)sample_op.execute(*input, cudf::get_default_stream());
     CHECK(sample_op.boundaries_computed());
     CHECK(sample_op.get_num_partitions() == 1);
     CHECK_FALSE(sample_op.runs_without_input());
+    CHECK_THROWS_AS(sample_op.set_cross_rank_boundaries(nullptr), std::logic_error);
+    CHECK(sample_op.cross_rank_boundaries() == hook.get());
     REQUIRE(hook->key_columns.size() == 1);
     CHECK(hook->key_columns[0] == 0);
     CHECK(hook->num_parts[0] == 1);

@@ -39,13 +39,15 @@ sample_all_gather_boundaries::sample_all_gather_boundaries(
   cucascade::memory::memory_space& gpu,
   std::vector<cudf::order> column_order,
   std::vector<cudf::null_order> null_precedence,
-  std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries)
+  std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries,
+  std::chrono::milliseconds timeout)
   : _service(std::move(service)),
     _stream(stream),
     _gpu(&gpu),
     _column_order(std::move(column_order)),
     _null_precedence(std::move(null_precedence)),
-    _set_exchange_boundaries(std::move(set_exchange_boundaries))
+    _set_exchange_boundaries(std::move(set_exchange_boundaries)),
+    _timeout(timeout)
 {
 }
 
@@ -101,7 +103,7 @@ sort_boundaries sample_all_gather_boundaries::make(request const& request,
     // 2. Every rank's summary, merged in rank order: the same global sample on every rank.
     // TODO(#2375): all_gather blocks this GPU worker thread until every rank's summary arrives.
     _gather_entered = true;
-    _gathered       = exchange::all_gather(*_service, _stream, summary, gpu, stream.get());
+    _gathered = exchange::all_gather(*_service, _stream, summary, gpu, stream.get(), _timeout);
   }
   auto const& gathered = *_gathered;
   std::vector<::cucascade::read_only_data_batch> parts;

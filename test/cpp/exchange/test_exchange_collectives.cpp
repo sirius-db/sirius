@@ -181,6 +181,7 @@ struct distributed_sampling {
   sirius::exchange::stream_id stream{0};
   cucascade::memory::memory_space* gpu{nullptr};
   std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries;
+  std::chrono::milliseconds timeout = sirius::op::sample_all_gather_boundaries::default_timeout;
 };
 
 /// A SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small enough that
@@ -214,7 +215,8 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample(
     *sampling.gpu,
     std::vector<cudf::order>{sirius::op::to_cudf_order(order)},
     std::vector<cudf::null_order>{sirius::op::to_cudf_null_order(order, nulls)},
-    std::move(sampling.set_exchange_boundaries)));
+    std::move(sampling.set_exchange_boundaries),
+    sampling.timeout));
   return sample;
 }
 
@@ -582,6 +584,48 @@ TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange
                     Catch::Matchers::ContainsSubstring("injected failure"));
   peer.join();
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+}
+
+TEST_CASE("an aborted query wakes a SORT_SAMPLE waiting on its peer's sample",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  auto const stream = sirius::exchange::make_stream_id(9, 1);
+  auto sample       = make_sample({c.all[0].service,
+                                   stream,
+                                   env().gpu,
+                                   [](std::shared_ptr<cudf::table const>) {},
+                                   std::chrono::minutes{2}});
+  // Rank 1 never samples: its query fails instead, as a cancelled or failed statement's does.
+  std::thread peer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    c.all[1].service->abort(sirius::exchange::query_of(stream), "injected failure");
+  });
+  std::vector<std::shared_ptr<cucascade::data_batch>> const input{keys_batch(0, 1, 20'000)};
+  pipelineable_operator_data data{input};
+  auto const start = std::chrono::steady_clock::now();
+  CHECK_THROWS_WITH(sample->execute(data, utils::default_stream()),
+                    Catch::Matchers::ContainsSubstring("injected failure"));
+  peer.join();
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+  CHECK_FALSE(sample->boundaries_computed());
+}
+
+TEST_CASE("a SORT_SAMPLE gives up on a rank that sends no sample within its wait time",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  auto sample = make_sample({c.all[0].service,
+                             sirius::exchange::make_stream_id(10, 1),
+                             env().gpu,
+                             [](std::shared_ptr<cudf::table const>) {},
+                             std::chrono::milliseconds{200}});
+  std::vector<std::shared_ptr<cucascade::data_batch>> const input{keys_batch(0, 1, 20'000)};
+  pipelineable_operator_data data{input};
+  auto const start = std::chrono::steady_clock::now();
+  CHECK_THROWS_AS(sample->execute(data, utils::default_stream()), sirius::internal_exception);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+  CHECK_FALSE(sample->boundaries_computed());
 }
 
 TEST_CASE("an all-gather that times out leaves its stream free to attach again",
