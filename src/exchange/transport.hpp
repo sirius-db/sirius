@@ -117,8 +117,9 @@ class transport {
     /// still goes once nothing else is queued. Bounds how long senders' batches stay pinned in
     /// the queue (they are already in GPU memory, under their producers' reservations).
     std::size_t max_queued_bytes = std::size_t{1} << 30;
-    /// How long the engine may hold work without progress before it fails: a lost peer is
-    /// fail-stop (#2373), so this bounds how long one hangs a query.
+    /// How long the engine may hold work, or wait for batches a peer's end promised, without
+    /// progress before it fails: a lost peer is fail-stop (#2373), so this bounds how long one
+    /// hangs a query.
     std::chrono::milliseconds stall_timeout{std::chrono::minutes{10}};
     /// Called on the engine thread, once per batch, when a batch of this many bytes finds no room
     /// on either tier. Must not block. Unset: the batch waits for room to appear.

@@ -174,6 +174,8 @@ struct transport::engine {
     std::optional<std::uint64_t> expected;
   };
   std::map<std::pair<rank_t, stream_id>, stream_end> ends;
+  /// Ends in `ends` that promised more batches than were delivered so far: work a peer owes.
+  std::size_t owed_ends{0};
   std::vector<bool> recv_in_use;
   std::vector<std::vector<std::uint32_t>> credits_back;
 
@@ -234,7 +236,8 @@ struct transport::engine {
     for (auto const& p : out) {
       if (p.current) { return true; }
     }
-    return false;
+    // A peer that ended a stream sends its batches before the end, so they are in flight or lost.
+    return owed_ends > 0;
   }
 
   // ---- receiving -----------------------------------------------------------------------------
@@ -356,7 +359,9 @@ struct transport::engine {
       } catch (...) {
         fail_query(stream, std::current_exception());
       }
-      ++ends[{from, stream}].delivered;
+      auto& end = ends[{from, stream}];
+      ++end.delivered;
+      if (end.expected && end.delivered == *end.expected) { --owed_ends; }
       check_end(from, stream);
     }
     for (rank_t peer = 0; peer < credits_back.size(); ++peer) {
@@ -467,7 +472,16 @@ struct transport::engine {
         throw sirius::invalid_input_exception(
           "exchange: rank {} ended stream {} twice", from, e->stream);
       }
+      if (end.delivered > e->batches) {
+        throw sirius::invalid_input_exception(
+          "exchange: rank {} ended stream {} after {} batches, having sent {}",
+          from,
+          e->stream,
+          e->batches,
+          end.delivered);
+      }
       end.expected = e->batches;
+      if (end.delivered < e->batches) { ++owed_ends; }
       check_end(from, e->stream);
     } else if (auto* a = std::get_if<abort_message>(&m)) {
       cb.on_abort(a->query, from, std::move(a->what));
