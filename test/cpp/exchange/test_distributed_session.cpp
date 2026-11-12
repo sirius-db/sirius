@@ -20,6 +20,7 @@
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "sirius/exception.hpp"
+#include "sirius_config.hpp"
 
 #include <catch.hpp>
 
@@ -172,4 +173,48 @@ TEST_CASE("a window that fails to begin aborts its query on every rank and retir
   auto const aborted = std::make_shared<recording>();
   c.services[0]->attach(sirius::exchange::make_stream_id(12, 2), aborted);
   CHECK(aborted->failed);
+}
+
+TEST_CASE(
+  "a distributed session's settings come from the operator params and cannot change once "
+  "connected",
+  "[exchange][distributed_session]")
+{
+  sirius::operator_params params;
+  params.exchange_peers        = {"a:1", "b:2"};
+  params.exchange_rank         = 1;
+  params.exchange_host_staging = sirius::exchange::host_staging::always;
+  auto const wanted            = distributed_session::settings::from(params);
+  CHECK(wanted.peers == params.exchange_peers);
+  CHECK(wanted.rank == 1);
+  CHECK(wanted.host_staging == sirius::exchange::host_staging::always);
+
+  two_ranks c;
+  distributed_session session;
+  int connects       = 0;
+  auto const connect = [&] {
+    ++connects;
+    return c.services[1];
+  };
+  CHECK(session.service(wanted, connect) == c.services[1]);
+  CHECK(session.service(distributed_session::settings::from(params), connect) == c.services[1]);
+  CHECK(connects == 1);
+
+  auto const changed = [&](auto change) {
+    auto other = params;
+    change(other);
+    return distributed_session::settings::from(other);
+  };
+  for (auto const& other : {changed([](auto& p) { p.exchange_peers.push_back("c:3"); }),
+                            changed([](auto& p) { p.exchange_rank = 0; }),
+                            changed([](auto& p) {
+                              p.exchange_host_staging = sirius::exchange::host_staging::never;
+                            })}) {
+    CHECK_THROWS_MATCHES(session.service(other, connect),
+                         sirius::invalid_input_exception,
+                         Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring(
+                           "the exchange settings cannot change once connected")));
+  }
+  CHECK(connects == 1);
+  CHECK(session.service() == c.services[1]);
 }
