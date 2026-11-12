@@ -255,6 +255,17 @@ class Parquet:
 
 
 @dataclass
+class Large:
+    fraction: float = 0.0
+    fact_tables: list[int] = field(default_factory=lambda: [1, 2])
+    fact_rows: list[int] = field(default_factory=lambda: [200000, 1000000])
+    dims: list[int] = field(default_factory=lambda: [2, 4])
+    null_fk_ratio: float = 0.03
+    dangling_fk_ratio: float = 0.03
+    skew: float = 0.35
+
+
+@dataclass
 class Data:
     tables: list[int] = field(default_factory=lambda: [3, 6])
     rows: list[int] = field(default_factory=lambda: [50, 2000])
@@ -264,6 +275,7 @@ class Data:
     edge_values: EdgeValues = field(default_factory=EdgeValues)
     pin: Pin = field(default_factory=Pin)
     parquet: Parquet = field(default_factory=Parquet)
+    large: Large = field(default_factory=Large)
 
 
 @dataclass
@@ -335,6 +347,21 @@ class FuzzConfig:
 
     def validate(self) -> None:
         f = self.features
+        large = self.data.large
+        for name in ("fraction", "null_fk_ratio", "dangling_fk_ratio", "skew"):
+            value = getattr(large, name)
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ConfigError(f"data.large.{name} must be between 0 and 1")
+        if large.null_fk_ratio + large.dangling_fk_ratio >= 1:
+            raise ConfigError(
+                "data.large null and dangling FK ratios must sum to less than 1"
+            )
+        for name in ("fact_tables", "fact_rows", "dims"):
+            bounds = getattr(large, name)
+            if len(bounds) != 2 or bounds[0] < 1 or bounds[1] < bounds[0]:
+                raise ConfigError(
+                    f"data.large.{name} must be a positive [min, max] pair"
+                )
         if (
             not math.isfinite(self.oracle.query_timeout_seconds)
             or self.oracle.query_timeout_seconds <= 0

@@ -92,6 +92,7 @@ EXTRACT_TS = EXTRACT_DATE + ["hour", "minute", "second", "millisecond", "microse
 class ScopeTable:
     alias: str
     columns: list[ColumnRef]
+    table_name: str | None = None
 
 
 @dataclass
@@ -274,6 +275,19 @@ class QueryGenerator:
             sel.where = (
                 predicates[0] if len(predicates) == 1 else Logical("AND", predicates)
             )
+        if self.ds.has_facts and mode == "full":
+            dims = [
+                t for t in scope.tables if t.table_name and t.table_name.startswith("t")
+            ]
+            if dims and self.rng.random() < 0.45:
+                dim = self.rng.choice(dims)
+                key = next(c for c in dim.columns if c.name == "k")
+                selective = Compare(
+                    "<", key, Literal(self.rng.choice([5, 10, 25]), st.INTEGER)
+                )
+                sel.where = (
+                    Logical("AND", [sel.where, selective]) if sel.where else selective
+                )
 
         if mode == "exists":
             sel.items = [SelectItem(Literal(1, st.INTEGER), "c0")]
@@ -466,16 +480,26 @@ class QueryGenerator:
         else:
             n = self._pick({"1": 0.4, "2": 0.35, "3": 0.15, "4": 0.1})
             n = min(int(n), max_tables)
-        first, first_scope = self._gen_from_item(depth, ctes, force_cte)
+        first, first_scope = self._gen_from_item(
+            depth, ctes, force_cte, allow_fact=outer is None
+        )
         tree: Join | TableRef | Derived = first
         scope = Scope([first_scope], outer=outer)
         for _ in range(n - 1):
-            right, right_scope = self._gen_from_item(depth, ctes, None)
+            right, right_scope = self._gen_from_item(
+                depth, ctes, None, allow_fact=outer is None
+            )
             jt = rng.choice(self.join_types) if self.join_types else "inner"
             # Cross products and inequality-only (nested-loop) joins multiply row counts;
             # confine them to two-table FROM clauses so results stay bounded.
             if jt == "cross" and n != 2:
                 jt = "inner"
+            if jt == "cross" and (right_scope.table_name or "").startswith("f"):
+                continue
+            if jt == "cross" and any(
+                (t.table_name or "").startswith("f") for t in scope.tables
+            ):
+                continue
             cond = (
                 None
                 if jt == "cross"
@@ -490,7 +514,11 @@ class QueryGenerator:
         return tree, scope
 
     def _gen_from_item(
-        self, depth: int, ctes: dict[str, list[ColumnRef]], force_cte: str | None
+        self,
+        depth: int,
+        ctes: dict[str, list[ColumnRef]],
+        force_cte: str | None,
+        allow_fact: bool = True,
     ) -> tuple[TableRef | Derived, ScopeTable]:
         rng = self.rng
         alias = self._alias()
@@ -506,9 +534,14 @@ class QueryGenerator:
             if cols:
                 self._note("derived_table")
                 return Derived(sub, alias), ScopeTable(alias, cols)
-        table = rng.choice(self.ds.tables)
+        candidates = (
+            self.ds.tables
+            if allow_fact
+            else [t for t in self.ds.tables if not t.name.startswith("f")]
+        )
+        table = rng.choice(candidates)
         cols = [ColumnRef(alias, c.name, c.type) for c in table.columns]
-        return TableRef(table.name, alias), ScopeTable(alias, cols)
+        return TableRef(table.name, alias), ScopeTable(alias, cols, table.name)
 
     def _output_columns(self, sel: Select, alias: str) -> list[ColumnRef]:
         cols = []
@@ -533,6 +566,42 @@ class QueryGenerator:
         ]
         if not pairs:
             return None
+        if self.ds.has_facts:
+            names = {table.alias: table.table_name for table in scope.tables + [right]}
+            fact_pairs = []
+            for left, right_col in pairs:
+                left_name, right_name = names.get(left.alias), names.get(
+                    right_col.alias
+                )
+                if not left_name or not right_name:
+                    continue
+                if (
+                    left_name.startswith("f")
+                    and right_name.startswith("t")
+                    and left.name == f"fk_{right_name}"
+                    and right_col.name == "k"
+                ):
+                    fact_pairs.append((left, right_col))
+                elif (
+                    right_name.startswith("f")
+                    and left_name.startswith("t")
+                    and right_col.name == f"fk_{left_name}"
+                    and left.name == "k"
+                ):
+                    fact_pairs.append((left, right_col))
+                elif (
+                    left_name.startswith("f")
+                    and right_name.startswith("f")
+                    and left.name == right_col.name == "k"
+                ):
+                    fact_pairs.append((left, right_col))
+            if fact_pairs:
+                left, right_col = rng.choice(fact_pairs)
+                return Compare("=", left, right_col)
+            if (right.table_name or "").startswith("f") or any(
+                (t.table_name or "").startswith("f") for t in scope.tables
+            ):
+                return None
         key_pairs = [(l, r) for l, r in pairs if l.name == "k" and r.name == "k"]
         l, r = (
             rng.choice(key_pairs)

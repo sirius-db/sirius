@@ -37,7 +37,10 @@ from .classify import Verdict, classify_gpu_error, narrows_gap, normalize_reason
 from .artifacts import runtime_info, write_json
 from .compare import ResultSet, Tolerances, compare_mode, compare_results
 from .config import FuzzConfig
-from .dataset_variants import choose as choose_dataset_variants, comment as variant_comment
+from .dataset_variants import (
+    choose as choose_dataset_variants,
+    comment as variant_comment,
+)
 from .query_gen import QueryGenerator
 from .reduce import reduce_query
 from .report import QueryRecord, Report, signature
@@ -563,6 +566,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                 + variant_comment(dataset_variants)
                 + f"{ds.schema_sql()}\n{ds.data_sql()}\nCHECKPOINT;\n"
             )
+            load_start = time.monotonic()
             try:
                 session.load_dataset(ds, alias, variants=dataset_variants)
             except Exception as e:  # noqa: BLE001
@@ -570,11 +574,15 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                 send({"type": "done", "reason": f"dataset load failed: {e}"})
                 return
             evaluator.set_dataset(ds, alias)
+            load_seconds = time.monotonic() - load_start
+            log(
+                f"dataset loaded: {stem} rows={sum(t.row_count for t in ds.tables)} load_seconds={load_seconds:.3f}"
+            )
             send(
                 {
                     "type": "dataset",
                     "stem": stem,
-                    "rows": sum(len(t.rows) for t in ds.tables),
+                    "rows": sum(t.row_count for t in ds.tables),
                 }
             )
             if dataset_idx == 0 and session.gpu_available:

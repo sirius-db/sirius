@@ -124,6 +124,15 @@ compression = [false, true]
 tables_fraction = 0.0
 row_group_size = 256
 
+[data.large]
+fraction = 0.0
+fact_tables = [1, 2]
+fact_rows = [200000, 1000000]
+dims = [2, 4]
+null_fk_ratio = 0.03
+dangling_fk_ratio = 0.03
+skew = 0.35
+
 [oracle]
 float32_rel_tol = 1e-4
 float64_rel_tol = 1e-9

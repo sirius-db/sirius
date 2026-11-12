@@ -39,12 +39,22 @@ class Table:
     name: str
     columns: list[Column]
     rows: list[tuple[Any, ...]] = field(default_factory=list)
+    insert_select: str | None = None
+    generated_rows: int | None = None
+
+    @property
+    def row_count(self) -> int:
+        return (
+            self.generated_rows if self.generated_rows is not None else len(self.rows)
+        )
 
     def create_sql(self) -> str:
         cols = ", ".join(c.ddl() for c in self.columns)
         return f'CREATE TABLE "{self.name}" ({cols});'
 
     def insert_sql(self, order: list[int] | None = None, batch: int = 500) -> list[str]:
+        if self.insert_select is not None:
+            return [self.insert_select]
         idx = order if order is not None else list(range(len(self.rows)))
         stmts: list[str] = []
         for start in range(0, len(idx), batch):
@@ -67,6 +77,10 @@ class Dataset:
     tables: list[Table]
     seed: int
 
+    @property
+    def has_facts(self) -> bool:
+        return any(t.name.startswith("f") for t in self.tables)
+
     def schema_sql(self) -> str:
         return "\n".join(t.create_sql() for t in self.tables)
 
@@ -75,6 +89,16 @@ class Dataset:
         out: list[str] = []
         rng = random.Random(permutation_seed) if permutation_seed is not None else None
         for t in self.tables:
+            if t.insert_select is not None:
+                if permutation_seed is None:
+                    out.append(t.insert_select)
+                else:
+                    # The source rows stay identical; only their insertion order changes.
+                    order = (
+                        f" ORDER BY ((i * 17 + {permutation_seed % 1000003}) % 1000003)"
+                    )
+                    out.append(t.insert_select.replace(" r(i);", " r(i)" + order + ";"))
+                continue
             order = list(range(len(t.rows)))
             if rng is not None:
                 rng.shuffle(order)
@@ -180,7 +204,11 @@ class DataGenerator:
         the value pools it builds stay for the queries generated over it."""
         self.rng = rng = random.Random(seed)
         self._build_pools()
-        lo, hi = self.cfg.data.tables
+        large = (
+            self.cfg.data.large.fraction > 0
+            and rng.random() < self.cfg.data.large.fraction
+        )
+        lo, hi = self.cfg.data.large.dims if large else self.cfg.data.tables
         n_tables = rng.randint(lo, hi)
         tables: list[Table] = []
         for ti in range(n_tables):
@@ -201,8 +229,64 @@ class DataGenerator:
             n_rows = rng.randint(rows_lo, rows_hi)
             table = Table(f"t{ti}", cols)
             table.rows = [tuple(self.value(c) for c in cols) for _ in range(n_rows)]
+            if large:
+                table.rows = [(i, *row[1:]) for i, row in enumerate(table.rows)]
             tables.append(table)
+        if large:
+            fact_lo, fact_hi = self.cfg.data.large.fact_tables
+            dims = list(tables)
+            for fi in range(rng.randint(fact_lo, fact_hi)):
+                tables.append(self._fact_table(fi, dims))
         return Dataset(tables, seed)
+
+    def _fact_table(self, index: int, dims: list[Table]) -> Table:
+        rng = self.rng
+        columns = [Column("k", st.BIGINT)]
+        columns += [Column(f"fk_{dim.name}", st.INTEGER) for dim in dims]
+        payload_count = rng.randint(3, 6)
+        forced = [
+            st.VARCHAR,
+            rng.choice([t for t in self.types if t.is_numeric] or [st.INTEGER]),
+        ]
+        for ci in range(payload_count):
+            typ = forced[ci] if ci < len(forced) else rng.choice(self.types)
+            columns.append(Column(f"c{ci}_{_abbrev(typ)}", typ))
+        count = rng.randint(*self.cfg.data.large.fact_rows)
+        select = ["i"]
+        large = self.cfg.data.large
+        null_cut = round(1000 * large.null_fk_ratio)
+        dangling_cut = null_cut + round(1000 * large.dangling_fk_ratio)
+        skew_cut = round(1000 * large.skew)
+        for dim in dims:
+            salt = rng.randrange(1, 100000)
+            odd = rng.randrange(1, 1000) * 2 + 1
+            n = len(dim.rows)
+            valid = f"CASE WHEN ((i * {odd} + {salt}) % 1000) < {skew_cut} THEN ((i * 13 + {salt}) % {min(n, 10)}) ELSE ((i * {odd} + {salt}) % {n}) END"
+            selector = f"((i * 31 + {salt}) % 1000)"
+            select.append(
+                f"CASE WHEN {selector} < {null_cut} THEN NULL "
+                f"WHEN {selector} < {dangling_cut} THEN {n} + ((i + {salt}) % 97) "
+                f"ELSE {valid} END"
+            )
+        for col in columns[1 + len(dims) :]:
+            pool = [self._fit(value, col.type) for value in self.pool(col.type.kind)]
+            odd = rng.randrange(1, 1000) * 2 + 1
+            salt = rng.randrange(1, 100000)
+            arms = " ".join(
+                f"WHEN {j} THEN {st.render_insert_value(value, col.type)}"
+                for j, value in enumerate(pool)
+            )
+            select.append(
+                f"CAST(CASE ((i * {odd} + {salt}) % {len(pool)}) {arms} END AS {col.type.name})"
+            )
+        statement = (
+            f'INSERT INTO "f{index}" SELECT '
+            + ", ".join(select)
+            + f" FROM range({count}) r(i);"
+        )
+        return Table(
+            f"f{index}", columns, insert_select=statement, generated_rows=count
+        )
 
     def _assign_nulls(self, col: Column) -> None:
         nulls = self.cfg.nulls

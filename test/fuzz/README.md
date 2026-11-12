@@ -186,6 +186,34 @@ dataset. CPU-only replay omits the Sirius pin calls.
 
 ---
 
+### Large dimension/fact datasets
+
+`data.large.fraction` selects the large tier per dataset. It defaults to `0.0`,
+so existing campaigns keep the small tables. Set it to `1.0` to use only the
+large tier or `0.3` for a mixed campaign. The large tier has `data.large.dims`
+dimension tables (`t0`, ...), each with a dense unique `k`, and
+`data.large.fact_tables` fact tables (`f0`, ...). Each fact has a unique `k`,
+one `fk_tN` per dimension, and typed payload columns. `data.large.fact_rows`
+sets the row-count range. The SQL-generated facts use seeded arithmetic and
+pool values, so saved `dataset.sql` files replay without materializing Python
+tuples. `Dataset.data_sql(permutation_seed)` inserts the same fact rows in a
+different order for ambiguity checks.
+
+`data.large.null_fk_ratio`, `dangling_fk_ratio`, and `skew` control foreign-key
+NULLs, keys absent from their dimension, and concentration on hot dimension
+keys. Large-tier joins use the `fk_tN = tN.k` relationship. The fuzzer skips
+fact cross joins and inequality-only fact joins because they make the CPU
+reference unbounded.
+
+For a bounded run on the GB300, use `--set data.large.fraction=1.0` with one of
+`large-default.yaml`, `large-8m.yaml`, `large-lowmem.yaml`, or
+`large-lowmem-disk.yaml` through `--sirius-config`. The `large-8m` profile also
+needs `--set 'variants.settings.hash_partition_bytes=[8388608]'` and
+`--set 'variants.settings.max_sort_partition_bytes=[8388608]'` so randomized
+per-query settings do not override the YAML. Use
+`--set data.parquet.row_group_size=20000` with the Parquet variant to create
+multiple row groups on large fact tables.
+
 ## Finding unsupported features
 
 `fuzz run --mode gaps` finds the queries Sirius accepts at plan time and then hands to the CPU at
