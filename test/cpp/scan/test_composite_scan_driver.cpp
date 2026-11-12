@@ -162,7 +162,8 @@ struct test_child : gpu_ingestible {
     ::cuda::stream_ref,
     bool,
     std::shared_ptr<sirius::like_multiliteral_cache const>,
-    sirius::expression_query_policy) override
+    sirius::expression_query_policy,
+    scan_execution_context) override
   {
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));

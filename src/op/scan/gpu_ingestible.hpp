@@ -125,7 +125,8 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     ::cuda::stream_ref stream,
     bool like_swar_fastpath                                           = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
-    expression_query_policy policy                                    = {});
+    expression_query_policy policy                                    = {},
+    split_validation const* validation                                = nullptr);
 
   virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
 
@@ -234,7 +235,12 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     ::cuda::stream_ref stream,
     bool like_swar_fastpath                                           = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
-    expression_query_policy policy                                    = {}) = 0;
+    expression_query_policy policy                                    = {},
+    scan_execution_context execution                                  = {}) = 0;
+
+  // Record resident/decompression results before the shared consumer sees them.
+  // Implementations may attach authoritative execution facts when qualified.
+  virtual void record_resident_execution(filtered_table&) const {}
 
   /**
    * @brief Whether `view_layout` can describe any resident batch of this scan

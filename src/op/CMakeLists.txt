@@ -42,6 +42,9 @@ target_sources(
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_scan_core.cpp
           scan/materialization_contract.cpp
+          scan/shared_materializer.cpp
+          scan/row_lineage.cpp
+          scan/row_lineage.cu
           scan/positional_visibility.cpp
           scan/positional_visibility.cu
           scan/field_id_mapping.cpp
@@ -51,6 +54,7 @@ target_sources(
           scan/table_scan/owned_arrow_scan.cpp
           scan/table_scan/split_validation.cpp
           scan/table_scan/bound_read_view.cpp
+          scan/table_scan/field_mapper.cpp
           scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
           scan/parquet_delete_reader.cpp

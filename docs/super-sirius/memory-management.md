@@ -85,6 +85,14 @@ decode retains interval deletion; filters published later cannot enable position
 User-requested virtual columns retain their own workspace. Pipeline memory history and retry
 floors still apply independently; this removes the position estimate, not other measured peaks.
 
+Canonical lineage is opt-in: identity and interval selections use host metadata;
+a device selection retains an INT64 ordinal column (8 B/row), with additional
+copy/sort scratch during validation. `lineage_conversion_workspace_bytes()` and
+`shared_materialization_workspace_bytes()` estimate extra working space; they do
+not reserve memory and currently have no production callers. An adapter using them
+must account for its complete working set according to the API contract. Default
+Parquet/Iceberg scans do not reserve canonical-lineage scratch.
+
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 
 ## Memory Reservations
