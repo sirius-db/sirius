@@ -382,6 +382,8 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
   std::size_t input_size   = 0;
   auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
+  // Inputs left in place by the operator's port_residency_policy are never converted or cloned.
+  if (pipelineable_input && !pipelineable_input->materializes_on_gpu()) { return 0; }
   if (pipelineable_input) {
     for (const auto& ro : pipelineable_input->get_read_only_batches()) {
       if (!ro.get_data()) { continue; }
