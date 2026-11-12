@@ -54,6 +54,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_join_utils.hpp"
 #include "sirius_context.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -540,6 +541,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   auto condition_domains =
     build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
                    : std::vector<std::size_t>{};
+  // The coverage gate needs a domain that bounds rows. A filter's keep-ratio estimate needs only a
+  // bound on the values, which survive any join, and can use a Parquet scan's footer row count.
+  auto condition_value_domains =
+    build_evidence ? build_key_domain_cardinalities(
+                       op,
+                       [&](duckdb::LogicalGet const& get) {
+                         auto const rows = transparent::parquet_scan_row_count(get);
+                         return rows ? rows : duckdb_base_table_cardinality{context}(get);
+                       },
+                       origin_policy::value_preserving)
+                   : std::vector<std::size_t>{};
 
   // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
   // context, prove_unique_columns considers declared PRIMARY KEYs alone.
@@ -649,8 +661,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         break;
       }
     }
-    auto admitted_keys = admit_dynamic_filter_keys(
-      conditions, condition_key_shapes, condition_domains, build_side_unique_column);
+    auto admitted_keys = admit_dynamic_filter_keys(conditions,
+                                                   condition_key_shapes,
+                                                   condition_domains,
+                                                   build_side_unique_column,
+                                                   condition_value_domains);
 
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;

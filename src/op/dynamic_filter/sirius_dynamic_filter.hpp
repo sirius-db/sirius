@@ -36,6 +36,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <unordered_map>
@@ -63,6 +64,11 @@ class sirius_dynamic_filter {
   void set_preserve_nulls(bool value) noexcept { _preserve_nulls = value; }
   [[nodiscard]] bool preserves_nulls() const noexcept { return _preserve_nulls; }
 
+  // Set only before publication: a static estimate of the share of probe rows the filter keeps.
+  void set_estimated_selectivity(double value) noexcept { _estimated_selectivity = value; }
+  [[nodiscard]] std::optional<double> estimated_selectivity() const noexcept
+  { return _estimated_selectivity; }
+
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
 
   [[nodiscard]] virtual bool is_available_on_device(int /*device_id*/) const noexcept
@@ -72,6 +78,7 @@ class sirius_dynamic_filter {
 
  private:
   bool _preserve_nulls = false;
+  std::optional<double> _estimated_selectivity;
 };
 
 /**

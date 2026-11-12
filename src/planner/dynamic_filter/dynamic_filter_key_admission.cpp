@@ -61,6 +61,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   op::dynamic_filter_condition_shape shape,
   std::size_t condition_index,
   std::size_t domain_cardinality,
+  std::size_t value_domain,
   std::optional<std::size_t> build_side_unique_column)
 {
   // Comparison semantics determine NULL handling independently of the producer join type.
@@ -95,6 +96,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
     .probe_storage_type           = probe_storage_type,
     .key_shape                    = shape,
     .build_key_domain_cardinality = domain_cardinality,
+    .build_key_value_domain       = value_domain,
     .build_key_proven_unique =
       build_side_unique_column == std::optional{static_cast<std::size_t>(build_key_ordinal)},
     .preserve_nulls = preserve_nulls};
@@ -134,7 +136,8 @@ std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
   std::vector<std::size_t> const& condition_domain_cardinalities,
-  std::optional<std::size_t> build_side_unique_column)
+  std::optional<std::size_t> build_side_unique_column,
+  std::vector<std::size_t> const& condition_value_domains)
 {
   if (condition_shapes.size() != conditions.size()) {
     throw std::invalid_argument(
@@ -148,16 +151,26 @@ std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_
       "with the join conditions");
   }
 
+  if (!condition_value_domains.empty() && condition_value_domains.size() != conditions.size()) {
+    throw std::invalid_argument(
+      "[dynamic_filter_key_admission] Value domains must be empty or aligned one-to-one with the "
+      "join conditions");
+  }
+
   std::vector<op::dynamic_filter_publish_plan::admitted_key> admitted_keys;
   for (std::size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
     auto const domain_cardinality = condition_index < condition_domain_cardinalities.size()
                                       ? condition_domain_cardinalities[condition_index]
                                       : 0;
+    auto const value_domain       = condition_index < condition_value_domains.size()
+                                      ? condition_value_domains[condition_index]
+                                      : 0;
     auto admitted                 = admit_scan_route_key(conditions[condition_index],
-                                         condition_shapes[condition_index],
-                                         condition_index,
-                                         domain_cardinality,
-                                         build_side_unique_column);
+                                                         condition_shapes[condition_index],
+                                                         condition_index,
+                                                         domain_cardinality,
+                                                         value_domain,
+                                                         build_side_unique_column);
     if (!admitted.has_value()) { continue; }
     admitted_keys.push_back(*std::move(admitted));
   }

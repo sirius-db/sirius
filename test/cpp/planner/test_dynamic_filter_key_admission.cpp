@@ -530,6 +530,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
                  probe_storage_type,
                  key_shape,
                  domain,
+                 value_domain,
                  unique,
                  preserve_nulls] = expected_key(3);
     (void)planner_condition_index;
@@ -539,6 +540,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     (void)probe_storage_type;
     (void)key_shape;
     (void)domain;
+    (void)value_domain;
     (void)unique;
     (void)preserve_nulls;
 
@@ -575,6 +577,10 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     auto vary_domain                         = base;
     vary_domain.build_key_domain_cardinality = 1000;
     REQUIRE_FALSE(base == vary_domain);
+
+    auto vary_value_domain                   = base;
+    vary_value_domain.build_key_value_domain = 1000;
+    REQUIRE_FALSE(base == vary_value_domain);
 
     auto vary_proven_unique                    = base;
     vary_proven_unique.build_key_proven_unique = true;

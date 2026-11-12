@@ -20,8 +20,13 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
+
+namespace duckdb {
+class LogicalGet;
+}  // namespace duckdb
 
 namespace sirius::transparent {
 
@@ -41,6 +46,11 @@ namespace sirius::transparent {
 /// \return The number of scans given statistics.
 std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
                                           duckdb::LogicalOperator& plan);
+
+/// \brief The number of rows in all files of \p get, a Parquet scan add_parquet_footer_statistics
+/// has covered (a one-file scan too), or nullopt. Exact and unfiltered: the sum of the footers' row
+/// counts. DuckDB's own cardinality for a multi-file scan extrapolates from one file.
+[[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get);
 
 /// \brief Read the footer statistics of \p paths into the cache add_parquet_footer_statistics uses,
 /// so the first query over them does not pay for reading every footer.

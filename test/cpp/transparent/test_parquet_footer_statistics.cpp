@@ -26,10 +26,12 @@
 #include "utils/gpu_execution_fixture.hpp"
 
 #include <catch.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace {
@@ -306,4 +308,38 @@ TEST_CASE_METHOD(ParquetFilesFixture,
     }
   }
   CHECK(merged_statistics_cache_size() <= merged_statistics_cache_capacity);
+}
+
+namespace {
+
+duckdb::LogicalGet const* first_get(duckdb::LogicalOperator const& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    return &op.Cast<duckdb::LogicalGet>();
+  }
+  for (auto const& child : op.children) {
+    if (auto const* found = first_get(*child)) { return found; }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - the footers' row count is the scan's key domain",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]")
+{
+  // Two files of 100 rows. A filter on the scan does not change the unfiltered domain.
+  auto const multi = con->ExtractPlan("SELECT count(*) FROM v WHERE x >= 150");
+  auto const* get  = first_get(*multi);
+  REQUIRE(get != nullptr);
+  CHECK(sirius::transparent::parquet_scan_row_count(*get) == std::optional<std::size_t>{200});
+
+  // A scan of one file gets no footer statistics, but its footer is read for the row count.
+  auto const single      = con->ExtractPlan("SELECT x FROM read_parquet('" +
+                                            (dir / "f0.parquet").string() + "') WHERE x >= 50");
+  auto const* single_get = first_get(*single);
+  REQUIRE(single_get != nullptr);
+  CHECK(sirius::transparent::parquet_scan_row_count(*single_get) ==
+        std::optional<std::size_t>{100});
 }

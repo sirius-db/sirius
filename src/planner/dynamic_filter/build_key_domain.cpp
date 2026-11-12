@@ -28,15 +28,15 @@ namespace sirius::planner {
 namespace detail {
 
 duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
-                                                    std::size_t output_ordinal) noexcept
+                                                    std::size_t output_ordinal,
+                                                    origin_policy policy) noexcept
 {
-  auto const origin =
-    resolve_scan_column_origin(subtree, output_ordinal, origin_policy::row_subset);
+  auto const origin = resolve_scan_column_origin(subtree, output_ordinal, policy);
   return origin ? origin->get : nullptr;
 }
 
 std::vector<duckdb::LogicalGet const*> resolve_build_key_scans(
-  duckdb::LogicalComparisonJoin const& join)
+  duckdb::LogicalComparisonJoin const& join, origin_policy policy)
 {
   std::vector<duckdb::LogicalGet const*> scans(join.conditions.size(), nullptr);
   if (join.children.size() != 2) { return scans; }
@@ -46,7 +46,7 @@ std::vector<duckdb::LogicalGet const*> resolve_build_key_scans(
     if (build_side.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const ordinal =
       static_cast<std::size_t>(build_side.Cast<duckdb::BoundReferenceExpression>().Index());
-    scans[condition_index] = resolve_pass_through_scan(*join.children[1], ordinal);
+    scans[condition_index] = resolve_pass_through_scan(*join.children[1], ordinal, policy);
   }
   return scans;
 }
