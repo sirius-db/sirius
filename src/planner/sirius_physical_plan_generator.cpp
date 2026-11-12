@@ -39,6 +39,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "expression/ast/utils.hpp"
@@ -99,6 +100,7 @@
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -179,6 +181,140 @@ struct floating_aggregate_key_shape {
   bool needs_cpu              = false;
 };
 
+floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOperator const& op);
+
+bool is_whole_partition(duckdb::BoundWindowExpression const& window)
+{
+  // Without ORDER BY all rows of a partition are peers, so CURRENT_ROW_RANGE ends the partition.
+  return window.OrderBy().empty() &&
+         window.WindowStart() == duckdb::WindowBoundary::UNBOUNDED_PRECEDING &&
+         (window.WindowEnd() == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING ||
+          window.WindowEnd() == duckdb::WindowBoundary::CURRENT_ROW_RANGE);
+}
+
+bool is_bound_ref(duckdb::Expression const& expression)
+{
+  return expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
+}
+
+duckdb::idx_t ref_index(duckdb::Expression const& expression)
+{
+  return expression.Cast<duckdb::BoundReferenceExpression>().Index();
+}
+
+/**
+ * @brief Whether rows of `op` that agree on the exact columns in `columns` also agree on every
+ *        floating SUM/AVG result among them.
+ *
+ * Holds when the columns include every GROUP BY column of the aggregate, or every PARTITION BY
+ * column of the whole-partition window, that produced those results, followed as plain column
+ * references through projections, filters and inner equality joins. A low-bit difference then
+ * cannot merge or split rows. Any other shape returns false.
+ */
+bool columns_determine_floating_results(std::set<duckdb::idx_t> columns,
+                                        duckdb::LogicalOperator const& op)
+{
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
+      std::set<duckdb::idx_t> below;
+      for (auto const column : columns) {
+        auto const& expression = *op.expressions[column];
+        if (!is_bound_ref(expression)) return false;
+        below.insert(ref_index(expression));
+      }
+      return columns_determine_floating_results(std::move(below), *op.children[0]);
+    }
+    case duckdb::LogicalOperatorType::LOGICAL_FILTER: {
+      auto const& filter = op.Cast<duckdb::LogicalFilter>();
+      std::set<duckdb::idx_t> below;
+      for (auto const column : columns) {
+        below.insert(filter.HasProjectionMap() ? duckdb::idx_t{filter.projection_map[column]}
+                                               : column);
+      }
+      return columns_determine_floating_results(std::move(below), *op.children[0]);
+    }
+    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
+      auto const& join = op.Cast<duckdb::LogicalComparisonJoin>();
+      if (join.join_type != duckdb::JoinType::INNER) return false;
+      // The output is the left columns, then the right columns, each through its projection map.
+      auto const& left_map  = join.left_projection_map;
+      auto const& right_map = join.right_projection_map;
+      auto const left_width = left_map.empty() ? op.children[0]->types.size() : left_map.size();
+      std::array<std::set<duckdb::idx_t>, 2> sides;
+      for (auto const column : columns) {
+        if (column < left_width) {
+          sides[0].insert(left_map.empty() ? column : duckdb::idx_t{left_map[column]});
+        } else {
+          auto const right = column - left_width;
+          sides[1].insert(right_map.empty() ? right : duckdb::idx_t{right_map[right]});
+        }
+      }
+      // Joined rows that agree on one column of an equality condition agree on the other.
+      for (auto const& condition : join.conditions) {
+        if (!condition.IsComparison()) continue;
+        auto const comparison = condition.GetComparisonType();
+        if (comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+            comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+          continue;
+        }
+        if (!is_bound_ref(condition.GetLHS()) || !is_bound_ref(condition.GetRHS())) continue;
+        auto const left  = ref_index(condition.GetLHS());
+        auto const right = ref_index(condition.GetRHS());
+        if (sides[0].contains(left)) sides[1].insert(right);
+        if (sides[1].contains(right)) sides[0].insert(left);
+      }
+      for (std::size_t side = 0; side < sides.size(); ++side) {
+        auto const& child = *op.children[side];
+        if (inspect_floating_aggregate_keys(child).has_floating_aggregate &&
+            !columns_determine_floating_results(sides[side], child)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+      auto const& aggregate = op.Cast<duckdb::LogicalAggregate>();
+      if (aggregate.grouping_sets.size() > 1) return false;
+      // Groups come first in the output, and each group is one row.
+      for (duckdb::idx_t group = 0; group < aggregate.groups.size(); ++group) {
+        if (!columns.contains(group)) return false;
+      }
+      return true;
+    }
+    case duckdb::LogicalOperatorType::LOGICAL_WINDOW: {
+      // Input columns pass through, so they must not carry floating results of their own.
+      if (inspect_floating_aggregate_keys(*op.children[0]).has_floating_aggregate) return false;
+      for (auto const& expression : op.expressions) {
+        if (expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_WINDOW) {
+          return false;
+        }
+        auto const& window = expression->Cast<duckdb::BoundWindowExpression>();
+        if (!window.AggregateFunction()) continue;
+        auto const name = window.AggregateFunction()->GetName().GetIdentifierName();
+        if (!may_differ_in_low_bits(name, window.GetChildren(), window.GetReturnType())) continue;
+        if (!is_whole_partition(window)) return false;
+        // Input columns keep their positions in the window's output.
+        for (auto const& partition : window.Partitions()) {
+          if (!is_bound_ref(*partition) || !columns.contains(ref_index(*partition))) return false;
+        }
+      }
+      return true;
+    }
+    default: return false;
+  }
+}
+
+bool keys_determine_floating_results(std::vector<duckdb::Expression const*> const& keys,
+                                     duckdb::LogicalOperator const& input)
+{
+  std::set<duckdb::idx_t> columns;
+  for (auto const* key : keys) {
+    if (!is_bound_ref(*key)) return false;
+    columns.insert(ref_index(*key));
+  }
+  return columns_determine_floating_results(std::move(columns), input);
+}
+
 floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOperator const& op)
 {
   floating_aggregate_key_shape shape;
@@ -196,6 +332,8 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
   }
   bool const floating_aggregate_below = shape.has_floating_aggregate;
   bool exact_key_here                 = false;
+  std::vector<duckdb::Expression const*> keys;
+  bool keys_can_be_traced = false;
   if (op.type == duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
     auto const& aggregate = op.Cast<duckdb::LogicalAggregate>();
     for (auto const& expression : aggregate.expressions) {
@@ -210,8 +348,11 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
         }
       }
     }
+    // A floating DISTINCT argument is compared within a group, so only GROUP BY keys are traced.
+    keys_can_be_traced = !exact_key_here;
     for (auto const& group : aggregate.groups) {
       if (contains_floating_type(group->GetReturnType())) exact_key_here = true;
+      keys.push_back(group.get());
     }
   } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW) {
     for (auto const& expression : op.expressions) {
@@ -227,7 +368,9 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
     auto const& distinct = op.Cast<duckdb::LogicalDistinct>();
     for (auto const& target : distinct.distinct_targets) {
       if (contains_floating_type(target->GetReturnType())) exact_key_here = true;
+      keys.push_back(target.get());
     }
+    keys_can_be_traced = true;
   } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_UNION ||
              op.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
              op.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
@@ -239,10 +382,12 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
       }
     }
   }
-  // This is conservative: the floating key may be unrelated to an aggregate below this node.
-  // Proving expression lineage through projections, joins and CTE references would need a separate
-  // pass.
-  if (exact_key_here && floating_aggregate_below) shape.needs_cpu = true;
+  // Otherwise this is conservative: the floating key may be unrelated to an aggregate below it.
+  if (exact_key_here && floating_aggregate_below &&
+      !(keys_can_be_traced && op.children.size() == 1 &&
+        keys_determine_floating_results(keys, *op.children[0]))) {
+    shape.needs_cpu = true;
+  }
   shape.has_exact_floating_key |= exact_key_here;
   if (op.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && producer && consumer) {
     // The producer and consumer are sibling subtrees; the consumer's CTE_REF does not descend

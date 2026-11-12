@@ -774,7 +774,17 @@ TEST_CASE_METHOD(DistinctFixture,
     expect_plan_fallback_matches_cpu(
       "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) "
       "OVER (PARTITION BY k) a FROM avg_keys)");
+    compare_gpu_vs_cpu_approx(
+      "SELECT DISTINCT k, AVG(CAST(-12.802 AS DOUBLE)) OVER (PARTITION BY k) a FROM avg_keys", {1});
   }
+  // A key that includes the producer's GROUP BY or PARTITION BY columns fixes the row count, so
+  // these stay on the GPU. The window form is rewritten into an aggregate and a self-join here.
+  compare_gpu_vs_cpu_approx(
+    "SELECT DISTINCT k, a FROM (SELECT k, AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys "
+    "GROUP BY k)",
+    {1});
+  compare_gpu_vs_cpu_approx(
+    "SELECT DISTINCT k, AVG(CAST(-12.802 AS DOUBLE)) OVER (PARTITION BY k) a FROM avg_keys", {1});
   for (char const* set_operation : {"UNION", "EXCEPT", "INTERSECT"}) {
     CAPTURE(set_operation);
     expect_plan_fallback_matches_cpu(
