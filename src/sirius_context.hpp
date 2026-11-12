@@ -39,6 +39,7 @@
 
 #include <rmm/resource_ref.hpp>
 
+#include <cucascade/data/row_range_read.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
@@ -719,6 +720,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Get the memory reservation manager.
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
   [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager() const;
+
+  /// The process-wide row-range reader registry (initialized by initialize()).
+  [[nodiscard]] cucascade::row_range_reader_registry& row_range_readers();
 
   /// \brief The data repository manager owned by @p query_id's query
   /// \return The manager, or nullptr

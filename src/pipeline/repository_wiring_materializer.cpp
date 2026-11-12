@@ -69,9 +69,13 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
 
     auto* repo = data_repo_manager.get_repository(op_id, wiring.port_id).get();
 
-    next_op->add_port(wiring.port_id,
-                      std::make_unique<op::sirius_physical_operator::port>(
-                        wiring.barrier_type, repo, wiring.source_pipeline, dest_pipeline));
+    auto const policy = next_op->input_residency_policy(wiring.port_id);
+    repo->set_downgrade_priority(policy.downgrade_priority);
+
+    auto p = std::make_unique<op::sirius_physical_operator::port>(
+      wiring.barrier_type, repo, wiring.source_pipeline, dest_pipeline);
+    p->residency = policy;
+    next_op->add_port(wiring.port_id, std::move(p));
     wiring.source_op->add_next_port_after_sink({next_op, wiring.port_id});
   }
 }

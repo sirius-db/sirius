@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <format>
 #include <numeric>
@@ -278,6 +279,12 @@ void downgrade_executor::processing_loop()
       // allocating. This makes the pressure response FIFO: earliest queries keep execution
       // priority, latest queries pay for the memory.
       //
+      // Within a query, repositories are visited by downgrade priority, highest first. The
+      // priority is a per-repository hint for how cheap its batches are to spill; it comes from
+      // port_residency_policy::downgrade_priority and is copied onto the repository at wiring.
+      // The sort is stable, so equal priorities (0 by default) keep get_repositories() order.
+      // Priority never reorders repositories across queries.
+      //
       // get_all() returns ascending by query id, so this iterates the snapshot in reverse.
       // get_all_convertible() snapshots eligible batches once per repo so a batch isn't
       // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
@@ -288,8 +295,15 @@ void downgrade_executor::processing_loop()
         auto borrow = _query_lifecycle.try_acquire_work(victim_id);
         if (!borrow) { continue; }
         if (req->satisfied.load() || pool_interrupted || target_completed()) break;
-        auto repos = manager->get_repositories();
-        for (auto* repo : repos) {
+        // Read each priority once: it is an atomic that wiring may still be setting, and a key
+        // that changes mid-sort would break the comparator's ordering.
+        std::vector<std::pair<int32_t, cucascade::shared_data_repository*>> repos;
+        for (auto* repo : manager->get_repositories()) {
+          repos.emplace_back(repo->get_downgrade_priority(), repo);
+        }
+        std::ranges::stable_sort(
+          repos, std::ranges::greater{}, [](auto const& entry) { return entry.first; });
+        for (auto* repo : repos | std::views::values) {
           if (req->satisfied.load() || target_completed()) break;
 
           convertible_data_batch_provider provider(repo);

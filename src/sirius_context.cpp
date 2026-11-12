@@ -20,6 +20,7 @@
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "data/sirius_row_range_reader_registry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -904,12 +905,14 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   struct initialization_guard {
     SiriusContext* self;
     bool owns_converter_registry = false;
+    bool owns_row_range_registry = false;
     bool committed               = false;
     ~initialization_guard()
     {
       if (committed) { return; }
       self->release_resources();
       if (owns_converter_registry) { sirius::converter_registry::shutdown(); }
+      if (owns_row_range_registry) { sirius::row_range_reader_registry::shutdown(); }
     }
   } rollback{this};
 
@@ -940,6 +943,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
   rollback.owns_converter_registry = sirius::converter_registry::initialize(
     config_.get_downgrade_executor_config().copy_chunk_bytes);
+  rollback.owns_row_range_registry = sirius::row_range_reader_registry::initialize();
 
   // Discovery is shared by all subsystems; execution GPU ids come from the
   // configured memory manager built below.
@@ -1252,6 +1256,11 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
 {
   throw_if_not_initialized();
   return *memory_manager_;
+}
+
+cucascade::row_range_reader_registry& SiriusContext::row_range_readers()
+{
+  return sirius::row_range_reader_registry::get();
 }
 
 sirius::data::data_repository_manager_registry::manager_ptr
