@@ -80,6 +80,7 @@
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/sirius_plan_sort_exchange.hpp"
 #include "planner/sirius_plan_window.hpp"
 #include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/preparation_ledger.hpp"
@@ -1501,66 +1502,20 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 }
 
 //! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
-//! original_input`. Destructive: ORDER_BY's
-//! `projections`/`types` are overwritten with the identity over the input's types so every
-//! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
-//! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
-//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
+//! original_input`, built by `build_sort_exchange` with every sort key used for the range
+//! boundaries.
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                    const sirius::operator_params& op_params)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> order_op) {
-    auto* order_ptr = &order_op->Cast<sirius::op::sirius_physical_order>();
-    if (order_ptr->children.empty()) {
+    if (order_op->children.empty()) {
       throw std::runtime_error(
         "[sirius_physical_plan_generator::wrap_order_by] ORDER_BY has no child input");
     }
-
-    auto original_projections = order_ptr->projections;
-    auto const& child_types   = order_ptr->children[0]->types;
-
-    duckdb::vector<std::size_t> identity_proj;
-    identity_proj.reserve(child_types.size());
-    for (std::size_t col_idx = 0; col_idx < child_types.size(); col_idx++) {
-      identity_proj.push_back(col_idx);
-    }
-    order_ptr->projections = std::move(identity_proj);
-    order_ptr->types       = child_types;
-
-    auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
-      order_ptr,
-      op_params.sort_sample_bytes,
-      op_params.max_sort_partition_bytes,
-      op_params.max_sort_partition_memory_fraction);
-    auto* sample_ptr = sample.get();
-    sample->children.push_back(std::move(order_op));
-
-    auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);
-    partition->set_sample_op(sample_ptr);
-    partition->children.push_back(std::move(sample));
-
-    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
-
-    bool is_identity = (original_projections.size() == order_ptr->types.size());
-    if (is_identity) {
-      for (std::size_t i = 0; i < original_projections.size(); i++) {
-        if (original_projections[i] != i) {
-          is_identity = false;
-          break;
-        }
-      }
-    }
-    if (!is_identity) {
-      duckdb::vector<sirius::logical_type> output_types;
-      output_types.reserve(original_projections.size());
-      for (auto idx : original_projections) {
-        output_types.push_back(order_ptr->types[idx]);
-      }
-      merge->set_final_projections(std::move(original_projections), std::move(output_types));
-    }
-
-    merge->children.push_back(std::move(partition));
-    return merge;
+    return sirius::planner::build_sort_exchange(
+      duckdb::unique_ptr_cast<sirius::op::sirius_physical_operator,
+                              sirius::op::sirius_physical_order>(std::move(order_op)),
+      sirius::planner::sort_exchange_options::from(op_params));
   });
 }
 
@@ -1929,10 +1884,19 @@ void insert_gpu_pipeline_operators_recursive(
       auto const& window = slot->Cast<sirius::op::sirius_physical_window>();
       std::vector<duckdb::idx_t> keys(window.partition_columns().begin(),
                                       window.partition_columns().end());
-      slot->children[0] = build_window_exchange(std::move(slot->children[0]),
-                                                keys,
-                                                slot->estimated_cardinality,
-                                                op_params.hash_partition_bytes);
+      if (window.input_exchange() == sirius::op::window_exchange::sorted) {
+        slot->children[0] = sirius::planner::build_window_sort_exchange(
+          std::move(slot->children[0]),
+          keys,
+          window.order(),
+          slot->estimated_cardinality,
+          sirius::planner::sort_exchange_options::from(op_params));
+      } else {
+        slot->children[0] = build_window_exchange(std::move(slot->children[0]),
+                                                  keys,
+                                                  slot->estimated_cardinality,
+                                                  op_params.hash_partition_bytes);
+      }
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:

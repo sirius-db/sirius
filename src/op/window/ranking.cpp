@@ -36,7 +36,7 @@ cudf::data_type const result_type{cudf::type_id::INT64};
 // Throws std::invalid_argument for an empty request or a column outside @p input.
 void validate(cudf::table_view input,
               std::vector<cudf::size_type> const& partition_columns,
-              ranking_order const& order,
+              window_order const& order,
               std::vector<ranking_function> const& functions)
 {
   if (functions.empty()) { throw std::invalid_argument("Ranking window has no functions"); }
@@ -106,7 +106,7 @@ std::unique_ptr<cudf::groupby_scan_aggregation> make_scan(ranking_function funct
 std::unique_ptr<cudf::table> evaluate_ranking_window(
   cudf::table_view input,
   std::vector<cudf::size_type> const& partition_columns,
-  ranking_order const& order,
+  window_order const& order,
   std::vector<ranking_function> const& functions,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)

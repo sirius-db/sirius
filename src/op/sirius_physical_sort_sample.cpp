@@ -25,7 +25,12 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/stream_compaction.hpp>
+
 #include <algorithm>
+#include <numeric>
+#include <stdexcept>
+#include <string>
 
 namespace sirius {
 namespace op {
@@ -90,6 +95,15 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
     _max_partition_bytes_override(max_partition_bytes),
     _max_partition_memory_fraction(max_partition_memory_fraction)
 {
+}
+
+void sirius_physical_sort_sample::set_boundary_key_count(std::size_t count)
+{
+  if (count == 0 || count > orders.size()) {
+    throw std::invalid_argument("Sort sample boundary key count must be in [1, " +
+                                std::to_string(orders.size()) + "], got " + std::to_string(count));
+  }
+  _boundary_key_count = count;
 }
 
 std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
@@ -316,10 +330,12 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
 
-      // Extract only the sort key columns from merged sample for the boundaries
+      // Extract only the boundary key columns (the leading boundary_key_count() sort keys)
+      // from the merged sample for the boundaries
+      auto const key_count = boundary_key_count();
       std::vector<cudf::column_view> sort_key_cols;
-      for (int idx : order_key_idx) {
-        sort_key_cols.push_back(merged_sample_view.column(idx));
+      for (std::size_t k = 0; k < key_count; ++k) {
+        sort_key_cols.push_back(merged_sample_view.column(order_key_idx[k]));
       }
       cudf::table_view sort_keys_view(sort_key_cols);
 
@@ -329,7 +345,22 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                            cudf::out_of_bounds_policy::DONT_CHECK,
                                            stream,
                                            space->get_default_allocator());
-      _num_partitions       = num_parts;
+      // SORT_PARTITION never splits rows that are equal on the boundary keys, so several
+      // quantiles that fall inside one run of equal keys give repeated boundaries, and every
+      // range between two repeats would be empty. The gathered rows are sorted on the boundary
+      // keys, so dropping adjacent duplicates leaves distinct boundaries and no range between
+      // two boundaries is empty by construction. The first range can still be empty: rows equal
+      // to a boundary fall after it, so when the first boundary is the smallest key nothing
+      // sorts before it.
+      std::vector<cudf::size_type> all_columns(key_count);
+      std::iota(all_columns.begin(), all_columns.end(), 0);
+      _partition_boundaries = cudf::unique(_partition_boundaries->view(),
+                                           all_columns,
+                                           cudf::duplicate_keep_option::KEEP_FIRST,
+                                           cudf::null_equality::EQUAL,
+                                           stream,
+                                           space->get_default_allocator());
+      _num_partitions       = static_cast<size_t>(_partition_boundaries->num_rows()) + 1;
     }
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this

@@ -20,7 +20,9 @@
 #include "expression/ast/node.hpp"  // sirius::ast::node
 
 // standard library
+#include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace duckdb {
 class Expression;
@@ -45,5 +47,14 @@ namespace sirius::ast {
  *         (target type), or BoundFunctionExpression (return type).
  */
 std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr);
+
+/**
+ * @brief The value of @p expr when it is a non-NULL `BIGINT` constant, otherwise `std::nullopt`.
+ *
+ * Operations that need one scalar for a whole call, rather than a column, accept only such a
+ * constant. They rely on DuckDB's optimizer to fold a constant expression such as `1 + 1` or
+ * `CAST(2 AS BIGINT)` first.
+ */
+std::optional<int64_t> bigint_constant(duckdb::Expression const& expr);
 
 }  // namespace sirius::ast

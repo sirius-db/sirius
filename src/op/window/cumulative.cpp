@@ -75,11 +75,11 @@ cudf::data_type result_type(aggregate_id function, cudf::data_type input)
 
 // Returns @p aggregates with `sum_no_overflow` replaced by `sum`. Throws std::invalid_argument for
 // an empty request, an unsupported function or argument type, or a column outside @p input.
-std::vector<cumulative_aggregate> normalize_aggregates(
+std::vector<window_aggregate> normalize_aggregates(
   cudf::table_view input,
   std::vector<cudf::size_type> const& partition_columns,
-  ranking_order const& order,
-  std::vector<cumulative_aggregate> aggregates)
+  window_order const& order,
+  std::vector<window_aggregate> aggregates)
 {
   if (aggregates.empty()) { throw std::invalid_argument("Cumulative window has no aggregates"); }
   if (order.columns.empty()) {
@@ -136,8 +136,8 @@ std::unique_ptr<cudf::groupby_scan_aggregation> make_scan(aggregate_id function)
 std::unique_ptr<cudf::table> evaluate_cumulative_window(
   cudf::table_view input,
   std::vector<cudf::size_type> const& partition_columns,
-  ranking_order const& order,
-  std::vector<cumulative_aggregate> const& requested,
+  window_order const& order,
+  std::vector<window_aggregate> const& requested,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {

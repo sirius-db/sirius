@@ -141,6 +141,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   auto merged_batch = gpu_merge_impl::merge_order_by(
     input_batches, order_key_idx, column_order, null_precedence, stream, *space, batch_telemetry());
 
+  // Publish the whole range as one batch. A framed WINDOW evaluates one batch per task and relies
+  // on a range never being divided between batches, which would split a partition.
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (merged_batch) {
     if (_final_projections.empty()) {

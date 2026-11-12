@@ -23,6 +23,7 @@
 #include <cudf/table/table.hpp>
 
 #include <atomic>
+#include <optional>
 
 namespace sirius {
 namespace op {
@@ -55,6 +56,21 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
 
+  /// Set the number of leading sort keys that range boundaries are sampled and compared on.
+  ///
+  /// By default all keys are used. A boundary row holds only these keys, and SORT_PARTITION
+  /// compares only these keys when it cuts a batch. The count does not change how ties are
+  /// treated: see get_partition_boundaries().
+  ///
+  /// @throws std::invalid_argument if @p count is zero or larger than the number of sort keys.
+  void set_boundary_key_count(std::size_t count);
+
+  /// Number of leading sort keys the range boundaries are computed and compared on.
+  [[nodiscard]] std::size_t boundary_key_count() const
+  {
+    return _boundary_key_count.value_or(orders.size());
+  }
+
  public:
   bool is_source() const override { return true; }
   // SORT_SAMPLE is not a pipeline sink — it runs as an intermediate operator in the
@@ -70,7 +86,14 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override to pull sample bytes before boundary computation, then one batch at a time
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  //! Get the computed partition boundaries (P-1 rows, sort key columns only)
+  //! Get the computed partition boundaries: P-1 distinct rows, each holding the first
+  //! boundary_key_count() sort key columns.
+  //!
+  //! SORT_PARTITION cuts a batch before the first row not less than each boundary, so rows that
+  //! are equal on the boundary keys always land in the same range. A repeated boundary could
+  //! then only yield an empty range, so repeats are removed and P counts distinct boundaries.
+  //! The first range can still be empty, when the first boundary is the smallest key in the
+  //! input.
   const cudf::table& get_partition_boundaries() const { return *_partition_boundaries; }
 
   //! Get the computed number of partitions
@@ -91,6 +114,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;
+
+  //! Number of leading sort keys used for range boundaries; unset means all keys.
+  std::optional<std::size_t> _boundary_key_count;
 
   //! Boundary computation lifecycle: NOT_DONE → SCHEDULED (input claimed) → DONE.
   //! get_next_task_input_data() transitions to SCHEDULED under the task-creation lock;

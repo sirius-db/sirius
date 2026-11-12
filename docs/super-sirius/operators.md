@@ -516,10 +516,34 @@ arrive through a child-owned pipeline, and a delim join is declined at any depth
 because the operator's task hint can poll a MARK hash join inside the delim subtree before its
 sizing partitions have run.
 
+### `sirius_physical_window` — `WINDOW`
+**File:** `src/op/sirius_physical_window.hpp`
+
+Evaluates the window functions of one stage, one batch per task, and publishes the input's payload columns followed by the results. The planner splits a `LogicalWindow` into stages and emits `PROJECTION (hidden key and argument columns) → WINDOW` for each. Every input batch must hold all rows of the partitions it contains. The operator has three modes, held as a variant, and `input_exchange()` tells the planner which exchange to put under it:
+
+| Mode | Functions | `input_exchange()` | Input built by |
+|---|---|---|---|
+| Whole partition | aggregates whose frame is the whole partition, with or without `ORDER BY` | `hash` | `build_window_exchange`: `PARTITION (hash, FULL) → CONCAT`, one bucket per batch |
+| Ranking | `rank`, `dense_rank`, `row_number` | `hash` | as above |
+| Running | `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX` over `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (no string `MIN` or `MAX`), with or without `PARTITION BY` | `hash` | as above; each bucket is sorted inside the task |
+| Framed | aggregates over any other `ROWS` frame or a `RANGE` frame bounded by `CURRENT ROW`, and the running aggregates the running mode does not take, with `PARTITION BY` and `ORDER BY` | `sorted` | `build_window_sort_exchange`: the distributed sort below, one merged range per batch |
+
+The framed input is `ORDER_BY → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT` on the partition keys (`ASC NULLS FIRST`, chosen only in `build_window_sort_exchange`) followed by the window order keys, with the range boundaries computed on the partition keys only (`boundary_key_count`). A partition therefore lands whole in one range.
+
+- `WINDOW` sources its own pipeline above the `MERGE_SORT` sink. `input_barrier_for` returns `PIPELINE` for that port, because a merged range depends on no other range and can be windowed as soon as it is published. The hash modes keep the FULL barrier.
+- Custom `get_next_task_input_data()`: pops one batch from any repository partition, so bucket and range indices with gaps are drained. It relies on `MERGE_SORT` publishing each range as exactly one batch.
+- Partition and order keys are compared in their carriers. Arguments are restored to their logical types before evaluation.
+- A partition must fit one batch: fewer than 2^31 rows, and within GPU memory. Range sizing is only as good as the sort's sample, so a skewed or oversized range fails in `MERGE_SORT` through its ordinary OOM handling before the window runs.
+
 ### Whole-partition window evaluator
 **File:** `src/op/window/whole_partition.hpp`, `src/op/window/whole_partition.cpp`
 
-`evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. It runs a `cudf::groupby()` (a reduction when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow. A floating point `MIN` or `MAX` orders NaN above every other value, as in DuckDB, with the helpers in `src/op/window/float_extremum.hpp`.
+`evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. Like the framed evaluator it is split into a host-only `plan_whole_partition_window()`, which validates and returns a `whole_partition_plan`, and an execution step. The window planner builds the plan in `plan_window_stage` (declining the window if planning throws) and `sirius_physical_window` executes it on each bucket. Execution runs one `cudf::groupby()` (reductions when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow. The only per-bucket decision is whether an `INT64`, `DECIMAL32` or `DECIMAL64` sum must be widened to `DECIMAL128` (`preparation::widen_if_needed`, decided by `sums_needing_widening` from the bucket's values). A floating point `MIN` or `MAX` orders NaN above every other value, as in DuckDB, with the helpers in `src/op/window/float_extremum.hpp`.
+
+### Framed window evaluator
+**File:** `src/op/window/frame.hpp`, `src/op/window/framed.hpp`, `src/op/window/framed.cpp`
+
+The evaluator is split in two. `plan_framed_window()` is a host-only function of the input column types, the partition and order columns and the aggregates. It does all validation (throwing `std::invalid_argument`, so a planner can decline) and returns a `framed_window_plan`: the value columns to prepare (casts to the sum type, NaN to NULL, NaN flags), the deduplicated cuDF rolling requests grouped by frame with each frame's execution strategy, and a recipe per output (a request as is, `sum / count`, or a NaN-restoring float extremum). `evaluate_framed_window(plan, table)` only executes it. `evaluate_framed_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over a `ROWS` or `RANGE` frame (`window_frame`) of one table that is already sorted on the partition columns and the order keys. It neither sorts nor reorders: the results are in the input row order. Each aggregate has its own frame, and aggregates that read the same prepared column over the same frame share one cuDF rolling aggregation (so `SUM(x)` and `AVG(x)` share the sum). `ROWS` frames run `cudf::grouped_rolling_window`. A `RANGE` frame with several order keys allows only `UNBOUNDED` and `CURRENT ROW` endpoints and runs the multi-key `cudf::grouped_range_rolling_window`. With one order key, `cudf::make_range_windows` computes the per-row windows and `cudf::rolling_window` evaluates them. A frame whose start lies after its end (e.g. `ROWS 3 PRECEDING AND 5 PRECEDING`) is empty: for `ROWS` the evaluator returns NULL without calling cuDF, which rejects such bounds, and for `RANGE` it clamps windows that would end before they start. `RANGE` offsets are host integers in the order key's unit and must fit that type. Shared typing (`window_sum_type`, `window_result_type`, `check_decimal_sum_fits`) lives in `src/op/window/aggregate_types.hpp`. The parts of a plan both aggregate evaluators share (`window_aggregate_plan`: value columns, requests and output recipes, with the builder, value preparation and output assembly) live in `src/op/window/aggregate_plan.hpp`. A floating point `MIN` or `MAX` plans an extremum over the argument with NaN replaced by NULL and a `MAX` over its NaN flags. At execution the argument is checked for NaN once (`make_nan_free_argument`): without NaN the extremum reads the argument as it is and the flag request does not run, and with NaN `restore_nan` puts NaN back from the flags. A framed `WINDOW` runs it on each merged range of its sorted input.
 
 ### Ranking window evaluator
 **File:** `src/op/window/ranking.hpp`, `src/op/window/ranking.cpp`
@@ -613,10 +637,14 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 - `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
+`set_boundary_key_count(n)` restricts the boundaries to the first `n` sort keys; by default all keys are used. With a prefix, the boundary table holds only those columns and duplicate boundary rows are removed, so `get_num_partitions()` is the number of distinct boundaries plus one. Rows equal on the prefix always land in the same range. The first range can be empty, when the first boundary is the smallest prefix value. A framed `WINDOW` uses this to cut ranges on its partition keys.
+
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
 
 Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
+
+Batches are compared with the boundaries on as many leading sort keys as the boundary table has columns, so a key prefix set on SORT_SAMPLE applies here without a second setting. A batch whose key columns differ in physical type from the boundaries throws `internal_exception`: boundary rows come from the sample batches, so a column must use one carrier in every batch reaching the sort.
 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
@@ -628,6 +656,9 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 
 - Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
 - Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
+- Publishes each range as exactly one batch. A framed `WINDOW` above it evaluates one batch per task and depends on this.
+
+The chain `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` is built in one place, `build_sort_exchange` in `src/planner/sirius_plan_sort_exchange.hpp`, for both a query `ORDER BY` and the input of a framed window.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`

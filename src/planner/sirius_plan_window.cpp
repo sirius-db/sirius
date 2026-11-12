@@ -29,6 +29,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -122,15 +123,17 @@ bool is_cumulative_extremum_argument(duckdb::LogicalType const& type)
   }
 }
 
-/// Decline the window modifiers that no window function here supports.
-void decline_unsupported_modifiers(duckdb::BoundWindowExpression const& expression)
+/// Decline the window modifiers that no window function here supports. Frame offsets are declined
+/// too unless @p allow_frame_offsets is set, for an aggregate whose frame is translated.
+void decline_unsupported_modifiers(duckdb::BoundWindowExpression const& expression,
+                                   bool allow_frame_offsets = false)
 {
   if (expression.Distinct()) { decline("DISTINCT"); }
   if (expression.Filter()) { decline("FILTER"); }
   if (expression.WindowExclude() != duckdb::WindowExcludeMode::NO_OTHER) { decline("EXCLUDE"); }
   if (!expression.ArgOrders().empty()) { decline("argument ORDER BY"); }
   if (expression.IgnoreNulls()) { decline("IGNORE NULLS"); }
-  if (expression.StartExpr() || expression.EndExpr()) {
+  if (!allow_frame_offsets && (expression.StartExpr() || expression.EndExpr())) {
     decline("frame offsets or navigation arguments");
   }
 }
@@ -183,11 +186,11 @@ bool same_order(duckdb::BoundWindowExpression const& a, duckdb::BoundWindowExpre
   return true;
 }
 
-/// Record the order key slots, directions and NULL placements of the first ranking window.
+/// Record the order key slots, directions and NULL placements of the stage's first window.
 template <typename Prepare>
-void plan_ranking_order(window_plan& plan,
-                        duckdb::BoundWindowExpression const& expression,
-                        Prepare&& prepare)
+void plan_window_order(window_plan& plan,
+                       duckdb::BoundWindowExpression const& expression,
+                       Prepare&& prepare)
 {
   for (auto const& node : expression.OrderBy()) {
     if (node.null_order == duckdb::OrderByNullType::ORDER_DEFAULT) {
@@ -196,46 +199,27 @@ void plan_ranking_order(window_plan& plan,
     if (!is_supported_order_key(node.expression->GetReturnType())) {
       decline("order key type or collation");
     }
-    plan.ranking_order.columns.push_back(static_cast<cudf::size_type>(prepare(*node.expression)));
-    plan.ranking_order.directions.push_back(op::to_cudf_order(node.type));
-    plan.ranking_order.nulls.push_back(op::to_cudf_null_order(node.type, node.null_order));
+    plan.order.columns.push_back(static_cast<cudf::size_type>(prepare(*node.expression)));
+    plan.order.directions.push_back(op::to_cudf_order(node.type));
+    plan.order.nulls.push_back(op::to_cudf_null_order(node.type, node.null_order));
   }
 }
 
 /**
- * @brief Return the aggregate to run for @p expression, or decline it.
+ * @brief Return the aggregate function of @p expression, or decline it.
  *
  * Valid is a `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` or `MAX` without `DISTINCT`, `FILTER`,
- * `EXCLUDE`, `IGNORE NULLS` or an argument `ORDER BY`, in one of two forms:
- * - Without a window `ORDER BY`, over a frame that covers the whole partition. `SUM` and `AVG`
- *   take a numeric argument. `COUNT`, `MIN` and `MAX` also take the types allowed as partition
- *   keys, and `MIN` and `MAX` keep the argument type.
- * - With a window `ORDER BY`, over `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, for `SUM`,
- *   `COUNT`, `COUNT(*)`, `MIN` and `MAX`. `MIN` and `MAX` take an integer, decimal, floating
- *   point, date or timestamp argument.
+ * `EXCLUDE`, `IGNORE NULLS` or an argument `ORDER BY`. `SUM` and `AVG` take a numeric argument.
+ * `COUNT`, `MIN` and `MAX` also take the types allowed as partition keys, and `MIN` and `MAX` keep
+ * the argument type. The frame is not checked here.
  */
-aggregate_id build_aggregate(duckdb::BoundWindowExpression const& expression)
+aggregate_id build_aggregate_function(duckdb::BoundWindowExpression const& expression)
 {
-  using duckdb::WindowBoundary;
   if (expression.GetExpressionType() != duckdb::ExpressionType::WINDOW_AGGREGATE ||
       !expression.AggregateFunction()) {
     decline("only SUM, AVG, COUNT, MIN and MAX aggregates are planned");
   }
-  decline_unsupported_modifiers(expression);
-  bool const ordered = !expression.OrderBy().empty();
-  if (ordered) {
-    // DuckDB's default frame with an ORDER BY is a RANGE frame, where peers share a result.
-    if (expression.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
-        expression.WindowEnd() != WindowBoundary::CURRENT_ROW_ROWS) {
-      decline(
-        "window ORDER BY with a frame other than ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
-    }
-  } else if (expression.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
-             (expression.WindowEnd() != WindowBoundary::UNBOUNDED_FOLLOWING &&
-              expression.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE)) {
-    // Without ORDER BY all rows are peers. DuckDB retains CURRENT_ROW_RANGE for the default frame.
-    decline("frame does not cover the whole partition");
-  }
+  decline_unsupported_modifiers(expression, /*allow_frame_offsets=*/true);
   auto const id =
     from_duckdb_aggregate_name(expression.AggregateFunction()->GetName().GetIdentifierName());
   // Every aggregate below also requires the result type DuckDB bound. Any other overload is
@@ -252,9 +236,7 @@ aggregate_id build_aggregate(duckdb::BoundWindowExpression const& expression)
         expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
       return aggregate_id::count;
     }
-    if (is_supported_count_min_max_argument(argument) &&
-        (!ordered || is_cumulative_extremum_argument(argument)) &&
-        expression.GetReturnType() == argument) {
+    if (is_supported_count_min_max_argument(argument) && expression.GetReturnType() == argument) {
       if (id == aggregate_id::min) { return aggregate_id::min; }
       if (id == aggregate_id::max) { return aggregate_id::max; }
     }
@@ -264,8 +246,7 @@ aggregate_id build_aggregate(duckdb::BoundWindowExpression const& expression)
     decline("aggregate argument type or arity");
   }
   auto const& argument = expression.GetChildren()[0]->GetReturnType();
-  if (id == aggregate_id::avg && !ordered &&
-      expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
+  if (id == aggregate_id::avg && expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
     return aggregate_id::avg;
   }
   // Statistics propagation replaces SUM with this internal implementation while retaining
@@ -283,13 +264,135 @@ aggregate_id build_aggregate(duckdb::BoundWindowExpression const& expression)
   decline("aggregate function or result type");
 }
 
+/// Whether the frame of @p expression covers its whole partition whatever the row order. Without
+/// ORDER BY all rows are peers, so DuckDB's default frame, which ends at CURRENT_ROW_RANGE, covers
+/// it too. CURRENT_ROW_ROWS still ends at the physical current row.
+bool covers_whole_partition(duckdb::BoundWindowExpression const& expression)
+{
+  using duckdb::WindowBoundary;
+  if (expression.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING) { return false; }
+  return expression.WindowEnd() == WindowBoundary::UNBOUNDED_FOLLOWING ||
+         (expression.OrderBy().empty() &&
+          expression.WindowEnd() == WindowBoundary::CURRENT_ROW_RANGE);
+}
+
+/**
+ * @brief Translate the frame of @p expression, or decline it.
+ *
+ * `ROWS` offsets must be non-negative `BIGINT` constants once DuckDB's optimizer has folded them.
+ * `RANGE` offsets and `GROUPS` frames are declined.
+ */
+op::window_frame translate_frame(duckdb::BoundWindowExpression const& expression)
+{
+  using duckdb::WindowBoundary;
+  std::optional<op::frame_unit> unit;
+  auto const set_unit = [&](op::frame_unit next) {
+    // DuckDB does not bind a frame that mixes units. Decline one defensively.
+    if (unit && *unit != next) { decline("frame mixes ROWS and RANGE bounds"); }
+    unit = next;
+  };
+  auto const bound = [&](WindowBoundary boundary,
+                         duckdb::Expression const* offset,
+                         bool is_start) -> op::frame_bound {
+    switch (boundary) {
+      case WindowBoundary::UNBOUNDED_PRECEDING:
+        if (!is_start) { decline("frame ends at UNBOUNDED PRECEDING"); }
+        return op::frame_unbounded{};
+      case WindowBoundary::UNBOUNDED_FOLLOWING:
+        if (is_start) { decline("frame starts at UNBOUNDED FOLLOWING"); }
+        return op::frame_unbounded{};
+      case WindowBoundary::CURRENT_ROW_ROWS:
+        set_unit(op::frame_unit::rows);
+        return op::frame_current_row{};
+      case WindowBoundary::CURRENT_ROW_RANGE:
+        set_unit(op::frame_unit::range);
+        return op::frame_current_row{};
+      case WindowBoundary::EXPR_PRECEDING_ROWS:
+      case WindowBoundary::EXPR_FOLLOWING_ROWS: {
+        set_unit(op::frame_unit::rows);
+        if (!offset) { decline("frame offset is missing"); }
+        auto const rows = ast::bigint_constant(*offset);
+        if (!rows) { decline("non-constant frame offset"); }
+        if (*rows < 0) { decline("negative frame offset"); }
+        return op::frame_row_offset{*rows, boundary == WindowBoundary::EXPR_PRECEDING_ROWS};
+      }
+      case WindowBoundary::EXPR_PRECEDING_RANGE:
+      case WindowBoundary::EXPR_FOLLOWING_RANGE: decline("RANGE frame offsets");
+      case WindowBoundary::CURRENT_ROW_GROUPS:
+      case WindowBoundary::EXPR_PRECEDING_GROUPS:
+      case WindowBoundary::EXPR_FOLLOWING_GROUPS: decline("GROUPS frames");
+      default: decline("frame bound");
+    }
+  };
+  auto start = bound(expression.WindowStart(), expression.StartExpr().get(), true);
+  auto end   = bound(expression.WindowEnd(), expression.EndExpr().get(), false);
+  // Both bounds unbounded covers the partition and is routed before translation.
+  return {unit.value_or(op::frame_unit::rows), std::move(start), std::move(end)};
+}
+
+// An aggregate over a frame that is not the whole partition.
+struct framed_function {
+  aggregate_id function;
+  op::window_frame frame;
+};
+
+/**
+ * @brief Whether the running evaluator computes @p function for @p expression.
+ *
+ * It takes a window `ORDER BY` with the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`,
+ * `SUM`, `COUNT` and `COUNT(*)`, and `MIN` and `MAX` over an integer, decimal, floating point, date
+ * or timestamp argument.
+ */
+bool runs_cumulatively(aggregate_id function, duckdb::BoundWindowExpression const& expression)
+{
+  using duckdb::WindowBoundary;
+  if (expression.OrderBy().empty() ||
+      expression.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
+      expression.WindowEnd() != WindowBoundary::CURRENT_ROW_ROWS) {
+    return false;
+  }
+  switch (function) {
+    case aggregate_id::sum:
+    case aggregate_id::count:
+    case aggregate_id::count_star: return true;
+    case aggregate_id::min:
+    case aggregate_id::max:
+      return is_cumulative_extremum_argument(expression.GetChildren()[0]->GetReturnType());
+    default: return false;
+  }
+}
+
+// An aggregate and the kind of window that evaluates it.
+struct classified_aggregate {
+  std::variant<aggregate_id, framed_function> function;
+  window_kind kind;
+};
+
+/**
+ * @brief Return the aggregate, running aggregate or framed aggregate to run for @p expression, or
+ * decline it.
+ *
+ * Aggregates whose frame covers the whole partition, with or without a window `ORDER BY`, are
+ * evaluated without sorting: the order cannot change the result of these functions. Aggregates
+ * that `runs_cumulatively` accepts are running aggregates, sorted within each hash bucket. Any
+ * other frame needs a window `ORDER BY` and a `PARTITION BY`, and is translated by
+ * `translate_frame`.
+ */
+classified_aggregate build_aggregate(duckdb::BoundWindowExpression const& expression)
+{
+  auto const function = build_aggregate_function(expression);
+  if (covers_whole_partition(expression)) { return {function, window_kind::whole_partition}; }
+  if (expression.OrderBy().empty()) { decline("frame does not cover the whole partition"); }
+  if (runs_cumulatively(function, expression)) { return {function, window_kind::cumulative}; }
+  if (expression.Partitions().empty()) { decline("framed window without PARTITION BY"); }
+  return {framed_function{function, translate_frame(expression)}, window_kind::framed};
+}
+
 // One window expression, validated, with the function it computes and its kind.
 struct classified_expression {
   duckdb::idx_t index;
   duckdb::BoundWindowExpression const* expression;
-  std::variant<aggregate_id, op::ranking_function> function;
-  // A ranking function, an aggregate over the whole partition, or a running aggregate over the
-  // window `ORDER BY`.
+  std::variant<aggregate_id, op::ranking_function, framed_function> function;
   window_kind kind;
 };
 
@@ -312,11 +415,12 @@ std::vector<classified_expression> classify_window_expressions(duckdb::LogicalWi
     auto const& expression = bound.Cast<duckdb::BoundWindowExpression>();
     if (auto const ranking = build_ranking(expression)) {
       result.push_back({i, &expression, *ranking, window_kind::ranking});
-    } else {
-      auto const kind =
-        expression.OrderBy().empty() ? window_kind::whole_partition : window_kind::cumulative;
-      result.push_back({i, &expression, build_aggregate(expression), kind});
+      continue;
     }
+    auto aggregate = build_aggregate(expression);
+    std::visit(
+      [&](auto const& function) { result.push_back({i, &expression, function, aggregate.kind}); },
+      aggregate.function);
   }
   return result;
 }
@@ -325,10 +429,11 @@ std::vector<classified_expression> classify_window_expressions(duckdb::LogicalWi
  * @brief Split classified window expressions into stages.
  *
  * Two expressions share a stage when all of these hold:
- * - They are of one kind: ranking functions, aggregates over the whole partition, or running
- *   aggregates (with a window `ORDER BY`).
+ * - They are of the same kind: ranking functions, aggregates over the whole partition, running
+ *   aggregates, or aggregates over other frames.
  * - Their `PARTITION BY` keys are equivalent.
- * - For ranking functions and running aggregates, their `ORDER BY` is the same.
+ * - Except for aggregates over the whole partition, their `ORDER BY` is the same. Framed
+ *   aggregates may differ in their frames.
  *
  * Stages are listed in the order of their first expression, and the expressions of a stage keep
  * their order.
@@ -342,10 +447,11 @@ std::vector<std::vector<classified_expression>> split_window_into_stages(
   std::vector<std::vector<classified_expression>> stages;
   for (auto const& entry : expressions) {
     auto const& expression = *entry.expression;
+    auto const kind        = entry.kind;
     auto const match       = std::ranges::find_if(stages, [&](auto const& stage) {
       auto const& first = *stage.front().expression;
-      return stage.front().kind == entry.kind && first.PartitionsAreEquivalent(expression) &&
-             (entry.kind == window_kind::whole_partition || same_order(first, expression));
+      return stage.front().kind == kind && first.PartitionsAreEquivalent(expression) &&
+             (kind == window_kind::whole_partition || same_order(first, expression));
     });
     if (match == stages.end()) {
       stages.push_back({entry});
@@ -356,8 +462,67 @@ std::vector<std::vector<classified_expression>> split_window_into_stages(
   return stages;
 }
 
+// Plans how the whole-partition evaluator computes the aggregates of @p plan, refusing the window
+// when the evaluator cannot run them. The evaluator reads the partition keys and the arguments in
+// their logical types, so only their slots need a cuDF type.
+op::whole_partition_plan plan_aggregate_evaluation(window_plan const& plan)
+{
+  std::vector<cudf::data_type> types(plan.prepared_types.size(),
+                                     cudf::data_type{cudf::type_id::EMPTY});
+  auto const read = [&](duckdb::idx_t slot) {
+    auto const type = sirius::get_cudf_type(sirius::from_duckdb(plan.prepared_types[slot]));
+    if (!type) { decline("key or argument type"); }
+    types[slot] = *type;
+    return static_cast<cudf::size_type>(slot);
+  };
+  std::vector<cudf::size_type> keys;
+  for (auto const slot : plan.partition_slots) {
+    keys.push_back(read(slot));
+  }
+  std::vector<op::window_aggregate> aggregates;
+  for (auto const& expression : plan.expressions) {
+    aggregates.push_back({expression.function, read(expression.argument_slot)});
+  }
+  try {
+    return op::plan_whole_partition_window(types, keys, aggregates);
+  } catch (std::invalid_argument const&) {
+    decline("aggregate the evaluator cannot run");
+  }
+}
+
+// Plans how the framed evaluator computes the framed aggregates of @p plan, refusing the window
+// when the evaluator cannot run them. Partition and order keys may reach the evaluator in narrower
+// carriers; only the argument types are checked when it runs.
+op::framed_window_plan plan_framed_evaluation(window_plan const& plan)
+{
+  std::vector<cudf::data_type> types(plan.prepared_types.size(),
+                                     cudf::data_type{cudf::type_id::EMPTY});
+  auto const read = [&](duckdb::idx_t slot) {
+    auto const type = sirius::get_cudf_type(sirius::from_duckdb(plan.prepared_types[slot]));
+    if (!type) { decline("key or argument type"); }
+    types[slot] = *type;
+    return static_cast<cudf::size_type>(slot);
+  };
+  std::vector<cudf::size_type> keys;
+  for (auto const slot : plan.partition_slots) {
+    keys.push_back(read(slot));
+  }
+  for (auto const slot : plan.order.columns) {
+    read(static_cast<duckdb::idx_t>(slot));
+  }
+  std::vector<op::framed_aggregate> aggregates;
+  for (auto const& expression : plan.framed) {
+    aggregates.push_back({expression.function, read(expression.argument_slot), expression.frame});
+  }
+  try {
+    return op::plan_framed_window(types, keys, plan.order, aggregates);
+  } catch (std::invalid_argument const&) {
+    decline("framed aggregate the evaluator cannot run");
+  }
+}
+
 // Plans the expressions of one stage of `window` over an input of `input_types`. The expressions
-// come from `split_window_into_stages`, so they share their kind, partitions and window order. The
+// come from `split_window_into_stages`, so they share their kind, partitions and ranking order. The
 // input starts with the window child's columns, and a later stage of the same window also holds the
 // results of the stages below it. The output is the input followed by the results of `stage`.
 window_plan plan_window_stage(duckdb::LogicalWindow const& window,
@@ -411,8 +576,8 @@ window_plan plan_window_stage(duckdb::LogicalWindow const& window,
     return slot;
   };
 
-  // The expressions of a stage share their partitions and, for ranking functions and running
-  // aggregates, their ORDER BY, so the first expression defines both.
+  // The expressions of a stage share their partitions and, except for aggregates over the whole
+  // partition, their ORDER BY, so the first expression defines both.
   auto const& first = *stage.front().expression;
   for (auto const& key : first.Partitions()) {
     if (!is_supported_partition_key(key->GetReturnType())) {
@@ -421,7 +586,7 @@ window_plan plan_window_stage(duckdb::LogicalWindow const& window,
     plan.partition_slots.push_back(prepare(*key));
   }
   plan.kind = stage.front().kind;
-  if (plan.kind != window_kind::whole_partition) { plan_ranking_order(plan, first, prepare); }
+  if (plan.kind != window_kind::whole_partition) { plan_window_order(plan, first, prepare); }
 
   for (duckdb::idx_t i = 0; i < stage.size(); ++i) {
     auto const& entry      = stage[i];
@@ -434,11 +599,21 @@ window_plan plan_window_stage(duckdb::LogicalWindow const& window,
       plan.rankings.push_back({*ranking, expression.GetReturnType(), output_slot});
       continue;
     }
-    auto const aggregate     = std::get<aggregate_id>(entry.function);
+    auto const* framed       = std::get_if<framed_function>(&entry.function);
+    auto const aggregate     = framed ? framed->function : std::get<aggregate_id>(entry.function);
     auto const& argument     = aggregate == aggregate_id::count_star
                                  ? static_cast<duckdb::Expression const&>(count_all_argument)
                                  : *expression.GetChildren()[0];
     auto const argument_slot = prepare(argument);
+    if (framed) {
+      plan.framed.push_back({aggregate,
+                             argument_slot,
+                             plan.prepared_types[argument_slot],
+                             expression.GetReturnType(),
+                             framed->frame,
+                             output_slot});
+      continue;
+    }
     plan.expressions.push_back({aggregate,
                                 argument_slot,
                                 plan.prepared_types[argument_slot],
@@ -447,6 +622,10 @@ window_plan plan_window_stage(duckdb::LogicalWindow const& window,
                                 expression.WindowEnd(),
                                 output_slot});
   }
+  if (plan.kind == window_kind::whole_partition) {
+    plan.aggregate_plan = plan_aggregate_evaluation(plan);
+  }
+  if (!plan.framed.empty()) { plan.framed_plan = plan_framed_evaluation(plan); }
   return plan;
 }
 
@@ -556,6 +735,54 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_exchange(
   return assembly;
 }
 
+duckdb::unique_ptr<op::sirius_physical_operator> build_window_sort_exchange(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  std::vector<duckdb::idx_t> const& partition_slots,
+  op::window_order const& order,
+  std::size_t estimated_cardinality,
+  sort_exchange_options options)
+{
+  if (!child) { throw std::invalid_argument("Window exchange requires a prepared child"); }
+  if (partition_slots.empty()) {
+    throw std::invalid_argument("Sorted window exchange requires a PARTITION BY");
+  }
+  if (order.directions.size() != order.columns.size() ||
+      order.nulls.size() != order.columns.size()) {
+    throw std::invalid_argument("Window order has mismatched lengths");
+  }
+  auto const types = child->types;
+  // The sort operators only read the slot of a reference. Its type is the carrier's.
+  auto const reference = [&](duckdb::idx_t slot) {
+    if (slot >= types.size()) {
+      throw std::invalid_argument("Window sort key is outside its prepared schema");
+    }
+    return duckdb::make_uniq<duckdb::BoundReferenceExpression>(sirius::to_duckdb(types[slot]),
+                                                               slot);
+  };
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  // Any fixed order of the partition keys makes equal keys adjacent.
+  for (auto const slot : partition_slots) {
+    orders.emplace_back(
+      duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST, reference(slot));
+  }
+  for (std::size_t i = 0; i < order.columns.size(); ++i) {
+    if (order.columns[i] < 0) {
+      throw std::invalid_argument("Window sort key is outside its prepared schema");
+    }
+    auto const sql_order = op::to_duckdb_order(order.directions[i], order.nulls[i]);
+    orders.emplace_back(sql_order.type,
+                        sql_order.null_order,
+                        reference(static_cast<duckdb::idx_t>(order.columns[i])));
+  }
+  duckdb::vector<std::size_t> identity(types.size());
+  std::iota(identity.begin(), identity.end(), 0);
+  auto local_sort = duckdb::make_uniq<op::sirius_physical_order>(
+    types, std::move(orders), std::move(identity), estimated_cardinality);
+  local_sort->children.push_back(std::move(child));
+  options.boundary_key_count = partition_slots.size();
+  return build_sort_exchange(std::move(local_sort), options);
+}
+
 namespace {
 
 // Builds the WINDOW operator of one stage on top of its prepared input.
@@ -568,6 +795,20 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_stage(
   auto prepared = sirius::from_duckdb_vec(bound_plan.prepared_types);
   std::vector<cudf::size_type> keys(bound_plan.partition_slots.begin(),
                                     bound_plan.partition_slots.end());
+  if (bound_plan.kind == window_kind::framed) {
+    if (!bound_plan.framed_plan) {
+      throw duckdb::InternalException(
+        "Window stage of framed aggregates lacks its evaluation plan");
+    }
+    auto framed = duckdb::make_uniq<op::sirius_physical_window>(
+      sirius::from_duckdb_vec(bound_plan.output_types),
+      std::move(prepared),
+      bound_plan.input_width,
+      *bound_plan.framed_plan,
+      estimated_cardinality);
+    framed->children.push_back(std::move(child));
+    return framed;
+  }
   if (bound_plan.kind == window_kind::ranking) {
     std::vector<op::ranking_function> functions;
     for (auto const& ranking : bound_plan.rankings) {
@@ -578,14 +819,14 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_stage(
       std::move(prepared),
       bound_plan.input_width,
       std::move(keys),
-      bound_plan.ranking_order,
+      bound_plan.order,
       std::move(functions),
       estimated_cardinality);
     ranked->children.push_back(std::move(child));
     return ranked;
   }
   if (bound_plan.kind == window_kind::cumulative) {
-    std::vector<op::cumulative_aggregate> running;
+    std::vector<op::window_aggregate> running;
     for (auto const& expression : bound_plan.expressions) {
       running.push_back(
         {expression.function, static_cast<cudf::size_type>(expression.argument_slot)});
@@ -595,23 +836,20 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_window_stage(
       std::move(prepared),
       bound_plan.input_width,
       std::move(keys),
-      bound_plan.ranking_order,
+      bound_plan.order,
       std::move(running),
       estimated_cardinality);
     result->children.push_back(std::move(child));
     return result;
   }
-  std::vector<op::whole_partition_aggregate> aggregates;
-  for (auto const& expression : bound_plan.expressions) {
-    aggregates.push_back(
-      {expression.function, static_cast<cudf::size_type>(expression.argument_slot)});
+  if (!bound_plan.aggregate_plan) {
+    throw duckdb::InternalException("Window stage of aggregates lacks its evaluation plan");
   }
   auto result =
     duckdb::make_uniq<op::sirius_physical_window>(sirius::from_duckdb_vec(bound_plan.output_types),
                                                   std::move(prepared),
                                                   bound_plan.input_width,
-                                                  std::move(keys),
-                                                  std::move(aggregates),
+                                                  *bound_plan.aggregate_plan,
                                                   estimated_cardinality);
   result->children.push_back(std::move(child));
   return result;

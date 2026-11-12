@@ -231,6 +231,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/test_cross_join_slicing.cpp
     test/cpp/operator/window/test_cumulative.cpp
+    test/cpp/operator/window/test_framed.cpp
     test/cpp/operator/window/test_ranking.cpp
     test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
@@ -303,6 +304,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_set_operation_lowering.cpp
+    test/cpp/planner/test_sort_exchange.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/planner/test_substrait_scan_ranges.cpp
     test/cpp/planner/test_query_id.cpp

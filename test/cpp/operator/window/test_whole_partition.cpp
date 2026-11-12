@@ -28,13 +28,15 @@
 
 #include <catch.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <variant>
 
 namespace {
 using sirius::op::evaluate_whole_partition_window;
-using sirius::op::whole_partition_aggregate;
+using sirius::op::window_aggregate;
 using function = sirius::aggregate_id;
 
 void set_validity(cudf::column& column,
@@ -654,7 +656,7 @@ TEST_CASE("whole-partition evaluator rejects invalid requests", "[window_evaluat
   columns.push_back(sirius::test::operator_utils::make_string_column({"a", "b", "c"}, stream, mr));
   cudf::table input(std::move(columns));
   auto const evaluate = [&](std::vector<cudf::size_type> const& partition_columns,
-                            std::vector<whole_partition_aggregate> const& aggregates) {
+                            std::vector<window_aggregate> const& aggregates) {
     return evaluate_whole_partition_window(input.view(), partition_columns, aggregates, stream, mr);
   };
 
@@ -712,7 +714,7 @@ TEST_CASE("whole-partition evaluator widens only the sum columns that could over
   columns.push_back(column<int32_t>(small_dec32, dec32, stream, mr));
   columns.push_back(column<int32_t>(large_dec32, dec32, stream, mr));
   cudf::table input(std::move(columns));
-  std::vector<whole_partition_aggregate> aggregates;
+  std::vector<window_aggregate> aggregates;
   for (cudf::size_type c = 1; c <= 6; ++c) {
     aggregates.push_back({function::sum, c});
   }
@@ -742,4 +744,90 @@ TEST_CASE("whole-partition evaluator widens only the sum columns that could over
   check(3, large_dec64, -2);
   check(4, small_dec32, -2);
   check(5, large_dec32, -2);
+}
+
+TEST_CASE("whole-partition plan shares requests and widens sums by type", "[window_evaluator]")
+{
+  using plan_type = sirius::op::whole_partition_plan;
+  using cudf::type_id;
+  std::vector<cudf::data_type> const types{cudf::data_type{type_id::INT32},
+                                           cudf::data_type{type_id::INT64},
+                                           cudf::data_type{type_id::FLOAT32},
+                                           cudf::data_type{type_id::DECIMAL128, -2},
+                                           cudf::data_type{type_id::INT16}};
+  auto const plan = sirius::op::plan_whole_partition_window(types,
+                                                            {0},
+                                                            {{function::sum, 1},
+                                                             {function::avg, 1},
+                                                             {function::count, 1},
+                                                             {function::max, 2},
+                                                             {function::sum, 3},
+                                                             {function::sum, 4},
+                                                             {function::sum, 2}});
+  REQUIRE(plan.outputs.size() == 7);
+  CHECK(plan.group_columns == std::vector<cudf::size_type>{0});
+  // The group columns and the arguments need their logical types.
+  CHECK(plan.argument_columns == std::vector<cudf::size_type>{1, 2, 3, 4});
+  CHECK(sirius::op::logical_type_columns(plan) == std::vector<cudf::size_type>{0, 1, 2, 3, 4});
+  for (std::size_t v = 0; v < plan.values.size(); ++v) {
+    CHECK(std::any_of(plan.requests.begin(), plan.requests.end(), [&](auto const& request) {
+      return request.values == v;
+    }));
+  }
+  auto const& sum   = std::get<plan_type::output_request>(plan.outputs[0].recipe);
+  auto const& avg   = std::get<plan_type::output_average>(plan.outputs[1].recipe);
+  auto const& count = std::get<plan_type::output_request>(plan.outputs[2].recipe);
+  // SUM and AVG share one sum, and AVG and COUNT one count.
+  CHECK(avg.sum == sum.request);
+  CHECK(avg.count == count.request);
+  auto const preparation_of = [&](plan_type::output const& output) {
+    auto const request = std::get<plan_type::output_request>(output.recipe).request;
+    return plan.values[plan.requests[request].values].how;
+  };
+  // A 64 bit integer sum is widened only when a table's values need it.
+  CHECK(preparation_of(plan.outputs[0]) == plan_type::preparation::widen_if_needed);
+  CHECK(plan.requests[sum.request].type == cudf::data_type{type_id::DECIMAL128, 0});
+  CHECK(plan.requests[count.request].type == cudf::data_type{type_id::INT64});
+  CHECK(std::holds_alternative<plan_type::output_float_extremum>(plan.outputs[3].recipe));
+  {
+    auto const& extremum = std::get<plan_type::output_float_extremum>(plan.outputs[3].recipe);
+    // The extremum reads the NaN free values and NaN comes back from the maximum of the NaN flags.
+    CHECK(plan.values[plan.requests[extremum.extremum].values].how ==
+          plan_type::preparation::nans_to_nulls);
+    CHECK(plan.requests[extremum.any_nan].kind == plan_type::aggregation::max);
+    CHECK(plan.values[plan.requests[extremum.any_nan].values].how ==
+          plan_type::preparation::nan_flags);
+    CHECK(plan.requests[extremum.any_nan].type == cudf::data_type{type_id::BOOL8});
+  }
+  // DECIMAL128 sums in place and checks DECIMAL(38). Narrow integers sum in place in INT64.
+  CHECK(preparation_of(plan.outputs[4]) == plan_type::preparation::none);
+  CHECK(plan.outputs[4].check_decimal38);
+  CHECK_FALSE(plan.outputs[0].check_decimal38);
+  CHECK(preparation_of(plan.outputs[5]) == plan_type::preparation::none);
+  CHECK(plan.outputs[5].type == cudf::data_type{type_id::DECIMAL128, 0});
+  // FLOAT32 sums in FLOAT64.
+  CHECK(preparation_of(plan.outputs[6]) == plan_type::preparation::cast);
+  CHECK(plan.outputs[6].type == cudf::data_type{type_id::FLOAT64});
+}
+
+TEST_CASE("whole-partition evaluator rejects a table that does not match its plan",
+          "[window_evaluator][gpu]")
+{
+  rmm::cuda_stream owning_stream;
+  auto stream = static_cast<::cuda::stream_ref>(owning_stream);
+  auto mr     = cudf::get_current_device_resource_ref();
+  using cudf::type_id;
+  auto const plan = sirius::op::plan_whole_partition_window(
+    {cudf::data_type{type_id::INT32}, cudf::data_type{type_id::INT64}}, {0}, {{function::sum, 1}});
+  auto keys     = column<int32_t>({0, 1}, cudf::data_type{type_id::INT32}, stream, mr);
+  auto values64 = column<int64_t>({1, 2}, cudf::data_type{type_id::INT64}, stream, mr);
+  auto values32 = column<int32_t>({1, 2}, cudf::data_type{type_id::INT32}, stream, mr);
+  CHECK_NOTHROW(evaluate_whole_partition_window(
+    plan, cudf::table_view{{keys->view(), values64->view()}}, stream, mr));
+  CHECK_THROWS_AS(evaluate_whole_partition_window(
+                    plan, cudf::table_view{{keys->view(), values32->view()}}, stream, mr),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(
+    evaluate_whole_partition_window(plan, cudf::table_view{{keys->view()}}, stream, mr),
+    std::invalid_argument);
 }
