@@ -43,9 +43,7 @@ nan_free_argument make_nan_free_argument(cudf::column_view values,
       !static_cast<cudf::numeric_scalar<bool> const&>(*any).value(stream)) {
     return {};
   }
-  auto int8_flags = cudf::cast(flags->view(), cudf::data_type{cudf::type_id::INT8}, stream, mr);
-  flags.reset();
-  return {std::move(int8_flags), cudf::column_nans_to_nulls(values, stream, mr)};
+  return {std::move(flags), cudf::column_nans_to_nulls(values, stream, mr)};
 }
 
 std::unique_ptr<cudf::column> restore_nan(std::unique_ptr<cudf::column> result,
@@ -54,12 +52,17 @@ std::unique_ptr<cudf::column> restore_nan(std::unique_ptr<cudf::column> result,
                                           ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr)
 {
-  auto const boolean = cudf::data_type{cudf::type_id::BOOL8};
-  auto replace       = cudf::cast(any_nan, boolean, stream, mr);
+  cudf::column_view replace = any_nan;
+  std::unique_ptr<cudf::column> min_replace;
   if (function == aggregate_id::min) {
-    auto empty = cudf::is_null(result->view(), stream, mr);
-    replace    = cudf::binary_operation(
-      replace->view(), empty->view(), cudf::binary_operator::LOGICAL_AND, boolean, stream, mr);
+    auto empty  = cudf::is_null(result->view(), stream, mr);
+    min_replace = cudf::binary_operation(any_nan,
+                                         empty->view(),
+                                         cudf::binary_operator::LOGICAL_AND,
+                                         cudf::data_type{cudf::type_id::BOOL8},
+                                         stream,
+                                         mr);
+    replace     = min_replace->view();
   }
   auto nan = cudf::make_numeric_scalar(result->type(), stream, mr);
   if (result->type().id() == cudf::type_id::FLOAT32) {
@@ -70,7 +73,7 @@ std::unique_ptr<cudf::column> restore_nan(std::unique_ptr<cudf::column> result,
       std::numeric_limits<double>::quiet_NaN(), stream);
   }
   nan->set_valid_async(true, stream);
-  return cudf::copy_if_else(*nan, result->view(), replace->view(), stream, mr);
+  return cudf::copy_if_else(*nan, result->view(), replace, stream, mr);
 }
 
 }  // namespace sirius::op

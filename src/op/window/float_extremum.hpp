@@ -48,7 +48,7 @@ namespace sirius::op {
  * Both members are nullptr when the argument holds no NaN.
  */
 struct nan_free_argument {
-  /// 1 for a NaN row and 0 for every other row, including NULL rows, as INT8.
+  /// true for a NaN row and false for every other row, including NULL rows, as BOOL8.
   std::unique_ptr<cudf::column> flags;
   /// The argument with NaN replaced by NULL.
   std::unique_ptr<cudf::column> finite;
@@ -72,7 +72,8 @@ nan_free_argument make_nan_free_argument(cudf::column_view values,
  * no other non-NULL value is, which is where @p result is NULL.
  *
  * @param result The `min` or `max` over the NaN free copy.
- * @param any_nan The maximum of the NaN flags over the same rows as each value of @p result.
+ * @param any_nan The maximum of the NaN flags over the same rows as each value of @p result, as
+ * BOOL8 without NULLs.
  * @param function `min` or `max`.
  */
 std::unique_ptr<cudf::column> restore_nan(std::unique_ptr<cudf::column> result,

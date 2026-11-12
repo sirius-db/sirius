@@ -294,6 +294,8 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   struct prepared_argument {
     cudf::size_type column;
     nan_free_argument nan_free;
+    // The request of the maximum of the NaN flags, shared by the `min` and `max` of the column.
+    std::optional<std::size_t> flag_request;
   };
   std::vector<prepared_argument> nan_free_arguments;
   std::vector<whole_partition_aggregate> simple_aggregates;
@@ -306,7 +308,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     cudf::groupby::aggregation_request request;
     request.values = input.column(agg.argument_column);
     // Set when the argument holds NaN.
-    nan_free_argument const* nan_free = nullptr;
+    prepared_argument* nan_free = nullptr;
     if ((agg.function == aggregate_id::min || agg.function == aggregate_id::max) &&
         cudf::is_floating_point(request.values.type())) {
       auto existing =
@@ -317,21 +319,22 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
         existing = std::prev(nan_free_arguments.end());
       }
       if (existing->nan_free.flags) {
-        nan_free       = &existing->nan_free;
-        request.values = nan_free->finite->view();
+        nan_free       = &*existing;
+        request.values = nan_free->nan_free.finite->view();
       }
     }
     request.aggregations.push_back(simple_aggregation<cudf::groupby_aggregation>(agg.function));
     requests.push_back(std::move(request));
-    if (nan_free) {
-      nan_flag_indices[i] = requests.size();
+    if (nan_free && !nan_free->flag_request) {
+      nan_free->flag_request = requests.size();
       cudf::groupby::aggregation_request any_nan;
-      any_nan.values = nan_free->flags->view();
+      any_nan.values = nan_free->nan_free.flags->view();
       any_nan.aggregations.push_back(
         simple_aggregation<cudf::groupby_aggregation>(aggregate_id::max));
       requests.push_back(std::move(any_nan));
       simple_aggregates.push_back({aggregate_id::max, agg.argument_column});
     }
+    if (nan_free) { nan_flag_indices[i] = nan_free->flag_request; }
   }
 
   // 3. Run the requests. The group by also gives the group keys.
