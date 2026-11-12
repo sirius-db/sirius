@@ -12,7 +12,9 @@
 # moving to plan time.
 
 [features]
-window_functions = false
+window_functions = true
+window_gaps = false
+float_exact_keys = false
 distinct = true
 grouping_sets = true
 full_join = false
@@ -25,8 +27,8 @@ types = ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT",
 [features.set_ops]
 union_all = true
 union = true
-except = false
-intersect = false
+except = true
+intersect = true
 
 [features.joins]
 types = ["inner", "left", "right", "semi", "anti"]
@@ -49,6 +51,8 @@ materialized = true
 [features.aggregates]
 functions = ["sum", "count", "count_star", "min", "max", "avg"]   # first: nondeterministic
 distinct = "on"  # off | grouped_only | on
+filter = true
+filter_subquery = false
 
 [features.scalar_functions]
 enabled = ["add", "sub", "mul", "div", "int_div", "mod",

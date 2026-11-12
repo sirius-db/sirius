@@ -43,8 +43,8 @@ def gap_switch(default: Any, on: Any = True) -> Any:
 class SetOps:
     union_all: bool = True
     union: bool = True
-    except_: bool = gap_switch(False)
-    intersect: bool = gap_switch(False)
+    except_: bool = True
+    intersect: bool = True
 
 
 @dataclass
@@ -79,6 +79,8 @@ class Aggregates:
         default_factory=lambda: ["sum", "count", "count_star", "min", "max", "avg"]
     )
     distinct: str = "on"  # off | grouped_only | on
+    filter: bool = True
+    filter_subquery: bool = gap_switch(False)
 
 
 @dataclass
@@ -177,7 +179,9 @@ class Complexity:
 
 @dataclass
 class Features:
-    window_functions: bool = gap_switch(False)
+    window_functions: bool = True
+    window_gaps: bool = gap_switch(False)
+    float_exact_keys: bool = gap_switch(False)
     distinct: bool = True
     grouping_sets: bool = True
     full_join: bool = gap_switch(False)

@@ -34,7 +34,7 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(None)
         self.assertEqual(cfg.source_path, str(DEFAULT_CONFIG))
         self.assertEqual(cfg.to_dict(), load_config(DEFAULT_CONFIG).to_dict())
-        self.assertFalse(cfg.features.window_functions)
+        self.assertTrue(cfg.features.window_functions)
 
     def test_default_file_lists_every_key(self):
         # The shipped file is where a feature gets flipped on when Sirius supports it,
@@ -127,7 +127,7 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(None, ["features.expressions.try=true"])
         again = tomllib.loads(cfg.to_toml())
         self.assertTrue(again["features"]["expressions"]["try"])
-        self.assertEqual(again["features"]["set_ops"]["except"], False)
+        self.assertEqual(again["features"]["set_ops"]["except"], True)
 
     def test_bad_type_name(self):
         with self.assertRaises(ValueError):

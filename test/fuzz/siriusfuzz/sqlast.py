@@ -43,6 +43,7 @@ class ColumnRef(Expr):
     alias: str
     name: str
     type: st.SqlType
+    computed_float: bool = False
 
     @property
     def kind(self) -> str:  # type: ignore[override]
@@ -229,16 +230,21 @@ class Agg(Expr):
     arg: Expr | None
     distinct: bool = False
     kind: str = "unknown"
+    filter: Expr | None = None
 
     def sql(self) -> str:
         if self.name == "count_star":
-            return "count(*)"
-        assert self.arg is not None
-        d = "DISTINCT " if self.distinct else ""
-        return f"{self.name}({d}{self.arg.sql()})"
+            body = "count(*)"
+        else:
+            assert self.arg is not None
+            d = "DISTINCT " if self.distinct else ""
+            body = f"{self.name}({d}{self.arg.sql()})"
+        if self.filter is not None:
+            body += f" FILTER (WHERE {self.filter.sql()})"
+        return body
 
     def label(self) -> str:
-        return f"Agg({self.name}{',distinct' if self.distinct else ''})"
+        return f"Agg({self.name}{',distinct' if self.distinct else ''}{',filter' if self.filter else ''})"
 
 
 @dataclass
@@ -280,9 +286,17 @@ class Window(Expr):
     partition_by: list[Expr]
     order_by: list["OrderItem"]
     kind: str = "unknown"
+    frame: str | None = None
+
+    def label(self) -> str:
+        return f"Window({self.name}{',running' if self.frame else ''})"
 
     def sql(self) -> str:
-        inner = self.arg.sql() if self.arg is not None else ""
+        inner = (
+            self.arg.sql()
+            if self.arg is not None
+            else ("*" if self.name == "count" else "")
+        )
         parts = []
         if self.partition_by:
             parts.append(
@@ -290,6 +304,8 @@ class Window(Expr):
             )
         if self.order_by:
             parts.append("ORDER BY " + ", ".join(o.sql() for o in self.order_by))
+        if self.frame:
+            parts.append(self.frame)
         return f"{self.name}({inner}) OVER ({' '.join(parts)})"
 
 
@@ -390,7 +406,7 @@ def has_computed_float(items: list[SelectItem], names: set[str] | None = None) -
     return any(
         (names is None or it.alias in names)
         and it.expr.kind == "float"
-        and not isinstance(it.expr, ColumnRef)
+        and (not isinstance(it.expr, ColumnRef) or it.expr.computed_float)
         for it in items
     )
 

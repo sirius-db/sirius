@@ -167,6 +167,23 @@ feature, flip its flag to `true` there. `--set key.path=value` overrides any key
 
 `known_issues.toml` quarantines confirmed divergences by regex; every entry carries an issue link.
 
+**Phase 2b SQL shapes.** `features.window_functions` generates whole-partition `sum`, `avg`,
+`count`, `min`, and `max`; ordered `rank`, `dense_rank`, and `row_number`; and running
+`sum`, `count`, `min`, and `max` with an explicit unbounded-preceding ROWS frame. It also
+generates multiple window specifications and a derived-table top-N-per-group filter. These
+queries use direct base-table inputs and the unique `k` column as a deterministic tie-breaker.
+`features.window_gaps` adds declined default and bounded frames and running `avg` in gaps mode.
+
+`features.aggregates.filter` adds `FILTER (WHERE ...)` to roughly one fifth of grouped and
+ungrouped aggregates, including `count(DISTINCT x)`. The generated predicate uses the same
+input scope as the aggregate; `features.aggregates.filter_subquery` allows experimental
+`IN`/`EXISTS` predicates in gaps mode. `features.set_ops.except` and `.intersect` each cover
+distinct and `ALL` forms, including pairs of projections over the same table. By default the
+generator keeps computed floating-point results out of exact DISTINCT, set-membership,
+grouping, and window keys. `features.float_exact_keys` restores those shapes in gaps mode so
+the known last-bit rounding issue stays measurable. `EXCEPT ALL` and `INTERSECT ALL` exclude
+floating-point keys because Sirius does not admit those keys for the `ALL` forms.
+
 **Sirius YAML.** `--sirius-config` selects it (repeat the flag to alternate across workers);
 otherwise the configuration's `sirius.configs` applies (by default the integration YAML and
 `config/partition16k.yaml`, whose 16 KiB budgets split the small fuzz tables into several hash

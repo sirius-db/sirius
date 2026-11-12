@@ -16,7 +16,19 @@ from siriusfuzz.query_gen import QueryGenerator
 from siriusfuzz.report import _CLAIMED_FEATURES
 from siriusfuzz.schema_gen import DataGenerator
 from siriusfuzz.session import Session
-from siriusfuzz.sqlast import Compare, Join, Logical
+from siriusfuzz.sqlast import (
+    Agg,
+    ColumnRef,
+    Compare,
+    Exists,
+    InSubquery,
+    Join,
+    Logical,
+    Select,
+    SetOp,
+    Window,
+    has_computed_float,
+)
 
 
 def walk(node):
@@ -66,6 +78,101 @@ def run_batch(cfg, n, seed):
         finally:
             session.close()
     return ok, errors, qg.stats
+
+
+class Phase2bShapes(unittest.TestCase):
+    def generated(self, overrides, count=1200):
+        cfg = load_config(None, overrides)
+        dg = DataGenerator(cfg, random.Random(20261112))
+        ds = dg.generate(20261112)
+        qg = QueryGenerator(cfg, ds, random.Random(20261112), dg)
+        return [qg.generate() for _ in range(count)]
+
+    def test_window_admission_and_consumers(self):
+        queries = self.generated(["features.window_functions=true"])
+        windows = [n for q in queries for n in walk(q) if isinstance(n, Window)]
+        self.assertGreater(len(windows), 30)
+        self.assertTrue(any(w.name == "row_number" for w in windows))
+        self.assertTrue(any(w.name == "rank" for w in windows))
+        self.assertTrue(any(w.name == "dense_rank" for w in windows))
+        self.assertTrue(any(w.frame for w in windows))
+        self.assertTrue(any("WHERE" in q.sql() and '"rn"' in q.sql() for q in queries))
+        self.assertTrue(
+            any(sum(isinstance(n, Window) for n in walk(q)) >= 2 for q in queries)
+        )
+        for w in windows:
+            self.assertFalse(
+                any(
+                    isinstance(k, ColumnRef) and k.computed_float
+                    for k in w.partition_by
+                )
+            )
+            self.assertFalse(
+                any(
+                    isinstance(o.expr, ColumnRef) and o.expr.computed_float
+                    for o in w.order_by
+                )
+            )
+            self.assertFalse(any(k.kind == "float" for k in w.partition_by), w.sql())
+            self.assertFalse(
+                any(k.kind == "int" and not k.type.signed for k in w.partition_by),
+                w.sql(),
+            )
+            if w.name in ("rank", "dense_rank", "row_number"):
+                self.assertTrue(w.order_by, w.sql())
+            elif w.order_by:
+                self.assertEqual(
+                    w.frame, "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", w.sql()
+                )
+                self.assertNotEqual(w.name, "avg", w.sql())
+
+    def test_aggregate_filters(self):
+        queries = self.generated(["features.aggregates.filter=true"])
+        filtered = [
+            n
+            for q in queries
+            for n in walk(q)
+            if isinstance(n, Agg) and n.filter is not None
+        ]
+        self.assertGreater(len(filtered), 30)
+        self.assertTrue(any("FILTER (WHERE" in q.sql() for q in queries))
+        for agg in filtered:
+            self.assertIn(agg.name, ("count_star", "count", "sum", "min", "max", "avg"))
+            self.assertFalse(
+                any(isinstance(n, (Exists, InSubquery)) for n in walk(agg.filter))
+            )
+
+    def test_set_operations_and_exact_float_keys(self):
+        queries = self.generated(
+            ["features.set_ops.except=true", "features.set_ops.intersect=true"]
+        )
+        ops = [n for q in queries for n in walk(q) if isinstance(n, SetOp)]
+        for op in ("EXCEPT", "EXCEPT ALL", "INTERSECT", "INTERSECT ALL"):
+            self.assertTrue(any(n.op == op for n in ops), op)
+        membership = [n for n in ops if n.op.startswith(("EXCEPT", "INTERSECT"))]
+        shared = [
+            n
+            for n in membership
+            if n.arms[0].from_.sql() == n.arms[1].from_.sql()
+            and n.arms[0].where != n.arms[1].where
+        ]
+        self.assertGreaterEqual(len(shared) / len(membership), 0.5)
+        for q in queries:
+            for n in walk(q):
+                if isinstance(n, SetOp) and "ALL" not in n.op:
+                    self.assertFalse(
+                        any(has_computed_float(arm.items) for arm in n.arms), n.sql()
+                    )
+                if isinstance(n, Select):
+                    if n.distinct:
+                        self.assertFalse(has_computed_float(n.items), n.sql())
+                    self.assertFalse(
+                        any(
+                            isinstance(k, ColumnRef) and k.computed_float
+                            for k in n.group_by
+                        ),
+                        n.sql(),
+                    )
 
 
 @unittest.skipUnless(SHELL, "no DuckDB shell available")
@@ -130,7 +237,14 @@ class GeneratorValidity(unittest.TestCase):
     def test_row_number_is_independent_of_input_order(self):
         # The ambiguity filter permutes input rows the same way; a row_number()
         # whose ORDER BY has ties would fail this and be discarded as ambiguous.
-        cfg = load_config(None, ["data.rows=[20,200]"], mode="gaps")
+        cfg = load_config(
+            None,
+            [
+                "data.rows=[20,200]",
+                "features.window_functions=true",
+                "features.complexity.query=0.0",
+            ],
+        )
         dg = DataGenerator(cfg, random.Random(4))
         ds = dg.generate(4)
         qg = QueryGenerator(cfg, ds, random.Random(4), dg)
@@ -140,8 +254,15 @@ class GeneratorValidity(unittest.TestCase):
             try:
                 session.load_dataset(ds, "base")
                 session.load_dataset(ds, "perm", permutation_seed=5)
-                for _ in range(1500):
-                    sql = qg.generate().sql()
+                for _ in range(2500):
+                    query = qg.generate()
+                    if not isinstance(query, Select) or not any(
+                        isinstance(node, Window) and node.name == "row_number"
+                        for item in query.items
+                        for node in walk(item)
+                    ):
+                        continue
+                    sql = query.sql()
                     # LIMIT/OFFSET may cut through ties when the profile allows it.
                     if "row_number()" not in sql or "LIMIT" in sql or "OFFSET" in sql:
                         continue

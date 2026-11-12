@@ -52,6 +52,7 @@ from .sqlast import (
     Try,
     Window,
     has_computed_float,
+    walk,
 )
 
 CONCRETE: dict[str, st.SqlType] = {
@@ -186,6 +187,8 @@ class QueryGenerator:
     def _generate_once(self) -> Query:
         r = self.rng.random()
         pq = self.f.complexity.query
+        if self.f.window_functions and self.rng.random() < 0.06:
+            return self._gen_window_consumer()
         if self.f.cte.materialized and r < pq:
             return self._gen_with_cte()
         set_ops = self._enabled_set_ops()
@@ -201,7 +204,9 @@ class QueryGenerator:
                 ("UNION ALL", 3.0 if so.union_all else 0),
                 ("UNION", 1.0 if so.union else 0),
                 ("EXCEPT", 1.0 if so.except_ else 0),
+                ("EXCEPT ALL", 1.0 if so.except_ else 0),
                 ("INTERSECT", 1.0 if so.intersect else 0),
+                ("INTERSECT ALL", 1.0 if so.intersect else 0),
             )
             if w > 0
         }
@@ -221,16 +226,103 @@ class QueryGenerator:
         main.ctes.insert(0, cte)
         return main
 
+    def _gen_window_consumer(self) -> Select:
+        """Top N per group, with the window result filtered in an outer SELECT."""
+        table = self.rng.choice(self.ds.tables)
+        inner_alias = self._alias()
+        cols = [ColumnRef(inner_alias, c.name, c.type) for c in table.columns]
+        key = next(c for c in cols if c.name == "k")
+        parts = [c for c in cols if c.name.startswith("fk_")]
+        if not parts:
+            parts = [
+                c
+                for c in cols
+                if c.name != "k"
+                and (
+                    c.kind in ("bool", "date", "timestamp", "varchar")
+                    or (c.kind == "int" and c.type.signed)
+                    or (c.kind == "decimal" and c.type.precision > 16)
+                )
+            ] or [key]
+        part = self.rng.choice(parts)
+        order = [OrderItem(key)]  # k is unique in every base table
+        window = Window("row_number", None, [part], order, kind="int")
+        inner = Select(
+            items=[SelectItem(key, "k"), SelectItem(window, "rn")],
+            from_=TableRef(table.name, inner_alias),
+        )
+        if table.name.startswith("f"):
+            inner.where = Compare("<", key, Literal(1000, st.BIGINT))
+        outer_alias = self._alias()
+        rank = ColumnRef(outer_alias, "rn", st.BIGINT)
+        self._note("window")
+        self._note("window:consumer")
+        return Select(
+            items=[
+                SelectItem(ColumnRef(outer_alias, "k", key.type), "c0"),
+                SelectItem(rank, "c1"),
+            ],
+            from_=Derived(inner, outer_alias),
+            where=Between(rank, Literal(1, st.BIGINT), Literal(3, st.BIGINT)),
+        )
+
     def _gen_setop(self, depth: int) -> Query:
         op = self._pick(self._enabled_set_ops())
-        self._note(f"setop:{op}")
         n_cols = self.rng.randint(1, 4)
-        kinds = [self.rng.choice(list(CONCRETE)) for _ in range(n_cols)]
+        allowed = (
+            [k for k in CONCRETE if k != "float"]
+            if op in ("EXCEPT ALL", "INTERSECT ALL")
+            else list(CONCRETE)
+        )
+        kinds = [self.rng.choice(allowed) for _ in range(n_cols)]
         types = [CONCRETE[k] for k in kinds]
         arms: list[Select] = [
             self._gen_select(depth=depth + 1, outer=None, required=types)
             for _ in range(self.rng.choice([2, 2, 2, 3]))
         ]
+        if (
+            not self.f.float_exact_keys
+            and "ALL" not in op
+            and any(has_computed_float(arm.items) for arm in arms)
+        ):
+            if op in ("EXCEPT", "INTERSECT") and "float" in kinds:
+                # Their ALL forms cannot compare floating-point keys at all.
+                kinds = ["int" if kind == "float" else kind for kind in kinds]
+                types = [CONCRETE[k] for k in kinds]
+                arms = [
+                    self._gen_select(depth=depth + 1, outer=None, required=types)
+                    for _ in range(len(arms))
+                ]
+            else:
+                op = "UNION ALL" if op == "UNION" else f"{op} ALL"
+        if op.startswith(("EXCEPT", "INTERSECT")) and self.rng.random() < 0.75:
+            # Keep the projections identical so membership and multiplicity are tested.
+            right = copy.deepcopy(arms[0])
+
+            def visible_table(
+                node: TableRef | Derived | Join | None,
+            ) -> TableRef | None:
+                if isinstance(node, TableRef):
+                    return node
+                if isinstance(node, Join):
+                    left = visible_table(node.left)
+                    if left is not None:
+                        return left
+                    if node.join_type not in ("semi", "anti"):
+                        return visible_table(node.right)
+                return None
+
+            ref = visible_table(right.from_)
+            if ref is not None:
+                key = ColumnRef(ref.alias, "k", st.BIGINT)
+                pred = Compare(
+                    "<", key, Literal(self.rng.choice([5, 10, 25]), st.BIGINT)
+                )
+                right.where = (
+                    Logical("AND", [right.where, pred]) if right.where else pred
+                )
+                arms[1] = right
+        self._note(f"setop:{op}")
         setop = SetOp(op, list(arms))
         names = arms[0].output_names()
         if self.f.order_by.enabled and self.rng.random() < 0.5:
@@ -320,8 +412,19 @@ class QueryGenerator:
                 if col.name == "k"
             ]
             if fact_keys:
-                bound = Compare("<", fact_keys[0], Literal(1000, st.BIGINT))
-                sel.where = Logical("AND", [sel.where, bound]) if sel.where else bound
+                unbounded_running_window = (
+                    self.f.window_functions
+                    and self.rng.random() < 0.02
+                    and any(
+                        isinstance(n, Window) and n.frame and not n.partition_by
+                        for n in walk(sel)
+                    )
+                )
+                if not unbounded_running_window:
+                    bound = Compare("<", fact_keys[0], Literal(1000, st.BIGINT))
+                    sel.where = (
+                        Logical("AND", [sel.where, bound]) if sel.where else bound
+                    )
         self._gen_order_limit(sel, depth)
         return sel
 
@@ -339,7 +442,11 @@ class QueryGenerator:
             items = []
             for i, typ in enumerate(required):
                 expr = self._gen_expr(typ.kind, scope, depth + 1)
-                items.append(SelectItem(Cast(expr, typ), f"c{i}"))
+                items.append(
+                    SelectItem(
+                        expr if exact_type(expr) == typ else Cast(expr, typ), f"c{i}"
+                    )
+                )
             sel.items = items
             self._maybe_distinct(sel)
             return
@@ -361,10 +468,18 @@ class QueryGenerator:
                 items.append(
                     SelectItem(self._gen_expr(kind, scope, depth + 1), f"c{i}")
                 )
-            if self.f.window_functions and rng.random() < 0.3:
-                items.append(
-                    SelectItem(self._gen_window(scope, depth + 1), f"c{len(items)}")
-                )
+            if (
+                self.f.window_functions
+                and depth == 0
+                and scope.outer is None
+                and len(scope.tables) == 1
+                and scope.tables[0].table_name is not None
+                and rng.random() < 0.3
+            ):
+                for _ in range(2 if rng.random() < 0.2 else 1):
+                    items.append(
+                        SelectItem(self._gen_window(scope, depth + 1), f"c{len(items)}")
+                    )
             sel.items = items
             self._maybe_distinct(sel)
         if exact_outputs:
@@ -374,6 +489,8 @@ class QueryGenerator:
 
     def _maybe_distinct(self, sel: Select) -> None:
         if self.f.distinct and self.rng.random() < 0.2:
+            if not self.f.float_exact_keys and has_computed_float(sel.items):
+                return
             sel.distinct = True
             self._note("distinct")
 
@@ -388,7 +505,22 @@ class QueryGenerator:
         aggs: list[Expr] = []
         for _ in range(rng.randint(1, 3)):
             aggs.append(self._gen_agg(scope, depth + 1, grouped=True))
+        self._filter_pair_shapes(aggs, scope)
         items += [SelectItem(a, f"c{len(items) + i}") for i, a in enumerate(aggs)]
+        if self.f.window_functions and self.f.window_gaps and rng.random() < 0.04:
+            numeric = scope.columns("int") + scope.columns("float")
+            if numeric:
+                arg = rng.choice(numeric)
+                inner = Agg("sum", arg, kind=arg.kind)
+                grouped_window = Window(
+                    "sum",
+                    inner,
+                    [keys[0]],
+                    [],
+                    kind=arg.kind,
+                )
+                items.append(SelectItem(grouped_window, f"c{len(items)}"))
+                self._note("window:grouped_gap")
         sel.items = items
         sel.group_by = [copy.deepcopy(k) for k in keys]
         if self.f.grouping_sets and rng.random() < 0.3:
@@ -401,13 +533,48 @@ class QueryGenerator:
     def _gen_ungrouped_agg(self, sel: Select, scope: Scope, depth: int) -> None:
         self._note("ungrouped_aggregate")
         n = self.rng.randint(1, 3)
-        sel.items = [
-            SelectItem(self._gen_agg(scope, depth + 1, grouped=False), f"c{i}")
-            for i in range(n)
-        ]
+        aggs = [self._gen_agg(scope, depth + 1, grouped=False) for _ in range(n)]
+        self._filter_pair_shapes(aggs, scope)
+        sel.items = [SelectItem(agg, f"c{i}") for i, agg in enumerate(aggs)]
+
+    def _filter_pair_shapes(self, aggs: list[Expr], scope: Scope) -> None:
+        if not self.f.aggregates.filter or len(aggs) < 2:
+            return
+        key = next((c for c in scope.columns("int") if c.name == "k"), None)
+        if key is None:
+            return
+        choice = self.rng.random()
+        if choice < 0.1:
+            # Same argument, one filtered and one unfiltered.
+            arg = self.rng.choice(scope.columns())
+            aggs[0] = Agg("count", arg, kind="int")
+            aggs[1] = Agg(
+                "count",
+                copy.deepcopy(arg),
+                kind="int",
+                filter=Compare("<", key, Literal(10, st.BIGINT)),
+            )
+            self._note("agg:filter")
+            self._note("agg:filter_shared_arg")
+        elif choice < 0.2:
+            # Every aggregate has a distinct filter.
+            for i in range(len(aggs)):
+                arg = self.rng.choice(scope.columns())
+                aggs[i] = Agg(
+                    "count",
+                    arg,
+                    kind="int",
+                    filter=Compare("<", key, Literal(5 + 5 * i, st.BIGINT)),
+                )
+                self._note("agg:filter")
+            self._note("agg:filter_all")
 
     def _gen_group_key(self, scope: Scope, depth: int) -> Expr:
-        cols = scope.columns()
+        cols = [
+            c
+            for c in scope.columns()
+            if self.f.float_exact_keys or not c.computed_float
+        ]
         if self.ds.has_facts:
             fact_aliases = {
                 table.alias
@@ -568,7 +735,9 @@ class QueryGenerator:
             return TableRef(table.name, alias), ScopeTable(alias, cols, table.name)
         if force_cte is not None or (ctes and rng.random() < 0.4):
             name = force_cte or rng.choice(list(ctes))
-            cols = [ColumnRef(alias, c.name, c.type) for c in ctes[name]]
+            cols = [
+                ColumnRef(alias, c.name, c.type, c.computed_float) for c in ctes[name]
+            ]
             self._note("cte_ref")
             return TableRef(name, alias), ScopeTable(alias, cols)
         pq = self.f.complexity.query
@@ -593,7 +762,14 @@ class QueryGenerator:
             typ = exact_type(item.expr)
             if typ is None:
                 continue
-            cols.append(ColumnRef(alias, item.alias, typ))
+            cols.append(
+                ColumnRef(
+                    alias,
+                    item.alias,
+                    typ,
+                    typ.kind == "float" and has_computed_float([item]),
+                )
+            )
         return cols
 
     def _gen_join_cond(
@@ -1017,36 +1193,108 @@ class QueryGenerator:
     def _gen_window(self, scope: Scope, depth: int) -> Expr:
         rng = self.rng
         self._note("window")
-        cols = scope.columns()
+        cols = [
+            c
+            for c in scope.columns()
+            if self.f.float_exact_keys or not c.computed_float
+        ]
         if not cols:
             raise GenerationFailed("no columns for window")
-        part = [rng.choice(cols)] if rng.random() < 0.7 else []
-        order = [OrderItem(rng.choice(cols), desc=rng.random() < 0.5)]
 
-        def row_number() -> Window:
-            # row_number() breaks ORDER BY ties arbitrarily; ordering by every column
-            # in scope leaves ties only between indistinguishable rows. The aggregates
-            # below need no tiebreak: their default RANGE frame gives peers one value.
+        def numeric(c: ColumnRef) -> bool:
+            t = c.type
+            return (
+                t.kind == "float"
+                or (t.kind == "int" and t.signed)
+                or (t.kind == "decimal" and t.precision > 16)
+            )
+
+        def partitionable(c: ColumnRef) -> bool:
+            return (
+                c.kind in ("bool", "date", "timestamp", "varchar")
+                or (c.kind == "int" and c.type.signed)
+                or (c.kind == "decimal" and c.type.precision > 16)
+            )
+
+        fact_tables = [t for t in scope.tables if (t.table_name or "").startswith("f")]
+        partition_candidates = [c for c in cols if partitionable(c)]
+        if fact_tables and not self.f.float_exact_keys:
+            # Foreign keys keep partitions bounded on million-row fact tables.
+            partition_candidates = [
+                c
+                for c in partition_candidates
+                if c.name.startswith("fk_")
+                or c.alias not in {t.alias for t in fact_tables}
+            ] or partition_candidates
+        part = (
+            [rng.choice(partition_candidates)]
+            if partition_candidates and rng.random() < (0.9 if fact_tables else 0.7)
+            else []
+        )
+        order_cols = [c for c in cols if numeric(c) or partitionable(c)]
+        first = rng.choice(order_cols)
+        order = [OrderItem(first, desc=rng.random() < 0.5)]
+        choices = [
+            "rank",
+            "dense_rank",
+            "row_number",
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+        ]
+        name = rng.choice(choices)
+        running = name in ("count", "sum", "min", "max") and rng.random() < 0.4
+        if self.f.window_gaps and rng.random() < 0.08:
+            running = True
+            name = "avg"
+        if name in ("rank", "dense_rank"):
+            return Window(name, None, part, order, kind="int")
+        if name == "row_number" or running:
+            if (
+                any(c.computed_float for c in scope.columns())
+                and not self.f.float_exact_keys
+            ):
+                return Window("rank", None, part, order, kind="int")
             order.extend(
                 OrderItem(c, desc=rng.random() < 0.5)
-                for c in cols
-                if c is not order[0].expr
+                for c in order_cols
+                if c is not first
             )
-            return Window("row_number", None, part, order, kind="int")
-
-        name = rng.choice(["row_number", "count", "sum", "min", "max"])
+        else:
+            order = []
         if name == "row_number":
-            return row_number()
-        nums = scope.columns("int") + scope.columns("float") + scope.columns("decimal")
-        arg = (
-            rng.choice(nums)
-            if nums and name != "count"
-            else (rng.choice(cols) if name == "count" else None)
-        )
-        if arg is None:
-            return row_number()
-        kind = "int" if name == "count" else arg.kind
-        return Window(name, arg, part, order, kind=kind)
+            return Window(name, None, part, order, kind="int")
+        arg: Expr | None = None
+        if name != "count" or rng.random() < 0.7:
+            if name == "count":
+                candidates = [c for c in cols if numeric(c) or partitionable(c)]
+            elif name in ("sum", "avg"):
+                candidates = [c for c in cols if numeric(c)]
+            elif running:
+                candidates = [
+                    c for c in cols if numeric(c) or c.kind in ("date", "timestamp")
+                ]
+            else:
+                candidates = [c for c in cols if numeric(c) or partitionable(c)]
+            if not candidates:
+                return Window(
+                    "row_number",
+                    None,
+                    part,
+                    order or [OrderItem(c) for c in order_cols],
+                    kind="int",
+                )
+            arg = rng.choice(candidates)
+        kind = "int" if name == "count" else ("float" if name == "avg" else arg.kind)
+        frame = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" if running else None
+        if self.f.window_gaps and running and rng.random() < 0.25:
+            frame = rng.choice([None, "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"])
+        win = Window(name, arg, part, order, kind=kind, frame=frame)
+        if name == "sum" and arg is not None and arg.kind == "int":
+            return Cast(win, st.BIGINT)
+        return win
 
     # -- booleans --------------------------------------------------------
 
@@ -1176,13 +1424,15 @@ class QueryGenerator:
             distinct = rng.random() < 0.25 and (grouped or distinct_mode == "on")
         if name == "count_star":
             self._note("agg:count_star")
-            return Agg("count_star", None, kind="int")
+            return self._maybe_filter_agg(
+                Agg("count_star", None, kind="int"), scope, depth
+            )
         if name in ("sum", "avg"):
             kind = rng.choice(["int", "float", "decimal"])
             arg = self._gen_expr(kind, scope, depth + 1)
             out = "float" if name == "avg" else kind
             self._note(f"agg:{name}")
-            agg = Agg(name, arg, kind=out)
+            agg = self._maybe_filter_agg(Agg(name, arg, kind=out), scope, depth)
             if name == "sum" and kind == "int":
                 # sum(int) is HUGEINT; narrow as _gen_agg_of_kind does so the column type stays
                 # BIGINT (an EMPTY_RESULT over a HUGEINT column falls back to the CPU).
@@ -1191,17 +1441,42 @@ class QueryGenerator:
         if name == "count":
             kind = self._pick_kind_in_scope(scope)
             self._note("agg:count" + (":distinct" if distinct else ""))
-            return Agg(
-                "count",
-                self._gen_expr(kind, scope, depth + 1),
-                distinct=distinct,
-                kind="int",
+            return self._maybe_filter_agg(
+                Agg(
+                    "count",
+                    self._gen_expr(kind, scope, depth + 1),
+                    distinct=distinct,
+                    kind="int",
+                ),
+                scope,
+                depth,
             )
         if name in ("min", "max", "first"):
             kind = self._pick_kind_in_scope(scope)
             self._note(f"agg:{name}")
-            return Agg(name, self._gen_expr(kind, scope, depth + 1), kind=kind)
+            agg = Agg(name, self._gen_expr(kind, scope, depth + 1), kind=kind)
+            return self._maybe_filter_agg(agg, scope, depth)
         raise GenerationFailed(name)
+
+    def _maybe_filter_agg(self, agg: Agg, scope: Scope, depth: int) -> Agg:
+        if (
+            not self.f.aggregates.filter
+            or agg.name == "first"
+            or self.rng.random() >= 0.2
+        ):
+            return agg
+        for _ in range(4):
+            try:
+                pred = self._gen_bool(_inner_only(scope), depth + 1)
+            except GenerationFailed:
+                continue
+            if self.f.aggregates.filter_subquery or not any(
+                isinstance(n, (Exists, InSubquery, ScalarSubquery)) for n in walk(pred)
+            ):
+                agg.filter = pred
+                self._note("agg:filter")
+                return agg
+        return agg
 
     def _gen_agg_of_kind(self, kind: str, scope: Scope, depth: int) -> Expr:
         rng = self.rng
@@ -1277,6 +1552,17 @@ def exact_type(expr: Expr) -> st.SqlType | None:
             if t.kind == "decimal":
                 return st.decimal_type(38, t.scale)
         return None
+    if isinstance(expr, Window):
+        if expr.name in ("rank", "dense_rank", "row_number", "count"):
+            return st.BIGINT
+        if expr.name == "avg":
+            return st.DOUBLE
+        if expr.name == "sum" and expr.arg is not None:
+            t = exact_type(expr.arg)
+            if t is not None and t.kind == "int":
+                return st.HUGEINT
+            return t
+        return exact_type(expr.arg) if expr.arg is not None else None
     if isinstance(expr, Func):
         if expr.name in ("strlen", "length") or expr.name in EXTRACT_TS:
             return st.BIGINT

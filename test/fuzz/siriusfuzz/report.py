@@ -577,6 +577,8 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
     claimed = ["where"]
     if f.aggregates.functions:
         claimed += ["group_by", "ungrouped_aggregate"]
+    if f.aggregates.filter:
+        claimed.append("agg:filter")
     claimed += [f"join:{jt}" for jt in f.joins.types]
     if f.full_join:
         claimed.append("join:full")
@@ -594,7 +596,9 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
         ("UNION ALL", f.set_ops.union_all),
         ("UNION", f.set_ops.union),
         ("EXCEPT", f.set_ops.except_),
+        ("EXCEPT ALL", f.set_ops.except_),
         ("INTERSECT", f.set_ops.intersect),
+        ("INTERSECT ALL", f.set_ops.intersect),
     ):
         if on:
             claimed.append(f"setop:{op}")
