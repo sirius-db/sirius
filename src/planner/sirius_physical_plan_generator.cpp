@@ -215,6 +215,16 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
     for (auto const& target : distinct.distinct_targets) {
       if (is_floating_type(target->GetReturnType())) exact_key_here = true;
     }
+  } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_UNION ||
+             op.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
+             op.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+    // Distinct set operations deduplicate every column; EXCEPT and INTERSECT also match rows
+    // exactly. The ALL forms of EXCEPT and INTERSECT already decline floating keys.
+    if (!op.Cast<duckdb::LogicalSetOperation>().setop_all) {
+      for (auto const& type : op.types) {
+        if (is_floating_type(type)) exact_key_here = true;
+      }
+    }
   }
   // This is conservative: the floating key may be unrelated to an aggregate below this node.
   // Proving expression lineage through projections, joins and CTE references would need a separate

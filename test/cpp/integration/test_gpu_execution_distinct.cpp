@@ -775,6 +775,15 @@ TEST_CASE_METHOD(DistinctFixture,
       "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) "
       "OVER (PARTITION BY k) a FROM avg_keys)");
   }
+  for (char const* set_operation : {"UNION", "EXCEPT", "INTERSECT"}) {
+    CAPTURE(set_operation);
+    expect_plan_fallback_matches_cpu(
+      std::string{"SELECT a FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys "
+                  "GROUP BY k) "} +
+      set_operation +
+      " SELECT a FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys "
+      "GROUP BY k HAVING k > 1)");
+  }
   expect_plan_fallback_matches_cpu(
     "WITH averages AS MATERIALIZED (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
     "FROM avg_keys GROUP BY k) SELECT a FROM averages GROUP BY a");
