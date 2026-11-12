@@ -93,6 +93,9 @@ exchange_service::exchange_service(fabric& fabric,
 std::shared_ptr<inbound> exchange_service::receiver_of(stream_id stream, held event)
 {
   std::lock_guard lock{_mutex};
+  // The engine thread delivers until shutdown() has joined it, after _held was cleared: a batch
+  // kept now would outlive the memory space it lives in.
+  if (_shut_down) { return nullptr; }
   if (_aborted.contains(query_of(stream))) { return nullptr; }
   if (auto it = _receivers.find(stream); it != _receivers.end()) { return it->second; }
   if (!retired(query_of(stream)) && !_detached.contains(stream)) {
@@ -147,7 +150,8 @@ void exchange_service::shutdown()
       _error = std::make_exception_ptr(
         sirius::internal_exception("exchange: shut down with the Sirius context"));
     }
-    stopped = std::move(_transport);
+    stopped    = std::move(_transport);
+    _shut_down = true;
     _held.clear();
     _receivers.clear();
   }

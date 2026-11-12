@@ -128,6 +128,8 @@ class exchange_service {
   std::set<distributed_query_id> _retired_above;
   /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
+  /// shutdown() has begun: nothing that arrives from here on is kept.
+  bool _shut_down{false};
   // Last: its engine thread calls back into the members above until it is destroyed. Null once
   // shut down.
   std::unique_ptr<transport> _transport;
