@@ -451,9 +451,9 @@ void read_positional_delete_file(duckdb::ClientContext& context,
       }
       return projection;
     },
-    [&] {
+    [&](bool) {
       auto& positions = partials.emplace_back();
-      return [&positions](duckdb::DataChunk& chunk) {
+      return [&positions](uint64_t, duckdb::DataChunk& chunk) {
         duckdb::UnifiedVectorFormat paths;
         duckdb::UnifiedVectorFormat offsets;
         chunk.data[0].ToUnifiedFormat(paths);

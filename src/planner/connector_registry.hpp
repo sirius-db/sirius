@@ -23,6 +23,7 @@
 
 #include <duckdb/function/table_function.hpp>
 
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -43,7 +44,14 @@ class gpu_ingestible;
 }  // namespace scan
 }  // namespace op
 }  // namespace sirius
+namespace sirius::ducklake {
+struct provider_api;
+}
+
 namespace sirius::planner {
+std::shared_ptr<const ducklake::provider_api> registered_ducklake_provider(
+  duckdb::DatabaseInstance& db);
+
 struct scan_contract_provenance;
 using scan_lowering =
   duckdb::unique_ptr<op::sirius_physical_operator> (*)(op::sirius_physical_table_scan&,

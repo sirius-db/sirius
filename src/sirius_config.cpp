@@ -367,7 +367,15 @@ static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& 
     out = static_cast<size_t>(*value);
   };
   limit("max_inflight_metadata_jobs", opt.max_inflight_metadata_jobs, true);
-  limit("max_inflight_dv_jobs", opt.max_inflight_dv_jobs, true);
+  limit("max_permits", opt.max_permits, true);
+  std::optional<size_t> legacy_permits;
+  limit("max_inflight_dv_jobs", legacy_permits, true);
+  if (legacy_permits) {
+    if (opt.max_permits && opt.max_permits != legacy_permits)
+      throw std::runtime_error("preparation.max_inflight_dv_jobs conflicts with max_permits");
+    SIRIUS_LOG_WARN("preparation.max_inflight_dv_jobs is deprecated; use preparation.max_permits");
+    opt.max_permits = legacy_permits;
+  }
   limit("lookahead_batches", opt.lookahead_batches);
   limit("max_control_work", opt.max_control_work);
   limit("drain_quantum", opt.drain_quantum);

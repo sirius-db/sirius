@@ -21,6 +21,13 @@ std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::t
                                                          position_lookup const&,
                                                          ::cuda::stream_ref,
                                                          rmm::device_async_resource_ref);
+// Use the original bound file index when paths can repeat within a scan.
+using run_position_lookup = std::function<std::span<int64_t const>(batch_row_run const&)>;
+std::unique_ptr<cudf::table> apply_run_positional_visibility(std::unique_ptr<cudf::table>,
+                                                             std::span<batch_row_run const>,
+                                                             run_position_lookup const&,
+                                                             ::cuda::stream_ref,
+                                                             rmm::device_async_resource_ref);
 void apply_positional_visibility(materialized_batch&,
                                  position_lookup const&,
                                  ::cuda::stream_ref,

@@ -611,12 +611,11 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
         "' has no planning-capable remote backend",
       {{unsupported->contract, verdict_reason::iceberg_puffin_uri_unsupported}});
   }
-  host_reservation_provider provider(sirius_ctx->get_memory_manager(),
-                                     std::make_shared<decltype(sirius_ctx)>(sirius_ctx));
-  auto counters  = sirius_ctx->physical_counters();
-  auto* selected = counters->track_units && counters->preparation_provider_for_testing
-                     ? counters->preparation_provider_for_testing.get()
-                     : &provider;
+  auto counters = sirius_ctx->physical_counters();
+  auto provider = counters->track_units ? counters->preparation_provider_for_testing : nullptr;
+  if (!provider)
+    provider = std::make_shared<host_reservation_provider>(
+      sirius_ctx->get_memory_manager(), std::make_shared<decltype(sirius_ctx)>(sirius_ctx));
   if (counters->track_units && counters->preparation_envelope_for_testing) {
     for (auto& request : required_requests)
       counters->preparation_envelope_for_testing(request.envelope);
@@ -645,7 +644,7 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
       auto const& config = sirius_ctx->get_config().get_scan_manager_config();
       auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
       auto permits       = static_cast<size_t>(config.thread_pool.num_threads);
-      if (limits.max_inflight_dv_jobs) permits = std::min(permits, limits.max_inflight_dv_jobs);
+      if (limits.max_permits) permits = std::min(permits, limits.max_permits);
       participants.reserve(required_requests.size() + (dv_eligible ? requests.size() : 0));
       for (auto& request : required_requests)
         participants.push_back(std::move(request));
@@ -653,7 +652,7 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
         for (auto& request : requests)
           participants.push_back(std::move(request));
       try {
-        decision = prepare_statement_resources(*selected,
+        decision = prepare_statement_resources(std::move(provider),
                                                participants,
                                                spaces.front()->get_id(),
                                                static_cast<uint32_t>(permits),

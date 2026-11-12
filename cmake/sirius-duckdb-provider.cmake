@@ -10,9 +10,30 @@ if(NOT EXISTS "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
       "Initialize the DuckDB submodule or set SIRIUS_DUCKDB_SOURCE_DIR")
 endif()
 
+set(SIRIUS_DUCKLAKE_SOURCE_DIR
+    ""
+    CACHE PATH "Pinned, host-patched DuckLake source for the private bridge")
+set(SIRIUS_DUCKLAKE_LIBRARY
+    ""
+    CACHE FILEPATH "Optional matching DuckLake extension for offline tests")
+
 function(sirius_add_duckdb_source)
   # Keep DuckDB options scoped to its dependency build.
-  set(DUCKDB_EXTENSION_CONFIGS "")
+  if(SIRIUS_DUCKLAKE_LIBRARY AND (NOT EXISTS "${SIRIUS_DUCKLAKE_LIBRARY}"
+                                  OR IS_DIRECTORY "${SIRIUS_DUCKLAKE_LIBRARY}"))
+    message(FATAL_ERROR "The configured DuckLake test extension does not exist")
+  endif()
+  if(SIRIUS_DUCKLAKE_SOURCE_DIR)
+    if(NOT EXISTS
+       "${SIRIUS_DUCKLAKE_SOURCE_DIR}/src/include/storage/ducklake_scan.hpp")
+      message(
+        FATAL_ERROR "Supply the pinned DuckLake source for the private bridge")
+    endif()
+    set(DUCKDB_EXTENSION_CONFIGS "")
+  else()
+    set(DUCKDB_EXTENSION_CONFIGS
+        "${SIRIUS_DUCKDB_SOURCE_DIR}/.github/config/extensions/ducklake.cmake")
+  endif()
   set(BUILD_EXTENSIONS "core_functions;parquet")
   set(BUILD_SHELL OFF)
   set(BUILD_UNITTESTS OFF)

@@ -11,6 +11,7 @@
 
 #include <cuda/stream_ref>  // IWYU pragma: keep
 
+#include <algorithm>
 #include <bit>
 #include <charconv>
 #include <cstring>
@@ -67,13 +68,20 @@ cudf::data_type type_for(std::string_view f)
     int precision = 0, scale = 0;
     auto p = std::from_chars(f.data() + 2, f.data() + f.size(), precision);
     if (p.ec != std::errc{} || p.ptr == f.data() + f.size() || *p.ptr != ',') invalid();
-    auto s = std::from_chars(p.ptr + 1, f.data() + f.size(), scale);
-    if (s.ec != std::errc{} ||
-        (s.ptr != f.data() + f.size() &&
-         std::string_view(s.ptr, f.data() + f.size() - s.ptr) != ",128") ||
-        precision < 1 || precision > 38 || scale < 0 || scale > precision)
+    auto s             = std::from_chars(p.ptr + 1, f.data() + f.size(), scale);
+    auto suffix        = std::string_view(s.ptr, f.data() + f.size() - s.ptr);
+    auto bits          = suffix.empty() || suffix == ",128" ? 128
+                         : suffix == ",64"                  ? 64
+                         : suffix == ",32"                  ? 32
+                                                            : 0;
+    auto max_precision = bits == 32 ? 9 : bits == 64 ? 18 : 38;
+    if (s.ec != std::errc{} || !bits || precision < 1 || precision > max_precision || scale < 0 ||
+        scale > precision)
       invalid();
-    return cudf::data_type{T::DECIMAL128, -scale};
+    return cudf::data_type{bits == 32   ? T::DECIMAL32
+                           : bits == 64 ? T::DECIMAL64
+                                        : T::DECIMAL128,
+                           -scale};
   }
   invalid();
 }
@@ -303,17 +311,30 @@ std::vector<cudf::data_type> validate_arrow_host_flat(
         if (string_offset(a.buffers[1], row + 1) < string_offset(a.buffers[1], row)) invalid();
       if (string_offset(a.buffers[1], end) != string_offset(a.buffers[1], begin) && !a.buffers[2])
         invalid();
-    } else if (type.id() == cudf::type_id::DECIMAL128) {
+    } else if (type.id() == cudf::type_id::DECIMAL32 || type.id() == cudf::type_id::DECIMAL64 ||
+               type.id() == cudf::type_id::DECIMAL128) {
       int precision = 0;
       std::string_view format(s.format);
       (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
       __uint128_t limit = 1;
       for (int digit = 0; digit < precision; ++digit)
         limit *= 10;
+      auto bytes = cudf::size_of(type);
       for (auto row = begin; row < end; ++row) {
         if (validity && !(validity[row / 8] & (1U << (row % 8)))) continue;
+        auto* source = static_cast<uint8_t const*>(a.buffers[1]) + row * bytes;
         __int128_t value;
-        std::memcpy(&value, static_cast<uint8_t const*>(a.buffers[1]) + row * 16, 16);
+        if (bytes == 4) {
+          int32_t v;
+          std::memcpy(&v, source, sizeof(v));
+          value = v;
+        } else if (bytes == 8) {
+          int64_t v;
+          std::memcpy(&v, source, sizeof(v));
+          value = v;
+        } else {
+          std::memcpy(&value, source, sizeof(value));
+        }
         auto magnitude = static_cast<__uint128_t>(value);
         if (value < 0) magnitude = __uint128_t{0} - magnitude;
         if (magnitude >= limit) invalid();
@@ -346,13 +367,16 @@ std::size_t arrow_import_staging_bytes(ArrowArray const& array,
   return total;
 }
 
-std::vector<cudf::data_type> owned_arrow_batch::input_types() const
+std::vector<cudf::data_type> const& owned_arrow_batch::validated_types() const
 {
-  return validate_arrow_host_flat(schema, array, metadata_lengths);
+  std::call_once(validation_once,
+                 [&] { types = validate_arrow_host_flat(schema, array, metadata_lengths); });
+  return types;
 }
+std::vector<cudf::data_type> owned_arrow_batch::input_types() const { return validated_types(); }
 std::size_t owned_arrow_batch::estimated_device_bytes() const
 {
-  auto types        = input_types();
+  auto const& types = validated_types();
   std::size_t total = 0;
   auto add          = [&](uint64_t count, uint64_t width) {
     if (count > (std::numeric_limits<std::size_t>::max() - total) / width)
@@ -385,11 +409,21 @@ void owned_arrow_batch::validate_for(materialization_program const& program) con
 {
   if (!capacity || !schema.release || !array.release || !program.contract || !program.generation)
     throw std::invalid_argument("Arrow import requires admitted input and program");
-  auto types = validate_arrow_host_flat(schema, array, metadata_lengths);
-  if (!program.input_types || types != *program.input_types)
+  validate_arrow_bound_schema(schema, validated_types(), program);
+}
+
+void validate_arrow_bound_schema(ArrowSchema const& schema,
+                                 std::span<cudf::data_type const> types,
+                                 materialization_program const& program)
+{
+  if (!program.input_types ||
+      !std::equal(
+        types.begin(), types.end(), program.input_types->begin(), program.input_types->end()))
     throw transparent::arrow_schema_drift_error("Arrow schema does not match its bound program");
   for (std::size_t i = 0; i < types.size(); ++i) {
-    if (types[i].id() != cudf::type_id::DECIMAL128) continue;
+    if (types[i].id() != cudf::type_id::DECIMAL32 && types[i].id() != cudf::type_id::DECIMAL64 &&
+        types[i].id() != cudf::type_id::DECIMAL128)
+      continue;
     int precision = 0;
     std::string_view format(schema.children[i]->format);
     (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);

@@ -200,7 +200,7 @@ struct harness {
              9,
              check_bit(later_check::host_staged),
              4096,
-             [this]() -> std::optional<composite_scan_child> {
+             [this](size_t) -> std::optional<composite_scan_child> {
                if (on_discover) on_discover();
                if (discoveries == children.size()) return {};
                return composite_scan_child{

@@ -56,3 +56,5 @@ FROM lineitem
 GROUP BY l_returnflag
 ORDER BY l_returnflag;
 ```
+
+For DuckLake GPU scans, install DuckLake once with `INSTALL ducklake FROM core;` and run `LOAD ducklake;` in the session that loads Sirius.

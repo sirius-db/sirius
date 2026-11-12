@@ -213,14 +213,16 @@ struct harness {
   std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
   std::shared_ptr<void const> identity             = std::make_shared<int>(4);
   std::unique_ptr<arrow_import_ingestible> driver;
-  std::shared_ptr<arrow_input_gate> gate = std::make_shared<arrow_input_gate>();
+  std::shared_ptr<arrow_input_gate> gate;
   harness(std::shared_ptr<arrow_batch_producer> producer,
           materialization_program program                   = integer_program(),
           bool empty_source                                 = true,
           sm::reservation_provider* external                = nullptr,
           std::shared_ptr<arrow_batch_producer> other       = {},
           uint64_t quantum                                  = 1,
+          std::shared_ptr<arrow_input_gate> input_gate      = std::make_shared<arrow_input_gate>(),
           std::shared_ptr<physical_check_counters> counters = {})
+    : gate(std::move(input_gate))
   {
     auto unique     = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
     auto envelope   = producer->limits().envelope;
@@ -256,8 +258,27 @@ struct harness {
   harness(std::shared_ptr<physical_check_counters> counters,
           std::shared_ptr<arrow_batch_producer> producer,
           materialization_program program = integer_program())
-    : harness(std::move(producer), std::move(program), true, nullptr, {}, 1, std::move(counters))
+    : harness(std::move(producer),
+              std::move(program),
+              true,
+              nullptr,
+              {},
+              1,
+              std::make_shared<arrow_input_gate>(),
+              std::move(counters))
   {
+  }
+  auto make_preparation_source()
+  {
+    auto lane = driver->make_preparation_source({});
+    // The fixture owns any gate it supplies to the driver.
+    if (gate) {
+      lane.bind_wakeup = [gate = gate, bind = std::move(lane.bind_wakeup)](auto wake) {
+        gate->wake = wake;
+        bind(std::move(wake));
+      };
+    }
+    return lane;
   }
   std::unique_ptr<scan_info> next(sm::preparation_stop_token stop = {})
   {
@@ -654,9 +675,10 @@ TEST_CASE("Arrow push rejects schema and bound drift before waiting", "[arrow_dr
   auto error = capture_rejection([&] { q->offer(offered); });
   auto drift = mode == 0 || mode == 4;
   std::string expected =
-    mode == 0 ? "Arrow offered schema drift"
-              : (mode == 3 || mode == 5 ? "unsupported or invalid arrow_host_flat_v1 input"
-                                        : "Arrow offered input exceeds its declared bounds");
+    (mode == 0 || mode == 4)
+      ? "Arrow schema does not match its bound program"
+      : (mode == 3 || mode == 5 ? "unsupported or invalid arrow_host_flat_v1 input"
+                                : "Arrow offered input exceeds its declared bounds");
   check_physical_failure(error, expected, drift);
   CHECK(reported == error);
   check_physical_failure(reported, expected, drift);
@@ -768,20 +790,31 @@ TEST_CASE("Arrow rootless descriptors require normal EOS from the bound source",
 TEST_CASE("Arrow copy and normalization bounds are checked before accepting an offer",
           "[arrow_driver][fw_s4]")
 {
-  auto mode     = GENERATE(0, 1);
+  enum class scenario { copy, normalization, copy_with_precision_drift };
+  auto test =
+    GENERATE(scenario::copy, scenario::normalization, scenario::copy_with_precision_drift);
+  auto program       = integer_program();
+  auto owner         = std::make_shared<integer_tree>();
+  bool normalization = test == scenario::normalization;
+  arrow_push_limits limits{3, 8192, normalization ? 8192U : 16U, normalization ? 1U : 8192U};
+  if (test == scenario::copy_with_precision_drift) {
+    program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL32, -2}};
+    program.input_types        = program.output_types;
+    program.decimal_precisions = {8};
+    owner->field.format        = "d:9,2,32";
+  }
   auto counters = make_counters(false);
   int failures  = 0;
   std::exception_ptr reported;
   auto q = std::make_shared<arrow_push_queue>(
-    integer_program(),
-    arrow_push_limits{3, 8192, mode == 0 ? 16U : 8192U, mode == 1 ? 1U : 8192U},
+    program,
+    limits,
     [&](auto error) {
       ++failures;
       reported = error;
     },
     counters);
-  harness h(counters, q);
-  auto owner   = std::make_shared<integer_tree>();
+  harness h(counters, q, program);
   auto offered = owner->offer(owner);
   auto error   = capture_rejection([&] { q->offer(offered); });
   CHECK(reported == error);
@@ -852,7 +885,7 @@ TEST_CASE("Arrow lanes run and close on their declared owner without publishing 
   sirius::pipeline::completion_handler completion;
   sm::native_reader_executor readers(1, 1);
   sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
-  auto lane      = h.driver->make_preparation_source({});
+  auto lane      = h.make_preparation_source();
   auto connector = std::make_shared<sm::split_connector>();
   sm::preparation_coordinator::source source;
   source.execution   = lane.execution;
@@ -969,14 +1002,20 @@ TEST_CASE("Arrow push copies nullable Boolean slices and bound decimal precision
 TEST_CASE("Arrow push refuses decimal precision drift even when the scale matches",
           "[arrow_driver][fw_s4]")
 {
+  auto bits = GENERATE(32, 64, 128);
+  CAPTURE(bits);
   auto track_units           = GENERATE(false, true);
   auto counters              = make_counters(track_units);
   auto program               = integer_program();
-  program.output_types       = {cudf::data_type{cudf::type_id::DECIMAL128, -2}};
+  program.output_types       = {cudf::data_type{bits == 32   ? cudf::type_id::DECIMAL32
+                                                : bits == 64 ? cudf::type_id::DECIMAL64
+                                                             : cudf::type_id::DECIMAL128,
+                                                -2}};
   program.input_types        = program.output_types;
-  program.decimal_precisions = {9};
+  program.decimal_precisions = {8};
   auto owner                 = std::make_shared<integer_tree>(0);
-  owner->field.format        = "d:10,2";
+  auto format                = "d:9,2," + std::to_string(bits);
+  owner->field.format        = format.c_str();
   int failures               = 0;
   std::exception_ptr reported;
   auto q = queue(counters, program, [&](auto error) {
@@ -984,9 +1023,13 @@ TEST_CASE("Arrow push refuses decimal precision drift even when the scale matche
     reported = error;
   });
   harness h(counters, q, program);
-  auto error = capture_rejection([&] { q->offer(owner->offer(owner)); });
+  auto offered = std::async(std::launch::async, [&] { q->offer(owner->offer(owner)); });
+  auto status  = offered.wait_for(2s);
+  if (status != std::future_status::ready) q->cancel();
+  REQUIRE(status == std::future_status::ready);
+  auto error = capture_rejection([&] { offered.get(); });
   CHECK(reported == error);
-  check_physical_failure(error, "Arrow offered decimal precision drift", true);
+  check_physical_failure(error, "Arrow decimal precision does not match its bound program", true);
   CHECK(failures == 1);
   CHECK(h.profiles->counters == counters);
   CHECK(counters->arrow_schema_drift_refusals == 1);
@@ -1015,6 +1058,45 @@ TEST_CASE("Arrow rootless empty source supports a zero-column binding", "[arrow_
   CHECK(h.profiles->counters->arrow_batches_imported == 0);
   CHECK(h.backing.seen->allocations == 0);
   stream.synchronize();
+}
+
+TEST_CASE("Arrow child registration preserves the final input owner's wakeup",
+          "[arrow_driver][arrow_gate_wake]")
+{
+  auto parent  = std::make_shared<sm::preparation_gate>();
+  auto child   = std::make_shared<sm::preparation_gate>();
+  auto shared  = std::make_shared<arrow_input_gate>();
+  shared->wake = sm::preparation_wakeup(parent);
+  harness first(std::make_shared<pull_producer>(), integer_program(), true, nullptr, {}, 1, shared);
+  auto held = first.next();
+  REQUIRE(held);
+  harness next(std::make_shared<pull_producer>(), integer_program(), true, nullptr, {}, 1, shared);
+  next.driver->bind_preparation_wakeup(sm::preparation_wakeup(child));
+  CHECK(std::holds_alternative<sm::preparation_pending>(next.driver->try_claim_split({})));
+  std::thread([input = std::move(held)]() mutable { input.reset(); }).join();
+  CHECK(parent->wake_generation == 1);
+  CHECK(child->wake_generation == 0);
+  CHECK(next.next());
+}
+
+TEST_CASE("Arrow input retirement wakes its owning registration", "[arrow_driver][arrow_gate_wake]")
+{
+  auto external = GENERATE(false, true);
+  harness source(std::make_shared<pull_producer>(),
+                 integer_program(),
+                 true,
+                 nullptr,
+                 {},
+                 1,
+                 external ? std::make_shared<arrow_input_gate>() : nullptr);
+  auto gate = std::make_shared<sm::preparation_gate>();
+  source.make_preparation_source().bind_wakeup(sm::preparation_wakeup(gate));
+  source.ledger->bind_wakeup({});  // Isolate the input gate's notification.
+  auto held = source.next();
+  REQUIRE(held);
+  auto before = gate->wake_generation;
+  held.reset();
+  CHECK(gate->wake_generation == before + 1);
 }
 
 TEST_CASE("Arrow imported input retires only after its final descriptor owner",
@@ -1526,7 +1608,7 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   sirius::pipeline::completion_handler completion;
   sm::native_reader_executor readers(1, 1);
   sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
-  auto lane      = h.driver->make_preparation_source({});
+  auto lane      = h.make_preparation_source();
   auto connector = std::make_shared<sm::split_connector>();
   sm::preparation_coordinator::source source;
   source.execution   = lane.execution;
@@ -1608,7 +1690,7 @@ TEST_CASE("Arrow legacy pull interrupts after an observed stop follow coordinato
   sirius::pipeline::completion_handler completion;
   sm::native_reader_executor readers(1, 1);
   sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
-  auto lane      = h.driver->make_preparation_source({});
+  auto lane      = h.make_preparation_source();
   auto connector = std::make_shared<sm::split_connector>();
   sm::preparation_coordinator::source source;
   source.execution   = lane.execution;
@@ -1641,7 +1723,8 @@ TEST_CASE("Arrow legacy pull interrupts after an observed stop follow coordinato
   // producer, not by the driver's bracketing checks.
   if (which == mode::failure_induced)
     completion.report_error(std::make_exception_ptr(std::runtime_error("original failure")));
-  if (which == mode::normal_eos) coordinator.request_stop(sm::stop_reason::normal_eos);
+  if (which == mode::normal_eos || (!entered && which == mode::no_token_interrupt))
+    coordinator.request_stop(sm::stop_reason::normal_eos);
   if (which == mode::user_cancel) coordinator.request_stop(sm::stop_reason::user_cancel);
   if (which == mode::failure_induced) coordinator.request_stop(sm::stop_reason::failure_induced);
   reading.release();

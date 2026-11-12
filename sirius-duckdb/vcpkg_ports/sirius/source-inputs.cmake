@@ -4,6 +4,8 @@ if(NOT PORT STREQUAL "sirius")
   return()
 endif()
 
+list(APPEND VCPKG_ENV_PASSTHROUGH DUCKDB_DUCKLAKE_DIRECTORY)
+
 get_filename_component(sirius_source "${CMAKE_CURRENT_LIST_DIR}/../../.."
                        ABSOLUTE)
 find_program(sirius_git NAMES git REQUIRED)
