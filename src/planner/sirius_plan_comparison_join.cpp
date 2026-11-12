@@ -52,6 +52,7 @@
 #include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_join_utils.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
@@ -64,6 +65,36 @@
 #include <vector>
 
 namespace sirius::planner {
+
+duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
+  duckdb::LogicalOperator& op,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
+  duckdb::vector<sirius::join_condition> conditions,
+  duckdb::JoinType join_type,
+  sirius::operator_params const& params,
+  hash_join_options options)
+{
+  auto join =
+    duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(op,
+                                                             std::move(left),
+                                                             std::move(right),
+                                                             std::move(conditions),
+                                                             join_type,
+                                                             options.left_projection_map,
+                                                             options.right_projection_map,
+                                                             std::move(options.delim_types),
+                                                             op.estimated_cardinality,
+                                                             params.max_build_hash_table_bytes,
+                                                             std::move(options.dynamic_filter_plan),
+                                                             params.hash_partition_bytes,
+                                                             params.max_broadcast_join_size,
+                                                             options.dynamic_filter_stats_sink);
+  join->mark_join_build_switch_ratio   = params.mark_join_build_switch_ratio;
+  join->runtime_distinct_build_probe   = params.enable_runtime_distinct_build_probe;
+  join->max_build_probe_resident_bytes = params.max_build_probe_resident_bytes;
+  return join;
+}
 
 /// Whether @p get is a plain parquet scan whose output columns are the files' own columns, read by
 /// name. A pin proves something about those columns, so a scan that maps, renames, merges or
@@ -791,25 +822,18 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
        .enable_multi_partition    = op_params.enable_dynamic_filter_multi_partition,
        .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu}};
 
-    auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
-      op,
-      std::move(left),
-      std::move(right),
-      std::move(conditions),
-      op.join_type,
-      std::move(left_projection_map),
-      std::move(right_projection_map),
-      sirius::from_duckdb_vec(op.mark_types),
-      op.estimated_cardinality,
-      op_params.max_build_hash_table_bytes,
-      std::move(filter_plan),
-      op_params.hash_partition_bytes,
-      op_params.max_broadcast_join_size,
-      stats);
-    auto& hj                          = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.mark_join_build_switch_ratio   = op_params.mark_join_build_switch_ratio;
-    hj.runtime_distinct_build_probe   = op_params.enable_runtime_distinct_build_probe;
-    hj.max_build_probe_resident_bytes = op_params.max_build_probe_resident_bytes;
+    auto join = make_hash_join(op,
+                               std::move(left),
+                               std::move(right),
+                               std::move(conditions),
+                               op.join_type,
+                               op_params,
+                               {.left_projection_map       = std::move(left_projection_map),
+                                .right_projection_map      = std::move(right_projection_map),
+                                .delim_types               = sirius::from_duckdb_vec(op.mark_types),
+                                .dynamic_filter_plan       = std::move(filter_plan),
+                                .dynamic_filter_stats_sink = stats});
+    auto& hj  = *join;
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 

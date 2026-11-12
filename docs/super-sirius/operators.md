@@ -416,7 +416,8 @@ in what DuckDB's binder puts around it. `UNION ALL` is the node alone, and
 `a UNION ALL b UNION ALL c` binds to one node with three children. `UNION` and `UNION BY NAME` are
 a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate.
 The `EXCEPT ALL` / `INTERSECT ALL` lowering also uses `UNION` to merge its two tagged inputs.
-Distinct `EXCEPT` and `INTERSECT` fall back to CPU.
+Distinct `EXCEPT` and `INTERSECT` do not use `UNION`: they lower to a null-safe ANTI or SEMI hash
+join, then deduplicate its rows with a grouped aggregate (see `plan_except_intersect`).
 
 The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends two more
 shapes to the CPU. The first is `allow_out_of_order = false`, which requires output in arm order.

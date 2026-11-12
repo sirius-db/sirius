@@ -28,10 +28,8 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 `sirius.max_concurrent_queries` is a positive startup integer, default **1**, shared by
 connections to one DatabaseInstance. It bounds initialization through retirement. Additional
-queries wait in a cancellable FIFO queue. The former
-`sirius.executor.scan_manager.max_concurrent_queries` key is a deprecated alias; conflicting
-values fail configuration loading. See [Concurrent queries](concurrent-queries.md) for the
-maintenance, error and multi-GPU contracts.
+queries wait in a cancellable FIFO queue. See [Concurrent queries](concurrent-queries.md) for
+the maintenance, error and multi-GPU contracts.
 
 ### `SIRIUS_DISABLE`
 
@@ -808,6 +806,12 @@ requires startup configuration.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
 
+Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA
+error reports, and its I/O layer where enabled) go to the same sink, prefixed `[cucascade]`.
+cuCascade's own gate mirrors what the active sink accepts: `sirius_log_level` under `spdlog`,
+nothing under `noop`, and under `duckdb` every record is handed to DuckDB, which applies its own
+level exactly as it does to Sirius's records.
+
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
@@ -835,9 +839,6 @@ These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is
 rejected. `RESET` restores the registered default. Query initialization captures both
 settings in an immutable snapshot, so later changes do not affect an existing query.
 Evaluators retain their own policy values rather than reading mutable global defaults.
-
-`expression_executor_strategy` remains registered as a deprecated compatibility alias for
-`expression_evaluator_strategy`; new configuration should use the evaluator name.
 
 ### Scan
 
@@ -908,6 +909,7 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
+| `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see

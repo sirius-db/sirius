@@ -88,6 +88,66 @@ TEST_CASE("Copy-origin correspondence is one-to-one", "[transparent][read_view]"
   CHECK(comparison.reason == "binding_mismatch");
 }
 
+TEST_CASE("Copy-origin read views admit a merged scan of an identical view",
+          "[transparent][read_view]")
+{
+  auto a = view("a.parquet");
+  auto b = view("b.parquet");
+  // The original plan scanned view `a` twice (scans 10 and 20) and `b` once.
+  std::vector<original_binding> logical{{10, a}, {20, a}, {30, b}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(a), fingerprint(b)};
+
+  // A planner pass merged scans 10 and 20, which read the same view, into scan 10.
+  std::vector<candidate_binding> merged{{10, a}, {30, b}};
+  auto comparison = compare_read_views(candidate_origin::copy, logical, physical, merged);
+  CHECK(comparison.equal);
+  CHECK(comparison.reason.empty());
+
+  // Every view the original read must still be read: dropping the only scan of `b` is a mismatch.
+  std::vector<candidate_binding> dropped_b{{10, a}, {20, a}};
+  auto missing = compare_read_views(candidate_origin::copy, logical, physical, dropped_b);
+  CHECK_FALSE(missing.equal);
+  CHECK(missing.reason == "fingerprint_mismatch");
+
+  // So is reading a view more often than the original plan did.
+  std::vector<candidate_binding> extra{{10, a}, {20, a}, {30, b}, {40, b}};
+  auto more = compare_read_views(candidate_origin::copy, logical, physical, extra);
+  CHECK_FALSE(more.equal);
+
+  // And reading a different view in place of the merged one.
+  auto c = view("c.parquet");
+  std::vector<candidate_binding> swapped{{10, c}, {30, b}};
+  auto other = compare_read_views(candidate_origin::copy, logical, physical, swapped);
+  CHECK_FALSE(other.equal);
+}
+
+TEST_CASE("Copy-origin read views merge identical files only for the same selector",
+          "[transparent][read_view]")
+{
+  // Two snapshots over the same data files, as with Iceberg deletes: equal physical identity,
+  // different selected rows.
+  auto snapshot_1 = view("a.parquet", "snapshot=1", true);
+  auto snapshot_2 = view("a.parquet", "snapshot=2", true);
+  REQUIRE(fingerprint(snapshot_1) == fingerprint(snapshot_2));
+  CHECK_FALSE(same_selector(*snapshot_1, *snapshot_2));
+
+  std::vector<original_binding> logical{{10, snapshot_1}, {20, snapshot_2}};
+  std::vector<read_view_fingerprint> physical{fingerprint(snapshot_1), fingerprint(snapshot_2)};
+  std::vector<candidate_binding> merged{{10, snapshot_1}};
+  auto different = compare_read_views(candidate_origin::copy, logical, physical, merged);
+  CHECK_FALSE(different.equal);
+  CHECK(different.reason == "binding_mismatch");
+
+  // Missing evidence proves nothing either.
+  auto unproven = view("a.parquet", std::nullopt, true);
+  CHECK_FALSE(same_selector(*unproven, *unproven));
+
+  auto same = view("a.parquet", "snapshot=1", true);
+  std::vector<original_binding> logical_same{{10, snapshot_1}, {20, same}};
+  auto equal = compare_read_views(candidate_origin::copy, logical_same, physical, merged);
+  CHECK(equal.equal);
+}
+
 TEST_CASE("Replan without logical originals preserves the single-scan shortcut",
           "[transparent][read_view]")
 {

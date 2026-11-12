@@ -126,7 +126,7 @@ args = [{ arg = "output_dir", default = "telemetry_data" }]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
-cuda-version = "13.4.*"
+cuda-version = "13.5.*"
 libcudf = "==26.10.02"
 libcuvs = "==26.10.00"
 
