@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -533,6 +534,22 @@ TEST_CASE("a rank whose rewrite fails aborts the query on every rank, and the ne
     CHECK_THAT(errors[1],
                Catch::Matchers::ContainsSubstring("distributed execution does not support"));
   }
+  // Both ranks retired the query: their exchanges keep nothing of it, so a receiver attached now
+  // is not failed, as one of a query that was only aborted would be.
+  struct recording : sirius::exchange::inbound {
+    bool failed = false;
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override {}
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override { failed = true; }
+  };
+  auto const late_stream = sirius::exchange::make_stream_id(7, 1000);
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const late = std::make_shared<recording>();
+    c.all[r].service->attach(late_stream, late);
+    CHECK_FALSE(late->failed);
+    c.all[r].service->detach(late_stream);
+  }
+  // The next query plans on both ranks.
   auto plans = plan_on_every_rank(f, "SELECT k FROM big", 2);
   CHECK(distribute(plans, c, f, 8) == std::vector<std::string>(2));
 }

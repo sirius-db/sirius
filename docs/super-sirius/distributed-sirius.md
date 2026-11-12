@@ -370,12 +370,13 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   rank: the rank tells its peers (`exchange_service::abort`), and each fails that query's sources
   and all-gathers at once instead of waiting; the next query runs normally. A query whose
   execution window fails in `begin_execution_window()` is aborted the same way and retired on
-  that rank (`distributed_session::fail_window_begin`). A statement that fails after it was
-  planned and before its window is tied to its query is not, and its peers wait out their
-  timeouts: one cancelled or refused while it waits for admission, or a prepared statement whose
-  window fails to begin. A lost peer or a failed transport is fail-stop: every later distributed
-  query fails, saying the transport failed earlier, and nothing reconnects. To recover, restart
-  every rank: a restarted rank alone cannot reconnect to peers whose transport failed, and its
+  that rank (`distributed_session::fail_window_begin`), and so is one whose `distribute_plan()`
+  throws after the query was numbered. A statement that fails after it was planned and before
+  its window is tied to its query is not, and its peers wait out their timeouts: one cancelled
+  or refused while it waits for admission, or a prepared statement whose window fails to begin.
+  A lost peer or a failed transport is fail-stop: every later distributed query fails, saying
+  the transport failed earlier, and nothing reconnects. To recover, restart every rank: a
+  restarted rank alone cannot reconnect to peers whose transport failed, and its
   `SET sirius_exchange_rank` fails after the 2-minute connect timeout (#2373).
 - **Hosts:** every run so far used one host. Ranks on several hosts, and networks without RDMA,
   are untested (#2372).

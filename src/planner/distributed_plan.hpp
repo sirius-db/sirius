@@ -73,6 +73,9 @@ struct connector;
  * Every rank must plan the same query: before returning, this blocks until every rank of
  * @p service has planned it, comparing the plans' shapes in an all-gather.
  *
+ * Whatever it throws, it first aborts @p query on every rank and retires it on this one: the
+ * query is numbered by then, and the other ranks would wait for this one in the all-gather.
+ *
  * @param query This query's number, the same on every rank: its exchanges' stream ids.
  * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
  * @throws sirius::not_implemented_exception on an operator distributed execution does not
