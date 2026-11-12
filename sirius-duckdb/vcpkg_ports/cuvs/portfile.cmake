@@ -15,6 +15,8 @@ vcpkg_from_github(
   static-cuda-math.patch
   disable-openmp.patch
   fix-host-refine-template-arguments.patch
+  # Unfiltered brute-force search no longer links cuSPARSE.
+  split-filtered-brute-force.patch
   HEAD_REF
   main)
 
