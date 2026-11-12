@@ -37,6 +37,7 @@
  */
 
 #include <catch.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
@@ -765,6 +766,15 @@ TEST_CASE_METHOD(DistinctFixture,
   expect_plan_fallback_matches_cpu(
     "SELECT k % 2 p, COUNT(DISTINCT a) FROM (SELECT k, AVG(CAST(-12.802 AS DOUBLE)) a "
     "FROM avg_keys GROUP BY k) GROUP BY p");
+  {
+    // Otherwise DuckDB rewrites a whole-partition window into an aggregate and a self-join.
+    sirius::test::disabled_optimizers_guard keep_window{*con, "window_self_join"};
+    compare_gpu_vs_cpu_approx(
+      "SELECT k, AVG(CAST(-12.802 AS DOUBLE)) OVER (PARTITION BY k) a FROM avg_keys", {1});
+    expect_plan_fallback_matches_cpu(
+      "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) "
+      "OVER (PARTITION BY k) a FROM avg_keys)");
+  }
   expect_plan_fallback_matches_cpu(
     "WITH averages AS MATERIALIZED (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
     "FROM avg_keys GROUP BY k) SELECT a FROM averages GROUP BY a");

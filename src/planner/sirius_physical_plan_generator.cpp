@@ -33,6 +33,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -197,6 +198,17 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
     }
     for (auto const& group : aggregate.groups) {
       if (is_floating_type(group->GetReturnType())) exact_key_here = true;
+    }
+  } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW) {
+    for (auto const& expression : op.expressions) {
+      if (expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_WINDOW) continue;
+      auto const& window = expression->Cast<duckdb::BoundWindowExpression>();
+      if (!window.AggregateFunction()) continue;
+      auto const name = window.AggregateFunction()->GetName().GetIdentifierName();
+      if ((name == "avg" || name == "sum") && window.GetChildren().size() == 1 &&
+          is_floating_type(window.GetChildren()[0]->GetReturnType())) {
+        shape.has_floating_aggregate = true;
+      }
     }
   } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_DISTINCT) {
     auto const& distinct = op.Cast<duckdb::LogicalDistinct>();
