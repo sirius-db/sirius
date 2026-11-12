@@ -96,9 +96,12 @@ struct forged_peer {
   std::unique_ptr<fabric> fab  = hub.attach(0, send, recv);
   std::unique_ptr<fabric> peer = hub.attach(1, peer_send, peer_recv);
   received got;
-  std::unique_ptr<transport> t =
-    std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got));
+  std::unique_ptr<transport> t;
 
+  explicit forged_peer(transport::options opts = {})
+    : t(std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got), opts))
+  {
+  }
   ~forged_peer() { t.reset(); }
 
   void forge(sirius::exchange::message const& m) { peer->notify(0, sirius::exchange::encode(m)); }
@@ -320,6 +323,37 @@ TEST_CASE("a transport that makes no progress for the stall timeout fails both r
   }
   CHECK_THROWS_WITH(std::rethrow_exception(c.ranks[1].got->error),
                     Catch::Matchers::ContainsSubstring("no progress"));
+}
+
+TEST_CASE("an end whose promised batches never arrive fails the receiver at the stall timeout",
+          "[exchange][transport]")
+{
+  using namespace sirius::exchange;
+  transport::options const quick{.stall_timeout = std::chrono::milliseconds{300}};
+  constexpr stream_id stream = 5;
+  SECTION("one batch promised, none sent")
+  {
+    forged_peer c(quick);
+    c.forge(end_message{stream, 1});
+    c.fails_with("no progress");
+  }
+  SECTION("no batch promised: the stream ends, and an idle transport does not stall")
+  {
+    forged_peer c(quick);
+    c.forge(end_message{stream, 0});
+    REQUIRE(c.got.wait_for([&] { return c.got.ended.size() == 1; }, std::chrono::seconds{30}));
+    CHECK_FALSE(c.got.wait_for([&] { return c.got.error != nullptr; }, std::chrono::seconds{1}));
+  }
+  SECTION("ends that overtake their batches are not a stall")
+  {
+    cluster c(3,
+              3,
+              6,
+              {.shuffle = true, .deliver_every = 5},
+              env().host,
+              {.stall_timeout = std::chrono::seconds{2}});
+    all_to_all(c, {1, 2}, 2, 8'000);
+  }
 }
 
 TEST_CASE("a failed write fails both ranks, and frees the batches the sender held",
