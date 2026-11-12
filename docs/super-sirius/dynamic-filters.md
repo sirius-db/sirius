@@ -55,7 +55,7 @@ flowchart LR
 
 The main components are:
 
-- **Evidence and key admission.** `build_subtree_is_filtering` and `build_relation_is_opaque` decide whether discovery should run. `admit_dynamic_filter_keys` accepts supported equality keys and records the build/probe metadata needed at runtime.
+- **Evidence and key admission.** `build_subtree_is_filtering`, `build_relation_is_opaque` and `build_subtree_has_filtering_join` decide whether discovery should run. `admit_dynamic_filter_keys` accepts supported equality keys and records the build/probe metadata needed at runtime.
 - **Target discovery.** `trace_probe_key` follows a key through physical operators only while its value and row semantics remain safe. A reachable GPU scan wins; otherwise `place_endpoint` may insert a membership-only `sirius_physical_dynamic_filter` at the deepest safe point. Unknown or unsafe transformations stop descent.
 - **Publication plan.** `dynamic_filter_publish_plan` binds admitted build keys to target channels and target output ordinals, carries filter policy, and identifies the admitted GPU/HOST replica spaces.
 - **Publication session.** `dynamic_filter_publication_session` owns the whole-build claim, source pin/readiness, one-shot construction, terminal outcome, and producer completion rights. The session claims and pins a whole-build delivery, invokes the join's existing repository deposit synchronously, then validates readiness and publishes inline. An eligible PARTITION or BUILD_FILTER stage can instead accumulate a Bloom filter from every certified build batch (see [Multi-partition build accumulation](#multi-partition-build-accumulation)).
@@ -65,6 +65,8 @@ The main components are:
 The probe key's entry ordinal and a target's output ordinal are different coordinate spaces. The discovery walk performs that translation; channel push, storage, and lookup all use the target output ordinal.
 
 For build evidence, projections and a plain deduplication aggregate over a `CTE_REF` or `DELIM_GET` retain the underlying opaque-relation evidence. The aggregate must have no aggregate expressions or grouping functions and use ordinary grouping over all its keys. This permits filters built from the deduplicated output; it does not trace scan lineage through a CTE reference.
+
+A SEMI or ANTI comparison join anywhere in the build subtree (either side variant, and as a `DELIM_JOIN`) is also evidence. Such a join only removes rows, so the build it feeds is reduced like a filtered one. DuckDB's own join-filter test does not count it. Under `delim_join_as_cte`, DuckDB attaches a correlated subquery's outer keys with a semi join on one table; this evidence lets the join above that table publish the reduction to its probe side.
 
 Probe-side discovery descends through a materialized `CTE` operator into its rest (`children[1]`) with the same ordinal, so a join above a CTE places its filter next to the `CTE_SCAN` reader and not above the whole CTE subtree. A `CTE_SCAN` is otherwise a terminal; `RECURSIVE_CTE` and `RECURSIVE_KEY_CTE` are never looked through.
 

@@ -588,8 +588,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("filter on, unfiltered build: no endpoint wires anywhere")
   {
-    // An unfiltered base-table build supplies neither filter nor opaque-build evidence, and either
-    // kind would arm discovery for both routes -- with neither, no route wires.
+    // An unfiltered base-table build supplies no filter, opaque-build or semi-join evidence, and
+    // any kind would arm discovery for both routes -- with none, no route wires.
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, query, keep_shape);
     INFO(tree_to_string(plan.get()));
@@ -861,6 +861,36 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                                      "(SELECT r.rid FROM small_right r JOIN small_c c "
                                      " ON r.other = c.ckey WHERE c.cother % 2 = 0) j "
                                      "ON l.id = j.rid",
+                                     keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* outer = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(outer != nullptr);
+    auto const& targets =
+      outer->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().probe_targets();
+    REQUIRE(targets.size() == 1);
+    CHECK(targets.front().route_class == sirius::op::dynamic_filter_route_class::scan);
+
+    auto endpoints = collect(outer->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(endpoints.size() == 1);
+    REQUIRE(endpoints.front()->children.size() == 1);
+    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+  }
+
+  SECTION("semi- or anti-join-output build: join evidence wires the outer scan route")
+  {
+    // No table here carries a filter; the build is reduced only by the SEMI or ANTI join.
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto const join_keyword = GENERATE(std::string("SEMI"), std::string("ANTI"));
+    CAPTURE(join_keyword);
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT * FROM big_left l JOIN "
+                                     "(SELECT r.rid FROM small_right r " +
+                                       join_keyword +
+                                       " JOIN small_c c "
+                                       " ON r.other = c.ckey) j "
+                                       "ON l.id = j.rid",
                                      keep_shape);
     INFO(tree_to_string(plan.get()));
 

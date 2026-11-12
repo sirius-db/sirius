@@ -60,8 +60,10 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace sirius::planner {
@@ -530,7 +532,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
-  bool const build_evidence = build_filtered || build_opaque;
+  bool const build_join_filtered =
+    dynamic_filter_enabled && build_subtree_has_filtering_join(*op.children[1]);
+  bool const build_evidence = build_filtered || build_opaque || build_join_filtered;
 
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
@@ -763,13 +767,21 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       }
     }
     if (!targets.empty()) {
+      std::string evidence;
+      for (auto const& [present, name] : {std::pair{build_filtered, "filtered"},
+                                          std::pair{build_opaque, "opaque"},
+                                          std::pair{build_join_filtered, "semi-join"}}) {
+        if (!present) { continue; }
+        if (!evidence.empty()) { evidence += '+'; }
+        evidence += name;
+      }
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
         "target(s) ({} scan-bound, {} join-edge; evidence={}; build est {} rows).",
         targets.size(),
         scan_target_count,
         targets.size() - scan_target_count,
-        build_filtered ? (build_opaque ? "filtered+opaque" : "filtered") : "opaque",
+        evidence,
         rhs_cardinality);
     } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
@@ -781,7 +793,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
-        "neither filter nor opaque-build evidence (build est {} rows).",
+        "no filter, opaque-build or semi-join evidence (build est {} rows).",
         rhs_cardinality);
     }
 
