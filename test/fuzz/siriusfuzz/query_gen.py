@@ -78,7 +78,9 @@ LIKE_PATTERNS = [
     "%'%",
     "%\\%%",
 ]
-REGEX_PATTERNS = ["[aeiou]", "a+", "\\d+", "^.", "x", "[A-Z]", "(an)+", "\\s"]
+# No shorthand classes (\d, \s, \w, \b): RE2's are ASCII-only and cuDF's are Unicode-aware,
+# so Sirius declines them at plan time.
+REGEX_PATTERNS = ["[aeiou]", "a+", "[0-9]+", "^.", "x", "[A-Z]", "(an)+", "[ ]"]
 REGEX_REPLACEMENTS = ["", "_", "X", "\\0\\0"]
 DATE_PARTS_DATE = ["year", "month", "day", "quarter", "week"]
 DATE_PARTS_TS = DATE_PARTS_DATE + ["hour", "minute", "second"]
@@ -545,8 +547,11 @@ class QueryGenerator:
             op = "IS NOT DISTINCT FROM"
             self._note("join:null_safe")
         cond: Expr = Compare(op, l, r)
-        if self.f.joins.inequality and rng.random() < 0.2 and len(pairs) > 1:
-            l2, r2 = rng.choice(pairs)
+        # cuDF's mixed join needs the equality and inequality columns to be disjoint, so a
+        # key column must not reappear in the range condition.
+        others = [(a, b) for a, b in pairs if a is not l and b is not r]
+        if self.f.joins.inequality and rng.random() < 0.2 and others:
+            l2, r2 = rng.choice(others)
             self._note("join:inequality")
             cond = Logical("AND", [cond, Compare(rng.choice(["<", ">", "<>"]), l2, r2)])
         elif rng.random() < 0.15 and len(pairs) > 1:
@@ -766,7 +771,15 @@ class QueryGenerator:
             )
         if what == "date_trunc":
             src_kind = rng.choice(["date", "timestamp"])
-            part = rng.choice(DATE_PARTS_DATE if src_kind == "date" else DATE_PARTS_TS)
+            units = self.f.scalar_functions.date_trunc_units
+            parts = [
+                p
+                for p in (DATE_PARTS_DATE if src_kind == "date" else DATE_PARTS_TS)
+                if p in units
+            ]
+            if not parts:
+                raise GenerationFailed("date_trunc unit")
+            part = rng.choice(parts)
             return Func(
                 "date_trunc",
                 [Literal(part, st.VARCHAR), self._gen_expr(src_kind, scope, depth + 1)],

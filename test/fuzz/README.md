@@ -168,7 +168,9 @@ feature, flip its flag to `true` there. `--set key.path=value` overrides any key
 `known_issues.toml` quarantines confirmed divergences by regex; every entry carries an issue link.
 
 **Sirius YAML.** `--sirius-config` selects it (repeat the flag to alternate across workers);
-otherwise the configuration's `sirius.configs` applies, and with `sirius.configs = []` the run
+otherwise the configuration's `sirius.configs` applies (by default the integration YAML and
+`config/partition16k.yaml`, whose 16 KiB budgets split the small fuzz tables into several hash
+partitions), and with `sirius.configs = []` the run
 uses whatever Sirius itself would pick up (`SIRIUS_CONFIG_FILE`, `./sirius.yaml`,
 `~/.sirius/sirius.yaml`, else built-in defaults). Whichever file is used is copied into the run
 and into every finding, so a replay elsewhere restores it.

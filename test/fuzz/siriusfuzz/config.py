@@ -115,6 +115,22 @@ class ScalarFunctions:
     weights: dict[str, float] = field(
         default_factory=lambda: {"like": 2.0, "regexp_replace": 0.5}
     )
+    # The GPU truncates to day and finer; year/quarter/month/week fall back.
+    date_trunc_units: list[str] = field(
+        default_factory=lambda: ["day", "hour", "minute", "second"],
+        metadata={
+            "gaps": [
+                "year",
+                "quarter",
+                "month",
+                "week",
+                "day",
+                "hour",
+                "minute",
+                "second",
+            ]
+        },
+    )
 
 
 @dataclass
@@ -287,7 +303,10 @@ class Sirius:
         "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"
     )
     configs: list[str] = field(
-        default_factory=lambda: ["test/cpp/integration/integration.yaml"]
+        default_factory=lambda: [
+            "test/cpp/integration/integration.yaml",
+            "test/fuzz/config/partition16k.yaml",
+        ]
     )
     dataset_queries: int = 200  # queries per generated dataset before regenerating
 

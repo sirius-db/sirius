@@ -56,6 +56,7 @@ enabled = ["add", "sub", "mul", "div", "int_div", "mod",
            "regexp_replace", "concat", "concat_operator",
            "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
            "date_trunc"]
+date_trunc_units = ["day", "hour", "minute", "second"]  # year/quarter/month/week fall back
 [features.scalar_functions.weights]
 like = 2.0
 regexp_replace = 0.5
@@ -145,5 +146,6 @@ max_sort_partition_bytes = [0, 1048576]
 [sirius]
 shell = "sirius-duckdb/build/release/duckdb"      # the DuckDB shell `pixi run make` builds
 extension = "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"   # loaded into the shell
-configs = ["test/cpp/integration/integration.yaml"]
+configs = ["test/cpp/integration/integration.yaml",     # alternated across workers
+           "test/fuzz/config/partition16k.yaml"]         # same, with 16 KiB hash partitions
 dataset_queries = 200

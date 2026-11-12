@@ -2,8 +2,10 @@
 feature coverage (every enabled feature must be emitted)."""
 
 import collections
+import dataclasses
 import pathlib
 import random
+import re
 import tempfile
 import unittest
 
@@ -14,6 +16,19 @@ from siriusfuzz.query_gen import QueryGenerator
 from siriusfuzz.report import _CLAIMED_FEATURES
 from siriusfuzz.schema_gen import DataGenerator
 from siriusfuzz.session import Session
+from siriusfuzz.sqlast import Compare, Join, Logical
+
+
+def walk(node):
+    """Every dataclass node reachable from ``node`` through fields and lists."""
+    if dataclasses.is_dataclass(node) and not isinstance(node, type):
+        yield node
+        for f in dataclasses.fields(node):
+            yield from walk(getattr(node, f.name))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from walk(item)
+
 
 SHELL = conftest_path.available_shell()
 
@@ -144,6 +159,49 @@ class GeneratorValidity(unittest.TestCase):
             finally:
                 session.close()
         self.assertGreater(checked, 20)
+
+    def test_generated_shapes_stay_on_the_gpu(self):
+        """Shapes the planner is known to decline are not generated under the default
+        configuration: date_trunc units coarser than day, regex shorthand classes, and a
+        join key column reused in the same join's inequality (cuDF mixed join needs the
+        equality and inequality columns to be disjoint)."""
+        cfg = load_config(None, ["data.rows=[20,50]"])
+        rng = random.Random(11)
+        dg = DataGenerator(cfg, rng)
+        ds = dg.generate(11)
+        qg = QueryGenerator(cfg, ds, random.Random(11), dg)
+        units = set(cfg.features.scalar_functions.date_trunc_units)
+        seen_trunc = seen_ineq = 0
+        for _ in range(800):
+            q = qg.generate()
+            sql = q.sql()
+            for unit in re.findall(r"date_trunc\('(\w+)'", sql):
+                seen_trunc += 1
+                self.assertIn(unit, units, sql)
+            self.assertNotRegex(sql, r"regexp_replace\([^)]*\\[dsw]", sql)
+            for node in walk(q):
+                if not isinstance(node, Join) or not isinstance(node.cond, Logical):
+                    continue
+                eq = [
+                    c
+                    for c in node.cond.args
+                    if isinstance(c, Compare) and c.op in ("=", "IS NOT DISTINCT FROM")
+                ]
+                ineq = [
+                    c
+                    for c in node.cond.args
+                    if isinstance(c, Compare) and c.op in ("<", ">", "<>", "<=", ">=")
+                ]
+                for e in eq:
+                    for i in ineq:
+                        seen_ineq += 1
+                        self.assertFalse(
+                            e.left.sql() == i.left.sql()
+                            and e.right.sql() == i.right.sql(),
+                            sql,
+                        )
+        self.assertGreater(seen_trunc, 0)
+        self.assertGreater(seen_ineq, 0)
 
     def test_deterministic_for_seed(self):
         cfg = load_config(None, ["data.rows=[20,50]"])

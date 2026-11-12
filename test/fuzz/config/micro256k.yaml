@@ -9,7 +9,7 @@ sirius:
     disk:
       disk_id: 0
       capacity_bytes: 100Gi
-      downgrade_root_dirs: /localhome/local-akhiljn/sirius-spill
+      downgrade_root_dirs: /tmp/sirius_disk_memory
   telemetry:
     enable_quent: false
   operator_params:

@@ -1,20 +1,31 @@
+# test/cpp/integration/integration.yaml with 16 KiB hash/concat/cross-join/sort budgets, so the
+# fuzzer's ~100 KB tables run as several partitions. Scan batching stays at the shared default:
+# 16 KiB scan tasks only add GPU_VALUES size-floor fallbacks on this data.
 sirius:
   topology:
     num_gpus: 1
   memory:
     gpu:
-      usage_limit_fraction: 0.8
+      usage_limit_fraction: 0.4
+      reservation_limit_fraction: 1.0
     host:
-      capacity_bytes: 64Gi
-    disk:
-      disk_id: 0
-      capacity_bytes: 100Gi
-      downgrade_root_dirs: /localhome/local-akhiljn/sirius-spill
-  telemetry:
-    enable_quent: false
+      capacity_bytes: 32000000000
+      initial_number_pools: 10
+      pool_size: 512
+      block_size: 1048576
+  executor:
+    pipeline:
+      num_threads: 4
+    task_creator:
+      num_threads: 2
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
   operator_params:
-    scan_task_batch_size: 64Ki
+    scan_task_batch_size: 100000000
+    max_sort_partition_bytes: 0
     hash_partition_bytes: 16Ki
     concat_batch_bytes: 16Ki
     cross_join_task_bytes: 16Ki
     sort_sample_bytes: 16Ki
+    max_build_hash_table_bytes: 90000000
