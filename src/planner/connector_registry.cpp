@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "op/scan/generator/generate_function.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
@@ -357,12 +358,31 @@ connector make_sirius_stream_source_connector()
           .certify                    = nullptr};
 }
 
-std::array<connector, 6> const entries{make_seq_scan_connector(),
+// No bytes are read and the table function's CPU body only throws, so the generator shares the
+// stream source's byte class and replay veto.
+connector make_sirius_generate_connector()
+{
+  return {.function_name              = "sirius_generate",
+          .kind                       = kind::generator,
+          .registry_profile           = "sirius.generate.v1",
+          .bind_data_matches          = matches_bind<op::scan::generator::GenerateFunctionData>,
+          .lower                      = nullptr,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
+          .byte_source                = bytes::stream,
+          .permits_cpu_replay         = false,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt,
+          .certify                    = nullptr};
+}
+
+std::array<connector, 7> const entries{make_seq_scan_connector(),
                                        make_parquet_scan_connector(),
                                        make_read_parquet_connector(),
                                        make_sirius_read_parquet_connector(),
                                        make_iceberg_scan_connector(),
-                                       make_sirius_stream_source_connector()};
+                                       make_sirius_stream_source_connector(),
+                                       make_sirius_generate_connector()};
 
 duckdb::vector<duckdb::TableFunction> copy_functions(duckdb::TableFunctionSet const& functions)
 {
@@ -485,6 +505,7 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
   }
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
+  if (name == "sirius_generate") return {op::scan::generator::get_generate_function()};
   // Iceberg is initialized at extension load, never during a planning lookup.
   return {};
 }

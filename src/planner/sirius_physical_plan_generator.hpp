@@ -212,6 +212,13 @@ class sirius_physical_plan_generator {
   //! stream_session once the plan tree owns it.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_streaming_source_plan(
     duckdb::LogicalGet& op);
+
+  //! Builds the GENERATOR source a `sirius_generate(...)` read stands for from its bound spec,
+  //! under a projection when the query references only some of its columns. The leaf has no
+  //! scan metadata; its contract is allocated and recorded as supported so plan-wide contract
+  //! accounting sees it.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_generator_plan(
+    duckdb::LogicalGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);

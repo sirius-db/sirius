@@ -43,8 +43,10 @@
 #include "io/path_utils.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
+#include "op/scan/generator/generate_function.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_generator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/scan_returned_types.hpp"
@@ -437,6 +439,73 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
   return source;
 }
 
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_generator_plan(duckdb::LogicalGet& op)
+{
+  auto const* bind =
+    dynamic_cast<sirius::op::scan::generator::GenerateFunctionData const*>(op.bind_data.get());
+  if (bind == nullptr) {
+    throw duckdb::InternalException("sirius_generate is missing its generator bind data");
+  }
+  auto const& spec = bind->spec;
+
+  if (op.returned_types.size() != spec.columns.size()) {
+    throw duckdb::InternalException("sirius_generate: bound schema disagrees with its spec");
+  }
+  // Projection pushdown is off, so the source always produces every column of the spec (a
+  // column's values depend on its position in it). The binder still lists only the columns the
+  // query references; those are selected by a projection above the source, as DuckDB does.
+  auto const& column_ids    = op.GetColumnIds();
+  bool projection_necessary = column_ids.size() != spec.columns.size();
+  duckdb::vector<duckdb::LogicalType> projected_types;
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> projections;
+  for (std::size_t i = 0; i < column_ids.size(); ++i) {
+    if (column_ids[i].IsVirtualColumn()) {
+      throw duckdb::NotImplementedException("sirius_generate has no virtual columns");
+    }
+    auto const column = column_ids[i].GetPrimaryIndex();
+    if (column >= spec.columns.size()) {
+      throw duckdb::InternalException("sirius_generate: column index is outside its spec");
+    }
+    projection_necessary |= column != i;
+    projected_types.push_back(op.returned_types[column]);
+    projections.push_back(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(op.returned_types[column], column));
+  }
+
+  auto view = std::make_shared<sirius::op::scan::bound_read_view const>(
+    sirius::op::scan::capture_bound_read_view(op, context));
+  sirius::op::scan::column_requirements columns;
+  columns.column_ids = column_ids;
+  // The generator reuses the stream materializer kind; the profile tells the two apart.
+  sirius::op::scan::materializer_contract_identity materializer{
+    sirius::op::scan::materializer_kind::stream, "sirius.generate.v1"};
+  auto const contract_id =
+    sirius::op::scan::allocate_scan_contract(*read_views,
+                                             contract_provenance.window_id,
+                                             contract_provenance.finalize_generation,
+                                             next_scan_node_id++,
+                                             std::move(view),
+                                             std::move(columns),
+                                             {},
+                                             std::move(materializer),
+                                             op.returned_types,
+                                             op.table_index.index);
+  sirius::op::scan::certification_result generator_result;
+  generator_result.verdict = sirius::op::scan::eligibility_verdict::supported;
+  read_views->record_verdict(contract_id, generator_result);
+  // Exact: bind rejected a product that overflows.
+  auto const rows = spec.num_batches * spec.rows_per_batch;
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> source =
+    duckdb::make_uniq<sirius::op::sirius_physical_generator>(
+      sirius::from_duckdb_vec(op.returned_types), spec, rows);
+  if (!projection_necessary) { return source; }
+  return push_projection(std::move(source),
+                         sirius::from_duckdb_vec(projected_types),
+                         translate_expressions(std::move(projections)),
+                         rows);
+}
+
 duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> extract_unpushed_scan_filters(
   duckdb::LogicalGet const& op, duckdb::TableFilterSet& table_filters)
 {
@@ -607,6 +676,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // STREAMING_SOURCE leaf: fragment-declared repo + senders, not a file scan.
   if (op.function.GetName() == sirius::exec::kStreamSourceFunctionName) {
     return create_streaming_source_plan(op);
+  }
+
+  // GENERATOR leaf: synthetic data produced on the GPU from the bound spec, not a file scan.
+  if (op.function.GetName() == sirius::op::scan::generator::kGenerateFunctionName) {
+    return create_generator_plan(op);
   }
 
   // Plan-time probe for the duckdb-native seq_scan path: strings at/over
