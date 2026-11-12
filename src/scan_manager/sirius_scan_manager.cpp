@@ -2647,7 +2647,7 @@ void sirius_scan_manager::log_gds_proof(sirius::query_id_t query_id)
   SIRIUS_LOG_INFO(
     "[gds] query={} device_bytes={} device_reads={:.0f} cufile_reads={} nvfs_reads={} "
     "posix_reads={} node_mmap_delta={} GB/s={:.2f} read_ms_avg={:.2f} wait_ms_avg={:.2f} "
-    "read_thread_s={:.1f} verdict={}",
+    "read_thread_s={:.1f} held_reads={} verdict={}",
     query_id,
     bytes,
     reads,
@@ -2662,6 +2662,7 @@ void sirius_scan_manager::log_gds_proof(sirius::query_id_t query_id)
     reads > 0 ? static_cast<double>(end.io.device_wait_ns - start.io.device_wait_ns) / 1e6 / reads
               : 0.0,
     static_cast<double>(end.io.device_read_ns - start.io.device_read_ns) / 1e9,
+    end.io.held_reads - start.io.held_reads,
     has_cufile ? sirius::io::gds::to_string(sirius::io::gds::classify(delta)) : "unknown");
 }
 

@@ -18,6 +18,7 @@
 #include "io/gds/gds_ioctx.hpp"
 #include "io/gds/gds_stats.hpp"
 #include "scan_manager/config.hpp"
+#include "utils/log_test_utils.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -36,6 +37,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -95,6 +97,24 @@ std::size_t read_device(gds_ioctx& ctx,
     .device_read_async_io(
       obj, offset, size, static_cast<std::uint8_t*>(dst.data()), default_stream())
     .get();
+}
+
+/// Whether one message containing @p text and @p also is logged within five seconds.
+bool logged(sirius::test::scoped_recording_log_sink const& logs,
+            std::string_view text,
+            std::string_view also)
+{
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  do {
+    for (auto const& record : logs.records()) {
+      if (record.message.find(text) != std::string::npos &&
+          record.message.find(also) != std::string::npos) {
+        return true;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
 }
 
 }  // namespace
@@ -241,6 +261,69 @@ TEST_CASE("gds_ioctx fails reads once one is stuck past the timeout", "[gds_ioct
     release = true;
   }
   cv.notify_all();
+}
+
+TEST_CASE("gds_ioctx reports a held read while it is out and when it returns", "[gds_ioctx]")
+{
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+  // A size of its own: lines of an earlier test's context name another file.
+  pattern_file file(k_mib + 4096);
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool release = false;
+  // Releases the held read on every way out, so that a failed check cannot leave the
+  // context's destructor waiting for it.
+  struct releaser {
+    std::mutex& mutex;
+    std::condition_variable& cv;
+    bool& release;
+    ~releaser()
+    {
+      {
+        std::lock_guard lock{mutex};
+        release = true;
+      }
+      cv.notify_all();
+    }
+  };
+
+  auto opts   = posix_options();
+  opts.reader = [&](kvikio::FileHandle&, void*, std::size_t size, std::size_t offset) {
+    if (offset == 0) {
+      std::unique_lock lock{mutex};
+      cv.wait(lock, [&] { return release; });
+    }
+    return size;
+  };
+  opts.watchdog_period = std::chrono::milliseconds(20);
+  opts.held_after      = std::chrono::milliseconds(200);
+  gds_config config;
+  config.num_threads          = 2;
+  config.slow_read_ms_per_mib = 0;
+  gds_ioctx ctx(config, std::move(opts));
+  releaser const on_exit{mutex, cv, release};
+  auto const obj = ctx.open_io_object(file.path.string());
+
+  rmm::device_buffer held_dst(4096, rmm::cuda_stream_default);
+  auto held = ctx.device_read_async_io(
+    *obj, 0, 4096, static_cast<std::uint8_t*>(held_dst.data()), default_stream());
+  // The report names the read while it is still out, and other reads go on.
+  auto const where = "4096 bytes at 0 of " + file.path.string();
+  REQUIRE(logged(logs, "[gds] held: 1 reads have not returned, the oldest a cuFile read", where));
+  CHECK(logged(logs, "[gds] held: 1 reads have not returned", "; GB/s received per RDMA port: "));
+  rmm::device_buffer dst(4096, rmm::cuda_stream_default);
+  CHECK(read_device(ctx, *obj, 8192, 4096, dst) == 4096);
+  CHECK(ctx.counters().held_reads == 0);
+
+  {
+    std::lock_guard lock{mutex};
+    release = true;
+  }
+  cv.notify_all();
+  CHECK(std::move(held).get() == 4096);
+  CHECK(ctx.counters().held_reads == 1);
+  CHECK(logged(logs, "[gds] held: a cuFile read returned after", where));
+  CHECK_FALSE(ctx.stalled());
 }
 
 TEST_CASE("gds_ioctx stops issuing reads when they stay slow", "[gds_ioctx]")
