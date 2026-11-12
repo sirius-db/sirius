@@ -260,7 +260,7 @@ The evaluator raises `sirius::invalid_input_exception` for a SQL error it detect
 
 The evaluator's contract relative to DuckDB, which new operators and tests use as their oracle:
 
-1. **Never raise for rows a Row-exact Guard excludes.** CASE, COALESCE and TRY never raise for a row on an operation in a branch that the row does not select, nor does a fused NVRTC kernel for an operand that AND or OR skips for the row. Where an evaluator computes a guarded branch over every row (the `MATERIALIZE` and cuDF AST strategies, and an NVRTC kernel compiled for a subexpression of that branch), it may detect such an error; CPU Replay then returns DuckDB's value.
+1. **Never raise for rows a Row-exact Guard excludes.** CASE, COALESCE and TRY never raise for a row on an operation in a branch that the row does not select, nor does a fused NVRTC kernel for an operand that AND or OR skips for the row because an earlier operand already decided the result. An operand that runs for the row raises its overflow even where another operand decides the value. Where an evaluator computes a guarded branch over every row (the `MATERIALIZE` and cuDF AST strategies, and an NVRTC kernel compiled for a subexpression of that branch), it may detect such an error; CPU Replay then returns DuckDB's value.
 2. **Raise when an Evaluated Operation overflows** and no guard suppresses it, even if the final value is NULL. TRY_CAST turns only its own conversion failure into NULL; an overflow inside its input still raises.
 3. **Order- and chunk-dependent errors may return a value.** Where DuckDB's own raising depends on evaluation order or vector granularity (projection AND/OR across a vector, filter conjunct order, LIMIT), Sirius may return a value.
 

@@ -27,22 +27,22 @@
 #include "codegen/stdint_shim.hpp"
 
 //===----------KLEENE AND/OR----------===//
+// Both operands were evaluated, so Overflow Poison in either one poisons the result even where the
+// other one is a deciding FALSE (AND) or TRUE (OR).
 __device__ __forceinline__ reg_val<bool> eval_kleene_and(reg_val<bool> acc, reg_val<bool> rhs)
 {
-  bool const acc_false = acc.valid && !acc.overflow && !acc.val;
-  bool const rhs_false = rhs.valid && !rhs.overflow && !rhs.val;
-  if (acc_false || rhs_false) { return reg_val<bool>{false, true, false}; }
   if (acc.overflow || rhs.overflow) { return reg_val<bool>{false, true, true}; }
+  if ((acc.valid && !acc.val) || (rhs.valid && !rhs.val)) {
+    return reg_val<bool>{false, true, false};
+  }
   if (acc.valid && rhs.valid) { return reg_val<bool>{true, true, false}; }
   return reg_val<bool>{false, false, false};
 }
 
 __device__ __forceinline__ reg_val<bool> eval_kleene_or(reg_val<bool> acc, reg_val<bool> rhs)
 {
-  bool const acc_true = acc.valid && !acc.overflow && acc.val;
-  bool const rhs_true = rhs.valid && !rhs.overflow && rhs.val;
-  if (acc_true || rhs_true) { return reg_val<bool>{true, true, false}; }
   if (acc.overflow || rhs.overflow) { return reg_val<bool>{false, true, true}; }
+  if ((acc.valid && acc.val) || (rhs.valid && rhs.val)) { return reg_val<bool>{true, true, false}; }
   if (acc.valid && rhs.valid) { return reg_val<bool>{false, true, false}; }
   return reg_val<bool>{false, false, false};
 }

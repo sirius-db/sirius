@@ -23,11 +23,12 @@
  * `docs/super-sirius/expression-executor.md` states what it guarantees. An overflow in a branch
  * that a Row-exact Guard (CASE, COALESCE) excludes returns DuckDB's value, even where an evaluator
  * computes that branch over every row; an evaluated overflow returns DuckDB's error even where the
- * row's value is NULL; an unguarded conversion overflow returns DuckDB's error, as does an overflow
- * in a TRY_CAST's input; and a check that DuckDB does not share (a non-finite STDDEV_SAMP) returns
- * DuckDB's value. Each case asserts whether the query completed on the GPU or through CPU Replay,
- * so a replay cannot hide a broken GPU path. Overflow of abs and negation is covered beside their
- * other cases in `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
+ * row's value is NULL or another AND, OR or BETWEEN operand decides it; an unguarded conversion
+ * overflow returns DuckDB's error, as does an overflow in a TRY_CAST's input; and a check that
+ * DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value. Each case asserts
+ * whether the query completed on the GPU or through CPU Replay, so a replay cannot hide a broken
+ * GPU path. Overflow of abs and negation is covered beside their other cases in
+ * `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
  */
 
 #include <catch.hpp>
@@ -36,6 +37,8 @@
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 using SqlErrorFixture = sirius::test::GpuExecutionFixture;
 
@@ -122,6 +125,46 @@ TEST_CASE_METHOD(SqlErrorFixture,
     guarded_error_path(strategy));
   expect_error_matches_cpu("SELECT id, CAST(ms AS TIMESTAMP) FROM far_millis;",
                            execution_path::cpu_replay);
+}
+
+TEST_CASE_METHOD(SqlErrorFixture,
+                 "an overflow in an evaluated AND, OR or BETWEEN operand returns DuckDB's error "
+                 "even where another operand decides the value",
+                 "[integration][gpu_execution][sql_errors]")
+{
+  auto const strategy = GENERATE(sirius::test::each_expression_evaluator_strategy());
+  CAPTURE(strategy);
+  run_ok(
+    "CREATE TABLE operands AS SELECT * FROM (VALUES"
+    " (0, (-2147483648)::INTEGER, 1), (1, 3, -1), (2, -2, 0), (3, NULL, NULL), (4, 4, -7),"
+    " (5, 5, 9)) v(id, x, y);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{*con, strategy};
+
+  // Row 0 evaluates the overflowing abs(x) first; the FALSE (AND), TRUE (OR) or FALSE upper bound
+  // (BETWEEN) beside it does not suppress the error. DuckDB rewrites a BETWEEN whose bound is not a
+  // constant into an AND of its two comparisons, so only native tests reach Sirius's own BETWEEN
+  // with an overflowing bound.
+  expect_error_matches_cpu("SELECT id, (abs(x) > 0) AND (y < 0) FROM operands;",
+                           execution_path::cpu_replay);
+  expect_error_matches_cpu("SELECT id, (abs(x) > 0) OR (y > 0) FROM operands;",
+                           execution_path::cpu_replay);
+  expect_error_matches_cpu("SELECT id, y BETWEEN abs(x) AND -id FROM operands;",
+                           execution_path::cpu_replay);
+
+  // DuckDB evaluates both operands of a projection AND, so it raises. A fused `nvrtc_jit` kernel
+  // skips abs(x) on the rows where y < 0 is FALSE, row 0 among them, and may return a value
+  // (contract rule 3); every other strategy computes abs(x) on every row and replays.
+  auto const skipped = std::string{"SELECT id, (y < 0) AND (abs(x) > 0) FROM operands;"};
+  if (strategy == sirius::expression_evaluator_strategy::NVRTC_JIT) {
+    auto const result = run_on_path(skipped, execution_path::gpu);
+    REQUIRE_FALSE(result->HasError());
+    std::vector<std::vector<std::string>> const expected{
+      {"0", "false"}, {"1", "true"}, {"2", "false"}, {"3", "NULL"}, {"4", "true"}, {"5", "false"}};
+    CHECK(collect_rows(*result) == expected);
+  } else {
+    expect_error_matches_cpu(skipped, execution_path::cpu_replay);
+  }
 }
 
 TEST_CASE_METHOD(SqlErrorFixture,

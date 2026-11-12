@@ -5115,10 +5115,10 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
     return exec.evaluate(tv);
   };
 
-  SECTION("Kleene AND/OR: FALSE AND <overflow> and <overflow> AND FALSE do not throw")
+  SECTION("Kleene AND/OR: a skipped overflowing operand does not throw, an evaluated one does")
   {
     // col0 = {10, 20}: col0 + INT_MAX overflows on both rows!
-    // 1. FALSE AND (col0 + INT_MAX > 0) -> FALSE (no overflow!)
+    // 1. FALSE AND (col0 + INT_MAX > 0) -> FALSE (the overflowing operand is skipped!)
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(
@@ -5130,19 +5130,19 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       CHECK(copy_bool_column_to_host(out->view().column(0)) == std::vector<std::uint8_t>{0, 0});
     }
 
-    // 2. (col0 + INT_MAX > 0) AND FALSE -> FALSE (RHS false dominates LHS overflow!)
+    // 2. (col0 + INT_MAX > 0) AND FALSE throws: the left operand is evaluated on every row, so its
+    // overflow is an error even though the FALSE right operand decides the value.
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(make_ovf_bool());
       ch.push_back(
         make_cmp(sirius::comparison_type::lt, make_ref_typed(0, int_t), make_int_const(0)));
       auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch));
-      auto out  = eval_one_col({10, 20}, {true, true}, *expr);
-      CHECK(out->view().column(0).null_count() == 0);
-      CHECK(copy_bool_column_to_host(out->view().column(0)) == std::vector<std::uint8_t>{0, 0});
+      REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
     }
 
-    // 3. TRUE OR (col0 + INT_MAX > 0) -> TRUE (no overflow!)
+    // 3. TRUE OR (col0 + INT_MAX > 0) -> TRUE (the overflowing operand is skipped!)
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(
@@ -5154,16 +5154,16 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       CHECK(copy_bool_column_to_host(out->view().column(0)) == std::vector<std::uint8_t>{1, 1});
     }
 
-    // 4. (col0 + INT_MAX > 0) OR TRUE -> TRUE (RHS true dominates LHS overflow!)
+    // 4. (col0 + INT_MAX > 0) OR TRUE throws: the left operand is evaluated on every row, so its
+    // overflow is an error even though the TRUE right operand decides the value.
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(make_ovf_bool());
       ch.push_back(
         make_cmp(sirius::comparison_type::gt, make_ref_typed(0, int_t), make_int_const(0)));
       auto expr = make_conj(sirius::ast::conjunction::kind::op_or, std::move(ch));
-      auto out  = eval_one_col({10, 20}, {true, true}, *expr);
-      CHECK(out->view().column(0).null_count() == 0);
-      CHECK(copy_bool_column_to_host(out->view().column(0)) == std::vector<std::uint8_t>{1, 1});
+      REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
     }
 
     // 5. Undominated overflow: TRUE AND (col0 + INT_MAX > 0) throws invalid_input_exception!
@@ -5184,6 +5184,19 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       ch.push_back(make_ovf_bool());
       auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch));
       REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
+    }
+
+    // 7. col0 BETWEEN (col0 + INT_MAX) AND -1 throws: BETWEEN evaluates both bounds on every row,
+    // so the lower bound's overflow is an error even though the FALSE upper bound decides the
+    // value. The NULL row keeps the input nullable, which takes the three-valued path.
+    {
+      auto expr = make_between(make_ref_typed(0, int_t),
+                               make_ovf_int(),
+                               make_int_const(-1),
+                               /*lower_inclusive=*/true,
+                               /*upper_inclusive=*/true);
+      REQUIRE_THROWS_AS(eval_one_col({10, 20, 0}, {true, true, false}, *expr),
                         sirius::invalid_input_exception);
     }
   }
@@ -5370,7 +5383,8 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
 
     // x IN (10, col0 + INT_MAX):
     //   when x = 10 on all rows, short-circuits on element 0 and does NOT throw overflow!
-    //   even if evaluated in reverse `(col0 + INT_MAX, 10)`, valid match 10 dominates overflow!
+    // x IN (col0 + INT_MAX, 10) throws even where the later match 10 decides the value: the
+    //   overflowing element is evaluated first on every row, so its overflow is an error.
     {
       std::vector<std::unique_ptr<ast_node>> vals1;
       vals1.push_back(make_int_const(10));
@@ -5383,12 +5397,9 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       std::vector<std::unique_ptr<ast_node>> vals2;
       vals2.push_back(make_ovf_int());
       vals2.push_back(make_int_const(10));
-      auto in2  = make_in(make_ref_typed(0, int_t), std::move(vals2), /*negated=*/false);
-      auto out2 = eval_one_col({10, 10}, {true, true}, *in2);
-      CHECK(out2->view().column(0).null_count() == 0);
-      CHECK(copy_bool_column_to_host(out2->view().column(0)) == std::vector<std::uint8_t>{1, 1});
-
-      // When x = 20 (does not match 10), the overflow is undominated and throws!
+      auto in2 = make_in(make_ref_typed(0, int_t), std::move(vals2), /*negated=*/false);
+      REQUIRE_THROWS_AS(eval_one_col({10, 10}, {true, true}, *in2),
+                        sirius::invalid_input_exception);
       REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *in2),
                         sirius::invalid_input_exception);
     }

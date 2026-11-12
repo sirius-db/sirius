@@ -33,6 +33,7 @@
 #include <format>
 #include <iterator>
 #include <limits>
+#include <string_view>
 #include <variant>
 
 namespace sirius::nvrtc {
@@ -188,6 +189,14 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
     expr += r->var_name + ".overflow";
   }
   return expr.empty() ? "false" : expr;
+}
+
+// Whether a Kleene AND (or OR) accumulator can still change: it carries no Overflow Poison and is
+// not a definite FALSE (TRUE). A later operand runs only while this holds, so an operand skipped
+// for a row never raises.
+[[nodiscard]] std::string kleene_undecided(std::string_view accumulator, bool is_and)
+{
+  return format("!({0}.overflow || ({0}.valid && {1}{0}.val))", accumulator, is_and ? "!" : "");
 }
 
 [[nodiscard]] bool any_can_overflow(std::initializer_list<register_value const*> regs)
@@ -692,17 +701,14 @@ register_value translation_context::produce_conjunction(sirius::ast::conjunction
   auto const first    = produce(*expr.children.front());
   emit_reg_val_assign("bool", var_name, first.var_name);
 
-  bool non_null       = first.is_statically_non_null;
-  bool can_ovf        = first.can_overflow;
-  bool const is_and   = (expr.op == sirius::ast::conjunction::kind::op_and);
-  char const* fn_name = is_and ? "eval_kleene_and" : "eval_kleene_or";
-  // The next operand only runs while the accumulator can still change: a definite FALSE (AND) or
-  // TRUE (OR) dominates every later operand, including one that would overflow.
-  auto const dom_cond =
-    format("!({0}.valid && !{0}.overflow && {1}{0}.val)", var_name, is_and ? "!" : "");
+  bool non_null        = first.is_statically_non_null;
+  bool can_ovf         = first.can_overflow;
+  bool const is_and    = (expr.op == sirius::ast::conjunction::kind::op_and);
+  char const* fn_name  = is_and ? "eval_kleene_and" : "eval_kleene_or";
+  auto const undecided = kleene_undecided(var_name, is_and);
 
   for (auto it = std::next(expr.children.begin()); it != expr.children.end(); ++it) {
-    emit_line(format("if ({}) {{", dom_cond));
+    emit_line(format("if ({}) {{", undecided));
     auto const rhs = produce(**it);
     emit_line(format("{0} = {1}({0}, {2});", var_name, fn_name, rhs.var_name));
     emit_line("}");
@@ -799,8 +805,8 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
   bool can_ovf      = probe_reg.can_overflow;
   bool all_non_null = probe_reg.is_statically_non_null;
   for (std::size_t i = 0; i < expr.values.size(); ++i) {
-    // A definite TRUE dominates the remaining list values.
-    if (i > 0) { emit_line(format("if (!({0}.valid && !{0}.overflow && {0}.val)) {{", var_name)); }
+    // As in OR, a list value runs only while the result is undecided.
+    if (i > 0) { emit_line(format("if ({}) {{", kleene_undecided(var_name, /*is_and=*/false))); }
     auto const val_reg = produce(*expr.values[i]);
     can_ovf            = can_ovf || val_reg.can_overflow;
     all_non_null       = all_non_null && val_reg.is_statically_non_null;

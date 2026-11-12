@@ -178,7 +178,7 @@ TEST_CASE("nvrtc_codegen - each conjunction and coalesce operand is produced exa
     CHECK(reg.device_type.id() == cudf::type_id::BOOL8);
   }
 
-  SECTION("OR dominance guards reference the accumulator with a true test")
+  SECTION("OR guards skip a later operand once the accumulator is poisoned or TRUE")
   {
     std::vector<std::unique_ptr<ast_node>> children;
     children.push_back(make_ref_typed(8, bool_t));
@@ -190,8 +190,8 @@ TEST_CASE("nvrtc_codegen - each conjunction and coalesce operand is produced exa
     auto const body = ctx.body_code();
     CHECK(count_occurrences(body, "eval_kleene_or(") == 1);
     CHECK(count_occurrences(body,
-                            "if (!(" + reg.var_name + ".valid && !" + reg.var_name +
-                              ".overflow && " + reg.var_name + ".val)) {") == 1);
+                            "if (!(" + reg.var_name + ".overflow || (" + reg.var_name +
+                              ".valid && " + reg.var_name + ".val))) {") == 1);
     // The same column is loaded once however often it is referenced.
     CHECK(ctx.input_columns().size() == 1);
     CHECK(count_occurrences(body, "in_0_data[row]") == 1);
