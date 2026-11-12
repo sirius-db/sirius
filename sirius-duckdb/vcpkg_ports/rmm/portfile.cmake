@@ -28,13 +28,14 @@ vcpkg_from_github(
 
 include("${CMAKE_CURRENT_LIST_DIR}/../rapids_common.cmake")
 
+set(RAPIDS_LOGGER_VERSION 0.3.0)
 vcpkg_from_github(
   OUT_SOURCE_PATH
   RAPIDS_LOGGER_PATH
   REPO
   rapidsai/rapids-logger
   REF
-  v0.3.0
+  v${RAPIDS_LOGGER_VERSION}
   SHA512
   0952bcd7c6579b0cc613e848c1d695466942d3a09d3f98af4c8fed97d23f5e7ad86d73603bfc58b55a4f33461b4e567716d0a70957935fefb896907bdf1074d1
   HEAD_REF
@@ -118,3 +119,18 @@ file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")
 
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
+
+include(
+  "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/sirius-third-party-component.cmake")
+sirius_third_party_component(
+  "${CURRENT_PACKAGES_DIR}/share/${PORT}/third_party/rapids-logger"
+  NAME
+  "rapids-logger"
+  VERSION
+  "${RAPIDS_LOGGER_VERSION}"
+  LICENSE
+  "Apache-2.0"
+  HOMEPAGE
+  "https://github.com/rapidsai/rapids-logger"
+  FILES
+  "${RAPIDS_LOGGER_PATH}/LICENSE")

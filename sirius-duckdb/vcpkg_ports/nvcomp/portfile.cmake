@@ -108,4 +108,5 @@ endif()
 set(nvcomp_FOUND TRUE)
 ")
 
-vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
+vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE"
+                        "${SOURCE_PATH}/NOTICE")

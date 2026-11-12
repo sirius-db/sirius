@@ -33,6 +33,7 @@
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "sirius_licenses.hpp"
 
 #include <dlfcn.h>
 
@@ -273,6 +274,9 @@ class sirius_loader {
     loader_status_ptr result = std::move(status);
     if (!result->backend_loaded) { register_fallback(result); }
     loader_.RegisterFunction(status_function::create(result));
+    // A loaded backend embeds a superset of the loader's notices; a backend built before it
+    // listed them has no sirius_licenses(), which beats under-reporting it.
+    if (!result->backend_loaded) { sirius_duckdb::third_party_notices::register_function(loader_); }
     if (install_failed_) {
       // Only now is the fallback certain; a FATAL error or a rejected gpu_execution throws.
       print(

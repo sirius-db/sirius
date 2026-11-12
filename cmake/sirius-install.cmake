@@ -1,7 +1,8 @@
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
-  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+  PATH_VARS SIRIUS_THIRD_PARTY_INSTALL_DIR)
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
   VERSION "${PROJECT_VERSION}"

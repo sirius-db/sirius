@@ -169,6 +169,23 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertEqual(self.rows(result), [{"stubs": 0}])
 
+    def test_loaded_backend_owns_sirius_licenses(self):
+        result = self.query(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};"
+            "SELECT extension_name FROM duckdb_functions()"
+            " WHERE function_name = 'sirius_licenses';"
+        )
+        self.assertEqual(self.rows(result), [{"extension_name": "sirius_cuda13"}])
+
+    def test_backend_loaded_after_fallback_owns_sirius_licenses(self):
+        result = self.query(
+            f"LOAD {quote(self.loader)}; LOAD {quote(self.backend(13))};"
+            "SELECT extension_name FROM duckdb_functions()"
+            " WHERE function_name = 'sirius_licenses';",
+            version=12000,
+        )
+        self.assertEqual(self.rows(result), [{"extension_name": "sirius_cuda13"}])
+
     def test_unsupported_driver(self):
         for version in [0, 11080, 11999, 12000, 12070]:
             with self.subTest(version=version):
@@ -359,6 +376,29 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
+
+    def test_release_extracts_embedded_notices(self):
+        script = (
+            Path(__file__).resolve().parents[3]
+            / "scripts/extract_third_party_notices.py"
+        )
+        result = subprocess.run(
+            ["python3", str(script), str(self.loader)], check=True, capture_output=True
+        )
+        expected = (
+            args.build_dir / "extension/sirius/THIRD_PARTY_NOTICES.txt"
+        ).read_bytes()
+        self.assertEqual(result.stdout, expected)
+        rows = self.rows(
+            self.query(
+                f"LOAD {quote(self.loader)};"
+                "SELECT component, license_text FROM sirius_licenses();",
+                version=12000,
+            )
+        )
+        self.assertGreater(len(rows), 20)
+        for row in rows:
+            self.assertIn(row["license_text"].encode(), expected, row["component"])
 
     def test_loader_has_no_cuda_or_engine_dependency(self):
         result = subprocess.run(

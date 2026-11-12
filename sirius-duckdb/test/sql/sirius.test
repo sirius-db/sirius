@@ -72,3 +72,11 @@ SELECT id FROM sirius_knn_search('vectors', 'vec', [0, 0, 0]::FLOAT[3], k => 5);
 
 statement ok
 SELECT * FROM unpin_table('vectors');
+
+# The backend lists its bundled third-party components; static builds add the vcpkg ports.
+query I
+SELECT count(*) FROM sirius_licenses()
+WHERE component IN ('Sirius', 'DuckDB', 'cuCascade', 'Protocol Buffers', 'Rust standard library')
+  AND length(license_text) > 0;
+----
+5

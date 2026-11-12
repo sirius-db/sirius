@@ -63,13 +63,14 @@ vcpkg_from_github(
 
 # cutlass 4.1.0 pinned via cpp/cmake/patches/cutlass_override.json
 # (header-only).
+set(CUTLASS_VERSION 4.1.0)
 vcpkg_from_github(
   OUT_SOURCE_PATH
   CUTLASS_PATH
   REPO
   NVIDIA/cutlass
   REF
-  v4.1.0
+  v${CUTLASS_VERSION}
   SHA512
   a8c2cdf772ea3b1a35bfc948ca70240477d6e8ee004ae9e487275a7b35e40424b2820396cbc827482ddb75172fcdf56372ea0d4d96ae6f3253369bd315de3ce6
   HEAD_REF
@@ -165,3 +166,36 @@ file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")
 
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
+
+# CUTLASS kernels compiled into cuVS, and code cuVS adapts from other projects.
+include(
+  "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/sirius-third-party-component.cmake")
+sirius_third_party_component(
+  "${CURRENT_PACKAGES_DIR}/share/${PORT}/third_party/cutlass"
+  NAME
+  "CUTLASS"
+  VERSION
+  "${CUTLASS_VERSION}"
+  LICENSE
+  "BSD-3-Clause"
+  HOMEPAGE
+  "https://github.com/NVIDIA/cutlass"
+  FILES
+  "${CUTLASS_PATH}/LICENSE.txt")
+file(
+  GLOB thirdparty_licenses
+  LIST_DIRECTORIES false
+  "${SOURCE_PATH}/thirdparty/LICENSES/*")
+list(SORT thirdparty_licenses)
+sirius_third_party_component(
+  "${CURRENT_PACKAGES_DIR}/share/${PORT}/third_party/cuvs-derived"
+  NAME
+  "Code adapted in cuVS"
+  VERSION
+  "${VERSION}"
+  LICENSE
+  "MIT AND BSD-3-Clause AND Apache-2.0"
+  HOMEPAGE
+  "https://github.com/rapidsai/cuvs/tree/v${VERSION}/thirdparty"
+  FILES
+  ${thirdparty_licenses})

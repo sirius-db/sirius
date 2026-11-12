@@ -27,25 +27,27 @@ vcpkg_from_github(
 # rapids-cmake otherwise downloads the CPM release asset during configure.
 include("${CMAKE_CURRENT_LIST_DIR}/../rapids_common.cmake")
 
+set(RAPIDS_LOGGER_VERSION 0.3.0)
 vcpkg_from_github(
   OUT_SOURCE_PATH
   RAPIDS_LOGGER_PATH
   REPO
   rapidsai/rapids-logger
   REF
-  v0.3.0
+  v${RAPIDS_LOGGER_VERSION}
   SHA512
   0952bcd7c6579b0cc613e848c1d695466942d3a09d3f98af4c8fed97d23f5e7ad86d73603bfc58b55a4f33461b4e567716d0a70957935fefb896907bdf1074d1
   HEAD_REF
   main)
 
+set(RTCX_REF a9f63f8cdd4b0b41a2d88a9f705576a61b4222ec)
 vcpkg_from_github(
   OUT_SOURCE_PATH
   RTCX_PATH
   REPO
   rapidsai/librtcx
   REF
-  a9f63f8cdd4b0b41a2d88a9f705576a61b4222ec
+  ${RTCX_REF}
   SHA512
   e6f27dda72aa183be9ed636926e01fdd9740162f24f4ad5bcf2ce7a17d48cde0c554c24cbbd0ad351845c2253d4d82e2333bbbc5e57d346772ba64e52789a998
   HEAD_REF
@@ -70,13 +72,14 @@ rapids_find_package(nvjitlink REQUIRED CONFIG BUILD_EXPORT_SET rtcx-exports INST
 add_library(rtcx STATIC
             src/hash.cpp]])
 
+set(BS_THREAD_POOL_VERSION 4.1.0)
 vcpkg_from_github(
   OUT_SOURCE_PATH
   BS_THREAD_POOL_PATH
   REPO
   bshoshany/thread-pool
   REF
-  v4.1.0
+  v${BS_THREAD_POOL_VERSION}
   SHA512
   4908f00def23082e7ddc0b24a710e53b3fde51b02188e79cfcd9dabb22627ebd1b6e5b3c4bf1b366eae79660c26878cc034c171747c3d0b7ef8a98c85a77033b
   HEAD_REF
@@ -273,3 +276,72 @@ vcpkg_replace_string(
   "\$<LINK_ONLY:nanoarrow_static>" "\$<LINK_ONLY:nanoarrow::nanoarrow_static>")
 
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
+
+# Libraries built into cuDF from sources fetched above.
+include(
+  "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/sirius-third-party-component.cmake")
+set(third_party "${CURRENT_PACKAGES_DIR}/share/${PORT}/third_party")
+sirius_third_party_component(
+  "${third_party}/rapids-logger"
+  NAME
+  "rapids-logger"
+  VERSION
+  "${RAPIDS_LOGGER_VERSION}"
+  LICENSE
+  "Apache-2.0"
+  HOMEPAGE
+  "https://github.com/rapidsai/rapids-logger"
+  FILES
+  "${RAPIDS_LOGGER_PATH}/LICENSE")
+sirius_third_party_component(
+  "${third_party}/librtcx"
+  NAME
+  "librtcx"
+  VERSION
+  "${RTCX_REF}"
+  LICENSE
+  "Apache-2.0"
+  HOMEPAGE
+  "https://github.com/rapidsai/librtcx"
+  FILES
+  "${RTCX_PATH}/LICENSE")
+sirius_third_party_component(
+  "${third_party}/thread-pool"
+  NAME
+  "BS::thread_pool"
+  VERSION
+  "${BS_THREAD_POOL_VERSION}"
+  LICENSE
+  "MIT"
+  HOMEPAGE
+  "https://github.com/bshoshany/thread-pool"
+  FILES
+  "${BS_THREAD_POOL_PATH}/LICENSE.txt")
+file(
+  GLOB_RECURSE cudf_sources
+  LIST_DIRECTORIES false
+  "${SOURCE_PATH}/cpp/src/*" "${SOURCE_PATH}/cpp/include/*")
+list(FILTER cudf_sources EXCLUDE REGEX "/cpp/include/cudf_test/")
+list(SORT cudf_sources)
+set(cudf_snippet_license "MIT AND Zlib AND BSL-1.0 AND bzip2-1.0.6")
+set(cudf_source_notices "${CURRENT_BUILDTREES_DIR}/cudf-source-notices.txt")
+sirius_third_party_source_notices(
+  "${cudf_source_notices}"
+  ROOT
+  "${SOURCE_PATH}"
+  LICENSE
+  "${cudf_snippet_license}"
+  SOURCES
+  ${cudf_sources})
+sirius_third_party_component(
+  "${third_party}/source-snippets"
+  NAME
+  "Third-party code in cuDF sources"
+  VERSION
+  "${VERSION}"
+  LICENSE
+  "${cudf_snippet_license}"
+  HOMEPAGE
+  "https://github.com/rapidsai/cudf"
+  FILES
+  "${cudf_source_notices}")
