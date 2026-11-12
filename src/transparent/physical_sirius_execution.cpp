@@ -438,7 +438,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       const std::string gpu_msg = gpu_error.RawMessage();
       SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg);
 
-      // A user interrupt is never a fallback candidate — propagate it as-is.
+      // A user interrupt is never a candidate for CPU Replay -- propagate it as-is.
       if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
 
       // A pre-existing-unavailable error on an S3 query keeps its stable typed

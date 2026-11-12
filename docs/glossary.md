@@ -100,6 +100,8 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## R
 
+**Register Value** - The value a fused NVRTC kernel holds in registers for one expression node of one row: its payload, its SQL validity, and its Overflow Poison (`reg_val<T>` in the device runtime).
+
 **Row-exact Guard** - A construct (CASE, COALESCE, TRY) under which DuckDB guarantees that operations in branches not selected for a row are not evaluated for that row.
 
 ## S

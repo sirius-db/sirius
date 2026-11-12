@@ -139,9 +139,9 @@ void retain_until_stream_completes(std::shared_ptr<codegen::jit::CompiledKernel 
  * @brief Copies the status words at @p device into @p host, waiting for @p stream, and raises the
  *        error the status bits of word 0 report.
  *
- * @throws invalid_input_exception when a poisoned value reached the sink (@c status_overflow_bit),
- * with the @c overflow_message of @p overflow_sites, or when a scalar subquery produced more than
- * one row (@c status_subquery_error_bit).
+ * @throws invalid_input_exception when a value carrying Overflow Poison reached the NVRTC Sink (@c
+ * status_overflow_bit), with the @c overflow_message of @p overflow_sites, or when a scalar
+ * subquery produced more than one row (@c status_subquery_error_bit).
  */
 void read_status_words(std::span<std::uint32_t> host,
                        std::uint32_t const* device,

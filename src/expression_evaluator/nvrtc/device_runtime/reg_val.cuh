@@ -201,12 +201,13 @@ __device__ __forceinline__ ovf_result<T> mul_overflow(T a, T b)
  * Overflow Poison.
  *
  * Every function of this runtime and every statement that `translation_context` emits keeps one
- * invariant: an operation sets @c overflow only by propagating an operand's poison, or from its own
- * computation over operands that are all valid and unpoisoned. The payload of an invalid value is
- * unspecified and never decides overflow. Poison therefore always comes from an Evaluated
- * Operation, and the `ProjectSink` and `FilterSink` kernels report every poison that reaches them,
- * whatever the value's final validity: `n + abs(x)` with `n` NULL and `x` the lowest INTEGER is a
- * NULL that still carries the poison of `abs(x)`.
+ * invariant: an operation sets @c overflow only by propagating an operand's Overflow Poison, or
+ * from its own computation over operands that are all valid and carry no Overflow Poison. The
+ * payload of an invalid value is unspecified and never decides overflow. Overflow Poison therefore
+ * always comes from an Evaluated Operation, and the NVRTC Sinks of the `ProjectSink` and
+ * `FilterSink` kernels report every Overflow Poison that reaches them, whatever the value's final
+ * validity: `n + abs(x)` with `n` NULL and `x` the lowest INTEGER is a NULL that still carries the
+ * Overflow Poison of `abs(x)`.
  */
 template <typename T>
 struct reg_val {
