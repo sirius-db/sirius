@@ -846,6 +846,16 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
 
+  /// Device ids of the GPUs that hold Simpatico-compressed GPU-tier chunks of any pinned
+  /// entry over the same source as @p table_info (same parquet file set or same DuckDB table
+  /// incarnation), sorted and duplicate-free. Matches on source identity alone, so it can
+  /// name the owners of a pin that ends up not serving the scan, but never misses the owners
+  /// of one that does.
+  /// Read by query admission: a compressed chunk is decoded on the GPU that holds it, so
+  /// these GPUs must stay in the query's admitted set.
+  [[nodiscard]] std::vector<int> compressed_gpu_pin_owner_devices(
+    const op::scan::ingestible_table_info& table_info) const;
+
   parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Pin @p file_paths' column-chunk bytes into the prefetching cache.

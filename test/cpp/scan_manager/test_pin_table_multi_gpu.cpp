@@ -64,6 +64,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <set>
@@ -263,6 +264,131 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   REQUIRE(tasks_per_gpu.count(1));
   REQUIRE(tasks_per_gpu.at(0) >= 1);
   REQUIRE(tasks_per_gpu.at(1) >= 1);
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Admission gate: a Simpatico-compressed GPU-tier chunk is decoded on the GPU that holds it
+// (compressed pins have no cross-GPU copy step), so a query that admission narrows to fewer
+// GPUs must keep every GPU holding one of its compressed chunks. Without that, the scan of a
+// chunk on an excluded GPU is moved to an admitted GPU, whose decoder then reads another
+// GPU's memory: a remote read where the pools have peer access, an illegal address (and a
+// lost CUDA context) where they do not.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under gpus_per_query",
+          "[pin_mgpu][scan_manager][multi_gpu][admission]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("owner-admission");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  generate_4file_surface(tmp);
+
+  // One plan block per table column (k, v). pin_table looks the file up by pin name.
+  auto const plan_dir = tmp / "plans";
+  fs::create_directories(plan_dir);
+  {
+    std::ofstream plan(plan_dir / "owner_pin.txt");
+    plan << "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
+            "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+  }
+
+  // 1 MB batches spread the pin's chunks over both GPUs; gpus_per_query: 1 would, on its own,
+  // admit every query onto GPU 0 alone.
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;
+  params.gpus_per_query       = 1;
+  auto yaml_path              = tmp / "pin_mgpu_owner_admission.yaml";
+  write_mgpu_yaml(yaml_path, params);
+
+  auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
+  {
+    auto con          = env->make_connection();
+    auto const run_ok = [&con](std::string const& sql) {
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      if (result->HasError()) { UNSCOPED_INFO(sql << " failed: " << result->GetError()); }
+      REQUIRE_FALSE(result->HasError());
+      return result;
+    };
+
+    // No CPU fallback: a query that cannot run on the GPU fails this test instead of passing
+    // on DuckDB's answer.
+    run_ok("SET enable_duckdb_fallback = false;");
+    run_ok("SET pin_table_compression = true;");
+    run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
+    run_ok("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';");
+
+    auto const glob = parquet_glob(tmp);
+    run_ok("CALL pin_table('" + glob + "', tier='gpu', name='owner_pin');");
+
+    // The pin has to be the case under test: every chunk compressed, held by both GPUs.
+    std::size_t chunks     = 0;
+    std::size_t compressed = 0;
+    std::set<int> owners;
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+    sirius_ctx->get_scan_manager().visit_pinned_entries(
+      [&](std::string_view name, const auto& entry) {
+        if (name != "owner_pin") { return true; }  // keep looking
+        chunks = entry.device_chunks.size();
+        for (auto const& chunk : entry.device_chunks) {
+          if (chunk.compressed) {
+            ++compressed;
+            owners.insert(chunk.compressed->get_memory_space().get_device_id());
+          }
+        }
+        return false;  // found
+      });
+    INFO("chunks=" << chunks << " compressed=" << compressed << " owner_gpus=" << owners.size());
+    REQUIRE(chunks >= 2u);
+    REQUIRE(compressed == chunks);
+    REQUIRE(owners.size() >= 2u);
+
+    // Replace the files with a larger surface. The file set is unchanged, so the pin still
+    // serves the scan, and the original values coming back prove the query read the pinned
+    // chunks and not the files.
+    generate_parquet_surface(tmp,
+                             "SELECT range AS k, range * 2 AS v FROM range(200000)",
+                             /*num_files=*/4);
+
+    auto const tasks_per_gpu = [&] {
+      std::map<int, std::size_t> out;
+      env->get_task_scheduler(con).visit_executors(
+        [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+          out[device_id] = exec.get_metrics().tasks_executed;
+        });
+      return out;
+    };
+
+    auto const query = "SELECT max(k), sum(k), sum(v) FROM read_parquet('" + glob + "');";
+    for (int iteration = 0; iteration < 2; ++iteration) {
+      auto before       = tasks_per_gpu();
+      auto const result = run_ok(query);
+      auto after        = tasks_per_gpu();
+
+      // 4 files of range(100000): max(k) = 99999, sum(k) = 4 * 4999950000, sum(v) = 2 * sum(k).
+      REQUIRE(result->RowCount() == 1);
+      CHECK(result->GetValue(0, 0).ToString() == "99999");
+      CHECK(result->GetValue(1, 0).ToString() == "19999800000");
+      CHECK(result->GetValue(2, 0).ToString() == "39999600000");
+
+      // Every GPU holding a compressed chunk ran part of the query, although gpus_per_query
+      // is 1: its chunks were decoded where they live.
+      for (int const owner : owners) {
+        INFO("iteration=" << iteration << " owner gpu=" << owner
+                          << " tasks before=" << before[owner] << " after=" << after[owner]);
+        CHECK(after[owner] > before[owner]);
+      }
+    }
+
+    run_ok("CALL unpin_table('owner_pin');");
+  }
+
+  env.reset();
   fs::remove_all(tmp, ec);
 }
 

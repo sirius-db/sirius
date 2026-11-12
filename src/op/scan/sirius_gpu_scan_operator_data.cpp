@@ -27,12 +27,14 @@
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <pipeline/batch_lock_utils.hpp>
 #include <scan_manager/readahead_scan_manager.hpp>
+#include <transparent/replay_admission.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -304,6 +306,23 @@ void scan_operator_input::prepare_for_processing(
         mut.get_current_tier() != ::cucascade::memory::Tier::GPU ||
         dynamic_cast<cucascade::gpu_table_representation*>(mut.get_data()) == nullptr;
       if (converted_here) {
+        // A device-compressed pin is decoded in place: the decoder reads the compressed buffers
+        // where pin time left them. From another GPU that is a remote read when the pools have
+        // peer access and an illegal address when they do not, and the fault leaves the CUDA
+        // context unusable for the rest of the process. Refuse before anything touches the
+        // batch or launches a kernel. Admission keeps the owners of such pins in the query's GPU
+        // set, so reaching this means the task placement and the pin disagree.
+        if (auto const* compressed_pin =
+              dynamic_cast<::sirius::compressed_device_representation const*>(mut.get_data())) {
+          auto const& owner_space = compressed_pin->get_memory_space();
+          if (owner_space.get_id() != requested_memory_space->get_id()) {
+            throw transparent::classified_execution_error(
+              transparent::late_failure_cause::gpu_error,
+              "compressed pinned chunk is stored on GPU " +
+                std::to_string(owner_space.get_device_id()) + " but its scan was assigned to GPU " +
+                std::to_string(requested_memory_space->get_device_id()));
+          }
+        }
         bool const selection_unprofitable =
           pushdown_selection_unprofitable &&
           pushdown_selection_unprofitable->load(std::memory_order_relaxed);
