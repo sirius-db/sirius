@@ -94,6 +94,11 @@ class distributed_session {
   /// Window @p window's query failed with @p error: every peer's run of it fails too.
   void abort(std::uint64_t window, std::exception_ptr const& error) noexcept;
 
+  /// Window @p window failed to begin with @p error: aborts its query on every rank, retires it
+  /// here and unties the window. The destructor of a scope that failed to begin does not run, so
+  /// nothing else would.
+  void fail_window_begin(std::uint64_t window, std::exception_ptr const& error) noexcept;
+
   /// Window @p window's query retires: waits (up to a minute) until the exchange holds none of
   /// the batches it sent, then forgets the query's exchange state.
   void retire(std::uint64_t window);

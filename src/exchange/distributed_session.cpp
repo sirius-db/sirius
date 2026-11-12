@@ -125,6 +125,27 @@ void distributed_session::abort(std::uint64_t window, std::exception_ptr const& 
   }
 }
 
+void distributed_session::fail_window_begin(std::uint64_t window,
+                                            std::exception_ptr const& error) noexcept
+{
+  abort(window, error);
+  try {
+    std::uint64_t query = 0;
+    std::shared_ptr<exchange_service> service;
+    {
+      std::lock_guard lock{_mutex};
+      if (auto const it = _by_window.find(window); it != _by_window.end()) {
+        query = it->second;
+        _by_window.erase(it);
+      }
+      service = _service;
+    }
+    // Unlike retire(), no wait for sent batches: the window ran nothing.
+    if (query != 0 && service) { service->forget(query); }
+  } catch (...) {  // best effort, like abort()
+  }
+}
+
 void distributed_session::retire(std::uint64_t window)
 {
   // The exchange may still hold batches this rank sent, until their last frame is staged; they

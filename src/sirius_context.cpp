@@ -813,6 +813,9 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     // Both the initial health check and a refused lifecycle registration precede
     // query resource registration. Preserve the typed refusal for CPU fallback.
     state_ = scope_state::FAILED;
+    if (auto* session = ctx_.distributed()) {
+      session->fail_window_begin(sirius::value_of(window_id_), std::current_exception());
+    }
     {
       std::lock_guard lock(ctx_.window_completions_mutex_);
       ctx_.window_completions_.erase(sirius::value_of(window_id_));
@@ -831,6 +834,9 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     }
     lease_release_.state = lease_release_state::begin_failed;
     ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
+    if (auto* session = ctx_.distributed()) {
+      session->fail_window_begin(sirius::value_of(window_id_), std::current_exception());
+    }
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     release();
@@ -844,6 +850,9 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     state_               = scope_state::FAILED;
     lease_release_.state = lease_release_state::begin_failed;
     ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
+    if (auto* session = ctx_.distributed()) {
+      session->fail_window_begin(sirius::value_of(window_id_), std::current_exception());
+    }
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     release();
