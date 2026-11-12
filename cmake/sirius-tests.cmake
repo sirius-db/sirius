@@ -554,8 +554,7 @@ set_target_properties(
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
-# Export publication/ordering tests need neither a CUDA driver nor a DuckDB
-# runtime.
+# Export cleanup/ordering tests need neither a CUDA driver nor a DuckDB runtime.
 add_executable(
   sirius_parquet_session_test src/output/parquet_session.cpp
                               test/cpp/output/test_parquet_session.cpp)

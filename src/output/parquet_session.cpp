@@ -2,14 +2,11 @@
 #include "output/parquet_session.hpp"
 
 #include <fcntl.h>
-#include <linux/fs.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
-#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -47,13 +44,6 @@ std::string index_name(std::uint64_t index)
   out << std::setfill('0') << std::setw(20) << index;
   return out.str();
 }
-void remove_parts(std::vector<std::filesystem::path> const& files) noexcept
-{
-  for (auto const& file : files) {
-    std::error_code ignored;
-    std::filesystem::remove(file, ignored);
-  }
-}
 }  // namespace
 parquet_session::parquet_session(parquet_export_spec spec) : spec_(std::move(spec))
 {
@@ -65,15 +55,40 @@ parquet_session::parquet_session(parquet_export_spec spec) : spec_(std::move(spe
 parquet_session::~parquet_session() { abort(); }
 void parquet_session::start_locked()
 {
-  if (published_) throw std::runtime_error("Parquet export is already published");
-  if (!staging_.empty()) return;
-  if (std::filesystem::exists(spec_.directory) || std::filesystem::is_symlink(spec_.directory))
-    throw std::runtime_error("Parquet export requires a new directory: " +
-                             spec_.directory.string());
-  auto pattern = (spec_.directory.parent_path() / ".sirius-parquet-XXXXXX").string();
-  if (!::mkdtemp(pattern.data()))
-    throw std::system_error(errno, std::generic_category(), "Creating Parquet staging directory");
-  staging_ = pattern;
+  if (successful_ || aborted_) throw std::runtime_error("Parquet export is already finished");
+  if (started_) return;
+  if (std::filesystem::is_symlink(std::filesystem::symlink_status(spec_.directory)))
+    throw std::runtime_error("Parquet destination must not be a symlink");
+  // Like DuckDB, allow existing directory trees provided they contain no files.
+  // create_directory is nonrecursive: the destination's parent must exist.
+  created_directory_ = std::filesystem::create_directory(spec_.directory) || created_directory_;
+  for (auto const& entry : std::filesystem::recursive_directory_iterator(spec_.directory)) {
+    if (entry.is_symlink() || !entry.is_directory())
+      throw std::runtime_error("Parquet output directory is not empty: " +
+                               spec_.directory.string());
+  }
+  started_ = true;
+}
+void parquet_session::reserve_part_locked(std::filesystem::path const& path)
+{
+  // Reserve ownership before handing the filename to cuDF (which opens with
+  // truncation). A racing export must not overwrite this export's files.
+  auto [it, inserted] = owned_files_.insert(path);
+  if (!inserted) throw std::runtime_error("Parquet part is still owned by a previous attempt");
+  auto fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0666);
+  if (fd < 0) {
+    auto error = errno;
+    owned_files_.erase(it);
+    throw std::system_error(error, std::generic_category(), "Reserving Parquet output file");
+  }
+  if (::close(fd) != 0)
+    throw std::system_error(errno, std::generic_category(), "Closing Parquet file reservation");
+}
+void parquet_session::remove_part_locked(std::filesystem::path const& path) noexcept
+{
+  auto it = owned_files_.find(path);
+  if (it == owned_files_.end()) return;
+  if (::unlink(path.c_str()) == 0 || errno == ENOENT) owned_files_.erase(it);
 }
 void parquet_session::write(input_id const& id,
                             std::optional<std::size_t> position,
@@ -101,7 +116,7 @@ void parquet_session::write(input_id const& id,
       for (std::size_t i = 0; i < rows.size(); ++i) {
         auto name =
           position ? index_name(*position) + "-" + index_name(i) : index_name(next_.fetch_add(1));
-        record->files.push_back(staging_ / ("part-" + name + ".parquet"));
+        record->files.push_back(spec_.directory / ("part-" + name + ".parquet"));
       }
     } else if (record->rows != rows || record->position != position) {
       throw std::runtime_error("Parquet retry changed its input layout");
@@ -111,11 +126,17 @@ void parquet_session::write(input_id const& id,
     record->active = true;
   }
   try {
-    for (std::size_t i = 0; i < rows.size(); ++i)
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      {
+        std::lock_guard guard(mutex_);
+        reserve_part_locked(record->files[i]);
+      }
       writer(i, record->files[i]);
+    }
   } catch (...) {
-    remove_parts(record->files);
     std::lock_guard guard(mutex_);
+    for (auto const& path : record->files)
+      remove_part_locked(path);
     record->active = false;
     throw;
   }
@@ -123,9 +144,9 @@ void parquet_session::write(input_id const& id,
   record->active    = false;
   record->committed = true;
 }
-parquet_export_result parquet_session::publish(
+parquet_export_result parquet_session::finish(
   write_part const& write_empty,
-  std::function<void(parquet_export_result const&)> const& before_publish)
+  std::function<void(parquet_export_result const&)> const& prepare_completion)
 {
   std::lock_guard guard(mutex_);
   start_locked();
@@ -142,30 +163,30 @@ parquet_export_result parquet_session::publish(
     }
   }
   if (result.files == 0) {
-    auto path = staging_ / "part-00000000000000000000.parquet";
+    auto path = spec_.directory / "part-00000000000000000000.parquet";
+    reserve_part_locked(path);
     write_empty(0, path);
     result.files = 1;
     result.bytes = std::filesystem::file_size(path);
   }
-  if (before_publish) before_publish(result);
-  // Linux local filesystems only. Unlike rename(), never replace a concurrently
-  // created destination (including an empty directory or a symlink).
-  if (::syscall(SYS_renameat2,
-                AT_FDCWD,
-                staging_.c_str(),
-                AT_FDCWD,
-                spec_.directory.c_str(),
-                RENAME_NOREPLACE) != 0)
-    throw std::system_error(
-      errno, std::generic_category(), "Publishing Parquet directory without replacement");
-  published_ = true;
-  staging_.clear();
+  if (prepare_completion) prepare_completion(result);
+  // Files are already visible. Only mark success after completion is prepared,
+  // so a completion-allocation failure still cleans up this export's output.
+  successful_ = true;
   return result;
 }
 void parquet_session::abort() noexcept
 {
-  std::error_code ignored;
-  if (!staging_.empty()) std::filesystem::remove_all(staging_, ignored);
-  staging_.clear();
+  if (successful_) return;
+  aborted_ = true;
+  for (auto it = owned_files_.begin(); it != owned_files_.end();) {
+    // Advance before removal; failed cleanup keeps ownership for another attempt.
+    auto const& path = *it++;
+    remove_part_locked(path);
+  }
+  // Never recursively remove a directory: concurrent or preexisting contents
+  // belong to someone else. Preserve directories that predate this export.
+  if (created_directory_ && (::rmdir(spec_.directory.c_str()) == 0 || errno == ENOENT))
+    created_directory_ = false;
 }
 }  // namespace sirius::output

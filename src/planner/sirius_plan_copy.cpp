@@ -88,7 +88,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator:
       copy.return_type != duckdb::CopyFunctionReturnType::CHANGED_ROWS ||
       copy.overwrite_mode != duckdb::CopyOverwriteMode::COPY_ERROR_ON_CONFLICT)
     throw duckdb::NotImplementedException(
-      "Sirius Parquet COPY supports batch-sized parts in a new directory only");
+      "Sirius Parquet COPY supports batch-sized parts in a directory without existing files only");
   if (copy.file_path.empty() || copy.file_path.find("://") != std::string::npos ||
       copy.file_path == "/dev/stdout")
     throw duckdb::NotImplementedException("Sirius Parquet COPY supports local directories only");

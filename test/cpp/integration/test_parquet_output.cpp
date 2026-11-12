@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <fstream>
 
 namespace {
 struct export_directory {
@@ -32,6 +33,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "[parquet_export_gpu][integration]")
 {
   export_directory root;
+  std::filesystem::create_directory(root.path / "ordered");
   run_ok("SET gpu_execution=false");
   run_ok(
     "CREATE TABLE export_input AS SELECT i::INTEGER k, (i % 7)::INTEGER v FROM range(10000) t(i)");
@@ -233,4 +235,52 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE_FALSE(rows->HasError());
   auto actual = sirius::test::collect_rows(*rows, false);
   REQUIRE(actual == std::vector<std::vector<std::string>>{{"1.23"}, {"-4.56"}, {"0.00"}});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY rejects nonempty destinations without CPU replay",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  auto target = root.path / "existing";
+  std::filesystem::create_directories(target / "nested");
+  auto original = target / "nested" / "original.txt";
+  std::ofstream(original) << "preserve";
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_input AS SELECT 42::INTEGER k");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=true");
+  auto result = con->Query("COPY (SELECT * FROM export_input) TO " + quote(target) +
+                           " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  REQUIRE(result->HasError());
+  REQUIRE(result->GetError().find("CPU replay disabled") != std::string::npos);
+  REQUIRE(std::filesystem::file_size(original) == 8);
+  REQUIRE(std::distance(std::filesystem::directory_iterator(target),
+                        std::filesystem::directory_iterator{}) == 1);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY overwrite and append options remain unsupported",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_input AS SELECT 42::INTEGER k");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  for (auto const* option : {"OVERWRITE", "OVERWRITE_OR_IGNORE", "APPEND"}) {
+    INFO(option);
+    auto target = root.path / option;
+    std::filesystem::create_directory(target);
+    auto original = target / "original.txt";
+    std::ofstream(original) << "preserve";
+    auto result = con->Query("COPY (SELECT * FROM export_input) TO " + quote(target) +
+                             " (FORMAT PARQUET, PER_THREAD_OUTPUT true, " + option + " true)");
+    REQUIRE(result->HasError());
+    REQUIRE(std::filesystem::file_size(original) == 8);
+    REQUIRE(std::distance(std::filesystem::directory_iterator(target),
+                          std::filesystem::directory_iterator{}) == 1);
+  }
 }

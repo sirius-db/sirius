@@ -791,4 +791,4 @@ a fresh directory. GPU export measurements disable CPU fallback. Readback and
 validation are outside timing; the default row-output mode is unchanged.
 
 See [Parquet output](../../docs/super-sirius/parquet-output.md) for option support,
-file ordering, validation, configuration, and publication semantics.
+file ordering, validation, configuration, and failure-cleanup semantics.
