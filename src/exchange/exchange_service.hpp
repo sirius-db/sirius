@@ -82,7 +82,8 @@ class exchange_service {
   /// See transport::wait_sent. True once shut down: the transport freed what it held.
   [[nodiscard]] bool wait_sent(distributed_query_id query, std::chrono::milliseconds timeout);
 
-  /// Routes @p stream to @p receiver, replaying what arrived for it before.
+  /// Routes @p stream to @p receiver, replaying what arrived for it before. If a replayed callback
+  /// throws, the stream is left detached and the exception goes on.
   /// @throws sirius::invalid_input_exception when the stream already has a receiver.
   void attach(stream_id stream, std::shared_ptr<inbound> receiver);
   /// Stops routing @p stream; later arrivals for it are dropped.

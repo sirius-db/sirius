@@ -695,6 +695,41 @@ TEST_CASE("a stream takes a second receiver only once its first has detached",
   CHECK_NOTHROW(service.attach(stream, std::make_shared<ignoring>()));
 }
 
+TEST_CASE("a receiver that throws while its held arrivals are replayed is not left attached",
+          "[exchange][operators]")
+{
+  struct throwing : sirius::exchange::inbound {
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override
+    {
+      throw std::runtime_error("replay failed");
+    }
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override {}
+  };
+  struct counting : sirius::exchange::inbound {
+    int events{0};
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override
+    {
+      ++events;
+    }
+    void on_end(rank_t) override { ++events; }
+    void on_error(std::exception_ptr) override { ++events; }
+  };
+  ranks c(1);
+  auto& service          = *c.all[0].service;
+  stream_id const stream = sirius::exchange::make_stream_id(1, 1);
+  // Held: nobody is attached yet.
+  service.send(stream, 0, key_value_batch(0, 0));
+  CHECK_THROWS_WITH(service.attach(stream, std::make_shared<throwing>()),
+                    Catch::Matchers::ContainsSubstring("replay failed"));
+  // Like a detached stream, it drops what arrives next.
+  service.send(stream, 0, key_value_batch(0, 1));
+  // It takes a receiver again, which gets neither that nor what was held for the failed one.
+  auto second = std::make_shared<counting>();
+  CHECK_NOTHROW(service.attach(stream, second));
+  CHECK(second->events == 0);
+}
+
 TEST_CASE("queries retiring out of order are each forgotten", "[exchange][operators]")
 {
   ranks c(2);
