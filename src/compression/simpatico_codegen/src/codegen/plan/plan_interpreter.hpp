@@ -48,6 +48,14 @@ struct fused_leaf_builder {
   std::vector<RawPassthroughLeaf> raw_passthrough_leaves;
 };
 
+struct onpair_dictionary;
+
+/// What a column's compress takes beyond its plan.
+struct compress_options {
+  /// Dictionary the plan's onpair step encodes with, as is; null trains or reuses one.
+  std::shared_ptr<onpair_dictionary const> onpair_dict;
+};
+
 /// True if `op` is a codegen-fusable operator name
 /// (delta / rle / bitpack / for / zigzag).
 bool is_codegen_compressor(std::string const& op);
@@ -64,7 +72,8 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           std::string_view plan_dsl,
                                           ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr,
-                                          std::string* error_out);
+                                          std::string* error_out,
+                                          compress_options const& options = {});
 
 /// Compress a single column with ONE operator and return the resulting
 /// ``compressed_representation``.  A thin wrapper for the BFS explorer:

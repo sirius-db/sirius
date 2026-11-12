@@ -155,6 +155,7 @@ struct CompressWalk {
   ::cuda::stream_ref stream{cudaStream_t{}};
   rmm::device_async_resource_ref mr;
   std::string* error_out;
+  compress_options const& options;
   bool failed = false;
 
   // Eager-release bookkeeping: which reprs_by_input key owns each live column,
@@ -505,8 +506,9 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   // A string-aligned OnPair parse reads the strings' offsets from str_split's offsets
   // channel: the str_split rep stays alive until its chars, being compressed here, are.
   std::vector<compressible_output> parent_channels;
-  if (auto* onpair = dynamic_cast<onpair_compressor*>(compressor.get());
-      onpair && onpair->config.string_aligned) {
+  auto* onpair = dynamic_cast<onpair_compressor*>(compressor.get());
+  if (onpair && options.onpair_dict) { onpair->config.dictionary = options.onpair_dict; }
+  if (onpair && onpair->config.string_aligned) {
     PlanNode const& parent           = tree.nodes[input_val.node];
     auto const rep_it                = reprs_by_input.find(ValueId{input_val.node, 0});
     cudf::column_view const* offsets = nullptr;
@@ -610,7 +612,8 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           std::string_view plan_dsl,
                                           ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr,
-                                          std::string* error_out)
+                                          std::string* error_out,
+                                          compress_options const& options)
 {
   nvtx_scoped_range nvtx_range{"simpatico::compress_column"};
   // Single-stream per column: all work runs on `stream`. Cross-column
@@ -657,7 +660,7 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   std::vector<bool> visited(tree.nodes.size(), false);
 
   CompressWalk walk{
-    tree, consumer_by_input, columns, reprs_by_input, visited, stream, mr, error_out};
+    tree, consumer_by_input, columns, reprs_by_input, visited, stream, mr, error_out, options};
   walk.emit_path(ValueId{0, 0});
   if (walk.failed) return nullptr;
 

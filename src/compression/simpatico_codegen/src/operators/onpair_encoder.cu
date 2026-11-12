@@ -430,14 +430,20 @@ void with_offsets(cudf::column_view offsets, F&& f)
   }
 }
 
+}  // namespace
+
 /// A trained dictionary as the host-side tables the parse uses; immutable once cached.
-struct host_dictionary {
+struct onpair_dictionary {
   std::uint32_t source_size = 0;
   std::vector<std::uint32_t> fingerprints;  ///< Power-of-two, see parse_table.
   std::vector<std::uint16_t> byte_id, pair_len_mask;
   std::vector<std::uint8_t> dict16, lens;
   double fit_bytes_per_code = 0;  ///< Probe bytes per code on the data it was trained for.
 };
+
+namespace {
+
+using host_dictionary = onpair_dictionary;
 
 host_dictionary build_host_dictionary(onpair::Dictionary const& dict)
 {
@@ -582,20 +588,24 @@ class dictionary_cache {
   std::vector<entry> entries_;
 };
 
-/// Trains a dictionary on a strided host sample of the @p n_chars device bytes at @p chars.
-host_dictionary train_host_dictionary(std::uint8_t const* chars,
-                                      std::size_t n_chars,
-                                      onpair_encoder_config const& cfg,
-                                      ::cuda::stream_ref stream)
+}  // namespace
+
+onpair_training_sample sample_onpair_training_data(std::uint8_t const* chars,
+                                                   std::size_t n_chars,
+                                                   onpair_encoder_config const& cfg,
+                                                   ::cuda::stream_ref stream)
 {
+  if (n_chars == 0 || cfg.sample_slice_bytes == 0) { return {}; }
   auto const s = stream.get();
 
   // ── Sample: n_slices runs of slice bytes, evenly strided over the characters ──────────
   std::size_t const slice  = std::min(cfg.sample_slice_bytes, n_chars);
   std::size_t const want   = std::max<std::size_t>(1, cfg.sample_bytes / slice);
   std::size_t const n_full = n_chars / slice;
-  std::vector<std::uint8_t> sample;
-  std::vector<std::uint32_t> sample_offsets{0};
+  onpair_training_sample out;
+  auto& sample         = out.bytes;
+  auto& sample_offsets = out.offsets;
+  sample_offsets.push_back(0);
   if (n_full <= want) {
     sample.resize(n_chars);
     check_cuda(cudaMemcpyAsync(sample.data(), chars, n_chars, cudaMemcpyDeviceToHost, s),
@@ -613,18 +623,30 @@ host_dictionary train_host_dictionary(std::uint8_t const* chars,
       sample_offsets.push_back(static_cast<std::uint32_t>(i * slice));
   }
   stream.sync();
-
-  // ── Train on the host ─────────────────────────────────────────────────────────────────
-  onpair::encoding::TrainingConfig tc;
-  tc.bits      = static_cast<onpair::BitWidth>(cfg.bits);
-  tc.threshold = onpair::encoding::DynamicThreshold{1.0};
-  tc.seed      = cfg.seed;
-  auto const trained =
-    onpair::encoding::train(sample.data(), sample_offsets.data(), sample_offsets.size() - 1, tc);
-  return build_host_dictionary(trained.dict);
+  return out;
 }
 
-}  // namespace
+std::shared_ptr<onpair_dictionary const> train_onpair_dictionary(
+  onpair_training_sample const& sample, onpair_encoder_config const& cfg)
+{
+  if (sample.offsets.size() < 2) {
+    throw std::invalid_argument("onpair train: the sample holds no characters");
+  }
+  onpair::encoding::TrainingConfig tc;
+  tc.bits            = static_cast<onpair::BitWidth>(cfg.bits);
+  tc.threshold       = onpair::encoding::DynamicThreshold{1.0};
+  tc.seed            = cfg.seed;
+  auto const trained = onpair::encoding::train(
+    sample.bytes.data(), sample.offsets.data(), sample.offsets.size() - 1, tc);
+  return std::make_shared<onpair_dictionary const>(build_host_dictionary(trained.dict));
+}
+
+std::size_t onpair_dictionary_bytes(onpair_dictionary const& dict)
+{
+  return dict.fingerprints.size() * sizeof(std::uint32_t) +
+         (dict.byte_id.size() + dict.pair_len_mask.size()) * sizeof(std::uint16_t) +
+         dict.dict16.size() + dict.lens.size();
+}
 
 std::unique_ptr<onpair_compressed_representation> onpair_compressed_representation::encode(
   std::uint8_t const* chars,
@@ -683,9 +705,11 @@ std::unique_ptr<onpair_compressed_representation> onpair_compressed_representati
   // ── Reuse a cached dictionary that still fits, or train one ───────────────────────────
   auto& cache = dictionary_cache::instance();
   rmm::device_uvector<unsigned long long> probe_count(1, stream, mr);
-  std::shared_ptr<host_dictionary const> hdict;
+  std::shared_ptr<host_dictionary const> hdict = cfg.dictionary;
   std::optional<device_dictionary> ddict;
-  if (cfg.reuse_dictionaries) {
+  if (hdict) {
+    ddict.emplace(*hdict, stream, mr);
+  } else if (cfg.reuse_dictionaries) {
     for (auto const& candidate : cache.snapshot(cfg.bits)) {
       ddict.emplace(*candidate, stream, mr);
       double const fit = probe_bytes_per_code(
@@ -698,8 +722,8 @@ std::unique_ptr<onpair_compressed_representation> onpair_compressed_representati
     }
   }
   if (!hdict) {
-    auto fresh =
-      std::make_shared<host_dictionary>(train_host_dictionary(chars, n_chars, cfg, stream));
+    auto fresh = std::make_shared<host_dictionary>(
+      *train_onpair_dictionary(sample_onpair_training_data(chars, n_chars, cfg, stream), cfg));
     ddict.emplace(*fresh, stream, mr);
     if (cfg.reuse_dictionaries) {
       fresh->fit_bytes_per_code = probe_bytes_per_code(
@@ -707,7 +731,7 @@ std::unique_ptr<onpair_compressed_representation> onpair_compressed_representati
     }
     hdict = std::move(fresh);
   }
-  if (cfg.reuse_dictionaries) { cache.touch(hdict, cfg.bits); }
+  if (cfg.reuse_dictionaries && !cfg.dictionary) { cache.touch(hdict, cfg.bits); }
   parse_table const table         = ddict->table;
   std::uint32_t const source_size = hdict->source_size;
   auto const& d_dict16            = ddict->dict16;
