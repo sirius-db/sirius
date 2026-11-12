@@ -190,22 +190,20 @@ knn_result gemm_topk(raft::device_resources const& res,
                      rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
- * @brief Expanded-L2 top-k over byte-valued vectors held as int8 (value - 128), on the int8 tensor
- *        cores.
+ * @brief cuVS INT8 brute-force L2 top-k over row-major signed-byte vectors.
  *
- * L2 does not change when both sides shift by 128, and the shifted values fit int8, so the dot
- * products come out of an int8 GEMM exact in int32. |x|^2 and |q|^2 of the shifted rows are
- * supplied (@p x_sq, @p q_sq; exact int32). The distances are exact up to the final sqrt.
- * @p x is [n x d] and @p q [m x d], row-major; @p d a multiple of 4. @p x must stay readable for
- * up to 3 rows past @p n (the GEMM runs over n rounded up to 4; those rows are ignored).
+ * A fixed [-128, 127] scalar quantizer preserves every code exactly. Both byte-valued vectors
+ * shifted by 128 and already-quantized codes can be searched in their code space. Distances
+ * are squared L2 (or L2 when @p take_sqrt is true), rounded to float; callers using approximate
+ * codes remain responsible for refinement in the original space.
+ * @p x is [n x d] and @p q [m x d]; no padding is required. The positive dimension must be a
+ * multiple of four and at most 131068. Requires the SQ brute-force API from NVIDIA/cuvs#2954.
  */
-knn_result gemm_int8_topk(
+knn_result brute_force_int8_topk(
   raft::device_resources const& res,
   std::int8_t const* x,
-  std::int32_t const* x_sq,
   int64_t n,
   std::int8_t const* q,
-  std::int32_t const* q_sq,
   int64_t m,
   int64_t d,
   int64_t k,

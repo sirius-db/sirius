@@ -2405,9 +2405,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       gemm_search_enabled() && _lists != nullptr &&
       (!radius_join || (bound_gemm_enabled && vss::bound_filter_int8_supports(dim))) &&
       (_lists->encoding == vss::list_encoding::uint8 || codes_int8) && _lists->row_sq != nullptr &&
-      l2 && dim % 4 == 0;
+      l2 && dim % 4 == 0 && dim <= 131068;
     std::optional<rmm::device_uvector<std::int8_t>> probe_i8, routed_i8;
-    std::optional<rmm::device_uvector<std::int32_t>> probe_sq, routed_sq;
+    std::optional<rmm::device_uvector<std::int32_t>> probe_sq;
     // The rotated probe lives as long as its codes: freed while the quantize reading it is still
     // queued, its memory went to a concurrent task (one task per probe chunk) and corrupted them.
     std::optional<rmm::device_uvector<float>> probe_code_error, rotated_probe;
@@ -2429,7 +2429,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       probe_i8.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
       probe_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
       routed_i8.emplace(static_cast<std::size_t>(max_routed * dim), stream, mr);
-      routed_sq.emplace(static_cast<std::size_t>(max_routed), stream, mr);
       if (codes_int8) {
         // The probe gets the lists' codes too, and its own exact coding error per row -- rotated
         // first, like the rows, when the lists were (the FP32 re-score keeps the unrotated probe).
@@ -3562,8 +3561,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             continue;
           }
 
-          // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
-          // per-call device synchronization, which is paid here once per slice.
+          // Search all routed queries together against this corpus slice.
           auto const knn = [&] {
             if (f16_sweep0) {
               vss::gather_bytes(probe_f16->data(),
@@ -3588,14 +3586,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             }
             if (int8_search) {
               vss::gather_bytes(probe_i8->data(), dim, rows_c, m, routed_i8->data(), stream);
-              vss::gather_int32(probe_sq->data(), rows_c, m, routed_sq->data(), stream);
-              return vss::gemm_int8_topk(
+              return vss::brute_force_int8_topk(
                 res,
                 reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
-                reinterpret_cast<std::int32_t const*>(chunk_norms) + slice.begin,
                 slice_rows,
                 routed_i8->data(),
-                routed_sq->data(),
                 m,
                 dim,
                 k_eff,
