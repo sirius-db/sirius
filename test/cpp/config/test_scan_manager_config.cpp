@@ -977,6 +977,7 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
     CHECK(r.fan_out == d.fan_out);
     CHECK(r.interface == d.interface);
     CHECK(r.pin_to_irq_cpus == d.pin_to_irq_cpus);
+    CHECK(r.raise_reactor_priority == d.raise_reactor_priority);
     CHECK(r.max_retry_attempts == d.max_retry_attempts);
     CHECK(r.max_auth_retry_attempts == d.max_auth_retry_attempts);
     CHECK(r.retry_backoff_base == d.retry_backoff_base);
@@ -1044,7 +1045,8 @@ TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][r
                                                        "        iowq_max_unbound: 9\n"
                                                        "        fan_out: 3\n"
                                                        "        interface: eth1\n"
-                                                       "        pin_to_irq_cpus: false\n"));
+                                                       "        pin_to_irq_cpus: false\n"
+                                                       "        raise_reactor_priority: true\n"));
   CHECK(cfg.rest_n_reactors == 4);
   auto const check = [](cucascade::io::rest::config const& rest) {
     CHECK(rest.n_max_concurrent_scans == 5);
@@ -1085,6 +1087,7 @@ TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][r
     CHECK(rest.fan_out == 3);
     CHECK(rest.interface == "eth1");
     CHECK_FALSE(rest.pin_to_irq_cpus);
+    CHECK(rest.raise_reactor_priority);
   };
   check(cfg.rest);
   check(cfg.to_io_config().rest);

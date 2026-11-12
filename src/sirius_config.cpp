@@ -436,6 +436,7 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   read_count(r, "fan_out", opt.fan_out, true);
   r.optional("interface", opt.interface);
   r.optional("pin_to_irq_cpus", opt.pin_to_irq_cpus);
+  r.optional("raise_reactor_priority", opt.raise_reactor_priority);
 
   if (auto n = r.optional_node("tls")) sirius::from_yaml(*n, opt.tls);
   r.reject_unknown();
