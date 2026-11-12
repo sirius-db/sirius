@@ -1,7 +1,3 @@
 {
-  "clangd.path": "/etc/profiles/per-user/dvats/bin/clangd",
-  "clangd.arguments": [
-    "--compile-commands-dir=${workspaceFolder}/build/release",
-    "-j=6"
-  ]
+  "clangd.path": "${workspaceFolder}/.pixi/envs/default/bin/clangd"
 }
