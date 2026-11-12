@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -175,6 +176,14 @@ class transport {
   /// transport has failed: its peers have heard of that.
   void abort(distributed_query_id query, std::string what);
 
+  /// @p query was aborted, here or on a peer: wakes its senders waiting for room in send(), which
+  /// then queues nothing more for it. What it already queued still goes. Does not block, so a
+  /// callback may call it.
+  void cancel(distributed_query_id query);
+
+  /// This rank retired @p query: drops its cancellation.
+  void forget(distributed_query_id query);
+
   /// Waits until this rank holds no batch it sent on a stream of @p query: the transport keeps a
   /// sent batch until its last frame is staged, or until it fails, and its memory may belong to
   /// the query.
@@ -194,6 +203,8 @@ class transport {
   /// Sent batches not yet freed, by query; _released is notified as they are.
   std::map<distributed_query_id, std::size_t> _held;
   std::condition_variable _released;
+  /// Queries cancelled and not yet forgotten.
+  std::set<distributed_query_id> _cancelled;
   std::exception_ptr _error;
   /// abort() notices for the engine thread to send to every peer.
   std::vector<abort_message> _aborts;
