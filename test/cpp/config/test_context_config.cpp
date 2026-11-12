@@ -179,7 +179,7 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
     CHECK(gpu.memory_capacity == capacity);
     CHECK(gpu.reservation_limit_fraction == 0.7);
     CHECK(config.get_operator_params().scan_task_batch_size == capacity / 40);
-    CHECK(config.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+    CHECK(config.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
           4 * (capacity / 40));
     CHECK(config.get_operator_params().hash_partition_bytes == (32ULL << 20));
   }
@@ -212,7 +212,7 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
   }
 }
 
-TEST_CASE("dynamic-filter Bloom budget follows resolved scan size unless explicitly configured",
+TEST_CASE("dynamic-filter Bloom budget always follows resolved scan size",
           "[context_config][config][dynamic_filter]")
 {
   cucascade::memory::topology_discovery discovery;
@@ -227,15 +227,14 @@ TEST_CASE("dynamic-filter Bloom budget follows resolved scan size unless explici
     auto const parsed              = sirius::parsed_sirius_config::from_node(root);
     auto const resolved            = parsed.resolve(discovery.get_topology());
     auto const expected            = scan_bytes > max_bytes / 4 ? max_bytes : 4 * scan_bytes;
-    CHECK(resolved.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == expected);
+    CHECK(resolved.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() == expected);
 
     // Resolution is repeatable and does not mutate the parsed settings.
     CHECK(parsed.resolve(discovery.get_topology())
             .get_operator_params()
-            .max_dynamic_filter_bloom_bytes_per_gpu == expected);
+            .max_dynamic_filter_bloom_bytes_per_gpu() == expected);
   }
   params["max_dynamic_filter_bloom_bytes_per_gpu"] = "17MiB";
-  auto const resolved =
-    sirius::parsed_sirius_config::from_node(root).resolve(discovery.get_topology());
-  CHECK(resolved.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == (17ULL << 20));
+  CHECK_THROWS_WITH(sirius::parsed_sirius_config::from_node(root),
+                    Catch::Matchers::ContainsSubstring("always 4x scan_task_batch_size"));
 }

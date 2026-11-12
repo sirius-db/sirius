@@ -83,10 +83,7 @@ constexpr batch_setting batch_settings[] = {
   {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
   {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
   {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
-  {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8},
-  {"max_dynamic_filter_bloom_bytes_per_gpu",
-   &operator_params::max_dynamic_filter_bloom_bytes_per_gpu,
-   4}};
+  {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
 
 }  // namespace
 
@@ -457,12 +454,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   }
   r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
   r.optional("enable_dynamic_filter_multi_partition", opt.enable_dynamic_filter_multi_partition);
-  r.optional("max_dynamic_filter_bloom_bytes_per_gpu",
-             yaml::bytes(opt.max_dynamic_filter_bloom_bytes_per_gpu));
-  if (opt.max_dynamic_filter_bloom_bytes_per_gpu == 0) {
+  if (r.has("max_dynamic_filter_bloom_bytes_per_gpu")) {
     throw std::runtime_error(
-      "'operator_params.max_dynamic_filter_bloom_bytes_per_gpu': must be greater than zero; set "
-      "enable_dynamic_filter_multi_partition to false to disable Bloom accumulation");
+      "'operator_params.max_dynamic_filter_bloom_bytes_per_gpu': removed; the Bloom budget is "
+      "always 4x scan_task_batch_size; remove this key. Set enable_dynamic_filter_multi_partition "
+      "to false to disable Bloom accumulation");
   }
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
@@ -1064,12 +1060,6 @@ try {
   if (!is_explicit(&operator_params::max_build_hash_table_bytes)) {
     settings._operator_params.max_build_hash_table_bytes =
       sirius::memory::saturating_mul(8, settings._operator_params.hash_partition_bytes);
-  }
-  // Resolve after explicit scan-size overrides. SET/RESET uses this startup default
-  // without coupling subsequent session changes to the two independent settings.
-  if (!is_explicit(&operator_params::max_dynamic_filter_bloom_bytes_per_gpu)) {
-    settings._operator_params.max_dynamic_filter_bloom_bytes_per_gpu =
-      sirius::memory::saturating_mul(4, settings._operator_params.scan_task_batch_size);
   }
   settings.finalize_derived_config();
   return settings;
