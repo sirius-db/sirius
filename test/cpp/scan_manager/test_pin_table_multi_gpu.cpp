@@ -372,9 +372,10 @@ TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under 
 
       // 4 files of range(100000): max(k) = 99999, sum(k) = 4 * 4999950000, sum(v) = 2 * sum(k).
       REQUIRE(result->RowCount() == 1);
-      CHECK(result->GetValue(0, 0).ToString() == "99999");
-      CHECK(result->GetValue(1, 0).ToString() == "19999800000");
-      CHECK(result->GetValue(2, 0).ToString() == "39999600000");
+      auto const& rows = result->Collection();
+      CHECK(rows.GetValue(0, 0).ToString() == "99999");
+      CHECK(rows.GetValue(1, 0).ToString() == "19999800000");
+      CHECK(rows.GetValue(2, 0).ToString() == "39999600000");
 
       // Every GPU holding a compressed chunk ran part of the query, although gpus_per_query
       // is 1: its chunks were decoded where they live.
