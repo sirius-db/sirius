@@ -144,7 +144,6 @@ target_link_options(sirius_unittest PRIVATE
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(
     sirius_cuda_fault_test
-    test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
     test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
     test/cpp/memory/test_device_transfer_fault.cpp
     test/cpp/scan_manager/test_memory_prefetcher_health.cpp

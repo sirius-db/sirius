@@ -39,6 +39,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -49,8 +50,8 @@ namespace {
 using inventory = sirius::op::complete_build_inventory;
 using ledger    = sirius::op::build_arrival_ledger;
 using sirius::op::construction_decline;
-using geometry = sirius::op::detail::accumulated_bloom_geometry;
-namespace acc  = sirius::test::accumulation;
+using sirius::op::detail::accumulated_bloom_chunk_bytes;
+namespace acc = sirius::test::accumulation;
 
 cudf::column_view empty_column(cudf::data_type type) { return {type, 0, nullptr, nullptr, 0}; }
 
@@ -75,7 +76,7 @@ static_assert(std::is_nothrow_move_assignable_v<inventory>);
 }  // namespace
 
 TEST_CASE("arrival ledger certifies exactly the pushed batches as a sorted inventory",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 7);
@@ -132,7 +133,7 @@ TEST_CASE("arrival ledger certifies exactly the pushed batches as a sorted inven
 }
 
 TEST_CASE("arrival ledger declines when the repository holds a batch it never saw",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const recorded = fixture.make_batch(0, 0, 4);
@@ -147,27 +148,13 @@ TEST_CASE("arrival ledger declines when the repository holds a batch it never sa
 }
 
 TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const valid = fixture.make_batch(0, 0, 4);
   ledger arrivals;
   arrivals.record(*valid);
 
-  // Host arrivals are readable, but certification still accepts only GPU arrivals.
-  SECTION("a batch that is not GPU resident")
-  {
-    auto const spilled = fixture.make_batch(0, 10, 4);
-    auto* host = fixture.manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
-    auto const stream = fixture.gpu(0).acquire_stream();
-    {
-      auto writable = spilled->to_mutable();
-      writable.convert_to<cucascade::host_data_representation>(
-        sirius::converter_registry::get(), host, stream);
-    }
-    stream.sync();
-    arrivals.record(*spilled);
-  }
   SECTION("a batch that is mutably locked at push")
   {
     auto const locked = fixture.make_batch(0, 10, 4);
@@ -181,8 +168,66 @@ TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
           construction_decline::unreadable_arrival);
 }
 
+namespace {
+
+/// Spills @p batch to host memory, as the downgrade executor would.
+void spill_to_host(acc::fixture const& fixture, acc::batch_ptr const& batch)
+{
+  auto* host = fixture.manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
+  auto const stream = fixture.gpu(0).acquire_stream();
+  {
+    auto writable = batch->to_mutable();
+    writable.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), host, stream);
+  }
+  stream.sync();
+}
+
+}  // namespace
+
+TEST_CASE("a spilled host arrival certifies with the facts a GPU arrival records",
+          "[dynamic_filter][construction][inventory]")
+{
+  acc::fixture fixture;
+  auto const resident = fixture.make_batch(0, 0, 4);
+  auto const spilled  = fixture.make_batch(0, 10, 6);
+  spill_to_host(fixture, spilled);
+  ledger arrivals;
+  arrivals.record(*resident);
+  arrivals.record(*spilled);
+  auto certified = arrivals.certify({.repository_batches = 2});
+  REQUIRE_FALSE(decline_of(certified));
+  auto const& complete = std::get<inventory>(certified);
+  REQUIRE(complete.total_rows() == 10);
+  auto const index =
+    static_cast<std::size_t>(complete.find(spilled->get_batch_id()) - complete.batches().data());
+  auto const host_columns = complete.batch_columns(index);
+  auto const gpu_columns  = complete.batch_columns(1 - index);
+  REQUIRE(host_columns.size() == gpu_columns.size());
+  for (std::size_t column = 0; column < host_columns.size(); ++column) {
+    CHECK(host_columns[column].carrier == gpu_columns[column].carrier);
+    CHECK(host_columns[column].null_count == gpu_columns[column].null_count);
+  }
+}
+
+TEST_CASE("after certification a late empty host arrival is ignored, one with rows throws",
+          "[dynamic_filter][construction][inventory]")
+{
+  acc::fixture fixture;
+  auto const batch = fixture.make_batch(0, 0, 4);
+  ledger arrivals;
+  arrivals.record(*batch);
+  REQUIRE_FALSE(decline_of(arrivals.certify({.repository_batches = 1})));
+  auto const empty = fixture.make_batch(0, 100, 0);
+  spill_to_host(fixture, empty);
+  REQUIRE_NOTHROW(arrivals.record(*empty));
+  auto const late = fixture.make_batch(0, 200, 3);
+  spill_to_host(fixture, late);
+  REQUIRE_THROWS_AS(arrivals.record(*late), std::logic_error);
+}
+
 TEST_CASE("certified inventories need no downstream partition count and transfer on move",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const batch = fixture.make_batch(0, 0, 9);
@@ -201,7 +246,7 @@ TEST_CASE("certified inventories need no downstream partition count and transfer
 }
 
 TEST_CASE("inventory records top-level key types without constraining payload children",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const integer = empty_column(cudf::data_type{cudf::type_id::INT64});
@@ -232,7 +277,7 @@ TEST_CASE("inventory records top-level key types without constraining payload ch
 }
 
 TEST_CASE("a missing or changed key type stays unavailable while siblings remain usable",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const integer     = empty_column(cudf::data_type{cudf::type_id::INT32});
@@ -278,10 +323,10 @@ class fake_compressed_representation final : public sirius::simpatico_compressed
   }
 };
 
-/// A GPU batch of @p rows rows: an all-null INT32 column and a valid DECIMAL64(-2) column.
-acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type rows)
+/// A batch of @p rows rows in GPU @p space: an all-null INT32 column and a valid DECIMAL64(-2)
+/// column.
+acc::batch_ptr make_nullable_batch(cucascade::memory::memory_space& space, cudf::size_type rows)
 {
-  auto& space       = fixture.gpu(0);
   auto const stream = space.acquire_stream();
   auto const mr     = space.get_default_allocator();
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -298,6 +343,12 @@ acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type 
     std::move(*table), space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
+/// `make_nullable_batch` on the first GPU of @p fixture.
+acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type rows)
+{
+  return make_nullable_batch(fixture.gpu(0), rows);
+}
+
 auto const k_int32     = cudf::data_type{cudf::type_id::INT32};
 auto const k_decimal64 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
 
@@ -312,7 +363,7 @@ sirius::op::arrival_facts facts_of(cucascade::data_batch& batch)
 }  // namespace
 
 TEST_CASE("an arrival reports each column's carrier and null count from GPU and host tables",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const batch = make_nullable_batch(fixture, 5);
@@ -337,54 +388,89 @@ TEST_CASE("an arrival reports each column's carrier and null count from GPU and 
   CHECK(spilled.columns == expected);
 }
 
-TEST_CASE("an arrival reports each column's carrier and null count from a disk table",
-          "[dynamic_filter][multi_partition][inventory]")
-{
-  auto const directory = std::filesystem::temp_directory_path() / "sirius_test_arrival_facts";
-  std::filesystem::create_directories(directory);
-  sirius::converter_registry::reset_for_testing();
-  cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(1)
-    .set_gpu_usage_limit(std::size_t{1} << 30)
-    .set_reservation_fraction_per_gpu(0.75)
-    .set_per_numa_region_capacity(std::size_t{1} << 30)
-    .use_gpu_id_as_host_id()
-    .set_reservation_fraction_per_numa_region(0.75)
-    .set_disk_mounting_point(0, std::size_t{4} << 30, directory.string());
-  auto manager =
-    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-  sirius::converter_registry::initialize();
-  auto* gpu  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  auto* disk = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).front();
-  REQUIRE(gpu != nullptr);
+namespace {
 
-  auto const stream = gpu->acquire_stream();
-  auto const mr     = gpu->get_default_allocator();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::make_numeric_column(k_int32, 3, cudf::mask_state::ALL_NULL, stream, mr));
-  columns.push_back(
-    cudf::make_fixed_point_column(k_decimal64, 3, cudf::mask_state::UNALLOCATED, stream, mr));
-  auto batch = sirius::make_data_batch(
-    cudf::table{std::move(columns)}, *gpu, stream, sirius::telemetry::batch_telemetry_info{});
+/// One GPU whose memory manager also spills to a disk tier in a temporary directory.
+struct disk_memory {
+  std::filesystem::path directory;
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+  cucascade::memory::memory_space* gpu  = nullptr;
+  cucascade::memory::memory_space* disk = nullptr;
+
+  explicit disk_memory(std::string_view name)
+    : directory{std::filesystem::temp_directory_path() / name}
   {
-    auto writable = batch->to_mutable();
-    writable.convert_to<cucascade::disk_data_representation>(
-      sirius::converter_registry::get(),
-      const_cast<cucascade::memory::memory_space*>(disk),
-      stream);
+    std::filesystem::create_directories(directory);
+    sirius::converter_registry::reset_for_testing();
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(std::size_t{1} << 30)
+      .set_reservation_fraction_per_gpu(0.75)
+      .set_per_numa_region_capacity(std::size_t{1} << 30)
+      .use_gpu_id_as_host_id()
+      .set_reservation_fraction_per_numa_region(0.75)
+      .set_disk_mounting_point(0, std::size_t{4} << 30, directory.string());
+    manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+    sirius::converter_registry::initialize();
+    gpu  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+    disk = const_cast<cucascade::memory::memory_space*>(
+      manager->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).front());
+    REQUIRE(gpu != nullptr);
   }
-  stream.sync();
+  disk_memory(disk_memory const&)            = delete;
+  disk_memory& operator=(disk_memory const&) = delete;
+  ~disk_memory()
+  {
+    manager.reset();
+    std::filesystem::remove_all(directory);
+  }
+
+  /// Moves @p batch to the disk tier, as the downgrade executor would.
+  void spill(cucascade::data_batch& batch) const
+  {
+    auto const stream = gpu->acquire_stream();
+    {
+      auto writable = batch.to_mutable();
+      writable.convert_to<cucascade::disk_data_representation>(
+        sirius::converter_registry::get(), disk, stream);
+    }
+    stream.sync();
+  }
+};
+
+}  // namespace
+
+TEST_CASE("after certification a late empty disk arrival is ignored, one with rows throws",
+          "[dynamic_filter][construction][inventory]")
+{
+  disk_memory const memory{"sirius_test_late_disk_arrival"};
+  auto const batch = make_nullable_batch(*memory.gpu, 4);
+  ledger arrivals;
+  arrivals.record(*batch);
+  REQUIRE_FALSE(decline_of(arrivals.certify({.repository_batches = 1})));
+  auto const empty = make_nullable_batch(*memory.gpu, 0);
+  memory.spill(*empty);
+  REQUIRE(facts_of(*empty).tier == cucascade::memory::Tier::DISK);
+  REQUIRE_NOTHROW(arrivals.record(*empty));
+  auto const late = make_nullable_batch(*memory.gpu, 3);
+  memory.spill(*late);
+  REQUIRE_THROWS_AS(arrivals.record(*late), std::logic_error);
+}
+
+TEST_CASE("an arrival reports each column's carrier and null count from a disk table",
+          "[dynamic_filter][construction][inventory]")
+{
+  disk_memory const memory{"sirius_test_arrival_facts"};
+  auto const batch = make_nullable_batch(*memory.gpu, 3);
+  memory.spill(*batch);
   auto const facts = facts_of(*batch);
   CHECK(facts.tier == cucascade::memory::Tier::DISK);
   CHECK(facts.rows == 3);
   CHECK(facts.columns == std::vector<sirius::op::column_facts>{{k_int32, 3}, {k_decimal64, 0}});
-  batch.reset();
-  manager.reset();
-  std::filesystem::remove_all(directory);
 }
 
 TEST_CASE("a compressed arrival closes the ledger with its own reason",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto* host = fixture.manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
@@ -403,7 +489,7 @@ TEST_CASE("a compressed arrival closes the ledger with its own reason",
 }
 
 TEST_CASE("an inventory keeps every batch's columns and summarizes them for policy",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const nullable = make_nullable_batch(fixture, 6);
@@ -446,7 +532,7 @@ TEST_CASE("an inventory keeps every batch's columns and summarizes them for poli
 }
 
 TEST_CASE("a column absent from some batch has no carriers and no null count",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const make = [&](std::vector<cudf::column_view> columns) {
@@ -471,63 +557,35 @@ TEST_CASE("a column absent from some batch has no carriers and no null count",
   CHECK_FALSE(facts.columns[1].null_rows);
 }
 
-TEST_CASE("accumulated Bloom geometry uses global rows and sums aligned key arrays",
-          "[dynamic_filter][multi_partition][bloom_budget]")
-{
-  auto small = geometry::try_create(16, 2, 512);
-  REQUIRE(small);
-  REQUIRE(small->blocks == 1);
-  REQUIRE(small->raw_bytes == 32);
-  REQUIRE(aligned(small->raw_bytes) == 256);
-  REQUIRE(small->arrays_bytes == 512);
-  REQUIRE(small->chunk_bytes == 256);
-  REQUIRE(small->chunks_per_key() == 1);
-  REQUIRE_FALSE(geometry::try_create(16, 2, 511));
-
-  auto next_block = geometry::try_create(129, 2, 1024);
-  REQUIRE(next_block);
-  REQUIRE(next_block->blocks == 9);
-  REQUIRE(next_block->raw_bytes == 288);
-  REQUIRE(aligned(next_block->raw_bytes) == 512);
-  REQUIRE(next_block->arrays_bytes == 1024);
-
-  auto const maximum = std::numeric_limits<std::size_t>::max();
-  REQUIRE_FALSE(geometry::try_create(16, 0, maximum));
-  REQUIRE_FALSE(geometry::try_create(16, 1, 0));
-  REQUIRE_FALSE(geometry::try_create(maximum, 1, maximum));
-  REQUIRE_FALSE(geometry::try_create(16, maximum, maximum));
-  REQUIRE_FALSE(geometry::try_create(16, maximum / 256 + 1, maximum));
-}
-
 TEST_CASE("accumulated Bloom transfer chunks are aligned and cover non-aligned arrays",
-          "[dynamic_filter][multi_partition][bloom_budget]")
+          "[dynamic_filter][construction][bloom_budget]")
 {
-  constexpr std::size_t mib = std::size_t{1} << 20;
+  // The bytes of one Bloom array sized on @p rows keys.
+  auto const raw_bytes_for = [](std::size_t rows) {
+    return sirius::op::bloom_blocks_for(rows) * sirius::op::bloom_bytes_per_block;
+  };
   SECTION("one chunk when the array is below the minimum chunk")
   {
-    auto const shape = geometry::try_create(1'000'001, 1, 256 * mib);
-    REQUIRE(shape);
-    REQUIRE(shape->raw_bytes == 2'000'032);
-    REQUIRE(aligned(shape->raw_bytes) == 2'000'128);
-    REQUIRE(shape->chunk_bytes == 2'000'128);
-    REQUIRE(shape->chunks_per_key() == 1);
+    auto const raw_bytes = raw_bytes_for(1'000'001);
+    REQUIRE(raw_bytes == 2'000'032);
+    REQUIRE(aligned(raw_bytes) == 2'000'128);
+    REQUIRE(accumulated_bloom_chunk_bytes(raw_bytes) == 2'000'128);
   }
   SECTION("an eighth of the array, rounded up to the alignment, with a partial last chunk")
   {
-    auto const shape = geometry::try_create(20'971'536, 1, 256 * mib);
-    REQUIRE(shape);
-    REQUIRE(shape->raw_bytes == 41'943'072);
-    REQUIRE(shape->chunk_bytes == 5'243'136);
-    REQUIRE(shape->chunk_bytes % 256 == 0);
-    REQUIRE(shape->chunks_per_key() == 8);
-    auto const last = shape->raw_bytes - 7 * shape->chunk_bytes;
+    auto const raw_bytes = raw_bytes_for(20'971'536);
+    auto const chunk     = accumulated_bloom_chunk_bytes(raw_bytes);
+    REQUIRE(raw_bytes == 41'943'072);
+    REQUIRE(chunk == 5'243'136);
+    REQUIRE(chunk % 256 == 0);
+    REQUIRE(::cuda::ceil_div(raw_bytes, chunk) == 8);
+    auto const last = raw_bytes - 7 * chunk;
     REQUIRE(last == 5'241'120);
     REQUIRE(last % 32 == 0);
   }
   SECTION("the chunk is clamped to the maximum")
   {
-    auto const shape = geometry::try_create(std::size_t{64} << 20, 1, std::size_t{1} << 40);
-    REQUIRE(shape);
-    REQUIRE(shape->chunk_bytes == geometry::k_max_transfer_chunk_bytes);
+    REQUIRE(accumulated_bloom_chunk_bytes(raw_bytes_for(std::size_t{64} << 20)) ==
+            sirius::op::detail::k_max_bloom_transfer_chunk_bytes);
   }
 }

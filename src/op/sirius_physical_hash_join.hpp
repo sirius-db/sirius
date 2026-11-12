@@ -330,8 +330,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
   /**
-   * @brief The session that publishes this join's dynamic filters, through which the build-side
-   * `sirius_physical_partition` accumulates a multi-partition filter.
+   * @brief The session that publishes this join's dynamic filters, which its construction site (the
+   * build-side `sirius_physical_partition`, or `sirius_physical_build_filter`) drives.
    */
   [[nodiscard]] dynamic_filter_publication_session& dynamic_filter_session() noexcept
   {
@@ -395,9 +395,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   {
     return _max_build_hash_table_bytes;
   }
-
-  // Publication may claim only a delivery known to contain the whole build.
-  void set_build_arrives_whole(bool arrives_whole);
 
   /// @brief Called by the build-side PARTITION's observer for every build batch it hash-partitions
   /// (before scattering). For a MARK join with null-propagating keys this records, join-wide,
@@ -499,11 +496,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
-
-  bool _build_arrives_whole = false;
-
-  // Guarded by op_state_mutex.
-  bool _build_not_whole_reported = false;
 
   // Whole-counted BUILD_PROBE and orphan bytes. Relaxed reads may be slightly stale.
   std::atomic<std::size_t> _whole_probe_bytes{0};
@@ -623,10 +615,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
 
  public:
-  void push_data_batch_partitioned(std::string_view port_id,
-                                   std::shared_ptr<::cucascade::data_batch> batch,
-                                   std::size_t partition_idx) override;
-
   [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
   {
     return _dynamic_filter_session.plan();

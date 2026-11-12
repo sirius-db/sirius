@@ -80,8 +80,6 @@ void require_complete_publication(observed_run const& run,
   REQUIRE(run.after.accumulations_skipped_transient == run.before.accumulations_skipped_transient);
   REQUIRE(run.after.accumulations_abandoned == run.before.accumulations_abandoned);
   REQUIRE(run.after.filters_pushed > run.before.filters_pushed);
-  REQUIRE(run.after.publications_skipped_build_not_whole ==
-          run.before.publications_skipped_build_not_whole);
 }
 
 void run_ok(duckdb::Connection& con, std::string const& sql)
@@ -113,7 +111,6 @@ void check_union_all_accumulation(duckdb::Connection& con, bool host_staged = fa
 {
   scoped_sirius_setting gpu_on(con, "gpu_execution", true);
   scoped_sirius_setting master_on(con, "enable_dynamic_filter", true);
-  scoped_sirius_setting accumulation_on(con, "enable_dynamic_filter_multi_partition", true);
   scoped_sirius_setting native_keys(con, "enable_compressed_materialization", false);
   sirius::test::disabled_optimizers_guard shape(
     con, "statistics_propagation,join_order,build_side_probe_side");
@@ -161,13 +158,13 @@ void check_union_all_accumulation(duckdb::Connection& con, bool host_staged = fa
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - multi-partition accumulation through UNION ALL matches the CPU",
-                 "[integration][gpu_execution][dynamic_filter][multi_partition]")
+                 "[integration][gpu_execution][dynamic_filter][construction]")
 {
   check_union_all_accumulation(*con);
 }
 
 TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two GPUs",
-          "[integration][gpu_execution][dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[integration][gpu_execution][dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   // The `[integration][multi_gpu]` tags make the `shared_env_listener` in `unittest.cpp` activate
@@ -201,7 +198,7 @@ TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - complete multi-partition dynamic filters match the CPU",
-                 "[integration][gpu_execution][dynamic_filter][multi_partition]")
+                 "[integration][gpu_execution][dynamic_filter][construction]")
 {
   std::string const key_type = GENERATE(std::string{"INTEGER"}, std::string{"BIGINT"});
   CAPTURE(key_type);
@@ -239,27 +236,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     cpu_rows = sirius::test::collect_rows(*result);
   }
 
-  SECTION("disabled accumulation retains one-shot-only behavior")
-  {
-    scoped_sirius_setting accumulation_off(*con, "enable_dynamic_filter_multi_partition", false);
-    auto const run = run_on_gpu(*con, query);
-    REQUIRE(run.rows == cpu_rows);
-    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
-    REQUIRE(run.after.filters_pushed == run.before.filters_pushed);
-    REQUIRE(run.after.publications_skipped_build_not_whole >
-            run.before.publications_skipped_build_not_whole);
-  }
-
   SECTION("enabled accumulation publishes every original contribution")
   {
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     require_complete_publication(run_on_gpu(*con, query), cpu_rows);
     require_complete_publication(run_on_gpu(*con, query), cpu_rows);
   }
 
   SECTION("a LIMIT above an ORDER BY over the accumulating join completes normally")
   {
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     std::string const limited =
       "SELECT k, payload FROM (SELECT p.k AS k, b.payload AS payload FROM df_probe p "
       "JOIN df_build b ON p.k = b.k WHERE b.marker <> 0 ORDER BY p.k) LIMIT 10";
@@ -280,7 +264,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   SECTION("the master switch disables accumulated publication")
   {
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     scoped_sirius_setting master_off(*con, "enable_dynamic_filter", false);
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
@@ -292,7 +275,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   SECTION("pinned narrow payloads retain native accumulated join keys")
   {
     scoped_sirius_setting compression_on(*con, "enable_compressed_materialization", true);
-    scoped_sirius_setting accumulation_on(*con, "enable_dynamic_filter_multi_partition", true);
     absl::Cleanup unpin = [&] {
       con->Query("CALL unpin_table('df_probe');");
       con->Query("CALL unpin_table('df_build');");
@@ -313,36 +295,27 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
   }
 
-  SECTION("disabling accumulation does not change results")
+  SECTION("a single-partition build over a lowered Bloom cap gets no Bloom and matches the CPU")
   {
-    scoped_sirius_setting accumulation_off(*con, "enable_dynamic_filter_multi_partition", false);
+    sirius::test::scoped_setting whole_partition(*con, "hash_partition_bytes", 64 * 1024 * 1024);
+    sirius::test::scoped_setting whole_build(*con, "max_build_hash_table_bytes", 64 * 1024 * 1024);
+    sirius::test::scoped_setting force_bloom(*con, "dynamic_filter_inlist_max_l2_fraction", 0);
+    sirius::test::scoped_setting lowered_cap(*con, "max_dynamic_filter_bloom_bytes_per_gpu", 1);
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
-    REQUIRE(run.after.publication_attempts == run.before.publication_attempts);
-    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
-    REQUIRE(run.after.accumulations_skipped_inventory ==
-            run.before.accumulations_skipped_inventory);
-    REQUIRE(run.after.accumulations_skipped_admission ==
-            run.before.accumulations_skipped_admission);
-    REQUIRE(run.after.keys_considered == run.before.keys_considered);
-    REQUIRE(run.after.keys_skipped_bloom_size_gate == run.before.keys_skipped_bloom_size_gate);
-    REQUIRE(run.after.keys_skipped_bloom_unsupported == run.before.keys_skipped_bloom_unsupported);
-    REQUIRE(run.after.keys_skipped_type_mismatch == run.before.keys_skipped_type_mismatch);
+    REQUIRE(run.after.keys_skipped_bloom_size_gate > run.before.keys_skipped_bloom_size_gate);
     REQUIRE(run.after.membership_filters_built == run.before.membership_filters_built);
-    REQUIRE(run.after.filters_pushed == run.before.filters_pushed);
-    REQUIRE(run.after.accumulation_publications_finished ==
-            run.before.accumulation_publications_finished);
+    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
   }
 
-  SECTION("disabling accumulation leaves one-shot Bloom publication enabled")
+  SECTION("a single-partition build constructs its filters at the PARTITION")
   {
-    scoped_sirius_setting accumulation_off(*con, "enable_dynamic_filter_multi_partition", false);
     sirius::test::scoped_setting whole_partition(*con, "hash_partition_bytes", 64 * 1024 * 1024);
     sirius::test::scoped_setting whole_build(*con, "max_build_hash_table_bytes", 64 * 1024 * 1024);
     sirius::test::scoped_setting force_bloom(*con, "dynamic_filter_inlist_max_l2_fraction", 0);
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
-    REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
+    REQUIRE(run.after.accumulations_started > run.before.accumulations_started);
     REQUIRE(run.after.keys_skipped_bloom_size_gate == run.before.keys_skipped_bloom_size_gate);
     REQUIRE(run.after.membership_filters_built > run.before.membership_filters_built);
     REQUIRE(run.after.filters_pushed > run.before.filters_pushed);

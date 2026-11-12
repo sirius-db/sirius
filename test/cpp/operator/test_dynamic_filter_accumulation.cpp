@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "construction_parity_utils.hpp"
 #include "dynamic_filter_accumulation_test_utils.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
@@ -75,9 +76,11 @@ static_assert(std::is_nothrow_copy_constructible_v<sirius::unjoined_gpu_work>);
 /**
  * @brief Bytes one GPU's partials occupy for @p keys keys over @p rows total rows.
  */
+/// The per-GPU lease of @p keys Bloom keys, each sized on @p rows valid rows.
 std::size_t partial_bytes(std::size_t rows, std::size_t keys)
 {
-  return acc::bloom_geometry(rows, keys, ~std::uint64_t{0}).arrays_bytes;
+  return keys * op::detail::tracked_replica_allocation_bytes(
+                  op::sirius_dynamic_bloom_filter::estimated_bytes(rows));
 }
 
 void require_no_tracker(acc::fixture const& fixture)
@@ -171,7 +174,7 @@ std::vector<bool> probe_mask(op::sirius_dynamic_bloom_filter const& bloom,
 }  // namespace
 
 TEST_CASE("join_on_failure joins listed streams only when the body throws",
-          "[dynamic_filter][multi_partition][join_on_failure]")
+          "[dynamic_filter][construction][join_on_failure]")
 {
   rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
   rmm::cuda_stream first{rmm::cuda_stream::flags::non_blocking};
@@ -203,7 +206,7 @@ TEST_CASE("join_on_failure joins listed streams only when the body throws",
 }
 
 TEST_CASE("begin allocates zeroed partials under exact per-GPU leases",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const batch  = fixture.make_batch(0, 0, 1000);
@@ -228,7 +231,7 @@ TEST_CASE("begin allocates zeroed partials under exact per-GPU leases",
 }
 
 TEST_CASE("declared domain coverage gates accumulation before partial allocation",
-          "[dynamic_filter][multi_partition][domain_evidence]")
+          "[dynamic_filter][construction][domain_evidence]")
 {
   auto const all_gated = GENERATE(false, true);
   auto const gated_key = GENERATE(std::size_t{0}, std::size_t{1});
@@ -252,7 +255,7 @@ TEST_CASE("declared domain coverage gates accumulation before partial allocation
                                            base.probe_targets(),
                                            base.replica_spaces(),
                                                    {.domain_coverage_threshold = threshold,
-                                                    .enable_multi_partition    = true,
+                                                    .inlist_max_l2_fraction    = 0.0,
                                                     .max_bloom_bytes_per_gpu   = 256 * mib}};
   }();
   sirius::test::scoped_recording_log_sink logs{"debug"};
@@ -268,7 +271,7 @@ TEST_CASE("declared domain coverage gates accumulation before partial allocation
   std::size_t decisions = 0;
   std::size_t skips     = 0;
   for (auto const& record : logs.records()) {
-    if (!record.message.starts_with("[dynamic_filter_domain] path=accumulated ")) { continue; }
+    if (!record.message.starts_with("[dynamic_filter_domain] path=construction ")) { continue; }
     INFO(record.message);
     REQUIRE(record.message.find("provenance=pinned_parquet_exact eligible=1") != std::string::npos);
     ++decisions;
@@ -297,7 +300,7 @@ TEST_CASE("declared domain coverage gates accumulation before partial allocation
 }
 
 TEST_CASE("accumulation never starts without a usable geometry or inventory",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const batch  = fixture.make_batch(0, 0, 1000);
@@ -305,9 +308,9 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
   SECTION("a zero cap refuses every geometry")
   {
     REQUIRE_FALSE(fixture.begin({batch}, 0));
-    REQUIRE(fixture.session->plan().multi_partition_enabled());
     auto const counters = fixture.stats.snapshot();
-    REQUIRE(counters.publication_attempts == 0);
+    // One attempt per begin, ended at once: the cap left no key to construct.
+    REQUIRE(counters.publication_attempts == 1);
     REQUIRE(counters.accumulations_skipped_inventory == 0);
     REQUIRE(counters.accumulations_skipped_admission == 0);
     REQUIRE(counters.keys_skipped_bloom_size_gate == 2);
@@ -321,8 +324,8 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
   {
     REQUIRE_FALSE(fixture.begin({batch},
                                 fixture.make_plan(256 * mib,
-                                                  {cudf::data_type{cudf::type_id::INT64},
-                                                   cudf::data_type{cudf::type_id::INT32}})));
+                                                  {cudf::data_type{cudf::type_id::INT16},
+                                                   cudf::data_type{cudf::type_id::INT16}})));
     REQUIRE(fixture.stats.snapshot().keys_skipped_type_mismatch == 2);
   }
   SECTION("zero rows") { REQUIRE_FALSE(fixture.begin({fixture.make_batch(0, 0, 0)})); }
@@ -330,11 +333,10 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
   {
     fixture.session = std::make_unique<op::dynamic_filter_publication_session>(
       fixture.make_plan(256 * mib), &fixture.stats);
-    REQUIRE_FALSE(
-      fixture.session->try_begin_accumulation(op::construction_decline::inventory_mismatch));
+    fixture.session->decline(op::construction_decline::inventory_mismatch);
     REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
   }
-  REQUIRE_FALSE(fixture.session->accumulation_claimed());
+  REQUIRE(fixture.session->terminal());
   REQUIRE(fixture.stats.snapshot().accumulations_started == 0);
   REQUIRE(fixture.allocated_bytes() == before);
   fixture.contribute(batch);
@@ -345,7 +347,7 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
 }
 
 TEST_CASE("contributions enqueue without a host wait and publish from another stream",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 2000);
@@ -380,7 +382,7 @@ TEST_CASE("contributions enqueue without a host wait and publish from another st
 }
 
 TEST_CASE("publication waits for contributions still queued on the root's task stream",
-          "[dynamic_filter][multi_partition][in_flight]")
+          "[dynamic_filter][construction][in_flight]")
 {
   acc::load_accumulation_kernels(1);
   acc::fixture fixture;
@@ -403,7 +405,7 @@ TEST_CASE("publication waits for contributions still queued on the root's task s
 }
 
 TEST_CASE("publication waits for contributions still queued on every GPU",
-          "[dynamic_filter][multi_partition][in_flight][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][in_flight][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 3);
@@ -441,7 +443,7 @@ TEST_CASE("publication waits for contributions still queued on every GPU",
 }
 
 TEST_CASE("accumulated publication delivers the exact union to every GPU",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 4);
@@ -517,7 +519,7 @@ TEST_CASE("accumulated publication delivers the exact union to every GPU",
 }
 
 TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   struct case_shape {
@@ -568,7 +570,7 @@ TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
 }
 
 TEST_CASE("duplicates and retries count once and only the final original ID publishes, once",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first    = fixture.make_batch(0, 0, 500);
@@ -619,7 +621,7 @@ TEST_CASE("duplicates and retries count once and only the final original ID publ
 }
 
 TEST_CASE("a refused direct scratch allocation uses the smaller bounded HOST workspace",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -647,7 +649,7 @@ TEST_CASE("a refused direct scratch allocation uses the smaller bounded HOST wor
 }
 
 TEST_CASE("closing or cancelling collecting input never waits for queued inserts",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   bool const cancel = GENERATE(true, false);
   acc::fixture fixture;
@@ -696,7 +698,7 @@ TEST_CASE("closing or cancelling collecting input never waits for queued inserts
 }
 
 TEST_CASE("input closure during publication does not retire the builder early",
-          "[dynamic_filter][multi_partition][in_flight]")
+          "[dynamic_filter][construction][in_flight]")
 {
   acc::load_accumulation_kernels(1);
   acc::fixture fixture;
@@ -728,7 +730,7 @@ TEST_CASE("input closure during publication does not retire the builder early",
 }
 
 TEST_CASE("a tracked task thread publishes without releasing partial storage",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first    = fixture.make_batch(0, 0, 300);
@@ -758,7 +760,7 @@ TEST_CASE("a tracked task thread publishes without releasing partial storage",
 }
 
 TEST_CASE("a tracked task thread charges the merge scratch to its own reservation",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -797,7 +799,7 @@ TEST_CASE("a tracked task thread charges the merge scratch to its own reservatio
 
 TEST_CASE(
   "a tracked task thread admits a merge scratch larger than its reservation as its task would",
-  "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+  "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -860,7 +862,7 @@ TEST_CASE(
 }
 
 TEST_CASE("input closed before every batch contributed ends without a filter",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first    = fixture.make_batch(0, 0, 300);
@@ -878,7 +880,7 @@ TEST_CASE("input closed before every batch contributed ends without a filter",
 }
 
 TEST_CASE("a contribution that does not match its partial's GPU fails the attempt",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -909,8 +911,7 @@ TEST_CASE("a contribution that does not match its partial's GPU fails the attemp
   REQUIRE(fixture.channel->snapshot().empty());
 }
 
-TEST_CASE("a late batch without rows is ignored by contributions",
-          "[dynamic_filter][multi_partition]")
+TEST_CASE("a late batch without rows is ignored by contributions", "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 300);
@@ -929,8 +930,7 @@ TEST_CASE("a late batch without rows is ignored by contributions",
   REQUIRE(counters.accumulation_publications_finished == 1);
 }
 
-TEST_CASE("only retryable kernel-launch failures are transient",
-          "[dynamic_filter][multi_partition]")
+TEST_CASE("only retryable kernel-launch failures are transient", "[dynamic_filter][construction]")
 {
   using error = op::detail::accumulation_cuda_error;
   for (auto const code : {cudaErrorLaunchOutOfResources, cudaErrorInvalidValue}) {
@@ -944,7 +944,7 @@ TEST_CASE("only retryable kernel-launch failures are transient",
 }
 
 TEST_CASE("each accumulation failure kind sets exactly its counters",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   using op::detail::accumulation_failure;
   // The cleanup failure join_on_failure raises when it cannot join submitted GPU work.
@@ -1085,28 +1085,30 @@ void exercise_pending_cuda_error(bool per_stream, bool reduction)
 
 }  // namespace
 
-TEST_CASE("a pending CUDA error propagates from contribution", "[dynamic_filter][multi_partition]")
+TEST_CASE("a pending CUDA error propagates from contribution", "[dynamic_filter][construction]")
 {
   exercise_pending_cuda_error(GENERATE(false, true), false);
 }
 
 TEST_CASE("a pending CUDA error propagates from reduction",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   exercise_pending_cuda_error(GENERATE(false, true), true);
 }
 
 TEST_CASE("a mismatched planned key type is omitted without losing its sibling",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 300);
   auto const second = fixture.make_batch(0, 900, 300);
   REQUIRE(fixture.begin(
     {first, second},
+    // An INT32 column cannot carry an INT16 key; an INT32 carrier of an INT64 key would be
+    // restored.
     fixture.make_plan(
-      256 * mib, {cudf::data_type{cudf::type_id::INT64}, cudf::data_type{cudf::type_id::INT64}})));
+      256 * mib, {cudf::data_type{cudf::type_id::INT16}, cudf::data_type{cudf::type_id::INT64}})));
   fixture.contribute(first);
   fixture.contribute(second);
   fixture.publish(0, second->get_batch_id());
@@ -1118,7 +1120,7 @@ TEST_CASE("a mismatched planned key type is omitted without losing its sibling",
   }
 }
 
-TEST_CASE("a tracked thread never releases partial storage", "[dynamic_filter][multi_partition]")
+TEST_CASE("a tracked thread never releases partial storage", "[dynamic_filter][construction]")
 {
   bool const per_stream = GENERATE(false, true);
   acc::fixture fixture({.per_stream_tracking = per_stream});
@@ -1135,7 +1137,7 @@ TEST_CASE("a tracked thread never releases partial storage", "[dynamic_filter][m
   REQUIRE(refusing_task);
   auto& allocator    = fixture.allocator(0);
   auto const tracked = allocator.get_allocated_bytes(stream);
-  fixture.session->decline_accumulation();
+  fixture.session->decline_task_input();
   REQUIRE(allocator.get_allocated_bytes(stream) == tracked);
   REQUIRE(fixture.allocated_bytes()[0] == partials + mib);
   fixture.session->release_retired_storage();
@@ -1148,7 +1150,7 @@ TEST_CASE("a tracked thread never releases partial storage", "[dynamic_filter][m
 }
 
 TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -1163,7 +1165,7 @@ TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
   blocker.reset();
   REQUIRE(fixture.allocated_bytes() == baseline);
   require_no_tracker(fixture);
-  REQUIRE_FALSE(fixture.session->accumulation_claimed());
+  REQUIRE(fixture.session->terminal());
   REQUIRE(fixture.stats.snapshot().accumulations_skipped_admission == 1);
   fixture.session->finish_input();
   REQUIRE(fixture.channel->snapshot().terminal());
@@ -1171,7 +1173,7 @@ TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
 }
 
 TEST_CASE("a publication root without a partial declines and settles",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -1199,7 +1201,7 @@ TEST_CASE("a publication root without a partial declines and settles",
 }
 
 TEST_CASE("a publication on another GPU's stream fails before it enqueues anything",
-          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -1229,7 +1231,7 @@ TEST_CASE("a publication on another GPU's stream fails before it enqueues anythi
 }
 
 TEST_CASE("an owed publication that never runs ends the attempt without a filter",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first    = fixture.make_batch(0, 0, 300);
@@ -1259,7 +1261,7 @@ TEST_CASE("an owed publication that never runs ends the attempt without a filter
   REQUIRE(fixture.allocated_bytes() == baseline);
 }
 
-TEST_CASE("cancellation during the late wait prevents fan-out", "[dynamic_filter][multi_partition]")
+TEST_CASE("cancellation during the late wait prevents fan-out", "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 3000);
@@ -1293,52 +1295,64 @@ TEST_CASE("cancellation during the late wait prevents fan-out", "[dynamic_filter
   REQUIRE(fixture.channel->snapshot().empty());
 }
 
-TEST_CASE("accumulation declines admitted key types it cannot insert",
-          "[dynamic_filter][multi_partition]")
+TEST_CASE("construction accumulates every admitted key type", "[dynamic_filter][construction]")
 {
   auto const key_type = GENERATE(cudf::type_id::TIMESTAMP_DAYS, cudf::type_id::STRING);
   CAPTURE(key_type);
   acc::fixture fixture;
   auto const first  = make_mixed_batch(fixture, key_type, 0, 300);
   auto const second = make_mixed_batch(fixture, key_type, 900, 300);
-  auto const before = fixture.allocated_bytes();
-  // The whole-build Bloom filter admits both types; accumulation inserts only INT32 and INT64.
-  REQUIRE(op::sirius_dynamic_bloom_filter::supports(cudf::data_type{key_type}));
-  REQUIRE_FALSE(op::detail::accumulated_bloom_builder::supports(cudf::data_type{key_type}));
-
-  SECTION("as the only key, nothing starts or allocates")
-  {
-    REQUIRE_FALSE(
-      fixture.begin({first, second}, fixture.make_plan(256 * mib, {cudf::data_type{key_type}})));
-    REQUIRE_FALSE(fixture.session->accumulation_claimed());
-    REQUIRE(fixture.allocated_bytes() == before);
-    auto const counters = fixture.stats.snapshot();
-    REQUIRE(counters.keys_skipped_bloom_unsupported == 1);
-    REQUIRE(counters.accumulations_started == 0);
-  }
-  SECTION("beside an INT64 key, only the INT64 key accumulates")
-  {
-    REQUIRE(fixture.begin(
-      {first, second},
-      fixture.make_plan(256 * mib,
-                        {cudf::data_type{key_type}, cudf::data_type{cudf::type_id::INT64}})));
-    REQUIRE(fixture.allocated_bytes()[0] == before[0] + partial_bytes(600, 1));
-    fixture.contribute(first);
-    fixture.contribute(second);
-    fixture.publish(0, second->get_batch_id());
-    auto const counters = fixture.stats.snapshot();
-    REQUIRE(counters.keys_skipped_bloom_unsupported == 1);
-    REQUIRE(counters.accumulation_publications_finished == 1);
-    REQUIRE(acc::filters_on_column(*fixture.channel, 0).empty());
-    for (auto const& batch : {first, second}) {
-      REQUIRE(fixture.possible_rows(1, batch, 0) == 300);
+  REQUIRE(fixture.begin(
+    {first, second},
+    fixture.make_plan(256 * mib,
+                      {cudf::data_type{key_type}, cudf::data_type{cudf::type_id::INT64}})));
+  fixture.contribute(first);
+  fixture.contribute(second);
+  fixture.publish(0, second->get_batch_id());
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.filters_pushed == 2);
+  for (auto const& batch : {first, second}) {
+    for (std::size_t key : {0, 1}) {
+      REQUIRE(fixture.possible_rows(key, batch, 0) == 300);
     }
   }
-  REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
+  REQUIRE(counters.accumulations_skipped_error == 0);
 }
 
-TEST_CASE("inapplicable accumulation keys cannot report a declared coverage skip",
-          "[dynamic_filter][multi_partition][domain_evidence]")
+TEST_CASE("an accumulated Bloom key is sized on its valid rows", "[dynamic_filter][construction]")
+{
+  acc::fixture fixture;
+  auto const stream = fixture.publication_stream(0);
+  using sirius::test::columns::make_column;
+  using sirius::test::columns::validity;
+  using sirius::test::columns::values;
+  std::size_t const rows = 600;
+  auto const int32       = make_column(
+    cudf::data_type{cudf::type_id::INT32}, values<std::int32_t>(rows), stream, validity(rows));
+  auto const int64 = make_column(
+    cudf::data_type{cudf::type_id::INT64}, values<std::int64_t>(rows), stream, validity(rows));
+  std::vector<std::vector<cudf::column_view>> tables;
+  for (auto const& [begin, end] : {std::pair{0, 250}, std::pair{250, 600}}) {
+    tables.push_back({cudf::slice(int32->view(), {begin, end}).front(),
+                      cudf::slice(int64->view(), {begin, end}).front()});
+  }
+  auto const batches = sirius::test::construction::make_batches(fixture, tables);
+  REQUIRE(fixture.begin(batches));
+  for (auto const& batch : batches) {
+    fixture.contribute(batch);
+  }
+  fixture.publish(0, batches.back()->get_batch_id());
+  auto const valid = sirius::test::columns::valid_rows(rows);
+  REQUIRE(valid < rows);
+  for (std::size_t key : {0, 1}) {
+    CHECK(fixture.replica(key, 0).bytes.size() ==
+          op::sirius_dynamic_bloom_filter::estimated_bytes(valid));
+  }
+}
+
+TEST_CASE("declared coverage gates every constructible key type, and only constructible keys",
+          "[dynamic_filter][construction][domain_evidence]")
 {
   auto const key_type =
     GENERATE(cudf::type_id::STRING, cudf::type_id::TIMESTAMP_DAYS, cudf::type_id::INT32);
@@ -1363,24 +1377,27 @@ TEST_CASE("inapplicable accumulation keys cannot report a declared coverage skip
       std::move(keys),
       base.probe_targets(),
       base.replica_spaces(),
-              {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 256 * mib}};
+              {.inlist_max_l2_fraction = 0.0, .max_bloom_bytes_per_gpu = 256 * mib}};
   }();
   sirius::test::scoped_recording_log_sink logs{"debug"};
   REQUIRE_FALSE(fixture.begin({batch}, std::move(plan)));
   auto const counters = fixture.stats.snapshot();
   REQUIRE(counters.keys_considered == 1);
   REQUIRE(counters.keys_with_known_domain == 1);
-  REQUIRE(counters.keys_skipped_domain_gate == 0);
-  REQUIRE(counters.keys_skipped_bloom_unsupported == (incompatible_probe ? 0 : 1));
+  // Every key type constructs now; only a key no binding can read is outside the gate.
+  REQUIRE(counters.keys_skipped_domain_gate == (incompatible_probe ? 0 : 1));
   REQUIRE(counters.bindings_skipped_incompatible_probe == (incompatible_probe ? 1 : 0));
   REQUIRE(counters.accumulations_started == 0);
   REQUIRE(fixture.allocated_bytes() == before);
   std::size_t decisions = 0;
   for (auto const& record : logs.records()) {
-    if (!record.message.starts_with("[dynamic_filter_domain] path=accumulated ")) { continue; }
+    if (!record.message.starts_with("[dynamic_filter_domain] path=construction ")) { continue; }
     INFO(record.message);
-    REQUIRE(record.message.find("provenance=pinned_parquet_exact eligible=0") != std::string::npos);
-    REQUIRE(record.message.ends_with("decision=keep"));
+    REQUIRE(record.message.find(incompatible_probe
+                                  ? "provenance=pinned_parquet_exact eligible=0"
+                                  : "provenance=pinned_parquet_exact eligible=1") !=
+            std::string::npos);
+    REQUIRE(record.message.ends_with(incompatible_probe ? "decision=keep" : "decision=skip"));
     ++decisions;
   }
   REQUIRE(decisions == counters.keys_considered);
@@ -1392,7 +1409,7 @@ TEST_CASE("inapplicable accumulation keys cannot report a declared coverage skip
 }
 
 TEST_CASE("an accumulated filter probes like every other membership filter",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   // Key 0 (INT32) holds 0..299 and 900..1199; key 1 (INT64) holds 3k + 1 for the same k.
@@ -1447,7 +1464,7 @@ TEST_CASE("an accumulated filter probes like every other membership filter",
 }
 
 TEST_CASE("accumulation skips a key none of whose bindings can read its filter",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 300);
@@ -1461,7 +1478,7 @@ TEST_CASE("accumulation skips a key none of whose bindings can read its filter",
   {
     REQUIRE_FALSE(
       fixture.begin({first, second}, fixture.make_plan(256 * mib, {int32}, {}, {float64})));
-    REQUIRE_FALSE(fixture.session->accumulation_claimed());
+    REQUIRE(fixture.session->terminal());
     REQUIRE(fixture.allocated_bytes() == before);
     auto const counters = fixture.stats.snapshot();
     REQUIRE(counters.bindings_skipped_incompatible_probe == 1);
@@ -1499,7 +1516,7 @@ TEST_CASE("accumulation skips a key none of whose bindings can read its filter",
 }
 
 TEST_CASE("an accumulated fan-out skips bindings whose probe type the key cannot read",
-          "[dynamic_filter][multi_partition]")
+          "[dynamic_filter][construction]")
 {
   using plan_type = op::dynamic_filter_publish_plan;
   constexpr cudf::data_type int32{cudf::type_id::INT32};
@@ -1524,7 +1541,7 @@ TEST_CASE("an accumulated fan-out skips bindings whose probe type the key cannot
                   {.planner_condition_index = 1, .build_key_ordinal = 1, .storage_type = int64}},
                  std::move(targets),
                  fixture.spaces,
-                 {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 256 * mib}};
+                 {.inlist_max_l2_fraction = 0.0, .max_bloom_bytes_per_gpu = 256 * mib}};
   REQUIRE(fixture.begin({first, second}, std::move(plan)));
   REQUIRE(fixture.allocated_bytes()[0] == before[0] + partial_bytes(600, 2));
   REQUIRE(fixture.stats.snapshot().bindings_skipped_incompatible_probe == 0);
@@ -1546,7 +1563,7 @@ TEST_CASE("an accumulated fan-out skips bindings whose probe type the key cannot
 }
 
 TEST_CASE("a certified build survives payload canonicalization during spill and re-upgrade",
-          "[dynamic_filter][multi_partition][inventory][spill]")
+          "[dynamic_filter][construction][inventory][spill]")
 {
   acc::fixture fixture;
   rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
@@ -1607,7 +1624,7 @@ TEST_CASE("a certified build survives payload canonicalization during spill and 
 }
 
 TEST_CASE("a completed original ID is deduplicated before its changed representation is inspected",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const first   = fixture.make_batch(0, 0, 300);
@@ -1624,7 +1641,7 @@ TEST_CASE("a completed original ID is deduplicated before its changed representa
 }
 
 TEST_CASE("an unclaimed batch with a changed active key or row count declines",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const first   = fixture.make_batch(0, 0, 300);
@@ -1640,7 +1657,7 @@ TEST_CASE("an unclaimed batch with a changed active key or row count declines",
 }
 
 TEST_CASE("late cancellation or drain retains completed wrappers outside task accounting",
-          "[dynamic_filter][multi_partition][in_flight]")
+          "[dynamic_filter][construction][in_flight]")
 {
   acc::load_accumulation_kernels(1);
   bool const cancel = GENERATE(true, false);
@@ -1682,7 +1699,7 @@ TEST_CASE("late cancellation or drain retains completed wrappers outside task ac
 }
 
 TEST_CASE("inconsistent arrivals omit one key without suppressing its valid sibling",
-          "[dynamic_filter][multi_partition][inventory]")
+          "[dynamic_filter][construction][inventory]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 300);
@@ -1701,7 +1718,7 @@ TEST_CASE("inconsistent arrivals omit one key without suppressing its valid sibl
 }
 
 TEST_CASE("a key accepted by no channel stays owned until safe retirement",
-          "[dynamic_filter][multi_partition][memory]")
+          "[dynamic_filter][construction][memory]")
 {
   bool const per_stream = GENERATE(false, true);
   acc::fixture fixture({.per_stream_tracking = per_stream});
@@ -1850,7 +1867,7 @@ TEST_CASE("fatal accumulation diagnostics do not allocate during host OOM",
 }
 
 TEST_CASE("cached fusion probes accumulated Bloom replicas through narrower carriers",
-          "[dynamic_filter][multi_partition][fused_consumer]")
+          "[dynamic_filter][construction][fused_consumer]")
 {
   acc::fixture fixture;
   auto first  = fixture.make_batch(0, 0, 300);
@@ -1902,7 +1919,7 @@ TEST_CASE("cached fusion probes accumulated Bloom replicas through narrower carr
 }
 
 TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
-          "[dynamic_filter][multi_partition][fused_consumer][mgpu][multi_gpu]")
+          "[dynamic_filter][construction][fused_consumer][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   // Replicas live in each GPU's own memory pool, and GPU 1 loses access to GPU 0's pool once
@@ -2054,7 +2071,7 @@ TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
 }
 
 TEST_CASE("accumulated publication matches the complete partial union and bounded workspace",
-          "[dynamic_filter][multi_partition][accumulation_workspace][multi_gpu]")
+          "[dynamic_filter][construction][accumulation_workspace][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   using transport       = op::detail::accumulated_bloom_builder::publication_transport;
@@ -2134,7 +2151,7 @@ TEST_CASE("accumulated publication matches the complete partial union and bounde
 }
 
 TEST_CASE("local-only HOST publication allocates no transfer workspace",
-          "[dynamic_filter][multi_partition][accumulation_workspace]")
+          "[dynamic_filter][construction][accumulation_workspace]")
 {
   acc::fixture fixture;
   auto const geometry = acc::bloom_geometry(64);
@@ -2158,7 +2175,7 @@ TEST_CASE("local-only HOST publication allocates no transfer workspace",
 }
 
 TEST_CASE("HOST scratch uses the unused task reservation and returns its excess",
-          "[dynamic_filter][multi_partition][accumulation_workspace][multi_gpu]")
+          "[dynamic_filter][construction][accumulation_workspace][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
@@ -2199,8 +2216,7 @@ TEST_CASE("HOST scratch uses the unused task reservation and returns its excess"
   REQUIRE(fixture.allocated_bytes() == before);
 }
 
-TEST_CASE("one accumulated key completes both accepting bindings",
-          "[dynamic_filter][multi_partition]")
+TEST_CASE("one accumulated key completes both accepting bindings", "[dynamic_filter][construction]")
 {
   using plan_type = op::dynamic_filter_publish_plan;
   constexpr cudf::data_type int32{cudf::type_id::INT32};
@@ -2211,7 +2227,7 @@ TEST_CASE("one accumulated key completes both accepting bindings",
                  {{fixture.channel, op::dynamic_filter_route_class::scan, false, {{0, 0, int32}}},
                   {other, op::dynamic_filter_route_class::scan, false, {{0, 1, int32}}}},
                  fixture.spaces,
-                 {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 256 * mib}};
+                 {.inlist_max_l2_fraction = 0.0, .max_bloom_bytes_per_gpu = 256 * mib}};
   REQUIRE(fixture.begin({batch}, std::move(plan)));
   fixture.contribute(batch);
   fixture.publish(0, batch->get_batch_id());
@@ -2227,4 +2243,71 @@ TEST_CASE("one accumulated key completes both accepting bindings",
   REQUIRE(second.size() == 1);
   REQUIRE(first.front() == second.front());
   fixture.require_members({batch}, 1);
+}
+
+TEST_CASE("each decline acts only in its own phase", "[dynamic_filter][construction]")
+{
+  acc::fixture fixture;
+  auto const first  = fixture.make_batch(0, 0, 300);
+  auto const second = fixture.make_batch(0, 900, 300);
+  fixture.session   = std::make_unique<op::dynamic_filter_publication_session>(
+    fixture.make_plan(256 * mib), &fixture.stats);
+  // OPEN: no attempt exists for a task input to end.
+  fixture.session->decline_task_input();
+  REQUIRE_FALSE(fixture.session->terminal());
+  REQUIRE(fixture.session->begin(
+    std::get<op::complete_build_inventory>(acc::fixture::certify({first, second}))));
+  // COLLECTING: a certification decline, such as a second site's, leaves the attempt running.
+  fixture.session->decline(op::construction_decline::pipeline_barrier);
+  fixture.contribute(first);
+  fixture.contribute(second);
+  // PUBLISHING: neither decline takes the owed publication from the final contributor.
+  fixture.session->decline(op::construction_decline::input_shape);
+  fixture.session->decline_task_input();
+  REQUIRE_FALSE(fixture.session->terminal());
+  fixture.publish(0, second->get_batch_id());
+  REQUIRE(fixture.session->terminal());
+  // TERMINAL: nothing is left to end.
+  fixture.session->decline(op::construction_decline::port_directive);
+  fixture.session->decline_task_input();
+  fixture.require_members({first, second});
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulations_declined_pipeline_barrier == 0);
+  REQUIRE(counters.accumulations_declined_port_directive == 0);
+  REQUIRE(counters.accumulations_skipped_inventory == 0);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.publications_finished == 1);
+}
+
+TEST_CASE("an attempt budgets task scratch only while it may still publish",
+          "[dynamic_filter][construction][memory_estimate]")
+{
+  acc::fixture fixture;
+  // Few enough keys for small IN-lists, which the publishing task constructs at the root.
+  auto const first  = fixture.make_batch(0, 0, 4);
+  auto const second = fixture.make_batch(0, 900, 4);
+  REQUIRE(fixture.begin({first, second}));
+  REQUIRE(fixture.session->task_scratch_bound() > 0);
+  SECTION("a task input that is not one certified batch ends it")
+  {
+    fixture.session->decline_task_input();
+  }
+  SECTION("input that closes before every batch contributed ends it")
+  {
+    fixture.contribute(first);
+    fixture.session->finish_input();
+  }
+  SECTION("cancellation ends it") { fixture.session->cancel(); }
+  SECTION("publication ends it")
+  {
+    fixture.contribute(first);
+    fixture.contribute(second);
+    // The final contributor's task, or its retry, still publishes.
+    REQUIRE(fixture.session->task_scratch_bound() > 0);
+    fixture.publish(0, second->get_batch_id());
+  }
+  // Construction is released only when the site finalizes, but no later task constructs.
+  REQUIRE(fixture.session->terminal());
+  REQUIRE(fixture.session->task_scratch_bound() == 0);
+  fixture.session->release_retired_storage();
 }

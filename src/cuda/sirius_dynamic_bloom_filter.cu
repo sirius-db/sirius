@@ -932,37 +932,6 @@ std::vector<membership_key_domain> classify_keys(
 }  // namespace
 
 std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
-  std::vector<key> keys,
-  accumulated_bloom_geometry geometry,
-  std::span<dynamic_filter_replica_space const> targets)
-{
-  auto constexpr maximum = std::numeric_limits<std::size_t>::max();
-  // clang-format off
-  if (keys.empty() ||
-      geometry.raw_bytes == 0 ||
-      geometry.blocks != geometry.raw_bytes / bloom_bytes_per_block ||
-      geometry.raw_bytes % bloom_bytes_per_block != 0 ||
-      geometry.raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1) ||
-      geometry.chunk_bytes == 0 ||
-      geometry.chunk_bytes % rmm::CUDA_ALLOCATION_ALIGNMENT != 0 ||
-      geometry.chunk_bytes > tracked_replica_allocation_bytes(geometry.raw_bytes) ||
-      geometry.chunk_bytes > accumulated_bloom_geometry::k_max_transfer_chunk_bytes ||
-      keys.size() > maximum / tracked_replica_allocation_bytes(geometry.raw_bytes) ||
-      geometry.arrays_bytes != keys.size() * tracked_replica_allocation_bytes(geometry.raw_bytes)) {
-    throw accumulation_invariant_error{"invalid accumulated Bloom geometry"};
-  }
-  // clang-format on
-  std::vector<impl::shape> shapes(keys.size(),
-                                  {geometry.blocks, geometry.raw_bytes, geometry.chunk_bytes});
-  for (auto& active : keys) {
-    active.blocks = geometry.blocks;
-  }
-  auto domains = classify_keys(keys);
-  return create(std::make_unique<impl>(std::move(keys), std::move(shapes), std::move(domains)),
-                targets);
-}
-
-std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
   std::vector<key> keys, std::span<dynamic_filter_replica_space const> targets)
 {
   auto constexpr maximum = std::numeric_limits<std::size_t>::max();

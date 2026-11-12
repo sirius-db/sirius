@@ -15,94 +15,64 @@
  */
 
 /*
- * Tests the build-port claim condition in `sirius_physical_hash_join::push_data_batch_partitioned`:
- * the one-shot publisher may claim only a build batch carrying the whole build side, as reported
- * through `set_build_arrives_whole`; the join mode is not part of the condition. The tests drive
- * the build port directly, pinning the claim condition -- plus the reopening of a claimed window
- * without a usable GPU source (not GPU-resident, or resident on a GPU outside the plan's replica
- * set) and the fail-open containment of device memory exhaustion -- rather than any partitioning
- * decision.
+ * Tests a hash join's publication session through the calls its build PARTITION makes: one
+ * certified build batch, `begin`, a contribution, and the final contributor's publication. They pin
+ * the session-level outcomes the join depends on: publication in any join mode and in BUILD_PROBE
+ * mode, replica narrowing, fail-open memory exhaustion, cancellation, drained targets, unexpected
+ * errors, and the rights a session acquires or abandons.
  */
 
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "utils/dynamic_filter_publication_fixture.hpp"
-#include "utils/sirius_test_env.hpp"
 
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
-#include <rmm/error.hpp>
-
-#include <cuda_runtime_api.h>
 
 #include <catch.hpp>
-#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <chrono>
 #include <cstddef>
-#include <future>
 #include <memory>
-#include <optional>
-#include <thread>
+#include <stdexcept>
 #include <utility>
-#include <vector>
-
-namespace {
 
 using namespace sirius::test::publication;
 
-bool await_claim(dynamic_filter_stats const& stats)
-{
-  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
-  while (stats.publication_attempts.load() == 0 && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
-  return stats.publication_attempts.load() != 0;
-}
-
-}  // namespace
-
-TEST_CASE("hash join claims a whole build for publication in any join mode",
+TEST_CASE("a hash join's session constructs and publishes in any join mode",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
   claim_fixture fixture;
   REQUIRE_FALSE(fixture.hash_join->is_build_probe_mode());
-
-  fixture.hash_join->set_build_arrives_whole(true);
-  fixture.push_build_batch();
-
+  fixture.construct();
   CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 1);
-  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
   CHECK_FALSE(fixture.channel->snapshot().empty());
   CHECK(fixture.channel->snapshot().terminal());
 }
 
-TEST_CASE("a whole-build publication counts incompatible probe bindings in the session stats",
+TEST_CASE("a publication counts incompatible probe bindings in the session stats",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
-  // No integer key domain reads a FLOAT64 probe, so the only binding gets no filter.
+  // No integer key domain reads a FLOAT64 probe, so the only binding gets no filter, and no
+  // membership filter is built for it.
   claim_fixture fixture{duckdb::JoinType::INNER, 1, 0, cudf::data_type{cudf::type_id::FLOAT64}};
-  fixture.hash_join->set_build_arrives_whole(true);
-  fixture.push_build_batch();
-
+  fixture.construct();
   auto const counters = fixture.stats.snapshot();
   CHECK(counters.publication_attempts == 1);
-  CHECK(counters.membership_filters_built == 1);
+  CHECK(counters.membership_filters_built == 0);
   CHECK(counters.bindings_skipped_incompatible_probe == 1);
   CHECK(counters.filters_pushed == 0);
   CHECK(fixture.channel->snapshot().empty());
   CHECK(fixture.channel->snapshot().terminal());
 }
 
-TEST_CASE("hash join in BUILD_PROBE mode still publishes from a whole build",
+TEST_CASE("a hash join in BUILD_PROBE mode still publishes",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
   claim_fixture fixture;
-
   // Sizing from a small foldable build side selects BUILD_PROBE.
   auto const strategy = fixture.hash_join->get_partition_strategy(
     sirius::op::partition_sizing_input{.total_bytes    = 1024,
@@ -112,61 +82,13 @@ TEST_CASE("hash join in BUILD_PROBE mode still publishes from a whole build",
                                        .resident_bytes = 1024});
   REQUIRE(strategy.build_probe);
   REQUIRE(fixture.hash_join->is_build_probe_mode());
-
-  fixture.hash_join->set_build_arrives_whole(true);
-  fixture.push_build_batch();
-
+  fixture.construct();
   CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK_FALSE(fixture.channel->snapshot().empty());
 }
 
-TEST_CASE("a wired join whose build is not whole reports the skip exactly once",
-          "[dynamic_filter][publication_claim][gpu_execution]")
-{
-  // `set_build_arrives_whole` is never called, so the window can never claim. The condition is
-  // fixed before the first delivery, so every later build batch would report the same fact.
-  claim_fixture fixture;
-
-  fixture.push_build_batch();
-  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 1);
-
-  fixture.push_build_batch();
-  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 1);
-
-  CHECK(fixture.stats.publication_attempts.load() == 0);
-  CHECK(fixture.channel->snapshot().empty());
-}
-
-TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a sibling delivery",
-          "[dynamic_filter][publication_claim][gpu_execution]")
-{
-  // On a multi-GPU broadcast build every GPU delivers the whole build side, so a first delivery
-  // that was already downgraded to the host tier must not end the window terminally: a sibling
-  // delivery with a GPU-resident replica can still claim and publish.
-  claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-
-  fixture.hash_join->push_data_batch_partitioned(
-    "build", fixture.make_host_build_batch(), /*partition_idx=*/0);
-
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  CHECK(fixture.stats.publications_finished.load() == 0);
-  CHECK(fixture.stats.publications_failed.load() == 0);
-  CHECK(fixture.channel->snapshot().empty());
-
-  fixture.push_build_batch();
-
-  // The full accounting identity after the rescue: attempts == finished + failed + skipped.
-  CHECK(fixture.stats.publication_attempts.load() == 2);
-  CHECK(fixture.stats.publications_finished.load() == 1);
-  CHECK(fixture.stats.publications_failed.load() == 0);
-  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  CHECK_FALSE(fixture.channel->snapshot().empty());
-}
-
-TEST_CASE("a join whose replica restriction removed every GPU never claims",
+TEST_CASE("a join whose replica restriction removed every GPU never attempts",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
   claim_fixture fixture;
@@ -176,185 +98,74 @@ TEST_CASE("a join whose replica restriction removed every GPU never claims",
   fixture.hash_join->seal_dynamic_filter_plan();
   CHECK_FALSE(fixture.hash_join->publishes_dynamic_filters());
   CHECK(fixture.channel->snapshot().terminal());
-
-  fixture.hash_join->set_build_arrives_whole(true);
-  CHECK_NOTHROW(fixture.push_build_batch());
-
+  CHECK_NOTHROW(fixture.construct());
   CHECK(fixture.stats.publication_attempts.load() == 0);
-  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
   CHECK(fixture.channel->snapshot().empty());
 }
 
-TEST_CASE("device memory exhaustion during a claimed publication fails open",
+TEST_CASE("device memory exhaustion during construction fails open",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
   claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-
-  // Past the small-list gate, so filter construction must allocate device memory.
+  // Past the small-list gate, so construction must lease device memory.
   constexpr std::size_t kLargeBuildRows = 100000;
   auto batch = claim_fixture::make_build_batch_on(*fixture.gpu_space, kLargeBuildRows);
-
   {
-    // Leave under 64 KiB of the space's accounting capacity so the filter's first device
-    // allocation deterministically throws cucascade_out_of_memory (an rmm::out_of_memory).
+    // Leave under 64 KiB of the space's accounting capacity, so every lease is refused.
     constexpr std::size_t kHeadroomBytes = 64ull << 10;
     auto const stream                    = fixture.gpu_space->acquire_stream();
     auto const available                 = fixture.gpu_space->get_available_memory();
     REQUIRE(available > kHeadroomBytes);
     rmm::device_buffer const ballast{
       available - kHeadroomBytes, stream, fixture.gpu_space->get_default_allocator()};
-
-    CHECK_NOTHROW(
-      fixture.hash_join->push_data_batch_partitioned("build", batch, /*partition_idx=*/0));
+    CHECK_NOTHROW(fixture.construct_from(batch));
   }
-
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_failed.load() == 1);
-  CHECK(fixture.stats.publications_finished.load() == 0);
-  CHECK(fixture.stats.membership_filters_built.load() == 0);
+  auto const counters = fixture.stats.snapshot();
+  CHECK(counters.publication_attempts == 1);
+  CHECK(counters.accumulations_skipped_admission == 1);
+  CHECK(counters.membership_filters_built == 0);
   CHECK(fixture.channel->snapshot().empty());
   CHECK(fixture.channel->snapshot().terminal());
-
-  // FAILED is terminal: with the ballast freed, a second whole-build delivery must not reattempt.
-  fixture.push_build_batch();
+  // The attempt is over: with the ballast freed, another build does not reattempt.
+  fixture.construct();
   CHECK(fixture.stats.publication_attempts.load() == 1);
 }
 
-TEST_CASE("a whole build resident on a non-plan GPU reopens the window for a sibling delivery",
-          "[dynamic_filter][publication_claim][gpu_execution][multi_gpu]")
-{
-  if (!sirius::test::has_gpus(2)) { return; }
-
-  // Two GPU spaces exist, but the plan holds a replica space on GPU 0 only.
-  claim_fixture fixture{duckdb::JoinType::INNER, /*num_gpus=*/2};
-  fixture.hash_join->set_build_arrives_whole(true);
-
-  auto* other_gpu_space =
-    fixture.memory_manager->get_memory_space(cucascade::memory::Tier::GPU, kDeviceId + 1);
-  REQUIRE(other_gpu_space != nullptr);
-
-  fixture.hash_join->push_data_batch_partitioned(
-    "build", claim_fixture::make_build_batch_on(*other_gpu_space), /*partition_idx=*/0);
-
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  CHECK(fixture.stats.publications_finished.load() == 0);
-  CHECK(fixture.stats.publications_failed.load() == 0);
-  CHECK(fixture.channel->snapshot().empty());
-
-  fixture.push_build_batch();
-
-  CHECK(fixture.stats.publication_attempts.load() == 2);
-  CHECK(fixture.stats.publications_finished.load() == 1);
-  CHECK_FALSE(fixture.channel->snapshot().empty());
-}
-
-TEST_CASE("closing during an unusable whole delivery cannot reopen the producer",
+TEST_CASE("cancellation before publication accounts the attempt as failed",
           "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
 {
   claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-  auto batch = fixture.make_host_build_batch();
-  cucascade::shared_data_repository repository;
-  fixture.hash_join->get_port("build")->repo = &repository;
-  std::optional<cucascade::mutable_data_batch> held{batch->to_mutable()};
-  auto delivery = std::async(
-    std::launch::async, [&] { fixture.hash_join->push_data_batch_partitioned("build", batch, 0); });
-
-  bool const claimed = await_claim(fixture.stats);
-  fixture.hash_join->finalize_operator();
-  auto const during = fixture.channel->snapshot();
-  held.reset();
-  CHECK_NOTHROW(delivery.get());
-
-  REQUIRE(claimed);
-  CHECK_FALSE(during.terminal());
-  CHECK(fixture.channel->snapshot().terminal());
-  CHECK(fixture.channel->snapshot().empty());
-  CHECK(repository.size() == 1);
-  fixture.push_build_batch();
-  CHECK(repository.size() == 2);
-  fixture.hash_join->get_port("build")->repo = nullptr;
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  CHECK(fixture.stats.publications_finished.load() == 0);
-  CHECK(fixture.stats.publications_failed.load() == 0);
-}
-
-TEST_CASE("closing preserves an active usable owner and excludes sibling claims",
-          "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
-{
-  claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-  auto batch = fixture.make_build_batch();
-  cucascade::shared_data_repository repository;
-  fixture.hash_join->get_port("build")->repo = &repository;
-  std::optional<cucascade::mutable_data_batch> held{batch->to_mutable()};
-  auto delivery = std::async(
-    std::launch::async, [&] { fixture.hash_join->push_data_batch_partitioned("build", batch, 0); });
-
-  bool const claimed = await_claim(fixture.stats);
-  if (claimed) { fixture.hash_join->push_data_batch_partitioned("build", batch, 1); }
-  auto const winning_deposits_before_pin = repository.size(0);
-  auto const losing_deposits             = claimed ? repository.size(1) : 0;
-  fixture.hash_join->finalize_operator();
-  auto const during = fixture.channel->snapshot();
-  held.reset();
-  CHECK_NOTHROW(delivery.get());
-
-  REQUIRE(claimed);
-  CHECK(winning_deposits_before_pin == 0);
-  CHECK(losing_deposits == 1);
-  CHECK(repository.size(0) == 1);
-  CHECK(repository.size(1) == 1);
-  fixture.hash_join->get_port("build")->repo = nullptr;
-  CHECK_FALSE(during.terminal());
-  auto const after = fixture.channel->snapshot();
-  CHECK(after.terminal());
-  CHECK_FALSE(after.empty());
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_finished.load() == 1);
-  CHECK(fixture.stats.publications_failed.load() == 0);
-}
-
-TEST_CASE("cancellation before fan-out retains the owner and accounts its attempt",
-          "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
-{
-  claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-  auto batch = fixture.make_build_batch();
-  std::optional<cucascade::mutable_data_batch> held{batch->to_mutable()};
-  auto delivery = std::async(
-    std::launch::async, [&] { fixture.hash_join->push_data_batch_partitioned("build", batch, 0); });
-
-  bool const claimed = await_claim(fixture.stats);
+  auto& session = fixture.hash_join->dynamic_filter_session();
+  auto batch    = fixture.make_build_batch();
+  sirius::op::build_arrival_ledger ledger;
+  ledger.record(*batch);
+  auto certified = ledger.certify({.repository_batches = 1});
+  REQUIRE(session.begin(std::move(std::get<sirius::op::complete_build_inventory>(certified))));
+  auto const stream = fixture.gpu_space->acquire_stream();
+  {
+    auto source = batch->to_read_only();
+    session.contribute(batch->get_batch_id(), source, stream);
+    stream.sync();
+  }
+  // No operation is active, so the cancelled attempt completes at once and owes no publication.
   fixture.hash_join->cancel_dynamic_filter_publication();
-  auto const during = fixture.channel->snapshot();
-  held.reset();
-  CHECK_NOTHROW(delivery.get());
-
-  REQUIRE(claimed);
-  CHECK_FALSE(during.terminal());
+  CHECK(fixture.channel->snapshot().terminal());
+  session.publish_if_final(batch->get_batch_id(), *fixture.gpu_space, stream);
   auto const after = fixture.channel->snapshot();
   CHECK(after.terminal());
   CHECK(after.empty());
   CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_failed.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 0);
-  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 0);
-  fixture.push_build_batch();
-  CHECK(fixture.stats.publication_attempts.load() == 1);
 }
 
-TEST_CASE("cancelling an unclaimed producer does not invent an attempt",
+TEST_CASE("cancelling an open session does not invent an attempt",
           "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
 {
   claim_fixture fixture;
   fixture.hash_join->seal_dynamic_filter_plan();
   fixture.hash_join->cancel_dynamic_filter_publication();
-  fixture.hash_join->set_build_arrives_whole(true);
-  fixture.push_build_batch();
+  fixture.construct();
   CHECK(fixture.channel->snapshot().terminal());
   CHECK(fixture.channel->snapshot().empty());
   CHECK(fixture.stats.publication_attempts.load() == 0);
@@ -367,8 +178,7 @@ TEST_CASE("a drained target completes a successful zero-filter attempt",
 {
   claim_fixture fixture;
   fixture.channel->close_for_new_filters();
-  fixture.hash_join->set_build_arrives_whole(true);
-  fixture.push_build_batch();
+  fixture.construct();
   CHECK(fixture.channel->snapshot().terminal());
   CHECK(fixture.channel->snapshot().empty());
   CHECK(fixture.stats.publication_attempts.load() == 1);
@@ -377,142 +187,14 @@ TEST_CASE("a drained target completes a successful zero-filter attempt",
   CHECK(fixture.stats.publications_skipped_targets_drained.load() == 1);
 }
 
-TEST_CASE("unexpected publication errors resolve completion and propagate",
+TEST_CASE("unexpected construction errors resolve completion and propagate",
           "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
 {
+  // The admitted key's build ordinal lies outside the build schema: planning rejects it.
   claim_fixture fixture{duckdb::JoinType::INNER, 1, 1};
-  fixture.hash_join->set_build_arrives_whole(true);
-  CHECK_THROWS_AS(fixture.push_build_batch(), std::logic_error);
+  CHECK_THROWS_AS(fixture.construct(), std::logic_error);
   CHECK(fixture.channel->snapshot().terminal());
   CHECK(fixture.channel->snapshot().empty());
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_failed.load() == 1);
-}
-
-TEST_CASE("deposit observes a pinned unpublished owner that survives synthetic finalization",
-          "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
-{
-  claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-  struct finalizing_repository final : cucascade::shared_data_repository {
-    sirius_physical_hash_join& join;
-    sirius_dynamic_filter_set& channel;
-    dynamic_filter_stats& stats;
-    std::size_t deposits            = 0;
-    bool observed_pending_owner     = false;
-    bool observed_source_pin        = false;
-    bool stored_before_finalization = false;
-
-    finalizing_repository(sirius_physical_hash_join& join,
-                          sirius_dynamic_filter_set& channel,
-                          dynamic_filter_stats& stats)
-      : join(join), channel(channel), stats(stats)
-    {
-    }
-
-    void add_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                        std::size_t partition = 0) override
-    {
-      ++deposits;
-      auto const snapshot = channel.snapshot();
-      observed_pending_owner =
-        stats.publication_attempts.load() == 1 && !snapshot.terminal() && snapshot.empty();
-      observed_source_pin = batch->get_read_only_count() != 0;
-      cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
-      stored_before_finalization = size(partition) == 1;
-      // Only this test repository finalizes on deposit; production repositories just store.
-      join.finalize_operator();
-    }
-  } repository{*fixture.hash_join, *fixture.channel, fixture.stats};
-
-  fixture.hash_join->get_port("build")->repo = &repository;
-  auto batch                                 = fixture.make_build_batch();
-  fixture.hash_join->push_data_batch_partitioned("build", batch, 0);
-  fixture.hash_join->get_port("build")->repo = nullptr;
-  CHECK(repository.deposits == 1);
-  CHECK(repository.observed_pending_owner);
-  CHECK(repository.observed_source_pin);
-  CHECK(repository.stored_before_finalization);
-  CHECK(batch->get_read_only_count() == 0);
-  CHECK(fixture.channel->snapshot().terminal());
-  CHECK_FALSE(fixture.channel->snapshot().empty());
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_finished.load() == 1);
-}
-
-TEST_CASE("whole-build delivery deposits once when publication cannot claim",
-          "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
-{
-  claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-  std::size_t expected_attempts = 0;
-  SECTION("already published")
-  {
-    fixture.push_build_batch();
-    expected_attempts = 1;
-  }
-  SECTION("closed without a delivery") { fixture.hash_join->finalize_operator(); }
-  SECTION("cancelled before claim") { fixture.hash_join->cancel_dynamic_filter_publication(); }
-  SECTION("disabled publication")
-  {
-    fixture.hash_join->restrict_dynamic_filter_replicas({kDeviceId + 1});
-  }
-
-  cucascade::shared_data_repository repository;
-  fixture.hash_join->get_port("build")->repo = &repository;
-  auto batch                                 = fixture.make_build_batch();
-  fixture.hash_join->push_data_batch_partitioned("build", batch, 2);
-  fixture.hash_join->get_port("build")->repo = nullptr;
-
-  CHECK(repository.total_size() == 1);
-  CHECK(repository.get_data_batch_by_id(batch->get_batch_id(), 2) == batch);
-  CHECK(batch->get_read_only_count() == 0);
-  CHECK(fixture.stats.publication_attempts.load() == expected_attempts);
-}
-
-TEST_CASE("deposit exceptions resolve the claim and propagate without retry",
-          "[dynamic_filter][publication_claim][publication_lifecycle][gpu_execution]")
-{
-  claim_fixture fixture;
-  fixture.hash_join->set_build_arrives_whole(true);
-  struct throwing_repository final : cucascade::shared_data_repository {
-    bool throw_oom       = false;
-    std::size_t deposits = 0;
-
-    void add_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                        std::size_t partition = 0) override
-    {
-      ++deposits;
-      cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
-      if (throw_oom) { throw rmm::out_of_memory{"synthetic repository allocation failure"}; }
-      throw std::runtime_error{"synthetic repository delivery failure"};
-    }
-  } repository;
-  auto batch                                 = fixture.make_build_batch();
-  fixture.hash_join->get_port("build")->repo = &repository;
-
-  SECTION("ordinary delivery error")
-  {
-    CHECK_THROWS_AS(fixture.hash_join->push_data_batch_partitioned("build", batch, 0),
-                    std::runtime_error);
-  }
-  SECTION("delivery OOM is not optional publication OOM")
-  {
-    repository.throw_oom = true;
-    CHECK_THROWS_AS(fixture.hash_join->push_data_batch_partitioned("build", batch, 0),
-                    rmm::out_of_memory);
-  }
-  fixture.hash_join->get_port("build")->repo = nullptr;
-
-  CHECK(repository.deposits == 1);
-  CHECK(repository.size() == 1);
-  CHECK(batch->get_read_only_count() == 0);
-  CHECK(fixture.channel->snapshot().terminal());
-  CHECK(fixture.channel->snapshot().empty());
-  CHECK(fixture.stats.publication_attempts.load() == 1);
-  CHECK(fixture.stats.publications_failed.load() == 1);
-  CHECK(fixture.stats.publications_finished.load() == 0);
-  fixture.push_build_batch();
   CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_failed.load() == 1);
 }

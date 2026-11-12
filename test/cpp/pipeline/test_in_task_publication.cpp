@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "op/dynamic_filter/hash_join_partition_observer.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
@@ -95,6 +96,55 @@ class observed_partition final : public op::sirius_physical_partition {
 
   std::function<void(op::operator_data const&, ::cuda::stream_ref)> before_execute;
   std::function<void(op::operator_data const&, ::cuda::stream_ref)> after_execute;
+};
+
+/**
+ * @brief The join's own build observer with a test-only fault: an armed observer refuses, once, the
+ * memory a task needs after it contributed and before it publishes, as a mandatory allocation there
+ * would. The forward path allocates nothing between those points, so this stands in for one.
+ */
+class oom_before_publication final : public op::partition_input_observer {
+ public:
+  oom_before_publication(op::sirius_physical_hash_join& join, op::sirius_physical_partition& input)
+    : _inner{join, input}
+  {
+  }
+  void on_arrival(std::string_view port, cucascade::data_batch& batch) override
+  {
+    _inner.on_arrival(port, batch);
+  }
+  bool before_claim() override { return _inner.before_claim(); }
+  void on_hash_input(cucascade::read_only_data_batch const& batch) override
+  {
+    _inner.on_hash_input(batch);
+  }
+  std::optional<uint64_t> before_transform(op::pipelineable_operator_data const& input,
+                                           cucascade::read_only_data_batch const& batch,
+                                           ::cuda::stream_ref stream) override
+  {
+    return _inner.before_transform(input, batch, stream);
+  }
+  void after_transform(uint64_t id,
+                       cucascade::memory::memory_space& space,
+                       ::cuda::stream_ref stream) override
+  {
+    if (armed.exchange(false)) {
+      ++failures;
+      throw rmm::out_of_memory{"refused mandatory allocation after contribution"};
+    }
+    _inner.after_transform(id, space, stream);
+  }
+  void finalize_input() override { _inner.finalize_input(); }
+  [[nodiscard]] std::size_t task_scratch_bytes() const noexcept override
+  {
+    return _inner.task_scratch_bytes();
+  }
+
+  std::atomic<bool> armed{false};
+  std::atomic<std::size_t> failures{0};
+
+ private:
+  op::hash_join_partition_observer _inner;
 };
 
 struct allocation_observer {
@@ -227,7 +277,9 @@ struct harness {
   std::unique_ptr<sirius::creator::task_creator> creator;
   std::uint64_t next_task_id = 1;
 
-  explicit harness(std::size_t devices = 1, bool per_stream = false)
+  /// @param partitions The build PARTITION's partitions; 1 runs the forward path, which never
+  /// scatters
+  explicit harness(std::size_t devices = 1, bool per_stream = false, std::size_t partitions = 2)
     : memory{{.devices             = devices,
               .per_stream_tracking = per_stream,
               .gpu_resource_factory =
@@ -256,7 +308,7 @@ struct harness {
     tree.join->operator_id = 1;
     partition->operator_id = 2;
     receiver->operator_id  = 3;
-    partition->set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(2));
+    partition->set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(partitions));
 
     pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
     pipeline->set_pipeline_id(7);
@@ -510,6 +562,40 @@ TEST_CASE("the elected PARTITION task publishes before its first repository depo
   test.memory.require_members({first, second});
 }
 
+TEST_CASE("the elected forward-layout PARTITION task publishes before its deposit",
+          "[pipeline][dynamic_filter][in_task_publication]")
+{
+  harness test{1, false, 1};
+  auto const first  = test.memory.make_batch(0, 0, 2000);
+  auto const second = test.memory.make_batch(0, 5000, 2000);
+  auto tasks        = test.tasks({first, second});
+  std::vector<std::pair<bool, std::size_t>> snapshots;
+  bool full_union_at_deposit = false;
+  test.output.before_deposit = [&] {
+    auto snapshot = test.memory.channel->snapshot();
+    snapshots.emplace_back(snapshot.terminal(), snapshot.entries().size());
+    if (snapshots.size() == 2) {
+      full_union_at_deposit = contains_every_build_row(test.memory, {first, second});
+    }
+  };
+  test.start();
+  absl::Cleanup stop = [&] { test.scheduler->stop(); };
+  test.schedule(std::move(tasks[1]));
+  test.wait_completed(1);
+  test.schedule(std::move(tasks[0]));
+  test.wait_completed(2);
+  sirius::test::retire_scheduler_query(
+    test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
+  // One deposit per task: the forward path routes its input whole.
+  REQUIRE(snapshots.size() == 2);
+  REQUIRE((snapshots[0] == std::pair<bool, std::size_t>{false, 0}));
+  REQUIRE((snapshots[1] == std::pair<bool, std::size_t>{true, 2}));
+  REQUIRE(full_union_at_deposit);
+  REQUIRE(test.memory.stats.snapshot().accumulation_completed_contributions == 2);
+  REQUIRE(test.memory.stats.snapshot().accumulation_publications_finished == 1);
+  test.memory.require_members({first, second});
+}
+
 TEST_CASE("mandatory scatter OOM retries the elected identity through the executor",
           "[pipeline][dynamic_filter][in_task_publication][memory]")
 {
@@ -566,6 +652,88 @@ TEST_CASE("mandatory scatter OOM retries the elected identity through the execut
   REQUIRE(counters.filters_pushed == 2);
   REQUIRE(test.global->get_memory_history().totals().output_records == 2);
   test.memory.require_members({first, final});
+}
+
+TEST_CASE("a forward-layout OOM after contribution retries and publishes once",
+          "[pipeline][dynamic_filter][in_task_publication][memory]")
+{
+  harness test{1, false, 1};
+  auto observer = std::make_unique<oom_before_publication>(*test.tree.join, *test.partition);
+  auto& fault   = *observer;
+  test.partition->set_input_observer(std::move(observer));
+  auto const first                = test.memory.make_batch(0, 0, 100);
+  auto const final                = test.memory.make_batch(0, 1000, 2000);
+  auto record                     = std::make_shared<retry_record>();
+  record->constrain_first_attempt = true;
+  auto tasks                      = test.tasks({first, final}, record);
+  std::atomic<bool> retry_deposit_ready{false};
+  test.output.before_deposit = [&] {
+    if (record->retries.load() != 0) {
+      auto snapshot = test.memory.channel->snapshot();
+      retry_deposit_ready.store(snapshot.terminal() && snapshot.entries().size() == 2);
+    }
+  };
+  test.start();
+  absl::Cleanup stop = [&] { test.scheduler->stop(); };
+  test.schedule(std::move(tasks[0]));
+  test.wait_completed(1);
+  fault.armed.store(true);
+  test.schedule(std::move(tasks[1]));
+  test.wait_completed(3);
+  sirius::test::retire_scheduler_query(
+    test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
+  REQUIRE(fault.failures.load() == 1);
+  REQUIRE(record->retries.load() == 1);
+  REQUIRE(record->original_id == final->get_batch_id());
+  REQUIRE(retry_deposit_ready.load());
+  REQUIRE(test.output.deposits.load() == 2);
+  auto const counters = test.memory.stats.snapshot();
+  REQUIRE(counters.accumulation_duplicate_contributions == 1);
+  REQUIRE(counters.accumulation_completed_contributions == 2);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.filters_pushed == 2);
+  test.memory.require_members({first, final});
+}
+
+TEST_CASE("scheduler error drain joins a collecting forward-layout PARTITION task before reuse",
+          "[pipeline][dynamic_filter][in_task_publication]")
+{
+  acc::load_accumulation_kernels(1);
+  harness test{1, false, 1};
+  auto const first    = test.memory.make_batch(0, 0, 2000);
+  auto const final    = test.memory.make_batch(0, 5000, 2000);
+  auto const baseline = test.memory.allocated_bytes();
+  auto tasks          = test.tasks({first, final});
+  std::unique_ptr<acc::stream_gate> gate;
+  std::atomic<bool> gated{false};
+  test.partition->after_execute = [&](op::operator_data const&, ::cuda::stream_ref stream) {
+    gate = std::make_unique<acc::stream_gate>(stream);
+    gated.store(true);
+  };
+  test.start();
+  absl::Cleanup stop = [&] { test.scheduler->stop(); };
+  test.schedule(std::move(tasks[0]));
+  wait_until([&] { return gated.load() || test.completion->has_error(); });
+  REQUIRE(gated.load());
+  test.completion->report_error("another query task failed");
+  test.tree.join->cancel_dynamic_filter_publication();
+  auto drained       = std::async(std::launch::async, [&] {
+    sirius::test::retire_scheduler_query(
+      test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), false, test.creator.get());
+  });
+  auto const blocked = drained.wait_for(std::chrono::milliseconds{100});
+  gate->open();
+  REQUIRE(blocked == std::future_status::timeout);
+  drained.get();
+  REQUIRE_FALSE(gate->timed_out());
+  tasks.clear();
+  test.output.discard_batches();
+  test.tree.join->dynamic_filter_session().finalize_input();
+  REQUIRE(test.memory.channel->snapshot().terminal());
+  REQUIRE(test.memory.channel->snapshot().empty());
+  REQUIRE(test.memory.stats.snapshot().filters_pushed == 0);
+  REQUIRE(test.memory.allocated_bytes() == baseline);
+  require_worker_reuse(test);
 }
 
 TEST_CASE("a migrated final PARTITION accounts merge scratch in task history",
@@ -755,10 +923,10 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
   };
   {
     using builder_type = op::detail::accumulated_bloom_builder;
-    auto builder       = builder_type::try_create(
-      {{0, cudf::data_type{cudf::type_id::INT32}}, {1, cudf::data_type{cudf::type_id::INT64}}},
-      geometry,
-      memory.spaces);
+    auto builder =
+      builder_type::try_create({{0, cudf::data_type{cudf::type_id::INT32}, geometry.blocks},
+                                {1, cudf::data_type{cudf::type_id::INT64}, geometry.blocks}},
+                               memory.spaces);
     REQUIRE(builder);
     {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{1}};
