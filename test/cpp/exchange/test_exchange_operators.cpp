@@ -45,8 +45,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -724,6 +726,61 @@ TEST_CASE("a shut-down exchange service stops its transport and refuses later se
                     Catch::Matchers::ContainsSubstring("shut down"));
   CHECK_THROWS_WITH(service.close(stream + 1, 0), Catch::Matchers::ContainsSubstring("shut down"));
   service.abort(3, "after shutdown");
+}
+
+TEST_CASE("a batch that arrives while the exchange service shuts down is not kept",
+          "[exchange][operators]")
+{
+  /// Counts what it is given; its first batch waits for release().
+  struct gated : sirius::exchange::inbound {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered{false};
+    bool released{false};
+    int batches{0};
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override
+    {
+      std::unique_lock lock{mutex};
+      ++batches;
+      entered = true;
+      changed.notify_all();
+      changed.wait(lock, [&] { return released; });
+    }
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override {}
+    void release()
+    {
+      std::lock_guard lock{mutex};
+      released = true;
+      changed.notify_all();
+    }
+  };
+  // Notifications arrive together, so both batches below are copied out before the first is
+  // delivered, and the second is delivered in the same pass of the engine thread.
+  ranks c(2, {.deliver_every = 50});
+  stream_id const attached   = sirius::exchange::make_stream_id(3, 1);
+  stream_id const unattached = sirius::exchange::make_stream_id(3, 2);
+  auto& service              = *c.all[1].service;
+  auto first                 = std::make_shared<gated>();
+  service.attach(attached, first);
+  c.all[0].service->send(attached, 1, key_value_batch(0, 0));
+  c.all[0].service->send(unattached, 1, key_value_batch(0, 1));
+  {
+    std::unique_lock lock{first->mutex};
+    REQUIRE(
+      first->changed.wait_for(lock, std::chrono::seconds{30}, [&] { return first->entered; }));
+  }
+  // The engine thread is inside the first delivery. shutdown() clears what the service holds and
+  // then waits to join it; the second batch is delivered after that clear.
+  std::thread stopping([&] { service.shutdown(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  first->release();
+  stopping.join();
+
+  auto late = std::make_shared<gated>();
+  late->release();
+  service.attach(unattached, late);
+  CHECK(late->batches == 0);
 }
 
 TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL key to every rank",
