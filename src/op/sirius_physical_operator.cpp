@@ -70,6 +70,8 @@ void pipelineable_operator_data::adopt_row_identity(pipelineable_operator_data c
   }
   if (auto const device = source.get_preferred_device_id()) { set_preferred_device_id(*device); }
   _position = source._position;
+  // The replacement holds the same rows for the same consumer, so it is read the same way.
+  _materialize_on_gpu = source._materialize_on_gpu;
   _replaced_batch_ids.clear();
   for (std::size_t position = 0; position < _data_batches.size(); ++position) {
     if (!_data_batches[position]) { continue; }
@@ -153,6 +155,21 @@ void pipelineable_operator_data::prepare_for_processing(
         "pipelineable_operator_data: null batch encountered during prepare_for_processing");
     }
     try {
+      if (!_materialize_on_gpu) {
+        // The consumer reads this input itself: read-lock the batch where it is, in whatever tier
+        // and memory space it currently has. No conversion, no cross-GPU clone, and
+        // requested_memory_space is ignored. This is the lock lock_and_prepare_batch takes when
+        // the batch is already in the requested space, so the batch-state handling is the same.
+        cucascade::read_only_data_batch ro_lock = batch->to_read_only();
+        if (ro_lock.get_memory_space() == nullptr) {
+          throw sirius::internal_exception(
+            "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
+            batch->get_batch_id(),
+            static_cast<int>(batch->get_state()));
+        }
+        ro_batches.push_back(std::move(ro_lock));
+        continue;
+      }
       if (std::optional<pipeline::lock_and_prepare_batch_result> maybe_result =
             pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
         pipeline::lock_and_prepare_batch_result result = *maybe_result;
@@ -482,6 +499,11 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   std::optional<std::size_t> position;
+  // The materialize flag covers the whole task input, so the input skips GPU materialization only
+  // if every port that contributed a batch opted out (port::residency.materialize_inputs_on_gpu ==
+  // false). One contributing port that wants its batches on the GPU makes the whole input
+  // materialize, as it does today. Ports that contributed nothing have no say.
+  bool materialize_on_gpu = false;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
@@ -493,10 +515,13 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
       }
       position = batch_position;
       input_batch.push_back(std::move(batch));
+      materialize_on_gpu = materialize_on_gpu || port_ptr->residency.materialize_inputs_on_gpu;
     }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch, position);
+  auto input = std::make_unique<pipelineable_operator_data>(input_batch, position);
+  input->set_materialize_on_gpu(materialize_on_gpu);
+  return input;
 }
 
 bool sirius_physical_operator::all_ports_empty()
