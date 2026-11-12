@@ -35,7 +35,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda/buffer>
-#include <cuda/utility>
 #include <cuda_runtime.h>
 
 #include <api/simpatico_codegen.hpp>

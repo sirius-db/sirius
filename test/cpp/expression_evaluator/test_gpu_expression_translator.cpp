@@ -27,15 +27,12 @@
 #include <expression/ast/coalesce.hpp>
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/conjunction.hpp>
-#include <expression/ast/constant.hpp>
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>  // sirius::comparison_type, sirius::from_duckdb (enum mapper)
-#include <expression/value.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/logical_type.hpp>
 
@@ -1751,4 +1748,26 @@ TEST_CASE("translator: BETWEEN and NOT BETWEEN preserve NULL conjunction semanti
     CAPTURE(negated, i);
     if (valid[i]) CHECK(bool(values[i]) == (negated ? !expected[i] : expected[i]));
   }
+}
+
+TEST_CASE("translator: checked division cannot bypass its guards",
+          "[expression_translator][checked_division]")
+{
+  auto const function = GENERATE(sirius::function_id::int_div, sirius::function_id::mod);
+  for (auto const divisor : {0, -1}) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref(0));
+    args.push_back(make_int_const(divisor));
+    auto expr       = make_func(function, std::move(args), logical_type::make(type_id::INTEGER));
+    auto translator = make_translator();
+    CHECK_FALSE(translate(translator, *expr).has_value());
+    CHECK(expr->cudf_ast_op_count() == 0);
+  }
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_ref(1));
+  auto expr       = make_func(function, std::move(args), logical_type::make(type_id::INTEGER));
+  auto translator = make_translator();
+  CHECK_FALSE(translate(translator, *expr).has_value());
+  CHECK(expr->cudf_ast_op_count() == 0);
 }

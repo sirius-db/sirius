@@ -19,9 +19,14 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
+if(VCPKG_BUILD)
+  find_package(nixl 1.5.2 EXACT CONFIG REQUIRED)
+else()
+  include(${CMAKE_CURRENT_LIST_DIR}/sirius-nixl-build.cmake)
+endif()
 
-# The static vcpkg build only exports cuvs::cuvs_static; conda's shared build
-# already provides cuvs::cuvs. Provide the canonical name when it is missing so
+# The static vcpkg build only exports cuvs::cuvs_static; shared cuvs packages
+# already provide cuvs::cuvs. Provide the canonical name when it is missing so
 # both build paths link cuvs::cuvs the same way below.
 if(NOT TARGET cuvs::cuvs)
   add_library(cuvs::cuvs INTERFACE IMPORTED)
@@ -33,7 +38,7 @@ endif()
 # keeps libnvrtc.so out of the distributed extension's runtime dependencies.
 # Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
 # the nvrtc::nvrtc_static target, which simpatico links instead of CUDA::nvrtc
-# (see src/compression/simpatico_codegen/CMakeLists.txt). The pixi build uses
+# (see src/compression/simpatico_codegen/CMakeLists.txt). Other builds use
 # CUDA::nvrtc for the toolkit's shared library.
 if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
@@ -54,12 +59,10 @@ endif()
 
 # --- cuCollections (cuco) --- #
 
-# libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
-# the overlay port (sirius-duckdb/vcpkg_ports/cuco); configure-time downloads
-# are disabled there. Otherwise (pixi build) fetch the same commit cudf is built
-# against (populate sources without add_subdirectory; CCCL comes from cudf).
-# Either way cuco is header-only and exposed as the cuco::cuco target, so both
-# paths consume it identically below.
+# libcudf no longer ships its bundled copy. Use an installed cuco package when
+# one is found (the vcpkg overlay port, or one the caller provides); otherwise
+# fetch the commit cudf is built against. Either way cuco is header-only and
+# exposed as cuco::cuco (CCCL comes from cudf).
 if(VCPKG_BUILD)
   find_package(cuco CONFIG REQUIRED)
 else()
@@ -69,36 +72,14 @@ else()
     URL https://github.com/NVIDIA/cuCollections/archive/4b26118c99866221f99f35f4e3bc74afdbe063bc.tar.gz
     URL_HASH
       SHA256=cfff0dfe8552ca2a8e3c53d04c26ab4d95364d14c159aaf8a37b3971b78b609d
-    SOURCE_SUBDIR do-not-build)
+    SOURCE_SUBDIR do-not-build FIND_PACKAGE_ARGS CONFIG)
   FetchContent_MakeAvailable(cuco)
-  # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
-  # so no target is created. Define the same header-only cuco::cuco the vcpkg
-  # port exports (CCCL still comes from cudf) so both build paths consume cuco
-  # identically below.
+  # The fetched sources are not configured, so define the header-only target.
   if(NOT TARGET cuco::cuco)
     add_library(cuco::cuco INTERFACE IMPORTED)
     set_target_properties(cuco::cuco PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
                                                 "${cuco_SOURCE_DIR}/include")
   endif()
-endif()
-
-# CTrack is retained as an opt-in profiling dependency.
-if(BUILD_WITH_CTRACK)
-  # --- ctrack (profiling instrumentation) --- #
-  include(FetchContent)
-  FetchContent_Declare(
-    ctrack
-    GIT_REPOSITORY https://github.com/Compaile/ctrack.git
-    GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
-    SOURCE_SUBDIR do-not-build)
-  FetchContent_MakeAvailable(ctrack)
-  if(NOT TARGET ctrack::ctrack)
-    add_library(ctrack::ctrack INTERFACE IMPORTED)
-    set_target_properties(
-      ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                "${ctrack_SOURCE_DIR}/include")
-  endif()
-
 endif()
 
 if(VCPKG_BUILD)
@@ -130,16 +111,38 @@ set(CUCASCADE_BUILD_SHARED_LIBS OFF)
 set(CUCASCADE_BUILD_STATIC_LIBS ON)
 set(CUCASCADE_BUILD_CUDF ON)
 set(CUCASCADE_WARNINGS_AS_ERRORS OFF)
-set(CUCASCADE_BUILD_IO OFF)
+# cuCascade io's swappable third-party backends are pointed at the copies Sirius
+# already links so both sides of the boundary share one ABI: exec::invocable is
+# absl::AnyInvocable (Sirius's type) and moodycamel is duckdb's vendored fork
+# (namespace duckdb_moodycamel, target from sirius-duckdb-provider.cmake).
+set(CUCASCADE_BUILD_IO ON)
+set(CUCASCADE_USE_ABSEIL_INVOCABLE ON)
+set(CUCASCADE_MOODYCAMEL_TARGET duckdb::moodycamel)
+set(CUCASCADE_MOODYCAMEL_NAMESPACE duckdb_moodycamel)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 endblock()
 # cuCascade has no C++ modules; scanning breaks older compiler caches.
-set_target_properties(
-  cucascade_objects cucascade_cudf_objects cucascade_topology_discovery_objects
-  PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-foreach(target cucascade_objects cucascade_cudf_objects)
-  target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+# cucascade_io_objects exists only when CUCASCADE_BUILD_IO is ON.
+foreach(target cucascade_objects cucascade_cudf_objects
+               cucascade_topology_discovery_objects cucascade_io_objects)
+  if(TARGET ${target})
+    set_target_properties(${target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+  endif()
 endforeach()
+foreach(target cucascade_objects cucascade_cudf_objects cucascade_io_objects)
+  if(TARGET ${target})
+    target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+  endif()
+endforeach()
+# Topology discovery gets NVTX only from CUDA::nvtx3, i.e. the toolkit include
+# directory. Split toolkits (e.g. conda) install the headers elsewhere. Remove
+# once cuCascade looks them up itself.
+find_path(SIRIUS_NVTX3_INCLUDE_DIR nvtx3/nvtx3.hpp
+          HINTS ${CUDAToolkit_INCLUDE_DIRS})
+if(SIRIUS_NVTX3_INCLUDE_DIR)
+  target_include_directories(cucascade_topology_discovery_objects SYSTEM
+                             PRIVATE "${SIRIUS_NVTX3_INCLUDE_DIR}")
+endif()
 
 # Name of the NVTX domain every Sirius range is published into. Derived from the
 # project name so it has a single authoritative source; simpatico turns it into

@@ -15,13 +15,14 @@
  */
 
 // sirius
-#include "io/cache/types.hpp"
+#include "op/scan/table_scan/split_validation.hpp"
 
+#include <cucascade/io/cache/types.hpp>
 #include <data/data_batch_utils.hpp>
-#include <data/sirius_converter_registry.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/scan_output_operator_data.hpp>
@@ -44,10 +45,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -548,7 +547,10 @@ row_selection select_rows(sirius_gpu_scan_operator const& scan,
   }
   if (assembly.output) { return selection; }
   auto const& space = *input.gpu_memory_space;
-  if (source.state == filter_state::ROW_FILTERED_AND_PROJECTED) {
+  // Migrated producers pass through their bound record consumer, including
+  // already assembled outputs. Legacy producers retain their old fast path.
+  if (source.state == filter_state::ROW_FILTERED_AND_PROJECTED &&
+      (!source.execution || !source.execution->authoritative)) {
     assembly.output = source.table.release(stream, space.get_default_allocator());
     return selection;
   }
@@ -715,7 +717,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     if (_ingestible->output_assembly_is_leading_identity()) {
       scan_input->decode_restore_types = normalization_targets();
     }
-    scan_input->update(io::cache::scan_stage::queued);
+    scan_input->update(cucascade::io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }
@@ -737,16 +739,21 @@ void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input,
   if (!_contract_id) return;  // standalone unbound operator fixtures
   try {
     if (input.has_scan_metadata()) {
-      auto required =
-        _read_views ? _read_views->entry(_contract_id).eligibility.later_checks : later_check_set{};
-      validate_split_for_gpu(_contract_id, required, _expected_key, input.get_scan_info());
-      if (!_read_views)
+      if (!_read_views) {
+        validate_split_contract(_contract_id, input.get_scan_info());
         throw certificate_incomplete(_contract_id, {}, "bound scan registry missing");
-      for (auto const& dependency : input.get_scan_info().dependencies()) {
-        if (dependency.profiles && dependency.profiles != _read_views->profiles)
-          throw certificate_incomplete(
-            _contract_id, {}, "physical profile belongs to another scan registry");
       }
+      auto const& entry     = _read_views->entry(_contract_id);
+      auto const& validator = entry.contract.materializer.validator;
+      if (!validator)
+        throw certificate_incomplete(_contract_id, {}, "bound split validator missing");
+      validate_split_for_gpu(_contract_id,
+                             entry.eligibility.later_checks,
+                             _expected_key,
+                             input.get_scan_info(),
+                             *validator,
+                             entry.window_id.value_or(entry.finalize_generation),
+                             _read_views->profiles);
     } else if (input.is_resident()) {
       if (input.resident_contract_id != _contract_id)
         throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
@@ -803,6 +810,18 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       std::string(typeid(input_data).name()));
   }
   validate_input(*scan_input, false);
+  // Prepared GPU inputs must belong to the executing device. Reject a known mismatch
+  // before assembly; preparation handles cross-device copies.
+  if (auto const* space = scan_input->gpu_memory_space;
+      space && space->get_tier() == ::cucascade::memory::Tier::GPU) {
+    auto const current = sirius::op::detail::resolve_dynamic_filter_device_id(-1);
+    if (current >= 0 && space->get_device_id() != current) {
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::gpu_error,
+        "scan input is assigned to GPU " + std::to_string(space->get_device_id()) +
+          " but the scan executes on GPU " + std::to_string(current));
+    }
+  }
 
   auto receipt        = decode_receipt(*this, *scan_input);
   auto assembly       = std::make_unique<scan_assembly_state>();

@@ -20,11 +20,9 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <expression/ast/from_duckdb.hpp>

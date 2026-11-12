@@ -17,7 +17,8 @@
 #include <cudf/strings/utilities.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/constants.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
@@ -28,7 +29,6 @@
 #include <duckdb/planner/filter/in_filter.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 #include <duckdb/planner/planner.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
@@ -104,9 +104,9 @@ struct scan_estimates {
 scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_info> info)
 {
   auto ingestible = scan::make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto task       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto file = task({});
@@ -211,8 +211,8 @@ void check_unmapped_carrier(scan::scan_plan const& plan,
 
 struct carrier_file_fixture {
   sirius::test::scratch_dir scratch{"parquet_carrier_sizing"};
-  std::shared_ptr<sirius::io::kvikio_context> ioctx =
-    std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::kvikio_context> ioctx =
+    std::make_shared<cucascade::io::kvikio_context>();
 
   carrier_file_fixture()
   {
@@ -314,7 +314,7 @@ struct carrier_file_fixture {
                                                           std::size_t minimum_groups = 3)
   {
     auto task = reader.next_split_provider(
-      [ctx = ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ctx; });
+      [ctx = ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ctx; });
     REQUIRE(task);
     auto info  = task({});
     auto* file = dynamic_cast<scan::parquet_file_scan_info*>(info.get());
@@ -371,10 +371,10 @@ TEST_CASE("parquet scans without a prefetch cache retain advisory ranges",
           "[scan][parquet][prefetch]")
 {
   auto ingestible = scan::make_ingestible(make_nation_info(false));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
-  REQUIRE_FALSE(ioctx->uses_prefetching_cache());
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  REQUIRE_FALSE(ioctx->uses_fs_cache());
   auto task = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto coalescer = ingestible->create_batch_coalescer();
@@ -430,13 +430,72 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
         2 * 60 + rows + masked.mvcc_keep_mask.view().size_bytes());
 }
 
-TEST_CASE("parquet virtual batches apply only their source mode allocation model",
+TEST_CASE("Iceberg batches without virtual columns retain interval deletion budgets",
+          "[scan][parquet][sizing][row_positions]")
+{
+  auto const cap     = GENERATE(std::size_t{0}, std::size_t{100001}, std::size_t{250000});
+  auto const decoded = GENERATE(std::size_t{2000}, std::size_t{50000});
+  bool const quantum = GENERATE(false, true);
+  CAPTURE(cap, decoded, quantum);
+  auto info                    = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->names                  = {"x"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids             = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = 1;
+  info->contract_id            = 1;
+  info->approximate_batch_size = cap;
+  auto reader                  = std::make_shared<scan::parquet_gpu_ingestible>(std::move(info),
+                                                               scan::parquet_source_kind::ICEBERG);
+  auto coalescer               = reader->create_batch_coalescer();
+  auto make_file               = [&](int index) {
+    auto file                     = std::make_unique<scan::parquet_file_scan_info>();
+    file->file_index              = index;
+    file->file_path               = std::to_string(index) + ".parquet";
+    file->disable_filter_pushdown = true;
+    file->set_contract_payload(
+      1, {{.contract_id = 1, .split_id = 0, .input_identity = file->file_path}}, {{}});
+    file->row_groups.push_back({0, decoded, decoded, 10, 100});
+    return file;
+  };
+  std::vector<std::unique_ptr<scan::scan_info>> batches;
+  for (int index : {0, 1}) {
+    auto file = make_file(index);
+    if (quantum) {
+      std::size_t cursor = 0;
+      for (;;) {
+        auto step = coalescer->advance(*file, cursor, 1);
+        if (step.batch) batches.push_back(std::move(step.batch));
+        if (step.finished) break;
+      }
+    } else {
+      for (auto& batch : coalescer->push(std::move(file)))
+        batches.push_back(std::move(batch));
+    }
+  }
+  REQUIRE(batches.empty());
+  CHECK(coalescer->retained_bytes() == 2 * decoded);
+  batches = coalescer->flush();
+  REQUIRE(batches.size() == 1);
+  auto const& split = dynamic_cast<scan::parquet_split_info const&>(*batches.front());
+  CHECK_FALSE(split.requires_row_positions);
+  CHECK(split.disable_filter_pushdown);
+  CHECK(split.preparation_bytes() == 2 * decoded);
+  CHECK(split.estimated_working_set_bytes() == 2 * decoded);
+  CHECK(coalescer->retained_bytes() == 0);
+  CHECK(coalescer->push(make_file(0)).empty());
+  auto tail = coalescer->flush();
+  REQUIRE(tail.size() == 1);
+  CHECK(tail.front()->preparation_bytes() == decoded);
+  CHECK(tail.front()->estimated_working_set_bytes() == decoded);
+}
+
+TEST_CASE("parquet virtual batches reserve one reader result for either source mode",
           "[scan][parquet][sizing][virtual_columns]")
 {
   auto const kind =
     GENERATE(scan::parquet_source_kind::PLAIN_PARQUET, scan::parquet_source_kind::ICEBERG);
-  bool const legacy = kind == scan::parquet_source_kind::ICEBERG;
-  auto make_reader  = [kind](std::size_t cap) {
+  bool const reader_positions = GENERATE(false, true);
+  auto make_reader            = [kind](std::size_t cap) {
     auto info            = std::make_unique<scan::parquet_ingestible_table_info>();
     info->names          = {"x"};
     info->returned_types = {sirius::logical_type::make(sirius::type_id::INTEGER)};
@@ -450,44 +509,82 @@ TEST_CASE("parquet virtual batches apply only their source mode allocation model
                                      scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
     return std::make_shared<scan::parquet_gpu_ingestible>(std::move(info), kind);
   };
-  auto make_file = [] {
-    auto file = std::make_unique<scan::parquet_file_scan_info>();
+  auto make_file = [reader_positions] {
+    auto file                    = std::make_unique<scan::parquet_file_scan_info>();
+    file->requires_row_positions = reader_positions;
     file->set_contract_payload(
       1, {{.contract_id = 1, .split_id = 0, .input_identity = "sizing.parquet"}}, {{}});
     file->row_groups.push_back({0, 20, 60, 10, 1});
     file->row_groups.push_back({1, 20, 60, 10, 1});
+    for (auto& group : file->row_groups)
+      group.requires_row_positions = reader_positions;
     return file;
   };
 
-  SECTION("reservation includes inputs and concatenated result")
+  if (reader_positions) {
+    SECTION("split-local delete demand controls fill without changing preparation charges")
+    {
+      bool const delete_first                    = GENERATE(false, true);
+      auto reader                                = make_reader(100);
+      auto coalescer                             = reader->create_batch_coalescer();
+      auto file                                  = make_file();
+      file->static_reader_filter_ready           = true;
+      file->row_groups[0].requires_row_positions = delete_first;
+      file->row_groups[1].requires_row_positions = !delete_first;
+      for (auto& group : file->row_groups)
+        group.unfiltered_working_bytes = 40;
+      auto const registered = file->preparation_bytes();
+      std::size_t cursor    = 0;
+      auto first            = coalescer->advance(*file, cursor, 1);
+      CHECK_FALSE(first.batch);
+      CHECK(coalescer->retained_bytes() == (delete_first ? 60 : 40));
+      auto second = coalescer->advance(*file, cursor, 1);
+      REQUIRE(second.batch);  // A mixed batch would need positions for both groups: 120 > 100.
+      auto const& split = dynamic_cast<scan::parquet_split_info const&>(*second.batch);
+      CHECK(split.requires_row_positions == delete_first);
+      CHECK(split.estimated_working_set_bytes() == (delete_first ? 60 : 40));
+      CHECK(split.preparation_bytes() == 60);
+      CHECK(coalescer->retained_bytes() == 0);
+      CHECK(coalescer->advance(*file, cursor, 1).finished);
+      CHECK(coalescer->retained_bytes() == (delete_first ? 40 : 60));
+      auto tail = coalescer->flush();
+      REQUIRE(tail.size() == 1);
+      CHECK(tail.front()->estimated_working_set_bytes() == (delete_first ? 40 : 60));
+      CHECK(second.batch->preparation_bytes() + tail.front()->preparation_bytes() == registered);
+    }
+  }
+
+  SECTION("reservation retains the complete reader working set")
   {
     auto reader    = make_reader(std::numeric_limits<std::size_t>::max());
     auto coalescer = reader->create_batch_coalescer();
     CHECK(coalescer->retained_bytes() == 0);
     CHECK(coalescer->push(make_file()).empty());
-    CHECK(coalescer->retained_bytes() == (legacy ? 240 : 120));
+    CHECK(coalescer->retained_bytes() == 120);
     auto splits = coalescer->flush();
     CHECK(coalescer->retained_bytes() == 0);
     REQUIRE(splits.size() == 1);
-    CHECK(splits.front()->estimated_working_set_bytes() == (legacy ? 240 : 120));
+    CHECK(splits.front()->estimated_working_set_bytes() == 120);
   }
 
-  SECTION("coalescer applies the concatenation peak to its byte cap")
+  SECTION("multiple row groups fit without a legacy concatenation floor")
   {
-    auto reader    = make_reader(200);
+    auto reader    = make_reader(121);
     auto coalescer = reader->create_batch_coalescer();
     auto splits    = coalescer->push(make_file());
     auto tail      = coalescer->flush();
     for (auto& split : tail) {
       splits.push_back(std::move(split));
     }
-    REQUIRE(splits.size() == (legacy ? 2 : 1));
-    for (auto const& split : splits) {
-      CHECK(split->estimated_working_set_bytes() == (legacy ? 60 : 120));
+    REQUIRE(splits.size() == 1);
+    for (auto& split : splits) {
+      CHECK(split->estimated_working_set_bytes() == 120);
+      scan::scan_operator_input input{std::move(split)};
+      CHECK(input.get_estimated_working_set_size_in_bytes() == 120);
     }
   }
 
-  SECTION("separate files share the peak budget and flush resets the run count")
+  SECTION("separate files share the working set and flush resets retained bytes")
   {
     auto reader    = make_reader(240);
     auto coalescer = reader->create_batch_coalescer();
@@ -499,17 +596,13 @@ TEST_CASE("parquet virtual batches apply only their source mode allocation model
     CHECK(push_one().empty());
     CHECK(coalescer->retained_bytes() == 60);
     CHECK(push_one().empty());
-    CHECK(coalescer->retained_bytes() == (legacy ? 240 : 120));
+    CHECK(coalescer->retained_bytes() == 120);
     auto full = push_one();
-    REQUIRE(full.size() == (legacy ? 1 : 0));
-    if (legacy) {
-      CHECK(full.front()->estimated_working_set_bytes() == 240);
-      CHECK(full.front()->estimated_bytes() == 40);
-    }
+    REQUIRE(full.size() == 0);
     auto tail = coalescer->flush();
     REQUIRE(tail.size() == 1);
-    CHECK(tail.front()->estimated_working_set_bytes() == (legacy ? 60 : 180));
-    CHECK(tail.front()->estimated_bytes() == (legacy ? 20 : 60));
+    CHECK(tail.front()->estimated_working_set_bytes() == 180);
+    CHECK(tail.front()->estimated_bytes() == 60);
     auto const* split = dynamic_cast<scan::parquet_split_info*>(tail.front().get());
     REQUIRE(split);
     CHECK(split->source_kind == kind);
@@ -1662,12 +1755,12 @@ TEST_CASE_METHOD(carrier_file_fixture,
                  "parquet source pruning resolves only surviving original file identities",
                  "[scan][parquet][source_pruning]")
 {
-  struct counted_ioctx : sirius::io::ioctx {
+  struct counted_ioctx : cucascade::io::ioctx {
     size_t opens = 0;
     ~counted_ioctx() override { pre_destroy(); }
-    sirius::io::io_context_type type() const noexcept override
+    cucascade::io::io_context_type type() const noexcept override
     {
-      return sirius::io::io_context_type::kvikio;
+      return cucascade::io::io_context_type::kvikio;
     }
     void shutdown() noexcept override {}
     bool supports(std::string_view) const noexcept override { return true; }
@@ -1675,23 +1768,24 @@ TEST_CASE_METHOD(carrier_file_fixture,
     bool supports_host_to_device_read() const noexcept override { return false; }
     bool supports_vector_host_read() const noexcept override { return false; }
     bool supports_device_range_read() const noexcept override { return false; }
-    std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-      std::span<cudf::io::text::byte_range_info const> ranges,
+    std::vector<cucascade::io::byte_range> align_and_coalesce(
+      std::span<cucascade::io::byte_range const> ranges,
       std::optional<size_t>) const noexcept override
     {
       return {ranges.begin(), ranges.end()};
     }
-    size_t host_read_io(sirius::io::io_object const&, size_t, size_t, uint8_t*) override
+    size_t host_read_io(cucascade::io::io_object const&, size_t, size_t, uint8_t*) override
     {
       throw std::runtime_error("pruned file must not be read");
     }
-    sirius::exec::semi_future<size_t> mixed_readv_async_io(
-      sirius::io::io_object const&, std::vector<sirius::io::prepared_io_slice>&&) noexcept override
+    cucascade::exec::semi_future<size_t> mixed_readv_async_io(
+      cucascade::io::io_object const&,
+      std::vector<cucascade::io::prepared_io_slice>&&) noexcept override
     {
-      return sirius::exec::make_semi_future<size_t>(
+      return cucascade::exec::make_semi_future<size_t>(
         std::make_exception_ptr(std::runtime_error("pruned file must not be read")));
     }
-    std::shared_ptr<sirius::io::io_object> create_io_object(std::string) override
+    std::shared_ptr<cucascade::io::io_object> create_io_object(std::string) override
     {
       ++opens;
       throw std::runtime_error("pruned file must not be opened");
@@ -1720,8 +1814,8 @@ TEST_CASE_METHOD(carrier_file_fixture,
                                   duckdb::Value::UBIGINT(select_none ? 99 : 2)));
   auto reader = scan::make_ingestible(std::move(info));
   std::vector<std::string> resolved;
-  auto task =
-    reader->next_split_provider([&](std::string_view name) -> std::shared_ptr<sirius::io::ioctx> {
+  auto task = reader->next_split_provider(
+    [&](std::string_view name) -> std::shared_ptr<cucascade::io::ioctx> {
       resolved.emplace_back(name);
       if (select_none && resolver_throws) {
         throw std::runtime_error("pruned file must not be resolved");
@@ -1828,6 +1922,8 @@ TEST_CASE_METHOD(carrier_file_fixture,
   for (auto const& split : splits) {
     auto decoded = reader->materialize_metadata_to_table(
       *split, *space, cudf::get_default_stream(), false, nullptr);
+    REQUIRE(decoded.execution);
+    CHECK(decoded.execution->authoritative == !metadata_only);
     auto table = reader->post_filter_and_project(
       std::move(decoded), *space, cudf::get_default_stream(), false, nullptr, nullptr, {});
     CHECK(table->num_columns() == 1);

@@ -9,10 +9,9 @@ You are analyzing a dependency library or submodule used by this project. Your g
 
 ## Before Starting
 
-Ask the user:
-1. **Which library/submodule?** (e.g., `cucascade`, `duckdb`, `cudf`, `rmm`, `spdlog`, or a path to any dependency)
-2. **Where is the library source?** If it's a submodule, it's already in the repo. If it's an installed dependency, ask for the include path (e.g., `$CONDA_PREFIX/include/cudf` or `$LIBCUDF_ENV_PREFIX/include/rmm`).
-3. **Output location?** Default: `.claude/skills/module-discover/docs/<library_name>/`
+Use the supplied library, source path, and output location. Default the output to
+`.claude/skills/module-discover/docs/<library_name>/`. Find the library source locally when possible;
+ask for the library or source path only if it remains unclear or cannot be found.
 
 If the user gives just a name (e.g., "cudf"), try these locations in order:
 - Submodule in repo root: `./<name>/`

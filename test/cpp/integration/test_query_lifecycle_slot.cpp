@@ -29,14 +29,12 @@
  * in isolated child processes with bounded deadlines.
  */
 
-#include "log/logging.hpp"
 #include "sirius_extension.hpp"
 #include "utils/pinned_entry_census.hpp"
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog_search_path.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_data.hpp>
@@ -47,7 +45,6 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
-#include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -1717,10 +1714,9 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
   }
 
   // Session-only SET/RESET must not require a healthy GPU runtime. Exercise every
-  // independently gated setter, including the deprecated expression-strategy alias.
+  // independently gated setter.
   for (auto sql : {"SET scan_task_batch_size=12345",
                    "SET expression_evaluator_strategy='ast_jit'",
-                   "SET expression_executor_strategy='materialize'",
                    "SET enable_regex_jit_impl=false",
                    "SET pin_table_compression=true",
                    "SET pin_table_input_compression_plan_dir='/tmp/ac10-plans'",
@@ -1731,7 +1727,7 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
   auto const options      = duckdb::query_operator_options(*connection.context);
   auto const& compression = duckdb::session_compression_config(*connection.context);
   if (options->scan_task_batch_size != 12345 ||
-      options->expression_strategy != sirius::expression_evaluator_strategy::MATERIALIZE ||
+      options->expression_strategy != sirius::expression_evaluator_strategy::AST_JIT ||
       options->enable_regex_jit || !compression.enable_pin_table_compression ||
       compression.input_plan_dir != "/tmp/ac10-plans" || compression.min_batch_size_bytes != 123 ||
       compression.max_compressed_fraction != 0.25) {
@@ -1761,7 +1757,6 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
   }
   for (auto sql : {"RESET scan_task_batch_size",
                    "RESET expression_evaluator_strategy",
-                   "RESET expression_executor_strategy",
                    "RESET enable_regex_jit_impl",
                    "RESET pin_table_compression",
                    "RESET pin_table_input_compression_plan_dir",

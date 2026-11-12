@@ -1,0 +1,13 @@
+NIXL 1.5.2: use the free post function supported by current Asio releases.
+
+--- a/src/plugins/ucx/ucx_backend.cpp
++++ b/src/plugins/ucx/ucx_backend.cpp
+@@ -715,7 +715,7 @@
+     std::atomic<nixl_status_t> status{NIXL_SUCCESS};
+ 
+     for (size_t i = 0; i < comp_handle->getNumChunks(); i++) {
+-        io_->post([&, i]() {
++        asio::post(*io_, [&, i]() {
+             nixlUcxDedicatedThread *thread = nixlUcxDedicatedThread::getDedicatedThread();
+             NIXL_ASSERT(thread != nullptr);
+ 

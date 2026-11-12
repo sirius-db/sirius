@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "op/window/aggregate_types.hpp"
 #include "op/window/whole_partition.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
@@ -26,7 +27,6 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 
 #include <cmath>
 #include <limits>

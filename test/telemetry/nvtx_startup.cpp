@@ -1,6 +1,6 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 
-#include "duckdb.hpp"
+#include "duckdb.hpp"  // IWYU pragma: keep
 #include "sirius/ffi.hpp"
 
 #include <cstdlib>

@@ -3,7 +3,12 @@ target_sources(
   PRIVATE aggregate/aggregate_op_util.cpp
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
+          aggregate/carried_columns.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/aggregate_types.cpp
+          window/cumulative.cpp
+          window/float_extremum.cpp
+          window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
@@ -28,21 +33,27 @@ target_sources(
           scan/parquet_schema_mapping.cpp
           scan/scan_plan.cpp
           scan/scan_filter_analysis.cpp
+          scan/scan_execution_record.cpp
           scan/scan_utils.cpp
           scan/sirius_gpu_scan_operator.cpp
           scan/sirius_gpu_scan_operator_data.cpp
+          scan/composite_scan_driver.cpp
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_scan_core.cpp
           scan/materialization_contract.cpp
           scan/positional_visibility.cpp
+          scan/positional_visibility.cu
           scan/field_id_mapping.cpp
           scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
+          scan/table_scan/owned_arrow_scan.cpp
+          scan/table_scan/split_validation.cpp
           scan/table_scan/bound_read_view.cpp
           scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
+          scan/parquet_delete_reader.cpp
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp
           scan/equality_delete_filter.cpp
@@ -52,7 +63,6 @@ target_sources(
           dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/complete_build_inventory.cpp
-          dynamic_filter/dynamic_filter_replica_space.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
           dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
@@ -88,7 +98,10 @@ target_sources(
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
+          sirius_physical_window.cpp
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu
           scan/equality_delete_mask.cu)
+
+add_subdirectory(scan/arrow)

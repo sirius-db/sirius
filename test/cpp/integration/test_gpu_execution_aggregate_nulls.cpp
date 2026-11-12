@@ -24,7 +24,6 @@
 // insensitive, which suits GROUP BY output.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>

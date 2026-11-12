@@ -1,10 +1,3 @@
-# Keep the public configuration implementation's C++23 requirement local.
-add_library(sirius_context_config OBJECT src/context_config.cpp)
-target_compile_features(sirius_context_config PRIVATE cxx_std_23)
-set_target_properties(
-  sirius_context_config PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                   CXX_VISIBILITY_PRESET hidden)
-
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
@@ -14,8 +7,7 @@ add_library(sirius_shared SHARED src/sirius_library_anchor.cpp
                                  $<TARGET_OBJECTS:sirius_objects>)
 # Link the isolated implementations into both Sirius libraries.
 foreach(_target sirius_core sirius_shared)
-  target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_context_config>
-                                    $<TARGET_OBJECTS:sirius_spdlog_sink>)
+  target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_spdlog_sink>)
 endforeach()
 
 if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -53,8 +45,10 @@ set(SIRIUS_LINK_LIBRARIES
     spdlog::spdlog
     cuCascade::cucascade
     cuCascade::cucascade_cudf
+    cuCascade::cucascade_io
     yaml-cpp::yaml-cpp
     roaring::roaring
+    nixl::nixl
     telemetry_bridge
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
@@ -64,24 +58,18 @@ set(SIRIUS_LINK_LIBRARIES
     OpenSSL::Crypto
     absl::any_invocable
     kvikio::kvikio)
-if(BUILD_WITH_CTRACK)
-  list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
-endif()
 
-foreach(_target sirius_objects sirius_context_config sirius_core sirius_shared)
+foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-  if(NOT _target STREQUAL "sirius_context_config")
-    set_target_properties(
-      ${_target}
-      PROPERTIES CXX_STANDARD 20
-                 CXX_STANDARD_REQUIRED ON
-                 CUDA_STANDARD 20
-                 CUDA_STANDARD_REQUIRED ON
-                 CUDA_SEPARABLE_COMPILATION ON)
-    if(NOT _target STREQUAL "sirius_objects")
-      set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS
-                                                  ON)
-    endif()
+  set_target_properties(
+    ${_target}
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON
+               CUDA_SEPARABLE_COMPILATION ON)
+  if(NOT _target STREQUAL "sirius_objects")
+    set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   endif()
 
   # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
@@ -128,7 +116,8 @@ foreach(_target sirius_objects sirius_context_config sirius_core sirius_shared)
 
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
-  # (cuCascade::cucascade) and cudf::cudf.
+  # (cuCascade::cucascade) and cudf::cudf. cuCascade::cucascade_io is the io
+  # library (uring/REST/kvikio reactors, fs_cache) Sirius consumes directly.
 
   target_link_libraries(${_target} PRIVATE ${SIRIUS_LINK_LIBRARIES})
 
@@ -171,11 +160,10 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-target_compile_features(sirius_shared INTERFACE cxx_std_23)
-# Installed static consumers use the public headers too. Keep this requirement
-# out of DuckDB's in-tree build graph.
-target_compile_features(sirius_core INTERFACE "$<INSTALL_INTERFACE:cxx_std_23>")
-set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+# mold localizes GNU_UNIQUE symbols under --exclude-libs (rmm#826).
+if(CMAKE_LINKER_TYPE STREQUAL "MOLD")
+  set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+endif()
 
 # Keep the embedded DuckDB private when the host exposes another DuckDB
 # globally.
@@ -188,10 +176,9 @@ endforeach()
 target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections"
                     "LINKER:--allow-multiple-definition")
 
-# The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
-# telemetry bridge above, which CMake drives via Corrosion). Their build.rs
-# discovers the Sirius headers (repo + conda) and links the libsirius artifact
-# this build produces under build/<preset>/; see rust/crates/sirius-sys.
+# Cargo builds the Rust API crates separately from the telemetry bridge above.
+# sirius-sys links libsirius from build/<preset>; sirius-ffi additionally
+# compiles its C++ bridge against include/. See rust/README.md.
 
 # NVML's static stub cannot be embedded safely; the real library is supplied by
 # the NVIDIA driver. Keep this requirement in the exported support target.

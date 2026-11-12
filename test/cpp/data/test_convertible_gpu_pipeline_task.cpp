@@ -16,22 +16,29 @@
 
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <exec/multi_index_priority_queue.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
-#include <pipeline/sirius_pipeline_task_states.hpp>
-#include <utils/telemetry_utils.hpp>
+#include <utils/convertible_task_test_utils.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -72,47 +79,16 @@ class dummy_task : public sirius::parallel::itask {
   void execute(::cuda::stream_ref /*stream*/) override {}
 };
 
-/// Trivial index-keys extractor: puts every task in one priority level, which
-/// reproduces the plain-FIFO behavior of the old default queue. These tests
-/// exercise RAII return + predicate filtering, not priority/index ordering.
-sirius::exec::multi_index_priority_queue<sirius::parallel::itask>::key_extractor test_extractor()
-{
-  return [](const sirius::parallel::itask&) {
-    return sirius::exec::index_keys{
-      0, sirius::op::SiriusPhysicalOperatorType::INVALID, 0, sirius::exec::no_preferred_device};
-  };
-}
+using sirius::test::flat_key_extractor;
+using sirius::test::get_batch_size;
+using sirius::test::get_batch_tier;
+using sirius::test::make_test_gpu_task;
 
-/// Helper: create a gpu_pipeline_task with the given data batches.
-/// Batches remain in idle state (the new cucascade API default).
-std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
-  uint64_t task_id, std::vector<std::shared_ptr<cucascade::data_batch>> batches)
-{
-  auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
-  auto local =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
-  auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
-    nullptr, sirius::test::make_test_telemetry_context());
-
-  return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
-    task_id,
-    std::vector<cucascade::shared_data_repository*>{},
-    std::move(local),
-    std::move(global));
-}
-
-/// Helper: get the tier of a data_batch using a temporary read-only lock.
-inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
+inline bool batch_in_space(cucascade::data_batch& batch,
+                           const cucascade::memory::memory_space* space)
 {
   auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
-}
-
-/// Helper: get the size in bytes of a data_batch's data using a temporary read-only lock.
-inline size_t get_batch_size(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return ro.get_data()->get_size_in_bytes();
+  return ro.get_memory_space() == space;
 }
 
 }  // anonymous namespace
@@ -123,7 +99,7 @@ TEST_CASE("RAII returns task to queue on destruction", "[convertible_gpu_pipelin
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
@@ -147,7 +123,7 @@ TEST_CASE("RAII returns task after successful convert", "[convertible_gpu_pipeli
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{10, 20, 30}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
@@ -184,7 +160,7 @@ TEST_CASE("RAII returns task on exception", "[convertible_gpu_pipeline_task]")
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{4, 5, 6}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
@@ -213,7 +189,7 @@ TEST_CASE("non-gpu_pipeline_task skipped by predicate", "[convertible_gpu_pipeli
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   REQUIRE(queue.push(std::make_unique<dummy_task>()));
   REQUIRE(queue.size() == 1);
   sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
@@ -228,7 +204,7 @@ TEST_CASE("wrong memory_space skipped by predicate", "[convertible_gpu_pipeline_
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   // Create GPU task with batch in gpu_space
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
@@ -247,7 +223,7 @@ TEST_CASE("non-idle batch skipped by predicate", "[convertible_gpu_pipeline_task
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{7, 8, 9}, cudf::type_id::INT32);
 
@@ -273,7 +249,7 @@ TEST_CASE("matching task selected by predicate", "[convertible_gpu_pipeline_task
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});  // batch is idle
@@ -290,7 +266,7 @@ TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{100, 200, 300}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
@@ -311,7 +287,7 @@ TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch1 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto batch2 = sirius::test::operator_utils::make_numeric_batch(
@@ -336,7 +312,7 @@ TEST_CASE("get_all_convertible extracts all matching tasks", "[convertible_gpu_p
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
 
   for (uint64_t i = 0; i < 3; ++i) {
     auto batch = sirius::test::operator_utils::make_numeric_batch(
@@ -361,7 +337,7 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
   lifecycle.open_query(sirius::make_query_id(0));
   auto& e = env();
 
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
@@ -380,4 +356,112 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
 
   // Queue is interrupted and empty — task was destroyed, not pushed
   REQUIRE(queue.empty());
+}
+
+// A non-blocking request must not wait on a batch another thread holds exclusively (e.g. a task
+// restoring a shared input while it waits for the memory this downgrade is meant to free). Both
+// the size probe and the conversion skip the held batch and return promptly.
+TEST_CASE("non-blocking convert and bytes_in_space skip a batch held by another thread",
+          "[convertible_gpu_pipeline_task]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  auto held_batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto free_batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5, 6, 7}, cudf::type_id::INT32);
+  auto const free_size = get_batch_size(*free_batch);
+  auto task            = make_test_gpu_task(1, {held_batch, free_batch});
+  REQUIRE(queue.push(std::move(task)));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd != nullptr);
+
+  // Stands in for the other thread's exclusive hold.
+  std::optional<cucascade::mutable_data_batch> held;
+  held.emplace(held_batch->to_mutable());
+
+  auto probe          = std::async(std::launch::async, [&] {
+    auto bytes  = cd->bytes_in_space(e.gpu_space);
+    auto result = cd->convert({e.host_space}, e.stream(), *e.mgr, /*blocking=*/false);
+    return std::pair{bytes, std::move(result)};
+  });
+  bool const returned = probe.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  CHECK(returned);
+  held.reset();  // release before joining, so a probe that blocked can still finish
+  auto [bytes, result] = probe.get();
+  REQUIRE(returned);
+  REQUIRE(bytes == free_size);
+  REQUIRE(result.has_value());
+  REQUIRE((*result)[0] == free_size);
+  REQUIRE(get_batch_tier(*free_batch) == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*held_batch) == cucascade::memory::Tier::GPU);
+}
+
+// A GPU 0 executor's stream cannot touch GPU 1 memory (a build batch shared with a task on
+// another GPU, say). Bound to GPU 0, the wrapper moves only the task's GPU 0 batch and leaves the
+// GPU 1 batch where it is, instead of throwing part-way through the task.
+TEST_CASE("task conversion bound to one GPU leaves the task's other-GPU batches alone",
+          "[convertible_gpu_pipeline_task][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+
+  auto mgr   = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* gpu0 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* gpu1 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  auto* host = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(gpu0 != nullptr);
+  REQUIRE(gpu1 != nullptr);
+  REQUIRE(host != nullptr);
+
+  auto gpu0_batch = sirius::test::operator_utils::make_numeric_batch(
+    *gpu0, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto gpu1_batch = sirius::test::operator_utils::make_numeric_batch(
+    *gpu0, std::vector<int32_t>{4, 5, 6, 7, 8}, cudf::type_id::INT32);
+  auto const gpu0_size = get_batch_size(*gpu0_batch);
+  auto const gpu1_size = get_batch_size(*gpu1_batch);
+
+  // Place the second batch on GPU 1 (spilled, then upgraded there).
+  rmm::cuda_stream stream0;
+  auto& registry = sirius::converter_registry::get();
+  {
+    auto mut = gpu1_batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host, stream0);
+  }
+  stream0.synchronize();
+  {
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{1}};
+    rmm::cuda_stream stream1;
+    {
+      auto mut = gpu1_batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream1);
+    }
+    stream1.synchronize();
+  }
+  REQUIRE(batch_in_space(*gpu1_batch, gpu1));
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(flat_key_extractor());
+  auto task = make_test_gpu_task(1, {gpu0_batch, gpu1_batch});
+  REQUIRE(queue.push(std::move(task)));
+
+  // GPU 0's executor picks the task.
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
+  auto cd = provider.get_next_convertible(gpu0, false);
+  REQUIRE(cd != nullptr);
+  REQUIRE(cd->bytes_in_space(gpu0) == gpu0_size);
+  REQUIRE(cd->bytes_in_space(gpu1) == gpu1_size);
+
+  std::optional<std::vector<std::size_t>> result;
+  REQUIRE_NOTHROW(result = cd->convert({host}, stream0, *mgr, /*blocking=*/true));
+  REQUIRE(result.has_value());
+  REQUIRE(result->size() == 1);
+  CHECK((*result)[0] == gpu0_size);
+  CHECK(batch_in_space(*gpu0_batch, host));
+  CHECK(batch_in_space(*gpu1_batch, gpu1));
+  CHECK(gpu1_batch->get_state() == cucascade::batch_state::idle);
 }

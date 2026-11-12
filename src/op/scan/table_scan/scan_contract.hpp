@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -52,13 +53,14 @@ struct scan_envelope;
 class reservation_provider;
 struct admission_decision;
 }  // namespace sirius::scan_manager
-namespace sirius::io {
-class sirius_datasource;
+namespace cucascade::io {
+class datasource;
 class io_object_metadata;
-}  // namespace sirius::io
+}  // namespace cucascade::io
 
 namespace sirius::op::scan {
 class scan_info;
+struct scan_execution_record;
 // Adapter-owned semantic input published by the shared scan preparation path.
 // Concrete connectors extend this type; the preparation coordinator only keeps
 // the lifetime and never interprets connector-specific payloads.
@@ -202,7 +204,8 @@ enum class verdict_reason : uint16_t {
   callback_mismatch,
   iceberg_puffin_uri_unsupported,
   iceberg_puffin_remote_eager,
-  iceberg_delete_corrupt
+  iceberg_delete_corrupt,
+  provider_admission_refused
 };
 
 struct scan_publication_observation {
@@ -216,6 +219,8 @@ struct scan_publication_observation {
 
 struct physical_check_counters {
   std::atomic<uint64_t> split_flushed_for_schema{0};
+  std::atomic<uint64_t> arrow_batches_imported{0}, arrow_rows_imported{0};
+  std::atomic<uint64_t> arrow_schema_drift_refusals{0};
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
@@ -224,6 +229,8 @@ struct physical_check_counters {
   std::atomic<uint64_t> descriptor_mismatches{0};
   std::atomic<uint64_t> iceberg_delete_corrupt_inputs{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
+  std::atomic<uint64_t> execution_record_shadow_mismatches{0};
+  std::atomic<uint64_t> execution_record_shadow_coverage_added{0};
 
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.
@@ -231,6 +238,10 @@ struct physical_check_counters {
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
   // Per decoded batch, before any residual filter: reader filter present, output rows.
   std::function<void(bool, uint64_t)> parquet_filter_for_testing;
+  std::function<void(bool, scan_execution_record const&)> scan_execution_for_testing;
+  std::function<void(std::vector<std::size_t> const&)> scan_residual_for_testing;
+  // Actual cuDF prepend requests, independently for row and source index.
+  std::function<void(bool, bool)> parquet_positions_for_testing;
   std::function<void()> after_certify_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
@@ -296,7 +307,7 @@ struct physical_check_counters {
   }
   std::atomic<uint64_t> checks{0};
   std::array<std::atomic<uint64_t>,
-             static_cast<std::size_t>(verdict_reason::iceberg_delete_corrupt) + 1>
+             static_cast<std::size_t>(verdict_reason::provider_admission_refused) + 1>
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};
@@ -507,12 +518,12 @@ struct split_materializer_certificate {
 struct parquet_input_approval {
   std::size_t footer_bytes = 0;
   std::vector<std::size_t> row_groups;
-  std::shared_ptr<io::io_object_metadata const> metadata_owner;
+  std::shared_ptr<cucascade::io::io_object_metadata const> metadata_owner;
   std::string object_identity;
 };
 struct split_dependencies {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
   std::shared_ptr<parquet_input_approval const> parquet_approval;

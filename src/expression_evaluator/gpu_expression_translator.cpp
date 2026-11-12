@@ -28,7 +28,6 @@
 #include <cudf/wrappers/timestamps.hpp>
 
 // standard library
-#include <algorithm>
 #include <iterator>
 #include <numeric>
 #include <type_traits>
@@ -710,14 +709,7 @@ std::optional<expr_ref> gpu_expression_translator::add_in_list(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
-  // Standalone ASTs cannot implement DATE infinity and overflow checks.
-  if (alt.date_operation().has_value()) { return std::nullopt; }
-
-  // Unsupported functions fall through to the default arm below.
-  if (has_fixed_point_operand(alt)) {
-    SIRIUS_LOG_DEBUG("[expression_translator] Blocking decimal function from AST");
-    return std::nullopt;
-  }
+  if (!ast_supports_function(alt)) { return std::nullopt; }
 
   switch (alt.function()) {
     using enum sirius::function_id;

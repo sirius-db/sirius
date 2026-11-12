@@ -15,22 +15,16 @@
  */
 
 #include "config.hpp"
-#include "cuda/device_health.hpp"
-#include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/io/parquet.hpp>
-#include <cudf/io/types.hpp>
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <absl/cleanup/cleanup.h>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
@@ -41,8 +35,6 @@
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
-#include "compression/compressed_representation.hpp"
-#include "compression/compression_converters.hpp"
 #include "compression/plan_utils.hpp"
 #include "compression/spill_compression.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -74,22 +66,18 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/unsupported_optimizers.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <cudf/types.hpp>
-#include <cudf/utilities/traits.hpp>
-
-#include <rmm/mr/per_device_resource.hpp>
-
-#include <api/compressed_table_io.hpp>
-#include <api/simpatico_codegen.hpp>
 
 #include <array>
 #include <chrono>
@@ -100,6 +88,9 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
+#include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
+#include "late_mat/column_origin.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -121,33 +112,13 @@ extern "C" int cudaProfilerStop();
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/memory_resource.hpp>
-
-// PinTableFunction routes parquet reads through the scan manager's ioctx
-// instead of cudf's bundled file_source factory (which uses kvikio internally
-// and binds to a single CUDA context). This is mandatory in multi-GPU
-// configurations (enforced by sirius_config::enforce_sirius_backend_for_multi_gpu()).
-// Single-GPU users may still opt out via backend=kvikio; the
-// pin pipeline always routes through ioctx when one is available.
-//
-// Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
-// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
-// macro that collides with the BLOCK_SIZE static member in
-// <blockingconcurrentqueue.h> (used by pipeline / duckdb
-// connection_manager). All consumers of blockingconcurrentqueue.h must
-// precede this include.
-#include "io/s3/duckdb_secret_config.hpp"
-#include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
-#include "io/types.hpp"                // sirius::io::ioctx
-#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
-
-#include <dlfcn.h>
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -673,7 +644,13 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         gpu_error.Throw();
       }
       if (!duckdb_fallback_enabled(context)) {
-        throw std::runtime_error("SiriusExecuteQuery error: " + gpu_error.RawMessage());
+        // Match transparent execution: keep ordinary types, but do not let a GPU
+        // INTERNAL/FATAL error invalidate the database.
+        if (gpu_error.Type() == ExceptionType::INTERNAL ||
+            gpu_error.Type() == ExceptionType::FATAL) {
+          throw ExecutorException("SiriusExecuteQuery error: " + gpu_error.RawMessage());
+        }
+        gpu_error.Throw("SiriusExecuteQuery error: ");
       }
       // Check the bound sources before entering CPU replay. The helper below
       // retains its existing SQL-text check as an additional S3 signal.
@@ -768,6 +745,23 @@ static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
   names.push_back("ok");
   return nullptr;
 }
+
+struct PinTableArgs {
+  std::string path;
+  std::string tier;
+  std::string name;
+  std::optional<std::vector<std::string>> cols;
+  /// Optional per-call request for Simpatico pin compression. When omitted,
+  /// the legacy session/config setting remains the default.
+  std::optional<bool> compression;
+  /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
+  /// `format` named parameter, else inferred from the path extension
+  /// (.parquet -> parquet, .db/.duckdb -> duckdb).
+  std::string format;
+  /// duckdb-native only: schema that contains the table named by `name`. Defaults
+  /// to "main"; the catalog search path (current/USE'd database) still applies.
+  std::string schema = "main";
+};
 
 struct PinTableFunctionData : public TableFunctionData {
   PinTableArgs args;
@@ -979,6 +973,27 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 }
 
 }  // namespace
+
+static bool parquet_footer_statistics_enabled(ClientContext& context)
+{
+  Value setting;
+  return context.TryGetCurrentSetting("parquet_footer_statistics", setting) && !setting.IsNull() &&
+         setting.GetValue<bool>();
+}
+
+// Statistics are an optimization: a footer that cannot be read leaves its scans as they were,
+// and the scan itself reports the file's error.
+static std::size_t warm_parquet_footer_statistics(ClientContext& context,
+                                                  std::vector<std::string> const& paths)
+{
+  if (!parquet_footer_statistics_enabled(context)) { return 0; }
+  try {
+    return sirius::transparent::read_parquet_footer_statistics(context, paths);
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("No footer statistics read ahead: {}", e.what());
+    return 0;
+  }
+}
 
 unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context,
                                                           TableFunctionBindInput& input,
@@ -1208,6 +1223,17 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       if (file_paths.empty()) {
         throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
       }
+      // GlobFiles returns local files in directory order, and pinned chunks pack several
+      // files each, so a table stored sorted across numbered files (part.0, part.1, ...) would
+      // pin into chunks whose rows are not in order. Sorting the names with digit runs compared
+      // numerically (part.2 before part.10) keeps such tables sorted within and across chunks,
+      // which lets sorted-key aggregation apply to their scans. The full paths are compared, not
+      // the file names, so a glob spanning directories keeps each directory's files together.
+      // Nothing relies on this order for correctness.
+      std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
+        return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
+      });
+      warm_parquet_footer_statistics(context, file_paths);
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -1245,7 +1271,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // Compression config (tier-agnostic): load the per-table plan DSL from the plan
     // directory (if configured), then resolve it into a compression_pin_config. Both
     // the host and GPU pin paths compress with this when enabled.
-    const auto& comp_cfg = duckdb::session_compression_config(context);
+    const auto& comp_cfg  = duckdb::session_compression_config(context);
+    auto const unique_cfg = duckdb::query_operator_options(context);
     bool const compression_requested =
       data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
     if (compression_requested && comp_cfg.input_plan_dir.empty()) {
@@ -1338,11 +1365,17 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       }
     }
 
-    // Late-mat uniqueness probe: which pinned columns to observe for whole-table
-    // distinctness (off unless SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
-    // names outlive cache_info, which every insert path moves from.
+    // Uniqueness probe: with pin_table_prove_unique_keys, every column of a parquet pin is
+    // observed for whole-table distinctness, as a join-key candidate and for late materialization.
+    // A native table's scan takes the planner's PRIMARY KEY branch and never reads pin facts for
+    // joins, so its columns are observed only when late materialization is on and could use them;
+    // otherwise it would only cost pin time and GPU memory. The names outlive cache_info, which
+    // every insert path moves from.
     auto const pinned_column_names = cache_info.column_names();
-    auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+    auto const probe_unique_columns =
+      std::vector<bool>(pinned_column_names.size(),
+                        unique_cfg->prove_unique_keys &&
+                          (data.args.format == "parquet" || sirius::late_mat::late_mat_enabled()));
 
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                             std::vector<std::size_t> row_counts) {
@@ -1360,6 +1393,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       return metadata;
     };
 
+    // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
+    // file_source factory, which uses kvikIO internally and binds to a single CUDA context.
+    // That is mandatory on multi-GPU.
     if (data.args.tier == "host") {
       // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
       // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
@@ -1367,18 +1403,19 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
       // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
       // chunk back on a NUMA-local GPU.
-      auto host_result =
-        sirius::materialize_pin_to_host(*ingestible,
-                                        gpu_spaces_mut,
-                                        host_space_by_gpu,
-                                        scan_mgr.get_host_pin_placement(),
-                                        *scan_mgr.io_ctx(),
-                                        pinned_column_types,
-                                        pin_comp,
-                                        {.expression_policy   = pin_op_params.expression_policy(),
-                                         .capture_chunk_stats = capture_chunk_stats,
-                                         .enable_compressed_materialization = compressed_pin,
-                                         .probe_unique_columns = probe_unique_columns});
+      auto host_result = sirius::materialize_pin_to_host(
+        *ingestible,
+        gpu_spaces_mut,
+        host_space_by_gpu,
+        scan_mgr.get_host_pin_placement(),
+        *scan_mgr.io_ctx(),
+        pinned_column_types,
+        pin_comp,
+        {.expression_policy                 = pin_op_params.expression_policy(),
+         .capture_chunk_stats               = capture_chunk_stats,
+         .enable_compressed_materialization = compressed_pin,
+         .probe_unique_columns              = probe_unique_columns,
+         .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(host_result.column_storage));
@@ -1410,7 +1447,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         {.expression_policy                 = pin_op_params.expression_policy(),
          .capture_chunk_stats               = false,
          .enable_compressed_materialization = compressed_pin,
-         .probe_unique_columns              = probe_unique_columns});
+         .probe_unique_columns              = probe_unique_columns,
+         .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(dev_result.column_storage));
@@ -1425,15 +1463,16 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     } else {
       // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
       // (with its GPU placement) and pin them in place.
-      auto mat =
-        sirius::materialize_all_batches(*ingestible,
-                                        gpu_spaces_mut,
-                                        *scan_mgr.io_ctx(),
-                                        pinned_column_types,
-                                        {.expression_policy   = pin_op_params.expression_policy(),
-                                         .capture_chunk_stats = capture_chunk_stats,
-                                         .enable_compressed_materialization = compressed_pin,
-                                         .probe_unique_columns = probe_unique_columns});
+      auto mat = sirius::materialize_all_batches(
+        *ingestible,
+        gpu_spaces_mut,
+        *scan_mgr.io_ctx(),
+        pinned_column_types,
+        {.expression_policy                 = pin_op_params.expression_policy(),
+         .capture_chunk_stats               = capture_chunk_stats,
+         .enable_compressed_materialization = compressed_pin,
+         .probe_unique_columns              = probe_unique_columns,
+         .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(mat.column_storage));
@@ -1583,6 +1622,52 @@ static void ProfilerStopFunction(ClientContext& context,
   output.data[0].Append(Value::BOOLEAN(true));
   output.CheckCardinality(1);
   data.finished = true;
+}
+
+struct SiriusAnalyzeParquetData : public TableFunctionData {
+  std::string path;
+};
+
+struct SiriusAnalyzeParquetState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> SiriusAnalyzeParquetInit(ClientContext& context,
+                                                                     TableFunctionInitInput& input)
+{
+  return make_uniq<SiriusAnalyzeParquetState>();
+}
+
+static unique_ptr<FunctionData> SiriusAnalyzeParquetBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<Identifier>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_analyze_parquet requires a non-NULL path or glob");
+  }
+  auto result  = make_uniq<SiriusAnalyzeParquetData>();
+  result->path = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::UBIGINT);
+  names.push_back("files");
+  return std::move(result);
+}
+
+static void SiriusAnalyzeParquetFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output)
+{
+  auto const& data = data_p.bind_data->Cast<SiriusAnalyzeParquetData>();
+  auto& state      = data_p.global_state->Cast<SiriusAnalyzeParquetState>();
+  if (state.finished) { return; }
+  std::vector<std::string> paths;
+  for (auto const& file : FileSystem::GetFileSystem(context).GlobFiles(data.path)) {
+    paths.push_back(file.path);
+  }
+  auto const cached = sirius::transparent::read_parquet_footer_statistics(context, paths);
+  output.data[0].Append(Value::UBIGINT(cached));
+  output.CheckCardinality(1);
+  state.finished = true;
 }
 
 struct SiriusSetQueryLabelData : public TableFunctionData {
@@ -2381,6 +2466,14 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
+  TableFunction analyze_parquet("sirius_analyze_parquet",
+                                {LogicalType::VARCHAR},
+                                SiriusAnalyzeParquetFunction,
+                                SiriusAnalyzeParquetBind,
+                                SiriusAnalyzeParquetInit);
+  CreateTableFunctionInfo analyze_parquet_info(analyze_parquet);
+  catalog.CreateTableFunction(transaction, analyze_parquet_info);
+
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},
                                 SiriusSetQueryLabelFunction,
@@ -2525,18 +2618,6 @@ static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scop
   ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
 }
 
-// Deprecated alias for `expression_evaluator_strategy`. Kept so existing
-// `SET expression_executor_strategy=...` statements keep working; remove in a future release.
-static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
-                                                    SetScope scope,
-                                                    Value& parameter)
-{
-  SIRIUS_LOG_WARN(
-    "The 'expression_executor_strategy' setting is deprecated; use "
-    "'expression_evaluator_strategy' instead.");
-  ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
-}
-
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
                                     Value& /*parameter*/)
@@ -2591,7 +2672,7 @@ static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Val
 {
   auto* params                     = get_operator_params(context, scope);
   params->max_sort_partition_bytes = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
+  SIRIUS_LOG_DEBUG("Updated config max_sort_partition_bytes to {}",
                    params->max_sort_partition_bytes);
 }
 
@@ -2672,8 +2753,9 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
       level_name);
   }
   Config::LOG_LEVEL = std::move(level_name);
-  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
-  sirius::log::get_sink()->set_level(*parsed_level);
+  // Only re-targets the current sink and re-mirrors it onto cuCascade's gate; no
+  // rebuild (the duckdb sink ignores the level, and so does the mirror for it).
+  sirius::log::set_level(*parsed_level);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
@@ -2820,6 +2902,22 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
+static void SetPinTableProveUniqueKeys(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params              = get_operator_params(context, scope);
+  params->prove_unique_keys = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_prove_unique_keys to {}", params->prove_unique_keys);
+}
+
+static void SetPinTableUniqueExactMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  // 0 is meaningful: it restores the derived cap (a share of GPU memory space capacity).
+  auto* params                   = get_operator_params(context, scope);
+  params->unique_exact_max_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_unique_exact_max_bytes to {}",
+                   params->unique_exact_max_bytes);
+}
+
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
@@ -2835,6 +2933,14 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   auto* params                    = get_operator_params(context, scope);
   params->enable_dense_count_join = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
+}
+
+static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_exists_minmax_rewrite = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_EXISTS_MINMAX_REWRITE to {}",
+                   params->enable_exists_minmax_rewrite);
 }
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -3026,15 +3132,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
-
-  // Deprecated alias for `expression_evaluator_strategy`; remove in a future release.
-  config.AddExtensionOption(
-    "expression_executor_strategy",
-    "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
-    "'materialize', 'ast_interpret', or 'ast_jit'",
-    LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
-    SetExpressionExecutorStrategyDeprecated);
 
   add_sirius_option(
     config,
@@ -3321,6 +3418,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     SetEnableDenseCountJoin);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "enable_exists_minmax_rewrite",
+                    "runtime override for the correlated EXISTS MIN/MAX rewrite",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_exists_minmax_rewrite),
+                    SetEnableExistsMinmaxRewrite);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "dense_count_join_max_bytes",
                     "internal test hook for the dense count-join histogram budget",
                     LogicalType::UBIGINT,
@@ -3365,6 +3469,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableLikeSwarFastpath);
+
+  config.AddExtensionOption(
+    "parquet_footer_statistics",
+    "Whether a scan of several Parquet files gives DuckDB's optimizer the merged statistics of "
+    "all their footers, which DuckDB itself reads only with union_by_name",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(true));
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -3498,6 +3609,22 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
 
+  config.AddExtensionOption(
+    "pin_table_prove_unique_keys",
+    "Prove pinned parquet columns distinct at pin time, and let joins whose build key was proven "
+    "distinct take the single-pass distinct hash join, as for a PRIMARY KEY",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.prove_unique_keys),
+    SetPinTableProveUniqueKeys);
+
+  config.AddExtensionOption(
+    "pin_table_unique_exact_max_bytes",
+    "Cap in bytes on one column in pin_table's exact uniqueness check (a sort of the whole column; "
+    "peak GPU use is about three times the cap). 0 = 10% of the GPU memory space capacity",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.unique_exact_max_bytes),
+    SetPinTableUniqueExactMaxBytes);
+
   add_sirius_option(
     config,
     option_visibility::internal,
@@ -3599,6 +3726,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 // serial, quiescent override — concurrent optimizer runs while it changes
 // are unsupported; transparent execution then falls back to CPU on the
 // affected plan shapes instead of re-inserting.
+// Tells the sirius loader that the runtime initialized, so transparent execution is active. The
+// loader looks the key up by name.
+struct SiriusRuntimeReady : ObjectCacheEntry {
+  static constexpr char const* KEY = "sirius_runtime_ready";
+  std::string GetObjectType() override { return KEY; }
+  optional_idx GetEstimatedCacheMemory() const override { return optional_idx(); }
+};
+
 static void publish_transparent_optimizer_mask(DBConfig& config)
 {
   auto& live = config.options.disabled_optimizers;
@@ -3642,6 +3777,27 @@ static void default_to_explicit_delim_joins(DBConfig& config)
   Settings::Set<DelimJoinAsCteSetting>(config, SetScope::GLOBAL, Value::BOOLEAN(false));
 }
 
+// CUDA 12.8+ builds call cudaMemcpyBatchAsync, which older drivers lack. Keep this guard in sync
+// with the `CUDART_VERSION >= 12080` batch-copy paths (device_transfer.cpp,
+// duckdb_native_decoder.cpp, spill_chunked_converters.cpp). The sirius loader checks this too,
+// but a backend loaded directly bypasses it.
+static void check_cuda_driver_version()
+{
+#if CUDART_VERSION >= 12080 && CUDART_VERSION < 13000
+  int version = 0;
+  if (cudaDriverGetVersion(&version) != cudaSuccess || version == 0) {
+    throw InvalidInputException(
+      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: no driver found");
+  }
+  if (version < 12080) {
+    throw InvalidInputException(
+      "Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: reported CUDA version %d.%d",
+      version / 1000,
+      (version % 1000) / 10);
+  }
+#endif
+}
+
 static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
@@ -3656,6 +3812,7 @@ static void LoadInternal(ExtensionLoader& loader)
   bool const sirius_disabled = callback_ptr->is_disabled();
 
   if (!sirius_disabled) {
+    check_cuda_driver_version();
     // Config parsing above must remain NVTX-free. initialize_context creates Quent
     // before resolving hardware or constructing any instrumented runtime objects.
     callback_ptr->initialize_context();
@@ -3710,6 +3867,7 @@ static void LoadInternal(ExtensionLoader& loader)
   if (!sirius_disabled) {
     publish_transparent_optimizer_mask(config);
     default_to_explicit_delim_joins(config);
+    db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
 }
 

@@ -27,19 +27,20 @@ cmake = "4.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
 cxx-compiler = "*"
+git = "*"
 make = "*"
 ninja = "*"
 sccache = "=0.18.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
-clang = "21.*"
+clang = "22.*"
 wget = "*"
 pre-commit = "*"
 identify = "2.*"
-clang-tools = "21.*"
+clang-tools = "22.*"
 # Provides llvm-symbolizer (and friends) matching the clang version above, so
-# ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 21.*.
-llvm-tools = "21.*"
-lld = "21.*"
+# ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 22.*.
+llvm-tools = "22.*"
+lld = "22.*"
 pkg-config = "*"
 mold = "*"
 rust = "*"
@@ -50,6 +51,7 @@ croaring = "*"
 rumdl = ">=0.2.44"
 
 [feature.dev-libs.dependencies]
+asio = "*"
 catch2 = "3.*"
 librmm = "*"
 libcurand-dev = "*"
@@ -61,9 +63,13 @@ spdlog = "1.*"
 sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
+meson = "=1.12.1"
 openssl = "*"
 xxhash = "0.8.*"
 libcurl = "*"
+tomlplusplus = "*"
+# RAPIDS 26.10 / UCXX 0.52 requires UCX <1.22.
+ucx = "=1.21.0"
 pnpm = "*"
 python = "3.14.*"
 pyarrow = ">=14"
@@ -73,10 +79,34 @@ jansson = "*"
 snappy = "*"
 fastavro = "1.*"
 
+[feature.dev-libs.pypi-dependencies]
+# Local TPC-H Iceberg dataset writer; reuses the existing Python and PyArrow.
+pyiceberg = { version = "==0.12.0", extras = ["sql-sqlite"] }
+
 [tasks]
 # Differential fuzzer; see test/fuzz/README.md. Drives the DuckDB shell from the build.
 fuzz = { cmd = "PYTHONPATH=$PIXI_PROJECT_ROOT/test/fuzz python -m siriusfuzz", description = "Sirius fuzzer: run|doctor|replay|recheck|show-config|selftest (paths resolve from the current directory)" }
 fuzz-test = { cmd = "python -m unittest discover -s tests -t .", cwd = "test/fuzz", description = "Unit tests for the fuzzer harness (no GPU needed)" }
+
+[tasks._clang-tidy-configure]
+cmd = "cmake --preset clang-debug -B build/clang-tidy -U GIT_EXECUTABLE -DSIRIUS_TPCH_HAVOC=OFF"
+
+[tasks._clang-tidy-prepare]
+depends-on = ["_clang-tidy-configure"]
+cmd = """
+cmake --build build/clang-tidy --target cargo-build_telemetry_bridge simpatico_embedded_headers \
+  simpatico_codegen/tests/cache/fixtures/project/codegen/jit/embedded_headers.h \
+  simpatico_codegen/tests/cache/fixtures/cccl/codegen/jit/embedded_headers.h
+"""
+
+[tasks.clang-tidy]
+description = "Prepare generated headers and run advisory clang-tidy (optional source regexes and -j)."
+depends-on = ["_clang-tidy-prepare"]
+cmd = '''
+run-clang-tidy -p build/clang-tidy -warnings-as-errors='-*' \
+  -source-filter "$PIXI_PROJECT_ROOT/(src|test)/.*[.](c|cc|cpp|cxx)$" \
+  -header-filter "$PIXI_PROJECT_ROOT/(src|include|test)/"
+'''
 
 [tasks.duckdb]
 description = "Start the local DuckDB shell with Sirius loaded."
@@ -96,13 +126,13 @@ args = [{ arg = "output_dir", default = "telemetry_data" }]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
-cuda-version = "13.4.*"
+cuda-version = "13.5.*"
 libcudf = "==26.10.02"
 libcuvs = "==26.10.00"
 
 [feature.cuda13.activation.env]
-# GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120a, 120)
-CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120"
+# GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120f)
+CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100f-real;120f-real"
 VCPKG_CUDA_VERSION = "13"
 
 [feature.cuda12]
@@ -119,6 +149,8 @@ CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100-real;120-real"
 VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]
+autoconf = "*"
+automake = "*"
 # Enable S3 use for vcpkg cache
 awscli = "*"
 bison = "*"
@@ -126,6 +158,7 @@ libnvjitlink-dev = "*"
 cuda-nvrtc-dev = "*"
 libcurand-dev = "*"
 flex = "*"
+libtool = "*"
 patchelf = "*"
 zip = "*"
 
@@ -149,6 +182,7 @@ vcpkg = ["vcpkg", "cuda13"]
 vcpkg-cuda12 = ["vcpkg", "cuda12"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }
 docs = { features = ["docs"], no-default-feature = true }
+bindings = { features = ["bindings"], no-default-feature = true }
 
 [feature.docs]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
@@ -162,7 +196,7 @@ rust = "1.*"
 
 [feature.docs.tasks.docs-rust]
 description = "Build the Sirius Rust API reference without libsirius."
-cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps --target-dir build/docs/rust-target"
+cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --lib --no-deps --target-dir build/docs/rust-target"
 env = { DOCS_RS = "1", RUSTDOCFLAGS = "-D warnings" }
 
 [feature.docs.tasks.docs-theme]
@@ -190,3 +224,19 @@ depends-on = ["docs-theme"]
 description = "Build the combined C, C++ and Rust documentation site in build/docs/site."
 cmd = "rm -rf build/docs/site && mkdir -p build/docs/site && cp -R build/docs/c/html build/docs/site/c && cp -R build/docs/html build/docs/site/cpp && cp -R build/docs/rust-target/doc build/docs/site/rust && cp docs/site/index.html build/docs/site/index.html && cp docs/site/rust/index.html build/docs/site/rust/index.html"
 depends-on = ["docs-c", "docs-cpp", "docs-rust"]
+
+[feature.bindings]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.bindings.activation.env]
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
+
+[feature.bindings.dependencies]
+clang = "=23.1.3"
+libclang = "=23.1.3"
+rust = "1.95.*"
+
+[feature.bindings.tasks.generate-bindings]
+description = "Regenerate checked-in Rust C ABI declarations."
+cmd = "cargo check --locked --manifest-path rust/Cargo.toml -p sirius-sys --features generate-bindings"
+env = { DOCS_RS = "1" }

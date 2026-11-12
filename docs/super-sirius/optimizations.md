@@ -151,6 +151,95 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Correlated EXISTS MIN/MAX Rewrite
+
+**Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
+
+**Mechanism:** `rewrite_correlated_inequality_exists` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), before column bindings are resolved, so a replacement only has to emit the same bindings as the nodes it replaces. If it throws, the plan is copied again without it. It matches each subquery in either shape DuckDB produces:
+
+```
+delim_join_as_cte = false:  DELIM_JOIN (SEMI/ANTI, or MARK under FILTER(mark); IS NOT DISTINCT FROM)
+                             ├─ outer rows
+                             └─ [PROJECTION...] ← INNER JOIN(T, DELIM_GET) on  t.k = d.k  AND  t.x <> d.x
+delim_join_as_cte = true:   [RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = outer.k  AND  t.x <> outer.x
+```
+
+Either comparison may be null-safe (`IS NOT DISTINCT FROM` for the key, `IS DISTINCT FROM` for the value). Two or more matched joins nested through their outer rows whose scans read the same source (`capture_bound_read_view`) on the same base key column are replaced together, with one scan of `T`:
+
+```
+FILTER   EXISTS:     mn <> outer.x OR mx <> outer.x      (per subquery; projection map: the original columns)
+         NOT EXISTS: (that) IS NULL OR NOT (that)
+ └─ LEFT DELIM_JOIN on outer.k IS NOT DISTINCT FROM a.k
+     ├─ outer rows
+     └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
+          ← INNER JOIN(T, DELIM_GET(k))
+```
+
+`EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
+
+Plain SEMI/ANTI joins (`delim_join_as_cte = true`) over a table pinned in GPU memory, with every column they read, are left unmerged unless they are estimated not to fit on the GPU. Each such join scans its subquery's table and hashes its rows. That beats the merged aggregate only when the scans are cheap and the rows fit: q21 at SF1000 on a GB300 runs in 0.475 s unmerged against 0.531 s merged with `lineitem` pinned in GPU memory, but 8.2 s against 6.5 s without the pin. On a 32 GB RTX 4500 reading from S3, merging wins at SF1000 (10.7 s against 11.7 s) and at SF3000, where the unmerged joins spill (271 s against 54 s). The size estimate is the largest subquery scan's base-table row count times its key and value widths, since DuckDB's estimates of the subqueries' filters can be several times too low. The budget is the smallest GPU's downgrade threshold (`downgrade_trigger_fraction` of its capacity). Delim joins are merged regardless, as the merge was faster in every measured case.
+
+Because the merged plan reads one view fewer times than the original, `compare_read_views` (`src/transparent/read_view_registry.cpp`) accepts a candidate that reads an identical view fewer times, while still rejecting one that reads a new view, reads a view more often, or drops the only scan of a view.
+
+**Limits:**
+- Exactly one key and one value correlation, on an `INTEGER`/`BIGINT` key. The value must be an integer, fixed-point, temporal or duration type.
+- With `delim_join_as_cte = true`, plans where DuckDB keeps the delim join as a MARK join over a CTE scan (filtered or nullable subqueries) are not matched.
+
+**Code path:** `src/planner/sirius_plan_exists_rewrite.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`
+
+**Config:** `enable_exists_minmax_rewrite` (default `true`, see [Configuration](configuration.md)).
+
+### Sorted-Key Grouped Aggregation
+
+**Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
+
+**Mechanism:** For a batch with a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate, `grouped_aggregate_table()` verifies with `keys_ascending()` (`src/cuda/sorted_keys.cu`) that the key is ascending and, if so, builds the group-by with `cudf::sorted::YES`, so cuDF reduces runs of equal keys instead of hashing. Unsorted batches keep the hash path, so correctness never depends on the data layout. For integer, boolean, timestamp, duration and fixed-point keys the check is one `thrust::is_sorted` pass that stops at the first descent; `cudf::is_sorted`'s generic row comparator is about 2.4 times slower on a sorted INT64 column (SF1000 q18: 0.620 s with it, 0.597 s with the typed pass). Other keys use `cudf::is_sorted`. Verified-sorted keys also let the stable STDDEV_SAMP path skip its own sort.
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`
+
+**Config:** Always on. TPC-H SF1000 on a GB300, together with natural-order pinning: q18 1.148 s → 0.830 s.
+
+### Order-Preserving Partition and Sorted Merge
+
+**Motivation:** After a sorted-key partial aggregation each partial is sorted, and with a table pinned in key order the partials cover consecutive key ranges. `cudf::hash_partition` does not keep row order, so the merge had to hash and re-aggregate everything (q18: 352 ms of merge kernels at SF1000).
+
+**Mechanism:** Both parts decide from the data, so there is no setting:
+1. **Partition:** `hash_partition()` checks whether a single fixed-width, non-floating-point partition key is ascending. If so it uses a stable partition (`cudf::stable_sorted_order` of the partition ids, then a gather) that keeps the input order within each partition; otherwise it calls `cudf::hash_partition` as before. Both assign a row by its MurmurHash3 row hash modulo the partition count, so batches of one input may take either path and a key still lands in one partition.
+2. **Merge:** for a single fixed-width, non-floating-point group key, `merge_grouped_aggregate()` orders the incoming partials by their first key (gathered into one column, sorted on the device and read back with one synchronization), concatenates them, verifies the result with `keys_ascending()`, and uses the sorted-keys group-by if it passes. Any other input keeps the hash merge.
+
+**Code path:** `src/op/partition/gpu_partition_impl.cpp` — `hash_partition()`; `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`
+
+**Config:** None. TPC-H SF1000 on a GB300, on top of the sorted-key aggregation: q18 0.830 s → 0.639 s; no other query moved by more than run-to-run noise.
+
+### Natural-Order Parquet Pinning
+
+**Motivation:** `pin_table` lists local parquet files in directory order, and each pinned chunk packs several files, so a table stored sorted across numbered files (`part.0`, `part.1`, …) pinned into chunks whose rows are out of order: at TPC-H SF1000 only 3 of q18's 39 lineitem batches were in `l_orderkey` order.
+
+**Mechanism:** `pin_table` sorts the file list with glibc `strverscmp` (digit runs compared numerically, so `part.2` precedes `part.10`) before materializing, so chunks hold consecutive files. Nothing relies on the order for correctness: the consumers verify sortedness themselves, and matching a scan's files to a pinned entry ignores order.
+
+**Code path:** `src/sirius_extension.cpp` — pin file list
+
+**Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply.
+
+### Low-Cardinality Grouped Aggregation (experimental)
+
+**Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
+
+**Mechanism:** A custom CUDA kernel path, tried first by `grouped_aggregate_table()`:
+1. `find_groups_kernel` builds a 16-bit code from up to two one-character string keys, verifies every key length, and records the codes present and one representative row per code.
+2. The host maps the codes to at most 64 dense groups.
+3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
+4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
+
+It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+
+**Code path:**
+- `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
+- `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
+
+**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
@@ -163,6 +252,25 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 Only applies to INNER and LEFT joins with pure equality conditions (excludes IS NOT DISTINCT FROM due to `null_equality::UNEQUAL` semantics).
 
 **Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_columns()`, `src/op/sirius_physical_hash_join.cpp` — distinct hash table construction
+
+Parquet scans declare no PRIMARY KEY; for them, [Pin-Proven Unique Join Keys](#pin-proven-unique-join-keys) supplies the proof from pin-time facts.
+
+### Pin-Proven Unique Join Keys
+
+**Motivation:** The distinct hash join needs a proof that the build keys are unique, and for a base table the only proof was a declared PRIMARY KEY. Parquet tables declare none, so every join over pinned parquet took the two-pass `cudf::hash_join` (a count pass, then a retrieve pass), even for keys such as `o_orderkey` or `s_suppkey`. The runtime distinctness check is off by default (issue #1600).
+
+**Mechanism:** Two parts:
+1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports every output column whose pinned column was proven distinct at pin time, each as a key on its own (`prove_unique_columns()` tracks alternative keys, so a join on any one of them is proven). Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
+2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column of a parquet pin (and of a native table's pin when late materialization is on). A column must be an integer (or any column of a table under one million rows, such as `nation.n_name`, which a late-materialization ride can use), and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`; when it, the free GPU memory or a reservation is short, integer columns keep their check ahead of the others.
+
+Composite keys are not covered, because the proof is per column.
+
+**Code path:**
+- `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_from_pin()`, `prove_unique_columns()`
+- `src/late_mat/pin_uniqueness.cpp` — `unique_probe`, `exact_uniqueness_byte_cap()`
+- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — which pins are observed, and attaching the facts
+
+**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
 
 ### Scan Scheduling Tuning (PR #507)
 
@@ -386,8 +494,8 @@ distinctness proof.
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
 
 **Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
-`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
-which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+The pin-time uniqueness probe (`pin_table_prove_unique_keys`, on by default) supplies the proof
+that a group-by-rowid ride needs. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
 floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.
@@ -465,13 +573,13 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Repeated parquet reads pay full file-system cost on every query. A pinned-memory cache between the file and cuDF's parquet reader can serve subsequent reads at H2D-copy speed without re-reading from disk.
 
-**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache converts hits, claimed chunks, and gaps into one logical prepared-slice batch; `templated_ioctx` balances that batch across the two least-busy reactors with one shared coordinator. The worker chooses 256 KiB–16 MiB physical operations, uses `O_DIRECT` when the complete operation is compatible, and holds any multi-block CuCascade staging through its CUDA event. Cache-hit H2D copies likewise hold pins and a completion credit until the stream reaches them. A packed `atomic<uint64_t>` state machine combines lifecycle, reader pins, populated extent, and subscribers so coverage checks and claims are one CAS. Eviction is driven by a tiered LRU score; read-ahead budgets bound work while completion credits make teardown wait for all cache-owned accesses.
+**Mechanism:** The io layer this PR introduced as `sirius::io` is now consumed from cuCascade (`cucascade::io`; see the [Scan](scan.md#io-layer-cucascade-io) doc). It provides a `cudf::io::datasource` (`cucascade::io::datasource`) backed by io_uring and an optional pinned-memory chunk cache (`fs_cache`, formerly `prefetching_cache`). The cache converts hits, claimed chunks, and gaps into one logical prepared-slice batch; the context splits it into grouped requests sharing one coordinator and pushes each onto the queue of one of the two least-backlogged reactors (on a uring reactor, demand reads wait in a high-priority tier ahead of prefetches). A reactor, one worker thread with its own ring, chooses 256 KiB–16 MiB physical operations, uses `O_DIRECT` when the complete operation is compatible, and holds any multi-block CuCascade staging through its CUDA event. Cache-hit H2D copies likewise hold pins and a completion credit until the stream reaches them. A packed `atomic<uint64_t>` state machine combines lifecycle, reader pins, populated extent, and subscribers so coverage checks and claims are one CAS. A background evictor reclaims the chunks of finished scans (at its next pass under `eviction: idle`; under pinned-host-memory pressure with `lru`); read-ahead budgets bound work while completion credits make teardown wait for all cache-owned accesses.
 
 **Code path:**
-- `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
-- `src/io/cache/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
-- `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
-- `src/include/io/io_request.hpp` — prepared request grouping and exact completion fan-in
+- `cucascade/src/cudf/datasource.cpp` — `cudf::io::datasource` implementation
+- `cucascade/src/io/cache/fs_cache.cpp` — chunk cache and evictor
+- `cucascade/src/io/uring/uring_reactor.cpp` — io_uring reactor (worker thread, ring, pinned staging)
+- `cucascade/include/cucascade/io/io_request.hpp` — prepared request grouping and exact completion fan-in
 
 ### DuckDB-Native Scan Metadata Walk (PRs #868, #895, #936, #900)
 
@@ -490,19 +598,19 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** The DuckDB-native decoder issues many small segment reads. Synchronous `host_read()` calls bypass the datasource backend in favor of direct `pread()`, serializing I/O and inflating the request count per split.
 
-**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `sirius_datasource::host_read_ranges_async()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
+**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `cucascade::io::datasource::host_read_ranges_async()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
 
 **Code path:** `src/op/scan/duckdb_native_decoder.cpp` — range coalescing and `host_read_ranges_async()` dispatch
 
-### Async S3 / REST Reactor Backend (PR #859)
+### Async S3 / REST Backend (PR #859)
 
 **Motivation:** A per-request serial S3 backend staged each chunk as GET → H2D copy → `cudaStreamSynchronize`, serializing the GPU stream once per chunk and leaving request latency unhidden — costly when the reader issues many small ranged reads over high-RTT links.
 
-**Mechanism:** The remote read path is an asynchronous, concurrent reactor that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend, so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into a bounded pinned host staging block, then `cudaMemcpyAsync` H2D, detecting completion by polling a per-chunk `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` chunks are in flight while host staging stays O(`max_connections`).
+**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives its own libcurl multi handle), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
 
 **Code path:**
-- `src/io/rest/rest_reactor.cpp`, `src/io/rest/rest_ioctx.cpp` — async REST/S3 reactor over the shared `templated_ioctx` base
-- `src/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
+- `cucascade/src/io/rest/rest_reactor.cpp`, `cucascade/src/io/rest/rest_ioctx.cpp` — REST reactor and context over the shared `templated_ioctx` base
+- `cucascade/include/cucascade/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
 
 **Config:** `object_store` config (endpoint / region / credentials / signing mode) under `executor.scan_manager`
 
@@ -510,9 +618,9 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** A cold S3 parquet bind issued a HEAD for the object size plus separate trailer and footer GETs — three round-trips per file over high-RTT links.
 
-**Mechanism:** Opening with `open_hint::parquet_footer_probe` makes the REST backend issue one suffix-range GET (`Range: bytes=-N`), which returns the object size (from `Content-Range`) and stashes the trailing N bytes on the open object; the reactor then serves cuDF's trailer/footer reads from that per-open stash. `describe_parquet` is metadata-aware: a cold bind probes, while a warm re-bind opens `generic` (one HEAD) and reuses the parsed footer from the metadata store. Unusable suffix responses (a 200 full-body reply, 416, or a missing `Content-Range`) abort the body mid-stream and fall back to a plain HEAD. See the scan doc's S3 backend section for the open-path details.
+**Mechanism:** Opening with `open_hint::parquet_footer_probe` makes the REST backend issue one suffix-range GET (`Range: bytes=-N`), which returns the object size (from `Content-Range`) and stashes the trailing N bytes on the open object; the REST backend then serves cuDF's trailer/footer reads from that per-open stash. `describe_parquet` is metadata-aware: a cold bind probes, while a warm re-bind opens `generic` (one HEAD) and reuses the parsed footer from the metadata store. Unusable suffix responses (a 200 full-body reply, 416, or a missing `Content-Range`) abort the body mid-stream and fall back to a plain HEAD. See the scan doc's S3 backend section for the open-path details.
 
-**Code path:** `src/io/io_context.hpp` — `open_hint`; `src/io/rest/rest_ioctx.cpp`, `src/io/rest/rest_reactor.cpp`; `src/io/cache/metadata_store.cpp`; `src/scan_manager/sirius_scan_manager.cpp`
+**Code path:** `cucascade/include/cucascade/io/io_context.hpp` — `open_hint`; `cucascade/src/io/rest/rest_ioctx.cpp`, `cucascade/src/io/rest/rest_reactor.cpp`; `cucascade/src/io/cache/metadata_store.cpp`; `src/scan_manager/sirius_scan_manager.cpp`
 
 **Config:** `scan_manager.rest.footer_probe_bytes` (default 512 KiB) — must cover the footer or the probe falls back to a body re-GET
 
@@ -531,17 +639,17 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** A read often overlaps the cache only partially. Treating a partial overlap as a miss re-reads bytes already pinned in the cache, and a prefetch-only cache never warms itself from ordinary reads.
 
-**Mechanism:** The prefetching cache is chunk-granular (a fixed chunk size backed by a cuCascade pinned pool) and serves partial reads from cache while populating the cache on read, OS-page-cache style:
+**Mechanism:** The prefetching cache (now cuCascade's `fs_cache`) is chunk-granular (a fixed chunk size backed by a cuCascade pinned pool) and serves partial reads from cache while populating the cache on read, OS-page-cache style:
 - On `device_read_async`, cached chunks are copied straight to the device buffer; the remaining chunks complete the read using pinned chunks in the cache. When the backend supports host-to-device reads, the coverage policy is `partial` so only the uncached chunks hit the backend.
-- A read whose chunks are not yet cached can populate those chunk buffers as it reads (interior chunks are cached; block-aligned partial head/tail boundary chunks are read through an internal bounce slot and not cached), so a subsequent read of the same range is a hit.
-- Chunk readiness uses a packed atomic state machine; admission control caps concurrent in-flight chunks and a tiered-LRU evictor returns chunks to the pool. Asynchronous results are delivered through the `exec::semi_future` primitive, which can be waited on or connected to an executor callback.
+- A read whose chunks are not yet cached can populate those chunk buffers as it reads (a piece the cache cannot load is read through the backend's own staging and left uncached), so a subsequent read of the same range is a hit.
+- Chunk readiness uses a packed atomic state machine, and a background evictor returns chunks to the pool. Asynchronous results are delivered through the `exec::semi_future` primitive, which can be waited on or connected to an executor callback.
 
 **Code path:**
-- `src/io/cache/prefetching_cache.cpp` — `device_read_async()`, partial-read + populate-on-read, evictor
-- `src/io/io_context.cpp` — `ioctx` cache integration and coverage policy
-- `src/exec/semi_future.hpp` — async I/O completion primitive
+- `cucascade/src/io/cache/fs_cache.cpp` — `device_read_async()`, partial-read + populate-on-read, evictor
+- `cucascade/src/io/io_context.cpp` — `ioctx` cache integration and coverage policy
+- `cucascade/include/cucascade/exec/semi_future.hpp` — async I/O completion primitive (re-exported by Sirius's `src/exec/semi_future.hpp`)
 
-**Config:** the `cache` block under `executor.scan_manager` — `mode: sirius` arms it, `eviction` (`lru` / `idle`) picks what retires an idle chunk, and `eviction_threshold_fraction` / `min_prefetching_budget_fraction` size it
+**Config:** the `cache` block under `executor.scan_manager` — `mode: cucs` builds it, `eviction` (`lru` / `idle`) picks what retires an idle chunk, and `eviction_threshold_fraction` / `min_prefetching_budget_fraction` size it
 
 ### Load-Balanced Scan Batch Coalescing (PR #997)
 
@@ -554,7 +662,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/scan_manager/balancing_strategy.hpp`, `src/scan_manager/round_robin_strategy.cpp` — device-distribution interface and default
 - `src/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
 
-**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and reactor counts
+**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and the io reactor counts (`uring_n_reactors` / `rest_n_reactors`)
 
 ### Zone-Map Pruning on Pinned Chunks (PR #1154)
 

@@ -15,7 +15,6 @@
  */
 
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 

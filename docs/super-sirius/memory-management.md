@@ -70,7 +70,20 @@ memory_capacity = 1TB;          // total spill capacity
 
 ## Parquet scan working sets
 
-Virtual-column reader scans budget selected rows before filtering, including cuDF source/row indexes, output columns and filter/cast scratch. Plain Parquet no longer needs the old per-row-group concatenation allowance; Iceberg still does. Filename estimates include characters, offsets and construction buffers, with saturating arithmetic.
+Index estimates use the input rows in selected row groups, before reader filtering. A cuDF row index is UINT64 (8 B/row); a source index is INT32 (4 B/row), omitted for a single reader source. Estimates allow both pre-filter and filtered index columns to coexist.
+
+Iceberg scans without virtual columns use interval deletion before query predicates when deletes are present. They add no internal row/source index workspace and have no alternative position peak selected at split emission.
+
+Virtual scans already budget their output columns, reader indices and selection/cast scratch; deletion adds only missing index allowances and delete storage. Source costs are conservative before coalescing, so virtual estimates may retain a source allowance for a single-file split. Filename estimates include characters, offsets and construction buffers. Arithmetic saturates on overflow. These are buffer estimates, not an exact bound on all cuDF decoder scratch.
+
+File/split preparation charges retain the same additive row-group estimate from registration through consumption. Batch fill and execution omit the deletion-position allowance when the split's selected row groups contain no deletes. If groups with and without deletes share a filtered split, its position allowance covers every input row. Plain Parquet and Iceberg reader-mode virtual scans reserve one combined reader result rather than per-row-group table concatenation.
+
+Virtual scans eligible for reader-position deletion capture their dynamic-filter snapshot when the split is emitted. Admission
+checks the same snapshot and static reader translation as decode, on the target GPU. Without a
+usable reader predicate, the execution estimate excludes the internal position workspace and
+decode retains interval deletion; filters published later cannot enable positions for that split.
+User-requested virtual columns retain their own workspace. Pipeline memory history and retry
+floors still apply independently; this removes the position estimate, not other measured peaks.
 
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 
@@ -122,8 +135,8 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 1. Caller invokes `request_downgrade(predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`.
 2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
 3. For each request, the processing loop fetches candidates lazily in tiered order:
-   - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
-   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
+   - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle batches resident in the executor's source space one at a time
+   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue. Only the task's batches in the executor's source space are moved; inputs it holds in other spaces are left to that space's executor
 4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. The `predicate` is evaluated both **before dispatching each candidate** (a request that is already satisfied — e.g. the caller's reservation landed, or the running query freed memory — spills nothing) and after each conversion. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
 
 **Byte-targeted requests** (`downgrade_request::target_bytes`, set by monitor requests and `request_free_memory`) additionally stop dispatching once the *planned* bytes (freed + in-flight) cover the target, bounding overshoot to less than one batch regardless of pool width, and right-size the final pick per repository (`spill_policy.hpp`: smallest candidate that still covers the remaining deficit, ties in policy order). Together these keep a marginal overflow from evicting a whole extra multi-GB partition — the q9-class partition-spill cliff, where +0.1% of input rows doubled the spilled set and its host round-trips.
@@ -158,9 +171,9 @@ The compressed host representation decodes with the converter `pin_table` alread
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
 1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
-2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. A queued task can hold inputs in several spaces (inputs that were only partly spilled, a build batch shared from another GPU); only the batches still in the source space are converted, and the request is credited with the bytes that actually moved. Tasks are returned to the queue via RAII on all code paths.
 
-Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
+Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically per batch. A task is not a unit of rollback: its batches convert one at a time, and if a later batch throws, the ones already moved stay at the target but the request is credited nothing for the task, since the exception discards the running totals. Credited bytes are the batches' sizes in the source space, not what they occupy at the target (a batch spilled compressed is credited at its uncompressed GPU size).
 
 ## Memory Consumption History
 

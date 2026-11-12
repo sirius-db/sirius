@@ -16,13 +16,7 @@
 
 #include "config.hpp"
 
-#include "log/logging.hpp"
-
 namespace duckdb {
-
-uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 512ULL * 1024 * 1024;  ///< 50 MB
-
-uint64_t Config::MAX_SORT_PARTITION_BYTES = 0;  ///< 0 = auto (33% of available GPU memory)
 
 std::string Config::LOG_BACKEND = "spdlog";
 std::string Config::LOG_LEVEL   = "info";

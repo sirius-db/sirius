@@ -17,11 +17,9 @@
 #include "planner/connector_registry.hpp"
 
 #include "exec/stream_plan_bindings.hpp"
-#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
-#include "op/scan/field_id_mapping.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
@@ -38,21 +36,26 @@
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/extension/external_extension_provider.hpp>
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/main/extension_manager.hpp>
 #include <duckdb/main/settings.hpp>
+#include <duckdb/parser/tableref/table_function_ref.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
-#include <link.h>
 #include <parquet_extension.hpp>
+#include <parquet_multi_file_info.hpp>
 
+#include <algorithm>
 #include <array>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_set>
 
@@ -376,7 +379,8 @@ duckdb_extension_describe_t host_parquet_descriptor(duckdb::DatabaseInstance& db
 }
 
 duckdb::vector<duckdb::TableFunction> parquet_reference_functions(duckdb::DatabaseInstance& db,
-                                                                  std::string const& name)
+                                                                  std::string const& name,
+                                                                  bool reader_interface = false)
 {
   auto init = host_parquet_descriptor(db);
   if (!init) return {};
@@ -388,8 +392,33 @@ duckdb::vector<duckdb::TableFunction> parquet_reference_functions(duckdb::Databa
   reference.LoadStaticExtension(init);
   duckdb::ExtensionLoader loader(*reference.instance, "parquet");
   auto entry = loader.TryGetTableFunction(duckdb::Identifier(name));
-  return entry ? copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions)
-               : duckdb::vector<duckdb::TableFunction>{};
+  if (!entry) return {};
+  auto functions = copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions);
+  if (!reader_interface || functions.empty()) return functions;
+
+  // Parquet's custom bind leaves function_info empty. Bind the independently
+  // registered callback against an empty file list to obtain its nested reader
+  // and settings without opening a file or consulting the caller's catalog.
+  duckdb::Connection connection(reference);
+  auto trusted = functions.front();
+  duckdb::BoundTableFunction bound(trusted);
+  duckdb::vector<duckdb::Value> inputs{duckdb::Value::LIST(duckdb::LogicalType::VARCHAR, {})};
+  duckdb::named_argument_map_t options;
+  options["allow_empty"] = duckdb::Value::BOOLEAN(true);
+  duckdb::vector<duckdb::LogicalType> input_types, result_types;
+  duckdb::vector<duckdb::Identifier> input_names, result_names;
+  duckdb::TableFunctionRef ref;
+  duckdb::TableFunctionBindInput input(
+    inputs, options, input_types, input_names, nullptr, nullptr, bound, ref);
+  auto data        = trusted.bind(*connection.context, input, result_types, result_names);
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(data.get());
+  auto const* wrapper =
+    bind ? dynamic_cast<duckdb::TableFunctionMultiFileWrapper const*>(bind->interface.get())
+         : nullptr;
+  if (!wrapper || bind->initial_reader) return {};
+  trusted.function_info = duckdb::make_shared_ptr<duckdb::TableFunctionMultiFileInfo>(
+    wrapper->function, wrapper->settings);
+  return {std::move(trusted)};
 }
 
 duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
@@ -467,7 +496,9 @@ struct verified_callbacks {
   duckdb::TableFunction const& reference;
 
   template <class Function>
-  bool matches(Function const& candidate, unsigned depth = 0) const
+  bool matches(Function const& candidate,
+               unsigned depth              = 0,
+               bool verified_provider_info = false) const
   {
     // Initialization, binding/copy, and optimizer callbacks can change the reader's semantics
     // even when its scan body is unchanged. Only presentation/profiling callbacks are excluded.
@@ -546,7 +577,7 @@ struct verified_callbacks {
                                                        candidate.is_repeatable,
                                                        candidate.set_partitions_to_scan,
                                                        candidate.parallelism) &&
-           matches_info(candidate.function_info.get(), depth);
+           (verified_provider_info || matches_info(candidate.function_info.get(), depth));
   }
 
   bool matches_info(duckdb::TableFunctionInfo const* candidate, unsigned depth) const
@@ -569,6 +600,7 @@ struct verified_callbacks {
                     a.sample_files_parameter,
                     a.sampled_schema_is_union,
                     a.claim_batch,
+                    a.prepare_batch,
                     a.finish_batch,
                     a.supports_read_ahead,
                     a.schedule_io,
@@ -584,6 +616,7 @@ struct verified_callbacks {
                                                      b.sample_files_parameter,
                                                      b.sampled_schema_is_union,
                                                      b.claim_batch,
+                                                     b.prepare_batch,
                                                      b.finish_batch,
                                                      b.supports_read_ahead,
                                                      b.schedule_io,
@@ -637,6 +670,32 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
     if (name == "iceberg") initialize_iceberg_callbacks(db);
   }
 };
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+struct connector_override_scope {
+  duckdb::DatabaseInstance const* db;
+  std::shared_ptr<std::vector<connector> const> overrides;
+};
+std::mutex override_scopes_mutex;
+std::vector<connector_override_scope> override_scopes;
+
+// Retain the immutable override set under the lock, then release the lock before
+// verification or callbacks.
+std::shared_ptr<std::vector<connector> const> overrides_for(duckdb::DatabaseInstance const& db)
+{
+  std::lock_guard lock(override_scopes_mutex);
+  for (auto const& scope : override_scopes)
+    if (scope.db == &db) return scope.overrides;
+  return nullptr;
+}
+
+connector const* override_for(std::vector<connector> const* overrides, std::string const& name)
+{
+  if (!overrides) return nullptr;
+  for (auto const& candidate : *overrides)
+    if (candidate.function_name == name) return &candidate;
+  return nullptr;
+}
+#endif
 }  // namespace
 
 std::span<connector const> registered_connectors() { return entries; }
@@ -674,16 +733,51 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   initialize_iceberg_callbacks(db);
 }
 
+bool verified_parquet_interface(duckdb::FunctionData const* data, duckdb::ClientContext& context)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(data);
+  auto const* wrapper =
+    bind ? dynamic_cast<duckdb::TableFunctionMultiFileWrapper const*>(bind->interface.get())
+         : nullptr;
+  if (!wrapper) return false;
+  auto& db         = duckdb::DatabaseInstance::GetDatabase(context);
+  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
+  // The host exports its registration entry point, but may hide individual Parquet
+  // factories. Resolve the nested reader through the same independent catalog used
+  // for top-level callbacks, never through the caller's mutable catalog.
+  static accepted_callbacks cache;
+  std::lock_guard lock(cache.mutex);
+  auto const& references = cache.reference.get_or_resolve(
+    host, [&] { return parquet_reference_functions(db, "parquet_scan", true); });
+  duckdb::TableFunctionMultiFileInfo candidate(wrapper->function, wrapper->settings);
+  for (auto const& reference : references) {
+    if (verified_callbacks(reference).matches_info(&candidate, 0)) return true;
+  }
+  return false;
+}
+
 template <class Function>
 lookup_outcome lookup_connector_classified_impl(Function const& function,
                                                 duckdb::FunctionData const* bind,
                                                 duckdb::ClientContext& context)
 {
   bool function_known = false;
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+  auto const scoped_overrides = overrides_for(duckdb::DatabaseInstance::GetDatabase(context));
+#endif
   for (size_t i = 0; i < entries.size(); ++i) {
-    auto const& entry = entries[i];
-    if (entry.function_name != function.GetName()) continue;
+    auto const& registered = entries[i];
+    if (registered.function_name != function.GetName()) continue;
     function_known = true;
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+    // An installed override supplies the policy and hooks; trust verification below still
+    // uses the registered entry's reference cache.
+    auto const* overriding = override_for(scoped_overrides.get(), registered.function_name);
+    auto const& entry      = overriding ? *overriding : registered;
+#else
+    auto const& entry = registered;
+#endif
+
     if (!entry.bind_data_matches(bind)) continue;
     // The catalog's destructor identifies its host without a loader lookup per scan.
     auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(context));
@@ -717,9 +811,11 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
       }
       return {nullptr, lookup_decline::no_trusted_reference};
     }
+    if (entry.verify_binding && !entry.verify_binding(function, bind, context))
+      return {nullptr, lookup_decline::bind_data_mismatch};
     for (auto const& reference : references) {
       verified_callbacks const callbacks(reference);
-      if (!callbacks.matches(function)) continue;
+      if (!callbacks.matches(function, 0, entry.verify_binding != nullptr)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
         if (callbacks.matches(*registered)) return {&entry, lookup_decline::none};
       }
@@ -760,4 +856,42 @@ connector const* lookup_connector(duckdb::PhysicalTableScan const& get,
 {
   return lookup_connector(get.function, get.bind_data.get(), context);
 }
+
+#ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
+namespace testing {
+scoped_connector_overrides::scoped_connector_overrides(duckdb::DatabaseInstance const& db,
+                                                       std::vector<connector> overrides)
+  : db_(&db)
+{
+  for (auto const& candidate : overrides) {
+    auto const known = std::ranges::any_of(
+      entries, [&](auto const& entry) { return entry.function_name == candidate.function_name; });
+    if (!known)
+      throw std::invalid_argument("connector override names an unregistered function: " +
+                                  candidate.function_name);
+    if (!candidate.bind_data_matches)
+      throw std::invalid_argument("connector override requires a bind-data matcher: " +
+                                  candidate.function_name);
+    auto const duplicates = std::ranges::count_if(
+      overrides, [&](auto const& other) { return other.function_name == candidate.function_name; });
+    if (duplicates != 1)
+      throw std::invalid_argument("connector override repeats function: " +
+                                  candidate.function_name);
+  }
+  std::lock_guard lock(override_scopes_mutex);
+  if (std::ranges::any_of(override_scopes, [&](auto const& scope) { return scope.db == db_; }))
+    throw std::logic_error("a connector override scope is already installed for this database");
+  override_scopes.push_back(
+    {db_, std::make_shared<std::vector<connector> const>(std::move(overrides))});
+}
+
+scoped_connector_overrides::~scoped_connector_overrides()
+{
+  std::lock_guard lock(override_scopes_mutex);
+  std::erase_if(override_scopes, [&](auto const& scope) { return scope.db == db_; });
+}
+
+bool connector_overrides_linked() { return true; }
+}  // namespace testing
+#endif
 }  // namespace sirius::planner

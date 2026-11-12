@@ -177,6 +177,11 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
   // then applies the configured fallback policy. Planner-generated restores bypass translation.
   auto const& source_type = duckdb::BoundCastExpression::Child(expr).GetReturnType();
   auto const& target_type = expr.GetReturnType();
+  // cuDF's cast does not parse strings as numbers. DuckDB must handle CAST errors and
+  // TRY_CAST's null-on-invalid semantics until a compatible GPU parser exists.
+  if (source_type.id() == duckdb::LogicalTypeId::VARCHAR && target_type.IsNumeric()) {
+    return nullptr;
+  }
   if ((source_type.IsTemporal() && target_type.IsNumeric()) ||
       (source_type.IsNumeric() && target_type.IsTemporal())) {
     return nullptr;
@@ -258,20 +263,6 @@ bool gpu_supports_abs(duckdb::BoundFunctionExpression const& expr)
          type.id() != duckdb::LogicalTypeId::UHUGEINT;
 }
 
-// HUGEINT `//` and `%` run on the GPU only by a constant other than 0 and -1: cuDF leaves a zero
-// divisor's row undefined and wraps HUGEINT_MIN // -1, where DuckDB raises an error (or returns
-// NULL under TRY).
-bool gpu_supports_hugeint_division(duckdb::BoundFunctionExpression const& expr)
-{
-  auto const& divisor = *expr.GetChildren()[1];
-  if (expr.GetReturnType().id() != duckdb::LogicalTypeId::HUGEINT) { return true; }
-  if (divisor.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return false; }
-  auto const& value = divisor.Cast<duckdb::BoundConstantExpression>().GetValue();
-  if (value.IsNull()) { return false; }
-  auto const divisor_value = value.GetValue<duckdb::hugeint_t>();
-  return divisor_value != duckdb::hugeint_t(0) && divisor_value != duckdb::hugeint_t(-1);
-}
-
 // Unsigned (DuckDB rejects nonzero), HUGEINT and INTERVAL negation stay on the CPU.
 // cuDF's negation keeps its input type, so the result type must match it.
 bool gpu_supports_negate(duckdb::BoundFunctionExpression const& expr)
@@ -313,10 +304,6 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   auto const func_id_opt = sirius::from_duckdb_function_name(name, children.size());
   if (!func_id_opt.has_value()) { return nullptr; }
   if (*func_id_opt == function_id::negate && !gpu_supports_negate(expr)) { return nullptr; }
-  if ((*func_id_opt == function_id::int_div || *func_id_opt == function_id::mod) &&
-      !gpu_supports_hugeint_division(expr)) {
-    return nullptr;
-  }
   if (*func_id_opt == function_id::date_trunc) {
     // Match the GPU evaluator's supported frequencies. It requires a constant string;
     // reject other forms here so neither unsupported units nor dynamic units reach execution.

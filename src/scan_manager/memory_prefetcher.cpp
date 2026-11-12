@@ -16,7 +16,6 @@
 
 #include "scan_manager/memory_prefetcher.hpp"
 
-#include "cuda/device_health.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"

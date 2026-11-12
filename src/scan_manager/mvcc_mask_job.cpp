@@ -27,6 +27,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/error_data.hpp>
 #include <duckdb/transaction/transaction_data.hpp>
 
 #include <algorithm>
@@ -155,9 +156,11 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
       try {
         return op::scan::capture_mvcc_visibility_plan(
           *request.storage, *request.context, request.metadata);
+      } catch (duckdb::InterruptException const&) {
+        throw;
       } catch (std::exception const& e) {
-        throw std::runtime_error("[prepare_mvcc_mask_tasks] pinned entry '" + request.entry_name +
-                                 "': " + e.what());
+        duckdb::ErrorData(e).Throw("[prepare_mvcc_mask_tasks] pinned entry '" + request.entry_name +
+                                   "': ");
       }
     }();
     if (plan.mvcc_row_groups.size() != request.masks.size() ||

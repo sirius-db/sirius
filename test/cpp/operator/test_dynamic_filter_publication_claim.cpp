@@ -24,36 +24,25 @@
  * decision.
  */
 
-#include "expression/join_condition.hpp"
-#include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "operator_test_utils.hpp"
 #include "utils/dynamic_filter_publication_fixture.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cudf/types.hpp>
-#include <cudf/utilities/error.hpp>
 
-#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
-#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <data/sirius_converter_registry.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/operator/logical_comparison_join.hpp>
 
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <future>
 #include <memory>
 #include <optional>

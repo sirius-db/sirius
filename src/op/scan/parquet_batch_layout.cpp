@@ -7,7 +7,7 @@
 
 #include "op/scan/parquet_batch_layout.hpp"
 
-#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
 
 #include <limits>

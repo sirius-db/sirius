@@ -12,17 +12,15 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <utils/parquet_fixture_utils.hpp>
 
 #include <cstdint>
 #include <string>
-#include <variant>
 #include <vector>
 
 namespace {

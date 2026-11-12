@@ -15,10 +15,10 @@
  */
 
 #include "operator_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <creator/task_creator.hpp>
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -90,7 +90,7 @@ static auto make_source(std::set<sender_id_t> expected = {SOLE_SENDER})
 static std::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipeline(
   sirius_physical_streaming_source& op)
 {
-  sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*pipeline, op);
@@ -612,7 +612,7 @@ TEST_CASE("streaming_source SRC-18: sink pushes batch to downstream boundary por
   auto output = op->execute(*input, stream);
 
   // Create a downstream operator and wire up a port+repo.
-  sirius_physical_operator downstream_op;
+  sirius::op::test_physical_operator downstream_op;
   auto downstream_repo           = std::make_unique<cucascade::shared_data_repository>();
   auto downstream_port           = std::make_unique<sirius_physical_operator::port>();
   downstream_port->type          = MemoryBarrierType::FULL;

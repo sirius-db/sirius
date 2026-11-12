@@ -32,41 +32,6 @@
 #include <unordered_map>
 #include <vector>
 
-namespace duckdb {
-
-struct PinTableArgs {
-  std::string path;
-  std::string tier;
-  std::string name;
-  std::optional<std::vector<std::string>> cols;
-  /// Optional per-call request for Simpatico pin compression. When omitted,
-  /// the legacy session/config setting remains the default.
-  std::optional<bool> compression;
-  /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
-  /// `format` named parameter, else inferred from the path extension
-  /// (.parquet -> parquet, .db/.duckdb -> duckdb).
-  std::string format;
-  /// duckdb-native only: schema that contains the table named by `name`. Defaults
-  /// to "main"; the catalog search path (current/USE'd database) still applies.
-  std::string schema = "main";
-};
-
-void pin_table_to(const PinTableArgs& args);
-
-void unpin_table_to(const std::string& name);
-
-// Test-only helpers used by unit tests to verify pin_table forwards the
-// correct parameters to pin_table_to. Not part of the stable public API.
-namespace pin_table_testing {
-const std::vector<PinTableArgs>& recorded_calls();
-void clear_recorded_calls();
-
-const std::vector<std::string>& recorded_unpin_calls();
-void clear_recorded_unpin_calls();
-}  // namespace pin_table_testing
-
-}  // namespace duckdb
-
 namespace cudf {
 class table;
 class column;
@@ -86,15 +51,16 @@ namespace cucascade::memory {
 class memory_space;
 }  // namespace cucascade::memory
 
+namespace cucascade::io {
+class ioctx;
+}  // namespace cucascade::io
+
 namespace sirius {
 
 namespace op::scan {
 class gpu_ingestible;
 class scan_info;
 }  // namespace op::scan
-namespace io {
-class ioctx;
-}  // namespace io
 namespace scan_manager {
 class host_pin_placement;
 }  // namespace scan_manager
@@ -177,9 +143,12 @@ struct pin_materialization_options {
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
   /// Positional with the pinned columns: observe this column for whole-table
   /// distinctness (see @c late_mat::unique_probe). Empty — or all false —
-  /// leaves the probe off, which is the default; the caller derives it from
-  /// @c late_mat::pin_unique_probe_selection.
+  /// leaves the probe off.
   std::vector<bool> probe_unique_columns;
+  /// Cap on the bytes retained for the exact uniqueness stage across all columns together, a shared
+  /// budget rather than a per-column allowance; 0 = a share of the GPU memory space's capacity
+  /// (see @c late_mat::exact_uniqueness_byte_cap).
+  std::uint64_t unique_exact_max_bytes = 0;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
@@ -201,7 +170,7 @@ struct pin_materialization_options {
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options = {});
 
@@ -301,7 +270,7 @@ host_pin_result materialize_pin_to_host(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   scan_manager::host_pin_placement& placement,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options = {});
@@ -325,7 +294,7 @@ host_pin_result materialize_pin_to_host(
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options = {});

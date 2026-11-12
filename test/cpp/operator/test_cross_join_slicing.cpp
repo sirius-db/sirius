@@ -24,6 +24,7 @@
 #include "op/cross_join_slicing.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -131,7 +132,7 @@ TEST_CASE("cross join slicing - a task input rebuilt by late materialization joi
   duckdb::LogicalComparisonJoin logical(duckdb::JoinType::INNER);
   logical.types    = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
   auto const child = [] {
-    return duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+    return duckdb::make_uniq<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::PROJECTION,
       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
       0);

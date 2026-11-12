@@ -38,7 +38,7 @@ thrift-compiler = "0.22.*"
 
 [feature.be.tasks]
 # Build libsirius from source via the repo-root build (creates build/release, which
-# sirius-sys links by default).
+# sirius-ffi uses through sirius-sys by default).
 engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",description = "Build the Sirius engine (libsirius) from source for the BE to link"}
 
 # Engine-linked BE (default `sirius-engine` feature); needs the engine artifact and
@@ -59,7 +59,7 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.engine.dependencies]
 cxx-compiler = "*"
-cuda-version = "13.4.*"
+cuda-version = "13.5.*"
 libcudf = "==26.10.02"
 libcuvs = "==26.10.00"
 librmm = "*"

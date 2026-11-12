@@ -34,7 +34,7 @@ For the legacy Sirius implementation used for the ClickBench results, see the
 ## Requirements
 - Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
 - NVIDIA Turing or newer, with compute capability 7.5+.
-- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 525.60.13 or newer).
+- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 570.26 or newer).
 - `io_uring` enabled at runtime (`CONFIG_IO_URING`, `kernel.io_uring_disabled=0` recommended). Containers must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
 - Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`).
 
@@ -102,6 +102,12 @@ Execution is out-of-core with tiered memory management (GPU/host/disk), automati
 
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
+
+Sirius supports one active engine context per process; this is not enforced at runtime.
+Connections to the same DuckDB database instance share that context.
+Close all connections to the first database instance and release any objects that
+keep it alive before creating another instance. See the [Context API documentation](../include/sirius/context/context.hpp)
+for process-wide configuration and lifetime restrictions.
 
 The v2 extension requires the exact DuckDB revision pinned in this repository.
 Use the built CLI above. The default environment's DuckDB 1.5 Python package cannot
@@ -223,6 +229,7 @@ If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinne
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
+Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA error reports, and its I/O layer where enabled) flow through the same sink, prefixed `[cucascade]`, and are filtered by the same log level.
 
 Log directory and level can be initialized via environment variables before loading the extension:
 ```bash

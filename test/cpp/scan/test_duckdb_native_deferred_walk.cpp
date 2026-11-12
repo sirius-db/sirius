@@ -16,15 +16,14 @@
 
 // Metadata walk under a real execution-window lease; no GPU decode is performed here.
 
+#include "io/ioctx_resolver.hpp"
+
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
@@ -33,7 +32,6 @@
 #include <utils/table_filter_test_utils.hpp>
 
 #include <cstdio>
-#include <filesystem>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -258,7 +256,7 @@ TEST_CASE("deferred walk: split claims see the walk's row-group count",
   auto count_claims = [](duckdb_native_gpu_ingestible& ing) {
     std::size_t n = 0;
     while (auto task = ing.next_split_provider(
-             [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return nullptr; })) {
+             [](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return nullptr; })) {
       ++n;
     }
     return n;

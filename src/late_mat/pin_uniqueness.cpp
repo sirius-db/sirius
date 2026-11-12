@@ -17,33 +17,29 @@
 #include "late_mat/pin_uniqueness.hpp"
 
 #include "log/logging.hpp"
+#include "sirius_config.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/reduction/unique_count.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <algorithm>
-#include <cctype>
-#include <cstdlib>
+#include <exception>
 #include <limits>
+#include <memory>
+#include <numeric>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace sirius::late_mat {
 
 namespace {
-
-std::string lowered(std::string_view s)
-{
-  std::string out{s};
-  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return out;
-}
 
 /// Host value of an integer scalar, widened into the probe's common domain.
 /// Returns nullopt for anything the probe must not interpret — an invalid
@@ -82,54 +78,22 @@ std::optional<__int128_t> integer_scalar_value(cudf::scalar const& s, ::cuda::st
 
 }  // namespace
 
-std::vector<bool> pin_unique_probe_selection(std::span<std::string const> column_names)
+std::vector<std::size_t> exact_retention_priority(std::span<cudf::data_type const> types)
 {
-  std::vector<bool> selected(column_names.size(), false);
-
-  char const* raw = std::getenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
-  if (raw == nullptr || raw[0] == '\0') { return selected; }
-  std::string const spec = lowered(raw);
-  if (spec == "0" || spec == "none" || spec == "off") { return selected; }
-
-  if (spec == "all") {
-    selected.assign(column_names.size(), true);
-    return selected;
-  }
-
-  // Comma-separated names. An entry that matches nothing is not an error — a
-  // single setting is meant to cover a suite of pins over different tables.
-  std::size_t pos = 0;
-  while (pos <= spec.size()) {
-    auto const comma = spec.find(',', pos);
-    auto const end   = comma == std::string::npos ? spec.size() : comma;
-    std::string_view wanted{spec.data() + pos, end - pos};
-    while (!wanted.empty() && std::isspace(static_cast<unsigned char>(wanted.front()))) {
-      wanted.remove_prefix(1);
-    }
-    while (!wanted.empty() && std::isspace(static_cast<unsigned char>(wanted.back()))) {
-      wanted.remove_suffix(1);
-    }
-    if (!wanted.empty()) {
-      for (std::size_t i = 0; i < column_names.size(); ++i) {
-        if (lowered(column_names[i]) == wanted) { selected[i] = true; }
-      }
-    }
-    if (comma == std::string::npos) { break; }
-    pos = comma + 1;
-  }
-  return selected;
+  std::vector<std::size_t> priority(types.size());
+  std::iota(priority.begin(), priority.end(), std::size_t{0});
+  std::stable_partition(priority.begin(), priority.end(), [&](std::size_t c) {
+    return cudf::is_integral_not_bool(types[c]);
+  });
+  return priority;
 }
 
-std::size_t exact_uniqueness_row_cap()
+std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
+                                      std::uint64_t gpu_capacity_bytes)
 {
-  static std::size_t const value = []() -> std::size_t {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS");
-    if (v == nullptr || v[0] == '\0') { return 300'000'000; }
-    char* end         = nullptr;
-    auto const parsed = std::strtoull(v, &end, 10);
-    return (end == v || parsed == 0) ? 300'000'000 : static_cast<std::size_t>(parsed);
-  }();
-  return value;
+  if (configured_bytes > 0) { return static_cast<std::size_t>(configured_bytes); }
+  return static_cast<std::size_t>(static_cast<double>(gpu_capacity_bytes) *
+                                  config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION);
 }
 
 std::optional<bool> exact_distinct_over_chunks(std::span<cudf::column_view const> chunks,
@@ -188,7 +152,14 @@ void unique_probe::drop(std::size_t column_pos, std::string_view why)
   --_live_candidates;
 }
 
-void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref stream)
+void unique_probe::exact_unavailable(std::size_t column_pos)
+{
+  if (column_pos < _columns.size()) { _columns[column_pos].exact_available = false; }
+}
+
+void unique_probe::observe(cudf::table_view const& chunk,
+                           ::cuda::stream_ref stream,
+                           std::function<bool(std::size_t bytes)> const& try_reserve_sort_memory)
 {
   if (_live_candidates == 0) { return; }
 
@@ -206,6 +177,19 @@ void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref str
     return;
   }
 
+  // The chunk's value range, or nothing when it cannot be read (including for want of memory).
+  auto const chunk_range = [&](cudf::column_view const& values) -> std::optional<range> {
+    try {
+      auto const [min_s, max_s] = cudf::minmax(values, stream);
+      auto const lo             = integer_scalar_value(*min_s, stream);
+      auto const hi             = integer_scalar_value(*max_s, stream);
+      if (!lo || !hi) { return std::nullopt; }
+      return range{*lo, *hi};
+    } catch (std::exception const&) {
+      return std::nullopt;
+    }
+  };
+
   for (std::size_t i = 0; i < _columns.size() && _live_candidates > 0; ++i) {
     if (!_columns[i].candidate) { continue; }
     auto const col = chunk.column(static_cast<cudf::size_type>(i));
@@ -219,8 +203,17 @@ void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref str
       continue;
     }
     if (!cudf::is_integral_not_bool(col.type())) {
-      // Out of the cheap stage's reach, not out of the running: the exact check
-      // sorts whatever cuDF can sort.
+      // Out of the cheap stage's reach. Every column of a pin is observed, and the exact stage's
+      // sort is not worth paying on a big table's non-integer columns, so such a column stays in
+      // the running only while its table is small: a dimension's name column, say, which can prove
+      // a group-by-rowid ride (q5, q9 and q10 group by nation.n_name). The cap is on rows seen so
+      // far, so a big table's first chunk ends the column's chances with no sort and no retained
+      // values. A nested column is never worth it: the exact stage cannot judge one.
+      _columns[i].observed_rows += static_cast<std::size_t>(col.size());
+      if (cudf::is_nested(col.type()) || _columns[i].observed_rows > small_table_max_rows) {
+        drop(i, "not an integer, and nested or past the small-table row cap");
+        continue;
+      }
       _columns[i].cheap_undecidable = true;
       continue;
     }
@@ -231,26 +224,61 @@ void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref str
     // maximum representable value" and takes the whole pin down with it. Over
     // sorted values, counting consecutive runs IS the exact distinct count and
     // costs one pass.
-    if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
-      // Unsorted says nothing either way — leave it to the exact stage.
-      _columns[i].cheap_undecidable = true;
+    std::unique_ptr<cudf::table> sorted_copy;
+    cudf::column_view sorted_col = col;
+    cudf::size_type distinct     = 0;
+    std::optional<range> early_range;
+    try {
+      // With the exact stage out of reach, a column can only be proven by chunks whose ranges
+      // never overlap, so a chunk that overlaps an earlier one ends its chances and is not worth
+      // sorting.
+      if (!_columns[i].exact_available) {
+        early_range = chunk_range(col);
+        if (!early_range) {
+          drop(i, "its range cannot be read and the exact stage cannot settle it");
+          continue;
+        }
+        auto const overlaps = std::any_of(
+          _columns[i].ranges.begin(), _columns[i].ranges.end(), [&](range const& earlier) {
+            return earlier.min <= early_range->max && early_range->min <= earlier.max;
+          });
+        if (overlaps) {
+          drop(i, "its chunks overlap in range and the exact stage cannot settle it");
+          continue;
+        }
+      }
+      if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
+        // Most columns of a fact table are unsorted and repeat values, so sort this one chunk:
+        // a repeat refuses the column here, before the exact stage retains any of its values.
+        // The sort is optional. A pin that cannot spare the memory for it loses this proof,
+        // never the pin itself.
+        if (try_reserve_sort_memory &&
+            !try_reserve_sort_memory(static_cast<std::size_t>(col.size()) *
+                                     cudf::size_of(col.type()) * sort_scratch_factor)) {
+          drop(i, "no GPU memory reserved for sorting a chunk");
+          continue;
+        }
+        sorted_copy = cudf::sort(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream);
+        sorted_col  = sorted_copy->view().column(0);
+      }
+      distinct = cudf::unique_count(
+        sorted_col, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+    } catch (std::exception const& e) {
+      drop(i, std::string{"the check failed: "} + e.what());
       continue;
     }
-    auto const distinct =
-      cudf::unique_count(col, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+    sorted_copy.reset();
     if (distinct != col.size()) {
       drop(i, "a chunk repeats a value");
       continue;
     }
 
-    auto const [min_s, max_s] = cudf::minmax(col, stream);
-    auto const lo             = integer_scalar_value(*min_s, stream);
-    auto const hi             = integer_scalar_value(*max_s, stream);
-    if (!lo || !hi) {
+    auto const observed_range = early_range ? early_range : chunk_range(col);
+    if (!observed_range) {
       _columns[i].cheap_undecidable = true;
       continue;
     }
-    _columns[i].ranges.push_back(range{*lo, *hi});
+    _columns[i].ranges.push_back(*observed_range);
   }
 }
 

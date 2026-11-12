@@ -18,7 +18,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -33,14 +32,12 @@
 #include <cuda_runtime_api.h>
 
 #include <data/data_batch_utils.hpp>
-#include <expression/ast/utils.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
-#include <sirius/exception.hpp>
 #include <telemetry/nvtx.hpp>
 
 #include <algorithm>
@@ -48,15 +45,12 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <concepts>
 #include <cstddef>
-#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -339,6 +333,35 @@ detail::compaction_strategy detail::choose_compaction_strategy(
   return evaluate_compaction_policy(input).strategy;
 }
 
+namespace {
+template <typename Visit>
+void visit_reader_dynamic_filters(sirius::op::dynamic_filter_snapshot const& filters,
+                                  scan_plan const& plan,
+                                  std::optional<int> device_id,
+                                  Visit&& visit)
+{
+  for (auto const& [col_idx, filter] : filters.entries()) {
+    if (col_idx >= plan.output_layout.size()) continue;
+    auto const& entry = plan.output_layout[col_idx];
+    if (entry.source != scan_plan::output_entry::DATA || entry.idx >= plan.data_columns.size())
+      continue;
+    if (device_id && !filter->is_available_on_device(*device_id)) continue;
+    auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(filter.get());
+    if (lowerable) visit(*lowerable, plan.data_columns[entry.idx].name);
+  }
+}
+}  // namespace
+
+bool has_reader_dynamic_filter(sirius::op::dynamic_filter_snapshot const& filters,
+                               scan_plan const& plan,
+                               std::optional<int> device_id) noexcept
+{
+  bool found = false;
+  visit_reader_dynamic_filters(
+    filters, plan, device_id, [&](auto const&, auto const&) { found = true; });
+  return found;
+}
+
 cudf::ast::expression const* merge_dynamic_filters_into_ast(
   cudf::ast::tree& tree,
   cudf::ast::expression const* existing_root,
@@ -348,22 +371,11 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
 {
   device_id        = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
   auto const* root = existing_root;
-  for (auto const& [col_idx, filter] : filters.entries()) {
-    if (col_idx >= plan.output_layout.size()) { continue; }
-    auto const& entry = plan.output_layout[col_idx];
-    // DATA addresses M-space, which includes synthesized virtual columns after D.
-    // Only the physical prefix has a parquet name that the reader can filter on.
-    if (entry.source != scan_plan::output_entry::DATA || entry.idx >= plan.data_columns.size()) {
-      continue;
-    }
-    auto const& parquet_col_name = plan.data_columns[entry.idx].name;
-
-    if (!filter->is_available_on_device(device_id)) { continue; }
-    auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(filter.get());
-    if (!lowerable) { continue; }
-    auto const& col_ref = tree.emplace<cudf::ast::column_name_reference>(parquet_col_name);
-    root                = and_into(tree, root, lowerable->to_ast(tree, col_ref, device_id));
-  }
+  visit_reader_dynamic_filters(
+    filters, plan, device_id, [&](auto const& lowerable, auto const& name) {
+      auto const& col_ref = tree.emplace<cudf::ast::column_name_reference>(name);
+      root                = and_into(tree, root, lowerable.to_ast(tree, col_ref, device_id));
+    });
   return root;
 }
 

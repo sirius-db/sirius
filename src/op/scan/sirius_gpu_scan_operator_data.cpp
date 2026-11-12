@@ -22,7 +22,6 @@
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -212,7 +211,7 @@ scan_operator_input::~scan_operator_input()
   // the scheduler would never retire an operator and the budget would never
   // refill.
   try {
-    update(io::cache::scan_stage::disposed);
+    update(cucascade::io::cache::scan_stage::disposed);
   } catch (...) {  // NOLINT(bugprone-empty-catch)
     // A destructor must not throw; a lost dispose costs a delayed refill, and
     // the next split's update recomputes the same state anyway.
@@ -229,7 +228,7 @@ scan_operator_input::scan_operator_input(
 {
 }
 
-void scan_operator_input::update(io::cache::scan_stage site) const
+void scan_operator_input::update(cucascade::io::cache::scan_stage site) const
 {
   // The manager tracks progress per split, not per operator: one operator emits
   // many splits and they advance independently, so it needs to know which one
@@ -260,7 +259,7 @@ void scan_operator_input::prepare_for_processing(
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
-    update(io::cache::scan_stage::preparing);
+    update(cucascade::io::cache::scan_stage::preparing);
     return;
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
@@ -586,9 +585,16 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 
 std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
 {
+  return get_estimated_working_set_size_in_bytes(std::nullopt);
+}
+
+std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
+  std::optional<int> device) const
+{
   if (std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info)) {
-    auto const decode_bytes =
-      std::get<std::shared_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
+    auto const& metadata    = std::get<std::shared_ptr<scan_info>>(materialization_info);
+    auto const decode_bytes = device ? metadata->estimated_working_set_bytes_for_device(*device)
+                                     : metadata->estimated_working_set_bytes();
     if (mvcc_keep_mask.has_mask()) {
       // A partially visible insert-delta split is mask-filtered right after
       // decode: the decoded input and the compacted output (up to input-sized)

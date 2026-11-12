@@ -39,12 +39,12 @@
 #include <cucascade/memory/topology_discovery.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <array>
@@ -55,7 +55,6 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <optional>
 #include <set>
@@ -1513,7 +1512,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
       current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
       current_setting('max_build_probe_resident_bytes')::UBIGINT,
-      current_setting('spill_compression')::BOOLEAN
+      current_setting('spill_compression')::BOOLEAN,
+      current_setting('pin_table_prove_unique_keys')::BOOLEAN,
+      current_setting('pin_table_unique_exact_max_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1559,6 +1560,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_FALSE(resident_reset->HasError());
   require_resident_budget(9 * mib);
   REQUIRE(settings->Collection().GetValue(23, 0).GetValue<bool>());
+  REQUIRE_FALSE(settings->Collection().GetValue(24, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(25, 0).GetValue<uint64_t>() == 9 * mib);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
@@ -2591,6 +2594,25 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
       Catch::Matchers::ContainsSubstring("remove this key"));
 }
 
+TEST_CASE("failed initialization releases a newly installed converter registry",
+          "[sirius][context][public_context][isolated_context]")
+{
+  sirius::converter_registry::reset_for_testing();
+  finally restore_registry{[] { sirius::converter_registry::initialize(); }};
+  auto root = YAML::LoadFile(
+    (fs::path(__FILE__).parent_path() / "data" / "init_failure_pinned_rollback.yaml").string());
+  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"] = "2Mi";
+  auto config = sirius::parsed_sirius_config::from_node(root);
+  duckdb::SiriusContext engine;
+  REQUIRE_THROWS(engine.initialize(config));
+  CHECK_FALSE(sirius::converter_registry::is_initialized());
+
+  // Reuse the same engine object with a different converter configuration.
+  root["sirius"]["executor"]["scan_manager"]["uring_n_reactors"] = 1;
+  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"]    = "1Gi";
+  REQUIRE_NOTHROW(engine.initialize(sirius::parsed_sirius_config::from_node(root)));
+}
+
 TEST_CASE("Sirius query options stay local and snapshots remain immutable",
           "[sirius][config][isolated_context][query_options]")
 {
@@ -2665,16 +2687,8 @@ TEST_CASE("Sirius admission configuration has one authoritative limit",
     return cfg;
   };
   CHECK(load("sirius: {max_concurrent_queries: 4}").max_concurrent_queries() == 4);
-  CHECK(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}")
-          .max_concurrent_queries() == 2);
-  CHECK(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 2}}}")
-      .max_concurrent_queries() == 2);
-  REQUIRE_THROWS_WITH(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 3}}}"),
-    Catch::Matchers::ContainsSubstring("conflicting"));
+  REQUIRE_THROWS_WITH(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}"),
+                      Catch::Matchers::ContainsSubstring("unknown config key"));
   REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
   CHECK(load("sirius: {}").max_concurrent_queries() == 1);
 }

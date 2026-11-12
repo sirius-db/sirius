@@ -81,9 +81,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 
 #include <cuda_runtime.h>
 
-#include <compression/compressed_representation.hpp>
 #include <compression/decompression_pushdown_policy.hpp>
-#include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <unistd.h>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -2038,14 +2036,8 @@ TEST_CASE("pin_table compression - device tier driver returns uniqueness verdict
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
-  // Only k is asked for: the probe selection is by name, so d is never observed
-  // and must come back not-proven regardless of whether it happens to repeat.
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "k", 1);
-
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_uniqcompressed');");
   require_ok(pin, "pin uniqcompressed");
-
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
 
   // The driver actually took the compressed path — otherwise this would be
   // indistinguishable from the uncompressed GPU driver, which already had
@@ -2055,8 +2047,8 @@ TEST_CASE("pin_table compression - device tier driver returns uniqueness verdict
 
   auto const proven = proven_columns_of(con, "t_uniqcompressed");
   REQUIRE(proven.size() == 2);
-  REQUIRE(proven[0]);        // k: selected and distinct table-wide
-  REQUIRE_FALSE(proven[1]);  // d: never observed
+  REQUIRE(proven[0]);        // k: distinct table-wide
+  REQUIRE_FALSE(proven[1]);  // d: observed, but repeats
 
   run_ok(con, "CALL unpin_table('t_uniqcompressed');", "unpin");
   fs::remove_all(tmp);

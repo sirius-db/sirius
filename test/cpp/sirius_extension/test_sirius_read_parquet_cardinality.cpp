@@ -6,9 +6,9 @@
  */
 
 #include "catch.hpp"
-#include "sirius_extension.hpp"
+#include "sirius_extension.hpp"  // IWYU pragma: keep
 
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/function/function.hpp>
 #include <duckdb/storage/statistics/node_statistics.hpp>
 

@@ -6,12 +6,7 @@
  */
 
 #include "catch.hpp"
-#include "io/io_context.hpp"
-#include "io/rest/authorizer.hpp"
-#include "io/rest/rest_ioctx.hpp"
-#include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
@@ -29,7 +24,12 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <duckdb.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/authorizer.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
+#include <cucascade/io/rest/s3/static_credentials.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
@@ -37,7 +37,6 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <utils/table_filter_test_utils.hpp>
@@ -45,9 +44,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cerrno>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -56,7 +53,6 @@
 #include <fstream>
 #include <functional>
 #include <future>
-#include <iomanip>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -338,7 +334,7 @@ class sirius_config_env_guard {
     object_store_.ca_bundle_path = ca_bundle.value_or("");
     object_store_.tls_verify     = tls_verify.value_or(false);
     if (signing_mode.has_value()) {
-      REQUIRE(sirius::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
+      REQUIRE(cucascade::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
     }
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -428,7 +424,7 @@ class sirius_config_env_guard {
   }
 
   [[nodiscard]] fs::path const& config_path() const noexcept { return config_path_; }
-  [[nodiscard]] sirius::io::object_store_config const& object_store() const noexcept
+  [[nodiscard]] cucascade::io::object_store_config const& object_store() const noexcept
   {
     return object_store_;
   }
@@ -436,7 +432,7 @@ class sirius_config_env_guard {
  private:
   fs::path dir_;
   fs::path config_path_;
-  sirius::io::object_store_config object_store_;
+  cucascade::io::object_store_config object_store_;
   std::string original_config_env_;
   std::string original_disable_env_;
   bool had_original_config_env_{false};
@@ -780,7 +776,7 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
   return *sirius_ctx;
 }
 
-sirius::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::string const& uri)
+cucascade::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::string const& uri)
 {
   return *sirius::test::s3::require_rest_ioctx(
     require_sirius_context(fixture).get_scan_manager().create_datasource(uri));
@@ -792,7 +788,7 @@ void require_kvikio_ioctx(s3_sql_fixture& fixture, std::string const& uri)
   auto datasource  = sirius_ctx.get_scan_manager().create_datasource(uri);
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
-  REQUIRE(datasource->io_ctx()->type() == sirius::io::io_context_type::kvikio);
+  REQUIRE(datasource->io_ctx()->type() == cucascade::io::io_context_type::kvikio);
 }
 
 void require_s3_keys_listed(s3_sql_fixture& fixture,
@@ -1100,23 +1096,23 @@ TEST_CASE("S3 SQL config guard keeps object-store credentials out of YAML", "[s3
     CHECK(yaml.find("signing_mode:") == std::string::npos);
     CHECK(guard.object_store().session_token == "temporary-session-token");
     CHECK(guard.object_store().s3_signing_mode ==
-          sirius::io::object_store_config::signing_mode::header);
+          cucascade::io::object_store_config::signing_mode::header);
   }
 }
 
 TEST_CASE("S3 bench STS session token reaches presigned URLs", "[s3][sigv4]")
 {
-  sirius::io::rest::s3::static_credentials creds;
+  cucascade::io::rest::s3::static_credentials creds;
   creds.access_key_id     = "AKIAFAKEBENCHKEY";
   creds.secret_access_key = "fake-secret-key";
   creds.session_token     = "fake-session-token";
 
-  sirius::io::rest::s3::sigv4_presigned_authorizer authorizer{
+  cucascade::io::rest::s3::sigv4_presigned_authorizer authorizer{
     std::move(creds), "us-east-2", "https://s3.us-east-2.amazonaws.com"};
-  auto request =
-    authorizer.authorize(sirius::io::rest::object_ref{"sirius-bench", "tpch/lineitem_sf10.parquet"},
-                         sirius::io::rest::request_method::GET,
-                         std::chrono::seconds{60});
+  auto request = authorizer.authorize(
+    cucascade::io::rest::object_ref{"sirius-bench", "tpch/lineitem_sf10.parquet"},
+    cucascade::io::rest::request_method::GET,
+    std::chrono::seconds{60});
 
   CHECK(request.headers.empty());
   CHECK(request.url.find("X-Amz-Security-Token=") != std::string::npos);
@@ -1261,7 +1257,7 @@ TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
     s3_sql_fixture fixture(*env);
     set_gpu_execution(fixture.con, true);
     auto& rest = require_rest_ioctx(fixture, uri);
-    CHECK(rest.type() == sirius::io::io_context_type::restful);
+    CHECK(rest.type() == cucascade::io::io_context_type::restful);
     compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   }
 }
@@ -1526,7 +1522,7 @@ TEST_CASE("S3 LIST keeps its REST context alive while credentials rotate",
   std::size_t pages = 0;
   manager.list_objects_paged(prefix,
                              /*page_size=*/1,
-                             [&](sirius::io::rest::s3::list_objects_v2_page const&) {
+                             [&](cucascade::io::rest::s3::list_objects_v2_page const&) {
                                ++pages;
                                if (pages == 1) {
                                  // Replacing the final scope retires the registry's owner of the
@@ -1559,6 +1555,52 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE("transparent S3 footer statistics follow an equal-size overwrite",
+          "[s3][integration][sql][transparent][glob][parquet_footer_statistics]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  // Plain, uncompressed files of equal row counts have equal sizes whatever the values.
+  sirius::test::scratch_dir dir("s3_footer_statistics");
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto write_plain = [&](std::string const& name, int from, int to) {
+    require_query_ok(con,
+                     "COPY (SELECT range AS x FROM range(" + std::to_string(from) + ", " +
+                       std::to_string(to) + ")) TO " + dir.file_literal(name) +
+                       " (FORMAT parquet, COMPRESSION uncompressed)");
+    std::ifstream in(dir.file(name), std::ios::binary);
+    REQUIRE(in.is_open());
+    return std::vector<std::uint8_t>{std::istreambuf_iterator<char>{in},
+                                     std::istreambuf_iterator<char>{}};
+  };
+  auto const low         = write_plain("low.parquet", 0, 100);
+  auto const middle      = write_plain("middle.parquet", 100, 200);
+  auto const replacement = write_plain("replacement.parquet", 1000, 1100);
+  REQUIRE(middle.size() == replacement.size());
+  if (!sirius::test::put_s3_test_object("footer-statistics/a.parquet", low)) {
+    SUCCEED("managed SeaweedFS is required for the footer statistics overwrite test");
+    return;
+  }
+  REQUIRE(sirius::test::put_s3_test_object("footer-statistics/b.parquet", middle));
+
+  auto const glob = s3_uri(env->bucket, "footer-statistics/*.parquet");
+  auto analyzed   = require_query_ok(
+    fixture.con, "SELECT files FROM sirius_analyze_parquet(" + sql_quote(glob) + ")");
+  REQUIRE(collect_rows(*analyzed) == std::vector<std::vector<std::string>>{{"2"}});
+
+  auto const query = "SELECT count(*) FROM read_parquet(" + sql_quote(glob) + ") WHERE x >= 1000";
+  REQUIRE(collect_rows(*require_query_ok(fixture.con, query)) ==
+          std::vector<std::vector<std::string>>{{"0"}});
+  REQUIRE(sirius::test::put_s3_test_object("footer-statistics/b.parquet", replacement));
+  CHECK(collect_rows(*require_query_ok(fixture.con, query)) ==
+        std::vector<std::vector<std::string>>{{"100"}});
 }
 
 TEST_CASE("transparent S3 glob refuses semantic type drift before decoding",
@@ -2713,8 +2755,9 @@ TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
 
   s3_sql_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
-  auto const s3_query = "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn FROM " +
-                        s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  auto const s3_query =
+    "SELECT n_nationkey, PERCENT_RANK() OVER (ORDER BY n_nationkey) AS pr FROM " +
+    s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
   auto result = fixture.con.Query(s3_query);
   REQUIRE(result);
   REQUIRE(result->HasError());
@@ -2764,7 +2807,7 @@ TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU"
                   ->HasError());
 
   auto result = fixture.con.Query(
-    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
+    "SELECT n_nationkey, PERCENT_RANK() OVER (ORDER BY n_nationkey) AS pr "
     "FROM v_s3_nation ORDER BY n_nationkey");
   REQUIRE(result);
   REQUIRE(result->HasError());
@@ -2884,7 +2927,7 @@ TEST_CASE("transparent S3 eligibility covers copy and SQL-replan correspondence"
   }
 }
 
-TEST_CASE("transparent S3 execution rebuild preserves template origin and source veto",
+TEST_CASE("transparent S3 execution rebuild preserves read-view correspondence",
           "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
@@ -2931,18 +2974,11 @@ TEST_CASE("transparent S3 execution rebuild preserves template origin and source
                           : "SELECT sum(n_nationkey) FROM v_s3_rebuild");
         REQUIRE(result);
         INFO((result->HasError() ? result->GetError() : "success"));
-        if (multi) {
-          REQUIRE(result->HasError());
-          CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
-          CHECK(result->GetError().find("reason=no_correspondence") != std::string::npos);
-          CHECK(result->GetError().find("correspondence=none") != std::string::npos);
-        } else {
-          REQUIRE_FALSE(result->HasError());
-          CHECK(result->Collection().GetValue(0, 0).ToString() == "300");
-        }
+        REQUIRE_FALSE(result->HasError());
+        CHECK(result->Collection().GetValue(0, 0).ToString() == (multi ? "600" : "300"));
         auto const after = sirius::test::get_transparent_execution_stats(con);
         CHECK(after.execution_rebuilds == before.execution_rebuilds + 1);
-        CHECK(after.read_view_mismatches == before.read_view_mismatches + (multi ? 1 : 0));
+        CHECK(after.read_view_mismatches == before.read_view_mismatches);
         sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
       }
     }
@@ -3468,7 +3504,7 @@ TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
   } reset{*context};
 
   auto const query =
-    "SELECT n_nationkey, row_number() OVER (ORDER BY n_nationkey) "
+    "SELECT n_nationkey, percent_rank() OVER (ORDER BY n_nationkey) "
     "FROM explicit_remote_view";
   SECTION("plan generation fails") {}
   SECTION("window entry fails")
@@ -4043,7 +4079,7 @@ TEST_CASE("S3 metadata-only provenance skips pruned sources and data readers",
   auto datasource = context.get_scan_manager().create_datasource(uri);
   REQUIRE(datasource);
   auto ioctx = datasource->io_ctx();
-  auto* rest = dynamic_cast<sirius::io::rest::rest_ioctx*>(ioctx.get());
+  auto* rest = dynamic_cast<cucascade::io::rest::rest_ioctx*>(ioctx.get());
   REQUIRE(rest);
   auto info                    = std::make_unique<scan::parquet_ingestible_table_info>();
   info->resolved_file_paths    = {s3_uri(env->bucket, "does-not-exist-pruned.parquet"), uri};

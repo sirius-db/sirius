@@ -56,7 +56,7 @@ jobs:
       - name: Init build submodules
         run: git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true
@@ -97,16 +97,30 @@ jobs:
 
       - name: Test CUDA extension loader without a GPU
         run: |
+          # The unittest links the prebuilt library's capabilities when they sit next to it.
+          prebuilt="$PWD/build/loader-prebuilt"
+          mkdir -p "$prebuilt"
+          cp sirius-duckdb/build/release/src/libduckdb_static.a \
+            sirius-duckdb/build/release/src/main/extension/libduckdb_loadable_extensions.a \
+            sirius-duckdb/build/release/src/main/http/libduckdb_httplib.a "$prebuilt/"
           cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
             -DDUCKDB_EXPLICIT_VERSION=v2.0.0 \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=ON -DBUILD_SHELL=OFF \
             -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
-            -DPREBUILT_BINARY="$PWD/sirius-duckdb/build/release/src/libduckdb_static.a" \
+            -DPREBUILT_BINARY="$prebuilt/libduckdb_static.a" \
             -DDUCKDB_EXTENSION_CONFIGS="$PWD/sirius-duckdb/config/loader.cmake" \
             -DSIRIUS_LOADER_TESTS=ON
-          cmake --build build/loader --target sirius_loadable_extension sirius_loader_test_fixtures -j$(nproc)
+          cmake --build build/loader --target unittest sirius_loadable_extension sirius_loader_test_fixtures -j$(nproc)
           python sirius-duckdb/loader/test/test_loader.py \
             --duckdb sirius-duckdb/build/release/duckdb --build-dir build/loader
+          # The sqllogictests DuckDB's CI runs; hide any driver so they see a CPU-only machine.
+          repository="$PWD/build/loader/repository/v2.0.0/$(cat build/loader/duckdb_platform_out)"
+          mkdir -p "$repository"
+          cp build/loader/extension/sirius/sirius.duckdb_extension "$repository/"
+          LOCAL_EXTENSION_REPO="$PWD/build/loader/repository" \
+          LD_PRELOAD="$PWD/build/loader/extension/sirius/test/libsirius_test_hide_driver.so" \
+            build/loader/test/unittest --autoloading available --require sirius \
+            "$PWD/sirius-duckdb/loader/test/sql/*"
 
       - name: Build shared DuckDB scan host tests
         run: |
@@ -177,7 +191,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true
@@ -239,10 +253,17 @@ jobs:
       - name: Run C++ unit tests
         env:
           SIRIUS_EXTENSION_PATH: ${{ github.workspace }}/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+          SIRIUS_TEST_GPU: "1"
           SIRIUS_TEST_REQUIRE_DUCKLAKE: "1"
         run: |
           nvidia-smi
           python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
+
+      - name: Run Rust bindings tests
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build/release:$CONDA_PREFIX/lib:$CONDA_PREFIX/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          pixi run --locked -e ${{ matrix.cuda.pixi-environment }} cargo test --locked \
+            --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
@@ -314,7 +335,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true

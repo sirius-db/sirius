@@ -26,6 +26,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/error_data.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -96,9 +97,11 @@ insert_delta_workset prepare_insert_delta_tasks(
     try {
       request.plan =
         op::scan::prepare_insert_delta_capture(*request.storage, *request.context, request.n_cache);
+    } catch (duckdb::InterruptException const&) {
+      throw;
     } catch (std::exception const& e) {
-      throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + request.entry_name +
-                               "': " + e.what());
+      duckdb::ErrorData(e).Throw("[prepare_insert_delta_tasks] pinned entry '" +
+                                 request.entry_name + "': ");
     }
     request.bundles.clear();
   }
@@ -139,9 +142,11 @@ insert_delta_workset prepare_insert_delta_tasks(
             req->entry_name + "|" + e.input_identity,
             e.reason,
             "[prepare_insert_delta_tasks] pinned entry '" + req->entry_name + "': " + e.what());
+        } catch (duckdb::InterruptException const&) {
+          throw;
         } catch (std::exception const& e) {
-          throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + req->entry_name +
-                                   "': " + e.what());
+          duckdb::ErrorData(e).Throw("[prepare_insert_delta_tasks] pinned entry '" +
+                                     req->entry_name + "': ");
         }
       });
     }
@@ -339,7 +344,7 @@ void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
 std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
-  std::shared_ptr<sirius::io::sirius_datasource> datasource,
+  std::shared_ptr<cucascade::io::datasource> datasource,
   duckdb::SingleFileBlockManager const* block_manager,
   op::scan::scan_contract_id contract_id)
 {
@@ -435,8 +440,9 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
     // The prefetch handle inside a datasource is per-scan mutable state, so
     // every file-backed split owns a fresh duplicate (matching the native-scan
     // coalescer); splits that read no file carry none.
-    auto split_datasource = any_file_read && datasource ? datasource->duplicate()
-                                                        : std::shared_ptr<io::sirius_datasource>{};
+    auto split_datasource = any_file_read && datasource
+                              ? datasource->duplicate()
+                              : std::shared_ptr<cucascade::io::datasource>{};
     auto info             = std::make_unique<op::scan::duckdb_native_scan_info>(
       std::move(row_groups), std::move(split_datasource), block_manager);
     info->host_backed_only = !any_file_read;

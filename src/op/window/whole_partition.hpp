@@ -30,16 +30,6 @@
 
 namespace sirius::op {
 
-/// 10^@p digits as a signed 128 bit integer.
-constexpr __int128_t int128_pow10(int digits)
-{
-  __int128_t value = 1;
-  for (int i = 0; i < digits; ++i) {
-    value *= 10;
-  }
-  return value;
-}
-
 /**
  * @brief One aggregate to evaluate over the whole partition.
  */
@@ -60,10 +50,12 @@ struct whole_partition_aggregate {
  * aggregates are computed with a cuDF group by, or a reduction when there are no partition
  * columns, and joined back to the input rows with a distinct hash join. No sort is performed.
  *
- * The input is one complete hash bucket, which can hold several SQL partitions. Partition columns
- * and aggregate arguments refer to columns of @p input and must already have their logical types,
- * including decimal scales. Compressed physical carriers are not interpreted. Partition columns
- * can be booleans, 8 to 64 bit integers, decimals, timestamps or strings.
+ * The input is one complete hash bucket, which can hold several SQL partitions. It is evaluated as
+ * one cuDF table, so it must fit in GPU memory and hold fewer than 2^31 rows. A partition is never
+ * split across calls. Partition columns and aggregate arguments refer to columns of @p input and
+ * must already have their logical types, including decimal scales. Compressed physical carriers
+ * are not interpreted. Partition columns can be booleans, 8 to 64 bit integers, decimals,
+ * timestamps or strings.
  *
  * Result types:
  * - `sum` over signed integers is DECIMAL128 with scale 0, the exact carrier of DuckDB's HUGEINT.

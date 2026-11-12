@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
-#include "config.hpp"
-#include "cudf/aggregation.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
@@ -25,7 +23,6 @@
 #include "cudf/join/mark_join.hpp"
 #include "cudf/join/mixed_join.hpp"
 #include "cudf/null_mask.hpp"
-#include "cudf/reduction.hpp"
 #include "cudf/reduction/distinct_count.hpp"
 #include "cudf/stream_compaction.hpp"
 #include "cudf/table/table_view.hpp"
@@ -38,14 +35,11 @@
 #include "expression/ast/utils.hpp"
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
-#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
-#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/key_preparation.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -54,11 +48,9 @@
 #include "telemetry/nvtx.hpp"
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
@@ -214,11 +206,7 @@ void sirius_physical_hash_join::materialize_expression_join_keys(
   auto prepare_side = [&](auto& child, auto& projection_map, bool is_left) {
     auto const old_width = child->types.size();
     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
-    duckdb::vector<sirius::logical_type> types = child->types;
-    for (std::size_t c = 0; c < old_width; ++c) {
-      expressions.push_back(std::make_unique<sirius::ast::node>(
-        sirius::ast::reference{static_cast<uint32_t>(c), types[c]}));
-    }
+    duckdb::vector<sirius::logical_type> types;
     for (auto& condition : conditions) {
       auto& operand = is_left ? condition.left : condition.right;
       if (!operand) { throw duckdb::NotImplementedException("Join operand is missing"); }
@@ -232,21 +220,21 @@ void sirius_physical_hash_join::materialize_expression_join_keys(
       // A cast is an evaluated operation, including its kind, try_cast, and nested children.
       // Use the ordinary projection evaluator rather than inferring a physical conversion.
       auto const type  = operand->return_type();
-      auto const index = expressions.size();
+      auto const index = old_width + expressions.size();
       expressions.push_back(std::move(operand));
       types.push_back(type);
       operand = std::make_unique<sirius::ast::node>(
         sirius::ast::reference{static_cast<uint32_t>(index), type});
     }
-    if (expressions.size() == old_width) { return; }
+    if (expressions.empty()) { return; }
     if (projection_map.empty()) {
       for (std::size_t c = 0; c < old_width; ++c) {
         projection_map.push_back(c);
       }
     }
     auto const cardinality = child->estimated_cardinality;
-    child                  = sirius::planner::push_projection(
-      std::move(child), std::move(types), std::move(expressions), cardinality);
+    child                  = sirius::planner::push_appending_projection(
+      std::move(child), std::move(expressions), std::move(types), cardinality);
   };
   prepare_side(left, left_projection_map, true);
   prepare_side(right, right_projection_map, false);

@@ -25,7 +25,7 @@
 
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
 // destructor, which needs the AST node definition.
-#include "expression/ast/node.hpp"
+#include "expression/ast/node.hpp"  // IWYU pragma: keep
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -38,11 +38,12 @@
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/execution/operator/join/join_filter_pushdown.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/connection.hpp>
+#include <duckdb/main/database.hpp>
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/join_filter_pushdown_optimizer.hpp>
 #include <duckdb/optimizer/optimizer.hpp>

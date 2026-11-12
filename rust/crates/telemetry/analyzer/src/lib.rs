@@ -575,11 +575,12 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     statistics.custom_statistics =
                         std::mem::take(&mut statistics.custom_statistics)
                             .into_iter()
-                            .map(|(name, mut statistic)| {
+                            .map(|mut statistic| {
+                                let name = statistic.value.key.clone();
                                 let name = if let Some(value) =
-                                    scale_operator_statistic(&name, &statistic.value)
+                                    scale_operator_statistic(&name, &statistic.value.value)
                                 {
-                                    statistic.value = Some(value);
+                                    statistic.value.value = Some(value);
                                     statistic.quantity = Some(QUANTITY_SECONDS.to_owned());
                                     scaled_operator_statistic_name(name)
                                 } else {
@@ -587,7 +588,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                         operator_statistic_quantity(&name).map(str::to_owned);
                                     name
                                 };
-                                (name, statistic)
+                                statistic.value.key = name;
+                                statistic
                             })
                             .collect();
                 }

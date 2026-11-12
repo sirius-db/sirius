@@ -14,6 +14,7 @@
 
 import argparse
 import csv
+import datetime as datetime_module
 import glob
 import json
 import math
@@ -59,7 +60,7 @@ PROFILES = {
     # this is measuring.
     "cold": {
         "ordering": "sequential",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         # 'lru', not 'idle': the per-query reset_sirius_cache() below is what
         # makes this profile cold, so the evictor does not also need to drop a
         # chunk the moment nothing is reading it. 'idle' additionally retires
@@ -77,7 +78,7 @@ PROFILES = {
     # leftovers.
     "lukewarm": {
         "ordering": "sequential",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         "eviction": "lru",
         "drop_os_cache_between": False,
         "reset_cache_between": False,
@@ -87,7 +88,7 @@ PROFILES = {
     },
     "hot": {
         "ordering": "grouped",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         # LRU, not idle: back-to-back iterations of one query leave the cache
         # briefly idle between runs, and idle eviction would dispose exactly the
         # chunks the next iteration is about to re-read -- measuring a cold read
@@ -151,13 +152,13 @@ DEFAULT_PROFILE = {
 
 CACHE_CONFIG_PATH = ("sirius", "executor", "scan_manager", "cache")
 
-# --pin parquet pins undecoded column chunks into the prefetching cache, so it
-# needs a cache that keeps them: 'sirius' to have one at all, 'lru' because
+# --pin parquet pins undecoded column chunks into the pinned file cache, so it
+# needs a cache that keeps them: 'cucs' to have one at all, 'lru' because
 # 'idle' drops a chunk the moment nothing is reading it, and a threshold of 1.0
 # so the evictor only starts once the pool is genuinely full. Without these the
 # pin populates the cache and the evictor empties it again.
 PARQUET_PIN_CACHE = {
-    "mode": "sirius",
+    "mode": "cucs",
     "eviction": "lru",
     "eviction_threshold_fraction": 1.0,
 }
@@ -297,7 +298,8 @@ VALIDATION_ABS_TOL = 1e-10
 _RESULT_EVAL_GLOBALS = {
     "__builtins__": {},
     "Decimal": Decimal,
-    "datetime": datetime,
+    # repr() uses module-qualified constructors such as datetime.date(...).
+    "datetime": datetime_module,
     "date": date,
     "time": dtime,
     "timedelta": timedelta,
@@ -1788,11 +1790,12 @@ def parse_args():
             "runs, and OVERRIDES cache.mode/cache.eviction in --config. "
             "OMIT IT and the config is used exactly as given, with iterations "
             "back-to-back per query and nothing flushed between runs. "
-            "cold (per-query OS cache drop + reset_sirius_cache(), round-robin; "
-            "needs passwordless sudo), "
-            "lukewarm (OS cache dropped once at start, LRU retention, round-robin), "
-            "hot (OS cache dropped once at start, iterations back-to-back per "
-            "query). (default: unset — change nothing)"
+            "cold (per-query eviction hint and GPU Sirius cache reset, round-robin), "
+            "lukewarm (startup eviction hint, LRU retention, round-robin), "
+            "hot (startup eviction hint, iterations back-to-back per query). "
+            "Local dataset-file eviction uses posix_fadvise(DONTNEED), requires "
+            "no sudo, and may be ignored by the filesystem; S3 is skipped. "
+            "(default: unset — change nothing)"
         ),
     )
     p.add_argument(
@@ -1801,15 +1804,16 @@ def parse_args():
         default=None,
         help=(
             "Runner mode fixing BOTH the query-execution order and where the "
-            "cache is dropped. Unlike --profile, --mode always drops the OS "
-            "page cache (and resets the Sirius cache on GPU) -- it only chooses "
+            "cache is dropped. Unlike --profile, --mode always requests local "
+            "dataset-file eviction (and resets the Sirius cache on GPU); it chooses "
             "where. isolated: drop before every query run (grouped order, "
             "'drop q1 drop q2 ...'). sequential: round-robin, drop once at the "
             "start of each iteration ('drop q1 q2 ... q22  drop q1 q2 ...'). "
             "grouped: iterations back-to-back per query, drop once before each "
-            "query group ('drop q1 q1 ...  drop q2 q2 ...'). Requires "
-            "passwordless sudo for the OS cache drop. Overrides the ordering and "
-            "drop placement implied by --profile. (default: unset)"
+            "query group ('drop q1 q1 ...  drop q2 q2 ...'). Local dataset-file "
+            "eviction uses posix_fadvise(DONTNEED), requires no sudo, and may be "
+            "ignored by the filesystem; S3 is skipped. Overrides the ordering "
+            "and drop placement implied by --profile. (default: unset)"
         ),
     )
     p.add_argument(
@@ -1885,8 +1889,8 @@ def parse_args():
             "'host' selects the cache tier; 'none' disables pinning. Pin is "
             "per-query under the hot profile and a single union-pin at "
             "session start under cold/lukewarm. 'parquet' pins the undecoded "
-            "column-chunk bytes into the Sirius prefetching cache instead of "
-            "materialising on the GPU, so it needs cache.mode='sirius' and "
+            "column-chunk bytes into the pinned file cache instead of "
+            "materialising on the GPU, so it needs cache.mode='cucs' and "
             "--data-source parquet. (default: none)"
         ),
     )

@@ -36,7 +36,6 @@
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
@@ -53,7 +52,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -4154,6 +4152,49 @@ TEST_CASE("Floating comparisons order NaN above infinity and preserve NULL",
       std::vector<bool> expected{
         equal, !equal, greater, greater || equal, less, less || equal, !null_equal, null_equal};
       REQUIRE(bool(values[i]) == expected[c]);
+    }
+  }
+}
+
+TEST_CASE("AST_JIT keeps non-null inputs non-null on batches spanning several grid strides",
+          "[expression_evaluator][ast_jit]")
+{
+  auto& space = *get_default_gpu_space();
+  // Row counts that are not a multiple of 32 and exceed the resident grid make one warp diverge
+  // across grid-stride iterations in cuDF < 26.12's null-aware JIT kernel.
+  auto const rows = GENERATE(100, 4'000'000, 1'000'003, 2'000'029, 4'000'003);
+  std::vector<int32_t> left(rows), right(rows);
+  for (int i = 0; i < rows; ++i) {
+    left[i]  = static_cast<int32_t>((int64_t{i} * 7919) % 2000);
+    right[i] = static_cast<int32_t>((int64_t{i} * 104729) % 2000);
+  }
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_carrier_column(space, cudf::data_type{cudf::type_id::INT32}, left));
+  columns.push_back(make_carrier_column(space, cudf::data_type{cudf::type_id::INT32}, right));
+  auto input = make_batch_from_columns(space, std::move(columns));
+  auto type  = logical_type::make(type_id::INTEGER);
+  // AND lowers to NULL_LOGICAL_AND, which makes cuDF generate its null-aware JIT kernel.
+  std::vector<std::unique_ptr<ast_node>> comparisons;
+  comparisons.push_back(
+    make_cmp(sirius::comparison_type::gt, make_ref_typed(0, type), make_ref_typed(1, type)));
+  comparisons.push_back(
+    make_cmp(sirius::comparison_type::ge, make_ref_typed(0, type), make_ref_typed(1, type)));
+  auto node = make_conj(sirius::ast::conjunction::kind::op_and, std::move(comparisons));
+  exp_executor executor(*node,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{exp_strategy_enum::AST_JIT});
+  auto output = executor.evaluate(sirius::get_cudf_table_view(*input));
+  REQUIRE(output != nullptr);
+  CAPTURE(rows);
+  CHECK(executor.ast_jit_evaluation_count_for_testing() > 0);
+  REQUIRE(output->view().column(0).size() == rows);
+  REQUIRE(output->view().column(0).null_count() == 0);
+  auto values = copy_column_to_host<int8_t>(output->view().column(0));
+  for (int i = 0; i < rows; ++i) {
+    if (bool(values[i]) != (left[i] > right[i])) {
+      CAPTURE(i);
+      REQUIRE(bool(values[i]) == (left[i] > right[i]));
     }
   }
 }
