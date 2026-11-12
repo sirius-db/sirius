@@ -1399,6 +1399,15 @@ sirius_scan_manager::sirius_scan_manager(
       _config.uring_n_reactors,
       _config.uring.slices_per_pass,
       _config.uring.range_batch_slices);
+  } else if (_config.backend == scan_manager::io_backend::gds) {
+    if (_topology_index->gpu_ids().size() > 1) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] backend=gds supports one GPU per process; "
+        "topology reports " +
+        std::to_string(_topology_index->gpu_ids().size()) + " GPUs");
+    }
+    _gds_ctx = std::make_shared<sirius::io::gds::gds_ioctx>(_config.gds);
+    _io_ctx  = _gds_ctx;
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(
@@ -1517,6 +1526,10 @@ void sirius_scan_manager::prepare_for_query(
 {
   auto const query_id = query.query_id();
   _execution_completion.store(completion);
+  if (_gds_ctx) {
+    std::lock_guard lk{_gds_query_mutex};
+    _gds_query_start[query_id] = gds_snapshot::take(*_gds_ctx);
+  }
 
   // No global reset here. It used to be how the previous query's state was dropped; with
   // concurrent queries that would tear down whatever is still running. Each query's state is
@@ -2599,7 +2612,58 @@ void sirius_scan_manager::finish_preparation(sirius::query_id_t query_id) noexce
 void sirius_scan_manager::reset(sirius::query_id_t query_id)
 {
   drain_query(query_id);
+  log_gds_proof(query_id);
   release_checkpoint_keys(query_id);
+}
+
+sirius_scan_manager::gds_snapshot sirius_scan_manager::gds_snapshot::take(
+  sirius::io::gds::gds_ioctx const& ctx)
+{
+  return {ctx.counters(),
+          ctx.cufile(),
+          sirius::io::gds::read_nvidia_fs_mmap_count(),
+          std::chrono::steady_clock::now()};
+}
+
+void sirius_scan_manager::log_gds_proof(sirius::query_id_t query_id)
+{
+  if (!_gds_ctx) { return; }
+  gds_snapshot start;
+  {
+    std::lock_guard lk{_gds_query_mutex};
+    auto it = _gds_query_start.find(query_id);
+    if (it == _gds_query_start.end()) { return; }
+    start = it->second;
+    _gds_query_start.erase(it);
+  }
+  auto const end        = gds_snapshot::take(*_gds_ctx);
+  auto const bytes      = end.io.device_bytes - start.io.device_bytes;
+  auto const seconds    = std::chrono::duration<double>(end.at - start.at).count();
+  auto const has_cufile = start.cufile && end.cufile;
+  auto const delta = has_cufile ? *end.cufile - *start.cufile : sirius::io::gds::cufile_counters{};
+  auto const reads = static_cast<double>(end.io.device_reads - start.io.device_reads);
+  // The counters are per process (cuFile) and per node (nvidia-fs), so with
+  // queries running at once each line also holds the others' reads.
+  SIRIUS_LOG_INFO(
+    "[gds] query={} device_bytes={} device_reads={:.0f} cufile_reads={} nvfs_reads={} "
+    "posix_reads={} node_mmap_delta={} GB/s={:.2f} read_ms_avg={:.2f} wait_ms_avg={:.2f} "
+    "read_thread_s={:.1f} held_reads={} verdict={}",
+    query_id,
+    bytes,
+    reads,
+    has_cufile ? std::to_string(delta.total_reads) : "n/a",
+    has_cufile ? std::to_string(delta.nvfs_reads) : "n/a",
+    has_cufile ? std::to_string(delta.posix_reads) : "n/a",
+    start.node_mmaps && end.node_mmaps ? std::to_string(*end.node_mmaps - *start.node_mmaps)
+                                       : "n/a",
+    seconds > 0 ? static_cast<double>(bytes) / 1e9 / seconds : 0.0,
+    reads > 0 ? static_cast<double>(end.io.device_read_ns - start.io.device_read_ns) / 1e6 / reads
+              : 0.0,
+    reads > 0 ? static_cast<double>(end.io.device_wait_ns - start.io.device_wait_ns) / 1e6 / reads
+              : 0.0,
+    static_cast<double>(end.io.device_read_ns - start.io.device_read_ns) / 1e9,
+    end.io.held_reads - start.io.held_reads,
+    has_cufile ? sirius::io::gds::to_string(sirius::io::gds::classify(delta)) : "unknown");
 }
 
 void sirius_scan_manager::drain_query(sirius::query_id_t query_id)

@@ -286,6 +286,29 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, sirius::io::gds::gds_config& opt)
+{
+  yaml::reader r(node, "gds");
+  r.optional("num_threads", opt.num_threads, yaml::greater_than<std::size_t>{0});
+  // Measured on GPFS: 32 and 64 reads in flight per GPU are fastest, 128 is slower, and at
+  // 256 a cuFile read stopped returning.
+  if (opt.num_threads > sirius::io::gds::k_max_num_threads) {
+    throw std::runtime_error("'gds.num_threads': must be at most " +
+                             std::to_string(sirius::io::gds::k_max_num_threads));
+  }
+  r.optional("task_size", yaml::bytes(opt.task_size));
+  r.optional("require", opt.require);
+  std::int64_t timeout_s = opt.read_timeout.count();
+  r.optional("read_timeout_s", timeout_s, yaml::greater_than<std::int64_t>{0});
+  opt.read_timeout = std::chrono::seconds{timeout_s};
+  r.optional("slow_read_ms_per_mib", opt.slow_read_ms_per_mib);
+  if (opt.slow_read_ms_per_mib < 0) {
+    throw std::runtime_error("'gds.slow_read_ms_per_mib': must be >= 0");
+  }
+  if (opt.task_size == 0) { throw std::runtime_error("'gds.task_size': must be > 0"); }
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
@@ -414,6 +437,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
+  if (auto n = r.optional_node("gds")) sirius::from_yaml(*n, opt.gds);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
@@ -1152,6 +1176,13 @@ void sirius_config::enforce_native_backend_for_multi_gpu()
   size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
+  // Rewriting gds to native would read through io_uring without saying so.
+  if (num_gpus > 1 && _scan_manager_config.backend == scan_manager::io_backend::gds) {
+    throw std::runtime_error(
+      "sirius_config: scan_manager.backend 'gds' supports one GPU per "
+      "process, but " +
+      std::to_string(num_gpus) + " GPUs are configured");
+  }
   if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
     SIRIUS_LOG_WARN(
       "sirius_config: backend was not 'native' but {} GPUs are configured; "

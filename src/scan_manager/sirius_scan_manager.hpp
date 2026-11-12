@@ -21,6 +21,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/gds/gds_ioctx.hpp"
 #include "io/scoped_object_store_configs.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
@@ -1150,6 +1151,20 @@ class sirius_scan_manager {
   native_reader_executor _native_readers;
   coordinator_pool _coordinators;
   std::shared_ptr<cucascade::io::ioctx> _io_ctx;
+
+  /// The default context again, typed, when backend=gds; null otherwise.
+  std::shared_ptr<sirius::io::gds::gds_ioctx> _gds_ctx;
+  /// Counters at a query's start, for the per-query `[gds]` proof line.
+  struct gds_snapshot {
+    sirius::io::gds::gds_ioctx::io_counters io;
+    std::optional<sirius::io::gds::cufile_counters> cufile;
+    std::optional<std::uint64_t> node_mmaps;
+    std::chrono::steady_clock::time_point at;
+    static gds_snapshot take(sirius::io::gds::gds_ioctx const& ctx);
+  };
+  std::mutex _gds_query_mutex;
+  std::unordered_map<sirius::query_id_t, gds_snapshot> _gds_query_start;
+  void log_gds_proof(sirius::query_id_t query_id);
   /// `[uring_gauges]` DEBUG sampler of `_io_ctx` when it is a uring ioctx (null
   /// otherwise).  Stopped in @ref stop, before any ioctx is released.
   std::unique_ptr<uring_gauges_sampler> _uring_gauges_sampler;

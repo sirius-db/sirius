@@ -20,6 +20,13 @@ unset _rails
 # host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint
 # timeout").
 export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
+# Without the InfiniBand transports nothing looks a buffer up in UCX's registration cache, so
+# nothing drains the list where it queues every freed GPU buffer, and each cudaFreeAsync walks
+# that whole list under one lock (UCX 1.21, ucs_rcache_unmapped_callback). The join after Q14's
+# exchange took 12 s instead of under 1 s. The exchange registers its rings itself. Any UCX_TLS
+# but "all" turns the cache off; with a list of your own that has rc, dc or ud in it, export
+# UCX_RCACHE_ENABLE=y.
+[[ $UCX_TLS == all ]] || export UCX_RCACHE_ENABLE=${UCX_RCACHE_ENABLE:-n}
 # DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse it.
 export DUCKDB_AGENT_MODE=${DUCKDB_AGENT_MODE:-0}
 [[ -n ${NIXL_PREFIX:-} ]] || return 0

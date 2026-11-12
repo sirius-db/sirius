@@ -196,6 +196,7 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/cuda/test_device_copy_batch.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_gds_ioctx.cpp
     test/cpp/io/test_path_utils.cpp
     test/cpp/io/rest/test_rest_datasource_integration.cpp
     test/cpp/log/test_duckdb_sink.cpp

@@ -19,6 +19,7 @@
 
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "io/gds/gds_config.hpp"
 #include "scan_manager/preparation_options.hpp"
 
 #include <cucascade/io/config.hpp>
@@ -120,6 +121,9 @@ enum class io_backend {
   native,
   /// The kvikIO backend (drives @c kvikio::FileHandle directly).
   kvikio,
+  /// GPUDirect Storage: local files read into GPU memory with cuFile
+  /// (@c sirius::io::gds::gds_ioctx).
+  gds,
 };
 
 /// Parse a @ref io_backend from its lowercase YAML spelling.  @c "sirius" is the
@@ -130,6 +134,7 @@ inline bool string_to_enum(std::string_view sv, io_backend& out)
     {"native", io_backend::native},
     {"sirius", io_backend::native},  // deprecated alias
     {"kvikio", io_backend::kvikio},
+    {"gds", io_backend::gds},
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -145,6 +150,7 @@ inline bool enum_to_string(io_backend b, std::string& s)
   switch (b) {
     case io_backend::native: s = "native"; return true;
     case io_backend::kvikio: s = "kvikio"; return true;
+    case io_backend::gds: s = "gds"; return true;
   }
   return false;
 }
@@ -289,6 +295,9 @@ struct scan_manager_config {
   /// in place.
   cucascade::io::kvikio_config kvikio{};
 
+  /// GPUDirect Storage backend settings (backend=gds).
+  sirius::io::gds::gds_config gds{};
+
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
@@ -315,8 +324,11 @@ struct scan_manager_config {
   [[nodiscard]] cucascade::io::io_config to_io_config() const
   {
     cucascade::io::io_config out{};
-    out.backend          = backend == io_backend::kvikio ? cucascade::io::io_backend::kvikio
-                                                         : cucascade::io::io_backend::native;
+    // The registry must resolve local paths to the kvikio type under gds too:
+    // gds_ioctx reports that type, and the scan manager returns its default
+    // context only on a type match. Otherwise local reads go to a uring context.
+    out.backend          = backend == io_backend::native ? cucascade::io::io_backend::native
+                                                         : cucascade::io::io_backend::kvikio;
     out.uring_n_reactors = uring_n_reactors;
     out.rest_n_reactors  = rest_n_reactors;
     out.uring            = uring;
