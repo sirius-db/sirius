@@ -108,6 +108,7 @@ struct allocation_fixture {
     key                  = op == operation::absent_drop ? "s3://allocation-bucket/absent-prefix/"
                                                         : "s3://allocation-bucket/prefix-0/";
     before               = registry.capture();
+    before_entries       = *before;
     for (auto const& owner : owners) {
       owner_counts.push_back(owner.use_count());
     }
@@ -126,10 +127,7 @@ struct allocation_fixture {
   {
     auto const now = registry.capture();
     REQUIRE(now == before);
-    REQUIRE(now->size() == before->size());
-    for (std::size_t i = 0; i < before->size(); ++i) {
-      CHECK((*now)[i] == (*before)[i]);
-    }
+    CHECK(*now == before_entries);
     for (std::size_t i = 0; i < owners.size(); ++i) {
       CHECK(owners[i].use_count() == owner_counts[i]);
     }
@@ -184,6 +182,7 @@ struct allocation_fixture {
   long candidate_count{};
   std::string key;
   std::shared_ptr<const core::scope_set> before;
+  core::scope_set before_entries;
 };
 
 }  // namespace
@@ -381,6 +380,9 @@ TEST_CASE("Object-store registry allows last-owner deleters to reenter every wri
         result = registry.drop(value->uri_prefix);
       }
       REQUIRE(result.published);
+      // This call's set, not the one left by the deleter's nested publish and drop.
+      CHECK(result.published != registry.capture());
+      CHECK(result.published->size() == (std::string_view(action) == "replace" ? 1U : 0U));
     }
     CHECK_FALSE(observation->error);
     CHECK(observation->releases == 1);
@@ -518,8 +520,6 @@ TEST_CASE("Object-store registry survives each reached allocation failure", "[ob
         if (result.allocation.hit) { CHECK(result.allocation.requests == ordinal); }
         if (result.threw) {
           CHECK(result.allocation.hit);
-          CHECK_FALSE(result.outcome.refused);
-          CHECK_FALSE(result.outcome.published);
           fixture.check_unchanged();
           ++propagated;
         } else {

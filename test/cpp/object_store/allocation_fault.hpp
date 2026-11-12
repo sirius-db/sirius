@@ -13,8 +13,8 @@ struct observation {
 
 bool supported() noexcept;
 
-// Zero counts without failing. A nonzero ordinal fails once, then disables interception
-// before unwinding or a nothrow allocation's fallback can run.
+// When supported(), ordinal zero counts without failing. A reached nonzero ordinal fails
+// once, disabling interception before unwinding or a nothrow allocation's fallback can run.
 void arm(std::size_t ordinal = 0) noexcept;
 observation disarm() noexcept;
 
