@@ -3,11 +3,17 @@
     "bench/gb300-cold/config.yaml": "bdb108fd8fe888e6ca0542ed5e98141049eb9eb83cf33725f8c7e4b476ff7cbf",
     "bench/gb300-hot/config.yaml": "0d30afde6b37135819b59eaf46821d06ed99278c6cf96fc1e201ef734bfad237",
     "bench/gb300-pin/config.yaml": "05ee1859be0123cf8f2bf4a851953169375ce40f028a2aedcec455f565ee977c",
+    "bench/gb300-results/sf100/cold-per-query.csv": "b59991159bdd31740218232df23a8e17f9d40f8fe8ea91133cd64b79ab95293b",
+    "bench/gb300-results/sf100/hot-per-query.csv": "82ffafc4862787931b85d06a0bd0ea680d7e9452357e1b4eb242d27e0af718e9",
+    "bench/gb300-results/sf100/pin-per-query.csv": "d879128e11c324bd68360c981ac93d7e6f9247f32b313ae951969c036481c318",
     "bench/gb300-results/sf1000/cold-per-query.csv": "cc89af460c6d0395df3ef928a8b802a92e1c3926ce9d2769f954cce7510b3d5f",
     "bench/gb300-results/sf1000/hot-per-query.csv": "717e84817b335b15fcb7fb6143490706f35b7639f235bc2335c7207c8feaf4b6",
     "bench/gb300-results/sf1000/pin-per-query.csv": "0fdb68a81975a1b74b95f32b0fd1170951a05f684028a80ac86fe66f76087d0f",
     "bench/gb300-results/sf10000/cold-per-query.csv": "faaed516c3baa4d889f75b63922c89415c8ef50627207f6f20c29192c53953ed",
     "bench/gb300-results/sf10000/hot-per-query.csv": "9a4171a2634cfc14ae5cd3bb9beb3e376b0711ed36d953ea6952a541c1731b59",
+    "bench/gb300-results/sf300/cold-per-query.csv": "a75db73e433ee5daac272c8e0da554183e4b80efe45afd43d59c8c07eee2b1c5",
+    "bench/gb300-results/sf300/hot-per-query.csv": "f3679782c76c1a08038b5f519608e5f66ef0207ad92c65a444097d2eae21b6ab",
+    "bench/gb300-results/sf300/pin-per-query.csv": "cbcaa4de7c27607cff6087c9b01a616a80d29e3146f8f0effd4e10209d60933c",
     "bench/gb300-results/sf3000/cold-per-query.csv": "23c01e5752884e1bd3c9a969ab34c9ee971e8285cef275f1e35a81a3a32a0c68",
     "bench/gb300-results/sf3000/hot-per-query.csv": "39cef565a40e48964bf968e98207a55e8256a0f8c4161d78c2487c77c22714a4",
     "bench/gb300-results/sf3000/pin-per-query.csv": "31162db0a84b3391a1d10fe61f1376823d4e9e63d68459da0abe907b34887161",
@@ -19,16 +25,62 @@
   "concurrency": 1,
   "csv_line_endings": "Selected CSV values unchanged; CRLF line endings normalized to LF for the repository.",
   "original_selected_csv_checksums_sha256": {
+    "bench/gb300-results/sf100/cold-per-query.csv": "3a9724ac6759e5f3f152374a195da84a1f6505a21849b28d535557792fceca1d",
+    "bench/gb300-results/sf100/hot-per-query.csv": "9456a7e9ccc7602396299d755c9f3e014b4409c781259d5fa64d62b642ededdf",
+    "bench/gb300-results/sf100/pin-per-query.csv": "c66fc239c9f2e18e97ea456e7624d2bbc9a3865b46d76d975cb18217cd7c0203",
     "bench/gb300-results/sf1000/cold-per-query.csv": "8f3885162cb67dde22506a0a9ac6eae9e7f713414fbab12ff93f414e74a21a1c",
     "bench/gb300-results/sf1000/hot-per-query.csv": "6fee05959e445adcc15590488c367dd861175fe42cfb0cb3c7bb81d62dcff60a",
     "bench/gb300-results/sf1000/pin-per-query.csv": "87885f73fb093a6e6648abf88627f8325135e746dcd6658b2a4692ffc3df7a9b",
     "bench/gb300-results/sf10000/cold-per-query.csv": "06a08793ea68819dc624558f5d6377f6849592ae7bd9d318c47f975e01c7d4ab",
     "bench/gb300-results/sf10000/hot-per-query.csv": "42d8582ebacac7a7bcf040e1f25cd333e612850b648e908889751e28ea7f375c",
+    "bench/gb300-results/sf300/cold-per-query.csv": "665e115fd16f6b9165698d4af1daef238dfe43df02d6f88a8e234dc52fc4cca3",
+    "bench/gb300-results/sf300/hot-per-query.csv": "1e2298cb9a61a5f80629295b4980f5a99ac232d11386496d011a5f744ee57bfb",
+    "bench/gb300-results/sf300/pin-per-query.csv": "eaa51e399870754698a0ac9f02403bce189ee66a57b4de4df200f0bc036f0e5e",
     "bench/gb300-results/sf3000/cold-per-query.csv": "5e9b424622f64991ce07ee0357bee0ede330a22fa8cd210c4dda52e62b98bb5d",
     "bench/gb300-results/sf3000/hot-per-query.csv": "bb0cb6675f06ec0cb7d6287de8cb5da5d31b3ac1577274cd955204615944ff96",
     "bench/gb300-results/sf3000/pin-per-query.csv": "c212c75570093d96ce59dea90a9714a23a822128f70a666a331e6dbb508fd2fb"
   },
   "results": {
+    "sf100": {
+      "cold": {
+        "config": "bench/gb300-cold/config.yaml",
+        "gpu_executions": 44,
+        "iterations": 2,
+        "per_query_csv": "bench/gb300-results/sf100/cold-per-query.csv",
+        "q10_separate_config": null,
+        "query_time_s": [
+          7.862129,
+          7.776938
+        ],
+        "status": "complete"
+      },
+      "hot": {
+        "config": "bench/gb300-hot/config.yaml",
+        "gpu_executions": 44,
+        "iterations": 2,
+        "per_query_csv": "bench/gb300-results/sf100/hot-per-query.csv",
+        "q10_separate_config": null,
+        "query_time_s": [
+          6.483674,
+          5.532116
+        ],
+        "status": "complete"
+      },
+      "pin": {
+        "config": "bench/gb300-pin/config.yaml",
+        "gpu_executions": 22,
+        "iterations": 1,
+        "per_query_csv": "bench/gb300-results/sf100/pin-per-query.csv",
+        "q10_separate_config": null,
+        "query_time_s": [
+          1.612302
+        ],
+        "status": "complete",
+        "input_compression": "simpatico",
+        "pin_strategy": "per-query",
+        "pin_tier": "host"
+      }
+    },
     "sf1000": {
       "cold": {
         "config": "bench/gb300-cold/config.yaml",
@@ -98,6 +150,46 @@
         "query_time_s": null,
         "reason": "Per-query host pinning failed before Q13 execution: fixed-size host pool ran out of blocks; 448.12 GiB lifetime peak with 450 GiB configured capacity.",
         "status": "unavailable"
+      }
+    },
+    "sf300": {
+      "cold": {
+        "config": "bench/gb300-cold/config.yaml",
+        "gpu_executions": 44,
+        "iterations": 2,
+        "per_query_csv": "bench/gb300-results/sf300/cold-per-query.csv",
+        "q10_separate_config": null,
+        "query_time_s": [
+          20.47738,
+          20.386265
+        ],
+        "status": "complete"
+      },
+      "hot": {
+        "config": "bench/gb300-hot/config.yaml",
+        "gpu_executions": 44,
+        "iterations": 2,
+        "per_query_csv": "bench/gb300-results/sf300/hot-per-query.csv",
+        "q10_separate_config": null,
+        "query_time_s": [
+          15.258412,
+          13.388914
+        ],
+        "status": "complete"
+      },
+      "pin": {
+        "config": "bench/gb300-pin/config.yaml",
+        "gpu_executions": 22,
+        "iterations": 1,
+        "per_query_csv": "bench/gb300-results/sf300/pin-per-query.csv",
+        "q10_separate_config": null,
+        "query_time_s": [
+          3.272937
+        ],
+        "status": "complete",
+        "input_compression": "simpatico",
+        "pin_strategy": "per-query",
+        "pin_tier": "host"
       }
     },
     "sf3000": {
