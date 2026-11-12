@@ -154,8 +154,7 @@ expression_evaluator::expression_evaluator(
     _stream(stream),
     _min_ast_size(min_ast_size),
     _like_swar_fastpath(like_swar_fastpath),
-    _expression_caches(expression_caches ? std::move(expression_caches)
-                                         : std::make_shared<expression_query_caches>())
+    _expression_caches(query_caches_or_private(std::move(expression_caches)))
 {
   _ast_expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
@@ -194,8 +193,7 @@ expression_evaluator::expression_evaluator(
     _stream(stream),
     _min_ast_size(min_ast_size),
     _like_swar_fastpath(like_swar_fastpath),
-    _expression_caches(expression_caches ? std::move(expression_caches)
-                                         : std::make_shared<expression_query_caches>())
+    _expression_caches(query_caches_or_private(std::move(expression_caches)))
 {
   _ast_expressions.push_back(expression);
 }
@@ -214,8 +212,7 @@ expression_evaluator::expression_evaluator(
     _stream(stream),
     _min_ast_size(min_ast_size),
     _like_swar_fastpath(like_swar_fastpath),
-    _expression_caches(expression_caches ? std::move(expression_caches)
-                                         : std::make_shared<expression_query_caches>())
+    _expression_caches(query_caches_or_private(std::move(expression_caches)))
 {
 }
 

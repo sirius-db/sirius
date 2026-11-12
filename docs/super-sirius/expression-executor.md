@@ -193,7 +193,9 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
   `nvrtc::string_constant_cache` (in the `expression_query_caches` shared through the pipeline
   build context) uploads once per device, on a stream of its own; each launch's stream waits for
   that upload on the device, so a batch neither allocates device memory for its constants nor
-  copies them or blocks the host on them. The copies are freed when the query ends.
+  copies them or blocks the host on them. Each copy is charged to its device's GPU memory space,
+  not to the reservation of the task that first needed it, and is freed when the query ends, on
+  the cache's stream once every launch that read it has finished, without a host wait.
 - **Filters** compact survivors in a single pass for a one-tile batch, otherwise in three
   launches: the predicate kernel writes a survivor count per tile plus the per-warp ballot words,
   a one-block scan turns the counts into tile offsets, and a scatter kernel writes the surviving

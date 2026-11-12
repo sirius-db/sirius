@@ -211,8 +211,7 @@ kernel_arguments::kernel_arguments(kernel_abi const& abi,
                                    translation_context const& ctx,
                                    cudf::table_view const& input,
                                    string_constant_cache const* string_constants,
-                                   ::cuda::stream_ref stream,
-                                   rmm::device_async_resource_ref mr)
+                                   ::cuda::stream_ref stream)
   : _abi(abi),
     _inputs(ctx.input_columns().size()),
     _constants(ctx.constants().size()),
@@ -255,7 +254,7 @@ kernel_arguments::kernel_arguments(kernel_abi const& abi,
     if (string_constants == nullptr) {
       throw internal_exception("[nvrtc] string constants need a string_constant_cache");
     }
-    pool_data = _pool.emplace(string_constants->acquire(pool, stream, mr)).data();
+    pool_data = _pool.emplace(string_constants->acquire(pool, stream)).data();
   }
   for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
     auto const& cst = ctx.constants()[i];

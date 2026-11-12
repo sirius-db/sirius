@@ -22,6 +22,7 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -29,9 +30,13 @@
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/nvrtc/string_constant_cache.hpp>
 #include <expression_evaluator/query_caches.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 #include <sirius/exception.hpp>
 
 #include <atomic>
@@ -39,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <latch>
 #include <optional>
 #include <set>
 #include <string>
@@ -64,6 +70,23 @@ std::string read_back(char const* device_bytes, std::size_t size, rmm::cuda_stre
 /** A pool with an embedded NUL, a UTF-8 sequence and a payload longer than a few words. */
 std::string const mixed_pool =
   std::string("a\0b", 3) + "\xC3\xA9t\xC3\xA9" + std::string(4096, 'x');
+
+/**
+ * A memory manager configured like the engine's, with per-thread reservation tracking and a
+ * stream-ordered allocator on GPU 0.
+ */
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_engine_like_manager()
+{
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(std::size_t{256} << 20)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(std::size_t{256} << 20)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75)
+    .track_reservation_per_stream(false);
+  return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+}
 
 /** Host work that holds a stream until @c open is called or ten seconds pass. */
 class stream_gate {
@@ -156,10 +179,9 @@ TEST_CASE("string_constant_cache - one upload per pool serves every stream of a 
   rmm::cuda_stream upload_stream;
   rmm::cuda_stream consumer_stream;
   string_constant_cache const cache;
-  auto const mr = cudf::get_current_device_resource_ref();
 
-  auto const uploaded = cache.acquire(mixed_pool, upload_stream, mr);
-  auto const reused   = cache.acquire(mixed_pool, consumer_stream, mr);
+  auto const uploaded = cache.acquire(mixed_pool, upload_stream);
+  auto const reused   = cache.acquire(mixed_pool, consumer_stream);
 
   CHECK(cache.upload_count_for_testing() == 1);
   CHECK(reused.data() == uploaded.data());
@@ -173,16 +195,15 @@ TEST_CASE("string_constant_cache - the upload does not wait for work queued on t
   rmm::cuda_stream blocked_stream;
   rmm::cuda_stream other_stream;
   string_constant_cache const cache;
-  auto const mr = cudf::get_current_device_resource_ref();
   stream_gate gate(blocked_stream);
 
   std::optional<string_constant_cache::lease> blocked;
   {
     auto const before = std::chrono::steady_clock::now();
-    blocked.emplace(cache.acquire(mixed_pool, blocked_stream, mr));
+    blocked.emplace(cache.acquire(mixed_pool, blocked_stream));
     CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds(5));
   }
-  auto const other = cache.acquire(mixed_pool, other_stream, mr);
+  auto const other = cache.acquire(mixed_pool, other_stream);
   CHECK(read_back(other.data(), mixed_pool.size(), other_stream) == mixed_pool);
   CHECK_FALSE(gate.passed());
 
@@ -197,7 +218,7 @@ TEST_CASE("string_constant_cache - the source bytes may change once acquire retu
   string_constant_cache const cache;
   std::string source = mixed_pool;
 
-  auto const copy = cache.acquire(source, stream, cudf::get_current_device_resource_ref());
+  auto const copy = cache.acquire(source, stream);
   source.assign(source.size(), '?');
 
   CHECK(read_back(copy.data(), mixed_pool.size(), stream) == mixed_pool);
@@ -208,11 +229,10 @@ TEST_CASE("string_constant_cache - distinct pools are uploaded separately",
 {
   rmm::cuda_stream stream;
   string_constant_cache const cache;
-  auto const mr = cudf::get_current_device_resource_ref();
 
-  auto const first  = cache.acquire("alpha", stream, mr);
-  auto const second = cache.acquire("beta", stream, mr);
-  auto const again  = cache.acquire("alpha", stream, mr);
+  auto const first  = cache.acquire("alpha", stream);
+  auto const second = cache.acquire("beta", stream);
+  auto const again  = cache.acquire("alpha", stream);
 
   CHECK(cache.upload_count_for_testing() == 2);
   CHECK(again.data() == first.data());
@@ -220,25 +240,102 @@ TEST_CASE("string_constant_cache - distinct pools are uploaded separately",
   CHECK(read_back(second.data(), 4, stream) == "beta");
 }
 
-TEST_CASE("string_constant_cache - destruction waits for the work queued before a lease's release",
-          "[nvrtc_jit][string_constant_cache]")
+TEST_CASE(
+  "string_constant_cache - destruction returns before the work queued under a lease completes, "
+  "and that work still reads the copy",
+  "[nvrtc_jit][string_constant_cache]")
 {
   rmm::cuda_stream stream;
+  // Pinned, so that the read queues behind the gate instead of waiting for it on the host.
+  char* pinned = nullptr;
+  REQUIRE(cudaMallocHost(&pinned, mixed_pool.size()) == cudaSuccess);
+  std::unique_ptr<char, decltype(&cudaFreeHost)> const host{pinned, &cudaFreeHost};
+  auto const manager = make_engine_like_manager();
+  std::optional<string_constant_cache> cache{
+    std::in_place,
+    std::vector<cucascade::memory::memory_space const*>{
+      manager->get_memory_space(cucascade::memory::Tier::GPU, 0)}};
   std::optional<stream_gate> gate;
-  std::thread opener;
   {
-    string_constant_cache const cache;
-    {
-      auto const copy = cache.acquire(mixed_pool, stream, cudf::get_current_device_resource_ref());
-      gate.emplace(stream);
-    }
-    opener = std::thread([&] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      gate->open();
+    auto const copy = cache->acquire(mixed_pool, stream);
+    gate.emplace(stream);
+    REQUIRE(cudaMemcpyAsync(
+              host.get(), copy.data(), mixed_pool.size(), cudaMemcpyDeviceToHost, stream.value()) ==
+            cudaSuccess);
+  }
+
+  auto const before = std::chrono::steady_clock::now();
+  cache.reset();
+  CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds(5));
+  CHECK_FALSE(gate->passed());
+
+  gate->open();
+  stream.synchronize();
+  CHECK(std::string(host.get(), mixed_pool.size()) == mixed_pool);
+}
+
+TEST_CASE("string_constant_cache - concurrent acquisitions of one pool share one upload",
+          "[nvrtc_jit][string_constant_cache]")
+{
+  constexpr int thread_count = 8;
+  string_constant_cache const cache;
+  std::latch start{thread_count};
+  std::vector<char const*> copies(thread_count);
+  std::vector<std::string> read(thread_count);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < thread_count; ++t) {
+    threads.emplace_back([&, t] {
+      rmm::cuda_stream stream;
+      start.arrive_and_wait();
+      auto const copy = cache.acquire(mixed_pool, stream);
+      auto const own  = cache.acquire(std::format("pool of thread {}", t), stream);
+      copies[t]       = copy.data();
+      read[t]         = read_back(copy.data(), mixed_pool.size(), stream);
     });
   }
-  CHECK(gate->passed());
-  opener.join();
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  CHECK(cache.upload_count_for_testing() == 1 + thread_count);
+  CHECK(std::set<char const*>(copies.begin(), copies.end()).size() == 1);
+  for (auto const& bytes : read) {
+    CHECK(bytes == mixed_pool);
+  }
+}
+
+TEST_CASE(
+  "string_constant_cache - a cache over a GPU memory space charges its copies to the space for "
+  "its own lifetime, never to the calling thread's reservation",
+  "[nvrtc_jit][string_constant_cache]")
+{
+  // Per-thread tracking charges every allocation a thread makes through the space's allocator to
+  // the reservation attached to that thread.
+  auto const manager  = make_engine_like_manager();
+  auto* const space   = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* const charged = space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  REQUIRE(charged != nullptr);
+
+  rmm::cuda_stream stream;
+  auto task_reservation = space->make_reservation(std::size_t{1} << 20);
+  REQUIRE(task_reservation != nullptr);
+  REQUIRE(charged->attach_reservation_to_tracker(stream, std::move(task_reservation)));
+  auto const unrelated = charged->get_total_allocated_bytes();
+
+  std::optional<string_constant_cache> cache{
+    std::in_place, std::vector<cucascade::memory::memory_space const*>{space}};
+  {
+    auto const copy = cache->acquire(mixed_pool, stream);
+    CHECK(read_back(copy.data(), mixed_pool.size(), stream) == mixed_pool);
+  }
+  CHECK(charged->get_allocated_bytes(stream) == 0);
+  CHECK(charged->get_total_allocated_bytes() ==
+        unrelated + rmm::align_up(mixed_pool.size(), rmm::CUDA_ALLOCATION_ALIGNMENT));
+
+  cache.reset();
+  CHECK(charged->get_total_allocated_bytes() == unrelated);
+
+  charged->reset_stream_reservation(stream);
   stream.synchronize();
 }
 
@@ -246,8 +343,7 @@ TEST_CASE("string_constant_cache - an empty pool is rejected", "[nvrtc_jit][stri
 {
   rmm::cuda_stream stream;
   string_constant_cache const cache;
-  CHECK_THROWS_AS(cache.acquire({}, stream, cudf::get_current_device_resource_ref()),
-                  sirius::internal_exception);
+  CHECK_THROWS_AS(cache.acquire({}, stream), sirius::internal_exception);
   CHECK(cache.upload_count_for_testing() == 0);
 }
 
@@ -262,9 +358,8 @@ TEST_CASE("string_constant_cache - every device gets its own copy",
     rmm::cuda_set_device_raii const on_device{rmm::cuda_device_id{device}};
     rmm::cuda_stream upload_stream;
     rmm::cuda_stream consumer_stream;
-    auto const mr       = cudf::get_current_device_resource_ref();
-    auto const uploaded = cache.acquire(mixed_pool, upload_stream, mr);
-    auto const reused   = cache.acquire(mixed_pool, consumer_stream, mr);
+    auto const uploaded = cache.acquire(mixed_pool, upload_stream);
+    auto const reused   = cache.acquire(mixed_pool, consumer_stream);
     CHECK(reused.data() == uploaded.data());
     CHECK(read_back(reused.data(), mixed_pool.size(), consumer_stream) == mixed_pool);
     copies.insert(uploaded.data());

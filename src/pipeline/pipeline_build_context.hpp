@@ -63,8 +63,7 @@ class pipeline_build_context {
       _num_gpus(num_gpus),
       _operator_params(operator_params ? std::move(operator_params)
                                        : std::make_shared<const sirius::operator_params>()),
-      _expression_caches(expression_caches ? std::move(expression_caches)
-                                           : std::make_shared<sirius::expression_query_caches>())
+      _expression_caches(sirius::query_caches_or_private(std::move(expression_caches)))
   {
   }
 
@@ -90,8 +89,7 @@ class pipeline_build_context {
       _active_gpu_ids(std::move(active_gpu_ids)),
       _operator_params(operator_params ? std::move(operator_params)
                                        : std::make_shared<const sirius::operator_params>()),
-      _expression_caches(expression_caches ? std::move(expression_caches)
-                                           : std::make_shared<sirius::expression_query_caches>())
+      _expression_caches(sirius::query_caches_or_private(std::move(expression_caches)))
   {
     if (_active_gpu_ids.empty()) {
       throw std::invalid_argument(

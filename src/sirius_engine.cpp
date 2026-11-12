@@ -21,6 +21,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "expression_evaluator/query_caches.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible.hpp"
@@ -347,9 +348,13 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   sirius_physical_plan = &plan;
 
   std::vector<int> gpu_ids;
+  std::vector<cucascade::memory::memory_space const*> gpu_spaces;
   for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
          cucascade::memory::Tier::GPU)) {
-    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
+    if (space != nullptr) {
+      gpu_ids.push_back(space->get_device_id());
+      gpu_spaces.push_back(space);
+    }
   }
   std::sort(gpu_ids.begin(), gpu_ids.end());
   gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
@@ -377,7 +382,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
     std::move(active_gpu_ids),
-    std::move(query_operator_params)};
+    std::move(query_operator_params),
+    std::make_shared<expression_query_caches>(std::move(gpu_spaces))};
 
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);

@@ -355,7 +355,7 @@ filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
   std::int32_t* survivors_scratch = d_survivors.data();
   auto num_rows_arg               = static_cast<std::int32_t>(num_rows);
 
-  kernel_arguments args(abi, ctx, input, options.string_constants, stream, mr);
+  kernel_arguments args(abi, ctx, input, options.string_constants, stream);
   args.add_sink_argument(&num_rows_arg);
   args.add_sink_argument(&status_ptr);
   args.add_sink_argument(&tile_counts_ptr);

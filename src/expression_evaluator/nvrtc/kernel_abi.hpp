@@ -18,8 +18,6 @@
 
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/resource_ref.hpp>
-
 #include <cuda/stream>
 
 #include <expression_evaluator/nvrtc/string_constant_cache.hpp>
@@ -143,16 +141,13 @@ class kernel_arguments {
   /**
    * @param string_constants The cache that serves the device copy of the string-constant pool; may
    * be null only when the context has no non-empty string constant.
-   * @param mr The memory resource that allocates the pool's device copy when @p string_constants
-   * does not yet hold it.
    * @throws internal_exception if the context has a non-empty string constant but no cache
    */
   kernel_arguments(kernel_abi const& abi,
                    translation_context const& ctx,
                    cudf::table_view const& input,
                    string_constant_cache const* string_constants,
-                   ::cuda::stream_ref stream,
-                   rmm::device_async_resource_ref mr);
+                   ::cuda::stream_ref stream);
 
   /** @brief Supplies the next sink-owned parameter value; @p host_value must outlive the launch. */
   void add_sink_argument(void* host_value);

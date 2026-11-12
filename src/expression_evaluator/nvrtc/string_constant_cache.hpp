@@ -16,15 +16,19 @@
 
 #pragma once
 
-#include <rmm/resource_ref.hpp>
-
 #include <cuda/stream>
+#include <cuda_runtime_api.h>
 
 #include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string_view>
+#include <vector>
+
+namespace cucascade::memory {
+class memory_space;
+}  // namespace cucascade::memory
 
 namespace sirius::nvrtc {
 
@@ -37,23 +41,45 @@ namespace sirius::nvrtc {
  * query that evaluates the same expression over many batches, in many task-local
  * `expression_evaluator` instances, uploads it once per device. Each query's
  * `pipeline::pipeline_build_context` owns one cache, inside the `expression_query_caches` it shares
- * with every evaluator of the query, so the copies are freed with the query.
+ * with every evaluator of the query, so the copies live exactly as long as the query.
  *
- * Member functions are thread-safe. Each works on the calling thread's current device, which must
- * be the device of the stream it is given. The first acquisition of a pool on a device allocates
- * the copy from the given memory resource and uploads it on a stream the cache owns, so the upload
- * never waits for work already queued on the caller's stream; every acquisition then makes the
- * caller's stream wait for the upload on the device, so the host never waits for it.
+ * Member functions are thread-safe and never wait on the host for GPU work. Each works on the
+ * calling thread's current device, which must be the device of the stream it is given. Every device
+ * has its own copies, its own lock, and its own stream, which the cache creates at the device's
+ * first acquisition. The first acquisition of a pool on a device uploads it on that stream, so the
+ * upload never waits for work queued on the caller's stream. Concurrent acquisitions of the same
+ * pool wait only until that upload is queued, acquisitions of other pools do not wait for it, and
+ * every acquisition makes the caller's stream wait for the upload on the device.
  *
- * Destroying the cache waits on the host for its uploads and for the work queued before each
- * `lease` was released, then frees the copies. Every lease must be released before the cache is
- * destroyed.
+ * Destruction is stream-ordered too: each device's stream, which already orders the uploads, waits
+ * for the work queued before every `lease` was released, and the copies are freed on it. Every
+ * lease must be released before the cache is destroyed.
  */
 class string_constant_cache {
  public:
   class lease;
 
+  /**
+   * @brief A cache that allocates the copies of each device from the device's current memory
+   * resource, for code that runs without Sirius memory spaces, such as unit tests.
+   *
+   * Destruction waits on the host only when that resource frees synchronously, as
+   * `rmm::mr::cuda_memory_resource` does.
+   */
   string_constant_cache();
+
+  /**
+   * @brief A cache that charges its copies on the device of each of @p gpu_spaces to that GPU
+   * memory space, for exactly as long as the cache holds them.
+   *
+   * Each copy is allocated from the upstream resource of the space's reservation-aware allocator
+   * under a reservation of the copy's aligned size that the copy holds. The charge therefore never
+   * lands on the reservation of the task whose acquisition uploaded the copy, nor on whichever
+   * thread or stream frees it. A device without a space in @p gpu_spaces uses its current memory
+   * resource. The spaces must outlive the cache.
+   */
+  explicit string_constant_cache(std::vector<cucascade::memory::memory_space const*> gpu_spaces);
+
   ~string_constant_cache();
   string_constant_cache(string_constant_cache const&)            = delete;
   string_constant_cache& operator=(string_constant_cache const&) = delete;
@@ -64,16 +90,14 @@ class string_constant_cache {
    * @brief Returns a lease on the current device's copy of @p pool, ordered before any work queued
    * on @p stream after this call.
    *
-   * @p pool is read before the call returns. @p mr allocates the copy when this is the first
-   * acquisition of @p pool on the current device.
+   * @p pool is read before the call returns.
    *
    * @throws internal_exception if @p pool is empty
+   * @throws rmm::out_of_memory if the device's GPU memory space cannot hold the copy
    * @throws std::runtime_error carrying the CUDA error string if the stream, the allocation, the
    * copy, or an event fails
    */
-  [[nodiscard]] lease acquire(std::string_view pool,
-                              ::cuda::stream_ref stream,
-                              rmm::device_async_resource_ref mr) const;
+  [[nodiscard]] lease acquire(std::string_view pool, ::cuda::stream_ref stream) const;
 
   /** @brief Returns the number of uploads, one per distinct (pool, device) acquired. */
   [[nodiscard]] std::size_t upload_count_for_testing() const;
@@ -81,10 +105,11 @@ class string_constant_cache {
  private:
   struct device_copies;
 
-  /** @brief Records that the work queued on @p stream so far may read the copies of @p device. */
-  void record_use(int device, ::cuda::stream_ref stream) const noexcept;
+  /** @brief Returns the copies of @p device, creating them on the device's first acquisition. */
+  [[nodiscard]] device_copies& copies_of(int device) const;
 
-  mutable std::mutex _mutex;
+  std::vector<cucascade::memory::memory_space const*> _gpu_spaces;
+  mutable std::mutex _mutex;  ///< Guards `_devices`; never held across a CUDA call.
   mutable std::map<int, std::unique_ptr<device_copies>> _devices;
 };
 
@@ -94,8 +119,7 @@ class string_constant_cache {
  *
  * Releasing the lease, by destroying it or assigning over it, records that the work queued on that
  * stream so far may read the copy, so the cache frees the copy only after that work completes. A
- * lease must be released on the thread and device it was acquired on, while its stream still
- * exists.
+ * lease must be released on the device it was acquired on, while its stream still exists.
  */
 class string_constant_cache::lease {
  public:
@@ -111,16 +135,13 @@ class string_constant_cache::lease {
  private:
   friend class string_constant_cache;
 
-  lease(string_constant_cache const& cache,
-        char const* data,
-        int device,
-        ::cuda::stream_ref stream);
+  lease(device_copies& copies, char const* data, cudaEvent_t last_use, ::cuda::stream_ref stream);
 
   void release() noexcept;
 
-  string_constant_cache const* _cache;
+  device_copies* _copies;
   char const* _data;
-  int _device;
+  cudaEvent_t _last_use;  ///< Owned by `_copies`: the event of `_stream`'s latest release.
   ::cuda::stream_ref _stream;
 };
 
