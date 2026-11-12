@@ -53,7 +53,14 @@ impl Channel {
     }
 
     pub(crate) fn resource_type_decl() -> ResourceTypeDecl {
-        ResourceTypeDecl::new("channel", [CapacityDecl::new_rate("bytes")])
+        ResourceTypeDecl::new("channel", [CapacityDecl::new_rate(CHANNEL_BYTES)])
+    }
+
+    pub(crate) fn endpoints(&self) -> Option<(Uuid, Uuid)> {
+        let data = self.0.accumulator();
+
+        // To match logical copy endpoints against declared channels after ingestion.
+        data.source_id.zip(data.target_id)
     }
 }
 

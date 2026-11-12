@@ -410,8 +410,10 @@ TEST_CASE("deposit observes a pinned unpublished owner that survives synthetic f
     {
     }
 
+   private:
+    // The repository holds its mutex while invoking this hook.
     void add_data_batch_unlocked(const std::shared_ptr<cucascade::data_batch>& batch,
-                                 std::size_t partition = 0) override
+                                 std::size_t partition) override
     {
       ++deposits;
       auto const snapshot = channel.snapshot();
@@ -479,8 +481,9 @@ TEST_CASE("deposit exceptions resolve the claim and propagate without retry",
     bool throw_oom       = false;
     std::size_t deposits = 0;
 
+   private:
     void add_data_batch_unlocked(const std::shared_ptr<cucascade::data_batch>& batch,
-                                 std::size_t partition = 0) override
+                                 std::size_t partition) override
     {
       ++deposits;
       cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);

@@ -63,13 +63,6 @@ constexpr std::uint64_t bloom_cap       = 64 * acc::mib;
 
 class observed_repository final : public cucascade::shared_data_repository {
  public:
-  void add_data_batch_unlocked(const acc::batch_ptr& batch, std::size_t partition = 0) override
-  {
-    if (before_deposit) { before_deposit(); }
-    cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
-    deposits.fetch_add(1);
-  }
-
   void discard_batches()
   {
     for (std::size_t partition = 0; partition < num_partitions(); ++partition) {
@@ -79,6 +72,15 @@ class observed_repository final : public cucascade::shared_data_repository {
 
   std::function<void()> before_deposit;
   std::atomic<std::size_t> deposits{0};
+
+ private:
+  // The public entry point already holds the repository mutex.
+  void add_data_batch_unlocked(const acc::batch_ptr& batch, std::size_t partition) override
+  {
+    if (before_deposit) { before_deposit(); }
+    cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
+    deposits.fetch_add(1);
+  }
 };
 
 class observed_partition final : public op::sirius_physical_partition {

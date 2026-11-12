@@ -967,3 +967,752 @@ fn query_groups_use_ui_attributes() {
         Some(crate::boilerplate::QUERY_GROUP_ATTRIBUTE)
     );
 }
+
+const COPY_CHANNEL: u128 = 17;
+const COPY_HANDLE: u128 = 20;
+
+fn clone_start(handle: u128, time: u64, clone_id: u64, bytes: u64) -> Event<E> {
+    ev(
+        handle,
+        time,
+        E::BatchClone(s::BatchCloneEvent::Started {
+            clone_id,
+            source_tier: EntityRef::new(id(8), ()),
+            destination_tier: EntityRef::new(id(16), ()),
+            source_data_batch: EntityRef::new(id(13), ()),
+            destination_data_batch_id: 88,
+            bytes,
+        }),
+    )
+}
+
+fn clone_fixture() -> Vec<Event<E>> {
+    let mut events = fixture();
+    events.extend([
+        ev(
+            16,
+            0,
+            E::MemorySpace(s::MemorySpaceEvent::Declaration {
+                label: HOST_SPACE_LABEL.into(),
+                bounds: s::MemorySpaceBounds { bytes: 1000 },
+                worker_id: EntityRef::new(id(2), ()),
+                gpu_id: None,
+            }),
+        ),
+        ev(
+            COPY_CHANNEL,
+            0,
+            E::Channel(s::ChannelEvent::Declaration {
+                source_tier: EntityRef::new(id(8), ()),
+                destination_tier: EntityRef::new(id(16), ()),
+                worker_id: EntityRef::new(id(2), ()),
+                gpu_id: Some(EntityRef::new(id(7), ())),
+                label: "copy-only".into(),
+            }),
+        ),
+        // Completion order differs from start order, including across handles.
+        ev(
+            COPY_HANDLE,
+            6,
+            E::BatchClone(s::BatchCloneEvent::Completed {
+                clone_id: 2,
+                success: true,
+            }),
+        ),
+        ev(
+            21,
+            8,
+            E::BatchClone(s::BatchCloneEvent::Completed {
+                clone_id: 1,
+                success: true,
+            }),
+        ),
+        ev(
+            COPY_HANDLE,
+            7,
+            E::BatchClone(s::BatchCloneEvent::Completed {
+                clone_id: 1,
+                success: true,
+            }),
+        ),
+        clone_start(COPY_HANDLE, 4, 1, 600),
+        clone_start(COPY_HANDLE, 5, 2, 400),
+        clone_start(21, 6, 1, 200),
+    ]);
+    events
+}
+
+fn clone_timeline(
+    analyzer: &SiriusUiAnalyzer,
+    query: u128,
+    operators: Vec<Uuid>,
+    entity_type: Option<&str>,
+) -> quent_ui::timeline::response::ResourceTimeline {
+    use quent_ui::timeline::request::{
+        EntityFilter, ResourceTimelineRequest, SingleTimelineRequest, TimelineRequest,
+    };
+
+    analyzer
+        .single_resource_timeline(SingleTimelineRequest {
+            entry: TimelineRequest::Resource(ResourceTimelineRequest {
+                resource_id: id(COPY_CHANNEL),
+                long_entities_threshold_s: None,
+                entity_filter: EntityFilter {
+                    entity_type_name: entity_type.map(str::to_owned),
+                },
+                application: OperatorFilter {
+                    operator_ids: operators,
+                },
+                config: TimelineConfig {
+                    num_bins: 10,
+                    start: 0.0,
+                    end: 10.0,
+                },
+            }),
+            app_params: QueryFilter {
+                query_id: id(query),
+            },
+        })
+        .unwrap()
+        .data
+}
+
+fn clone_list(
+    analyzer: &SiriusUiAnalyzer,
+    query: u128,
+    operators: Vec<Uuid>,
+    entity_type: &str,
+) -> quent_query_engine_ui::EntityListResponse {
+    clone_list_in_window(
+        analyzer,
+        query,
+        operators,
+        entity_type,
+        quent_ui::entities::request::TimeWindow {
+            start: 0.0,
+            end: 10.0,
+        },
+    )
+}
+
+fn clone_list_in_window(
+    analyzer: &SiriusUiAnalyzer,
+    query: u128,
+    operators: Vec<Uuid>,
+    entity_type: &str,
+    window: quent_ui::entities::request::TimeWindow,
+) -> quent_query_engine_ui::EntityListResponse {
+    use quent_ui::entities::request::{
+        EntityListEntry, EntityListFilter, EntityListRequest, EntitySortKey, Sort, SortDir,
+    };
+
+    analyzer
+        .list_entities(EntityListRequest {
+            entry: EntityListEntry {
+                window,
+                filter: EntityListFilter {
+                    entity_type_name: Some(entity_type.into()),
+                    ..Default::default()
+                },
+                sort: Sort {
+                    key: EntitySortKey::UsageDuration,
+                    dir: SortDir::Desc,
+                },
+                page: None,
+                application: OperatorFilter {
+                    operator_ids: operators,
+                },
+            },
+            app_params: QueryFilter {
+                query_id: id(query),
+            },
+        })
+        .unwrap()
+}
+
+#[test]
+fn clone_pairs_ignore_order() {
+    use std::collections::HashSet;
+
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), clone_fixture().into_iter()).unwrap();
+    let reversed = SiriusUiAnalyzer::try_new(id(1), clone_fixture().into_iter().rev()).unwrap();
+    assert_eq!(analyzer.model.batch_clones.len(), 3);
+    assert_eq!(
+        analyzer.model.batch_clones.keys().collect::<HashSet<_>>(),
+        reversed.model.batch_clones.keys().collect::<HashSet<_>>(),
+    );
+    let mut intervals = analyzer
+        .model
+        .batch_clones
+        .values()
+        .map(|copy| {
+            assert_eq!(copy.source_batch_id(), Some(id(13)));
+            assert_eq!(copy.destination_batch_id(), Some(88));
+            assert_eq!(copy.channel_id(), Some(id(COPY_CHANNEL)));
+            assert_eq!(copy.success(), Some(true));
+            assert!(analyzer.model.try_entity_ref(copy.id()).is_ok());
+            (
+                copy.clone_id(),
+                copy.started_at(),
+                copy.completed_at(),
+                copy.bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    intervals.sort();
+    assert_eq!(
+        intervals,
+        vec![
+            (
+                1,
+                Some(EPOCH + 4 * SECOND),
+                Some(EPOCH + 7 * SECOND),
+                Some(600)
+            ),
+            (
+                1,
+                Some(EPOCH + 6 * SECOND),
+                Some(EPOCH + 8 * SECOND),
+                Some(200)
+            ),
+            (
+                2,
+                Some(EPOCH + 5 * SECOND),
+                Some(EPOCH + 6 * SECOND),
+                Some(400)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn clone_only_channels_show_rates() {
+    use quent_ui::timeline::response::ResourceTimeline;
+
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), clone_fixture().into_iter()).unwrap();
+    let bundle = analyzer.query_bundle(id(4)).unwrap();
+    assert!(bundle.entities.resources.contains_key(&id(COPY_CHANNEL)));
+    assert!(bundle.entities.fsm_types.contains_key("batch_clone"));
+    let ResourceTimeline::Binned(plain) = clone_timeline(&analyzer, 4, vec![id(6)], None) else {
+        panic!("plain timeline expected")
+    };
+    assert_eq!(
+        plain.capacities_values["bytes"],
+        vec![0.0, 0.0, 0.0, 0.0, 200.0, 600.0, 300.0, 100.0, 0.0, 0.0,]
+    );
+    let ResourceTimeline::BinnedByState(keyed) =
+        clone_timeline(&analyzer, 4, vec![id(6)], Some("batch_clone"))
+    else {
+        panic!("clone state timeline expected")
+    };
+    assert_eq!(
+        keyed.capacities_states_values["bytes"]["started"],
+        plain.capacities_values["bytes"]
+    );
+    assert_eq!(
+        clone_list(&analyzer, 4, vec![id(6)], "batch_clone").total,
+        3
+    );
+    assert_eq!(clone_list(&analyzer, 4, vec![id(6)], "data_batch").total, 1);
+
+    // A logical copy leaves the source batch's residency and byte count intact.
+    let flow = analyzer
+        .data_flow_timeline(CategoricalTimelineRequest {
+            measures: vec!["bytes".into()],
+            config: TimelineConfig {
+                num_bins: 10,
+                start: 0.0,
+                end: 10.0,
+            },
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    assert_eq!(
+        flow.operators[&id(6)].values["bytes"]["stationary"][GPU_SPACE_LABEL][5],
+        400.0
+    );
+}
+
+#[test]
+fn failed_clones_have_no_rate() {
+    use quent_ui::timeline::response::ResourceTimeline;
+
+    let mut events = clone_fixture();
+    events.extend([
+        clone_start(COPY_HANDLE, 4, 3, 900),
+        ev(
+            COPY_HANDLE,
+            7,
+            E::BatchClone(s::BatchCloneEvent::Completed {
+                clone_id: 3,
+                success: false,
+            }),
+        ),
+        clone_start(COPY_HANDLE, 4, 4, 900),
+        ev(
+            COPY_HANDLE,
+            6,
+            E::BatchClone(s::BatchCloneEvent::Completed {
+                clone_id: 5,
+                success: true,
+            }),
+        ),
+        clone_start(COPY_HANDLE, 5, 6, 900),
+        ev(
+            COPY_HANDLE,
+            5,
+            E::BatchClone(s::BatchCloneEvent::Completed {
+                clone_id: 6,
+                success: true,
+            }),
+        ),
+    ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    assert_eq!(analyzer.model.batch_clones.len(), 7);
+    let ResourceTimeline::Binned(timeline) = clone_timeline(&analyzer, 4, vec![id(6)], None) else {
+        panic!("plain timeline expected")
+    };
+    assert_eq!(
+        timeline.capacities_values["bytes"],
+        vec![0.0, 0.0, 0.0, 0.0, 200.0, 600.0, 300.0, 100.0, 0.0, 0.0,]
+    );
+    let listed = clone_list(&analyzer, 4, vec![id(6)], "batch_clone");
+    // Completion-only records have no source operator to attach to this query.
+    assert_eq!(listed.total, 6);
+}
+
+#[test]
+fn clone_filters_isolate_queries() {
+    use quent_ui::timeline::response::ResourceTimeline;
+
+    let mut events = clone_fixture();
+    events.extend([
+        ev(
+            30,
+            0,
+            E::Query(s::QueryEvent::Init {
+                seq: 0,
+                instance_name: "other".into(),
+                query_group_id: EntityRef::new(id(3), ()),
+            }),
+        ),
+        ev(30, 10, E::Query(s::QueryEvent::Finished { seq: 1 })),
+        ev(
+            31,
+            0,
+            E::Plan(s::PlanEvent::Declaration {
+                query_id: EntityRef::new(id(30), ()),
+                label: "other".into(),
+                edges: vec![],
+                worker_id: Some(EntityRef::new(id(2), ())),
+            }),
+        ),
+        ev(
+            32,
+            0,
+            E::Operator(s::OperatorEvent::Declaration {
+                plan_id: EntityRef::new(id(31), ()),
+                label: "other-scan".into(),
+                type_name: "scan".into(),
+                custom_attributes: Default::default(),
+            }),
+        ),
+    ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    assert_eq!(clone_list(&analyzer, 30, vec![], "batch_clone").total, 0);
+    assert_eq!(
+        clone_list(&analyzer, 4, vec![id(32)], "batch_clone").total,
+        0
+    );
+    for (query, operators) in [(30, vec![]), (4, vec![id(32)])] {
+        let ResourceTimeline::Binned(timeline) = clone_timeline(&analyzer, query, operators, None)
+        else {
+            panic!("plain timeline expected")
+        };
+        assert!(
+            timeline
+                .capacities_values
+                .values()
+                .flatten()
+                .all(|value| *value == 0.0)
+        );
+    }
+}
+
+#[test]
+fn same_space_clone_has_no_channel() {
+    use quent_analyzer::resource::{Usage, Using};
+
+    let mut events = clone_fixture();
+    events.retain(|event| !matches!(event.data, E::BatchClone(_)));
+    let mut started = clone_start(COPY_HANDLE, 4, 1, 600);
+    let E::BatchClone(s::BatchCloneEvent::Started {
+        destination_tier, ..
+    }) = &mut started.data
+    else {
+        unreachable!()
+    };
+    *destination_tier = EntityRef::new(id(8), ());
+    events.extend([
+        started,
+        ev(
+            COPY_HANDLE,
+            7,
+            E::BatchClone(s::BatchCloneEvent::Completed {
+                clone_id: 1,
+                success: true,
+            }),
+        ),
+    ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let copy = analyzer.model.batch_clones.values().next().unwrap();
+    assert_eq!(copy.channel_id(), None);
+    assert!(
+        copy.usages()
+            .all(|usage| usage.resource_id() != id(COPY_CHANNEL))
+    );
+    assert_eq!(
+        clone_list(&analyzer, 4, vec![id(6)], "batch_clone").total,
+        1
+    );
+}
+
+#[test]
+fn clone_destinations_are_local() {
+    let mut events = clone_fixture();
+    events.extend([
+        ev(
+            40,
+            0,
+            E::Worker(s::WorkerEvent::Init {
+                parent_engine_id: EntityRef::new(id(1), ()),
+                process_id: "43".into(),
+                tag: "remote".into(),
+            }),
+        ),
+        ev(
+            41,
+            0,
+            E::Plan(s::PlanEvent::Declaration {
+                query_id: EntityRef::new(id(4), ()),
+                label: "remote".into(),
+                edges: vec![],
+                worker_id: Some(EntityRef::new(id(40), ())),
+            }),
+        ),
+        ev(
+            42,
+            0,
+            E::Operator(s::OperatorEvent::Declaration {
+                plan_id: EntityRef::new(id(41), ()),
+                label: "remote".into(),
+                type_name: "scan".into(),
+                custom_attributes: Default::default(),
+            }),
+        ),
+    ]);
+    // Destination numbers repeat across workers, just like source batch numbers.
+    for (batch, operator) in [(50, 6), (51, 42)] {
+        events.extend([
+            ev(
+                batch,
+                7,
+                E::DataBatch(s::DataBatchEvent::Constructed {
+                    seq: 0,
+                    data_batch_id: 88,
+                    producer_pipeline_id: EntityRef::new(id(operator), ()),
+                }),
+            ),
+            ev(
+                batch,
+                7,
+                E::DataBatch(s::DataBatchEvent::Stationary {
+                    seq: 1,
+                    memory: EntityRef::new(id(16), s::MemorySpaceUsage { bytes: 200 }),
+                }),
+            ),
+            ev(
+                batch,
+                9,
+                E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
+            ),
+        ]);
+    }
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    for copy in analyzer.model.batch_clones.values() {
+        assert_eq!(copy.destination_batch_uuid(), Some(id(50)));
+    }
+}
+
+#[test]
+fn clone_bulk_keeps_details() {
+    use quent_ui::timeline::{
+        request::{
+            BulkChunkedTimelineRequest, BulkTimelineRequest, EntityFilter,
+            ResourceGroupTimelineRequest, SingleTimelineRequest, TimelineRequest,
+        },
+        response::{BulkTimelinesResponseEntry, ResourceTimeline},
+    };
+
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), clone_fixture().into_iter()).unwrap();
+    let config = TimelineConfig {
+        num_bins: 10,
+        start: 0.0,
+        end: 10.0,
+    };
+    let entry = TimelineRequest::ResourceGroup(ResourceGroupTimelineRequest {
+        resource_group_id: id(7),
+        resource_type_name: "channel".into(),
+        long_entities_threshold_s: Some(0.5),
+        entity_filter: EntityFilter {
+            entity_type_name: Some("batch_clone".into()),
+        },
+        app_params: OperatorFilter {
+            operator_ids: vec![id(6)],
+        },
+        config,
+    });
+    let single = analyzer
+        .single_resource_timeline(SingleTimelineRequest {
+            entry: entry.clone(),
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    let bulk = analyzer
+        .bulk_resource_timeline(BulkTimelineRequest {
+            entries: [("copies".into(), entry.clone())].into(),
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    let chunked = analyzer
+        .bulk_chunked_resource_timeline(BulkChunkedTimelineRequest {
+            entries: [("copies".into(), entry)].into(),
+            configs: vec![config],
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    let BulkTimelinesResponseEntry::Ok {
+        data: bulk_data, ..
+    } = &bulk.entries["copies"]
+    else {
+        panic!("bulk timeline expected")
+    };
+    let BulkTimelinesResponseEntry::Ok {
+        data: chunk_data, ..
+    } = &chunked.entries["copies"][0]
+    else {
+        panic!("chunked timeline expected")
+    };
+    let mut expected = None;
+    for timeline in [&single.data, bulk_data, chunk_data] {
+        let ResourceTimeline::BinnedByState(data) = timeline else {
+            panic!("clone state timeline expected")
+        };
+        assert_eq!(data.long_fsms.len(), 3);
+        assert!(
+            data.long_fsms
+                .iter()
+                .all(|fsm| analyzer.model.batch_clones.contains_key(&fsm.id))
+        );
+        if let Some(values) = expected {
+            assert_eq!(values, &data.capacities_states_values);
+        }
+        expected = Some(&data.capacities_states_values);
+    }
+}
+
+#[test]
+fn clone_windows_are_half_open() {
+    use quent_ui::entities::request::TimeWindow;
+    use std::collections::HashSet;
+
+    let mut events = clone_fixture();
+    events.retain(|event| !matches!(event.data, E::BatchClone(_)));
+    // Complete spans touch either edge; only clone 2 overlaps [5, 6).
+    for (clone_id, start, end) in [(1, 3, 5), (2, 4, 7), (3, 6, 8), (6, 5, 5), (7, 6, 6)] {
+        events.extend([
+            clone_start(COPY_HANDLE, start, clone_id, 200),
+            ev(
+                COPY_HANDLE,
+                end,
+                E::BatchClone(s::BatchCloneEvent::Completed {
+                    clone_id,
+                    success: true,
+                }),
+            ),
+        ]);
+    }
+    events.extend([
+        clone_start(COPY_HANDLE, 5, 4, 200),
+        clone_start(COPY_HANDLE, 6, 5, 200),
+    ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let listed = clone_list_in_window(
+        &analyzer,
+        4,
+        vec![id(6)],
+        "batch_clone",
+        TimeWindow {
+            start: 5.0,
+            end: 6.0,
+        },
+    );
+    let expected = analyzer
+        .model
+        .batch_clones
+        .values()
+        .filter(|copy| [2, 4, 6].contains(&copy.clone_id()))
+        .map(Entity::id)
+        .collect::<HashSet<_>>();
+    let actual = listed
+        .items
+        .iter()
+        .map(|item| item.entity.fsm.id)
+        .collect::<HashSet<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn untyped_list_merges_entities() {
+    use quent_ui::{
+        entities::request::{
+            EntityListEntry, EntityListFilter, EntityListRequest, EntityScope, EntitySortKey, Sort,
+            SortDir, TimeWindow,
+        },
+        paginate::PageParams,
+    };
+
+    let mut events = clone_fixture();
+    events.extend([
+        ev(
+            50,
+            7,
+            E::DataBatch(s::DataBatchEvent::Constructed {
+                seq: 0,
+                data_batch_id: 88,
+                producer_pipeline_id: EntityRef::new(id(6), ()),
+            }),
+        ),
+        ev(
+            50,
+            7,
+            E::DataBatch(s::DataBatchEvent::Stationary {
+                seq: 1,
+                memory: EntityRef::new(id(16), s::MemorySpaceUsage { bytes: 200 }),
+            }),
+        ),
+        ev(
+            50,
+            9,
+            E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
+        ),
+    ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let list = |filter, page| {
+        analyzer
+            .list_entities(EntityListRequest {
+                entry: EntityListEntry {
+                    window: TimeWindow {
+                        start: 0.0,
+                        end: 10.0,
+                    },
+                    filter,
+                    sort: Sort {
+                        key: EntitySortKey::UsageDuration,
+                        dir: SortDir::Desc,
+                    },
+                    page,
+                    application: OperatorFilter {
+                        operator_ids: vec![id(6)],
+                    },
+                },
+                app_params: QueryFilter { query_id: id(4) },
+            })
+            .unwrap()
+    };
+    let mut expected = ["task", "data_batch", "batch_clone"]
+        .into_iter()
+        .flat_map(|entity_type| {
+            list(
+                EntityListFilter {
+                    entity_type_name: Some(entity_type.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .items
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| {
+        right
+            .usage_duration_s
+            .total_cmp(&left.usage_duration_s)
+            .then_with(|| left.entity.fsm.id.cmp(&right.entity.fsm.id))
+    });
+    let expected_ids = expected
+        .iter()
+        .map(|item| item.entity.fsm.id)
+        .collect::<Vec<_>>();
+    assert_eq!(expected_ids.len(), 6);
+    let all = list(EntityListFilter::default(), None);
+    assert_eq!(all.total, 6);
+    assert_eq!(
+        all.items
+            .iter()
+            .map(|item| item.entity.fsm.id)
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+
+    // Pagination follows the merged ranking, including ties between entity types.
+    let page = list(
+        EntityListFilter::default(),
+        Some(PageParams { max: 2, page: 1 }),
+    );
+    assert_eq!(page.total, 6);
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| item.entity.fsm.id)
+            .collect::<Vec<_>>(),
+        expected_ids[2..4]
+    );
+
+    // Host memory belongs to the destination batch; the channel belongs to copies.
+    for (resource, expected_ids) in [
+        (16, vec![id(50)]),
+        (
+            COPY_CHANNEL,
+            list(
+                EntityListFilter {
+                    entity_type_name: Some("batch_clone".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .items
+            .into_iter()
+            .map(|item| item.entity.fsm.id)
+            .collect(),
+        ),
+    ] {
+        let scoped = list(
+            EntityListFilter {
+                scope: Some(EntityScope::Resource {
+                    resource_id: id(resource),
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(scoped.total as usize, expected_ids.len());
+        assert_eq!(
+            scoped
+                .items
+                .iter()
+                .map(|item| item.entity.fsm.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+    }
+}

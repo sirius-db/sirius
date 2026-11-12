@@ -143,7 +143,9 @@ class prepare_oom_input : public sirius::op::operator_data {
   }
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return 64; }
 
-  void prepare_for_processing(const ::cucascade::memory::memory_space*, ::cuda::stream_ref) override
+  void prepare_for_processing(const ::cucascade::memory::memory_space*,
+                              ::cuda::stream_ref,
+                              const sirius::telemetry::batch_telemetry_info&) override
   {
     throw rmm::out_of_memory("injected prepare OOM");
   }
