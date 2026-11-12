@@ -40,6 +40,9 @@ CSV line endings were normalized from CRLF to LF without changing the values;
 the manifest retains both the original and repository checksums.
 The later SF10000 fresh-instance cold rerun remains outside this snapshot.
 
+[Per-query Quent tier movements](quent-transfers/README.md) report how many
+bytes entered host and disk memory during each selected query execution.
+
 ## Host-pinned Parquet concurrency
 
 The [concurrency results](concurrency/summary.csv) add SF100, SF300, and SF1000
