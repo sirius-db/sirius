@@ -173,7 +173,9 @@ arrived. It is used three ways:
   `SORT_PARTITION` boundaries from inside its range. A rank with no input still runs its boundary
   task (`runs_without_input()`), since the others wait for it. `distribute_plan()` sets a
   `sample_all_gather_boundaries` on the plan's `SORT_SAMPLE` (`set_cross_rank_boundaries()`),
-  which the operator asks for its boundaries instead of cutting its own sample.
+  which the operator asks for its boundaries instead of cutting its own sample. It cannot be set
+  again once the boundary task is claimed. It waits up to 10 minutes for the other ranks' samples,
+  keeps what it gathered for a retry of the task, and frees it once the boundaries are made.
 - **The plan-shape check** (below).
 - **The Bloom merge** (below).
 
@@ -371,8 +373,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   and all-gathers at once instead of waiting; the next query runs normally. A query whose
   execution window fails in `begin_execution_window()` is aborted the same way and retired on
   that rank (`distributed_session::fail_window_begin`), and so is one whose `distribute_plan()`
-  throws after the query was numbered. A statement that fails after it was planned and before
-  its window is tied to its query is not, and its peers wait out their timeouts: one cancelled
+  throws after the query was numbered. A failure before the query is numbered tells no peer.
+  A statement that fails after it was planned and before its window is tied to its query is
+  not aborted either, and its peers wait out their timeouts: one cancelled
   or refused while it waits for admission, or a prepared statement whose window fails to begin.
   A lost peer or a failed transport is fail-stop: every later distributed query fails, saying
   the transport failed earlier, and nothing reconnects. To recover, restart every rank: a
@@ -398,6 +401,10 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
+| `[exchange][planner]` | The plan rewrite: where exchanges go, refusals, the plan-shape check, a rank whose planning fails |
+| `[exchange][distributed_session]` | The session: query numbering, windows tied to queries, connecting, a window that fails to begin |
+| `[planner][one_rank_parity]` | One configured peer plans and runs like none |
+| `[pipeline][finalize_listener]` | The callbacks run when an operator's pipeline ends |
 | `[exchange][nixl]` | Two ranks in one process over NIXL |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
 | `[dynamic_filter][probe]` | Merging two Blooms of one capacity |
