@@ -48,19 +48,19 @@ enum class window_exchange : std::uint8_t {
  * routing and apply the FULL barrier, and each batch is one bucket.
  *
  * A framed window reads the ranges of a distributed sort on the partition keys followed by the
- * order keys. Range boundaries are compared on the partition keys only, and the sort never splits
- * rows equal on the compared keys between ranges, so a partition is never split between ranges,
- * and each batch is one merged range, already sorted. MERGE_SORT must publish a
+ * order keys. Range boundaries are cut on the partition keys only, so a partition is never split
+ * between ranges, and each batch is one merged range, already sorted. MERGE_SORT must publish a
  * range as a single batch: a range divided between batches would split a partition. A range can
  * be windowed as soon as MERGE_SORT publishes it, so the input port is a PIPELINE barrier. Range
  * sizing is only as good as the sort's sample and the estimated cardinality, and a range that
  * does not fit fails in MERGE_SORT before the window runs.
  *
- * A task evaluates one bucket as one cuDF table on one GPU. A bucket holds every row of each
- * partition it contains, so a single partition is never split. Limits on a bucket:
+ * A task evaluates one batch, a bucket or a merged range, as one cuDF table on one GPU. A batch
+ * holds every row of each partition it contains, so a single partition is never split. Limits on
+ * a batch:
  * - Its row count must stay below the `cudf::size_type` limit (2^31 - 1). CONCAT rejects a bucket
- *   above it.
- * - Its input and results must fit in the GPU's memory. `execute` rejects a bucket whose known
+ *   above it. A merged range is one cuDF table, so it is under the limit when it arrives.
+ * - Its input and results must fit in the GPU's memory. `execute` rejects a batch whose known
  *   lower bound exceeds the memory space's maximum.
  *
  * A partition larger than either limit is not handled by this operator.
@@ -71,7 +71,8 @@ class sirius_physical_window : public sirius_physical_operator {
 
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
   {
-    // Hash buckets do not preserve the input's global sequence.
+    // Neither hash buckets nor merged ranges, which are windowed as they arrive, preserve the
+    // input's global sequence.
     return sirius::OrderPreservationType::NO_ORDER;
   }
 

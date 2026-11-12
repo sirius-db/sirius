@@ -183,7 +183,8 @@ MemoryBarrierType sirius_physical_window::input_barrier_for(
 }
 
 // The next complete bucket from CONCAT or merged range from MERGE_SORT, or nullptr when none is
-// ready.
+// ready. A task takes one batch, so each batch must hold every row of the partitions it contains.
+// CONCAT assembles one batch per bucket, and MERGE_SORT publishes one batch per range.
 std::unique_ptr<operator_data> sirius_physical_window::get_next_task_input_data()
 {
   std::lock_guard<std::mutex> guard(lock);

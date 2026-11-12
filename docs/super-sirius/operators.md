@@ -516,6 +516,25 @@ arrive through a child-owned pipeline, and a delim join is declined at any depth
 because the operator's task hint can poll a MARK hash join inside the delim subtree before its
 sizing partitions have run.
 
+### `sirius_physical_window` — `WINDOW`
+**File:** `src/op/sirius_physical_window.hpp`
+
+Evaluates the window functions of one stage, one batch per task, and publishes the input's payload columns followed by the results. The planner splits a `LogicalWindow` into stages and emits `PROJECTION (hidden key and argument columns) → WINDOW` for each. Every input batch must hold all rows of the partitions it contains. The operator has three modes, held as a variant, and `input_exchange()` tells the planner which exchange to put under it:
+
+| Mode | Functions | `input_exchange()` | Input built by |
+|---|---|---|---|
+| Whole partition | aggregates whose frame is the whole partition, with or without `ORDER BY` | `hash` | `build_window_exchange`: `PARTITION (hash, FULL) → CONCAT`, one bucket per batch |
+| Ranking | `rank`, `dense_rank`, `row_number` | `hash` | as above |
+| Running | `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX` over `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (no string `MIN` or `MAX`), with or without `PARTITION BY` | `hash` | as above; each bucket is sorted inside the task |
+| Framed | aggregates over any other `ROWS` frame or a `RANGE` frame bounded by `CURRENT ROW`, and the running aggregates the running mode does not take, with `PARTITION BY` and `ORDER BY` | `sorted` | `build_window_sort_exchange`: the distributed sort below, one merged range per batch |
+
+The framed input is `ORDER_BY → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT` on the partition keys (`ASC NULLS FIRST`, chosen only in `build_window_sort_exchange`) followed by the window order keys, with the range boundaries computed on the partition keys only (`boundary_key_count`). A partition therefore lands whole in one range.
+
+- `WINDOW` sources its own pipeline above the `MERGE_SORT` sink. `input_barrier_for` returns `PIPELINE` for that port, because a merged range depends on no other range and can be windowed as soon as it is published. The hash modes keep the FULL barrier.
+- Custom `get_next_task_input_data()`: pops one batch from any repository partition, so bucket and range indices with gaps are drained. It relies on `MERGE_SORT` publishing each range as exactly one batch.
+- Partition and order keys are compared in their carriers. Arguments are restored to their logical types before evaluation.
+- A partition must fit one batch: fewer than 2^31 rows, and within GPU memory. Range sizing is only as good as the sort's sample, so a skewed or oversized range fails in `MERGE_SORT` through its ordinary OOM handling before the window runs.
+
 ### Whole-partition window evaluator
 **File:** `src/op/window/whole_partition.hpp`, `src/op/window/whole_partition.cpp`
 
@@ -618,10 +637,14 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 - `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
+`set_boundary_key_count(n)` restricts the boundaries to the first `n` sort keys; by default all keys are used. With a prefix, the boundary table holds only those columns and duplicate boundary rows are removed, so `get_num_partitions()` is the number of distinct boundaries plus one. Rows equal on the prefix always land in the same range. The first range can be empty, when the first boundary is the smallest prefix value. A framed `WINDOW` uses this to cut ranges on its partition keys.
+
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
 
 Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
+
+Batches are compared with the boundaries on as many leading sort keys as the boundary table has columns, so a key prefix set on SORT_SAMPLE applies here without a second setting. A batch whose key columns differ in physical type from the boundaries throws `internal_exception`: boundary rows come from the sample batches, so a column must use one carrier in every batch reaching the sort.
 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
@@ -633,6 +656,9 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 
 - Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
 - Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
+- Publishes each range as exactly one batch. A framed `WINDOW` above it evaluates one batch per task and depends on this.
+
+The chain `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` is built in one place, `build_sort_exchange` in `src/planner/sirius_plan_sort_exchange.hpp`, for both a query `ORDER BY` and the input of a framed window.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
