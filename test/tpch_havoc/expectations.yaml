@@ -27,11 +27,3 @@ expectations:
     reason: "Unsupported expression in aggregate .*: list\\("
     issue: 2290
     queries: [Q01_V07]
-
-  # With Sirius loaded, binding fails with an INTERNAL error even on the CPU, which invalidates the
-  # database for every later test.
-  - outcome: skip
-    reason: INTERNAL binder error on native tables whenever Sirius is loaded
-    issue: 2294
-    scan: native
-    queries: [Q02_V08]
