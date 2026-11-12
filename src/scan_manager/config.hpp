@@ -246,11 +246,14 @@ struct scan_manager_config {
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
   /// Number of REST reactors for the S3/object-store IO path (each one worker
-  /// thread with its own io_uring ring and HTTP/1.1 connection pool).  A total
-  /// for the process, never per GPU.  0 sizes the pool from the egress NIC: one
-  /// reactor per NIC queue IRQ CPU, pinned to it (@c rest.pin_to_irq_cpus), when
-  /// the IRQs are steered to a strict subset of the NIC's NUMA-node cores; 2
-  /// unpinned reactors otherwise.
+  /// thread with its own io_uring ring and HTTP/1.1 connection pool), per routed
+  /// REST context and shared by all GPUs.  Each distinct resolved object-store
+  /// configuration (endpoint or credentials) builds its own context, so N
+  /// resident configurations hold N pools of this size, each with up to
+  /// @c rest.max_connections slots per reactor.  0 sizes each pool from the
+  /// egress NIC: one reactor per NIC queue IRQ CPU, pinned to it
+  /// (@c rest.pin_to_irq_cpus), when the IRQs are steered to a strict subset of
+  /// the NIC's NUMA-node cores; 2 unpinned reactors otherwise.
   std::size_t rest_n_reactors{2};
 
   /// Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator,

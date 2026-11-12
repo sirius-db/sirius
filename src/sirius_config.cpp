@@ -625,7 +625,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
       "backend: native instead");
   }
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
-  // A total for the process (never per GPU); 0 sizes the pool from the egress NIC's IRQs.
+  // Per routed REST context, shared by all GPUs; 0 sizes each pool from the egress NIC's IRQs.
   read_count(r, "rest_n_reactors", opt.rest_n_reactors);
   r.optional("reserve_rest_reactor_cpus", opt.reserve_rest_reactor_cpus);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
