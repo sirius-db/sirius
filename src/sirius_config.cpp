@@ -244,16 +244,6 @@ static void read_choice(yaml::reader& r,
   });
 }
 
-// A validator that throws @p text when @p ok rejects the value, so the error names the rule.
-template <typename Pred>
-static auto with_rule(Pred ok, char const* text)
-{
-  return [ok, text](auto const& value) {
-    if (!ok(value)) { throw std::runtime_error(text); }
-    return true;
-  };
-}
-
 static void from_yaml(const YAML::Node& node, cucascade::io::tls::config& opt)
 {
   namespace tls = cucascade::io::tls;
@@ -304,13 +294,10 @@ static void from_yaml(const YAML::Node& node, cucascade::io::tls::config& opt)
                {"tls1.2", std::optional{tls::version_bound::tls1_2}},
                {"tls1.3", std::optional{tls::version_bound::tls1_3}}});
   opt.max_version = max_version;
-  if (opt.max_version && opt.min_version > *opt.max_version) {
-    throw std::runtime_error("'rest.tls.max_version': must be at least rest.tls.min_version");
-  }
   r.optional("expect_no_pad", opt.expect_no_pad);
   r.optional("session_cache", opt.session_cache);
-  // 0 is only meaningful with the cache off; the cross-field rule is checked by the
-  // rest reader through rest::config::validate().
+  // Ranges and cross-field rules (0 only with the cache off, version ordering) are checked by
+  // the rest reader through rest::config::validate().
   read_count(r, "session_cache_per_endpoint", opt.session_cache_per_endpoint);
   r.optional("max_connection_bytes", yaml::bytes(opt.max_connection_bytes));
   r.optional("ciphersuites", opt.ciphersuites);
@@ -350,80 +337,56 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
                                "': removed; use sirius_config::set_object_store_config() instead");
     }
   }
-  constexpr std::size_t kib = std::size_t{1} << 10;
-  constexpr std::size_t mib = std::size_t{1} << 20;
-  auto nonnegative_duration = with_rule([](auto v) { return v.count() >= 0; }, "must be >= 0");
-  auto positive_duration    = with_rule([](auto v) { return v.count() > 0; }, "must be > 0");
-  auto nonnegative          = with_rule([](long v) { return v >= 0; }, "must be >= 0");
-  // Byte sizes accept suffixes, so they are range-checked after the read.
-  auto bytes_in =
-    [&r](char const* key, std::size_t& out, std::size_t lo, std::size_t hi, char const* text) {
-      r.optional(key, yaml::bytes(out));
-      if (r.has_value(key) && (out < lo || out > hi)) {
-        throw std::runtime_error("'rest." + std::string{key} + "': " + text);
-      }
-    };
-  constexpr auto no_limit = std::numeric_limits<std::size_t>::max();
+  // This reader owns the YAML surface: names, types (signed reads, so a negative value cannot
+  // wrap into an unsigned field), enum spellings and the trust rejections. Value ranges and
+  // cross-field rules belong to cuCascade and are enforced once, by validate() below.
 
   // -- scans and requests ------------------------------------------------------
   read_count(r, "n_max_concurrent_scans", opt.n_max_concurrent_scans);
   // Naming even the struct default must prevent pipeline-width default derivation.
   if (r.has_value("n_max_concurrent_scans")) { opt.n_max_concurrent_scans_explicit = true; }
-  r.optional("request_timeout_s", opt.request_timeout_s, nonnegative);
-  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes, nonnegative);
-  r.optional("stall_time_s", opt.stall_time_s, nonnegative);
+  r.optional("request_timeout_s", opt.request_timeout_s);
+  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
+  r.optional("stall_time_s", opt.stall_time_s);
   // Consumed by the logical range planner, independently of physical GET sizing.
   r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
-  bytes_in("min_segment_bytes", opt.min_segment_bytes, 1, no_limit, "must be > 0");
+  r.optional("min_segment_bytes", yaml::bytes(opt.min_segment_bytes));
   r.optional("max_segment_bytes", yaml::bytes(opt.max_segment_bytes));
-  if (opt.max_segment_bytes < opt.min_segment_bytes) {
-    throw std::runtime_error("'rest.max_segment_bytes': must be >= rest.min_segment_bytes");
-  }
-  bytes_in("footer_probe_bytes", opt.footer_probe_bytes, 0, 1024 * mib, "must be <= 1 GiB");
-  read_count(r, "list_max_matches", opt.list_max_matches, true);
-  read_count(r, "list_max_scanned", opt.list_max_scanned, true);
+  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
+  read_count(r, "list_max_matches", opt.list_max_matches);
+  read_count(r, "list_max_scanned", opt.list_max_scanned);
 
   // -- retry policy --------------------------------------------------------------
-  r.optional("retry_backoff_base_ms", opt.retry_backoff_base, nonnegative_duration);
-  r.optional("retry_jitter_ms", opt.retry_jitter, nonnegative_duration);
-  // Attempt budgets count the first attempt, so 0 would never send a request.
+  r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
+  r.optional("retry_jitter_ms", opt.retry_jitter);
   read_count(
-    r, "max_retry_attempts", opt.max_retry_attempts, true, std::numeric_limits<unsigned>::max());
+    r, "max_retry_attempts", opt.max_retry_attempts, false, std::numeric_limits<unsigned>::max());
   read_count(r,
              "max_auth_retry_attempts",
              opt.max_auth_retry_attempts,
-             true,
+             false,
              std::numeric_limits<unsigned>::max());
   r.optional("honor_retry_after", opt.honor_retry_after);
 
   // -- connection pool -------------------------------------------------------------
-  read_count(r, "max_connections", opt.max_connections, true, 4096);
-  r.optional("conn_max_age_s", opt.conn_max_age, nonnegative_duration);
-  r.optional("upkeep_interval_ms", opt.upkeep_interval, nonnegative_duration);
+  read_count(r, "max_connections", opt.max_connections);
+  r.optional("conn_max_age_s", opt.conn_max_age);
+  r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("upkeep_http1", opt.upkeep_http1);
-  r.optional("connect_timeout_ms", opt.connect_timeout, positive_duration);
-  r.optional("dns_ttl_s", opt.dns_ttl, positive_duration);
+  r.optional("connect_timeout_ms", opt.connect_timeout);
+  r.optional("dns_ttl_s", opt.dns_ttl);
   r.optional("dns_accumulate", opt.dns_accumulate);
-  read_count(r, "dns_max_addresses", opt.dns_max_addresses, true, 4096);
-  read_count(r, "keepalive_idle_s", opt.keepalive_idle_s, true);
-  read_count(r, "keepalive_interval_s", opt.keepalive_interval_s, true);
-  read_count(r, "keepalive_count", opt.keepalive_count);
-  // Largest effective MTU: a 65535-byte MSS plus IPv6/TCP headers (60) and timestamps (12).
-  bytes_in("min_mtu", opt.min_mtu, 0, 65535 + 60 + 12, "must be at most 65607 bytes");
-  read_count(r, "mtu_reject_max_attempts", opt.mtu_reject_max_attempts, true);
+  read_count(r, "dns_max_addresses", opt.dns_max_addresses);
+  r.optional("keepalive_idle_s", opt.keepalive_idle_s);
+  r.optional("keepalive_interval_s", opt.keepalive_interval_s);
+  r.optional("keepalive_count", opt.keepalive_count);
+  r.optional("min_mtu", yaml::bytes(opt.min_mtu));
+  read_count(r, "mtu_reject_max_attempts", opt.mtu_reject_max_attempts);
   r.optional("close_with_rst", opt.close_with_rst);
 
   // -- transport -----------------------------------------------------------------
-  bytes_in("receive_buffer_bytes",
-           opt.receive_buffer_bytes,
-           16 * kib,
-           4 * mib,
-           "must be in [16 KiB, 4 MiB]");
-  read_count(r, "queue_depth", opt.queue_depth, true, 32768);
-  if (opt.queue_depth < 2 * opt.max_connections) {
-    throw std::runtime_error("'rest.queue_depth': must be >= 2 * rest.max_connections (" +
-                             std::to_string(2 * opt.max_connections) + ") and <= 32768");
-  }
+  r.optional("receive_buffer_bytes", yaml::bytes(opt.receive_buffer_bytes));
+  read_count(r, "queue_depth", opt.queue_depth);
   read_choice(
     r,
     "wait_mode",
@@ -433,7 +396,7 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 
   // -- placement -------------------------------------------------------------------
   // fan_out vs. rest_n_reactors is checked by the scan_manager reader, which owns the count.
-  read_count(r, "fan_out", opt.fan_out, true);
+  read_count(r, "fan_out", opt.fan_out);
   r.optional("interface", opt.interface);
   r.optional("pin_to_irq_cpus", opt.pin_to_irq_cpus);
   r.optional("raise_reactor_priority", opt.raise_reactor_priority);
@@ -441,8 +404,8 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   if (auto n = r.optional_node("tls")) sirius::from_yaml(*n, opt.tls);
   r.reject_unknown();
 
-  // The per-key checks above give key context; cuCascade's own validate() then enforces every
-  // rule (cross-field ones included) exactly as the reactors will, reported under YAML names.
+  // cuCascade's validate() enforces every range and cross-field rule exactly as the reactors
+  // will; its errors name struct fields, reported here under their YAML keys.
   try {
     opt.validate();
   } catch (std::invalid_argument const& e) {
