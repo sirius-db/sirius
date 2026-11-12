@@ -251,7 +251,8 @@ else. Where an operator needs the other ranks in the middle of its work, it asks
 - The interface sits beside its operator and speaks of samples, filters and processes, not ranks
   or streams. With none set, the operator runs as in one process.
 - The implementation holds the `exchange_service` and its stream ids.
-- Only `distribute_plan()` builds one and sets it, and it adds to the plan shape there.
+- Only `distribute_plan()` builds one and sets it, through one call per hook
+  (`install_sort_boundaries()`, `install_filter_merge()`), and it adds to the plan shape there.
 - Two hooks on every operator cover the rest: `add_finalize_listener()` (act when an operator's
   pipeline ends) and `runs_without_input()` (a task owed with no input).
 

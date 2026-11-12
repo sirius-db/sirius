@@ -425,15 +425,10 @@ struct rewriter {
           spec.column_order.push_back(op::to_cudf_order(o.type));
           spec.null_precedence.push_back(op::to_cudf_null_order(o.type, o.null_order));
         }
-        auto* sink = &insert(partition.children[0], std::move(spec), false);
+        // Its own statement: the exchange takes its stream id before the all-gather takes one.
+        auto& sink = insert(partition.children[0], std::move(spec), false);
         // The sample, now below the sink, takes its boundaries from every rank's sample.
-        sample.set_cross_rank_boundaries(std::make_shared<op::sample_all_gather_boundaries>(
-          service,
-          stream(),
-          *gpu,
-          sink->spec().column_order,
-          sink->spec().null_precedence,
-          [sink](auto boundaries) { sink->set_range_boundaries(std::move(boundaries)); }));
+        install_sort_boundaries(sample, sink, service, stream(), *gpu);
         return done(placement::ranged);
       }
 
@@ -642,5 +637,20 @@ void install_filter_merge(op::sirius_physical_hash_join& join,
   // already running completes on its own.
   join.children[1]->add_finalize_listener(
     [&session = join.dynamic_filter_session()] { session.finish_input(); });
+}
+
+void install_sort_boundaries(op::sirius_physical_sort_sample& sample,
+                             op::sirius_physical_exchange_sink& sink,
+                             std::shared_ptr<exchange::exchange_service> service,
+                             exchange::stream_id stream,
+                             cucascade::memory::memory_space& gpu)
+{
+  sample.set_cross_rank_boundaries(std::make_shared<op::sample_all_gather_boundaries>(
+    std::move(service),
+    stream,
+    gpu,
+    sink.spec().column_order,
+    sink.spec().null_precedence,
+    [&sink](auto boundaries) { sink.set_range_boundaries(std::move(boundaries)); }));
 }
 }  // namespace sirius::planner
