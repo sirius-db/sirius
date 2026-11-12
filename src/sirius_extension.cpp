@@ -96,6 +96,7 @@ extern "C" int cudaProfilerStop();
 #include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/generator/generate_function.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
@@ -2441,6 +2442,8 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   // it wherever Sirius is loaded, not just on the FFI's embedded DuckDB, so a fragment plan binds
   // on the transparent path too.
   sirius::exec::register_stream_source_function(instance);
+  // sirius_generate(...): synthetic data produced on the GPU by the GENERATOR source.
+  sirius::op::scan::generator::register_generate_function(instance);
 
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
