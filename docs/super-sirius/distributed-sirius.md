@@ -17,7 +17,8 @@ SELECT ...;                               -- the same statement on every rank
 Without `sirius_exchange_peers`, nothing here applies and queries run in one process as before.
 
 To set up the ranks, the [gateway](distributed-gateway.md) and a client on several machines, see
-the [distributed quick start](distributed-quickstart.md).
+the [distributed quick start](distributed-quickstart.md). To have the ranks read Parquet through
+GPUDirect Storage, see the [GDS runbook](gds-runbook.md).
 
 ## Contents
 
