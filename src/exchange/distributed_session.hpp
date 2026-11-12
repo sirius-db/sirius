@@ -28,6 +28,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sirius {
+struct operator_params;
+}
+
 namespace sirius::exchange {
 
 class exchange_service;
@@ -42,12 +46,16 @@ class exchange_service;
  */
 class distributed_session {
  public:
-  /// The settings the exchange connected with; they cannot change afterwards.
+  /// The settings the exchange connected with; they cannot change afterwards. A setting added
+  /// here and in from() is one that service() refuses a change to.
   struct settings {
     std::vector<std::string> peers;
     std::uint32_t rank = 0;
     exchange::host_staging host_staging{};
     bool operator==(settings const&) const = default;
+
+    /// The exchange settings of @p params.
+    [[nodiscard]] static settings from(operator_params const& params);
   };
 
   distributed_session()                                      = default;

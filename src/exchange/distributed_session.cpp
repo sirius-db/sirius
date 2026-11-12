@@ -19,11 +19,19 @@
 #include "exchange/exchange_service.hpp"
 #include "log/logging.hpp"
 #include "sirius/exception.hpp"
+#include "sirius_config.hpp"
 
 #include <chrono>
 #include <utility>
 
 namespace sirius::exchange {
+
+distributed_session::settings distributed_session::settings::from(operator_params const& params)
+{
+  return {.peers        = params.exchange_peers,
+          .rank         = params.exchange_rank,
+          .host_staging = params.exchange_host_staging};
+}
 
 std::shared_ptr<exchange_service> distributed_session::service(
   settings const& wanted, std::function<std::shared_ptr<exchange_service>()> const& connect)
@@ -33,9 +41,7 @@ std::shared_ptr<exchange_service> distributed_session::service(
     std::lock_guard lock{_mutex};
     if (_service) {
       if (_settings && *_settings != wanted) {
-        throw sirius::invalid_input_exception(
-          "sirius_exchange_peers, sirius_exchange_rank and sirius_exchange_host_staging cannot "
-          "change once connected");
+        throw sirius::invalid_input_exception("the exchange settings cannot change once connected");
       }
       return _service;
     }

@@ -1335,10 +1335,7 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   sirius::operator_params const& params)
 {
   return distributed_session_for_use().service(
-    {.peers        = params.exchange_peers,
-     .rank         = params.exchange_rank,
-     .host_staging = params.exchange_host_staging},
-    [&] {
+    sirius::exchange::distributed_session::settings::from(params), [&] {
       if (params.exchange_rank >= params.exchange_peers.size()) {
         throw sirius::invalid_input_exception("sirius_exchange_rank {} of {} peers",
                                               params.exchange_rank,
