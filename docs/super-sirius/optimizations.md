@@ -151,6 +151,21 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Subquery Aggregates from the Delim Join's Rows
+
+**Motivation:** DuckDB decorrelates `l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)` (TPC-H q17) and q2's `MIN(ps_supplycost)` over the EUROPE suppliers into a delim join whose subquery side joins the outer rows' distinct keys back to a fresh scan of the subquery's tables. When the outer rows already hold every subquery row for their key, that second scan, and the join against the keys, are redundant.
+
+**Mechanism:** a logical rewrite on the transparent path's copy of DuckDB's optimized plan, before Sirius plans it. `DELIM_JOIN(O, ... AGGREGATE(I))` becomes `CTE(O) { JOIN(CTE_SCAN, ... AGGREGATE(CTE_SCAN)) }` with the same join type and conditions: the outer rows are materialized once and grouped by their key. Under `delim_join_as_cte = true`, where DuckDB has already made `O` a CTE and restricts `I` by a SEMI join against `SELECT DISTINCT key FROM CTE_SCAN`, the aggregate's input becomes a scan of that CTE instead. The aggregate keeps its table indexes, so nothing above it changes.
+
+**When it applies:** both sides are flattened into a product of leaves filtered by the conjunction of their predicates. `I` must be the subquery's rows `S` restricted by one `S.a = key` equality, and `O` must be `S' x P` where every leaf of `S` maps to exactly one scan of the same table view (or of the same CTE) in `S'`, the predicates over `S'` alone are exactly `S`'s, and every predicate across `S'` and `P` reads `S'` only through `a`. The join key must be `a` or a column of `P` equated with it. Then the outer rows with key `k` are `S`'s rows with `a = k`, each repeated the same number of times, which leaves MIN and MAX unchanged, and AVG too when its input is an INTEGER, a BIGINT, or a DECIMAL of width 5 to 18 (a DOUBLE sum depends on the order rows are added in). Repetition also scales AVG's sum: DuckDB sums those inputs in 128 bits, which no row count can overflow, while SMALLINT and DECIMAL(1-4) sum in 64 bits and HUGEINT and DECIMAL(19-38) in 128 bits, either of which can overflow on repeated rows where the original aggregate does not. A `key IS NOT NULL` filter replaces the subquery's `=` when no join already rejects NULL keys. Anything else declines: SUM, COUNT, DISTINCT or filtered aggregates, extra filters on either side, correlation on another column, an aggregate argument the outer rows do not output, or more than one duplicate-eliminated column.
+
+**Code path:**
+- `src/planner/sirius_plan_delim_aggregate_reuse.cpp` — matcher (`match_aggregate`) and both rewrites
+- `src/transparent/sirius_optimizer_extension.cpp` — runs it on the captured plan copy, planning without it if it throws
+- `src/transparent/read_view_registry.cpp` — read-view validation accepts a plan that reads an identical view fewer times
+
+**Config:** `enable_delim_aggregate_reuse` (default: `true`, see [Configuration](configuration.md)).
+
 ### Correlated EXISTS MIN/MAX Rewrite
 
 **Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
