@@ -291,7 +291,8 @@ bool sirius_pipeline::is_query_terminal() const
   auto s = get_sink();
   if (!s) { return false; }
   return s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
-         s->type == op::SiriusPhysicalOperatorType::STREAMING_SINK;
+         s->type == op::SiriusPhysicalOperatorType::STREAMING_SINK ||
+         s->type == op::SiriusPhysicalOperatorType::COPY_TO_FILE;
 }
 
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }

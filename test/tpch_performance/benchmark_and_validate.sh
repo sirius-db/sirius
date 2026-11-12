@@ -123,6 +123,14 @@ generate_report() {
             ! has_valid_timings "$SIRIUS_TIMING" || ! has_valid_timings "$DUCKDB_TIMING"; then
             status="error"
             (( errors++ ))
+        elif [ "${TPCH_RESULT_FORMAT:-rows}" = "parquet" ] || [ -n "$(find "$RUN_DIR/sirius/q${q}" -maxdepth 1 -type d -name 'parquet_iter*' -print -quit)" ]; then
+            if python3 "$SCRIPT_DIR/parquet_output.py" --compare "$RUN_DIR/sirius/q${q}" "$RUN_DIR/duckdb/q${q}"; then
+                status="success"
+                (( ok++ ))
+            else
+                status="validation"
+                (( validate++ ))
+            fi
         elif diff -q "$SIRIUS_FILE" "$DUCKDB_FILE" >/dev/null 2>&1; then
             status="success"
             (( ok++ ))
@@ -276,6 +284,14 @@ if [ "${1:-}" = "--report" ]; then
     REPORT_FLOAT_TOL="1e-10"
     while [ $# -gt 1 ]; do
         case "$1" in
+        --result-format)
+            export TPCH_RESULT_FORMAT="$2"
+            shift 2
+            ;;
+        --parquet-compression)
+            export TPCH_PARQUET_COMPRESSION="$2"
+            shift 2
+            ;;
             --float-tolerance)
                 REPORT_FLOAT_TOL="$2"
                 shift 2

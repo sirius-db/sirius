@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "output/parquet_spec.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -459,6 +460,11 @@ struct sirius_config {
     return _compression_config;
   }
 
+  output::parquet_compression parquet_output_compression() const noexcept
+  {
+    return _parquet_output_compression;
+  }
+
   /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
   /// Limits each query to the first @c gpus_per_query entries of the sorted
   /// active-GPU list; the rest are left available for future concurrent queries.
@@ -500,6 +506,7 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+  output::parquet_compression _parquet_output_compression{output::parquet_compression::snappy};
 };
 
 /// Validated configuration intent. Construction and parsing never discover hardware.
@@ -513,6 +520,7 @@ class parsed_sirius_config {
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  [[nodiscard]] output::parquet_compression parquet_output_compression() const noexcept;
   /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
   /// embedder check backend-dependent options before the engine is brought up.
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;

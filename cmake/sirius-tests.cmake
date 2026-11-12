@@ -553,3 +553,17 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# Export publication/ordering tests need neither a CUDA driver nor a DuckDB
+# runtime.
+add_executable(
+  sirius_parquet_session_test src/output/parquet_session.cpp
+                              test/cpp/output/test_parquet_session.cpp)
+target_compile_features(sirius_parquet_session_test PRIVATE cxx_std_20)
+set_target_properties(sirius_parquet_session_test
+                      PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_include_directories(
+  sirius_parquet_session_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp)
+target_link_libraries(sirius_parquet_session_test PRIVATE Catch2::Catch2WithMain
+                                                          pthread)

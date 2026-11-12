@@ -8,6 +8,8 @@ target_sources(
           config_loading.cpp
           debug_utils.cpp
           pin_table.cpp
+          output/parquet_session.cpp
+          output/parquet_writer.cpp
           sirius_config.cpp
           sirius_context.cpp
           sirius_engine.cpp

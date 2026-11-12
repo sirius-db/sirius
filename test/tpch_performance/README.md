@@ -781,3 +781,14 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - The `rewrite_parquet.py` script preserves the original schema (date32, decimal128) to avoid type mismatch issues with Sirius
 - cudf internally promotes date32 to timestamp; the rewriter casts back before writing
 - Large tables are split into multiple numbered files when exceeding the max file size limit
+
+## Exporting benchmark results to Parquet
+
+Add `--result-format parquet --parquet-compression snappy` to the Python runner or
+TPC-H shell runners/wrapper. This measures query execution plus export using
+`COPY (...) TO ... (FORMAT PARQUET, PER_THREAD_OUTPUT true)`. Each iteration writes
+a fresh directory. GPU export measurements disable CPU fallback. Readback and
+validation are outside timing; the default row-output mode is unchanged.
+
+See [Parquet output](../../docs/super-sirius/parquet-output.md) for option support,
+file ordering, validation, configuration, and publication semantics.

@@ -824,6 +824,10 @@ const operator_params& parsed_sirius_config::get_operator_params() const noexcep
 {
   return impl_->settings.get_operator_params();
 }
+output::parquet_compression parsed_sirius_config::parquet_output_compression() const noexcept
+{
+  return impl_->settings.parquet_output_compression();
+}
 const compression_config& parsed_sirius_config::get_compression_config() const noexcept
 {
   return impl_->settings.get_compression_config();
@@ -950,6 +954,17 @@ try {
   if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, settings._telemetry_config); }
 
   // Compression
+  if (auto output_node = r.optional_node("output")) {
+    yaml::reader output_reader(*output_node, "sirius.output");
+    if (auto parquet_node = output_reader.optional_node("parquet")) {
+      yaml::reader parquet_reader(*parquet_node, "sirius.output.parquet");
+      std::string codec = "snappy";
+      parquet_reader.optional("compression", codec);
+      settings._parquet_output_compression = output::parse_compression(codec);
+      parquet_reader.reject_unknown();
+    }
+    output_reader.reject_unknown();
+  }
   if (auto n = r.optional_node("compression")) {
     sirius::from_yaml(*n, settings._compression_config);
   }

@@ -53,6 +53,7 @@ class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalCrossProduct;
+class LogicalCopyToFile;
 class LogicalDelimGet;
 class LogicalDistinct;
 class LogicalDummyScan;
@@ -127,6 +128,9 @@ class sirius_physical_plan_generator {
                                  scan_contract_provenance provenance);
   ~sirius_physical_plan_generator();
 
+  // Original frontend SQL for validating COPY options consumed by DuckDB binding.
+  std::string copy_statement_sql;
+
   duckdb::LogicalDependencyList dependencies;
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
@@ -170,6 +174,8 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalComparisonJoin& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
+    duckdb::LogicalCopyToFile& op);
   // create_plan(duckdb::LogicalCopyDatabase &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalCreate
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
