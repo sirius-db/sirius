@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exchange/fabric.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/sirius_physical_operator.hpp"
 
@@ -43,7 +44,9 @@ class ClientContext;
 }
 
 namespace sirius::op {
+class sirius_physical_exchange_sink;
 class sirius_physical_hash_join;
+class sirius_physical_sort_sample;
 class sirius_physical_table_scan;
 }  // namespace sirius::op
 
@@ -140,5 +143,14 @@ void check_distributed_scan(op::sirius_physical_table_scan const& scan,
 void install_filter_merge(op::sirius_physical_hash_join& join,
                           std::shared_ptr<op::cross_rank_filter_merge> merge,
                           std::size_t bloom_keys);
+
+/// Has @p sample take its boundaries from every rank's sample, all-gathered on @p stream, and
+/// give the range exchange's boundaries to @p sink, the EXCHANGE_SINK after it, in whose order
+/// the samples are merged. @p sink must outlive @p sample's boundary task.
+void install_sort_boundaries(op::sirius_physical_sort_sample& sample,
+                             op::sirius_physical_exchange_sink& sink,
+                             std::shared_ptr<exchange::exchange_service> service,
+                             exchange::stream_id stream,
+                             cucascade::memory::memory_space& gpu);
 
 }  // namespace sirius::planner

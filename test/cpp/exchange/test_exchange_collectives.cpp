@@ -183,10 +183,9 @@ struct distributed_sampling {
   std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries;
 };
 
-/// A SORT_SAMPLE on column 0 that takes its boundaries from every rank's sample, ascending unless
-/// told otherwise, with partitions small enough that a rank keeps several.
-std::unique_ptr<sirius_physical_sort_sample> make_sample(
-  distributed_sampling sampling,
+/// A SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small enough that
+/// a rank keeps several.
+std::unique_ptr<sirius_physical_sort_sample> make_local_sample(
   duckdb::OrderType order       = duckdb::OrderType::ASCENDING,
   duckdb::OrderByNullType nulls = duckdb::OrderByNullType::NULLS_FIRST)
 {
@@ -195,11 +194,20 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample(
                       nulls,
                       duckdb::make_uniq<duckdb::BoundReferenceExpression>(
                         duckdb::LogicalType::BIGINT, duckdb::idx_t{0}));
-  auto sample = std::make_unique<sirius_physical_sort_sample>(key_types(),
-                                                              std::move(orders),
-                                                              /*estimated_cardinality=*/60'000,
-                                                              /*sort_sample_bytes=*/1 << 20,
-                                                              /*max_partition_bytes=*/64 * KiB);
+  return std::make_unique<sirius_physical_sort_sample>(key_types(),
+                                                       std::move(orders),
+                                                       /*estimated_cardinality=*/60'000,
+                                                       /*sort_sample_bytes=*/1 << 20,
+                                                       /*max_partition_bytes=*/64 * KiB);
+}
+
+/// make_local_sample(), taking its boundaries from every rank's sample.
+std::unique_ptr<sirius_physical_sort_sample> make_sample(
+  distributed_sampling sampling,
+  duckdb::OrderType order       = duckdb::OrderType::ASCENDING,
+  duckdb::OrderByNullType nulls = duckdb::OrderByNullType::NULLS_FIRST)
+{
+  auto sample = make_local_sample(order, nulls);
   sample->set_cross_rank_boundaries(std::make_shared<sirius::op::sample_all_gather_boundaries>(
     std::move(sampling.service),
     sampling.stream,
@@ -796,13 +804,9 @@ TEST_CASE("a DESC NULLS LAST range exchange keeps rank order and puts NULLs on t
 
   on_every_rank(world, [&](rank_t r) {
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 33, spec);
-    auto sample = make_sample(
-      {c.all[r].service,
-       34,
-       env().gpu,
-       [&sink](std::shared_ptr<cudf::table const> b) { sink.set_range_boundaries(std::move(b)); }},
-      duckdb::OrderType::DESCENDING,
-      duckdb::OrderByNullType::NULLS_LAST);
+    auto sample =
+      make_local_sample(duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST);
+    sirius::planner::install_sort_boundaries(*sample, sink, c.all[r].service, 34, *env().gpu);
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
@@ -870,10 +874,8 @@ TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted ra
   // As in a plan: SORT_SAMPLE's boundaries go to the EXCHANGE_SINK after it.
   on_every_rank(world, [&](rank_t r) {
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 31, spec);
-    auto sample =
-      make_sample({c.all[r].service, 32, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
-                     sink.set_range_boundaries(std::move(b));
-                   }});
+    auto sample = make_local_sample();
+    sirius::planner::install_sort_boundaries(*sample, sink, c.all[r].service, 32, *env().gpu);
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
