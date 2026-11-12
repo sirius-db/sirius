@@ -292,7 +292,7 @@ knn_result brute_force_int8_topk(raft::device_resources const& res,
     auto const query_view = raft::make_device_matrix_view<float, int64_t>(queries.data(), rows, d);
     scalar::inverse_transform(
       res,
-      quantizer.view(),
+      quantizer,
       raft::make_device_matrix_view<const std::int8_t, int64_t>(q + q0 * d, rows, d),
       query_view);
     bf::search(res,
