@@ -504,6 +504,19 @@ void gpu_pipeline_executor::process_task(
               ex.what());
 
             auto intermediate_data = ex.release_intermediate_data();
+            // On OOM, let the input shrink its own working set; a retry that shrank keeps the
+            // reservation floor it had before this OOM instead of the raised one. The retry
+            // count still increments, so the retry cap bounds a run of shrinks.
+            bool const shrank = dynamic_cast<oom_reschedule_exception*>(&ex) != nullptr &&
+                                intermediate_data && intermediate_data->shrink_for_retry();
+            if (shrank) {
+              SIRIUS_LOG_WARN(
+                "GPU Pipeline Executor: input of task {} (original task {}) shrank for retry {}; "
+                "keeping the reservation floor from before this OOM",
+                gpu_task->get_task_id(),
+                orig_task_id,
+                next_retry_count);
+            }
             if (auto pipelineable_data =
                   dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
               // We want to release the read-only lock on the data so that when its added back to
@@ -516,7 +529,13 @@ void gpu_pipeline_executor::process_task(
               std::move(intermediate_data), ex.get_resume_operator_index());
             new_local_state->retry_count      = next_retry_count;
             new_local_state->original_task_id = orig_task_id;
-            if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
+            if (cur_local) {
+              if (shrank) {
+                new_local_state->inherit_retry_reservation_floor_before_last_oom(*cur_local);
+              } else {
+                new_local_state->inherit_retry_reservation_floor(*cur_local);
+              }
+            }
 
             // Preserve the per-task device pin across reschedule. Dropping it lets
             // an OOM'd partition task scatter to the wrong GPU and touch a cuco
