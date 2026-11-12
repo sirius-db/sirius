@@ -391,29 +391,35 @@ nixl_fabric::~nixl_fabric() { release(); }
 void nixl_fabric::release() noexcept
 {
   if (_agent) {
-    // A write still in flight reads the send ring: give it a moment before deregistering.
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
-    for (auto& [id, req] : _writes) {
-      while (_agent->getXferStatus(req) == NIXL_IN_PROG &&
-             std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::microseconds{100});
+    // The descriptor lists and the warning allocate, and this function must not throw: whatever
+    // fails here, the cleanup below still runs.
+    try {
+      // A write still in flight reads the send ring: give it a moment before deregistering.
+      auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+      for (auto& [id, req] : _writes) {
+        while (_agent->getXferStatus(req) == NIXL_IN_PROG &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::microseconds{100});
+        }
+        if (auto const s = _agent->releaseXferReq(req); s != NIXL_SUCCESS) {
+          SIRIUS_LOG_WARN(
+            "exchange NIXL: releasing write {} failed: {}", id, nixlEnumStrings::statusStr(s));
+        }
       }
-      if (auto const s = _agent->releaseXferReq(req); s != NIXL_SUCCESS) {
-        SIRIUS_LOG_WARN(
-          "exchange NIXL: releasing write {} failed: {}", id, nixlEnumStrings::statusStr(s));
-      }
+      static_cast<void>(_agent->deregisterMem(ring_descs(_send, _device)));
+      static_cast<void>(_agent->deregisterMem(ring_descs(_recv, _device)));
+    } catch (...) {
     }
-    static_cast<void>(_agent->deregisterMem(ring_descs(_send, _device)));
-    static_cast<void>(_agent->deregisterMem(ring_descs(_recv, _device)));
   }
   // Copies still in flight read or write the mirrors: let them finish first.
   if (_d2h != nullptr) { static_cast<void>(cudaStreamSynchronize(_d2h)); }
   if (_h2d != nullptr) { static_cast<void>(cudaStreamSynchronize(_h2d)); }
+  // Destroyed where they are, with no container grown: an event is in exactly one of the three.
   for (auto& [id, w] : _staged) {
-    _free_events.push_back(w.copied);
+    static_cast<void>(cudaEventDestroy(w.copied));
   }
   for (auto& l : _landings) {
-    _free_events.push_back(l.copied);
+    static_cast<void>(cudaEventDestroy(l.copied));
   }
   for (auto* e : _free_events) {
     static_cast<void>(cudaEventDestroy(e));
