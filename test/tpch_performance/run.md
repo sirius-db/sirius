@@ -264,6 +264,18 @@ editing the base. Each case uses a fresh Sirius process. The output includes
 generated SQL, per-query timings, per-case summaries, plan hashes, and a
 comparison CSV. `--prepare-only` validates the workload without loading Sirius.
 
+To compare engine features, pass any combination of `--dynamic-filter on|off`,
+`--adaptive-join on|off`, and `--type-narrowing on|off`. An omitted switch
+inherits the base YAML. The runner writes these overrides only into the case
+configs and records them in `manifest.json`. `--adaptive-join off` sets both
+BUILD_PROBE admission budgets to zero, so eligible equality joins use the
+standard hash-join path; `on` permits the normal adaptive choice. This switch
+does not select a nested-loop join. `--type-narrowing` controls
+`enable_compressed_materialization` for eligible pinned numeric columns.
+Use a fresh output directory for each combination. The SF1000 repro reported
+a GPU-memory livelock with dynamic filtering disabled near full device
+capacity, so test that setting at a smaller scale first.
+
 ## Sirius Configuration
 
 The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:

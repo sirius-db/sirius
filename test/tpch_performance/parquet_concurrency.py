@@ -71,7 +71,26 @@ def max_overlap(records):
     return peak
 
 
-def write_case_config(base, target, concurrency):
+def feature_overrides(args, base_params):
+    overrides = {}
+    if args.dynamic_filter != "inherit":
+        overrides["enable_dynamic_filter"] = args.dynamic_filter == "on"
+    if args.type_narrowing != "inherit":
+        overrides["enable_compressed_materialization"] = args.type_narrowing == "on"
+    if args.adaptive_join == "off":
+        # Both budgets must be zero to prevent BUILD_PROBE admission.
+        overrides["max_build_hash_table_bytes"] = 0
+        overrides["max_build_probe_resident_bytes"] = 0
+    elif args.adaptive_join == "on":
+        for key in ("max_build_hash_table_bytes", "max_build_probe_resident_bytes"):
+            if base_params.get(key) == 0:
+                raise ValueError(
+                    f"Cannot enable adaptive join: base config sets {key}: 0"
+                )
+    return overrides
+
+
+def write_case_config(base, target, concurrency, overrides):
     original = base.read_text()
     data = yaml.safe_load(original)
     if not isinstance(data, dict) or not isinstance(data.get("sirius"), dict):
@@ -83,16 +102,26 @@ def write_case_config(base, target, concurrency):
         raise ValueError(
             f"Remove deprecated scan_manager.max_concurrent_queries: {base}"
         )
-    modified, count = re.subn(
-        r"(?m)^sirius:\s*$",
-        f"sirius:\n  max_concurrent_queries: {concurrency}",
-        original,
-    )
-    if count != 1:
-        raise ValueError(f"Expected one top-level sirius key in {base}")
+    if overrides:
+        data["sirius"].setdefault("operator_params", {}).update(overrides)
+        data["sirius"]["max_concurrent_queries"] = concurrency
+        modified = yaml.safe_dump(data, sort_keys=False)
+    else:
+        modified, count = re.subn(
+            r"(?m)^sirius:\s*$",
+            f"sirius:\n  max_concurrent_queries: {concurrency}",
+            original,
+        )
+        if count != 1:
+            raise ValueError(f"Expected one top-level sirius key in {base}")
     target.write_text(modified)
     effective = yaml.safe_load(modified)
-    if (
+    if overrides:
+        if effective != data:
+            raise ValueError(
+                f"Generated config differs from requested settings: {target}"
+            )
+    elif (
         effective["sirius"].pop("max_concurrent_queries") != concurrency
         or effective != data
     ):
@@ -109,6 +138,15 @@ def prepare(args):
     _build_views_sql(str(source))  # Verify all eight tables before generating anything.
     if not args.config.is_file():
         raise FileNotFoundError(args.config)
+    base_config = yaml.safe_load(args.config.read_text())
+    if not isinstance(base_config, dict) or not isinstance(
+        base_config.get("sirius"), dict
+    ):
+        raise ValueError(f"Invalid Sirius YAML: {args.config}")
+    base_params = base_config["sirius"].get("operator_params", {})
+    if not isinstance(base_params, dict):
+        raise ValueError(f"Invalid operator_params in {args.config}")
+    overrides = feature_overrides(args, base_params)
     plan_files = [PLAN_DIR / f"{table}.txt" for table in ("lineitem", "orders")]
     for plan_file in plan_files:
         if not plan_file.is_file() or plan_file.stat().st_size == 0:
@@ -166,6 +204,12 @@ def prepare(args):
         "input": str(source),
         "base_config": str(args.config.resolve()),
         "base_config_sha256": sha256(args.config),
+        "feature_switches": {
+            "dynamic_filter": args.dynamic_filter,
+            "adaptive_join": args.adaptive_join,
+            "type_narrowing": args.type_narrowing,
+        },
+        "operator_param_overrides": overrides,
         "concurrencies": args.concurrencies,
         "seed": seed,
         "query_dir": str(query_dir),
@@ -181,7 +225,7 @@ def prepare(args):
     for concurrency in args.concurrencies:
         case = args.output / f"c{concurrency}"
         case.mkdir()
-        write_case_config(args.config, case / "config.yaml", concurrency)
+        write_case_config(args.config, case / "config.yaml", concurrency, overrides)
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -337,6 +381,18 @@ def main():
     )
     parser.add_argument(
         "--config", type=Path, required=True, help="Base Sirius YAML; unchanged"
+    )
+    parser.add_argument(
+        "--dynamic-filter", choices=("inherit", "on", "off"), default="inherit",
+        help="Override runtime hash-join filtering (default: inherit base config)",
+    )
+    parser.add_argument(
+        "--adaptive-join", choices=("inherit", "on", "off"), default="inherit",
+        help="Allow BUILD_PROBE when eligible, or force standard hash join",
+    )
+    parser.add_argument(
+        "--type-narrowing", choices=("inherit", "on", "off"), default="inherit",
+        help="Override compressed materialization of eligible numeric columns",
     )
     parser.add_argument(
         "--output", type=Path, required=True, help="New result directory"
