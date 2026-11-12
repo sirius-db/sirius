@@ -19,6 +19,7 @@
 #include "compressed_disk_representation.hpp"
 #include "compressed_representation.hpp"
 #include "sirius_config.hpp"
+#include "spill_dictionary_registry.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -54,8 +55,11 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -68,7 +72,19 @@ spill_compression_settings g_settings;
 // Read on every spill; the struct behind it changes only on (re)configuration.
 std::atomic<bool> g_enabled{false};
 
+thread_local std::optional<spill_source> t_spill_source;
+
 }  // namespace
+
+std::optional<spill_source> current_spill_source() noexcept { return t_spill_source; }
+
+scoped_spill_source::scoped_spill_source(std::optional<spill_source> source) noexcept
+  : _previous(t_spill_source)
+{
+  t_spill_source = source;
+}
+
+scoped_spill_source::~scoped_spill_source() { t_spill_source = _previous; }
 
 void set_spill_compression_settings(spill_compression_settings const& settings)
 {
@@ -84,6 +100,8 @@ void apply_spill_compression_config(compression_config const& config)
     .min_batch_bytes         = config.spill_min_batch_bytes,
     .max_compressed_fraction = config.spill_max_compressed_fraction,
     .encode_reserve_fraction = config.spill_encode_reserve_fraction,
+    .onpair_strings          = config.spill_onpair_strings,
+    .release_columns_early   = config.spill_release_columns_early,
   });
 }
 
@@ -120,6 +138,11 @@ constexpr char const* kStringSplitPlan =
   "str_split.offsets -> delta -> differences\n"
   "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 constexpr char const* kStoredPlan = "input -> identity\n";
+constexpr char const* kOnPairStringPlan =
+  "input -> str_split -> offsets, chars\n"
+  "str_split.chars -> onpair\n"
+  "str_split.offsets -> delta -> differences\n"
+  "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 
 /// Rows a string column needs before a dictionary can pay for its key table.
 constexpr cudf::size_type kMinDictionaryRows = 4096;
@@ -237,34 +260,45 @@ std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_r
   return kBitpackPlan;
 }
 
+/// A string column's default plan, and whether an OnPair dictionary may replace it.
+struct string_plan_choice {
+  char const* plan;
+  bool onpair_candidate;
+};
+
+string_plan_choice choose_string_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+{
+  if (column.size() < kMinDictionaryRows) { return {kStoredPlan, false}; }
+  // A prefix is a cheap and, for batches built from scans and joins, representative
+  // sample; a wrong guess costs ratio, never correctness.
+  auto const sample_rows = std::min(column.size(), kDictionarySampleRows);
+  auto const sample      = cudf::slice(column, {0, sample_rows}, stream).front();
+  auto const valid_rows  = sample_rows - sample.null_count();
+  if (valid_rows > 0) {
+    auto const lengths = cudf::strings::count_bytes(cudf::strings_column_view(sample), stream);
+    auto const total   = cudf::reduce(lengths->view(),
+                                    *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+                                    cudf::data_type{cudf::type_id::INT64},
+                                    stream);
+    auto const bytes = static_cast<cudf::numeric_scalar<std::int64_t> const&>(*total).value(stream);
+    if (static_cast<double>(bytes) <= kMaxAnsOnlyAverageBytes * valid_rows) {
+      return {kStringSplitPlan, false};
+    }
+  }
+  auto const distinct = cudf::distinct_count(
+    sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+  return {static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
+            ? kDictionaryPlan
+            : kStringSplitPlan,
+          true};
+}
+
 }  // namespace
 
 std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
   if (column.type().id() == cudf::type_id::STRING) {
-    if (column.size() < kMinDictionaryRows) { return kStoredPlan; }
-    // A prefix is a cheap and, for batches built from scans and joins, representative
-    // sample; a wrong guess costs ratio, never correctness.
-    auto const sample_rows = std::min(column.size(), kDictionarySampleRows);
-    auto const sample      = cudf::slice(column, {0, sample_rows}, stream).front();
-    auto const valid_rows  = sample_rows - sample.null_count();
-    if (valid_rows > 0) {
-      auto const lengths = cudf::strings::count_bytes(cudf::strings_column_view(sample), stream);
-      auto const total   = cudf::reduce(lengths->view(),
-                                      *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
-                                      cudf::data_type{cudf::type_id::INT64},
-                                      stream);
-      auto const bytes =
-        static_cast<cudf::numeric_scalar<std::int64_t> const&>(*total).value(stream);
-      if (static_cast<double>(bytes) <= kMaxAnsOnlyAverageBytes * valid_rows) {
-        return kStringSplitPlan;
-      }
-    }
-    auto const distinct = cudf::distinct_count(
-      sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
-    return static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
-             ? kDictionaryPlan
-             : kStringSplitPlan;
+    return choose_string_plan(column, stream).plan;
   }
   if (!cudf::is_fixed_width(column.type())) { return kStoredPlan; }
   auto const type  = column.type();
@@ -288,6 +322,51 @@ using compression::spill_compression_declined;
 
 /// Streams the column-parallel encode runs on.
 constexpr std::size_t kEncodeStreams = 4;
+/// A string column whose ratio with its dictionary falls below this fraction of the ratio
+/// of the first batch it encoded is stored as is, and the column trains a new dictionary.
+constexpr double kMinDictionaryFitFraction = 0.8;
+
+std::string join_plans(std::vector<std::string> const& plans)
+{
+  std::string joined;
+  for (std::size_t i = 0; i < plans.size(); ++i) {
+    if (i > 0) { joined += "---\n"; }
+    joined += plans[i];
+  }
+  return joined;
+}
+
+/// The characters strings @p column spans, on the device. Synchronizes @p stream.
+std::pair<std::uint8_t const*, std::size_t> string_chars(cudf::column_view const& column,
+                                                         ::cuda::stream_ref stream)
+{
+  cudf::strings_column_view const strings(column);
+  if (strings.size() == 0) { return {nullptr, 0}; }
+  auto const offsets  = strings.offsets();
+  std::int64_t ends[] = {0, 0};
+  auto read           = [&](auto const* data) {
+    using offset_type = std::remove_cv_t<std::remove_pointer_t<decltype(data)>>;
+    offset_type values[2];
+    auto const first = static_cast<std::size_t>(strings.offset());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &values[0], data + first, sizeof(offset_type), cudaMemcpyDeviceToHost, stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(&values[1],
+                                  data + first + static_cast<std::size_t>(strings.size()),
+                                  sizeof(offset_type),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    ends[0] = values[0];
+    ends[1] = values[1];
+  };
+  if (offsets.type().id() == cudf::type_id::INT64) {
+    read(offsets.head<std::int64_t>());
+  } else {
+    read(offsets.head<std::int32_t>());
+  }
+  return {reinterpret_cast<std::uint8_t const*>(strings.chars_begin(stream)) + ends[0],
+          static_cast<std::size_t>(ends[1] - ends[0])};
+}
 
 /// A batch encoded on the device, ready to be staged to host memory or a file. The
 /// payload buffers belong to @c table and stay valid while it lives.
@@ -299,6 +378,13 @@ struct encoded_batch {
   std::size_t uncompressed_bytes{0};
   std::int64_t num_rows{0};
 };
+
+/// Frees @p column from a thread with no reservation attached. A free is charged to the
+/// calling thread's reservation, and the encode's must not be credited with the batch.
+void free_untracked(std::unique_ptr<cudf::column> column)
+{
+  std::thread([column = std::move(column)]() mutable { column.reset(); }).join();
+}
 
 std::vector<std::string> column_names(std::size_t num_columns)
 {
@@ -312,8 +398,9 @@ std::vector<std::string> column_names(std::size_t num_columns)
 
 /// Encode @p source with its default plans. Throws spill_compression_declined when the
 /// encode cannot get its headroom or does not save enough; any other exception is a
-/// failure the caller treats the same way.
-encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source,
+/// failure the caller treats the same way, except spill_source_released: with
+/// release_columns_early, @p source no longer holds the batch once its columns encode.
+encoded_batch encode_for_spill(cucascade::gpu_table_representation& source,
                                ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::spill_encode"};
@@ -358,37 +445,161 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
     if (reserved) { gpu_mr->reset_stream_reservation(stream); }
   };
 
-  std::string plan;
+  // A string column of a batch with a known source encodes with its dictionary once one
+  // is trained; until then it takes its default plan and samples itself for training.
+  auto const edge    = settings.onpair_strings ? compression::current_spill_source() : std::nullopt;
+  auto& dictionaries = compression::spill_dictionary_registry::global();
+  simpatico::onpair_encoder_config const onpair_config{};
+  auto const num_columns = static_cast<std::size_t>(view.num_columns());
+  std::vector<simpatico::compress_options> options(num_columns);
+  std::vector<std::string> plans;
+  plans.reserve(num_columns);
   bool all_stored = true;
   for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-    if (i > 0) { plan += "---\n"; }
-    auto column_plan = compression::default_spill_plan(view.column(i), stream);
-    all_stored       = all_stored && column_plan == compression::kStoredPlan;
-    plan += column_plan;
+    auto const column = view.column(i);
+    auto const index  = static_cast<std::size_t>(i);
+    std::string column_plan;
+    if (edge && column.type().id() == cudf::type_id::STRING) {
+      compression::spill_column_key const key{*edge, index};
+      if (auto dict = dictionaries.find(key)) {
+        column_plan                = compression::kOnPairStringPlan;
+        options[index].onpair_dict = std::move(dict);
+      } else {
+        auto const choice = compression::choose_string_plan(column, stream);
+        column_plan       = choice.plan;
+        if (choice.onpair_candidate && dictionaries.needs_training(key)) {
+          auto const [chars, n_chars] = string_chars(column, stream);
+          dictionaries.train_async(
+            key,
+            simpatico::sample_onpair_training_data(chars, n_chars, onpair_config, stream),
+            onpair_config);
+        }
+      }
+    } else {
+      column_plan = compression::default_spill_plan(column, stream);
+    }
+    all_stored = all_stored && column_plan == compression::kStoredPlan;
+    plans.push_back(std::move(column_plan));
   }
   // Storing every column as is saves nothing, and the encode would still copy the batch.
   if (all_stored) { throw spill_compression_declined("no column of the batch compresses"); }
 
   auto const mr = rmm::device_async_resource_ref{*gpu_mr};
-  if (per_thread) {
+
+  // Whether column i, @p compressed bytes with its dictionary, still compresses as well as
+  // the dictionary's first batch did. A column that does not is stored as is rather than
+  // kept at a poor ratio, and the column trains a new dictionary from the next batch.
+  auto onpair_fits = [&](std::size_t i, std::uint64_t compressed) {
+    auto const column = view.column(static_cast<cudf::size_type>(i));
+    auto const raw    = string_chars(column, stream).second +
+                     static_cast<std::size_t>(column.size() + 1) *
+                       cudf::size_of(cudf::strings_column_view(column).offsets().type());
+    auto const ratio = compressed == 0 ? 0.0 : static_cast<double>(raw) / compressed;
+    return dictionaries.record_ratio(compression::spill_column_key{*edge, i},
+                                     options[i].onpair_dict,
+                                     ratio,
+                                     kMinDictionaryFitFraction) &&
+           ratio >= 1.0;
+  };
+  auto store_as_is = [&](std::size_t i) {
+    auto stored = simpatico::compress_with_plan(
+      cudf::table_view{{view.column(static_cast<cudf::size_type>(i))}},
+      compression::kStoredPlan,
+      stream,
+      mr,
+      {});
+    return std::move(stored.columns.front());
+  };
+
+  // Freeing each column as soon as it is encoded keeps the encode's peak to one column's
+  // working set instead of the batch's compressed form, but leaves nothing to spill
+  // uncompressed, so it runs only once nothing is left to decline. A batch viewing memory
+  // it does not own would be copied by release_table.
+  bool const release_early = settings.release_columns_early && per_thread && source.owns_table();
+  if (release_early) {
+    auto columns = source.release_table(stream)->release();
+    out.table.columns.resize(num_columns);
+    // Smallest first: a column's encode scratch scales with it, so the largest columns
+    // encode once the rest of the batch is gone.
+    std::vector<std::size_t> order(num_columns);
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+      return columns[a]->alloc_size() < columns[b]->alloc_size();
+    });
+    try {
+      for (std::size_t const i : order) {
+        try {
+          auto encoded = simpatico::compress_with_plan(
+            cudf::table_view{{view.column(static_cast<cudf::size_type>(i))}},
+            plans[i],
+            stream,
+            mr,
+            {},
+            std::span{&options[i], 1});
+          if (options[i].onpair_dict) {
+            std::vector<std::uint8_t> header;
+            std::vector<simpatico::payload_buffer_ref> buffers;
+            std::uint64_t bytes = 0;
+            auto const error =
+              simpatico::build_compressed_table_header(encoded, header, buffers, bytes, stream);
+            if (!error.empty()) { throw std::runtime_error(error); }
+            if (!onpair_fits(i, bytes)) { encoded.columns.front() = store_as_is(i); }
+          }
+          out.table.columns[i] = std::move(encoded.columns.front());
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_DEBUG("[spill_compression] storing column {} as is: {}", i, e.what());
+          out.table.columns[i] = store_as_is(i);
+        }
+        free_untracked(std::move(columns[i]));
+      }
+    } catch (std::exception const& e) {
+      throw compression::spill_source_released(
+        std::string("spill encode failed after the batch was released: ") + e.what());
+    }
+  } else if (per_thread) {
     // The pool streams are not ordered after `stream`, which the batch and the plan
     // sampling ran on.
     stream.sync();
-    out.table = simpatico::compress_with_plan(
-      view, plan, simpatico::thread_device_stream_pool(kEncodeStreams), mr, {});
+    out.table = simpatico::compress_with_plan(view,
+                                              join_plans(plans),
+                                              simpatico::thread_device_stream_pool(kEncodeStreams),
+                                              mr,
+                                              {},
+                                              options);
   } else {
-    out.table = simpatico::compress_with_plan(view, plan, stream, mr, {});
+    out.table = simpatico::compress_with_plan(view, join_plans(plans), stream, mr, {}, options);
+  }
+
+  auto build_header = [&] {
+    out.header.clear();
+    out.buffers.clear();
+    auto const error = simpatico::build_compressed_table_header(
+      out.table, out.header, out.buffers, out.payload_bytes, stream);
+    if (!error.empty()) { throw std::runtime_error("build_compressed_table_header: " + error); }
+  };
+  build_header();
+
+  if (!release_early) {
+    bool restored = false;
+    for (std::size_t i = 0; i < num_columns; ++i) {
+      if (!options[i].onpair_dict) { continue; }
+      std::uint64_t compressed = 0;
+      for (auto const& buffer : out.buffers) {
+        if (buffer.column_index == i) { compressed += buffer.size_bytes; }
+      }
+      if (onpair_fits(i, compressed)) { continue; }
+      out.table.columns[i] = store_as_is(i);
+      restored             = true;
+    }
+    if (restored) { build_header(); }
   }
   // The tracker counts from the attach, so this is the encode's own peak.
   std::size_t const encode_peak = reserved ? gpu_mr->get_peak_allocated_bytes(stream) : 0;
 
-  auto const error = simpatico::build_compressed_table_header(
-    out.table, out.header, out.buffers, out.payload_bytes, stream);
-  if (!error.empty()) { throw std::runtime_error("build_compressed_table_header: " + error); }
-
   auto const compressed_bytes = out.header.size() + out.payload_bytes;
-  if (static_cast<double>(compressed_bytes) >
-      settings.max_compressed_fraction * static_cast<double>(out.uncompressed_bytes)) {
+  if (!release_early &&
+      static_cast<double>(compressed_bytes) >
+        settings.max_compressed_fraction * static_cast<double>(out.uncompressed_bytes)) {
     throw spill_compression_declined("compressed " + std::to_string(compressed_bytes) +
                                      " bytes of " + std::to_string(out.uncompressed_bytes));
   }
@@ -437,7 +648,9 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::gpu_to_compressed_host"};
-  auto const& gpu  = source.cast<cucascade::gpu_table_representation>();
+  // The batch is held exclusively and its representation replaced when this returns.
+  auto& gpu = const_cast<cucascade::gpu_table_representation&>(
+    source.cast<cucascade::gpu_table_representation>());
   auto encoded     = encode_for_spill(gpu, stream);
   auto* host_space = const_cast<cucascade::memory::memory_space*>(target_memory_space);
   auto* host_mr    = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
@@ -480,7 +693,9 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::gpu_to_compressed_disk"};
-  auto const& gpu   = source.cast<cucascade::gpu_table_representation>();
+  // The batch is held exclusively and its representation replaced when this returns.
+  auto& gpu = const_cast<cucascade::gpu_table_representation&>(
+    source.cast<cucascade::gpu_table_representation>());
   auto encoded      = encode_for_spill(gpu, stream);
   auto& backend     = target_memory_space->get_io_backend();
   auto const header = encoded.header.size();

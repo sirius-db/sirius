@@ -49,6 +49,8 @@ struct onpair_byte_ranges {
   std::uint64_t n;
 };
 
+struct onpair_dictionary;
+
 /// GPU OnPair encoder settings. The characters are cut into fixed segments that GPU
 /// threads parse independently, so tokens may span rows but never a segment.
 ///
@@ -77,7 +79,32 @@ struct onpair_encoder_config {
   /// string starts and no token spans two strings, so equal strings get equal codes and a
   /// string's codes start where it does. Needs the strings' offsets.
   bool string_aligned = false;
+  /// Encode with this dictionary as is: no probe, no training, and the cache is left alone.
+  /// A dictionary holds every single byte, so any data encodes, only less well than with a
+  /// dictionary trained on it.
+  std::shared_ptr<onpair_dictionary const> dictionary;
 };
+
+/// Characters to train a dictionary on, copied to the host.
+struct onpair_training_sample {
+  std::vector<std::uint8_t> bytes;
+  std::vector<std::uint32_t> offsets;  ///< Run boundaries, 0 to bytes.size().
+};
+
+/// Copies cfg.sample_bytes of the @p n_chars device bytes at @p chars to the host, in runs
+/// of cfg.sample_slice_bytes evenly strided over them. Synchronizes @p stream.
+onpair_training_sample sample_onpair_training_data(std::uint8_t const* chars,
+                                                   std::size_t n_chars,
+                                                   onpair_encoder_config const& cfg,
+                                                   ::cuda::stream_ref stream);
+
+/// Trains a dictionary of up to 2^cfg.bits tokens on @p sample. Host only: needs no GPU,
+/// so it can run off the thread that took the sample.
+std::shared_ptr<onpair_dictionary const> train_onpair_dictionary(
+  onpair_training_sample const& sample, onpair_encoder_config const& cfg);
+
+/// Host bytes @p dict's parse tables take; an encode uploads them to the device.
+std::size_t onpair_dictionary_bytes(onpair_dictionary const& dict);
 
 struct onpair_compressed_representation : standalone_compressed_representation {
   std::size_t dict_size          = 0;  ///< Tokens after pruning.

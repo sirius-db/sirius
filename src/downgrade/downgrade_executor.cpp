@@ -292,7 +292,7 @@ void downgrade_executor::processing_loop()
         for (auto* repo : repos) {
           if (req->satisfied.load() || target_completed()) break;
 
-          convertible_data_batch_provider provider(repo);
+          convertible_data_batch_provider provider(repo, victim_id);
           auto candidates = provider.get_all_convertible(
             source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
 

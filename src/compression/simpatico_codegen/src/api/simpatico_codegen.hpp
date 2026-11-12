@@ -83,13 +83,15 @@ std::vector<std::string> split_plan_dsl(std::string_view plan_dsl);
 /// @param mr            Device memory resource; nullptr selects the RMM default.
 /// @param column_names  Optional per-column names stored in the result. Must be
 ///                      empty or exactly @p table.num_columns() long.
+/// @param column_options Optional per-column compress options, empty or one per column.
 /// @throws std::runtime_error  plan/table column count mismatch or GPU error.
 compressed_table compress_with_plan(
   cudf::table_view table,
   std::string_view plan_dsl,
-  ::cuda::stream_ref stream             = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
-  std::vector<std::string> column_names = {});
+  ::cuda::stream_ref stream                        = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr                = rmm::mr::get_current_device_resource_ref(),
+  std::vector<std::string> column_names            = {},
+  std::span<compress_options const> column_options = {});
 
 /// Compress all columns in parallel using @p column_threads worker threads.
 ///
@@ -120,13 +122,15 @@ compressed_table compress_with_plan(
 /// @param pool           Caller-supplied stream pool.
 /// @param mr             Device memory resource; nullptr selects the RMM default.
 /// @param column_names   Optional per-column names.
+/// @param column_options Optional per-column compress options, empty or one per column.
 /// @throws std::runtime_error  plan/table column count mismatch or GPU error.
 compressed_table compress_with_plan(
   cudf::table_view table,
   std::string_view plan_dsl,
   simpatico::stream_pool& pool,
-  rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
-  std::vector<std::string> column_names = {});
+  rmm::device_async_resource_ref mr                = rmm::mr::get_current_device_resource_ref(),
+  std::vector<std::string> column_names            = {},
+  std::span<compress_options const> column_options = {});
 
 // ── Decompression ─────────────────────────────────────────────────────────────
 

@@ -34,6 +34,7 @@
 #include <compression/compressed_disk_representation.hpp>
 #include <compression/compressed_representation.hpp>
 #include <compression/spill_compression.hpp>
+#include <compression/spill_dictionary_registry.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -240,6 +241,20 @@ void move_to(std::shared_ptr<cucascade::data_batch> const& batch,
 {
   sirius::convertible_data_batch convertible(batch);
   REQUIRE(convertible.convert({space}, env().stream, *env().mgr, true).has_value());
+}
+
+/// Spill @p batch to @p space as a batch of the query-graph edge @p source.
+void spill_from(std::shared_ptr<cucascade::data_batch> const& batch,
+                cucascade::memory::memory_space* space,
+                sirius::compression::spill_source source)
+{
+  sirius::convertible_data_batch convertible(batch, nullptr, source);
+  REQUIRE(convertible.convert({space}, env().stream, *env().mgr, true).has_value());
+}
+
+std::size_t stored_bytes(cucascade::data_batch& batch)
+{
+  return batch.to_read_only().get_data()->get_size_in_bytes();
 }
 
 template <typename Representation>
@@ -455,4 +470,111 @@ TEST_CASE("spill compression: batches spill uncompressed when it does not apply"
     move_to(batch, env().gpu);
     CHECK(digest(*batch) == expected);
   }
+}
+
+TEST_CASE("spill compression: strings encode with a dictionary trained for their column",
+          "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  scoped_settings settings(enabled_settings());
+  auto& dictionaries = sirius::compression::spill_dictionary_registry::global();
+  int edge           = 0;
+  sirius::compression::spill_source const source{sirius::make_query_id(0xd1c7), &edge};
+  sirius::compression::spill_column_key const text_key{source, 0};
+
+  // Text from a small vocabulary, one-byte flags, and sorted keys.
+  constexpr std::size_t rows = 200'000;
+  auto make_table            = [&](std::uint64_t seed, bool words) {
+    static constexpr char const* vocabulary[] = {"furiously",
+                                                 "carefully",
+                                                 "regular",
+                                                 "pending",
+                                                 "ironic",
+                                                 "deposits",
+                                                 "accounts",
+                                                 "packages",
+                                                 "requests",
+                                                 "quickly",
+                                                 "express",
+                                                 "final",
+                                                 "blithely",
+                                                 "special"};
+    std::mt19937_64 rng{seed};
+    std::vector<std::string> text(rows), flags(rows);
+    std::vector<std::int64_t> keys(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+      if (words) {
+        for (std::size_t w = 0, n = 4 + rng() % 6; w < n; ++w) {
+          text[i] += (w ? " " : "") + std::string(vocabulary[rng() % std::size(vocabulary)]);
+        }
+      } else {
+        for (int c = 0; c < 24; ++c) {
+          text[i] += "0123456789abcdef"[rng() % 16];
+        }
+      }
+      flags[i] = std::string(1, "AFNOR"[rng() % 5]);
+      keys[i]  = static_cast<std::int64_t>(i);
+    }
+    auto stream = utils::default_stream();
+    auto mr     = utils::get_resource_ref(*env().gpu);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(utils::make_string_column(text, stream, mr));
+    columns.push_back(utils::make_string_column(flags, stream, mr));
+    columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, keys, stream));
+    columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, keys, stream));
+    return std::make_unique<cudf::table>(std::move(columns));
+  };
+  auto round_trip = [&](std::unique_ptr<cudf::table> table) {
+    auto batch          = gpu_batch(std::move(table));
+    auto const expected = digest(*batch);
+    spill_from(batch, env().host, source);
+    REQUIRE(holds<sirius::compressed_host_representation>(*batch));
+    auto const bytes = stored_bytes(*batch);
+    move_to(batch, env().gpu);
+    CHECK(digest(*batch) == expected);
+    return bytes;
+  };
+
+  // The first batch takes the default plans and trains the text column, not the flags.
+  auto const default_bytes = round_trip(make_table(1, true));
+  dictionaries.wait_idle();
+  REQUIRE(dictionaries.find(text_key) != nullptr);
+  CHECK(dictionaries.needs_training({source, 1}));
+  CHECK(dictionaries.size() == 1);
+
+  // Later batches of the column encode with its dictionary.
+  auto const onpair_bytes = round_trip(make_table(2, true));
+  CHECK(onpair_bytes < default_bytes);
+  CHECK(dictionaries.find(text_key) != nullptr);
+
+  // Data the dictionary does not fit is stored as is, and the column trains anew.
+  round_trip(make_table(3, false));
+  CHECK(dictionaries.find(text_key) == nullptr);
+  CHECK(dictionaries.needs_training(text_key));
+
+  dictionaries.erase_query(source.query);
+  CHECK(dictionaries.size() == 0);
+}
+
+TEST_CASE("spill compression: columns released as they encode", "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  auto s                  = enabled_settings();
+  s.release_columns_early = true;
+  scoped_settings settings(s);
+  auto* gpu_mr                = env().gpu->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  auto const allocated_before = gpu_mr->get_total_allocated_bytes();
+  auto const reserved_before  = gpu_mr->get_total_reserved_bytes();
+
+  auto batch          = gpu_batch(compressible_table());
+  auto const expected = digest(*batch);
+  move_to(batch, env().host);
+  REQUIRE(holds<sirius::compressed_host_representation>(*batch));
+  // Each column is freed off the encode's reservation, so the pool's count goes back down.
+  CHECK(gpu_mr->get_total_allocated_bytes() == allocated_before);
+  CHECK(gpu_mr->get_total_reserved_bytes() == reserved_before);
+
+  move_to(batch, env().gpu);
+  REQUIRE(holds<cucascade::gpu_table_representation>(*batch));
+  CHECK(digest(*batch) == expected);
 }

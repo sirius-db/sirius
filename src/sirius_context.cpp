@@ -17,6 +17,7 @@
 #include "sirius_context.hpp"
 
 #include "compression/spill_compression.hpp"
+#include "compression/spill_dictionary_registry.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -611,6 +612,7 @@ std::size_t SiriusContext::release_query_state(sirius::query_id_t query_id, bool
   // data_repository* into this query's manager.
   {
     auto leaked = data_repository_registry_.erase(query_id);
+    sirius::compression::spill_dictionary_registry::global().erase_query(query_id);
     if (auto completion = window_completion(query_id); completion && completion->has_error()) {
       for (auto const& info : leaked) {
         discarded_speculative_work_.fetch_add(info.count, std::memory_order_relaxed);

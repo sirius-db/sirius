@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "query_id.hpp"
+
 #include <cudf/column/column_view.hpp>
 
 #include <cuda/stream>
@@ -23,6 +25,7 @@
 #include <cucascade/data/representation_converter.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -57,6 +60,41 @@ struct spill_compression_settings {
   /// means the batch spills uncompressed. 0 skips the check
   /// (compression.spill_encode_reserve_fraction).
   double encode_reserve_fraction{1.5};
+  /// Encode the strings of a batch with a known source (spill_source) with an OnPair
+  /// dictionary trained per column in the background; until one is ready, and for
+  /// one-byte strings, the column takes its default plan
+  /// (compression.spill_onpair_strings).
+  bool onpair_strings{true};
+  /// Free each column of a spilled batch as soon as it is encoded, so the encode adds one
+  /// column's working set to the device rather than the batch's compressed form. The batch
+  /// then has no uncompressed form to fall back to: it is kept compressed whatever its
+  /// ratio, and a column whose encode fails is stored as is. Applies under per-thread
+  /// allocation tracking to batches that own their table
+  /// (compression.spill_release_columns_early).
+  bool release_columns_early{false};
+};
+
+/// The query-graph edge a spilled batch came from: the repository holding it, within
+/// its query. Keys the per-column state the spill path keeps across batches.
+struct spill_source {
+  query_id_t query{};
+  void const* repository{nullptr};
+};
+
+/// The source of the batch the calling thread is spilling, if any.
+[[nodiscard]] std::optional<spill_source> current_spill_source() noexcept;
+
+/// Makes @p source the calling thread's current_spill_source() for its lifetime. The
+/// converter signature has no room for it, and a convert runs on the calling thread.
+class scoped_spill_source {
+ public:
+  explicit scoped_spill_source(std::optional<spill_source> source) noexcept;
+  ~scoped_spill_source();
+  scoped_spill_source(scoped_spill_source const&)            = delete;
+  scoped_spill_source& operator=(scoped_spill_source const&) = delete;
+
+ private:
+  std::optional<spill_source> _previous;
 };
 
 /// Install the process-wide settings. The converters run on downgrade threads with no
@@ -83,7 +121,8 @@ void apply_spill_compression_config(compression_config const& config);
  * column of at least 4096 rows is dictionary-encoded, with bitpacked indices, when a
  * sample of it has few distinct values and its values average more than one byte;
  * otherwise it is split into ans-coded chars and delta-bitpacked offsets. Shorter string columns
- * and every other type are stored as is.
+ * and every other type are stored as is. A batch with a spill_source may instead encode
+ * a string column with OnPair; see spill_compression_settings::onpair_strings.
  */
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
                                              ::cuda::stream_ref stream);
@@ -91,6 +130,13 @@ void apply_spill_compression_config(compression_config const& config);
 /// Thrown by a spill converter that chose not to compress (too small a saving, no
 /// encode headroom). The caller spills the batch uncompressed instead.
 class spill_compression_declined : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+/// Thrown by a spill converter that failed after it took the batch's columns
+/// (release_columns_early): the batch cannot be spilled uncompressed instead.
+class spill_source_released : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };

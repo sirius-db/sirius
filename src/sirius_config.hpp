@@ -374,6 +374,16 @@ struct compression_config {
   /// batches peak at about 0.7-1.1x of their size, a batch of one string column at up
   /// to about 2.9x.
   double spill_encode_reserve_fraction{1.5};
+
+  /// Encode a spilled string column with an OnPair dictionary trained for it in the
+  /// background from its first spilled batch, which takes the default plan. One-byte
+  /// strings keep their default plan.
+  bool spill_onpair_strings{true};
+
+  /// Free each column of a spilled batch as soon as it is encoded. The batch then has no
+  /// uncompressed form to fall back to, so it stays compressed whatever its ratio, and an
+  /// encode that cannot even store a column as is fails the spill.
+  bool spill_release_columns_early{false};
 };
 
 class configuration_input_error : public std::runtime_error {

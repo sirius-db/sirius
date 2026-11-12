@@ -244,18 +244,31 @@ void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
   }
 }
 
+/// Options for column @p i of @p column_options, empty meaning none for any column.
+compress_options const& column_option(std::span<compress_options const> column_options,
+                                      std::size_t i)
+{
+  static compress_options const none{};
+  return column_options.empty() ? none : column_options[i];
+}
+
 compressed_table compress_columns_parallel(cudf::table_view table,
                                            std::vector<std::string> const& plans,
                                            stream_pool& pool,
                                            rmm::device_async_resource_ref mr,
-                                           std::vector<std::string> const& column_names)
+                                           std::vector<std::string> const& column_names,
+                                           std::span<compress_options const> column_options = {})
 {
   compressed_table out;
   out.columns.resize(plans.size());
   run_column_workers(plans.size(), pool, [&](size_t i, ::cuda::stream_ref stream) {
     std::string err;
-    auto plan_tree =
-      compress_column(table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
+    auto plan_tree = compress_column(table.column(static_cast<cudf::size_type>(i)),
+                                     plans[i],
+                                     stream,
+                                     mr,
+                                     &err,
+                                     column_option(column_options, i));
     if (!plan_tree) throw plan_error(err.empty() ? "compress failed" : err);
     compressed_column col;
     col.dtype     = table.column(static_cast<cudf::size_type>(i)).type();
@@ -963,23 +976,37 @@ std::vector<std::string> split_and_validate_plans(std::string_view plan_dsl,
   // elements are compressed regardless of the view's allocation base.
   return plans;
 }
+
+void validate_column_options(std::span<compress_options const> column_options, std::size_t n)
+{
+  if (!column_options.empty() && column_options.size() != n) {
+    throw plan_error("compress_with_plan: " + std::to_string(column_options.size()) +
+                     " column options for " + std::to_string(n) + " columns");
+  }
+}
 }  // namespace
 
 compressed_table compress_with_plan(cudf::table_view table,
                                     std::string_view plan_dsl,
                                     ::cuda::stream_ref stream,
                                     rmm::device_async_resource_ref mr,
-                                    std::vector<std::string> column_names)
+                                    std::vector<std::string> column_names,
+                                    std::span<compress_options const> column_options)
 {
   nvtx_scoped_range nvtx_range{"simpatico::compress_table[serial]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
+  validate_column_options(column_options, plans.size());
 
   compressed_table out;
   out.columns.reserve(plans.size());
   for (size_t i = 0; i < plans.size(); ++i) {
     std::string err;
-    auto plan_tree =
-      compress_column(table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
+    auto plan_tree = compress_column(table.column(static_cast<cudf::size_type>(i)),
+                                     plans[i],
+                                     stream,
+                                     mr,
+                                     &err,
+                                     column_option(column_options, i));
     if (!plan_tree) throw plan_error(err.empty() ? "compress failed" : err);
     compressed_column col;
     col.dtype     = table.column(static_cast<cudf::size_type>(i)).type();
@@ -1007,11 +1034,13 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     std::string_view plan_dsl,
                                     simpatico::stream_pool& pool,
                                     rmm::device_async_resource_ref mr,
-                                    std::vector<std::string> column_names)
+                                    std::vector<std::string> column_names,
+                                    std::span<compress_options const> column_options)
 {
   nvtx_scoped_range nvtx_range{"simpatico::compress_table[pool]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
-  return compress_columns_parallel(table, plans, pool, mr, column_names);
+  validate_column_options(column_options, plans.size());
+  return compress_columns_parallel(table, plans, pool, mr, column_names, column_options);
 }
 
 // ── decompress ────────────────────────────────────────────────────────────────
