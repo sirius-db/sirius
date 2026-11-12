@@ -56,6 +56,7 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -238,6 +239,10 @@ struct range_fault_policy {
   std::string etag;
   /// Held before every GET response is sent, so a read stays in flight that long.
   std::chrono::milliseconds response_delay{0};
+  /// Serve every connection on its own thread and keep it open across requests
+  /// (`Connection: keep-alive`), so a client can reuse it. Off: one request per
+  /// connection, served serially on the accept thread.
+  bool keep_alive{false};
 };
 
 class range_s3_server {
@@ -281,6 +286,16 @@ class range_s3_server {
       _listen_fd = -1;
     }
     if (_thread.joinable()) { _thread.join(); }
+    {
+      // Wake keep-alive connection threads blocked waiting for a next request.
+      std::lock_guard lock{_connections_mutex};
+      for (int const fd : _open_fds) {
+        ::shutdown(fd, SHUT_RDWR);
+      }
+    }
+    for (auto& connection : _connections) {
+      connection.join();
+    }
   }
 
   range_s3_server(range_s3_server const&)            = delete;
@@ -290,7 +305,7 @@ class range_s3_server {
 
   /// Every request the server has served, of any method.
   [[nodiscard]] int request_count() const { return _request_count.load(std::memory_order_relaxed); }
-  /// Accepted TCP connections (warm-up exchanges each open a fresh one).
+  /// Accepted TCP connections.
   [[nodiscard]] int connection_count() const
   {
     return _connection_count.load(std::memory_order_relaxed);
@@ -317,22 +332,56 @@ class range_s3_server {
         continue;
       }
       _connection_count.fetch_add(1, std::memory_order_relaxed);
-      handle_client(fd);
-      ::close(fd);
+      if (!_fault.keep_alive) {
+        serve_connection(fd);
+        ::close(fd);
+        continue;
+      }
+      std::lock_guard lock{_connections_mutex};
+      _open_fds.push_back(fd);
+      _connections.emplace_back([this, fd] {
+        serve_connection(fd);
+        std::lock_guard fds_lock{_connections_mutex};
+        std::erase(_open_fds, fd);
+        ::close(fd);
+      });
     }
   }
 
-  void handle_client(int fd)
+  /// Serve requests on @p fd until the peer closes it, it idles past the timeout, or (without
+  /// keep-alive) after the first one.
+  void serve_connection(int fd)
   {
     timeval timeout{};
-    timeout.tv_sec = 2;
+    timeout.tv_sec = _fault.keep_alive ? 30 : 2;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    do {
+      auto request = read_request(fd);
+      if (!request) { return; }
+      handle_request(fd, *request);
+    } while (_fault.keep_alive && !_stop.load());
+  }
 
+  /// One request's head (these requests carry no body), or nothing once the peer stops sending.
+  static std::optional<std::string> read_request(int fd)
+  {
     std::string request;
-    request.resize(4096);
-    ssize_t n = ::recv(fd, request.data(), request.size(), 0);
-    if (n <= 0) { return; }
-    request.resize(static_cast<std::size_t>(n));
+    std::array<char, 4096> chunk{};
+    while (request.find("\r\n\r\n") == std::string::npos) {
+      ssize_t n = ::recv(fd, chunk.data(), chunk.size(), 0);
+      if (n <= 0) { return std::nullopt; }
+      request.append(chunk.data(), static_cast<std::size_t>(n));
+    }
+    return request;
+  }
+
+  [[nodiscard]] std::string connection_header() const
+  {
+    return _fault.keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+  }
+
+  void handle_request(int fd, std::string const& request)
+  {
     ++_request_count;
 
     bool const is_head = request.rfind("HEAD ", 0) == 0;
@@ -341,39 +390,38 @@ class range_s3_server {
     if (is_head) {
       _head_count.fetch_add(1, std::memory_order_relaxed);
       response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) + "\r\n" +
-                 etag_header() + "Connection: close\r\n\r\n";
+                 etag_header() + connection_header();
       send_all(fd, response);
     } else if (is_get) {
       auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
       if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
       if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
         response = "HTTP/1.1 " + std::to_string(_fault.fail_status) +
-                   " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                   " Service Unavailable\r\nContent-Length: 0\r\n" + connection_header();
         send_all(fd, response);
         return;
       }
       if (auto range = parse_range(request)) {
         auto const [start, end, requested_end, suffix] = *range;
         if (suffix) { _suffix_get_count.fetch_add(1, std::memory_order_relaxed); }
-        // Single writer: requests are served one at a time on the accept thread.
-        if (requested_end > _max_requested_end.load()) { _max_requested_end.store(requested_end); }
+        auto seen = _max_requested_end.load();
+        while (requested_end > seen &&
+               !_max_requested_end.compare_exchange_weak(seen, requested_end)) {}
         auto const len = end - start + 1;
         response       = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
                    "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) +
                    "/" + std::to_string(_object.size()) + "\r\n" + etag_header() +
-                   "Connection: close\r\n\r\n";
+                   connection_header();
         send_all(fd, response);
         send_all(fd, _object.data() + start, len);
       } else {
         response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) + "\r\n" +
-                   etag_header() + "Connection: close\r\n\r\n";
+                   etag_header() + connection_header();
         send_all(fd, response);
         send_all(fd, _object.data(), _object.size());
       }
     } else {
-      response =
-        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n"
-        "Connection: close\r\n\r\n";
+      response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n" + connection_header();
       send_all(fd, response);
     }
   }
@@ -455,6 +503,9 @@ class range_s3_server {
   std::atomic<std::size_t> _suffix_get_count{0};
   std::atomic<std::size_t> _max_requested_end{0};
   std::thread _thread;
+  std::mutex _connections_mutex;
+  std::vector<std::thread> _connections;  ///< keep-alive mode: one per accepted connection
+  std::vector<int> _open_fds;             ///< keep-alive connections still being served
 };
 
 }  // namespace
@@ -684,12 +735,14 @@ TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[
 
 TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket", "[s3][routing]")
 {
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
+  // Keep-alive, so the client could reuse its connections: the warm-up's fresh connections are
+  // then its own policy, not a server that closes after every response.
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}),
+                         range_fault_policy{.keep_alive = true});
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
-  // One connection per reactor over two reactors: small enough for the serial
-  // test server to serve the burst, but still per-reactor rather than global
-  // (each reactor owns its own, thread-confined connection pool).
+  // One connection per reactor over two reactors: still per-reactor rather than
+  // global (each reactor owns its own, thread-confined connection pool).
   cfg.rest.max_connections = 1;
   cfg.rest_n_reactors      = 2;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
@@ -710,6 +763,22 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
     return server.request_count();
   };
 
+  // Reads reuse the pools' open connections: once both reactors have connected, more reads
+  // send more requests over the same connections.
+  std::vector<std::uint8_t> buffer(64);
+  auto const read_some = [&](std::size_t offset) {
+    for (std::size_t i = 0; i < 4; ++i) {
+      REQUIRE(datasource->host_read(offset + i * 128, buffer.size(), buffer.data()) ==
+              buffer.size());
+    }
+  };
+  read_some(0);
+  int const reused_connections = server.connection_count();
+  int const before_reuse       = server.request_count();
+  read_some(1024);
+  CHECK(server.request_count() > before_reuse);
+  REQUIRE(server.connection_count() == reused_connections);
+
   int const baseline             = server.request_count();
   int const baseline_connections = server.connection_count();
   constexpr int expected_warm    = 2;  // rest_n_reactors * max_connections
@@ -719,6 +788,7 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   // and HTTP are all exercised before the reads arrive.
   io_ctx->warmup("s3://warm-bucket");
   CHECK(wait_for_requests(baseline + expected_warm) >= baseline + expected_warm);
+  // Every warm-up request replaced a reusable idle connection with a new one.
   CHECK(server.connection_count() >= baseline_connections + expected_warm);
   int const after_warm = server.request_count();
 
