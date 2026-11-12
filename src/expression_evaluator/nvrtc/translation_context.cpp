@@ -269,6 +269,19 @@ void translation_context::emit_reg_val_assign(std::string_view type_name,
   emit_line(format("reg_val<{}> {} = {};", type_name, name, expr));
 }
 
+bool translation_context::record_overflow_site(overflow_site site,
+                                               bool raises_overflow,
+                                               bool inputs_can_overflow)
+{
+  if (raises_overflow) { _overflow_sites.push_back(site); }
+  return raises_overflow || inputs_can_overflow;
+}
+
+void translation_context::drop_overflow_sites_since(std::size_t mark) noexcept
+{
+  _overflow_sites.resize(mark);
+}
+
 std::size_t translation_context::get_or_bind_input_column(std::uint32_t column_index)
 {
   auto const it =
@@ -822,10 +835,10 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
 //===----------CAST----------===//
 register_value translation_context::produce_cast(sirius::ast::cast const& expr)
 {
-  auto const dst_type   = sirius::require_cudf_type(expr.target_type);
-  auto const dst_str    = cuda_type_name(dst_type);
-  auto const var_name   = next_var_name();
-  auto const first_site = _overflow_sites.size();
+  auto const dst_type = sirius::require_cudf_type(expr.target_type);
+  auto const dst_str  = cuda_type_name(dst_type);
+  auto const var_name = next_var_name();
+  auto const try_mark = overflow_site_mark();
 
   // Carrier restoration: a referenced column is loaded at its raw carrier width and widened inline.
   register_value const child = [&]() {
@@ -969,14 +982,12 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
                                     cudf::type_to_name(dst_type));
   }
 
-  if (op_can_ovf) { _overflow_sites.emplace_back(&expr); }
-  bool can_ovf  = child.can_overflow || op_can_ovf;
+  bool can_ovf  = record_overflow_site(&expr, op_can_ovf, child.can_overflow);
   bool non_null = child.is_statically_non_null;
   if (expr.try_cast && can_ovf) {
     emit_line(format(
       "if ({0}.overflow) {{ {0} = reg_val<{1}>{{{1}{{}}, false, false}}; }}", var_name, dst_str));
-    // No overflow of the TRY_CAST's subtree reaches a sink.
-    _overflow_sites.resize(first_site);
+    drop_overflow_sites_since(try_mark);
     can_ovf  = false;
     non_null = false;
   }
@@ -986,10 +997,10 @@ register_value translation_context::produce_cast(sirius::ast::cast const& expr)
 //===----------UNARY OPERATOR----------===//
 register_value translation_context::produce_unary_op(sirius::ast::unary_op const& expr)
 {
-  auto const first_site = _overflow_sites.size();
-  auto const child      = produce(*expr.child);
-  auto const var_name   = next_var_name();
-  auto const& c         = child.var_name;
+  auto const try_mark = overflow_site_mark();
+  auto const child    = produce(*expr.child);
+  auto const var_name = next_var_name();
+  auto const& c       = child.var_name;
 
   switch (expr.op) {
     case sirius::ast::unary_op::kind::op_not:
@@ -1008,8 +1019,7 @@ register_value translation_context::produce_unary_op(sirius::ast::unary_op const
                    format("{0}.overflow ? {1}{{}} : {0}.val", c, type_str),
                    format("{0}.valid && !{0}.overflow", c),
                    "false");
-      // No overflow of the TRY's operand reaches a sink.
-      _overflow_sites.resize(first_site);
+      drop_overflow_sites_since(try_mark);
       return register_value{var_name, child.device_type, false, false};
     }
     default:
@@ -1070,9 +1080,9 @@ register_value translation_context::produce_arithmetic(sirius::ast::function_cal
                                  format_int128_pow10(s_max - s_r)));
     }
     // Every decimal operation narrows a 128-bit intermediate to the output representation.
-    _overflow_sites.emplace_back(&expr);
+    bool const can_ovf  = record_overflow_site(&expr, true, any_can_overflow({&lhs, &rhs}));
     bool const non_null = all_statically_non_null({&lhs, &rhs}) && !is_div_or_mod;
-    return register_value{var_name, ret_type, non_null, /*can_overflow=*/true};
+    return register_value{var_name, ret_type, non_null, can_ovf};
   }
 
   char const* fn_name = nullptr;
@@ -1095,8 +1105,7 @@ register_value translation_context::produce_arithmetic(sirius::ast::function_cal
                     fid == sirius::function_id::mul ||
                     ((fid == sirius::function_id::div || fid == sirius::function_id::int_div) &&
                      !cudf::is_unsigned(ret_type)));
-  if (op_can_ovf) { _overflow_sites.emplace_back(&expr); }
-  bool const can_ovf  = any_can_overflow({&lhs, &rhs}) || op_can_ovf;
+  bool const can_ovf  = record_overflow_site(&expr, op_can_ovf, any_can_overflow({&lhs, &rhs}));
   bool const non_null = all_statically_non_null({&lhs, &rhs}) && !(is_div_or_mod && is_int_type);
   return register_value{var_name, ret_type, non_null, can_ovf};
 }
@@ -1193,9 +1202,10 @@ register_value translation_context::produce_date_trunc(sirius::ast::function_cal
         format("eval_cast_ts_scale_down<{}LL>({})", src_tps / dst_tps, trunc_var));
     }
   }
-  if (op_can_ovf) { _overflow_sites.emplace_back(&expr); }
-  return register_value{
-    var_name, ret_type, child.is_statically_non_null, child.can_overflow || op_can_ovf};
+  return register_value{var_name,
+                        ret_type,
+                        child.is_statically_non_null,
+                        record_overflow_site(&expr, op_can_ovf, child.can_overflow)};
 }
 
 //===----------STRING MATCHING FUNCTIONS----------===//
@@ -1304,9 +1314,10 @@ register_value translation_context::produce_function_call(sirius::ast::function_
     emit_reg_val_assign(
       type_str, var_name, format("eval_negate<{}>({})", type_str, child.var_name));
     bool const op_can_ovf = !cudf::is_floating_point(ret_type);
-    if (op_can_ovf) { _overflow_sites.emplace_back(&expr); }
-    return register_value{
-      var_name, ret_type, child.is_statically_non_null, child.can_overflow || op_can_ovf};
+    return register_value{var_name,
+                          ret_type,
+                          child.is_statically_non_null,
+                          record_overflow_site(&expr, op_can_ovf, child.can_overflow)};
   }
 
   if (fid == sirius::function_id::abs) {
@@ -1314,9 +1325,10 @@ register_value translation_context::produce_function_call(sirius::ast::function_
     emit_reg_val_assign(type_str, var_name, format("eval_abs<{}>({})", type_str, child.var_name));
     bool const op_can_ovf = cudf::is_fixed_point(ret_type) ||
                             (cudf::is_integral(ret_type) && !cudf::is_unsigned(ret_type));
-    if (op_can_ovf) { _overflow_sites.emplace_back(&expr); }
-    return register_value{
-      var_name, ret_type, child.is_statically_non_null, child.can_overflow || op_can_ovf};
+    return register_value{var_name,
+                          ret_type,
+                          child.is_statically_non_null,
+                          record_overflow_site(&expr, op_can_ovf, child.can_overflow)};
   }
 
   if (fid == sirius::function_id::round) {

@@ -116,6 +116,11 @@ inline constexpr std::size_t max_like_pattern_parameters = 8;
  *     @c register_value::var_name; its `.val`, `.valid` and `.overflow` are what a sink reads.
  *   - Input loads and constant initializations go to a prelude that runs before any branch, so a
  *     later `if` arm never introduces a load; node statements follow in the body.
+ *
+ * The @c overflow_sites() point into the expression trees the context produced, so a context must
+ * not outlive those trees, and its sites must never be cached with a compiled kernel in
+ * `codegen::jit::KernelCache`, which outlives every tree. `evaluate_project_sink` and
+ * `evaluate_filter_sink` create one context per launch.
  */
 class translation_context {
  public:
@@ -198,6 +203,24 @@ class translation_context {
   void emit_reg_val_assign(std::string_view type_name,
                            std::string_view name,
                            std::string_view expr);
+
+  /**
+   * @brief Records @p site when its own operation can raise Overflow Poison, and returns whether
+   * the operation's result can carry Overflow Poison, raised by the operation or passed on from its
+   * inputs.
+   */
+  [[nodiscard]] bool record_overflow_site(overflow_site site,
+                                          bool raises_overflow,
+                                          bool inputs_can_overflow);
+
+  /** @brief Returns the position from which `drop_overflow_sites_since` forgets overflow sites. */
+  [[nodiscard]] std::size_t overflow_site_mark() const noexcept { return _overflow_sites.size(); }
+
+  /**
+   * @brief Forgets the overflow sites recorded after @p mark, under a TRY or TRY_CAST, which turns
+   * their Overflow Poison into NULL before it can reach an NVRTC Sink.
+   */
+  void drop_overflow_sites_since(std::size_t mark) noexcept;
 
   /**
    * @brief Returns the narrowed physical carrier type when @p column_operand is a reference whose

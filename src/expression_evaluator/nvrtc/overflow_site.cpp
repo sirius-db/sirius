@@ -18,7 +18,6 @@
 #include <expression_evaluator/nvrtc/overflow_site.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <format>
 #include <vector>
@@ -29,11 +28,18 @@ namespace {
 
 constexpr std::size_t max_listed_candidates = 4;
 
-// Operators such as `+` read best infix; named functions and the one-operand `-` read as calls.
-[[nodiscard]] bool is_binary_operator(std::string_view name, std::size_t argument_count)
+// Arithmetic operators such as `+` read best infix; every other function reads as a call.
+[[nodiscard]] bool is_infix_operator(sirius::function_id function) noexcept
 {
-  return argument_count == 2 && !name.empty() &&
-         std::isalpha(static_cast<unsigned char>(name.front())) == 0;
+  switch (function) {
+    case sirius::function_id::add:
+    case sirius::function_id::sub:
+    case sirius::function_id::mul:
+    case sirius::function_id::div:
+    case sirius::function_id::int_div:
+    case sirius::function_id::mod: return true;
+    default: return false;
+  }
 }
 
 [[nodiscard]] std::string describe(sirius::ast::function_call const& call)
@@ -41,7 +47,7 @@ constexpr std::size_t max_listed_candidates = 4;
   auto const name   = sirius::to_duckdb_function_name(call.function());
   auto const& args  = call.arguments();
   auto const result = call.return_type().to_string();
-  if (is_binary_operator(name, args.size())) {
+  if (is_infix_operator(call.function()) && args.size() == 2) {
     return std::format("{} {} {} -> {}",
                        args[0]->return_type().to_string(),
                        name,

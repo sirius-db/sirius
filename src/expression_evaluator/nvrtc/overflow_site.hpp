@@ -36,11 +36,8 @@
 namespace sirius::nvrtc {
 
 /**
- * @brief An operation in a fused NVRTC kernel that can raise Overflow Poison by itself, rather than
- * only pass on the poison of its inputs.
- *
- * A site points into the expression tree that `translation_context` translated, so it is valid only
- * while that tree is alive.
+ * @brief The expression tree node of an operation in a fused NVRTC kernel that can raise Overflow
+ * Poison by itself, rather than only pass on the Overflow Poison of its inputs.
  */
 using overflow_site = std::variant<sirius::ast::function_call const*, sirius::ast::cast const*>;
 
