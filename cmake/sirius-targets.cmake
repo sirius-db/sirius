@@ -54,7 +54,6 @@ set(SIRIUS_LINK_LIBRARIES
     simpatico
     PkgConfig::NUMA
     PkgConfig::LIBURING
-    ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable)
 

@@ -38,8 +38,9 @@ Tools:
 
 CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `nvcomp`, `spdlog`,
 `yaml-cpp`, `roaring`, and `absl`, plus `OpenSSL`, `ZLIB`, and `CUDAToolkit`.
-`pkg-config` modules: `numa`, `liburing`, and `libcurl`. Use the RAPIDS versions
-pinned in `pixi.toml`.
+`pkg-config` modules: `numa` and `liburing`, plus `libcurl` when
+`SIRIUS_BUILD_TESTS` is on (the S3 test fixture uploads with it). Use the RAPIDS
+versions pinned in `pixi.toml`.
 
 The `duckdb`, `substrait`, and `cucascade` submodules are built from source.
 `cuco` and Corrosion are used from installed CMake packages when found and are
