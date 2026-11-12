@@ -17,6 +17,7 @@
 #include "op/window/cumulative.hpp"
 
 #include "op/window/aggregate_types.hpp"
+#include "op/window/float_extremum.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -26,9 +27,11 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 
 namespace sirius::op {
@@ -46,6 +49,8 @@ bool is_extremum_type(cudf::data_type type)
     case type_id::DECIMAL32:
     case type_id::DECIMAL64:
     case type_id::DECIMAL128:
+    case type_id::FLOAT32:
+    case type_id::FLOAT64:
     case type_id::TIMESTAMP_DAYS:
     case type_id::TIMESTAMP_SECONDS:
     case type_id::TIMESTAMP_MILLISECONDS:
@@ -212,8 +217,13 @@ std::unique_ptr<cudf::table> evaluate_cumulative_window(
 
   // A sum accumulates in a wider type than its argument, so it scans a widened copy. An 8 to 32 bit
   // integer is scanned as it is: cuDF sums it into INT64, and the result is cast to its result type
-  // at the end.
-  std::vector<std::unique_ptr<cudf::column>> widened(aggregates.size());
+  // at the end. A floating point `min` or `max` over an argument with NaN scans a copy with NaN
+  // replaced by NULL, because NaN orders above every other value, and a running maximum of its NaN
+  // flags restores NaN later (see float_extremum.hpp). Aggregates over one argument share its copy,
+  // flags and flag scan.
+  std::vector<std::unique_ptr<cudf::column>> copies(aggregates.size());
+  std::vector<std::optional<nan_free_argument>> nan_free(argument_columns.size());
+  std::vector<std::optional<std::size_t>> flag_request(argument_columns.size());
   std::vector<cudf::groupby::scan_request> requests;
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
     auto values =
@@ -221,19 +231,37 @@ std::unique_ptr<cudf::table> evaluate_cumulative_window(
     if (aggregates[i].function == aggregate_id::sum && !is_narrow_integer(values.type())) {
       auto const target = window_sum_type(values.type());
       if (values.type() != target) {
-        widened[i] = cudf::cast(values, target, stream, mr);
-        values     = widened[i]->view();
+        copies[i] = cudf::cast(values, target, stream, mr);
+        values    = copies[i]->view();
       }
+    }
+    auto const function      = aggregates[i].function;
+    auto const float_extrema = (function == aggregate_id::min || function == aggregate_id::max) &&
+                               cudf::is_floating_point(values.type());
+    // Without NaN the extremum scans the argument as it is.
+    if (float_extrema) {
+      auto& prepared = nan_free[argument_position[i]];
+      if (!prepared) { prepared = make_nan_free_argument(values, stream, mr); }
+      if (prepared->finite) { values = prepared->finite->view(); }
     }
     cudf::groupby::scan_request request;
     request.values = values;
     request.aggregations.push_back(make_scan(aggregates[i].function));
     requests.push_back(std::move(request));
   }
+  for (std::size_t arg = 0; arg < nan_free.size(); ++arg) {
+    if (!nan_free[arg] || !nan_free[arg]->flags) { continue; }
+    cudf::groupby::scan_request request;
+    request.values = nan_free[arg]->flags->view();
+    request.aggregations.push_back(make_scan(aggregate_id::max));
+    flag_request[arg] = requests.size();
+    requests.push_back(std::move(request));
+  }
   auto [labels, scans] = groups.scan(requests, stream, mr);
   labels.reset();
   requests.clear();
-  widened.clear();
+  copies.clear();
+  nan_free.clear();
 
   std::vector<std::unique_ptr<cudf::column>> scanned_columns;
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
@@ -251,7 +279,6 @@ std::unique_ptr<cudf::table> evaluate_cumulative_window(
     }
     scanned_columns.push_back(std::move(column));
   }
-  scans.clear();
 
   // The scan returns NULL for a row whose argument is NULL. The running value carries over such a
   // row, so fill each NULL with the closest value before it in its own partition. A NULL at the
@@ -278,6 +305,19 @@ std::unique_ptr<cudf::table> evaluate_cumulative_window(
       scanned_columns[static_cast<std::size_t>(fill_indices[j])] = std::move(filled_columns[j]);
     }
   }
+  for (std::size_t i = 0; i < aggregates.size(); ++i) {
+    auto const flag_index = flag_request[argument_position[i]];
+    auto const function   = aggregates[i].function;
+    if (!flag_index || (function != aggregate_id::min && function != aggregate_id::max)) {
+      continue;
+    }
+    scanned_columns[i] = restore_nan(std::move(scanned_columns[i]),
+                                     scans[*flag_index].results.front()->view(),
+                                     function,
+                                     stream,
+                                     mr);
+  }
+  scans.clear();
   sorted.reset();
   unpartitioned.reset();
 

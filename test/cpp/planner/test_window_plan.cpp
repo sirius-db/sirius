@@ -478,7 +478,6 @@ TEST_CASE("running aggregate planning rejects unsupported shapes", "[planner][wi
     std::string("sum(v) OVER (PARTITION BY p ORDER BY q ROWS BETWEEN CURRENT ROW AND UNBOUNDED "
                   "FOLLOWING)"),
     "avg(v) OVER (PARTITION BY p ORDER BY q" + frame + ")",
-    "min(f) OVER (PARTITION BY p ORDER BY q" + frame + ")",
     "max(s) OVER (PARTITION BY p ORDER BY q" + frame + ")",
     "sum(v::UBIGINT) OVER (PARTITION BY p ORDER BY q" + frame + ")",
     "sum(DISTINCT v) OVER (PARTITION BY p ORDER BY q" + frame + ")",
