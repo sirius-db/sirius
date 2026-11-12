@@ -6,7 +6,7 @@ import duckdb
 from siriusfuzz.config import FuzzConfig
 from siriusfuzz.query_gen import QueryGenerator, Scope, ScopeTable
 from siriusfuzz.schema_gen import DataGenerator
-from siriusfuzz.sqlast import ColumnRef
+from siriusfuzz.sqlast import Agg, ColumnRef
 
 
 class LargeDataTests(unittest.TestCase):
@@ -65,6 +65,23 @@ class LargeDataTests(unittest.TestCase):
         )
         cond = gen._gen_join_cond(Scope([left]), right, "inner")
         self.assertIn('"a0"."fk_t0" = "a1"."k"', cond.sql())
+
+    def test_large_projection_is_bounded_and_nested_queries_use_dimensions(self):
+        cfg, ds = self._dataset()
+        gen = QueryGenerator(cfg, ds, random.Random(91))
+        saw_fact = False
+        for _ in range(200):
+            nested = gen._gen_select(depth=1, outer=None)
+            self.assertNotIn('FROM "f', nested.sql())
+            select = gen._gen_select(depth=0, outer=None)
+            if 'FROM "f' not in select.sql():
+                continue
+            saw_fact = True
+            if not select.group_by and not any(
+                isinstance(item.expr, Agg) for item in select.items
+            ):
+                self.assertIn('"k" < CAST(1000 AS BIGINT)', select.sql())
+        self.assertTrue(saw_fact)
 
 
 if __name__ == "__main__":

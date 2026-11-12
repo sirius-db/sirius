@@ -306,6 +306,22 @@ class QueryGenerator:
             return sel
 
         self._gen_body(sel, scope, depth, required, exact_outputs)
+        if (
+            self.ds.has_facts
+            and mode == "full"
+            and not sel.group_by
+            and not any(isinstance(item.expr, Agg) for item in sel.items)
+        ):
+            fact_keys = [
+                col
+                for table in scope.tables
+                if (table.table_name or "").startswith("f")
+                for col in table.columns
+                if col.name == "k"
+            ]
+            if fact_keys:
+                bound = Compare("<", fact_keys[0], Literal(1000, st.BIGINT))
+                sel.where = Logical("AND", [sel.where, bound]) if sel.where else bound
         self._gen_order_limit(sel, depth)
         return sel
 
@@ -392,6 +408,13 @@ class QueryGenerator:
 
     def _gen_group_key(self, scope: Scope, depth: int) -> Expr:
         cols = scope.columns()
+        if self.ds.has_facts:
+            fact_aliases = {
+                table.alias
+                for table in scope.tables
+                if (table.table_name or "").startswith("f")
+            }
+            cols = [c for c in cols if not (c.alias in fact_aliases and c.name == "k")]
         if not cols:
             raise GenerationFailed("no columns to group by")
         col = self.rng.choice(cols)
@@ -481,13 +504,13 @@ class QueryGenerator:
             n = self._pick({"1": 0.4, "2": 0.35, "3": 0.15, "4": 0.1})
             n = min(int(n), max_tables)
         first, first_scope = self._gen_from_item(
-            depth, ctes, force_cte, allow_fact=outer is None
+            depth, ctes, force_cte, allow_fact=outer is None and depth == 0
         )
         tree: Join | TableRef | Derived = first
         scope = Scope([first_scope], outer=outer)
         for _ in range(n - 1):
             right, right_scope = self._gen_from_item(
-                depth, ctes, None, allow_fact=outer is None
+                depth, ctes, None, allow_fact=outer is None and depth == 0
             )
             jt = rng.choice(self.join_types) if self.join_types else "inner"
             # Cross products and inequality-only (nested-loop) joins multiply row counts;
