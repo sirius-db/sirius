@@ -37,6 +37,7 @@
  */
 
 #include <catch.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
@@ -736,6 +737,84 @@ TEST_CASE_METHOD(DistinctFixture,
 //===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution floating aggregates used as exact keys fall back at plan time",
+                 "[integration][gpu_execution][distinct][avg]")
+{
+  // DuckDB's serial sum gives five distinct averages for these constant-valued
+  // groups, while cuDF's parallel sum gives four. Exact DISTINCT/GROUP BY amplifies the low-bit
+  // difference into a different row count.
+  run_ok(
+    "CREATE TABLE avg_keys AS SELECT g::INTEGER k FROM range(1, 27) a(g), "
+    "range(26) b(i) WHERE i < g");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu_approx("SELECT k, AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys GROUP BY k",
+                            {1});
+  compare_gpu_vs_cpu_approx("SELECT k, SUM(CAST(-12.802 AS DOUBLE)) a FROM avg_keys GROUP BY k",
+                            {1});
+  compare_gpu_vs_cpu_approx(
+    "SELECT k::DOUBLE, AVG(CAST(-12.802 AS DOUBLE)) a "
+    "FROM avg_keys GROUP BY k::DOUBLE",
+    {1});
+  expect_plan_fallback_matches_cpu(
+    "SELECT DISTINCT a FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
+    "FROM avg_keys GROUP BY k)");
+  expect_plan_fallback_matches_cpu(
+    "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
+    "FROM avg_keys GROUP BY k)");
+  expect_plan_fallback_matches_cpu(
+    "SELECT k % 2 p, COUNT(DISTINCT a) FROM (SELECT k, AVG(CAST(-12.802 AS DOUBLE)) a "
+    "FROM avg_keys GROUP BY k) GROUP BY p");
+  {
+    // Otherwise DuckDB rewrites a whole-partition window into an aggregate and a self-join.
+    sirius::test::disabled_optimizers_guard keep_window{*con, "window_self_join"};
+    compare_gpu_vs_cpu_approx(
+      "SELECT k, AVG(CAST(-12.802 AS DOUBLE)) OVER (PARTITION BY k) a FROM avg_keys", {1});
+    expect_plan_fallback_matches_cpu(
+      "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) "
+      "OVER (PARTITION BY k) a FROM avg_keys)");
+    compare_gpu_vs_cpu_approx(
+      "SELECT DISTINCT k, AVG(CAST(-12.802 AS DOUBLE)) OVER (PARTITION BY k) a FROM avg_keys", {1});
+  }
+  // A key that includes the producer's GROUP BY or PARTITION BY columns fixes the row count, so
+  // these stay on the GPU. The window form is rewritten into an aggregate and a self-join here.
+  compare_gpu_vs_cpu_approx(
+    "SELECT DISTINCT k, a FROM (SELECT k, AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys "
+    "GROUP BY k)",
+    {1});
+  compare_gpu_vs_cpu_approx(
+    "SELECT DISTINCT k, AVG(CAST(-12.802 AS DOUBLE)) OVER (PARTITION BY k) a FROM avg_keys", {1});
+  for (char const* set_operation : {"UNION", "EXCEPT", "INTERSECT"}) {
+    CAPTURE(set_operation);
+    expect_plan_fallback_matches_cpu(
+      std::string{"SELECT a FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys "
+                  "GROUP BY k) "} +
+      set_operation +
+      " SELECT a FROM (SELECT AVG(CAST(-12.802 AS DOUBLE)) a FROM avg_keys "
+      "GROUP BY k HAVING k > 1)");
+  }
+  // Both averages are 3002399751580331 in DuckDB's long double division. The GPU rounds the sum
+  // 2^53 + 1 to FLOAT64 before dividing, so the first group's average differs in the low bit.
+  run_ok(
+    "CREATE TABLE avg_bigint AS SELECT * FROM (VALUES (1, 9007199254740991::BIGINT), (1, 1), "
+    "(1, 1), (2, 3002399751580331)) t(g, v)");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu_approx("SELECT g, AVG(v) a FROM avg_bigint GROUP BY g", {1});
+  expect_plan_fallback_matches_cpu(
+    "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(v) a FROM avg_bigint GROUP BY g)");
+  // The tuple is a STRUCT, so the guard must look at its fields.
+  expect_plan_fallback_matches_cpu(
+    "SELECT g // 3 p, COUNT(DISTINCT (a, 0)) FROM (SELECT g, AVG(v) a FROM avg_bigint "
+    "GROUP BY g) GROUP BY p");
+  expect_plan_fallback_matches_cpu(
+    "WITH averages AS MATERIALIZED (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
+    "FROM avg_keys GROUP BY k) SELECT a FROM averages GROUP BY a");
+  expect_plan_fallback_matches_cpu(
+    "WITH averages AS MATERIALIZED (SELECT AVG(CAST(-12.802 AS DOUBLE)) a, "
+    "AVG(CAST(-847.541 AS DOUBLE)) b, COUNT(DISTINCT k) c "
+    "FROM avg_keys GROUP BY k) SELECT a FROM averages GROUP BY a");
+}
 
 TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT ON with ORDER BY falls back at plan time",
