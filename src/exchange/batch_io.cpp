@@ -117,9 +117,9 @@ std::optional<outgoing_batch> outgoing_batch::make(std::shared_ptr<cucascade::da
   if (view.num_columns() == 0) {
     throw sirius::invalid_input_exception("exchange cannot send a batch with no columns");
   }
-  if (cudaEvent_t writer = read_only.get_writer_event()) {
-    RMM_CUDA_TRY(cudaStreamWaitEvent(stream.value(), writer, 0));
-  }
+  // With a writer event @p stream waits for it. Without one the writer is unknown, and this
+  // thread waits for the whole device.
+  read_only.get_data()->cast<cucascade::gpu_table_representation>().wait_for_writer(stream);
   auto* space = read_only.get_memory_space();
   outgoing_batch out{std::move(batch), std::move(read_only)};
   if (is_sliced(view)) {

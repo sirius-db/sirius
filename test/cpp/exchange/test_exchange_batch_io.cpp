@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
@@ -41,6 +42,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -248,8 +250,11 @@ TEST_CASE("a host landing spread over several host blocks keeps every value and 
   check_same_rows(sirius::get_cudf_table_view(want), sirius::get_cudf_table_view(got));
 }
 
-TEST_CASE("a send waits for the batch's pending writer", "[exchange][batch_io]")
+TEST_CASE("a send waits for the batch's pending writer, known or not", "[exchange][batch_io]")
 {
+  // A batch names its writer by an event; one built on a null writer stream has none.
+  bool const known_writer = GENERATE(true, false);
+  CAPTURE(known_writer);
   constexpr cudf::size_type rows = 50'000;
   std::vector<std::int32_t> values(rows);
   for (cudf::size_type i = 0; i < rows; ++i) {
@@ -286,11 +291,31 @@ TEST_CASE("a send waits for the batch's pending writer", "[exchange][batch_io]")
                           rows * sizeof(std::int32_t),
                           cudaMemcpyDeviceToDevice,
                           producer.value()) == cudaSuccess);
-  batch = sirius::make_data_batch(
-    std::move(table), *env().gpu, producer.view(), sirius::telemetry::batch_telemetry_info{});
+  if (known_writer) {
+    batch = sirius::make_data_batch(
+      std::move(table), *env().gpu, producer.view(), sirius::telemetry::batch_telemetry_info{});
+  } else {
+    batch = cucascade::data_batch::make(
+      sirius::get_next_batch_id(),
+      std::make_unique<cucascade::gpu_table_representation>(
+        std::move(table), *env().gpu, ::cuda::stream_ref{cudaStream_t{nullptr}}));
+  }
   REQUIRE(wait_for_flag(gate.entered));
 
-  out = outgoing_batch::make(batch, send_stream.view());
+  // The send takes the caller's owner: nothing else keeps the batch alive while it is sent.
+  auto planning = std::async(std::launch::async, [&, sent = std::move(batch)]() mutable {
+    return outgoing_batch::make(std::move(sent), send_stream.view());
+  });
+  if (known_writer) {
+    // The send stream waits for the writer's event; the caller does not.
+    REQUIRE(planning.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+  } else {
+    // No event to order the send stream after: the caller waits for the device, so for the writer.
+    CHECK(planning.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
+    CHECK_FALSE(gate.timed_out.load());
+    gate.release.store(true, std::memory_order_release);
+  }
+  out = planning.get();
   REQUIRE(out.has_value());
   auto const bytes = out->stream_bytes();
   REQUIRE(bytes <= send_frame.size());
@@ -302,11 +327,12 @@ TEST_CASE("a send waits for the batch's pending writer", "[exchange][batch_io]")
   // The copy out of the batch and its delivery, both on the send stream.
   out->copy_range(0, bytes, send_frame.data(), send_stream.view());
   landing->copy_in(0, send_frame.data(), bytes, send_stream.view());
-  std::this_thread::sleep_for(std::chrono::milliseconds{200});
-  CHECK(cudaStreamQuery(send_stream.value()) == cudaErrorNotReady);
-  CHECK_FALSE(gate.timed_out.load());
-
-  gate.release.store(true, std::memory_order_release);
+  if (known_writer) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    CHECK(cudaStreamQuery(send_stream.value()) == cudaErrorNotReady);
+    CHECK_FALSE(gate.timed_out.load());
+    gate.release.store(true, std::memory_order_release);
+  }
   send_stream.synchronize();
   REQUIRE_FALSE(gate.timed_out.load());
   out.reset();
