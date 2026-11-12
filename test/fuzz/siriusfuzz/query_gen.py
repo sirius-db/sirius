@@ -512,6 +512,16 @@ class QueryGenerator:
             right, right_scope = self._gen_from_item(
                 depth, ctes, None, allow_fact=outer is None and depth == 0
             )
+            if (
+                (right_scope.table_name or "").startswith("f")
+                and any(
+                    (table.table_name or "").startswith("f") for table in scope.tables
+                )
+                and len(scope.tables) > 1
+            ):
+                # A second fact reached through a dimension creates a many-to-many
+                # product, especially on the intentionally skewed hot keys.
+                continue
             jt = rng.choice(self.join_types) if self.join_types else "inner"
             # Cross products and inequality-only (nested-loop) joins multiply row counts;
             # confine them to two-table FROM clauses so results stay bounded.

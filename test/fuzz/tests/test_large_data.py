@@ -6,7 +6,7 @@ import duckdb
 from siriusfuzz.config import FuzzConfig
 from siriusfuzz.query_gen import QueryGenerator, Scope, ScopeTable
 from siriusfuzz.schema_gen import DataGenerator
-from siriusfuzz.sqlast import Agg, ColumnRef
+from siriusfuzz.sqlast import Agg, ColumnRef, Join, TableRef
 
 
 class LargeDataTests(unittest.TestCase):
@@ -82,6 +82,31 @@ class LargeDataTests(unittest.TestCase):
             ):
                 self.assertIn('"k" < CAST(1000 AS BIGINT)', select.sql())
         self.assertTrue(saw_fact)
+
+    def test_second_fact_never_joins_through_dimension(self):
+        cfg, ds = self._dataset()
+        gen = QueryGenerator(cfg, ds, random.Random(244))
+
+        def tables(node):
+            if isinstance(node, TableRef):
+                return [node.table]
+            if isinstance(node, Join):
+                if node.join_type in ("semi", "anti"):
+                    return tables(node.left)
+                return tables(node.left) + tables(node.right)
+            return []
+
+        for _ in range(500):
+            tree, _ = gen._gen_from(0, None, {}, None, "full")
+            while isinstance(tree, Join):
+                left = tables(tree.left)
+                right = tables(tree.right)
+                if any(name.startswith("f") for name in right):
+                    self.assertFalse(
+                        any(name.startswith("f") for name in left)
+                        and any(name.startswith("t") for name in left)
+                    )
+                tree = tree.left
 
 
 if __name__ == "__main__":
