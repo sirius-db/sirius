@@ -789,6 +789,8 @@ TEST_CASE_METHOD(DistinctFixture,
   run_ok(
     "CREATE TABLE avg_bigint AS SELECT * FROM (VALUES (1, 9007199254740991::BIGINT), (1, 1), "
     "(1, 1), (2, 3002399751580331)) t(g, v)");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu_approx("SELECT g, AVG(v) a FROM avg_bigint GROUP BY g", {1});
   expect_plan_fallback_matches_cpu(
     "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(v) a FROM avg_bigint GROUP BY g)");
   // The tuple is a STRUCT, so the guard must look at its fields.
