@@ -191,6 +191,45 @@ class contract_ingestible : public sirius::op::scan::gpu_ingestible {
   contract_table_info info;
 };
 }  // namespace
+TEST_CASE("Reusable slots reserve extra HOST backing only for discovered files",
+          "[scan_preparation][ledger]")
+{
+  auto provider         = std::make_shared<test_reservation_provider>();
+  provider->grant_bytes = 64;
+  preparation_ledger ledger(provider);
+  std::array<scan_envelope, 3> scans{{
+    {{{{8}, 16}}, {}, true, 1, 11},
+    {{{{8}, 16}}, {}, true, 1, 12},
+    {{{{8}, 8}}, {}, true},
+  }};
+  auto decision = ledger.admit(scans, host, 6);
+  REQUIRE(decision.deferred);
+  CHECK(decision.n_permits == 3);
+  CHECK(decision.c_requested == 64);
+  CHECK(decision.sigma_retained == 40);
+  CHECK(ledger.reusable_slot_limit(11) == 3);
+  CHECK(ledger.reusable_slot_limit(12) == 2);
+  CHECK(provider->seen->requests == 1);
+
+  // A short optional grant cannot spend another scan's guaranteed workspace.
+  provider->grant_bytes = GENERATE(23u, 24u);
+  auto extra            = ledger.try_reserve_reusable_slot(11, 1);
+  CHECK(bool(extra) == (provider->grant_bytes == 24));
+  CHECK(ledger.try_reserve_reusable_slot(11, 1) == extra);
+  CHECK(provider->seen->requests == 2);
+  CHECK_THROWS_AS(ledger.try_reserve_reusable_slot(12, 2), std::invalid_argument);
+  auto progress = ledger.try_acquire_unit({12, 0}, 16);
+  REQUIRE(progress);
+  if (extra) {
+    auto permit = extra->try_acquire_unit({11, 1}, 16);
+    REQUIRE(permit);
+    CHECK_FALSE(extra->try_acquire_unit({11, 2}, 0));
+  }
+  ledger.close();
+  CHECK_FALSE(ledger.try_reserve_reusable_slot(11, 2));
+  if (extra) CHECK_THROWS_AS(extra->try_acquire_unit({11, 2}, 0), std::logic_error);
+}
+
 TEST_CASE("Admission uses the one actual grant and releases all unsuccessful grants",
           "[scan_preparation][ledger]")
 {
@@ -802,10 +841,10 @@ TEST_CASE("Retained reallocation accounts for the simultaneous old and new buffe
 TEST_CASE("Statement resource requests share backing and roll back failed preparation",
           "[scan_preparation][ledger]")
 {
-  auto failure = GENERATE(0, 1, 2);  // success, prepare failure, bind failure
-  test_reservation_provider provider;
-  provider.grant_bytes = 128;
-  provider.quantum     = 8;
+  auto failure          = GENERATE(0, 1, 2);  // success, prepare failure, bind failure
+  auto provider         = std::make_shared<test_reservation_provider>();
+  provider->grant_bytes = 128;
+  provider->quantum     = 8;
   std::array<charged_block, 2> descriptors;
   std::array<std::shared_ptr<preparation_admission>, 2> admissions;
   std::array<uint64_t, 2> retained{7, 17};
@@ -837,15 +876,15 @@ TEST_CASE("Statement resource requests share backing and roll back failed prepar
     REQUIRE_THROWS_WITH(prepare_statement_resources(provider, requests, host),
                         failure == 1 ? "prepare failed" : "bind failed");
     CHECK(rollbacks == 2);
-    CHECK(provider.outstanding() == 0);
-    CHECK(provider.seen->allocated_bytes == 0);
+    CHECK(provider->outstanding() == 0);
+    CHECK(provider->seen->allocated_bytes == 0);
   } else {
     auto decision = prepare_statement_resources(provider, requests, host);
     REQUIRE(decision.deferred);
     CHECK(decision.sigma_retained == 32);
     CHECK(decision.w == 24);
     CHECK(decision.c_requested == 56);
-    CHECK(provider.seen->requests == 1);
+    CHECK(provider->seen->requests == 1);
     REQUIRE(admissions[0] == admissions[1]);
     auto ledger = admissions[0]->consume();
     auto first  = ledger->acquire_permit({1, 1});
@@ -856,11 +895,11 @@ TEST_CASE("Statement resource requests share backing and roll back failed prepar
     REQUIRE(second);
     second.release();
     ledger.reset();
-    CHECK(provider.outstanding() == 1);
+    CHECK(provider->outstanding() == 1);
     descriptors[0].release();
-    CHECK(provider.seen->allocated_bytes == 24);
+    CHECK(provider->seen->allocated_bytes == 24);
     descriptors[1].release();
-    CHECK(provider.outstanding() == 0);
+    CHECK(provider->outstanding() == 0);
   }
 }
 

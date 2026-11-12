@@ -18,6 +18,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "op/scan/puffin_io.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "sirius/exception.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -174,18 +175,9 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   try {
     std::unique_ptr<puffin_byte_source> source;
     try {
-      auto io_ctx = resolve(dv->file_path);
-      if (!io_ctx)
-        throw std::runtime_error("[iceberg_gpu_ingestible] no ioctx for Puffin file: " +
-                                 dv->file_path);
-      auto datasource =
-        sirius::io::open_datasource(io_ctx, dv->file_path, cucascade::io::open_hint::generic);
-      if (!datasource)
-        throw std::runtime_error("[iceberg_gpu_ingestible] no datasource for Puffin file: " +
-                                 dv->file_path);
-      source = make_puffin_byte_source(std::move(datasource));
-      if (stop.stop_requested())
-        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      source =
+        open_puffin_source(dv->file_path, resolve, scan_manager::preparation_stop_token(stop))
+          .source;
     } catch (sirius::transparent::classified_execution_error const&) {
       throw;
     } catch (duckdb::InterruptException const&) {

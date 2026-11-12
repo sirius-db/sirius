@@ -129,7 +129,7 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
       {"", 50, 50, 2000, 10},
       {"      preparation: {}\n", 50, 50, 2000, 10},
       {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 50, 50, 2000, 10},
-      {"      preparation:\n        max_inflight_dv_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_permits: 0\n", 50, 50, 2000, 10},
       {"      preparation:\n        interrupt_check_interval: 3\n", 50, 50, 2000, 3},
       {"      preparation:\n        interrupt_check_interval: 1s\n", 50, 50, 2000, 1000},
       {"      preparation:\n        partial_batch: {}\n", 50, 50, 2000, 10},
@@ -168,7 +168,7 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{interrupt_ms});
   CHECK(options.max_inflight_metadata_jobs ==
         (body.find("max_inflight_metadata_jobs: 0") != std::string::npos ? 0 : 4096));
-  CHECK(options.max_inflight_dv_jobs == 0);
+  CHECK(options.max_permits == 0);
 }
 
 TEST_CASE("Preparation timing YAML rejects invalid values and unknown keys",
@@ -217,7 +217,7 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
 {
   auto selected = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
   std::array keys{"max_inflight_metadata_jobs",
-                  "max_inflight_dv_jobs",
+                  "max_permits",
                   "lookahead_batches",
                   "max_control_work",
                   "drain_quantum",
@@ -243,7 +243,7 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
   REQUIRE(config.thread_pool.num_threads == workers);
   auto options = config.preparation.resolve(config.thread_pool.num_threads);
   std::array actual{options.max_inflight_metadata_jobs,
-                    options.max_inflight_dv_jobs,
+                    options.max_permits,
                     options.lookahead_batches,
                     options.max_control_work,
                     options.drain_quantum,
@@ -265,6 +265,7 @@ TEST_CASE("Preparation limit YAML rejects invalid values",
           "[scan_manager][config][preparation_config]")
 {
   auto key   = GENERATE("max_inflight_metadata_jobs",
+                      "max_permits",
                       "max_inflight_dv_jobs",
                       "lookahead_batches",
                       "max_control_work",
@@ -274,7 +275,7 @@ TEST_CASE("Preparation limit YAML rejects invalid values",
                       "coordinator_workers");
   auto value = GENERATE("0", "-1", "1.5", "many", "[]", "18446744073709551616");
   if ((std::string_view(key) == "max_inflight_metadata_jobs" ||
-       std::string_view(key) == "max_inflight_dv_jobs" ||
+       std::string_view(key) == "max_permits" || std::string_view(key) == "max_inflight_dv_jobs" ||
        std::string_view(key) == "coordinator_workers") &&
       std::string_view(value) == "0")
     return;
@@ -282,6 +283,35 @@ TEST_CASE("Preparation limit YAML rejects invalid values",
   scoped_yaml yaml(
     "sirius_preparation_limit_invalid.yaml",
     scan_manager_yaml(std::string("      preparation:\n        ") + key + ": " + value + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
+TEST_CASE("Preparation accepts the deprecated permit limit",
+          "[scan_manager][config][preparation_config]")
+{
+  auto value            = GENERATE(0, 3);
+  auto also_set_new_key = GENERATE(false, true);
+  auto fields = "      preparation:\n        max_inflight_dv_jobs: " + std::to_string(value) + "\n";
+  if (also_set_new_key) fields += "        max_permits: " + std::to_string(value) + "\n";
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+  scoped_yaml yaml("sirius_legacy_permits.yaml", scan_manager_yaml(fields));
+  auto config = sirius::parsed_sirius_config::from_file(yaml.path());
+  CHECK(config.get_scan_manager_config().preparation.max_permits == value);
+  auto records = logs.records();
+  CHECK(std::count_if(records.begin(), records.end(), [](auto const& record) {
+          return record.level == sirius::log::level::warn &&
+                 record.message.find("max_inflight_dv_jobs is deprecated") != std::string::npos;
+        }) == 1);
+}
+
+TEST_CASE("Preparation rejects conflicting permit limits",
+          "[scan_manager][config][preparation_config]")
+{
+  scoped_yaml yaml(
+    "sirius_conflicting_permits.yaml",
+    scan_manager_yaml(
+      "      preparation:\n        max_permits: 2\n        max_inflight_dv_jobs: 1\n"));
   CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
                   sirius::configuration_input_error);
 }

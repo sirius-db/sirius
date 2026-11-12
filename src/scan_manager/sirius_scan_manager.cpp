@@ -2335,7 +2335,6 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
                            ? _s3_configs.resolve(canonical_path)
                            : std::optional<sirius::io::scoped_object_store_configs::snapshot>{};
   auto const config_id = snapshot ? snapshot->id : 0;
-  auto const cache_key = routed_ioctx_key{type, config_id};
   // The local default `_io_ctx` already serves uring/kvikio; only an off-default
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
   if (_io_ctx && _io_ctx->type() == type && !snapshot) { return _io_ctx; }
@@ -2352,17 +2351,23 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // mutex serializes builders instead, so two first-touches of the same type
   // never construct twice (a losing ioctx would need drain/stop teardown).
   std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
-  if (uses_object_store_config && !canonical_path.empty()) {
-    auto latest          = _s3_configs.resolve(canonical_path);
-    auto const latest_id = latest ? latest->id : 0;
-    if (latest_id != config_id) {
-      build_lk.unlock();
-      return ioctx_for_type(type, canonical_path);
-    }
-  }
+  return ioctx_for_type_locked(type, canonical_path);
+}
+
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type_locked(
+  cucascade::io::io_context_type type, std::string_view path)
+{
+  auto const snapshot  = (type == cucascade::io::io_context_type::restful ||
+                         type == cucascade::io::io_context_type::kvikio) &&
+                            !path.empty()
+                           ? _s3_configs.resolve(path)
+                           : std::optional<io::scoped_object_store_configs::snapshot>{};
+  auto const config_id = snapshot ? snapshot->id : 0;
+  auto const cache_key = routed_ioctx_key{type, config_id};
+  if (_io_ctx && _io_ctx->type() == type && !snapshot) return _io_ctx;
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
       return it->second;
     }
   }
@@ -2387,8 +2392,7 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   io_ctx->start();
   init_cache_for(*io_ctx);
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] =
-    _routed_io_ctxs.emplace(routed_ioctx_key{type, config_id}, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
   return it->second;
 }
 
@@ -2484,7 +2488,29 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
   auto scope = normalize_path(std::string(path));
   std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
   std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
-  auto superseded_id = _s3_configs.install(scope, std::move(config));
+  install_s3_config_locked(scope, std::move(config), retired);
+}
+
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::capture_s3_context(
+  std::string_view path, cucascade::io::object_store_config config)
+{
+  auto scope = normalize_path(std::string(path));
+  auto type  = _ioctx_registry.lookup_path(scope);
+  if (!type || (*type != cucascade::io::io_context_type::restful &&
+                *type != cucascade::io::io_context_type::kvikio))
+    throw std::invalid_argument("S3 access scope requires an object-store backend");
+  std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
+  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  install_s3_config_locked(scope, std::move(config), retired);
+  return ioctx_for_type_locked(*type, scope);
+}
+
+void sirius_scan_manager::install_s3_config_locked(
+  std::string_view path,
+  cucascade::io::object_store_config config,
+  std::vector<std::shared_ptr<cucascade::io::ioctx>>& retired)
+{
+  auto superseded_id = _s3_configs.install(path, std::move(config));
   if (!superseded_id) { return; }
   std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
   for (auto const type :

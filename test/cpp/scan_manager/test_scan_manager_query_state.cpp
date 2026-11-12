@@ -1226,23 +1226,23 @@ TEST_CASE("independent providers compose admission and release partial preparati
           "[scan_manager][query_state][preparation_lifecycle]")
 {
   manager_fixture f;
-  sm::test::test_reservation_provider provider;
-  auto first           = std::make_shared<admitted_source>();
-  auto second          = std::make_shared<admitted_source>();
-  provider.grant_bytes = 128;
+  auto provider         = std::make_shared<sm::test::test_reservation_provider>();
+  auto first            = std::make_shared<admitted_source>();
+  auto second           = std::make_shared<admitted_source>();
+  provider->grant_bytes = 128;
   std::array requests{first->request(), second->request()};
   auto decision = sm::prepare_statement_resources(
     provider, requests, sm::memory_space_id{cucascade::memory::Tier::HOST, 0});
   REQUIRE(decision.deferred);
   CHECK(decision.sigma_retained == 40);
   CHECK(decision.c_requested == 72);
-  CHECK(provider.seen->requests == 1);
+  CHECK(provider->seen->requests == 1);
   bool mismatch = false;
   SECTION("shared admission") {}
   SECTION("second installation fails") { second->fail_install = true; }
   SECTION("foreign statement admission is refused")
   {
-    second->admission = make_test_admission(provider);
+    second->admission = make_test_admission(*provider);
     mismatch          = true;
   }
   auto const id = sirius::make_query_id(606);
@@ -1267,7 +1267,7 @@ TEST_CASE("independent providers compose admission and release partial preparati
   CHECK(first->installed.expired());
   CHECK(second->installed.expired());
   CHECK_THROWS_AS(first->admission->consume(), std::logic_error);
-  CHECK(provider.outstanding() == (mismatch ? 1 : 0));
+  CHECK(provider->outstanding() == (mismatch ? 1 : 0));
 }
 
 TEST_CASE("engine retires non-Iceberg preparation before releasing an unstarted plan",

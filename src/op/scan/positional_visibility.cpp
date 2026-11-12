@@ -33,11 +33,13 @@
 
 namespace sirius::op::scan {
 
-std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::table> tbl,
-                                                         std::span<batch_row_run const> layout,
-                                                         position_lookup const& positions_for,
-                                                         ::cuda::stream_ref stream,
-                                                         rmm::device_async_resource_ref mr)
+namespace {
+template <typename Lookup>
+std::unique_ptr<cudf::table> apply_visibility(std::unique_ptr<cudf::table> tbl,
+                                              std::span<batch_row_run const> layout,
+                                              Lookup const& positions_for,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
 {
   int64_t offset = 0;
   for (auto const& run : layout) {
@@ -49,23 +51,19 @@ std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::t
   }
   if (offset != tbl->num_rows()) throw std::invalid_argument("incomplete visibility row layout");
   auto const num_rows = static_cast<int64_t>(tbl->num_rows());
-  if (num_rows == 0 || !std::any_of(layout.begin(), layout.end(), [&](auto const& run) {
-        return !positions_for(run.data_file_path).empty();
-      })) {
-    return tbl;
-  }
+  if (num_rows == 0) return tbl;
 
-  // Host keep-mask over the whole batch. Delete positions are sorted per file, so each run's
-  // in-range window is two binary searches: O(deletes in range), not O(deletes in table).
-  std::vector<uint8_t> keep(static_cast<size_t>(num_rows), 1u);
-  bool any_deleted = false;
-
+  // Allocate a dense mask only if this batch intersects a deletion. A sparse
+  // file can have many batches entirely outside its deleted row ranges.
+  std::vector<uint8_t> keep;
   for (auto const& run : layout) {
-    auto const delete_positions = positions_for(run.data_file_path);
+    auto const delete_positions = positions_for(run);
     if (delete_positions.empty()) { continue; }
     auto const run_end = run.file_row_offset + run.num_rows;
     auto lo =
       std::lower_bound(delete_positions.begin(), delete_positions.end(), run.file_row_offset);
+    if (lo == delete_positions.end() || *lo >= run_end) continue;
+    if (keep.empty()) keep.assign(static_cast<size_t>(num_rows), 1u);
     auto hi = std::lower_bound(lo, delete_positions.end(), run_end);
 
     for (auto pos = lo; pos != hi; ++pos) {
@@ -79,11 +77,10 @@ std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::t
                                 "describe the decoded table");
       }
       keep[static_cast<size_t>(batch_row)] = 0u;
-      any_deleted                          = true;
     }
   }
 
-  if (!any_deleted) { return tbl; }
+  if (keep.empty()) { return tbl; }
 
   auto bool_col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::BOOL8},
                                                 static_cast<cudf::size_type>(num_rows),
@@ -100,6 +97,32 @@ std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::t
   stream.sync();
 
   return sirius::apply_retention_mask(tbl->view(), bool_col->view(), stream, mr);
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::table> tbl,
+                                                         std::span<batch_row_run const> layout,
+                                                         position_lookup const& positions_for,
+                                                         ::cuda::stream_ref stream,
+                                                         rmm::device_async_resource_ref mr)
+{
+  return apply_visibility(
+    std::move(tbl),
+    layout,
+    [&](auto const& run) { return positions_for(run.data_file_path); },
+    stream,
+    mr);
+}
+
+std::unique_ptr<cudf::table> apply_run_positional_visibility(
+  std::unique_ptr<cudf::table> tbl,
+  std::span<batch_row_run const> layout,
+  run_position_lookup const& positions_for,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  return apply_visibility(std::move(tbl), layout, positions_for, stream, mr);
 }
 
 void apply_positional_visibility(materialized_batch& batch,

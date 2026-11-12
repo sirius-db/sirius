@@ -83,6 +83,13 @@ uint64_t unit_envelope::temporary_charge(uint64_t quantum) const
     total = add(total, round(bytes, quantum));
   return total;
 }
+uint64_t unit_envelope::retained_charge(uint64_t quantum) const
+{
+  auto total = round(retained, quantum);
+  for (auto bytes : additional_retained_blocks)
+    total = add(total, round(bytes, quantum));
+  return total;
+}
 uint64_t host_reservation_provider::allocation_granularity(memory_space_id space) const
 {
   if (space.tier != cucascade::memory::Tier::HOST)
@@ -119,6 +126,14 @@ struct ledger_state {
   bool closed = false;
   preparation_wakeup wake;
   std::map<unit_key, unit_account> units;
+  struct reusable_scan {
+    unit_envelope envelope;
+    uint32_t limit;
+    std::map<size_t, std::shared_ptr<preparation_ledger>> extra;
+  };
+  memory_space_id space{cucascade::memory::Tier::HOST, 0};
+  std::mutex slots_mutex;  // Optional grants never hold the allocation or coordinator mutex.
+  std::map<op::scan::scan_contract_id, reusable_scan> reusable;
   // Caller holds mutex. No accounting changes until insertion succeeds.
   unit_account& register_unit(unit_key key, uint64_t limit)
   {
@@ -204,8 +219,14 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
     d.allocation_granularity = quantum;
     uint64_t units = 0, minimum_permits = 0;
     bool releasing_units = false;
+    std::vector<scan_envelope const*> reusable;
     for (auto const& scan : scans) {
       if (!scan.qualified) return d;
+      if (scan.reusable_slot_contract) {
+        if (scan.units.size() != 1 || scan.minimum_permits != 1)
+          throw std::invalid_argument("reusable preparation needs one progress unit per scan");
+        reusable.push_back(&scan);
+      }
       minimum_permits = add(minimum_permits, scan.minimum_permits);
       if (!scan.minimum_permits && !scan.units.empty()) releasing_units = true;
       for (auto bytes : scan.retained)
@@ -213,7 +234,7 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
       for (auto const& unit : scan.units) {
         auto unit_w      = unit.temporary_charge(quantum);
         units            = add(units, 1);
-        d.sigma_retained = add(d.sigma_retained, round(unit.retained, quantum));
+        d.sigma_retained = add(d.sigma_retained, unit.retained_charge(quantum));
         d.w              = std::max(d.w, unit_w);
       }
     }
@@ -224,14 +245,19 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
       d.reason = admission_reason::capacity;
       return d;
     }
-    minimum_permits = std::max<uint64_t>(1, minimum_permits);
-    if (d.w > (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / minimum_permits)
+    minimum_permits = std::min(units, std::max<uint64_t>(1, minimum_permits));
+    if (d.w && minimum_permits > (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / d.w)
       throw std::overflow_error("preparation minimum progress envelope overflow");
     auto minimum = d.sigma_retained + minimum_permits * d.w;
+    // Finite units are already known. Each lazy scan has exactly one known
+    // progress unit here, irrespective of the number of available workers.
     auto permits = std::min<uint64_t>(units, max_permits);
     if (d.w)
-      permits = std::min(permits, (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / d.w);
-    state_ = std::make_shared<ledger_state>();
+      permits = minimum_permits +
+                std::min<uint64_t>(permits - minimum_permits,
+                                   (std::numeric_limits<uint64_t>::max() - minimum) / d.w);
+    state_        = std::make_shared<ledger_state>();
+    state_->space = space;
     for (;;) {
       d.c_requested = d.sigma_retained + permits * d.w;
       d.c_obtained  = 0;
@@ -270,6 +296,23 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
       // Bound admission work even with a very large configured worker count.
       permits = std::max<uint64_t>(minimum_permits, permits / 2);
     }
+    if (!reusable.empty()) {
+      // Divide only the remaining count, without reserving HOST memory for
+      // hypothetical files. Each additional slot needs its own physical grant.
+      const uint32_t spare = slot_provider_ ? max_permits - d.n_permits : 0;
+      for (size_t i = 0; i < reusable.size(); ++i) {
+        auto const& scan = *reusable[i];
+        auto limit =
+          static_cast<uint32_t>(1 + spare / reusable.size() + (i < spare % reusable.size()));
+        if (!state_->reusable
+               .emplace(*scan.reusable_slot_contract,
+                        ledger_state::reusable_scan{scan.units.front(), limit, {}})
+               .second)
+          throw std::invalid_argument("duplicate reusable scan contract");
+      }
+    } else {
+      slot_provider_.reset();
+    }
     state_->retained_limit = d.sigma_retained;
     state_->w              = d.w;
     state_->permits        = d.n_permits;
@@ -285,6 +328,37 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
     state_.reset();
     d.reason = admission_reason::no_grant;
     return d;
+  }
+}
+uint32_t preparation_ledger::reusable_slot_limit(op::scan::scan_contract_id contract) const
+{
+  if (!state_) throw std::logic_error("preparation is not admitted");
+  auto it = state_->reusable.find(contract);
+  return it == state_->reusable.end() ? 1 : it->second.limit;
+}
+std::shared_ptr<preparation_ledger> preparation_ledger::try_reserve_reusable_slot(
+  op::scan::scan_contract_id contract, size_t slot)
+{
+  if (!slot || slot >= reusable_slot_limit(contract))
+    throw std::invalid_argument("reusable slot outside its statement allowance");
+  std::lock_guard guard(state_->slots_mutex);
+  {
+    std::lock_guard lock(state_->mutex);
+    if (state_->closed) return {};
+  }
+  auto& scan = state_->reusable.at(contract);
+  try {
+    auto [it, fresh] = scan.extra.try_emplace(slot);
+    if (fresh) {
+      // Both temporary and retained allocations use the backing that funded this slot.
+      auto extra = std::make_shared<preparation_ledger>(*slot_provider_);
+      scan_envelope request{{scan.envelope}, {}, true, 1};
+      if (extra->admit(std::span(&request, 1), state_->space).deferred)
+        it->second = std::move(extra);
+    }
+    return it->second;
+  } catch (std::bad_alloc const&) {
+    return {};  // The original progress slot is still usable.
   }
 }
 void preparation_ledger::register_unit(unit_key key, uint64_t retained_limit)
@@ -476,12 +550,19 @@ uint64_t preparation_ledger::allocation_failures() const
 }
 void preparation_ledger::close() noexcept
 {
-  if (state_) {
+  if (!state_) return;
+  std::lock_guard guard(state_->slots_mutex);
+  {
     std::lock_guard lock(state_->mutex);
     state_->closed = true;
   }
+  for (auto& [contract, scan] : state_->reusable) {
+    for (auto& [slot, extra] : scan.extra)
+      if (extra) extra->close();
+    scan.extra.clear();
+  }
 }
-admission_decision prepare_statement_resources(reservation_provider& provider,
+admission_decision prepare_statement_resources(std::shared_ptr<reservation_provider> provider,
                                                std::span<preparation_request> requests,
                                                memory_space_id space,
                                                uint32_t max_permits,
@@ -495,7 +576,7 @@ admission_decision prepare_statement_resources(reservation_provider& provider,
       throw std::invalid_argument("incomplete preparation resource request");
     envelopes.push_back(request.envelope);
   }
-  auto ledger   = std::make_unique<preparation_ledger>(provider);
+  auto ledger   = std::make_unique<preparation_ledger>(std::move(provider));
   auto decision = ledger->admit(envelopes, space, max_permits);
   if (!decision.deferred) return decision;
   try {

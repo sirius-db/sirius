@@ -75,7 +75,9 @@ struct delete_fixture {
             std::function<void(duckdb::DataChunk&)> const& consume)
   {
     read_parquet_delete_batches(
-      *connection.context, duckdb::OpenFileInfo(path), options, bind, [&] { return consume; });
+      *connection.context, duckdb::OpenFileInfo(path), options, bind, [&](bool) {
+        return [&](uint64_t, duckdb::DataChunk& chunk) { consume(chunk); };
+      });
   }
 };
 struct worker_rendezvous {
@@ -102,9 +104,14 @@ TEST_CASE("Parquet deletes project reordered columns across row groups", "[parqu
 {
   delete_fixture f;
   REQUIRE_FALSE(f.connection.Query("SET threads=1")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET async_threads=2")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET read_ahead_depth=2")->HasError());
+  REQUIRE_FALSE(f.connection.Query("SET disable_parquet_prefetching=false")->HasError());
   f.write(10000);
   uint64_t count = 0, batches = 0;
-  f.read(
+  read_parquet_delete_batches(
+    *f.connection.context,
+    duckdb::OpenFileInfo(f.path),
     {},
     [](auto const& columns, uint64_t rows) {
       REQUIRE(rows == 10000);
@@ -112,15 +119,19 @@ TEST_CASE("Parquet deletes project reordered columns across row groups", "[parqu
       REQUIRE(columns[0].type == duckdb::LogicalType::BIGINT);
       return std::vector<uint64_t>{1, 0, 2};
     },
-    [&](duckdb::DataChunk& chunk) {
-      ++batches;
-      REQUIRE(chunk.ColumnCount() == 3);
-      for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
-        REQUIRE(chunk.GetValue(0, i).GetValue<std::string>() == "data.parquet");
-        REQUIRE(chunk.GetValue(1, i).GetValue<int64_t>() == int64_t(count));
-        REQUIRE(chunk.GetValue(2, i).GetValue<int64_t>() == int64_t(count % 3));
-        ++count;
-      }
+    [&](bool ordered) {
+      REQUIRE(ordered);
+      return [&](uint64_t offset, duckdb::DataChunk& chunk) {
+        REQUIRE(offset == count);
+        ++batches;
+        REQUIRE(chunk.ColumnCount() == 3);
+        for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
+          REQUIRE(chunk.GetValue(0, i).GetValue<std::string>() == "data.parquet");
+          REQUIRE(chunk.GetValue(1, i).GetValue<int64_t>() == int64_t(count));
+          REQUIRE(chunk.GetValue(2, i).GetValue<int64_t>() == int64_t(count % 3));
+          ++count;
+        }
+      };
     });
   REQUIRE(count == 10000);
   REQUIRE(batches > 1);
@@ -159,15 +170,22 @@ TEST_CASE("Parquet delete workers claim each group once and propagate consumer f
   std::vector<int64_t> positions[2];
   auto scan = [&] {
     read_parquet_delete_batches(
-      *f.connection.context, duckdb::OpenFileInfo(f.path), options, position_projection, [&] {
+      *f.connection.context,
+      duckdb::OpenFileInfo(f.path),
+      options,
+      position_projection,
+      [&](bool ordered) {
+        REQUIRE_FALSE(ordered);
         auto worker = workers++;
         REQUIRE(worker < 2);
-        return [&, worker](duckdb::DataChunk& chunk) {
+        return [&, worker](uint64_t offset, duckdb::DataChunk& chunk) {
           if (fail) {
             ++consumed;
             throw std::runtime_error("consumer failed");
           }
           if (positions[worker].empty()) consumers.wait_for_peer();
+          if (chunk.GetValue(0, 0).GetValue<uint64_t>() != offset)
+            throw std::runtime_error("incorrect physical batch offset");
           for (duckdb::idx_t i = 0; i < chunk.size(); ++i)
             positions[worker].push_back(chunk.GetValue(0, i).GetValue<int64_t>());
         };
@@ -190,11 +208,10 @@ TEST_CASE("Parquet delete workers claim each group once and propagate consumer f
   states.Remove("delete_task_exit");
 }
 
-TEST_CASE("Parquet deletes reserve footer rows across workers before consuming",
+TEST_CASE("Parquet deletes reject inconsistent footer row counts before creating consumers",
           "[parquet_delete_reader]")
 {
   delete_fixture f;
-  REQUIRE_FALSE(f.connection.Query("SET threads=2")->HasError());
   REQUIRE_FALSE(f.connection.Query("SET parquet_metadata_cache=true")->HasError());
   f.write(4096);
   duckdb::OpenFileInfo file(f.path);
@@ -206,14 +223,17 @@ TEST_CASE("Parquet deletes reserve footer rows across workers before consuming",
   auto metadata      = duckdb::make_uniq<duckdb_parquet::FileMetaData>(*cached->metadata);
   metadata->num_rows = 2048;
   cached->metadata   = std::move(metadata);
-  worker_rendezvous rendezvous;
-  parquet_delete_read_options options;
-  options.after_decode_for_testing = [&] { rendezvous.wait_for_peer(); };
-  std::atomic<uint64_t> consumed{0};
-  REQUIRE_THROWS_WITH(
-    f.read(options, position_projection, [&](auto& chunk) { consumed += chunk.size(); }),
-    Catch::Matchers::ContainsSubstring("exceed footer count"));
-  REQUIRE(consumed <= 2048);
+  size_t factories   = 0;
+  REQUIRE_THROWS_WITH(read_parquet_delete_batches(context,
+                                                  file,
+                                                  {},
+                                                  position_projection,
+                                                  [&](bool) {
+                                                    ++factories;
+                                                    return [](uint64_t, duckdb::DataChunk&) {};
+                                                  }),
+                      Catch::Matchers::ContainsSubstring("exceed footer count"));
+  CHECK(factories == 0);
 }
 
 TEST_CASE("Parquet deletes drain workers before choosing the original error",
@@ -533,13 +553,18 @@ TEST_CASE("Remote Parquet deletes reject replacement and release handles on fail
     remote.last_modified = duckdb::timestamp_t(1000000);
     auto offset          = remote.bytes.size() - 8;
     parquet_delete_read_options options;
-    options.expected_footer_size =
-      duckdb::Load<uint32_t>(duckdb::const_data_ptr_cast(remote.bytes.data() + offset));
+    bool bound = GENERATE(true, false);
+    if (bound) {
+      options.expected_footer_size =
+        duckdb::Load<uint32_t>(duckdb::const_data_ptr_cast(remote.bytes.data() + offset));
+    } else {
+      options.verify_unbound_trailer = true;
+    }
     f.read(options, position_projection, [](auto&) {});
 
     // Replace the trailer while retaining the size and modification time.
     ++remote.generation;
-    remote.bytes[offset] ^= 1;
+    remote.bytes.back() ^= 1;
     REQUIRE_THROWS_WITH(f.read(options, position_projection, [](auto&) {}),
                         Catch::Matchers::ContainsSubstring("footer differs from binding"));
   }

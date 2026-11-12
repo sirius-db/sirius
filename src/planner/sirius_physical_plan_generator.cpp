@@ -48,6 +48,7 @@
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/puffin_io.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -189,9 +190,8 @@ void install_parquet_s3_configs(sirius::op::scan::parquet_ingestible_table_info 
   if (sirius_ctx == nullptr) { return; }
   auto const& defaults = sirius_ctx->get_config().get_scan_manager_config().object_store;
   for (auto const& path : table_info.resolved_file_paths) {
-    if (!sirius::io::s3::is_s3_path(path)) { continue; }
-    auto config = sirius::io::s3::resolve_duckdb_s3_secret(context, path, defaults);
-    sirius_ctx->get_scan_manager().install_s3_config(path, std::move(config));
+    sirius::io::s3::install_duckdb_s3_config(
+      context, sirius_ctx->get_scan_manager(), path, defaults);
   }
 }
 
@@ -530,29 +530,15 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   struct remote_puffin {
     scan_contract_id contract;
     std::string path;
-    std::string scheme;
     bool backend_available;
   };
   std::vector<remote_puffin> remote_puffins;
   auto const& scan_manager   = sirius_ctx->get_scan_manager();
   auto inspect_remote_puffin = [&](scan_contract_id contract, auto const& dv) {
-    bool remote = false;
-    std::string scheme;
-    try {
-      auto const parsed = cucascade::io::parse(dv.file_path);
-      scheme            = parsed.scheme;
-      remote            = parsed.scheme != "file";
-    } catch (std::invalid_argument const&) {
-      // Preserve the legacy handling for bare local paths. A malformed URI
-      // is remote only when it has an explicit scheme marker.
-      remote = dv.file_path.find("://") != std::string::npos;
-    }
-    if (!remote) return;
-    auto const backend           = scan_manager.planning_io_backend(dv.file_path);
-    auto const backend_available = scheme == "s3" && backend.has_value() &&
-                                   (*backend == cucascade::io::io_context_type::restful ||
-                                    *backend == cucascade::io::io_context_type::kvikio);
-    remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
+    auto capability = inspect_puffin_io(
+      dv.file_path, [&](auto const& path) { return scan_manager.planning_io_backend(path); });
+    if (capability.remote)
+      remote_puffins.push_back({contract, dv.file_path, capability.backend_available});
   };
   std::vector<scan_dv_count> counts;
   bool qualified = true;
@@ -611,12 +597,11 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
         "' has no planning-capable remote backend",
       {{unsupported->contract, verdict_reason::iceberg_puffin_uri_unsupported}});
   }
-  host_reservation_provider provider(sirius_ctx->get_memory_manager(),
-                                     std::make_shared<decltype(sirius_ctx)>(sirius_ctx));
-  auto counters  = sirius_ctx->physical_counters();
-  auto* selected = counters->track_units && counters->preparation_provider_for_testing
-                     ? counters->preparation_provider_for_testing.get()
-                     : &provider;
+  auto counters = sirius_ctx->physical_counters();
+  auto provider = counters->track_units ? counters->preparation_provider_for_testing : nullptr;
+  if (!provider)
+    provider = std::make_shared<host_reservation_provider>(
+      sirius_ctx->get_memory_manager(), std::make_shared<decltype(sirius_ctx)>(sirius_ctx));
   if (counters->track_units && counters->preparation_envelope_for_testing) {
     for (auto& request : required_requests)
       counters->preparation_envelope_for_testing(request.envelope);
@@ -645,7 +630,7 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
       auto const& config = sirius_ctx->get_config().get_scan_manager_config();
       auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
       auto permits       = static_cast<size_t>(config.thread_pool.num_threads);
-      if (limits.max_inflight_dv_jobs) permits = std::min(permits, limits.max_inflight_dv_jobs);
+      if (limits.max_permits) permits = std::min(permits, limits.max_permits);
       participants.reserve(required_requests.size() + (dv_eligible ? requests.size() : 0));
       for (auto& request : required_requests)
         participants.push_back(std::move(request));
@@ -653,7 +638,7 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
         for (auto& request : requests)
           participants.push_back(std::move(request));
       try {
-        decision = prepare_statement_resources(*selected,
+        decision = prepare_statement_resources(std::move(provider),
                                                participants,
                                                spaces.front()->get_id(),
                                                static_cast<uint32_t>(permits),

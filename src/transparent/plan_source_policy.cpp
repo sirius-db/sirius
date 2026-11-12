@@ -16,6 +16,7 @@
 
 #include "transparent/plan_source_policy.hpp"
 
+#include "io/s3/duckdb_secret_config.hpp"
 #include "planner/connector_registry.hpp"
 #include "sirius_sql_rewrite.hpp"
 
@@ -57,7 +58,8 @@ scan_source_policy classify(duckdb::BoundTableFunction const& function,
 {
   scan_source_policy result{
     function.GetName().GetIdentifierName(), byte_source_class::unclassified, true, ""};
-  auto const* entry = planner::lookup_connector(function, bind, context);
+  auto const* entry = planner::lookup_source_policy_connector(function, bind, context);
+  if (entry && entry->source_policy) return entry->source_policy(function, bind, context);
   if (entry) {
     result.source             = entry->byte_source;
     result.permits_cpu_replay = entry->permits_cpu_replay;
@@ -78,8 +80,7 @@ scan_source_policy classify(duckdb::BoundTableFunction const& function,
     }
     for (auto const& file : files->file_list->Files()) {
       auto const& path = file.path;
-      if (path.size() > 5 && (path[0] == 's' || path[0] == 'S') && path[1] == '3' &&
-          path[2] == ':' && path[3] == '/' && path[4] == '/') {
+      if (io::s3::is_s3_path(path)) {
         result.source             = byte_source_class::sirius_owned_s3;
         result.permits_cpu_replay = false;
         result.reason             = "S3 CPU fallback is not supported";

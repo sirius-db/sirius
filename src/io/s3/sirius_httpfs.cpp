@@ -16,12 +16,14 @@
 
 #include "io/s3/sirius_httpfs.hpp"
 
+#include "io/path_utils.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -44,7 +46,16 @@ namespace sirius::io::s3 {
 
 namespace {
 
-constexpr std::string_view kScheme = "s3://";
+constexpr std::string_view kScheme  = "s3://";
+constexpr char kNativeReadContext[] = "sirius_native_read_context";
+struct native_read_context : duckdb::ClientContextState {
+  native_read_context(std::string p, std::shared_ptr<cucascade::io::ioctx> c)
+    : path(std::move(p)), context(std::move(c))
+  {
+  }
+  std::string path;
+  std::shared_ptr<cucascade::io::ioctx> context;
+};
 
 /// FileHandle backed by a cucascade::io::datasource resolved through the
 /// scan_manager's create_datasource(path) seam — the datasource carries its
@@ -68,8 +79,25 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
 
   std::shared_ptr<cucascade::io::datasource> datasource_;
   std::string version_tag_;
+  bool native_cache_bypass_ = false;
   duckdb::idx_t cursor_{0};
 };
+
+std::shared_ptr<cucascade::io::ioctx> read_access_context(duckdb::ClientContext& client,
+                                                          duckdb::SiriusContext& runtime,
+                                                          std::string const& path)
+{
+  auto pinned = client.registered_state->Get<native_read_context>(kNativeReadContext);
+  if (pinned) {
+    if (pinned->path != path)
+      throw std::invalid_argument("Native S3 read differs from its captured input");
+    return pinned->context;
+  }
+  return capture_duckdb_s3_context(client,
+                                   runtime.get_scan_manager(),
+                                   path,
+                                   runtime.get_config().get_scan_manager_config().object_store);
+}
 
 sirius_httpfs_file_handle& as_httpfs_handle(duckdb::FileHandle& handle)
 {
@@ -118,16 +146,10 @@ duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
                                 "fallback; SET gpu_execution=true");
     }
   }
-  // No S3 CPU fallback. A CPU-fallback replay active here means the GPU plan
-  // failed and we are replaying on CPU (the replay is wrapped in a
-  // CpuFallbackGuard). Refuse so s3:// data is never served to a CPU plan,
-  // even when reached indirectly through a view. Uses the narrow
-  // CpuFallbackGuard flag (not the broad is_internal_query_active), so a
-  // legitimate internal s3:// read is not blocked. The flag is per-connection
-  // (this connection's replay), so an unrelated connection's fallback does
-  // not block this one's S3 access.
+  // A retained DuckDB plan may discover S3 deletes only at execution (including
+  // EXECUTE). Apply the same per-connection veto as for an explicit CPU replay.
   auto conn_state = duckdb::get_sirius_connection_state(*client);
-  if (conn_state && conn_state->is_cpu_fallback_active()) {
+  if (conn_state && conn_state->blocks_cpu_s3_access()) {
     throw duckdb::IOException(std::string("[sirius_httpfs] ") + verb + " '" + path +
                               "' on a CPU execution path: S3 CPU fallback is not supported (S3 is "
                               "GPU-only); Sirius has no CPU fallback for S3 data sources");
@@ -219,6 +241,35 @@ bool match_glob_no_crawl(std::vector<std::string_view> const& keys,
 
 }  // namespace
 
+scoped_native_read_context::scoped_native_read_context(
+  duckdb::ClientContext& context, std::string path, std::shared_ptr<cucascade::io::ioctx> captured)
+  : context_(context)
+{
+  if (!captured || !is_s3_path(path))
+    throw std::invalid_argument("Native S3 read requires a captured access scope");
+  if (context_.registered_state->Get<native_read_context>(kNativeReadContext))
+    throw std::logic_error("Native S3 read scope is already active on this connection");
+  context_.registered_state->Insert(
+    kNativeReadContext,
+    duckdb::make_shared_ptr<native_read_context>(std::move(path), std::move(captured)));
+}
+
+scoped_native_read_context::~scoped_native_read_context()
+{
+  context_.registered_state->Remove(kNativeReadContext);
+}
+
+validated_file_identity validated_identity(duckdb::FileHandle& handle)
+{
+  auto* native = dynamic_cast<sirius_httpfs_file_handle*>(&handle);
+  if (!native || native->datasource_->io_ctx()->type() != cucascade::io::io_context_type::restful ||
+      native->datasource_->get_io_object().identity().kind !=
+        cucascade::io::identity_kind::object_tag)
+    throw cucascade::io::descriptor_mismatch_error(
+      "Native remote reader requires a Sirius REST strong validator");
+  return {native->datasource_->get_io_object().identity_cache_key(), native->datasource_->io_ctx()};
+}
+
 bool sirius_httpfs::CanHandleFile(const std::string& fpath)
 {
   if (fpath.size() <= kScheme.size()) { return false; }
@@ -253,14 +304,14 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
     throw duckdb::IOException(
       "[sirius_httpfs] client context unavailable while resolving S3 credentials");
   }
-  auto s3_config = resolve_duckdb_s3_secret(
-    *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
-  sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
+  auto context = read_access_context(*client, *sirius_ctx, path);
   // Resolve through the scan_manager's datasource factory (the routed seam):
   // the returned datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
   // DuckDB to surface at bind time.
-  auto datasource = sirius_ctx->get_scan_manager().create_datasource(path);
+  auto datasource =
+    context ? sirius::io::open_datasource(context, path, cucascade::io::open_hint::generic)
+            : nullptr;
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }
@@ -272,6 +323,25 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
   duckdb::FileOpenFlags flags,
   duckdb::optional_ptr<duckdb::FileOpener> opener)
 {
+  bool require_identity = false;
+  if (file.extended_info &&
+      file.extended_info->TryGetOption("sirius_require_strong_identity", require_identity) &&
+      require_identity) {
+    auto handle = OpenFile(file.path, flags, opener);
+    (void)validated_identity(*handle);
+    duckdb::idx_t expected_size;
+    if (file.extended_info->TryGetOption("sirius_expected_size", expected_size) &&
+        (handle->GetFileSize() < 0 ||
+         static_cast<uint64_t>(handle->GetFileSize()) != expected_size))
+      throw cucascade::io::descriptor_mismatch_error(
+        "Native remote object size differs from binding");
+    // Native caches lack the Sirius credential scope. Bypass both their byte
+    // and footer caches; ioctx caches still reuse validated, scoped bytes.
+    auto& native = as_httpfs_handle(*handle);
+    native.version_tag_.clear();
+    native.native_cache_bypass_ = true;
+    return handle;
+  }
   auto const known_size = extract_known_size(file);
   if (!known_size) { return OpenFile(file.path, flags, opener); }
   if (flags.OpenForWriting()) {
@@ -284,14 +354,13 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
     throw duckdb::IOException(
       "[sirius_httpfs] client context unavailable while resolving S3 credentials");
   }
-  auto s3_config = resolve_duckdb_s3_secret(
-    *client, file.path, sirius_ctx->get_config().get_scan_manager_config().object_store);
-  sirius_ctx->get_scan_manager().install_s3_config(file.path, std::move(s3_config));
+  auto context = read_access_context(*client, *sirius_ctx, file.path);
   // A parquet_footer_probe open: one suffix-range GET resolves the size (== the
   // LIST size that rode the glob expansion) and stashes the footer, so the
   // binder's footer reads are served locally (no HEAD, no separate footer GETs).
-  auto datasource = sirius_ctx->get_scan_manager().create_datasource(
-    file.path, cucascade::io::open_hint::parquet_footer_probe);
+  auto datasource = context ? sirius::io::open_datasource(
+                                context, file.path, cucascade::io::open_hint::parquet_footer_probe)
+                            : nullptr;
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }
@@ -340,14 +409,23 @@ int64_t sirius_httpfs::GetFileSize(duckdb::FileHandle& handle)
   return static_cast<int64_t>(as_httpfs_handle(handle).datasource_->size());
 }
 
-duckdb::timestamp_t sirius_httpfs::GetLastModifiedTime(duckdb::FileHandle& /*handle*/)
+duckdb::timestamp_t sirius_httpfs::GetLastModifiedTime(duckdb::FileHandle& handle)
 {
-  return duckdb::timestamp_t(0);
+  // Parquet's metadata cache otherwise treats equal zero timestamps as valid.
+  return as_httpfs_handle(handle).native_cache_bypass_ ? duckdb::timestamp_t::ninfinity()
+                                                       : duckdb::timestamp_t(0);
 }
 
 std::string sirius_httpfs::GetVersionTag(duckdb::FileHandle& handle)
 {
   return as_httpfs_handle(handle).version_tag_;
+}
+
+duckdb::optional<duckdb::timestamp_t> sirius_httpfs::GetCacheValidUntil(duckdb::FileHandle& handle)
+{
+  // DuckDB's explicit no-store marker also prevents publishing read blocks.
+  if (as_httpfs_handle(handle).native_cache_bypass_) return duckdb::timestamp_t::ninfinity();
+  return duckdb::nullopt;
 }
 
 duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path,

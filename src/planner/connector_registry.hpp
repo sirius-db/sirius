@@ -23,6 +23,7 @@
 
 #include <duckdb/function/table_function.hpp>
 
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -43,7 +44,14 @@ class gpu_ingestible;
 }  // namespace scan
 }  // namespace op
 }  // namespace sirius
+namespace sirius::ducklake {
+struct provider_api;
+}
+
 namespace sirius::planner {
+std::shared_ptr<const ducklake::provider_api> registered_ducklake_provider(
+  duckdb::DatabaseInstance& db);
+
 struct scan_contract_provenance;
 using scan_lowering =
   duckdb::unique_ptr<op::sirius_physical_operator> (*)(op::sirius_physical_table_scan&,
@@ -90,6 +98,12 @@ struct connector {
   std::optional<scan_manager::preparation_request> (*prepare)(op::sirius_physical_table_scan&,
                                                               operator_params const&,
                                                               duckdb::ClientContext&) = nullptr;
+  // Inspect the original bound dependency inventory for CPU replay policy.
+  // Unlike capture, this may discover metadata, but must not open external
+  // data/delete files or rebind SQL. Exceptions make policy discovery incomplete.
+  transparent::scan_source_policy (*source_policy)(duckdb::BoundTableFunction const&,
+                                                   duckdb::FunctionData const*,
+                                                   duckdb::ClientContext&) = nullptr;
 };
 
 enum class lookup_decline : uint8_t {
@@ -110,6 +124,9 @@ connector const* lookup_connector(duckdb::PhysicalTableScan const&, duckdb::Clie
 connector const* lookup_connector(duckdb::TableFunction const&,
                                   duckdb::FunctionData const*,
                                   duckdb::ClientContext&);
+connector const* lookup_source_policy_connector(duckdb::BoundTableFunction const& function,
+                                                duckdb::FunctionData const* bind,
+                                                duckdb::ClientContext& context);
 connector const* lookup_connector(duckdb::BoundTableFunction const&,
                                   duckdb::FunctionData const*,
                                   duckdb::ClientContext&);

@@ -16,6 +16,8 @@
 
 #include "planner/connector_registry.hpp"
 
+#include "ducklake/binding_bridge.hpp"
+#include "ducklake/source_registration.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
@@ -46,6 +48,7 @@
 #include <duckdb/parser/tableref/table_function_ref.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/storage/object_cache.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <parquet_extension.hpp>
@@ -357,12 +360,13 @@ connector make_sirius_stream_source_connector()
           .certify                    = nullptr};
 }
 
-std::array<connector, 6> const entries{make_seq_scan_connector(),
+std::array<connector, 7> const entries{make_seq_scan_connector(),
                                        make_parquet_scan_connector(),
                                        make_read_parquet_connector(),
                                        make_sirius_read_parquet_connector(),
                                        make_iceberg_scan_connector(),
-                                       make_sirius_stream_source_connector()};
+                                       make_sirius_stream_source_connector(),
+                                       sirius::ducklake::scan_connector()};
 
 duckdb::vector<duckdb::TableFunction> copy_functions(duckdb::TableFunctionSet const& functions)
 {
@@ -662,12 +666,54 @@ void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
   }
 }
 
+// Provider callbacks and their module belong to the database that loaded them.
+struct ducklake_reference final : duckdb::ObjectCacheEntry {
+  static constexpr char const* key = "sirius.ducklake.scan_reference";
+  static std::string ObjectType() { return key; }
+  std::string GetObjectType() override { return key; }
+  duckdb::optional_idx GetEstimatedCacheMemory() const override { return {}; }
+  std::shared_ptr<const sirius::ducklake::provider_api> module;
+  detail::connector_reference_cache reference;
+};
+
+void initialize_ducklake_callbacks(duckdb::DatabaseInstance& db,
+                                   bool in_ducklake_load_callback = false)
+{
+  if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("ducklake")) return;
+  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i].function_name != "ducklake_scan") continue;
+    auto& cache = accepted[i];
+    std::lock_guard lock(cache.mutex);
+    auto& db_cache = db.GetObjectCache();
+    if (db_cache.Get<ducklake_reference>(ducklake_reference::key)) return;
+    try {
+      auto module = sirius::ducklake::resolve_provider(db, in_ducklake_load_callback);
+      if (!module) return;
+      auto parquet = parquet_reference_functions(db, "parquet_scan");
+      if (parquet.empty()) return;
+      auto references = sirius::ducklake::trusted_scan_functions(db, parquet.front(), *module);
+      if (references.empty()) return;
+      auto lake    = duckdb::make_shared_ptr<ducklake_reference>();
+      lake->module = std::move(module);
+      lake->reference.publish(host, std::move(references));
+      db_cache.Put(ducklake_reference::key, std::move(lake));
+    } catch (std::exception const& error) {
+      SIRIUS_LOG_WARN("DuckLake scan source verification failed during extension load: {}",
+                      error.what());
+    }
+    return;
+  }
+}
+
 /// Publishes trusted Iceberg callbacks when Iceberg loads after Sirius.
 class scan_source_extension_callback final : public duckdb::ExtensionCallback {
  public:
   void OnExtensionLoaded(duckdb::DatabaseInstance& db, std::string const& name) override
   {
     if (name == "iceberg") initialize_iceberg_callbacks(db);
+    if (name == "ducklake" || name == "parquet")
+      initialize_ducklake_callbacks(db, name == "ducklake");
   }
 };
 #ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
@@ -697,6 +743,36 @@ connector const* override_for(std::vector<connector> const* overrides, std::stri
 }
 #endif
 }  // namespace
+
+std::shared_ptr<const ducklake::provider_api> registered_ducklake_provider(
+  duckdb::DatabaseInstance& db)
+{
+  auto entry = db.GetObjectCache().Get<ducklake_reference>(ducklake_reference::key);
+  return entry ? entry->module : nullptr;
+}
+
+bool verified_parquet_interface(duckdb::FunctionData const* data, duckdb::ClientContext& context)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(data);
+  auto const* wrapper =
+    bind ? dynamic_cast<duckdb::TableFunctionMultiFileWrapper const*>(bind->interface.get())
+         : nullptr;
+  if (!wrapper) return false;
+  auto& db         = duckdb::DatabaseInstance::GetDatabase(context);
+  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
+  // The host exports its registration entry point, but may hide individual Parquet
+  // factories. Resolve the nested reader through the same independent catalog used
+  // for top-level callbacks, never through the caller's mutable catalog.
+  static accepted_callbacks cache;
+  std::lock_guard lock(cache.mutex);
+  auto const& references = cache.reference.get_or_resolve(
+    host, [&] { return parquet_reference_functions(db, "parquet_scan", true); });
+  duckdb::TableFunctionMultiFileInfo candidate(wrapper->function, wrapper->settings);
+  for (auto const& reference : references) {
+    if (verified_callbacks(reference).matches_info(&candidate, 0)) return true;
+  }
+  return false;
+}
 
 std::span<connector const> registered_connectors() { return entries; }
 
@@ -731,35 +807,14 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   duckdb::DBConfig::GetConfig(db).GetCallbackManager().Register(
     duckdb::make_shared_ptr<scan_source_extension_callback>());
   initialize_iceberg_callbacks(db);
-}
-
-bool verified_parquet_interface(duckdb::FunctionData const* data, duckdb::ClientContext& context)
-{
-  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(data);
-  auto const* wrapper =
-    bind ? dynamic_cast<duckdb::TableFunctionMultiFileWrapper const*>(bind->interface.get())
-         : nullptr;
-  if (!wrapper) return false;
-  auto& db         = duckdb::DatabaseInstance::GetDatabase(context);
-  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
-  // The host exports its registration entry point, but may hide individual Parquet
-  // factories. Resolve the nested reader through the same independent catalog used
-  // for top-level callbacks, never through the caller's mutable catalog.
-  static accepted_callbacks cache;
-  std::lock_guard lock(cache.mutex);
-  auto const& references = cache.reference.get_or_resolve(
-    host, [&] { return parquet_reference_functions(db, "parquet_scan", true); });
-  duckdb::TableFunctionMultiFileInfo candidate(wrapper->function, wrapper->settings);
-  for (auto const& reference : references) {
-    if (verified_callbacks(reference).matches_info(&candidate, 0)) return true;
-  }
-  return false;
+  initialize_ducklake_callbacks(db);
 }
 
 template <class Function>
 lookup_outcome lookup_connector_classified_impl(Function const& function,
                                                 duckdb::FunctionData const* bind,
-                                                duckdb::ClientContext& context)
+                                                duckdb::ClientContext& context,
+                                                bool source_policy_only = false)
 {
   bool function_known = false;
 #ifdef SIRIUS_TEST_CONNECTOR_OVERRIDES
@@ -781,7 +836,23 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
     if (!entry.bind_data_matches(bind)) continue;
     // The catalog's destructor identifies its host without a loader lookup per scan.
     auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(context));
-    auto& cache      = accepted[i];
+    duckdb::shared_ptr<ducklake_reference> lake;
+    if (registered.function_name == "ducklake_scan") {
+      auto& db_cache = context.db->GetObjectCache();
+      lake           = db_cache.Get<ducklake_reference>(ducklake_reference::key);
+      if (!lake) {
+        // Registration can overlap FinishLoad. Retry outside the registry lock.
+        initialize_ducklake_callbacks(*context.db);
+        lake = db_cache.Get<ducklake_reference>(ducklake_reference::key);
+      }
+    }
+    // An authenticated provider binding can expose dependencies even when its
+    // scan mode changes callbacks and is ineligible for GPU lowering.
+    if (source_policy_only && entry.verify_binding && entry.source_policy) {
+      if (entry.verify_binding(function, bind, context)) return {&entry, lookup_decline::none};
+      return {nullptr, lookup_decline::bind_data_mismatch};
+    }
+    auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
     auto catalog_entry =
       duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
@@ -791,7 +862,8 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
         duckdb::OnEntryNotFound::RETURN_NULL);
     if (!catalog_entry) return {nullptr, lookup_decline::catalog_entry_missing};
     // A mutable catalog can confirm registration, but must never grant trust.
-    auto const& references = cache.reference.get_or_resolve(
+    auto& reference_cache  = lake ? lake->reference : cache.reference;
+    auto const& references = reference_cache.get_or_resolve(
       host, [&] { return reference_functions(entry.function_name, context); });
     if (references.empty()) {
       if (cache.missing_reference_reported.insert(host).second) {
@@ -837,6 +909,13 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
                                   duckdb::ClientContext& context)
 {
   return lookup_connector_classified_impl(function, bind, context).entry;
+}
+
+connector const* lookup_source_policy_connector(duckdb::BoundTableFunction const& function,
+                                                duckdb::FunctionData const* bind,
+                                                duckdb::ClientContext& context)
+{
+  return lookup_connector_classified_impl(function, bind, context, true).entry;
 }
 
 connector const* lookup_connector(duckdb::BoundTableFunction const& function,
