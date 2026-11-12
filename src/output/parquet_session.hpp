@@ -12,7 +12,7 @@
 
 namespace sirius::output {
 // No GPU or frontend dependencies. Callbacks perform encoding outside the lock.
-// The query owner must quiesce tasks before abort(), publish(), or destruction.
+// The query owner must quiesce tasks before abort(), finish(), or destruction.
 class parquet_session {
  public:
   explicit parquet_session(parquet_export_spec spec);
@@ -25,9 +25,9 @@ class parquet_session {
              std::optional<std::size_t> position,
              std::vector<std::uint64_t> const& nonempty_rows,
              write_part const& writer);
-  parquet_export_result publish(
+  parquet_export_result finish(
     write_part const& write_empty,
-    std::function<void(parquet_export_result const&)> const& before_publish = {});
+    std::function<void(parquet_export_result const&)> const& prepare_completion = {});
   void abort() noexcept;
   parquet_export_spec const& spec() const { return spec_; }
 
@@ -41,12 +41,17 @@ class parquet_session {
   };
   void start_locked();
   parquet_export_spec spec_;
-  std::filesystem::path staging_;
+  void reserve_part_locked(std::filesystem::path const& path);
+  void remove_part_locked(std::filesystem::path const& path) noexcept;
+  std::set<std::filesystem::path> owned_files_;
   std::mutex mutex_;
   std::optional<bool> positioned_;
   std::set<std::size_t> positions_;
   std::map<input_id, input_record> inputs_;
   std::atomic<std::uint64_t> next_{0};
-  bool published_ = false;
+  bool started_           = false;
+  bool created_directory_ = false;
+  bool successful_        = false;
+  bool aborted_           = false;
 };
 }  // namespace sirius::output

@@ -111,7 +111,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
         engine.execute();  // Returns only after all asynchronous plan users retire.
         if (context.IsInterrupted()) throw duckdb::InterruptException();
         duckdb::unique_ptr<duckdb::QueryResult> completion;
-        sink->publish([&](output::parquet_export_result const& result) {
+        sink->finish([&](output::parquet_export_result const& result) {
           auto collection =
             duckdb::make_uniq<duckdb::ColumnDataCollection>(context, prepared.prepared->types);
           duckdb::ColumnDataAppendState append;

@@ -1,6 +1,6 @@
 # Parquet output
 
-Sirius can export a query result to a **new local directory** of Parquet parts:
+Sirius can export a query result to a **local directory containing no files** of Parquet parts:
 
 ```sql
 COPY (
@@ -13,8 +13,10 @@ COPY (
 ```
 
 The completion result is the number of rows written, as with DuckDB's `COPY`.
-The destination must not exist, including as an empty directory or a symlink.
-Its parent must already exist. Relative local paths are resolved at planning time.
+The destination may be absent or an existing directory tree containing no files.
+Preexisting empty subdirectories are allowed and preserved. Files, symlinks, and
+nonempty directory trees are rejected. If the destination is absent, its parent
+must already exist. Relative local paths are resolved at planning time.
 Remote destinations are not supported by the GPU writer.
 
 ## Options and fallback
@@ -69,21 +71,37 @@ Filename sorting reconstructs the **encoded part sequence** for positioned resul
 A consumer must honor that sequence and the order inside each part. An ordinary
 parallel Parquet directory scan does not itself guarantee SQL row order.
 
-## Failure and publication
+## Failure and cleanup
 
-Each query creates a private staging directory beside its destination. Failed
-encoding attempts remove their provisional parts. A completed input is recorded
-only once. The query retires asynchronous work before preparing completion and
-publishing the directory with a Linux atomic, no-replacement rename. A competing
-destination causes publication to fail without replacing it. A wholly empty result
-produces one schema-only part with zero rows.
+Like DuckDB's multi-file COPY, Sirius writes parts directly into the destination.
+Files can be visible, incomplete, or missing their Parquet footer while COPY is
+running. There is no atomic publication of the entire directory; consumers should
+wait for COPY to succeed before reading it. A wholly empty result produces one
+schema-only part with zero rows.
 
-Runtime export failures and cancellation clean up private staging on normal process
-unwind and **are not replayed on the CPU**. After publication the directory is owned
-by the caller and is never removed by cleanup. Process crashes can leave private
-`.sirius-parquet-*` staging directories; there is no crash-recovery service. Atomic
-visibility is not a durability guarantee: the writer does not promise `fsync` of
-all files and directories. Publication is external to DuckDB transaction rollback.
+Every part is first reserved with exclusive creation. An existing filename causes
+an error without overwriting it. The export tracks only files it successfully
+reserved. Failed encoding attempts remove their owned parts before retrying; a
+completed input is recorded only once. Concurrent exports into the same directory
+are not a supported coordination mechanism: they can fail directory validation or
+filename reservation, but failed reservations do not grant ownership of another
+writer's file.
+
+On runtime failure or cancellation, Sirius retires asynchronous work, then attempts
+to remove all files owned by the failed export, including completed parts. It removes
+the destination directory only if this export created it and it is still empty.
+Preexisting directories and unrelated files are preserved; cleanup never recursively
+removes the destination. Cleanup is best effort and is retried during destruction.
+Runtime failures **are not replayed on the CPU**, even when fallback is enabled.
+
+`OVERWRITE`, `OVERWRITE_OR_IGNORE`, and `APPEND` remain unsupported GPU options and
+follow the existing planning-time CPU fallback policy. The GPU writer never deletes
+or replaces preexisting output. These modes are deliberately not emulated by the
+cleanup mechanism.
+
+Once COPY succeeds, cleanup preserves the output. SQL transaction rollback does not
+undo a successful export. Process crashes or cleanup failures can leave partial
+output behind; there is no crash-recovery service or `fsync` durability guarantee.
 
 ## Implementation boundary
 
@@ -95,7 +113,7 @@ existing operator/pipeline infrastructure; another frontend can supply the same
 export specification. `sirius_interface.cpp` converts only the completion metadata
 back into a DuckDB result.
 
-The export session owns filename allocation, retry accounting, and publication.
+The export session owns filename allocation, retry accounting, and owned-file cleanup.
 The cuDF adapter owns Parquet metadata and encoding. The sink uses prepared batch
 read handles and the task stream, with a conservative encoding-workspace estimate.
 
@@ -112,7 +130,7 @@ The Python runner's existing `--output` selects the benchmark root. Shell runner
 use `OUTPUT_DIR`, or an engine-specific `tpch-parquet-output` directory. Every
 query/iteration writes into a fresh `q<N>/parquet_iter<I>` directory. SQL setup and
 cleanup around a query (notably Q15) are not put inside `COPY`. Export timing covers
-the query and file production/publication, not subsequent readback or cleanup.
+query execution, file production, and completion, not subsequent readback or cleanup.
 
 GPU export benchmarks disable CPU fallback, so unsupported GPU cases fail rather
 than recording CPU work under a GPU label. Both engines receive the same explicit

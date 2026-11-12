@@ -46,12 +46,12 @@ std::size_t sirius_physical_parquet_sink::no_history_peak_memory_estimate(
 {
   return memory::saturating_mul(stats.bytes, 2);
 }
-output::parquet_export_result sirius_physical_parquet_sink::publish(
-  std::function<void(output::parquet_export_result const&)> const& before_publish)
+output::parquet_export_result sirius_physical_parquet_sink::finish(
+  std::function<void(output::parquet_export_result const&)> const& prepare_completion)
 {
-  auto result = session_.publish(
+  auto result = session_.finish(
     [&](std::size_t, auto const& path) { output::write_empty_parquet(session_.spec(), path); },
-    before_publish);
+    prepare_completion);
   try {
     SIRIUS_LOG_INFO("[parquet_export] rows={} files={} bytes={} codec={} directory={}",
                     result.rows,
