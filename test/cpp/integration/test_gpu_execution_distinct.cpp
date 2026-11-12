@@ -792,6 +792,10 @@ TEST_CASE_METHOD(DistinctFixture,
   compare_gpu_vs_cpu_approx("SELECT g, AVG(v) a FROM avg_bigint GROUP BY g", {1});
   expect_plan_fallback_matches_cpu(
     "SELECT COUNT(DISTINCT a) FROM (SELECT AVG(v) a FROM avg_bigint GROUP BY g)");
+  // The tuple is a STRUCT, so the guard must look at its fields.
+  expect_plan_fallback_matches_cpu(
+    "SELECT g // 3 p, COUNT(DISTINCT (a, 0)) FROM (SELECT g, AVG(v) a FROM avg_bigint "
+    "GROUP BY g) GROUP BY p");
   expect_plan_fallback_matches_cpu(
     "WITH averages AS MATERIALIZED (SELECT AVG(CAST(-12.802 AS DOUBLE)) a "
     "FROM avg_keys GROUP BY k) SELECT a FROM averages GROUP BY a");

@@ -156,6 +156,13 @@ bool is_floating_type(duckdb::LogicalType const& type)
   return type.id() == duckdb::LogicalTypeId::FLOAT || type.id() == duckdb::LogicalTypeId::DOUBLE;
 }
 
+// Also finds floating fields of a STRUCT key, such as COUNT(DISTINCT (a, b)).
+bool contains_floating_type(duckdb::LogicalType const& type)
+{
+  return duckdb::TypeVisitor::Contains(
+    type, [](duckdb::LogicalType const& t) { return is_floating_type(t); });
+}
+
 // SUM over floating input depends on summation order. AVG with a floating result divides in FLOAT64
 // on the GPU but in long double in DuckDB, whatever its input type.
 bool may_differ_in_low_bits(std::string const& name,
@@ -199,12 +206,12 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
       }
       if (call.IsDistinct()) {
         for (auto const& argument : call.GetChildren()) {
-          if (is_floating_type(argument->GetReturnType())) exact_key_here = true;
+          if (contains_floating_type(argument->GetReturnType())) exact_key_here = true;
         }
       }
     }
     for (auto const& group : aggregate.groups) {
-      if (is_floating_type(group->GetReturnType())) exact_key_here = true;
+      if (contains_floating_type(group->GetReturnType())) exact_key_here = true;
     }
   } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW) {
     for (auto const& expression : op.expressions) {
@@ -219,7 +226,7 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
   } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_DISTINCT) {
     auto const& distinct = op.Cast<duckdb::LogicalDistinct>();
     for (auto const& target : distinct.distinct_targets) {
-      if (is_floating_type(target->GetReturnType())) exact_key_here = true;
+      if (contains_floating_type(target->GetReturnType())) exact_key_here = true;
     }
   } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_UNION ||
              op.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
@@ -228,7 +235,7 @@ floating_aggregate_key_shape inspect_floating_aggregate_keys(duckdb::LogicalOper
     // exactly. The ALL forms of EXCEPT and INTERSECT already decline floating keys.
     if (!op.Cast<duckdb::LogicalSetOperation>().setop_all) {
       for (auto const& type : op.types) {
-        if (is_floating_type(type)) exact_key_here = true;
+        if (contains_floating_type(type)) exact_key_here = true;
       }
     }
   }
