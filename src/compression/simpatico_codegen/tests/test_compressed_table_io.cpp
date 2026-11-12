@@ -308,8 +308,10 @@ void test_keep_bitpack_word_offsets()
     auto ct2 = memory_reread("keep offsets", ct, rerr);
     expect(rerr.empty(), ("keep offsets: read error: " + rerr).c_str());
     expect(offsets_of(ct2)->size() == 0, "keep offsets: a re-read rep has offsets");
-    simpatico::keep_bitpack_word_offsets(ct2, stream, mr);
-    auto const* kept = offsets_of(ct2);
+    auto const kept_bytes = simpatico::keep_bitpack_word_offsets(ct2, stream, mr);
+    auto const* kept      = offsets_of(ct2);
+    expect(kept_bytes.size() == 1 && kept_bytes[0] == kept->size(),
+           "keep offsets: reported bytes differ from the kept buffer");
     if (routed) {
       expect(kept->size() == 0, "keep offsets: tail-routed metadata got offsets");
     } else {

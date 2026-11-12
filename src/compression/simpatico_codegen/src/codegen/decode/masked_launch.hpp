@@ -104,7 +104,8 @@ void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
                                           decode_frame& frame);
 
 /// The unselected dictionary gather: every row's key bytes, decoded straight from ``tree``'s codes
-/// (a bitpack, FOR, zigzag or delta chain), so the code column is never materialized.
+/// so the code column is never materialized. The renderer accepts a bitpack, FOR, zigzag or delta
+/// code chain; the decode routes only bare bitpacked codes here.
 void launch_decode_fused_tree_dict_gather_all(codegen::jit::FusedTree const& tree,
                                               codegen::jit::LabeledBuffers const& labeled,
                                               char const* dtype,

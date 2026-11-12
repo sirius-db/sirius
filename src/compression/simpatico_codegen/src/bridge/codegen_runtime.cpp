@@ -335,16 +335,20 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 
 }  // namespace
 
-void keep_bitpack_word_offsets(compressed_table& table,
-                               ::cuda::stream_ref stream,
-                               rmm::device_async_resource_ref mr)
+std::vector<std::size_t> keep_bitpack_word_offsets(compressed_table& table,
+                                                   ::cuda::stream_ref stream,
+                                                   rmm::device_async_resource_ref mr)
 {
-  for (auto& column : table.columns) {
+  std::vector<std::size_t> kept(table.columns.size(), 0);
+  for (std::size_t c = 0; c < table.columns.size(); ++c) {
+    auto& column = table.columns[c];
     if (!column.plan_tree) continue;
     for (auto& node : column.plan_tree->nodes) {
       auto* rep = dynamic_cast<codegen_fused_representation*>(node.rep.get());
       if (rep == nullptr || node.op != "bitpack" || rep->word_offsets.size() != 0) continue;
-      // A tail-routed chunk_count or chunk_bits is decoded per call, so its offsets are too.
+      // A tail-routed chunk_count or chunk_bits exists only while a decode runs, so this node is
+      // skipped and each decode of the re-read table scans for its offsets (the encoder's own
+      // table keeps them either way).
       bool const routed =
         std::any_of(node.children.begin(), node.children.end(), [](auto const& e) {
           return e.channel == "chunk_count" || e.channel == "chunk_bits";
@@ -373,9 +377,11 @@ void keep_bitpack_word_offsets(compressed_table& table,
         throw std::runtime_error(
           "keep_bitpack_word_offsets: offsets scan failed (rc=" + std::to_string(rc) + ")");
       }
+      kept[c] += offsets.size();
       rep->word_offsets = std::move(offsets);
     }
   }
+  return kept;
 }
 
 }  // namespace simpatico
