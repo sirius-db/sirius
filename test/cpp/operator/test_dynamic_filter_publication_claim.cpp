@@ -421,16 +421,18 @@ TEST_CASE("deposit observes a pinned unpublished owner that survives synthetic f
     {
     }
 
-    void add_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                        std::size_t partition = 0) override
+   private:
+    // The repository holds its mutex while invoking this hook.
+    void add_data_batch_unlocked(const std::shared_ptr<cucascade::data_batch>& batch,
+                                 std::size_t partition) override
     {
       ++deposits;
       auto const snapshot = channel.snapshot();
       observed_pending_owner =
         stats.publication_attempts.load() == 1 && !snapshot.terminal() && snapshot.empty();
       observed_source_pin = batch->get_read_only_count() != 0;
-      cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
-      stored_before_finalization = size(partition) == 1;
+      cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
+      stored_before_finalization = partition_size_unlocked(partition) == 1;
       // Only this test repository finalizes on deposit; production repositories just store.
       join.finalize_operator();
     }
@@ -490,11 +492,12 @@ TEST_CASE("deposit exceptions resolve the claim and propagate without retry",
     bool throw_oom       = false;
     std::size_t deposits = 0;
 
-    void add_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                        std::size_t partition = 0) override
+   private:
+    void add_data_batch_unlocked(const std::shared_ptr<cucascade::data_batch>& batch,
+                                 std::size_t partition) override
     {
       ++deposits;
-      cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
+      cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
       if (throw_oom) { throw rmm::out_of_memory{"synthetic repository allocation failure"}; }
       throw std::runtime_error{"synthetic repository delivery failure"};
     }
