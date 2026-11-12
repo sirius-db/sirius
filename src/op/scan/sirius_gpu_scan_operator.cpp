@@ -22,6 +22,7 @@
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/scan_output_operator_data.hpp>
@@ -809,6 +810,18 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       std::string(typeid(input_data).name()));
   }
   validate_input(*scan_input, false);
+  // Prepared GPU inputs must belong to the executing device. Reject a known mismatch
+  // before assembly; preparation handles cross-device copies.
+  if (auto const* space = scan_input->gpu_memory_space;
+      space && space->get_tier() == ::cucascade::memory::Tier::GPU) {
+    auto const current = sirius::op::detail::resolve_dynamic_filter_device_id(-1);
+    if (current >= 0 && space->get_device_id() != current) {
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::gpu_error,
+        "scan input is assigned to GPU " + std::to_string(space->get_device_id()) +
+          " but the scan executes on GPU " + std::to_string(current));
+    }
+  }
 
   auto receipt        = decode_receipt(*this, *scan_input);
   auto assembly       = std::make_unique<scan_assembly_state>();
