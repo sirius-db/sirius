@@ -69,16 +69,6 @@ struct finishable_mark_pipeline : sirius::pipeline::sirius_pipeline {
   bool finished = false;
 };
 
-//! Depth-first, root-first numbering of a bare operator tree, standing in for
-//! pipeline::assign_operator_ids in fixtures that never build pipelines.
-void number_operator_tree(sirius::op::sirius_physical_operator& op, size_t& next_id)
-{
-  op.operator_id = next_id++;
-  for (auto& child : op.children) {
-    if (child) { number_operator_tree(*child, next_id); }
-  }
-}
-
 struct nlj_projection_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_nested_loop_join> nlj;

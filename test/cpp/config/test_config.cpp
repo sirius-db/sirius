@@ -837,6 +837,34 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("build_chunk_max_rows is read from operator_params YAML within cuDF's row limit",
+          "[config_opt]")
+{
+  auto const value = GENERATE(std::string{"1000"}, std::string{"0"}, std::string{"2147483648"});
+  auto const path  = std::filesystem::temp_directory_path() / "sirius_build_chunk_max_rows.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    build_chunk_max_rows: "
+        << value << '\n';
+  }
+
+  sirius_config cfg;
+  CHECK(cfg.get_operator_params().build_chunk_max_rows ==
+        sirius::config::DEFAULT_BUILD_CHUNK_MAX_ROWS);
+  if (value == "1000") {
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().build_chunk_max_rows == 1000);
+  } else {
+    CHECK_THROWS_WITH(cfg.load_from_file(path),
+                      Catch::Matchers::ContainsSubstring("build_chunk_max_rows"));
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("multi-partition dynamic-filter settings preserve defaults and parse byte budgets",
           "[config_opt][dynamic_filter][multi_partition]")
 {
