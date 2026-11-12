@@ -82,7 +82,19 @@ class sample_all_gather_boundaries final : public cross_rank_sort_boundaries {
   //! request.num_parts partitions.
   sort_boundaries make(request const& request, ::cuda::stream_ref stream) override;
 
+  //! Whether the gathered samples are still held: from the all-gather until make() has returned
+  //! its boundaries.
+  [[nodiscard]] bool holds_gathered_samples() const noexcept { return _gathered.has_value(); }
+
  private:
+  //! What make() does after its gather: sets the range exchange's boundaries and returns this
+  //! rank's, from @p gathered.
+  sort_boundaries boundaries_from(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> const& gathered,
+    std::size_t num_parts,
+    telemetry::batch_telemetry_info const& telemetry,
+    ::cuda::stream_ref stream);
+
   std::shared_ptr<exchange::exchange_service> _service;
   exchange::stream_id _stream;
   cucascade::memory::memory_space* _gpu;
@@ -90,8 +102,9 @@ class sample_all_gather_boundaries final : public cross_rank_sort_boundaries {
   std::vector<cudf::null_order> _null_precedence;
   std::function<void(std::shared_ptr<cudf::table const>)> _set_exchange_boundaries;
   std::chrono::milliseconds _timeout;
-  //! The all-gather's result, kept for an OOM retry of the boundary task, since the peers will
-  //! not gather on that stream again. Only one boundary task runs at a time.
+  //! The all-gather's result, kept until make() returns its boundaries: an OOM retry of the
+  //! boundary task needs it, since the peers will not gather on that stream again. Released
+  //! then, since this hook lives as long as the plan. Only one boundary task runs at a time.
   std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _gathered;
   //! This rank has entered the all-gather.
   bool _gather_entered = false;

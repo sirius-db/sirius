@@ -220,6 +220,13 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample(
   return sample;
 }
 
+/// The hook make_sample() set on @p sample.
+sirius::op::sample_all_gather_boundaries const& gathering(sirius_physical_sort_sample const& sample)
+{
+  return dynamic_cast<sirius::op::sample_all_gather_boundaries const&>(
+    *sample.cross_rank_boundaries());
+}
+
 using sirius::op::dynamic_filter_publish_plan;
 
 /// A join's filter plan on INT64 key column 0, publishing to @p channel.
@@ -754,6 +761,8 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   for (rank_t r = 0; r < world; ++r) {
     REQUIRE(samples[r]->boundaries_computed());
     REQUIRE(boundaries[r] != nullptr);
+    // The gathered samples are gone, with the plan still alive; the boundaries are not.
+    CHECK_FALSE(gathering(*samples[r]).holds_gathered_samples());
     CHECK(keys_of(*boundaries[r]) == keys_of(*boundaries[0]));
   }
   auto const eb = keys_of(*boundaries[0]);
@@ -803,6 +812,8 @@ TEST_CASE("an OOM after the boundary all-gather retries without gathering again"
     if (r == 0) {
       CHECK_THROWS_AS(samples[r]->execute(data, utils::default_stream()), rmm::out_of_memory);
       CHECK_FALSE(samples[r]->boundaries_computed());
+      // Kept for the retry.
+      CHECK(gathering(*samples[r]).holds_gathered_samples());
     }
     static_cast<void>(samples[r]->execute(data, utils::default_stream()));
   });
@@ -810,6 +821,7 @@ TEST_CASE("an OOM after the boundary all-gather retries without gathering again"
   for (rank_t r = 0; r < world; ++r) {
     REQUIRE(samples[r]->boundaries_computed());
     REQUIRE(boundaries[r] != nullptr);
+    CHECK_FALSE(gathering(*samples[r]).holds_gathered_samples());
   }
   CHECK(keys_of(*boundaries[0]) == keys_of(*boundaries[1]));
 }

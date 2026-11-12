@@ -54,21 +54,17 @@ sample_all_gather_boundaries::sample_all_gather_boundaries(
 sort_boundaries sample_all_gather_boundaries::make(request const& request,
                                                    ::cuda::stream_ref stream)
 {
-  auto const& sample_keys     = request.sample_keys;
-  auto const sample_bytes     = request.sample_bytes;
-  auto const num_parts        = request.num_parts;
-  auto const& column_order    = _column_order;
-  auto const& null_precedence = _null_precedence;
-  auto& gpu                   = *_gpu;
-  auto const mr               = gpu.get_default_allocator();
-  auto const world            = _service->world_size();
-  auto const rank             = _service->rank();
+  auto const& sample_keys = request.sample_keys;
+  auto const sample_bytes = request.sample_bytes;
+  auto const num_parts    = request.num_parts;
+  auto& gpu               = *_gpu;
+  auto const mr           = gpu.get_default_allocator();
 
   if (!_gathered) {
-    // A gather that failed part way left the peers past it; a retry would wait out the timeout.
+    // The peers are past this gather, whether it failed part way or finished and released its
+    // samples: another would wait out the timeout.
     if (_gather_entered) {
-      throw sirius::internal_exception(
-        "[sort_sample] the boundary all-gather failed part way and cannot be retried");
+      throw sirius::internal_exception("[sort_sample] the boundary all-gather cannot run again");
     }
     // 1. This rank's summary: evenly spaced rows of its sample, enough to give each of num_parts
     // partitions summary_rows_per_partition rows of the global sample in this rank's range. Fewer
@@ -105,7 +101,27 @@ sort_boundaries sample_all_gather_boundaries::make(request const& request,
     _gather_entered = true;
     _gathered = exchange::all_gather(*_service, _stream, summary, gpu, stream.get(), _timeout);
   }
-  auto const& gathered = *_gathered;
+  auto made = boundaries_from(*_gathered, num_parts, request.telemetry, stream);
+  // The boundaries may be copied straight from a gathered batch: that read ends before the
+  // batch is freed.
+  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  _gathered.reset();
+  return made;
+}
+
+sort_boundaries sample_all_gather_boundaries::boundaries_from(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> const& gathered,
+  std::size_t num_parts,
+  telemetry::batch_telemetry_info const& telemetry,
+  ::cuda::stream_ref stream)
+{
+  auto const& column_order    = _column_order;
+  auto const& null_precedence = _null_precedence;
+  auto& gpu                   = *_gpu;
+  auto const mr               = gpu.get_default_allocator();
+  auto const world            = _service->world_size();
+  auto const rank             = _service->rank();
+
   std::vector<::cucascade::read_only_data_batch> parts;
   for (auto const& g : gathered) {
     if (g) { parts.push_back(g->to_read_only()); }
@@ -116,7 +132,7 @@ sort_boundaries sample_all_gather_boundaries::make(request const& request,
   std::shared_ptr<::cucascade::data_batch> merged;
   if (parts.size() > 1) {
     merged = gpu_merge_impl::merge_order_by(
-      parts, keys, column_order, null_precedence, stream, gpu, request.telemetry);
+      parts, keys, column_order, null_precedence, stream, gpu, telemetry);
   }
   auto const global =
     merged ? get_cudf_table_view(merged->to_read_only()) : get_cudf_table_view(parts.front());
