@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -372,6 +373,25 @@ TEST_CASE("a failed write fails both ranks, and frees the batches the sender hel
   CHECK(sender.wait_sent(sirius::exchange::query_of(stream), std::chrono::seconds{5}));
   CHECK_THROWS(sender.send(stream, 1, gpu_batch(sample_table(1'000))));
   CHECK_THROWS(c.ranks[1].t->close(stream, 0));
+}
+
+TEST_CASE("a failed transport frees the batches it was still receiving", "[exchange][transport]")
+{
+  using namespace sirius::exchange;
+  forged_peer c;
+  auto const header = many_frame_header();
+  auto const before = env().gpu->get_available_memory();
+  // Frame 0 of about 19: the batch lands, taking its whole size, and stays incomplete.
+  c.forge(frame_message{5, 0, 0, 0, 64 * KiB, header});
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (env().gpu->get_available_memory() >= before) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  c.forge(error_message{"forged failure"});
+  c.fails_with("forged failure");
+  // The transport is still alive: its failure freed the landing, not its destructor.
+  CHECK(env().gpu->get_available_memory() == before);
 }
 
 TEST_CASE("a transport destroyed right after close and abort still sends them",

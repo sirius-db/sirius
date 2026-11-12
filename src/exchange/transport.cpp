@@ -709,7 +709,8 @@ void transport::run()
       }
     }
     // Freed now, not at ~transport: wait_sent() lets their query release its memory once they
-    // are gone. send() and close() queue nothing once _error is set.
+    // are gone, and a failed transport is kept until the context ends. send() and close() queue
+    // nothing once _error is set.
     std::vector<std::deque<engine::queued>> queued(e.queues.size());
     {
       std::lock_guard lock{_mutex};
@@ -724,6 +725,11 @@ void transport::run()
       p.current.reset();
     }
     e.staged.clear();
+    // A landing owns its whole batch from its first frame, and nothing completes one now. The
+    // copies into it may still run on the receive stream.
+    e.recv_stream.synchronize_no_throw();
+    e.copies.clear();
+    e.landings.clear();
     _room.notify_all();
     _released.notify_all();
     e.cb.on_error(error);
