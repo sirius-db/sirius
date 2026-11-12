@@ -33,7 +33,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <string>
 #include <system_error>
 #include <tuple>
 #include <utility>
@@ -52,6 +57,9 @@ constexpr std::int64_t k_slow_read_hold_ns = 2'000'000'000;
 
 /// Device bytes read before the share of POSIX reads is judged.
 constexpr std::uint64_t k_fallback_min_bytes = 1ULL << 30;
+
+/// Lines about held reads that may wait for their thread; more are counted, not kept.
+constexpr std::size_t k_max_held_lines = 256;
 
 [[nodiscard]] std::int64_t now_ns() noexcept
 {
@@ -97,6 +105,47 @@ std::size_t posix_read(int fd, std::uint8_t* dst, std::size_t size, std::size_t 
 {
   cpu_set_t set;
   return sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
+}
+
+using port_bytes = std::vector<std::pair<std::string, std::uint64_t>>;
+
+/// Bytes each RDMA port of this host has received, by device name. The storage
+/// path delivers file data through these ports.
+[[nodiscard]] port_bytes rdma_received_bytes()
+{
+  port_bytes ports;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it{"/sys/class/infiniband", ec}, end; !ec && it != end;
+       it.increment(ec)) {
+    std::ifstream in{it->path() / "ports/1/counters/port_rcv_data"};
+    std::uint64_t words = 0;
+    // The counter is in units of four bytes.
+    if (in >> words) { ports.emplace_back(it->path().filename().string(), words * 4); }
+  }
+  std::sort(ports.begin(), ports.end());
+  return ports;
+}
+
+/// "mlx5_0=0.0 mlx5_1=43.9": GB per second each port received between two samples.
+[[nodiscard]] std::string receive_rates(port_bytes const& before,
+                                        port_bytes const& after,
+                                        double seconds)
+{
+  std::string rates;
+  for (auto const& [name, bytes] : after) {
+    auto const prev = std::find_if(
+      before.begin(), before.end(), [&name](auto const& port) { return port.first == name; });
+    if (prev == before.end() || seconds <= 0 || bytes < prev->second) { continue; }
+    char rate[64];
+    std::snprintf(rate,
+                  sizeof(rate),
+                  "%s%s=%.1f",
+                  rates.empty() ? "" : " ",
+                  name.c_str(),
+                  static_cast<double>(bytes - prev->second) / 1e9 / seconds);
+    rates += rate;
+  }
+  return rates.empty() ? "n/a" : rates;
 }
 
 void notify(prepared_io_slice& slice, bool success) noexcept
@@ -149,11 +198,85 @@ struct gds_ioctx::request {
   std::exception_ptr error;
 };
 
+struct gds_ioctx::held_report {
+  struct line {
+    std::string text;
+    /// Whether the line ends with the receive rate of every RDMA port.
+    bool with_rates{false};
+    bool error{false};
+  };
+
+  void post(std::string text, bool with_rates, bool error = false)
+  {
+    {
+      std::lock_guard lock{mutex};
+      if (lines.size() >= k_max_held_lines) {
+        ++dropped;
+        return;
+      }
+      lines.push_back({std::move(text), with_rates, error});
+    }
+    cv.notify_all();
+  }
+
+  /// Logs the posted lines until `stop`. Owns its state: the context that started it may
+  /// be gone while a log call of this thread is still blocked.
+  static void run(std::shared_ptr<held_report> self, std::chrono::milliseconds period)
+  {
+    auto const period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(period).count();
+    auto ports           = rdma_received_bytes();
+    auto ports_at        = now_ns();
+    std::string rates    = "n/a";
+    std::unique_lock lock{self->mutex};
+    for (;;) {
+      self->cv.wait_for(lock, period, [&self] { return self->stop || !self->lines.empty(); });
+      auto const lines   = std::exchange(self->lines, {});
+      auto const dropped = std::exchange(self->dropped, 0);
+      auto const stop    = self->stop;
+      lock.unlock();
+      try {
+        // A line posted right after the last sample would get the rate of a few milliseconds.
+        if (auto const now = now_ns(); now - ports_at >= period_ns / 2) {
+          auto sample = rdma_received_bytes();
+          rates       = receive_rates(ports, sample, static_cast<double>(now - ports_at) / 1e9);
+          ports       = std::move(sample);
+          ports_at    = now;
+        }
+        for (auto const& line : lines) {
+          if (line.error) {
+            SIRIUS_LOG_ERROR("{}", line.text);
+          } else if (line.with_rates) {
+            SIRIUS_LOG_WARN("{}; GB/s received per RDMA port: {}", line.text, rates);
+          } else {
+            SIRIUS_LOG_WARN("{}", line.text);
+          }
+        }
+        if (dropped != 0) { SIRIUS_LOG_WARN("[gds] held: {} more lines were not kept", dropped); }
+      } catch (...) {  // Formatting may fail to allocate; the thread goes on.
+      }
+      lock.lock();
+      if (stop) {
+        self->done = true;
+        self->cv.notify_all();
+        return;
+      }
+    }
+  }
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<line> lines;
+  std::size_t dropped{0};
+  bool stop{false};
+  bool done{false};
+};
+
 gds_ioctx::gds_ioctx(gds_config config, options opts) : _config(config), _options(std::move(opts))
 {
   if (_config.num_threads == 0) { throw std::invalid_argument("gds: num_threads must be > 0"); }
   if (_config.task_size == 0) { throw std::invalid_argument("gds: task_size must be > 0"); }
   if (!_options.on_fatal_stall) {
+    _exits_on_stall         = true;
     _options.on_fatal_stall = [] {
       SIRIUS_LOG_ERROR("[gds] a read is stuck; exiting with status 70");
       // The log may sit on the filesystem that stopped answering: the flush gets
@@ -205,6 +328,9 @@ gds_ioctx::gds_ioctx(gds_config config, options opts) : _config(config), _option
   _reading      = std::make_unique<reading[]>(_config.num_threads);
   _workers.reserve(_config.num_threads);
   try {
+    // Before the threads that post to it.
+    _held_report = std::make_shared<held_report>();
+    std::thread(&held_report::run, _held_report, _options.watchdog_period).detach();
     for (std::size_t i = 0; i < _config.num_threads; ++i) {
       _workers.emplace_back([this, i] { worker_loop(i); });
     }
@@ -242,6 +368,15 @@ void gds_ioctx::shutdown() noexcept
   }
   _watchdog_cv.notify_all();
   if (_watchdog.joinable()) { _watchdog.join(); }
+  if (_held_report) {
+    std::unique_lock lock{_held_report->mutex};
+    _held_report->stop = true;
+    _held_report->cv.notify_all();
+    // Its last lines are logged before the caller can tear the logger down; a second is
+    // all it gets, since one of its log calls may be stuck.
+    _held_report->cv.wait_for(
+      lock, std::chrono::seconds(1), [this] { return _held_report->done; });
+  }
 }
 
 bool gds_ioctx::supports(std::string_view path) const noexcept
@@ -317,6 +452,31 @@ void gds_ioctx::settle(std::shared_ptr<request> const& req, std::exception_ptr e
   }
 }
 
+void gds_ioctx::note_read(std::int64_t read_ns,
+                          std::size_t worker,
+                          bool device,
+                          std::size_t size,
+                          std::size_t offset,
+                          io_object const& object) noexcept
+{
+  if (read_ns < std::chrono::duration_cast<std::chrono::nanoseconds>(_options.held_after).count()) {
+    return;
+  }
+  _held_reads.fetch_add(1, std::memory_order_relaxed);
+  try {
+    _held_report->post(
+      std::format("[gds] held: a {} read returned after {:.1f} s: worker {}, {} bytes at {} of {}",
+                  device ? "cuFile" : "host",
+                  static_cast<double>(read_ns) / 1e9,
+                  worker,
+                  size,
+                  offset,
+                  object.object_path()),
+      false);
+  } catch (...) {  // The read stands without its line.
+  }
+}
+
 void gds_ioctx::run_piece(std::shared_ptr<request> const& req,
                           std::size_t slice_index,
                           std::size_t piece_offset,
@@ -348,8 +508,10 @@ void gds_ioctx::run_piece(std::shared_ptr<request> const& req,
           done = object.handle().read(
             target.base, piece_size, offset, target.offset + piece_offset, false);
         }
+        auto const finished = now_ns();
         _read_started[worker].store(0);
-        _device_read_ns.fetch_add(now_ns() - started, std::memory_order_relaxed);
+        note_read(finished - started, worker, true, piece_size, offset, *req->object);
+        _device_read_ns.fetch_add(finished - started, std::memory_order_relaxed);
         _device_wait_ns.fetch_add(started - queued_at, std::memory_order_relaxed);
         _device_bytes.fetch_add(done, std::memory_order_relaxed);
         // A read has a fixed cost: small ones are charged as one MiB.
@@ -357,16 +519,26 @@ void gds_ioctx::run_piece(std::shared_ptr<request> const& req,
                                         std::memory_order_relaxed);
         _device_reads.fetch_add(1, std::memory_order_relaxed);
       } else {
-        auto* host = std::get<std::uint8_t*>(slice.h_buffer.buffer);
-        _read_started[worker].store(now_ns());
+        auto* host         = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+        auto const started = now_ns();
+        _read_started[worker].store(started);
         done = posix_read(object.handle().fd(), host + piece_offset, piece_size, offset);
         _read_started[worker].store(0);
+        note_read(now_ns() - started, worker, false, piece_size, offset, *req->object);
         _host_bytes.fetch_add(done, std::memory_order_relaxed);
       }
       if (done != piece_size) { throw std::runtime_error("gds_ioctx: short read"); }
       req->bytes.fetch_add(done);
     } catch (...) {
-      _read_started[worker].store(0);
+      // A held read may well end in an error; it counts and is reported all the same.
+      if (auto const started = _read_started[worker].exchange(0); started != 0) {
+        note_read(now_ns() - started,
+                  worker,
+                  _reading[worker].device.load(),
+                  _reading[worker].size.load(),
+                  _reading[worker].offset.load(),
+                  *req->object);
+      }
       error = std::current_exception();
     }
   }
@@ -495,6 +667,8 @@ void gds_ioctx::watchdog_loop()
 {
   auto const timeout_ns =
     std::chrono::duration_cast<std::chrono::nanoseconds>(_config.read_timeout).count();
+  auto const held_ns =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(_options.held_after).count();
   bool fatal_reported        = false;
   std::uint64_t seen_reads   = 0;
   std::uint64_t seen_read_ns = 0;
@@ -514,6 +688,45 @@ void gds_ioctx::watchdog_loop()
     }
 
     auto current = _state.load();
+    if (current != state::stalled && oldest != 0 && now - oldest >= held_ns) {
+      try {
+        std::size_t held   = 0;
+        std::int64_t first = 0;
+        std::size_t size   = 0;
+        std::size_t offset = 0;
+        bool device        = false;
+        std::string path;
+        {
+          std::lock_guard live_lock{_live_mutex};
+          for (std::size_t i = 0; i < _config.num_threads; ++i) {
+            auto const started = _read_started[i].load();
+            auto const* object = _reading[i].object.load();
+            if (started == 0 || object == nullptr || now - started < held_ns) { continue; }
+            ++held;
+            if (first == 0 || started < first) {
+              first  = started;
+              size   = _reading[i].size.load();
+              offset = _reading[i].offset.load();
+              device = _reading[i].device.load();
+              path   = object->object_path();
+            }
+          }
+        }
+        if (held != 0) {
+          _held_report->post(
+            std::format("[gds] held: {} reads have not returned, the oldest a {} read for {:.1f} s "
+                        "({} bytes at {} of {})",
+                        held,
+                        device ? "cuFile" : "host",
+                        static_cast<double>(now - first) / 1e9,
+                        size,
+                        offset,
+                        path),
+            true);
+        }
+      } catch (...) {  // The watchdog goes on without the line.
+      }
+    }
     if (current == state::ok && _config.require && _cufile_counters) {
       // cuFile serves reads of a few KiB (a tiny file, a file's tail) through POSIX
       // even under GDS, so a POSIX read alone proves nothing. A real fallback sends
@@ -523,11 +736,16 @@ void gds_ioctx::watchdog_loop()
         if (_device_bytes.load() >= k_fallback_min_bytes &&
             delta.posix_reads * 2 > delta.total_reads) {
           _state.store(current = state::posix_fallback);
-          SIRIUS_LOG_ERROR(
-            "[gds] cuFile served {} of {} reads through POSIX: it is not reading through GDS. "
-            "Failing reads.",
-            delta.posix_reads,
-            delta.total_reads);
+          try {
+            _held_report->post(
+              std::format("[gds] cuFile served {} of {} reads through POSIX: it is not reading "
+                          "through GDS. Failing reads.",
+                          delta.posix_reads,
+                          delta.total_reads),
+              false,
+              true);
+          } catch (...) {  // The state is set; only its line is lost.
+          }
         }
       }
     }
@@ -546,11 +764,16 @@ void gds_ioctx::watchdog_loop()
         slow_since = now;
       } else if (current == state::ok && now - slow_since >= k_slow_read_hold_ns) {
         _state.store(current = state::slow);
-        SIRIUS_LOG_ERROR(
-          "[gds] cuFile reads take {:.1f} ms per MiB (limit {:.1f}): the storage path is "
-          "degrading. Failing further GDS reads.",
-          ms_per_mib,
-          _config.slow_read_ms_per_mib);
+        try {
+          _held_report->post(
+            std::format("[gds] cuFile reads take {:.1f} ms per MiB (limit {:.1f}): the storage "
+                        "path is degrading. Failing further GDS reads.",
+                        ms_per_mib,
+                        _config.slow_read_ms_per_mib),
+            false,
+            true);
+        } catch (...) {  // The state is set; only its line is lost.
+        }
       }
       seen_reads   = reads;
       seen_read_ns = read_ns;
@@ -558,6 +781,18 @@ void gds_ioctx::watchdog_loop()
     }
     if (current != state::stalled && oldest != 0 && now - oldest > timeout_ns) {
       _state.store(current = state::stalled);
+      if (_exits_on_stall) {
+        // Every line logged from here on can block: with lines about held reads in its
+        // buffer, the log's periodic flush may be stuck writing to the filesystem that
+        // stopped answering, and it holds the sink's mutex. This ends the process even then.
+        try {
+          std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::_Exit(70);
+          }).detach();
+        } catch (...) {  // The default handler below still ends it when the log answers.
+        }
+      }
       SIRIUS_LOG_ERROR(
         "[gds] a read has been in flight for {} s (limit {} s); ending the process.",
         (now - oldest) / 1'000'000'000,
@@ -608,7 +843,8 @@ gds_ioctx::io_counters gds_ioctx::counters() const noexcept
           _device_reads.load(),
           _host_bytes.load(),
           _device_read_ns.load(),
-          _device_wait_ns.load()};
+          _device_wait_ns.load(),
+          _held_reads.load()};
 }
 
 std::optional<cufile_counters> gds_ioctx::cufile() const noexcept

@@ -80,6 +80,16 @@ class posix_fallback_error : public std::runtime_error {
  * reads fail with `read_stalled_error` while those in flight finish. That is
  * the early sign of a storage path going bad, seen half a minute before a stall.
  *
+ * A read in flight longer than `options::held_after` is held by the storage
+ * path: healthy reads take milliseconds. While any is held, a line a period
+ * says how many, names the oldest one's file and offset, and gives the receive
+ * rate of every RDMA port of the host; a held read that returns says how long
+ * it took. That is what tells a slow rail from a stuck read. Those lines, and
+ * every line of the watchdog before it declares a read stuck, are written by a
+ * thread of their own: a log call blocks when the log sits on the filesystem
+ * that stopped answering, and neither the watchdog nor a read thread may wait
+ * for that.
+ *
  * A read in flight longer than `read_timeout` ends the process with status 70.
  * cuFile reads cannot be cancelled, and failing the request instead would let
  * the caller free a buffer cuFile is still writing to.
@@ -98,6 +108,8 @@ class gds_ioctx final : public cucascade::io::ioctx {
     /// Unset reads with `kvikio::FileHandle::read` (cuFile, or POSIX in compat mode).
     device_reader reader{};
     std::chrono::milliseconds watchdog_period{1000};
+    /// A read in flight this long is counted and reported as held.
+    std::chrono::milliseconds held_after{1000};
     /// Reads a watchdog period needs before their mean time is judged.
     std::size_t slow_read_min_reads{16};
     /// Called once when a read is stuck. Defaults to logging and `std::_Exit(70)`.
@@ -112,6 +124,8 @@ class gds_ioctx final : public cucascade::io::ioctx {
     std::uint64_t device_read_ns{0};
     /// Time device reads waited for a pool thread, summed over reads.
     std::uint64_t device_wait_ns{0};
+    /// Reads that took longer than `options::held_after`.
+    std::uint64_t held_reads{0};
   };
 
   /// @throw std::runtime_error in GDS mode when cuFile does not report GDS as
@@ -158,6 +172,7 @@ class gds_ioctx final : public cucascade::io::ioctx {
  private:
   enum class state : int { ok, stalled, slow, posix_fallback };
   struct request;
+  struct held_report;
 
   void submit(std::function<void(std::size_t worker)> task);
   void worker_loop(std::size_t worker);
@@ -169,11 +184,19 @@ class gds_ioctx final : public cucascade::io::ioctx {
                  std::int64_t queued_at,
                  std::size_t worker);
   void settle(std::shared_ptr<request> const& req, std::exception_ptr error) noexcept;
+  void note_read(std::int64_t read_ns,
+                 std::size_t worker,
+                 bool device,
+                 std::size_t size,
+                 std::size_t offset,
+                 cucascade::io::io_object const& object) noexcept;
   [[nodiscard]] std::exception_ptr failure() const;
 
   gds_config _config;
   options _options;
   bool _cufile_counters{false};
+  /// Whether a stuck read ends the process: false only under a test's `on_fatal_stall`.
+  bool _exits_on_stall{false};
   cufile_counters _cufile_baseline{};
 
   std::atomic<state> _state{state::ok};
@@ -183,6 +206,8 @@ class gds_ioctx final : public cucascade::io::ioctx {
   std::atomic<std::uint64_t> _device_read_ns{0};
   std::atomic<std::uint64_t> _device_charged_bytes{0};
   std::atomic<std::uint64_t> _device_wait_ns{0};
+  std::atomic<std::uint64_t> _held_reads{0};
+  std::shared_ptr<held_report> _held_report;
 
   std::mutex _queue_mutex;
   std::condition_variable _queue_cv;
