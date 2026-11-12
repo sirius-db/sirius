@@ -156,7 +156,19 @@ queries/second and latency, as well as elapsed time.
 | `--validation-memory-limit-mb` | Measured-result capture budget in MiB, default 1024. Exceeding it fails the run instead of silently dropping checks. |
 
 All GPU worker connections disable CPU fallback so failed GPU work cannot silently become a
-successful CPU measurement. Ordinary errors are recorded and other requests continue; failures,
+successful CPU measurement. Workers verify that policy before the start barrier. After the child
+exits and logs flush, the supervisor requires an attributed successful GPU execution window for
+each successful measured GPU request. A cleanup window alone does not certify SQL success.
+Missing evidence (including CPU execution with `SIRIUS_DISABLE=1`, disabled logging, or a
+non-file log backend) fails the run and marks those requests as errors. Use the spdlog file
+backend at info level or more verbose for concurrent GPU runs.
+
+`SIRIUS_PRE_SQL` is rejected by the concurrent runner with `--engine gpu/both`, including
+single-client cooperative runs: worker sessions do not inherit root session options, and
+arbitrary maintenance SQL cannot safely be replayed on every worker. Serial runs retain this
+setup mechanism. CPU-only concurrent runs do not apply it.
+
+Ordinary errors are recorded and other requests continue; failures,
 timeouts, incomplete streams and validation mismatches make the final command exit nonzero.
 The whole-run watchdog also bounds native hangs that connection interruption cannot resolve.
 

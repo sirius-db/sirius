@@ -2,9 +2,11 @@
 """Run with pixi run python -m unittest discover -s test/tpch_performance -p test_concurrent_benchmark.py."""
 import argparse
 import csv
+from datetime import date, datetime, time as dtime, timedelta
 from decimal import Decimal
 import io
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -22,6 +24,7 @@ from tpch_pin_columns import emit_pin_all, union_columns_by_table
 def arguments(**overrides):
     defaults = dict(
         concurrency=2,
+        engine="both",
         concurrency_mode="identical",
         stream_order=None,
         mode=None,
@@ -44,6 +47,144 @@ def arguments(**overrides):
 
 
 class ConcurrentBenchmarkTests(unittest.TestCase):
+    def test_gpu_workers_verify_fallback_before_measuring(self):
+        for fallback_enabled in (False, True):
+            with self.subTest(fallback_enabled=fallback_enabled):
+                connections = []
+
+                def cursor():
+                    con = Mock()
+                    con.execute.return_value = con
+                    con.fetchone.return_value = (fallback_enabled,)
+                    con.fetchmany.return_value = []
+                    connections.append(con)
+                    return con
+
+                root = Mock()
+                root.cursor.side_effect = cursor
+                output = io.StringIO()
+                records, _, errors = cb.run_phase(
+                    root,
+                    arguments(query_timeout=0),
+                    "sirius",
+                    Path("."),
+                    [1],
+                    False,
+                    cb.CaptureBudget(0),
+                    csv.DictWriter(output, fieldnames=cb.FIELDS),
+                    output,
+                )
+                if fallback_enabled:
+                    self.assertTrue(errors)
+                    self.assertFalse(records)
+                else:
+                    self.assertFalse(errors)
+                    self.assertEqual(len(records), 4)
+                    self.assertTrue(all(r["gpu_fallback_disabled"] for r in records))
+                self.assertTrue(all(con.close.called for con in connections))
+
+    def test_pre_sql_is_rejected_for_gpu_workers_before_setup(self):
+        for sql in (
+            "SET expression_evaluator_strategy='ast_jit'",
+            "CALL reset_sirius_cache()",
+        ):
+            with self.subTest(sql=sql), patch.dict(os.environ, SIRIUS_PRE_SQL=sql):
+                with self.assertRaisesRegex(
+                    SystemExit, "root session settings are not inherited"
+                ):
+                    cb.check_arguments(arguments())
+                with self.assertRaises(SystemExit):
+                    cb.check_arguments(
+                        arguments(concurrency=1, concurrency_mode="cooperative")
+                    )
+                cb.check_arguments(arguments(engine="cpu"))
+                cb.check_arguments(arguments(concurrency=1))
+
+    def test_date_references_round_trip_and_reject_changed_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                (
+                    date(1995, 3, 15),
+                    datetime(1995, 3, 15, 12),
+                    dtime(12, 1),
+                    timedelta(days=1),
+                    Decimal("1.25"),
+                )
+            ]
+            perf._write_result(tmp, "duckdb", 3, rows)
+            captures = {("sirius", 1, 3, 0): rows}
+            verdicts = cb.validate_captures(captures, {}, [3], Path(tmp) / "duckdb")
+            self.assertEqual(verdicts[0]["status"], "success")
+            captures[("sirius", 1, 3, 0)] = [(date(1995, 3, 16), *rows[0][1:])]
+            self.assertEqual(
+                cb.validate_captures(captures, {}, [3], Path(tmp) / "duckdb")[0][
+                    "status"
+                ],
+                "mismatch",
+            )
+
+    def test_gpu_audit_requires_success_fallback_policy_and_own_window(self):
+        for window, fallback, request_status, expected in (
+            (True, True, "success", True),
+            (False, True, "success", False),  # e.g. SIRIUS_DISABLE=1
+            (True, False, "success", False),
+            (True, True, "error", True),  # never upgrade a failed request
+        ):
+            with self.subTest(
+                window=window, fallback=fallback, status=request_status
+            ), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                (directory / "csv").mkdir()
+                (directory / "log_dir").mkdir()
+                # Interleave a second connection to ensure its window cannot certify ours.
+                text = (
+                    "QueryBegin: instance=0xa connection=1 query=1 SQL: CALL sirius_set_query_label('readonly_s1_q1_i0')\n"
+                    "QueryBegin: instance=0xa connection=1 query=2 SQL: SELECT 1\n"
+                    "QueryBegin: instance=0xa connection=2 query=1 SQL: CALL sirius_set_query_label('readonly_s2_q1_i0')\n"
+                    "QueryBegin: instance=0xa connection=2 query=2 SQL: SELECT 1\n"
+                    "[window] end instance=0xa connection=2 window=11 query=2 outcome=ok\n"
+                )
+                if window:
+                    text += "[window] end instance=0xa connection=1 window=10 query=2 outcome=ok\n"
+                (directory / "log_dir/sirius.log").write_text(text)
+                record = dict(
+                    zip(
+                        cb.FIELDS,
+                        (
+                            "sirius",
+                            1,
+                            "q1",
+                            0,
+                            0,
+                            0,
+                            1,
+                            1,
+                            request_status,
+                            1,
+                            "",
+                            fallback,
+                        ),
+                    )
+                )
+                with (directory / "csv/concurrent_runtimes.csv").open(
+                    "w", newline=""
+                ) as out:
+                    writer = csv.DictWriter(out, fieldnames=cb.FIELDS)
+                    writer.writeheader()
+                    writer.writerow(record)
+                cb.write_json(
+                    directory / "concurrent_summary.json",
+                    {"engines": {"sirius": cb.summarize([record], 1, [])}},
+                )
+                self.assertEqual(cb.audit_gpu_execution(directory), expected)
+                summary = json.loads(
+                    (directory / "concurrent_summary.json").read_text()
+                )
+                self.assertEqual(
+                    summary["engines"]["sirius"]["complete"],
+                    expected and request_status == "success",
+                )
+
     def test_invalid_combinations(self):
         for values in (
             dict(concurrency=0),
@@ -444,6 +585,65 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
         self.assertIn("capture budget", result[5])
         self.assertIsNone(result[3])
         self.assertEqual(budget.used, 0)
+
+    def test_delayed_interrupt_finishes_before_connection_is_reused(self):
+        entered, release, finished = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        con = Mock()
+
+        def interrupt():
+            entered.set()
+            release.wait(3)
+            finished.set()
+
+        def execute(_sql):
+            self.assertTrue(entered.wait(3))
+
+        con.interrupt.side_effect = interrupt
+        con.execute.side_effect = execute
+        con.fetchmany.return_value = []
+        results = []
+        worker = threading.Thread(
+            target=lambda: results.append(
+                cb.execute_request(con, "select 1", 0.01, False, cb.CaptureBudget(0))
+            )
+        )
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertTrue(worker.is_alive())
+            self.assertFalse(results)
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(finished.is_set())
+        self.assertEqual(results[0][4], "timeout")
+        con.execute.side_effect = None
+        self.assertEqual(
+            cb.execute_request(con, "select 2", 0, False, cb.CaptureBudget(0))[4],
+            "success",
+        )
+        self.assertEqual(con.interrupt.call_count, 1)
+
+    def test_later_chunk_over_budget_releases_only_failed_capture(self):
+        budget = cb.CaptureBudget(1 << 20)
+        retained = budget.add([(42,)])
+        first_chunk = [(1,)]
+        first_size = budget.add(first_chunk)
+        budget.release(first_size)
+        budget.limit = retained + first_size
+        con = Mock()
+        con.fetchmany.side_effect = [first_chunk, [("x" * 4096,)], []]
+        result = cb.execute_request(con, "select", 0, True, budget)
+        self.assertEqual(con.fetchmany.call_count, 2)
+        self.assertEqual(result[4], "error")
+        self.assertIn("capture budget", result[5])
+        self.assertIsNone(result[3])
+        self.assertEqual(budget.used, retained)
 
     def test_tolerant_multiset_validation(self):
         self.assertTrue(

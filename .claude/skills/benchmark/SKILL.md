@@ -307,11 +307,11 @@ CPU pass. Ask when an unresolved choice materially changes cost or the intended 
 For comparisons, match the dataset, scale factor, mode, streams, predicates, pinning, config,
 and other execution settings except the variable under test. Report the exact invocation and
 effective config path with the results.
+
 In `--mode both`, validation also captures throughput results and compares them with the
 post-power baseline and each throughput RF1/RF2 committed state (2N+1 CPU snapshots).
 This checks membership in a collected state, not visibility during the query's transaction.
 Throughput-only mode skips this validation with a warning.
-
 
 Verify that the Sirius extension is built. Refresh and query generation also need `tpch-dbgen`;
 the generation scripts can build it from `test_datasets/tpch-dbgen.zip`. Inspect Sirius logs for

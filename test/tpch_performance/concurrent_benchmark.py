@@ -36,6 +36,7 @@ FIELDS = (
     "status",
     "row_count",
     "error",
+    "gpu_fallback_disabled",
 )
 
 
@@ -55,6 +56,11 @@ def check_arguments(args):
         if args.stream_order is not None:
             raise SystemExit("--stream-order requires --concurrency > 1")
         return
+    if os.environ.get("SIRIUS_PRE_SQL", "").strip() and args.engine != "cpu":
+        raise SystemExit(
+            "SIRIUS_PRE_SQL is not supported by concurrent GPU workers: root session "
+            "settings are not inherited, and arbitrary setup SQL cannot safely be replayed"
+        )
     if args.concurrency_mode == "cooperative" and args.stream_order == "permuted":
         raise SystemExit(
             "--concurrency-mode cooperative uses --queries order; --stream-order permuted is not supported"
@@ -332,6 +338,10 @@ def supervise(args, directory, config_path, validate, references, compression_pl
     except KeyboardInterrupt:
         status = 130
         termination = "interrupted"
+    # The child has exited, so even buffered log records are now available.
+    if status == 0 and not audit_gpu_execution(directory):
+        status = 1
+        termination = "gpu_execution_unverified"
     metadata = json.loads(metadata_path.read_text())
     metadata["status"] = "success" if status == 0 else "failed"
     metadata["exit_code"] = status
@@ -344,6 +354,65 @@ def supervise(args, directory, config_path, validate, references, compression_pl
     )
     write_json(summary_path, summary)
     return status if status >= 0 else 1
+
+
+def audit_gpu_execution(directory):
+    """Require a keyed GPU window AND successful, fallback-disabled consumption.
+
+    A window's outcome describes cleanup, not SQL success. Only the combination
+    with the worker's successful request and verified fallback policy certifies it.
+    Run in the supervisor after child exit, outside all benchmark measurements.
+    """
+    split_keyed_logs(directory)
+    path = directory / "csv" / "concurrent_runtimes.csv"
+    with path.open(newline="") as source:
+        records = list(csv.DictReader(source))
+    missing = []
+    for record in records:
+        if record["engine"] != "sirius" or record["status"] != "success":
+            continue
+        label = (
+            f"readonly_s{record['stream_id']}_{record['query']}_i{record['iteration']}"
+        )
+        log_path = directory / "sirius" / "execution_logs" / f"{label}.log"
+        evidence = log_path.read_text() if log_path.exists() else ""
+        if record.get("gpu_fallback_disabled") != "True" or not re.search(
+            r"\[window\] end .*\boutcome=ok\b", evidence
+        ):
+            record["status"] = "error"
+            record["error"] = (
+                "GPU execution unverified: require attributed GPU window, successful request and disabled fallback"
+            )
+            missing.append(label)
+    if not missing:
+        return True
+    with path.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(records)
+    summary_path = directory / "concurrent_summary.json"
+    summary = json.loads(summary_path.read_text())
+    gpu_records = []
+    for record in records:
+        if record["engine"] == "sirius":
+            gpu_records.append(
+                record
+                | {
+                    "end_s": float(record["end_s"]),
+                    "runtime_s": float(record["runtime_s"]),
+                }
+            )
+    old = summary["engines"]["sirius"]
+    summary["engines"]["sirius"] = summarize(
+        gpu_records, old["expected"], old["setup_errors"]
+    )
+    summary["gpu_execution_unverified"] = missing
+    write_json(summary_path, summary)
+    print(
+        f"GPU execution unverified for {len(missing)} requests; inspect attributed logs",
+        flush=True,
+    )
+    return False
 
 
 class CaptureBudget:
@@ -382,6 +451,8 @@ def execute_request(connection, sql, timeout, capture, budget):
     timer = threading.Timer(timeout, interrupt) if timeout else None
     rows = [] if capture else None
     count = charged = 0
+    error = ""
+    failed = False
     start = time.perf_counter()
     if timer:
         timer.start()
@@ -395,12 +466,18 @@ def execute_request(connection, sql, timeout, capture, budget):
             if capture:
                 charged += budget.add(chunk)
                 rows.extend(chunk)
-        end = time.perf_counter()
-        if expired.is_set():
-            raise TimeoutError("query timeout, including admission wait")
-        return start, end, count, rows, "success", ""
     except Exception as exc:
+        failed = True
+        error = str(exc)
+    finally:
         end = time.perf_counter()
+        if timer:
+            timer.cancel()
+            # No late interrupt may reach the next query on this connection.
+            timer.join()
+    # A callback already running when cancel() was called must finish before
+    # classifying the result, as well as before the next request can start.
+    if expired.is_set() or failed:
         if charged:
             budget.release(charged)
         return (
@@ -409,13 +486,9 @@ def execute_request(connection, sql, timeout, capture, budget):
             count,
             None,
             "timeout" if expired.is_set() else "error",
-            str(exc),
+            error or "query timeout, including admission wait",
         )
-    finally:
-        if timer:
-            timer.cancel()
-            # No late interrupt may reach the next query on this connection.
-            timer.join()
+    return start, end, count, rows, "success", ""
 
 
 def run_phase(
@@ -481,6 +554,10 @@ def run_phase(
             if use_gpu:
                 con.execute("SET gpu_execution=true")
                 con.execute("SET enable_duckdb_fallback=false")
+                if con.execute(
+                    "SELECT current_setting('enable_duckdb_fallback')"
+                ).fetchone() != (False,):
+                    raise RuntimeError("GPU worker could not disable DuckDB fallback")
                 con.execute(
                     f"CALL sirius_set_session_label('readonly_stream_{stream}')"
                 )
@@ -531,6 +608,7 @@ def run_phase(
                             status,
                             count,
                             error,
+                            use_gpu,
                         ),
                     )
                 )

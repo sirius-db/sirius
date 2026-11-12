@@ -5,11 +5,60 @@ import unittest
 from unittest.mock import patch
 
 import duckdb
+from queries import queries_for_scale_factor
 
 import tpch_power_throughput as throughput
 
 
 class ThroughputValidationTests(unittest.TestCase):
+    @patch.object(throughput, "log")
+    def test_q15_measured_cte_rows_are_compared_with_cpu_reference(self, _log):
+        con = duckdb.connect()
+        self.addCleanup(con.close)
+        con.execute(
+            "CREATE TABLE supplier AS SELECT 1 s_suppkey, 'name' s_name, 'address' s_address, 'phone' s_phone"
+        )
+        con.execute(
+            "CREATE TABLE lineitem AS SELECT 1 l_suppkey, 100::DECIMAL(12,2) l_extendedprice, 0.1::DECIMAL(12,2) l_discount, DATE '1993-06-01' l_shipdate"
+        )
+        statements = [queries_for_scale_factor(1)["q15"]]
+        _, measured = throughput.timed_query(con, statements, 0)
+        reference = throughput.cpu_pass(con, [(15, statements)], 0)
+        self.assertEqual(len(measured), 1)
+        self.assertEqual(measured[0][0], 1)
+        self.assertEqual(measured[0][-1], 90)
+        self.assertIsNone(throughput.compare_rows(reference[15], measured))
+        self.assertEqual(
+            throughput.validate_throughput(
+                {1: {15: measured}}, {"baseline": reference}
+            ),
+            {},
+        )
+        changed = [(*measured[0][:-1], 999)]
+        self.assertIn(
+            "stream1_q15",
+            throughput.validate_throughput({1: {15: changed}}, {"baseline": reference}),
+        )
+
+    def test_legacy_q15_view_sequence_retains_select_rows(self):
+        con = duckdb.connect()
+        self.addCleanup(con.close)
+        _, rows = throughput.timed_query(
+            con,
+            [
+                "CREATE VIEW revenue AS SELECT 90 AS value",
+                "SELECT * FROM revenue",
+                "DROP VIEW revenue",
+            ],
+            0,
+        )
+        self.assertEqual(rows, [(90,)])
+        self.assertFalse(
+            throughput._is_select(
+                "WITH values_cte AS (SELECT 1) INSERT INTO sample SELECT * FROM values_cte"
+            )
+        )
+
     def setUp(self):
         self.snapshots = {
             "baseline": {1: [(10,)], 6: [(20,)]},
