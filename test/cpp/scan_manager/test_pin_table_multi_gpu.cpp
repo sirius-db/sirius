@@ -52,6 +52,7 @@
 //
 // Both tests gate on require_two_gpus() and silently skip on 1-GPU hosts.
 
+#include "compression/compression_converters.hpp"
 #include "operator/mgpu_test_utils.hpp"
 #include "sirius_context.hpp"
 
@@ -268,19 +269,19 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
 }
 
 //===----------------------------------------------------------------------===//
-// Admission gate: a Simpatico-compressed GPU-tier chunk is decoded on the GPU that holds it
-// (compressed pins have no cross-GPU copy step), so a query that admission narrows to fewer
-// GPUs must keep every GPU holding one of its compressed chunks. Without that, the scan of a
-// chunk on an excluded GPU is moved to an admitted GPU, whose decoder then reads another
-// GPU's memory: a remote read where the pools have peer access, an illegal address (and a
-// lost CUDA context) where they do not.
+// Admission gate: when admission narrows a query to fewer GPUs, the scan of a
+// Simpatico-compressed GPU-tier chunk held by an excluded GPU runs on an admitted one. The
+// chunk's cached table is views into its owner's memory, so the admitted GPU copies the
+// compressed bytes over and decodes them itself. Decoding the cached table directly would be a
+// remote read where the pools have peer access, and an illegal address (and a lost CUDA
+// context) where they do not.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under gpus_per_query",
+TEST_CASE("pin_table - a compressed GPU pin is served on the admitted GPU under gpus_per_query",
           "[pin_mgpu][scan_manager][multi_gpu][admission]")
 {
   if (!require_two_gpus()) return;
 
-  auto tmp = make_tmp("owner-admission");
+  auto tmp = make_tmp("compressed-admission");
   std::error_code ec;
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
@@ -296,8 +297,8 @@ TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under 
             "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
   }
 
-  // 1 MB batches spread the pin's chunks over both GPUs; gpus_per_query: 1 would, on its own,
-  // admit every query onto GPU 0 alone.
+  // 1 MB batches spread the pin's chunks over both GPUs; gpus_per_query: 1 admits every query
+  // onto the first GPU alone.
   mgpu_env_params params;
   params.scan_task_batch_size = 1'000'000;
   params.gpus_per_query       = 1;
@@ -328,7 +329,7 @@ TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under 
     // The pin has to be the case under test: every chunk compressed, held by both GPUs.
     std::size_t chunks     = 0;
     std::size_t compressed = 0;
-    std::set<int> owners;
+    std::map<int, std::size_t> chunks_per_owner;
     auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
     sirius_ctx->get_scan_manager().visit_pinned_entries(
@@ -338,15 +339,16 @@ TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under 
         for (auto const& chunk : entry.device_chunks) {
           if (chunk.compressed) {
             ++compressed;
-            owners.insert(chunk.compressed->get_memory_space().get_device_id());
+            ++chunks_per_owner[chunk.compressed->get_memory_space().get_device_id()];
           }
         }
         return false;  // found
       });
-    INFO("chunks=" << chunks << " compressed=" << compressed << " owner_gpus=" << owners.size());
+    INFO("chunks=" << chunks << " compressed=" << compressed
+                   << " owner_gpus=" << chunks_per_owner.size());
     REQUIRE(chunks >= 2u);
     REQUIRE(compressed == chunks);
-    REQUIRE(owners.size() >= 2u);
+    REQUIRE(chunks_per_owner.size() >= 2u);
 
     // Replace the files with a larger surface. The file set is unchanged, so the pin still
     // serves the scan, and the original values coming back prove the query read the pinned
@@ -364,11 +366,24 @@ TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under 
       return out;
     };
 
+    // Admission keeps the first of the process's GPUs. Every chunk on another GPU has to be
+    // copied to it.
+    auto const executors = tasks_per_gpu();
+    REQUIRE_FALSE(executors.empty());
+    auto const admitted_gpu   = executors.begin()->first;
+    std::size_t remote_chunks = 0;
+    for (auto const& [owner, owned] : chunks_per_owner) {
+      if (owner != admitted_gpu) { remote_chunks += owned; }
+    }
+    REQUIRE(remote_chunks >= 1u);
+
     auto const query = "SELECT max(k), sum(k), sum(v) FROM read_parquet('" + glob + "');";
     for (int iteration = 0; iteration < 2; ++iteration) {
-      auto before       = tasks_per_gpu();
-      auto const result = run_ok(query);
-      auto after        = tasks_per_gpu();
+      auto before              = tasks_per_gpu();
+      auto const copied_before = sirius::compressed_chunks_decoded_on_another_gpu();
+      auto const result        = run_ok(query);
+      auto const copied        = sirius::compressed_chunks_decoded_on_another_gpu() - copied_before;
+      auto after               = tasks_per_gpu();
 
       // 4 files of range(100000): max(k) = 99999, sum(k) = 4 * 4999950000, sum(v) = 2 * sum(k).
       REQUIRE(result->RowCount() == 1);
@@ -377,12 +392,18 @@ TEST_CASE("pin_table - a compressed GPU pin keeps its owner GPUs admitted under 
       CHECK(rows.GetValue(1, 0).ToString() == "19999800000");
       CHECK(rows.GetValue(2, 0).ToString() == "39999600000");
 
-      // Every GPU holding a compressed chunk ran part of the query, although gpus_per_query
-      // is 1: its chunks were decoded where they live.
-      for (int const owner : owners) {
-        INFO("iteration=" << iteration << " owner gpu=" << owner
-                          << " tasks before=" << before[owner] << " after=" << after[owner]);
-        CHECK(after[owner] > before[owner]);
+      // gpus_per_query held: only the admitted GPU ran tasks, and it decoded the chunks the
+      // other GPUs hold from its own copy of their compressed bytes.
+      INFO("iteration=" << iteration << " admitted gpu=" << admitted_gpu
+                        << " remote chunks=" << remote_chunks << " copied=" << copied);
+      CHECK(copied >= remote_chunks);
+      for (auto const& [device, executed] : after) {
+        INFO("gpu=" << device << " tasks before=" << before[device] << " after=" << executed);
+        if (device == admitted_gpu) {
+          CHECK(executed > before[device]);
+        } else {
+          CHECK(executed == before[device]);
+        }
       }
     }
 

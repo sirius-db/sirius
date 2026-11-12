@@ -24,6 +24,15 @@ The scan orders their input reads after writes on the task stream, waits for the
 before returning, and rebinds the decoded columns to the task stream (`decompress_chunk`
 in `src/compression/compressed_scan.cpp`).
 
+A GPU-tier compressed chunk is decoded in place on the GPU that holds it. When query admission
+(`topology.gpus_per_query` or `admission_bytes_per_gpu`) assigns its scan to another GPU, the
+converter copies the compressed buffers of the projected columns to that GPU and decodes them
+there, as it does for a host-tier compressed chunk. The copy is a peer copy where the two GPUs'
+pools have peer access and is staged through pinned host memory otherwise
+(`memory::enqueue_device_copy`). The pinned chunk stays on its GPU and is only read. Such a
+scan pays a transfer of the compressed bytes per query, and its reservation covers the copied
+compressed bytes together with the decoded output.
+
 ## Decode-time equality pushdown
 
 A string equality filter over a compressed pinned column can be evaluated *inside* the
