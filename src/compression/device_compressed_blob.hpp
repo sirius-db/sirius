@@ -25,6 +25,7 @@
 
 #include <api/simpatico_codegen.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -96,6 +97,14 @@ struct slab_memory_resource {
   }
 };
 
+/// Where one payload buffer of a compressed chunk sits in device memory, keyed by the offset
+/// the chunk's .hpln header records for it.
+struct compressed_payload_slice {
+  std::uint64_t header_offset{0};
+  std::byte const* data{nullptr};
+  std::uint64_t size_bytes{0};
+};
+
 /// Holds the single contiguous device payload and the compressed_table whose leaf channels_
 /// are non-owning slices of that payload. Shared among all projections of the same pin chunk
 /// via shared_ptr. payload must be declared before table so it is destroyed after table:
@@ -107,6 +116,30 @@ struct compressed_device_blob {
   std::size_t slab_cursor{0};  // owns the slab's advance cursor (see slab_memory_resource)
   slab_memory_resource slab_mr;
   simpatico::compressed_table table;
+
+  /// What another GPU needs to decode this chunk: the chunk's .hpln header, and for every
+  /// non-empty payload buffer the header names, where its bytes are on the GPU that holds the
+  /// chunk. `table` cannot serve that purpose, because its leaves are views into this GPU's
+  /// memory. A GPU other than the owner copies the buffers it needs and rebuilds the table from
+  /// the header (see decompress_device_to_gpu). `slices` is ordered by ascending header offset
+  /// and points into storage this blob owns. An empty header means the chunk can only be decoded
+  /// on the GPU that holds it.
+  std::vector<std::uint8_t> header;
+  std::vector<compressed_payload_slice> slices;
+
+  /// The slice the header places at @p header_offset, or null.
+  [[nodiscard]] compressed_payload_slice const* find_slice(
+    std::uint64_t header_offset) const noexcept
+  {
+    auto const it =
+      std::lower_bound(slices.begin(),
+                       slices.end(),
+                       header_offset,
+                       [](compressed_payload_slice const& slice, std::uint64_t offset) {
+                         return slice.header_offset < offset;
+                       });
+    return it != slices.end() && it->header_offset == header_offset ? &*it : nullptr;
+  }
 };
 
 }  // namespace sirius

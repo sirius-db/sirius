@@ -22,9 +22,11 @@
 // vector to the (possibly cloned) batches underlying the read-only accessors, and the
 // target-space-aware bytes_to_materialize_input estimator.
 
+#include "api/compressed_table_io.hpp"
 #include "api/simpatico_codegen.hpp"
 #include "catch.hpp"
 #include "compression/compressed_representation.hpp"
+#include "compression/compression_converters.hpp"
 #include "compression/device_compressed_blob.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -35,7 +37,6 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
-#include "transparent/replay_admission.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
@@ -58,7 +59,9 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <future>
 #include <memory>
 #include <numeric>
@@ -758,11 +761,65 @@ TEST_CASE("cached scan assigned away from its pin clones and reserves on the tar
   target_stream.synchronize();
 }
 
-// A Simpatico-compressed pinned chunk has no cross-GPU copy step: its decoder reads the
-// compressed buffers where pin time left them. Decoding it from another GPU is a remote read
-// when the pools have peer access (this test then fails because nothing is refused) and an
-// illegal address when they do not (the process loses its CUDA context).
-TEST_CASE("compressed cached scan assigned away from its pin is refused before decoding",
+namespace {
+
+/// One bitpacked INT64 column compressed on @p space, held the way pin_table(tier='gpu') holds
+/// a chunk. With @p relocatable the chunk also carries its header and the place of each payload
+/// buffer, which is what lets another GPU copy and decode it.
+std::shared_ptr<sirius::compressed_device_representation> make_compressed_pin_chunk(
+  cudf::table_view const& input,
+  cucascade::memory::memory_space& space,
+  ::cuda::stream_ref stream,
+  bool relocatable)
+{
+  auto blob   = std::make_shared<sirius::compressed_device_blob>();
+  blob->table = simpatico::compress_with_plan(
+    input,
+    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    stream,
+    space.get_default_allocator());
+  stream.sync();
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  REQUIRE(
+    simpatico::build_compressed_table_header(blob->table, header, buffers, payload_bytes, stream)
+      .empty());
+  stream.sync();
+  if (relocatable) {
+    for (auto const& buffer : buffers) {
+      if (buffer.size_bytes == 0) { continue; }
+      blob->slices.push_back(sirius::compressed_payload_slice{
+        buffer.offset, static_cast<std::byte const*>(buffer.device_ptr), buffer.size_bytes});
+    }
+    blob->header = std::move(header);
+  }
+  return std::make_shared<sirius::compressed_device_representation>(
+    space,
+    std::move(blob),
+    std::vector<std::string>{"k"},
+    static_cast<std::size_t>(payload_bytes),
+    static_cast<std::size_t>(input.num_rows()) * sizeof(std::int64_t),
+    static_cast<std::int64_t>(input.num_rows()));
+}
+
+/// The batch a query scans a pinned chunk through: its own projection, sharing the chunk.
+std::shared_ptr<cucascade::data_batch> project_pin_chunk(
+  sirius::compressed_device_representation const& pinned)
+{
+  std::vector<std::size_t> const all_columns{0};
+  return cucascade::data_batch::make(sirius::get_next_batch_id(),
+                                     pinned.select_columns(all_columns));
+}
+
+}  // namespace
+
+// Admission can assign the scan of a compressed pinned chunk to a GPU other than the one that
+// holds it. The decoder cannot read the owner's buffers from there (an illegal address when
+// the two GPUs have no peer access), so the compressed bytes are copied to the assigned GPU
+// and decoded there.
+TEST_CASE("compressed cached scan assigned away from its pin is copied and decoded there",
           "[batch_lock_utils][cached_scan_placement][multi_gpu]")
 {
   if (skip_if_not_mgpu()) return;
@@ -772,44 +829,93 @@ TEST_CASE("compressed cached scan assigned away from its pin is refused before d
   rmm::cuda_stream source_stream;
   ::cuda::stream_ref const source_stream_ref{source_stream};
 
-  // One bitpacked INT64 column compressed on gpu0, the shape pin_table(tier='gpu') stores.
   auto table = sirius::create_cudf_table_with_random_data(kNumRows,
                                                           {cudf::data_type{cudf::type_id::INT64}},
                                                           {std::make_pair(0, 1000000)},
                                                           source_stream_ref,
                                                           f.gpu0->get_default_allocator());
   source_stream.synchronize();
-  auto blob   = std::make_shared<sirius::compressed_device_blob>();
-  blob->table = simpatico::compress_with_plan(
-    table->view(),
-    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
-    source_stream_ref,
-    f.gpu0->get_default_allocator());
-  source_stream.synchronize();
-  auto batch =
-    cucascade::data_batch::make(sirius::get_next_batch_id(),
-                                std::make_unique<sirius::compressed_device_representation>(
-                                  *f.gpu0,
-                                  std::move(blob),
-                                  std::vector<std::string>{"k"},
-                                  /*compressed_bytes=*/64,
-                                  /*uncompressed_bytes=*/kNumRows * sizeof(std::int64_t),
-                                  /*num_rows=*/static_cast<std::int64_t>(kNumRows)));
-  auto scan = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+  auto const values = column_values_to_host<int64_t>(table->view().column(0), source_stream_ref);
+  auto pinned       = make_compressed_pin_chunk(table->view(), *f.gpu0, source_stream_ref, true);
+  table.reset();
+  auto const compressed_bytes   = pinned->get_size_in_bytes();
+  auto const uncompressed_bytes = pinned->get_uncompressed_data_size_in_bytes();
 
-  std::optional<sirius::transparent::late_failure_cause> refusal;
+  {
+    rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+    rmm::cuda_stream target_stream;
+    auto input =
+      std::make_unique<sirius::op::scan::scan_operator_input>(project_pin_chunk(*pinned));
+    auto* scan = input.get();
+    sirius::pipeline::gpu_pipeline_task_local_state state(std::move(input));
+    CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu0) == 0);
+    // On another GPU the copied compressed bytes and the decoded output are live together.
+    CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu1) ==
+          compressed_bytes + uncompressed_bytes);
+
+    auto const copied_before = sirius::compressed_chunks_decoded_on_another_gpu();
+    scan->prepare_for_processing(f.gpu1, target_stream);
+    CHECK(sirius::compressed_chunks_decoded_on_another_gpu() == copied_before + 1);
+    CHECK(scan->gpu_memory_space == f.gpu1);
+    // A scan without a filter takes the decoded table out of its batch.
+    REQUIRE(scan->stolen_table);
+    CHECK(column_values_to_host<int64_t>(scan->stolen_table->view().column(0), target_stream) ==
+          values);
+    // An out-of-memory retry reuses the decoded input.
+    scan->prepare_for_processing(f.gpu1, target_stream);
+    CHECK(scan->stolen_table);
+    CHECK(sirius::compressed_chunks_decoded_on_another_gpu() == copied_before + 1);
+    target_stream.synchronize();
+  }
+
+  // The pinned chunk was only read: it is still on its owner, which decodes it in place.
+  CHECK(pinned->get_memory_space().get_id() == f.gpu0->get_id());
+  sirius::op::scan::scan_operator_input local_scan{project_pin_chunk(*pinned)};
+  auto const copied_after = sirius::compressed_chunks_decoded_on_another_gpu();
+  local_scan.prepare_for_processing(f.gpu0, source_stream);
+  CHECK(sirius::compressed_chunks_decoded_on_another_gpu() == copied_after);
+  CHECK(local_scan.gpu_memory_space == f.gpu0);
+  REQUIRE(local_scan.stolen_table);
+  CHECK(column_values_to_host<int64_t>(local_scan.stolen_table->view().column(0),
+                                       source_stream_ref) == values);
+  source_stream.synchronize();
+}
+
+// A chunk without the layout cannot be copied. Decoding its cached table from another GPU
+// would read the owner's memory, so the scan fails before anything runs on the GPU.
+TEST_CASE("compressed cached scan without a copy layout is refused on another GPU",
+          "[batch_lock_utils][cached_scan_placement][multi_gpu]")
+{
+  if (skip_if_not_mgpu()) return;
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+  rmm::cuda_stream source_stream;
+  ::cuda::stream_ref const source_stream_ref{source_stream};
+
+  auto table = sirius::create_cudf_table_with_random_data(kNumRows,
+                                                          {cudf::data_type{cudf::type_id::INT64}},
+                                                          {std::make_pair(0, 1000000)},
+                                                          source_stream_ref,
+                                                          f.gpu0->get_default_allocator());
+  source_stream.synchronize();
+  auto pinned = make_compressed_pin_chunk(table->view(), *f.gpu0, source_stream_ref, false);
+  table.reset();
+  auto batch = project_pin_chunk(*pinned);
+  auto scan  = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+
+  std::string refusal;
   {
     rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
     rmm::cuda_stream target_stream;
     try {
       scan->prepare_for_processing(f.gpu1, target_stream);
-    } catch (sirius::transparent::classified_execution_error const& refused) {
-      refusal = refused.cause;
+    } catch (std::exception const& refused) {
+      refusal = refused.what();
     }
     target_stream.synchronize();
   }
-  REQUIRE(refusal.has_value());
-  CHECK(*refusal == sirius::transparent::late_failure_cause::gpu_error);
+  CHECK(refusal.find("carries no layout to copy it") != std::string::npos);
 
   // The refusal touched nothing: the chunk is still compressed and still on its owner.
   {

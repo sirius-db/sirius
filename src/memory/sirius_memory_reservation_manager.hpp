@@ -52,6 +52,21 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
   [[nodiscard]] static std::optional<allocation_tracking_scope> gpu_allocation_tracking_scope(
     cucascade::memory::memory_space const& space);
 
+  /**
+   * @brief Look up the HOST space a live manager's GPU space stages cross-GPU copies through.
+   *
+   * It is the manager's first HOST space, the one the task creator hands to pipeline tasks. Code
+   * that is given only a GPU space, such as a representation converter, uses it for
+   * memory::enqueue_device_copy when two GPUs cannot copy to each other directly. Lookups are
+   * synchronized; the returned space lives as long as the manager that owns @p space.
+   *
+   * @param space GPU memory space to look up
+   * @return The staging space, or nullptr if @p space is unregistered or its manager has no HOST
+   * space
+   */
+  [[nodiscard]] static cucascade::memory::memory_space const* host_staging_space(
+    cucascade::memory::memory_space const& space);
+
  private:
   std::vector<runtime_stream_pool::registration> runtime_stream_pools_;
   void restore_device_resources() noexcept;
