@@ -656,7 +656,10 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     std::lock_guard lock{state_mutex_};
     state_ = cluster_state::starting;
     reason_.clear();
-    if (discard_log) { ddl_log_.clear(); }
+    if (discard_log) {
+      ddl_log_.clear();
+      saved_log_pending_ = false;
+    }
   }
   try {
     {
@@ -921,17 +924,20 @@ void gateway_state::stop_locked()
 void gateway_state::recover_locked(ClientContext& context)
 {
   std::vector<std::string> log;
+  bool from_file = false;
   {
     std::lock_guard lock{state_mutex_};
     log = ddl_log_;
+    // Still the saved log if an earlier attempt to replay it did not finish.
+    from_file = saved_log_pending_;
   }
   // A gateway that restarted has an empty log: its ranks replay the one it saved.
-  auto const file      = ddl_file(context);
-  bool const from_file = log.empty() && !file.empty() && std::filesystem::exists(file);
-  if (from_file) {
+  auto const file = ddl_file(context);
+  if (log.empty() && !file.empty() && std::filesystem::exists(file)) {
     log = load_ddl_log(file);
     std::lock_guard lock{state_mutex_};
-    ddl_log_ = log;
+    ddl_log_           = log;
+    saved_log_pending_ = from_file = true;
   }
   start_locked(context, options_);
   std::vector<std::string> kept;
@@ -959,11 +965,16 @@ void gateway_state::recover_locked(ClientContext& context)
       throw IOException(reason_);
     }
   }
-  if (skipped.empty()) { return; }
+  if (skipped.empty()) {
+    std::lock_guard lock{state_mutex_};
+    saved_log_pending_ = false;
+    return;
+  }
   std::fprintf(stderr, "sirius_gateway: %s\n", skipped.c_str());
   auto const save_error = try_save_ddl_log(file, kept);
   std::lock_guard lock{state_mutex_};
-  ddl_log_ = std::move(kept);
+  ddl_log_           = std::move(kept);
+  saved_log_pending_ = false;
   // Shown in sirius_gateway_status's error column until the next state change or start.
   reason_ = skipped + (save_error.empty() ? "" : "; " + save_error);
 }

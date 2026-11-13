@@ -84,7 +84,20 @@ FROM sirius_gateway_test_serve(19961, 'replaytoken', '');
 statement ok
 FROM sirius_gateway_add_rank('127.0.0.1:19961', exchange_port := 27261, token := 'replaytoken', name := 'a');
 
-# The first statement starts the ranks and replays the saved log: the failing entry is skipped,
+# A first start that fails before the replay does not make the saved entries fatal: the next
+# start still skips the one that cannot replay.
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'SELECT error(''setup refused'')';
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+failed its session setup
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = '';
+
+# The next statement starts the ranks and replays the saved log: the failing entry is skipped,
 # not a reason to fail this statement and every one after it.
 query II
 FROM sirius_gateway_run('SELECT (FROM a), (FROM b)');
