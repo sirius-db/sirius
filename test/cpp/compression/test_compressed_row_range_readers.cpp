@@ -1367,6 +1367,76 @@ TEST_CASE("compressed readers keep, rebuild or do without the reader state",
   }
 }
 
+/// Reads on @p stream, bypassing the helpers that use the default stream.
+cucascade::row_range_result read_rows_on(tier const& t,
+                                         std::span<const std::size_t> columns,
+                                         std::size_t row_begin,
+                                         std::size_t max_rows,
+                                         std::vector<dst_column> const& dsts,
+                                         ::cuda::stream_ref stream,
+                                         reader_state* state)
+{
+  std::vector<cucascade::column_destination> dest;
+  for (auto const& d : dsts) {
+    dest.push_back(d.dest);
+  }
+  cucascade::row_range_request request;
+  request.columns   = columns;
+  request.row_begin = row_begin;
+  request.max_rows  = max_rows;
+  auto ro           = t.batch->to_read_only();
+  return cucascade::read_rows_into(registry(), ro, request, dest, stream, nullptr, state);
+}
+
+TEST_CASE("compressed readers follow the caller from one stream to another",
+          "[compressed_row_range_readers]")
+{
+  if (!has_gpu()) { return; }
+  auto const& main            = main_batch();
+  const std::size_t columns[] = {kSplitNulls, kSorted, kDict, kRandomNulls, kRuns};
+  rmm::cuda_stream streams[2];
+
+  SECTION("one state, alternating streams")
+  {
+    for (auto const& t : main.tiers) {
+      INFO(t.name);
+      reader_state state;
+      std::size_t row_begin = 0;
+      for (int read = 0; read < 12; ++read) {
+        auto dsts = roomy_dsts(main.data, columns, 1700, 5, 2);
+        utils::default_stream().sync();  // the destinations were filled on the default stream
+        // Two reads per stream, then the other one.
+        auto& stream = streams[(read / 2) % 2];
+        auto result  = read_rows_on(t, columns, row_begin, 1700, dsts, stream, &state);
+        stream.synchronize();
+        check_read(main.data, columns, dsts, row_begin, 1700, result);
+        row_begin += result.rows_written;
+      }
+    }
+  }
+  SECTION("the state is dropped right after a read on another stream")
+  {
+    // Nothing waits for the stream between the read and the drop of the state (and, with no
+    // state slot, the end of the call): the reader keeps what the queued work reads alive.
+    const std::size_t fixed[] = {kSorted, kRandom, kRuns};
+    for (auto const& t : main.tiers) {
+      INFO(t.name);
+      for (bool keep_state : {true, false}) {
+        auto dsts = roomy_dsts(main.data, fixed, 9000, 3);
+        utils::default_stream().sync();
+        cucascade::row_range_result result;
+        {
+          reader_state state;
+          result =
+            read_rows_on(t, fixed, 1234, 9000, dsts, streams[0], keep_state ? &state : nullptr);
+        }
+        streams[0].synchronize();
+        check_read(main.data, fixed, dsts, 1234, 9000, result);
+      }
+    }
+  }
+}
+
 TEST_CASE("compressed readers refuse a column whose plan is not chunk-decodable",
           "[compressed_row_range_readers]")
 {

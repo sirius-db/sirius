@@ -57,6 +57,14 @@ using cucascade::row_range_unsupported_error;
 /// source. `storage` addresses the batch's shared backing store (device blob, pinned blob,
 /// file). The wrapped source owns a share of that store, so the address cannot be reused by
 /// another batch while this state lives.
+///
+/// It also keeps the payload alive for the reads enqueued from it. A read leaves copies and
+/// kernels on its stream that still read the payload (pinned host blocks, the device blob) after
+/// the call returns, and nothing else orders the payload's release after them: a HOST batch
+/// records no reader event, and a device blob is freed on its own allocation stream. Every read
+/// therefore records an event on its stream, and the destructor waits for the last one before
+/// it lets go of the wrapped source. The cursors of a state hold this source too, so it is
+/// destroyed after them.
 class tagged_payload_source final : public simpatico::payload_source {
  public:
   tagged_payload_source(std::shared_ptr<simpatico::payload_source> source,
@@ -65,6 +73,18 @@ class tagged_payload_source final : public simpatico::payload_source {
     : _source(std::move(source)), _type(type), _storage(storage)
   {
   }
+
+  ~tagged_payload_source() override
+  {
+    wait_for_reads();
+    if (_event != nullptr) {
+      device_scope const scope{_device};
+      CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(_event));
+    }
+  }
+
+  tagged_payload_source(const tagged_payload_source&)            = delete;
+  tagged_payload_source& operator=(const tagged_payload_source&) = delete;
 
   void read_to_device(std::uint64_t offset,
                       std::uint64_t size,
@@ -84,7 +104,62 @@ class tagged_payload_source final : public simpatico::payload_source {
     return _type == type && _storage == storage;
   }
 
+  /// Whether reads were enqueued on a stream other than @p stream.
+  [[nodiscard]] bool last_read_on_other_stream(cudaStream_t stream) const noexcept
+  {
+    return _event != nullptr && _stream != stream;
+  }
+
+  /// Marks the end of the work a read enqueued on @p stream.
+  void record_read(cudaStream_t stream) noexcept
+  {
+    if (_event == nullptr) {
+      CUCASCADE_ASSERT_CUDA_SUCCESS(cudaGetDevice(&_device));
+      if (cudaEventCreateWithFlags(&_event, cudaEventDisableTiming) != cudaSuccess) {
+        // No event to wait on later: finish the work now.
+        _event = nullptr;
+        CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream));
+        return;
+      }
+    }
+    _stream = stream;
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventRecord(_event, stream));
+  }
+
+  /// Blocks until the device has run everything the reads so far enqueued.
+  void wait_for_reads() const noexcept
+  {
+    if (_event == nullptr) { return; }
+    device_scope const scope{_device};
+    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventSynchronize(_event));
+  }
+
  private:
+  /// Makes @p device current for the scope: the state may be dropped on a thread bound to
+  /// another GPU than the one the reads ran on.
+  class device_scope {
+   public:
+    explicit device_scope(int device) noexcept
+    {
+      if (cudaGetDevice(&_previous) == cudaSuccess && _previous != device) {
+        _restore = cudaSetDevice(device) == cudaSuccess;
+      }
+    }
+    ~device_scope()
+    {
+      if (_restore) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaSetDevice(_previous)); }
+    }
+    device_scope(const device_scope&)            = delete;
+    device_scope& operator=(const device_scope&) = delete;
+
+   private:
+    int _previous{0};
+    bool _restore{false};
+  };
+
+  cudaEvent_t _event{nullptr};
+  cudaStream_t _stream{nullptr};
+  int _device{0};
   std::shared_ptr<simpatico::payload_source> _source;
   std::type_index _type;
   const void* _storage;
@@ -122,7 +197,24 @@ const void* backing_store(const compressed_disk_representation& representation)
   return &representation.path();
 }
 
-/// The state in @p slot if it reads @p representation, else a new one stored in @p slot.
+/// Records, when a read returns or throws, the end of what it enqueued on its stream.
+class read_recorder {
+ public:
+  read_recorder(tagged_payload_source& source, cudaStream_t stream) noexcept
+    : _source(source), _stream(stream)
+  {
+  }
+  ~read_recorder() { _source.record_read(_stream); }
+  read_recorder(const read_recorder&)            = delete;
+  read_recorder& operator=(const read_recorder&) = delete;
+
+ private:
+  tagged_payload_source& _source;
+  cudaStream_t _stream;
+};
+
+/// The state in @p slot if it reads @p representation, else a new one stored in @p slot. The
+/// state's payload is a tagged_payload_source.
 template <typename Representation>
 compressed_reader_state& state_for(const Representation& representation,
                                    std::unique_ptr<cucascade::row_range_reader_state>& slot)
@@ -187,9 +279,25 @@ cucascade::row_range_result read_rows_compressed(
                             std::to_string(num_rows) + " rows");
   }
 
-  // A caller that keeps no state gets one for this call only.
+  // A caller that keeps no state gets one for this call only; dropping it at the end of the
+  // call waits for the read (see tagged_payload_source).
   std::unique_ptr<cucascade::row_range_reader_state> call_state;
-  auto& state = state_for(*representation, state_slot != nullptr ? *state_slot : call_state);
+  auto& state  = state_for(*representation, state_slot != nullptr ? *state_slot : call_state);
+  auto& tagged = static_cast<tagged_payload_source&>(*state.payload);
+
+  // One stream per set of cursors. A cursor's device buffers (staged payload, decoder state and
+  // scratch) are stream-ordered allocations of the stream that first needed them: they are
+  // reused without a wait by the next read and freed on that stream. When the caller moves to
+  // another stream (the merger's next task), the earlier reads are waited for and the cursors
+  // dropped, so that no device memory of the state is ever shared between two streams and every
+  // buffer is freed on the stream that last used it.
+  if (tagged.last_read_on_other_stream(stream.get())) {
+    tagged.wait_for_reads();
+    for (auto& cursor : state.cursors) {
+      cursor.reset();
+    }
+  }
+  read_recorder const recorder{tagged, stream.get()};
 
   rmm::cuda_stream_view const stream_view{stream.get()};
   auto const mr = scratch != nullptr ? scratch->get_memory_resource()
