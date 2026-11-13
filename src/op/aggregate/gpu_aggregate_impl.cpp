@@ -150,9 +150,31 @@ bool lowcard_groupby_enabled()
   return enabled;
 }
 
+/// The strings of the INT32 dictionary @p codes of a key, whose distinct values are @p strings.
+/// Rows that are NULL in @p codes are NULL in the result.
+std::unique_ptr<cudf::column> decode_key_codes(cudf::column_view codes,
+                                               cudf::column_view strings,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  cudf::column_view const code_values(
+    codes.type(), codes.size(), codes.head(), nullptr, 0, codes.offset());
+  cudf::column_view const dictionary(cudf::data_type{cudf::type_id::DICTIONARY32},
+                                     codes.size(),
+                                     nullptr,
+                                     codes.null_mask(),
+                                     codes.null_count(),
+                                     codes.offset(),
+                                     {code_values, strings});
+  return cudf::dictionary::decode(cudf::dictionary_column_view(dictionary), stream, mr);
+}
+
 /// Aggregate @p input_table grouped by the `group_idx` columns. Returns the table
 /// `[keys..., aggregates..., carried...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for
 /// the parameters.
+///
+/// A STRING key whose batch is dictionary-encoded is grouped on its INT32 codes, and its result
+/// column is decoded back to STRING.
 std::unique_ptr<cudf::table> grouped_aggregate_table(
   cudf::table_view input_table,
   const std::vector<int>& group_idx,
@@ -304,7 +326,9 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // expensive HLL-based NDV estimate.
   constexpr double dict_encode_min_avg_len = 8.0;
   constexpr double dict_encode_max_ratio   = 0.10;
-  std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
+  // The DICTIONARY32 column of each encoded key, by key position; the group-by runs on its codes.
+  std::vector<std::unique_ptr<cudf::column>> encoded_key_owners(group_idx.size());
+  std::vector<std::optional<cudf::column_view>> encoded_key_strings(group_idx.size());
   std::vector<cudf::column_view> group_cols;
   group_cols.reserve(group_idx.size());
   for (int idx : group_idx) {
@@ -324,8 +348,12 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
         if (ratio < dict_encode_max_ratio) {
           auto encoded =
             cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-          group_cols.push_back(encoded->view());
-          encoded_key_owners.push_back(std::move(encoded));
+          // Group on the INT32 codes, with the key's nulls. cuDF hashes and compares a
+          // DICTIONARY32 key through its strings, so only the codes give integer hashing.
+          cudf::dictionary_column_view const dictionary(encoded->view());
+          encoded_key_strings[group_cols.size()] = dictionary.keys();
+          encoded_key_owners[group_cols.size()]  = std::move(encoded);
+          group_cols.push_back(dictionary.get_indices_annotated());
           SIRIUS_LOG_DEBUG(
             "local_grouped_agg: dict-encoding key col {} (avg_len={:.1f}, ndv={}, rows={})",
             idx,
@@ -362,7 +390,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // The order is verified per batch, so unsorted batches keep the hash path.
   bool keys_sorted = false;
   if (!has_collect_set && group_cols.size() == 1 && key_is_radix_sortable(group_cols[0]) &&
-      !cudf::is_dictionary(group_cols[0].type())) {
+      !cudf::is_dictionary(group_cols[0].type()) && !encoded_key_strings[0]) {
     keys_sorted = keys_ascending(group_cols[0], stream);
     SIRIUS_LOG_DEBUG(
       "local_grouped_agg: sorted-key check rows={} sorted={}", input_table.num_rows(), keys_sorted);
@@ -598,7 +626,10 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
 
   // Decode dictionary-encoded group key columns back to STRING
   for (size_t i = 0; i < group_idx.size(); i++) {
-    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
+    if (encoded_key_strings[i]) {
+      output_cols[i] =
+        decode_key_codes(output_cols[i]->view(), *encoded_key_strings[i], stream, mr);
+    } else if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
       cudf::dictionary_column_view dict_view(output_cols[i]->view());
       output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
     }
