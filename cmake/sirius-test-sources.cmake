@@ -35,6 +35,8 @@ set(TEST_SOURCES
     test/cpp/compression/test_compression.cpp
     test/cpp/compression/test_decode_reservation.cpp
     test/cpp/compression/test_spill_compression.cpp
+    test/cpp/compression/test_compressed_payload_sources.cpp
+    test/cpp/compression/test_compressed_row_range_readers.cpp
     test/cpp/config/test_c_api_config.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_sort_merge_settings.cpp
@@ -276,6 +278,7 @@ set(TEST_SOURCES
     test/cpp/operator/merge/test_windowed_merge_differential.cpp
     test/cpp/operator/merge/test_merge_sort_continuation.cpp
     test/cpp/operator/merge/test_merge_sort_faults.cpp
+    test/cpp/operator/merge/test_windowed_merge_compressed.cpp
     test/cpp/operator/test_physical_order.cpp
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
