@@ -18,6 +18,7 @@
 #include "cucascade/utils/overloaded.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/average.hpp"
 #include "op/aggregate/stddev.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -350,16 +351,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
         avg_col = cudf::binary_operation(
           sum_view, count_view, cudf::binary_operator::DIV, slot.output_type, stream, mr);
       } else {
-        // Non-DECIMAL: cast to FLOAT64 and divide
-        auto sum_f64 = cudf::cast(sum_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
-        auto count_f64 =
-          cudf::cast(count_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
-        avg_col = cudf::binary_operation(sum_f64->view(),
-                                         count_f64->view(),
-                                         cudf::binary_operator::DIV,
-                                         cudf::data_type{cudf::type_id::FLOAT64},
-                                         stream,
-                                         mr);
+        avg_col = average_as_double(sum_view, count_view, stream, mr);
       }
       return avg_col;
     },
