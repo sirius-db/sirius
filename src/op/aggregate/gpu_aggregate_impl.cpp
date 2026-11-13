@@ -29,6 +29,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/lists/lists_column_view.hpp>
@@ -323,9 +324,18 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   std::vector<std::optional<cudf::column_view>> encoded_key_strings(group_idx.size());
   std::vector<cudf::column_view> group_cols;
   group_cols.reserve(group_idx.size());
+  // A dictionary carrier key groups on its INT32 codes, which cuDF hashes far faster than a
+  // dictionary column; the output codes are rewrapped with the carrier's keys below.
+  std::vector<std::optional<cudf::column_view>> carrier_keys(group_idx.size());
   for (int idx : group_idx) {
     if (use_label_keys) { break; }
     auto col = input_table.column(idx);
+    if (col.type().id() == cudf::type_id::DICTIONARY32) {
+      cudf::dictionary_column_view const dictionary(col);
+      carrier_keys[group_cols.size()] = dictionary.keys();
+      group_cols.push_back(dictionary.get_indices_annotated());
+      continue;
+    }
     if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
       cudf::strings_column_view scv(col);
       auto avg_len = static_cast<double>(scv.chars_size(stream)) / col.size();
@@ -541,6 +551,16 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       }
     } else {
       request.values = input_table.column(aggregate_col_id);
+      // cuDF's hash group-by rejects dictionary values, sending the whole batch down the sort
+      // path; a count reads only validity, which the codes share.
+      bool const counts_only =
+        std::ranges::all_of(input_col_to_agg[aggregate_col_id], [](auto const& agg) {
+          return agg->kind == cudf::aggregation::Kind::COUNT_VALID ||
+                 agg->kind == cudf::aggregation::Kind::COUNT_ALL;
+        });
+      if (request.values.type().id() == cudf::type_id::DICTIONARY32 && counts_only) {
+        request.values = cudf::dictionary_column_view(request.values).get_indices_annotated();
+      }
     }
     request.aggregations = std::move(input_col_to_agg[aggregate_col_id]);
     requests.push_back(std::move(request));
@@ -622,6 +642,14 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
                                   stream,
                                   mr);
     output_cols    = key_table->release();
+  }
+  for (size_t i = 0; i < carrier_keys.size(); i++) {
+    if (!carrier_keys[i]) { continue; }
+    output_cols[i] =
+      cudf::make_dictionary_column(std::make_unique<cudf::column>(*carrier_keys[i], stream, mr),
+                                   std::move(output_cols[i]),
+                                   stream,
+                                   mr);
   }
 
   // Decode the group key columns encoded above back to STRING. A key that arrived as a dictionary
