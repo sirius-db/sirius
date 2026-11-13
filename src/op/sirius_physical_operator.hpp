@@ -513,6 +513,10 @@ struct input_stats {
   /// scan_operator_input::conversion_destination_bytes). Zero means unknown; the scan estimate
   /// then keeps its conservative maximum-expansion bound.
   std::size_t conversion_destination_bytes = 0;
+  /// Total rows of the input batches, read from their representation metadata. Empty when a
+  /// batch records no row count (for example a packed host table) or the input is not a list of
+  /// batches; estimates then fall back to a bound derived from @ref bytes.
+  std::optional<std::size_t> rows;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
