@@ -49,9 +49,9 @@ SEED = 42
 DEFAULT_ROWS_PER_BATCH = 8_000_000
 DEFAULT_SPILL_MIN_BATCH_BYTES = 1 << 20
 
-# Names under --out-dir. The repository's .gitignore ignores `runs/` and
-# `*output.txt`; these names are not ignored, so a results directory can be
-# committed as the harness wrote it.
+# Names under --out-dir. Result directories are not committed: the default
+# out-dir (test/sort_performance/output/) and test/sort_performance/results/
+# are git-ignored.
 PER_RUN_DIR = "per_run"
 CHILD_STDOUT_FILE = "child_stdout.txt"
 LOG_TAIL_FILE = "sirius_log_tail.txt"

@@ -16,8 +16,9 @@ the row count, which the harness compares with `num_batches × rows_per_batch`.
 
 `bench_metrics.py` holds the log parsers and the GPU memory sampler the harness uses.
 
-The measured results and the `one_shot` deprecation recommendation are in
-[RESULTS.md](RESULTS.md); the result files are under `results/`.
+A summary of the measured results and the `one_shot` deprecation recommendation is in
+[RESULTS.md](RESULTS.md). Result directories are not committed: write them under the default
+`output/` or under `results/`, both git-ignored.
 
 ## Where to run it
 
@@ -98,8 +99,7 @@ The owner's decision of 2026-11-13 for the A/B is the **whole GPU with data at 5
   workstation's RAM (the process grew to 113 GiB), the machine swapped, and the run was stopped
   unfinished.
 - **One cell at a time, as a pair**: the `windowed` run, then the `one_shot` run of the same
-  dataset and compression setting, each its own harness invocation
-  (`results/full/whole-gpu-5x/driver.sh`).
+  dataset and compression setting, each its own harness invocation.
 
 ### Disk
 
@@ -112,12 +112,12 @@ That estimate covers the spilled inputs only. Intermediate merge passes spill th
 again: an uncompressed windowed run of the whole-GPU matrix moved up to 977 GB to disk over its
 duration (how much the disk held at one time was not sampled). Check `df -h /mnt/disk_2` before
 each run. Each run spills under `<spill-dir>/sort_bench_<timestamp>/<run>` and that directory is
-deleted when the run ends. `driver.sh` also removes leftover `sort_bench_*` directories before
-each run.
+deleted when the run ends. A script that runs several invocations should also remove leftover
+`sort_bench_*` directories before each run.
 
 The smoke command (`--gpu-limit-bytes 4294967296 --scale 3`) never spills to disk, because the
 default host tier holds all of its data. To exercise the disk tier at that size, add a
-`--base-config` with a small host capacity (see `results/smoke/disk-tier/`):
+`--base-config` with a small host capacity:
 
 ```yaml
 sirius:
@@ -195,10 +195,8 @@ In `--out-dir`:
   batch, for example) is kept 5 times, so it cannot fill the file. The file is empty when the
   log has no such line.
 
-The repository's `.gitignore` hides none of these names, so a results directory can be added to
-git as the harness wrote it. The directories under `results/` were written by an earlier version
-that used `runs/` and `child_output.txt`, which `.gitignore` does hide, and were renamed by hand
-to the names above.
+Result directories are not committed; `output/` and `results/` under `test/sort_performance/`
+are git-ignored.
 
 ### Columns of `results.csv`
 
@@ -273,8 +271,7 @@ for t in test/sort_performance/test_*.py; do pixi run python -B "$t"; done
 
 - `test_sort_merge_bench.py` and `test_bench_metrics.py` test the harness and the parsers.
   `test_bench_metrics_source_formats.py` checks the parsers against the log format strings in the
-  C++ sources. `test_smoke_results.py` and `test_full_results.py` check the files under
-  `results/` and `RESULTS.md`.
+  C++ sources.
 - `-B` stops Python from writing `test/sort_performance/__pycache__/`, which git does not ignore.
 - pytest is not in the pixi environment; the files run under `unittest`. Run each file as a
   script: `python -m unittest test.sort_performance...` does not work, because the standard

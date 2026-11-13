@@ -1,1 +1,0 @@
-simpatico::codegen: cpp encode: exception: std::bad_alloc: out_of_memory: not enough capacity to allocate memory

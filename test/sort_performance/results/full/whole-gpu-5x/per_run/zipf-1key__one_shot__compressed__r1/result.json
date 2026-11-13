@@ -1,6 +1,0 @@
-{
-  "status": "error",
-  "error": "Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit",
-  "wall_s": 373.8703028120217,
-  "load_s": 0.6373879219754599
-}

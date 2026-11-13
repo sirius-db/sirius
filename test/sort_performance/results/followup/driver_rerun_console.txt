@@ -1,9 +1,0 @@
-[workstation] syncing /home/felipe/sirius/.worktrees/ws-d7931a22-3ecb-4bcc-8514-34bfa14af105 -> felipe@192.168.0.248:/mnt/disk_2/sirius-scalable-sort
-[workstation] building (release + extension)
-[workstation] running: bash test/sort_performance/results/followup/driver_rerun.sh 
-=== fits-gpu-rerun: 2026-11-13T09:25:29-06:00 free: 1010G
-=== fits-gpu-rerun: rc=0 2026-11-13T09:37:49-06:00
-=== twice-gpu-rerun: 2026-11-13T09:37:49-06:00 free: 1010G
-=== twice-gpu-rerun: rc=0 2026-11-13T09:58:15-06:00
-=== done: 2026-11-13T09:58:15-06:00 free: 1009G
-suite_rc=0
