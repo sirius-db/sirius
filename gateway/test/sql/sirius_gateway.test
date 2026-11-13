@@ -190,6 +190,33 @@ CALL sirius_rank_exit();
 ----
 gateway's console
 
+# A console-only call is refused at any depth, not only at the statement's top level.
+statement error con2
+SELECT * FROM sirius_gateway_status() WHERE EXISTS (FROM sirius_gateway_stop());
+----
+gateway's console
+
+statement error con2
+WITH s AS (FROM sirius_gateway_stop()) SELECT count(*) FROM sirius_gateway_status();
+----
+gateway's console
+
+# A statement that runs on the gateway reads nothing there but the gateway's own functions.
+statement error con2
+SELECT * FROM sirius_gateway_status(), query('FROM sirius_gateway_stop()');
+----
+cannot read tables, files or other table functions
+
+statement error con2
+SELECT * FROM sirius_gateway_status(), read_text('/etc/hostname');
+----
+cannot read tables, files or other table functions
+
+query I con2
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up';
+----
+2
+
 statement ok con2
 DISCONNECT;
 
