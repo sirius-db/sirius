@@ -191,14 +191,6 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
   return expr.empty() ? "false" : expr;
 }
 
-// Whether a Kleene AND (or OR) accumulator can still change: it carries no Overflow Poison and is
-// not a definite FALSE (TRUE). A later operand runs only while this holds, so an operand skipped
-// for a row never raises.
-[[nodiscard]] std::string kleene_undecided(std::string_view accumulator, bool is_and)
-{
-  return format("!({0}.overflow || ({0}.valid && {1}{0}.val))", accumulator, is_and ? "!" : "");
-}
-
 [[nodiscard]] bool any_can_overflow(std::initializer_list<register_value const*> regs)
 {
   return std::ranges::any_of(regs, [](auto const* r) { return r->can_overflow; });
@@ -260,6 +252,12 @@ void translation_context::emit_prelude_line(std::string const& line)
 void translation_context::emit_line(std::string const& line)
 {
   _body.append("    ").append(line).push_back('\n');
+}
+
+void translation_context::guard_since(operand_mark mark, std::string_view condition)
+{
+  _body.insert(mark.body_size, format("    if ({}) {{\n", condition));
+  emit_line("}");
 }
 
 void translation_context::emit_reg_val(std::string_view type_name,
@@ -695,23 +693,31 @@ register_value translation_context::produce_between(sirius::ast::between const& 
 }
 
 //===----------CONJUNCTION----------===//
-register_value translation_context::produce_conjunction(sirius::ast::conjunction const& expr)
+register_value translation_context::produce_conjunction(sirius::ast::conjunction const& expr,
+                                                        operand_position position)
 {
+  bool const in_condition    = (position == operand_position::condition);
+  auto const produce_operand = [&](sirius::ast::node const& operand) {
+    return in_condition ? produce_condition(operand) : produce(operand);
+  };
   auto const var_name = next_var_name();
-  auto const first    = produce(*expr.children.front());
+  auto const first    = produce_operand(*expr.children.front());
   emit_reg_val_assign("bool", var_name, first.var_name);
 
   bool non_null        = first.is_statically_non_null;
   bool can_ovf         = first.can_overflow;
   bool const is_and    = (expr.op == sirius::ast::conjunction::kind::op_and);
   char const* fn_name  = is_and ? "eval_kleene_and" : "eval_kleene_or";
-  auto const undecided = kleene_undecided(var_name, is_and);
+  char const* guard_fn = !is_and
+                           ? "kleene_or_may_change"
+                           : (in_condition ? "condition_and_continues" : "kleene_and_may_change");
+  auto const guard     = format("{}({})", guard_fn, var_name);
 
   for (auto it = std::next(expr.children.begin()); it != expr.children.end(); ++it) {
-    emit_line(format("if ({}) {{", undecided));
-    auto const rhs = produce(**it);
+    auto const mark = mark_operand();
+    auto const rhs  = produce_operand(**it);
     emit_line(format("{0} = {1}({0}, {2});", var_name, fn_name, rhs.var_name));
-    emit_line("}");
+    if (in_condition || !can_raise_since(mark, rhs)) { guard_since(mark, guard); }
     non_null = non_null && rhs.is_statically_non_null;
     can_ovf  = can_ovf || rhs.can_overflow;
   }
@@ -736,7 +742,7 @@ register_value translation_context::produce_case_expr(sirius::ast::case_expr con
   bool can_ovf      = false;
   bool all_non_null = true;
   for (auto const& c : expr.cases) {
-    auto const when_rv = produce(*c.when_);
+    auto const when_rv = produce_condition(*c.when_);
     can_ovf            = can_ovf || when_rv.can_overflow;
     // A poisoned WHEN poisons the result; a true WHEN selects its arm; otherwise fall through.
     emit_line(format("if ({}.overflow) {{", when_rv.var_name));
@@ -744,8 +750,8 @@ register_value translation_context::produce_case_expr(sirius::ast::case_expr con
     emit_line(format("}} else if ({0}.valid && {0}.val) {{", when_rv.var_name));
     if (c.then_->holds<sirius::ast::function_call>() &&
         c.then_->get<sirius::ast::function_call>().function() == sirius::function_id::error) {
-      _has_subquery_error = true;
-      all_non_null        = false;
+      ++_subquery_error_checks;
+      all_non_null = false;
       emit_line("row_subquery_error = true;");
     } else {
       auto const then_rv = produce(*c.then_);
@@ -804,9 +810,9 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
 
   bool can_ovf      = probe_reg.can_overflow;
   bool all_non_null = probe_reg.is_statically_non_null;
+  auto const guard  = format("kleene_or_may_change({})", var_name);
   for (std::size_t i = 0; i < expr.values.size(); ++i) {
-    // As in OR, a list value runs only while the result is undecided.
-    if (i > 0) { emit_line(format("if ({}) {{", kleene_undecided(var_name, /*is_and=*/false))); }
+    auto const mark    = mark_operand();
     auto const val_reg = produce(*expr.values[i]);
     can_ovf            = can_ovf || val_reg.can_overflow;
     all_non_null       = all_non_null && val_reg.is_statically_non_null;
@@ -831,7 +837,7 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
       emit_line(format("{} = {};", var_name, eq_var));
     } else {
       emit_line(format("{0} = eval_kleene_or({0}, {1});", var_name, eq_var));
-      emit_line("}");
+      if (!can_raise_since(mark, val_reg)) { guard_since(mark, guard); }
     }
   }
   if (expr.negated) { emit_line(format("{0}.val = !{0}.val;", var_name)); }
@@ -1400,6 +1406,13 @@ register_value translation_context::produce_function_call(sirius::ast::function_
                                   static_cast<int>(fid));
 }
 
+register_value translation_context::produce_condition(sirius::ast::node const& expr)
+{
+  bool const is_boundary = _boundary_map != nullptr && _boundary_map->contains(&expr);
+  if (!expr.holds<sirius::ast::conjunction>() || is_boundary) { return produce(expr); }
+  return produce_conjunction(expr.get<sirius::ast::conjunction>(), operand_position::condition);
+}
+
 register_value translation_context::produce(sirius::ast::node const& expr)
 {
   if (_boundary_map != nullptr) {
@@ -1418,7 +1431,7 @@ register_value translation_context::produce(sirius::ast::node const& expr)
       } else if constexpr (std::is_same_v<T, sirius::ast::comparison>) {
         return produce_comparison(alt);
       } else if constexpr (std::is_same_v<T, sirius::ast::conjunction>) {
-        return produce_conjunction(alt);
+        return produce_conjunction(alt, operand_position::value);
       } else if constexpr (std::is_same_v<T, sirius::ast::between>) {
         return produce_between(alt);
       } else if constexpr (std::is_same_v<T, sirius::ast::case_expr>) {

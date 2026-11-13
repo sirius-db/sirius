@@ -171,6 +171,12 @@ TEST_CASE("nvrtc_codegen - each conjunction and coalesce operand is produced exa
     auto const body = ctx.body_code();
     CHECK(count_occurrences(body, "eval_kleene_and(") == 2);
     CHECK(count_occurrences(body, "eval_kleene_or(") == 0);
+    // As a value, the operand that can overflow runs on every row; only the IS NOT NULL is skipped.
+    CHECK(count_occurrences(body, "if (kleene_and_may_change(") == 1);
+    // As a condition, both later operands run only on rows where the earlier ones are TRUE.
+    sirius::nvrtc::translation_context condition_ctx(table.view);
+    (void)condition_ctx.produce_condition(*pred);
+    CHECK(count_occurrences(condition_ctx.body_code(), "if (condition_and_continues(") == 2);
     // The constants 100, 1 and 0 are bound once each: no duplicate `c_N_val` parameter.
     CHECK(ctx.constants().size() == 3);
     CHECK(count_occurrences(body, " < ") == 1);
@@ -178,7 +184,7 @@ TEST_CASE("nvrtc_codegen - each conjunction and coalesce operand is produced exa
     CHECK(reg.device_type.id() == cudf::type_id::BOOL8);
   }
 
-  SECTION("OR guards skip a later operand once the accumulator is poisoned or TRUE")
+  SECTION("OR skips a later operand that cannot raise once the accumulator is TRUE")
   {
     std::vector<std::unique_ptr<ast_node>> children;
     children.push_back(make_ref_typed(8, bool_t));
@@ -189,9 +195,7 @@ TEST_CASE("nvrtc_codegen - each conjunction and coalesce operand is produced exa
     auto const reg  = ctx.produce(*pred);
     auto const body = ctx.body_code();
     CHECK(count_occurrences(body, "eval_kleene_or(") == 1);
-    CHECK(count_occurrences(body,
-                            "if (!(" + reg.var_name + ".overflow || (" + reg.var_name +
-                              ".valid && " + reg.var_name + ".val))) {") == 1);
+    CHECK(count_occurrences(body, "if (kleene_or_may_change(" + reg.var_name + ")) {") == 1);
     // The same column is loaded once however often it is referenced.
     CHECK(ctx.input_columns().size() == 1);
     CHECK(count_occurrences(body, "in_0_data[row]") == 1);

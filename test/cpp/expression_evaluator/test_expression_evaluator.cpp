@@ -5115,19 +5115,35 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
     return exec.evaluate(tv);
   };
 
-  SECTION("Kleene AND/OR: a skipped overflowing operand does not throw, an evaluated one does")
+  // Filters with `expr` as its predicate and returns the number of surviving rows.
+  auto select_one_col = [&](std::vector<std::int32_t> const& vals,
+                            std::vector<bool> const& valids,
+                            ast_node const& expr) {
+    auto batch = make_int32_batch_with_nulls(*space, vals, valids);
+    auto ro    = batch->to_read_only();
+    auto tv    = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+    exp_executor exec(
+      expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    return exec.select(tv)->num_rows();
+  };
+
+  SECTION(
+    "Kleene AND/OR: a projection evaluates every operand, a filter or CASE WHEN condition skips a "
+    "decided one")
   {
-    // col0 = {10, 20}: col0 + INT_MAX overflows on both rows!
-    // 1. FALSE AND (col0 + INT_MAX > 0) -> FALSE (the overflowing operand is skipped!)
+    // col0 = {10, 20}: col0 + INT_MAX overflows on both rows! Like DuckDB, a projection evaluates
+    // every AND/OR operand on every row, while a filter predicate or a CASE WHEN condition runs a
+    // later operand only on the rows the earlier ones leave undecided.
+    // 1. FALSE AND (col0 + INT_MAX > 0) throws in a projection and keeps no row in a filter.
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(
         make_cmp(sirius::comparison_type::lt, make_ref_typed(0, int_t), make_int_const(0)));
       ch.push_back(make_ovf_bool());
       auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch));
-      auto out  = eval_one_col({10, 20}, {true, true}, *expr);
-      CHECK(out->view().column(0).null_count() == 0);
-      CHECK(copy_bool_column_to_host(out->view().column(0)) == std::vector<std::uint8_t>{0, 0});
+      REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 0);
     }
 
     // 2. (col0 + INT_MAX > 0) AND FALSE throws: the left operand is evaluated on every row, so its
@@ -5142,16 +5158,16 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
                         sirius::invalid_input_exception);
     }
 
-    // 3. TRUE OR (col0 + INT_MAX > 0) -> TRUE (the overflowing operand is skipped!)
+    // 3. TRUE OR (col0 + INT_MAX > 0) throws in a projection and keeps every row in a filter.
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(
         make_cmp(sirius::comparison_type::gt, make_ref_typed(0, int_t), make_int_const(0)));
       ch.push_back(make_ovf_bool());
       auto expr = make_conj(sirius::ast::conjunction::kind::op_or, std::move(ch));
-      auto out  = eval_one_col({10, 20}, {true, true}, *expr);
-      CHECK(out->view().column(0).null_count() == 0);
-      CHECK(copy_bool_column_to_host(out->view().column(0)) == std::vector<std::uint8_t>{1, 1});
+      REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 2);
     }
 
     // 4. (col0 + INT_MAX > 0) OR TRUE throws: the left operand is evaluated on every row, so its
@@ -5177,7 +5193,8 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
                         sirius::invalid_input_exception);
     }
 
-    // 6. Undominated overflow: NULL AND (col0 + INT_MAX > 0) throws invalid_input_exception!
+    // 6. NULL AND (col0 + INT_MAX > 0) throws in a projection. A filter runs a later AND operand
+    // only on rows where every earlier one is TRUE, as DuckDB does, so it keeps no row.
     {
       std::vector<std::unique_ptr<ast_node>> ch;
       ch.push_back(make_null_const(bool_t));
@@ -5185,6 +5202,7 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch));
       REQUIRE_THROWS_AS(eval_one_col({10, 20}, {true, true}, *expr),
                         sirius::invalid_input_exception);
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 0);
     }
 
     // 7. col0 BETWEEN (col0 + INT_MAX) AND -1 throws: BETWEEN evaluates both bounds on every row,
@@ -5198,6 +5216,23 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
                                /*upper_inclusive=*/true);
       REQUIRE_THROWS_AS(eval_one_col({10, 20, 0}, {true, true, false}, *expr),
                         sirius::invalid_input_exception);
+    }
+
+    // 8. CASE WHEN (col0 < 0) AND (col0 + INT_MAX > 0) THEN 1 ELSE 0 END -> 0: the WHEN condition
+    // skips the overflowing operand like a filter does.
+    {
+      std::vector<std::unique_ptr<ast_node>> ch;
+      ch.push_back(
+        make_cmp(sirius::comparison_type::lt, make_ref_typed(0, int_t), make_int_const(0)));
+      ch.push_back(make_ovf_bool());
+      std::vector<sirius::ast::case_expr::when_then> cases;
+      cases.push_back(
+        {make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch)), make_int_const(1)});
+      auto expr = std::make_unique<ast_node>(
+        sirius::ast::case_expr{std::move(cases), make_int_const(0), int_t});
+      auto out = eval_one_col({10, 20}, {true, true}, *expr);
+      CHECK(copy_column_to_host<std::int32_t>(out->view().column(0)) ==
+            std::vector<std::int32_t>{0, 0});
     }
   }
 
@@ -5381,18 +5416,18 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       CHECK(copy_bool_column_to_host(out->view().column(0))[0] == 0U);
     }
 
-    // x IN (10, col0 + INT_MAX):
-    //   when x = 10 on all rows, short-circuits on element 0 and does NOT throw overflow!
-    // x IN (col0 + INT_MAX, 10) throws even where the later match 10 decides the value: the
-    //   overflowing element is evaluated first on every row, so its overflow is an error.
+    // x IN (10, col0 + INT_MAX) and x IN (col0 + INT_MAX, 10) throw even where the match 10
+    //   decides the value: like DuckDB, an IN evaluates every list value that can overflow on
+    //   every row, in a projection and in a filter alike.
     {
       std::vector<std::unique_ptr<ast_node>> vals1;
       vals1.push_back(make_int_const(10));
       vals1.push_back(make_ovf_int());
-      auto in1  = make_in(make_ref_typed(0, int_t), std::move(vals1), /*negated=*/false);
-      auto out1 = eval_one_col({10, 10}, {true, true}, *in1);
-      CHECK(out1->view().column(0).null_count() == 0);
-      CHECK(copy_bool_column_to_host(out1->view().column(0)) == std::vector<std::uint8_t>{1, 1});
+      auto in1 = make_in(make_ref_typed(0, int_t), std::move(vals1), /*negated=*/false);
+      REQUIRE_THROWS_AS(eval_one_col({10, 10}, {true, true}, *in1),
+                        sirius::invalid_input_exception);
+      REQUIRE_THROWS_AS(select_one_col({10, 10}, {true, true}, *in1),
+                        sirius::invalid_input_exception);
 
       std::vector<std::unique_ptr<ast_node>> vals2;
       vals2.push_back(make_ovf_int());

@@ -28,12 +28,14 @@
 #include <expression_evaluator/nvrtc/register_value.hpp>
 #include <helper/logical_type.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sirius::nvrtc {
@@ -117,6 +119,16 @@ inline constexpr std::size_t max_like_pattern_parameters = 8;
  *   - Input loads and constant initializations go to a prelude that runs before any branch, so a
  *     later `if` arm never introduces a load; node statements follow in the body.
  *
+ * The generated code evaluates an operation for a row exactly when DuckDB's `ExpressionExecutor`
+ * does for the operands' given order, so it raises a SQL error where DuckDB does. DuckDB evaluates
+ * a filter predicate and a CASE WHEN condition with `Select`, which recurses into AND and OR and
+ * runs a later operand only on the rows the earlier operands leave undecided (for AND, only where
+ * all of them are TRUE). It evaluates every other node with `Execute`, which runs every AND or OR
+ * operand and every IN list value on every row. `produce_condition` emits a node in the first
+ * position and `produce` in the second, where a later AND or OR operand or IN list value is still
+ * skipped for a decided row when it cannot raise a SQL error, because skipping it then changes no
+ * result.
+ *
  * The @c overflow_sites() point into the expression trees the context produced, so a context must
  * not outlive those trees, and its sites must never be cached with a compiled kernel in
  * `codegen::jit::KernelCache`, which outlives every tree. `evaluate_project_sink` and
@@ -141,6 +153,18 @@ class translation_context {
    */
   [[nodiscard]] register_value produce(sirius::ast::node const& expr);
 
+  /**
+   * @brief Emits the code for a node that DuckDB evaluates as a condition (a filter predicate or a
+   * CASE WHEN condition) and returns its @c register_value.
+   *
+   * Only its value's truth is meaningful: an AND that a later operand did not run for may be NULL
+   * where its Kleene value is FALSE.
+   *
+   * @param expr The condition to produce code for.
+   * @return The @c register_value of the produced code.
+   */
+  [[nodiscard]] register_value produce_condition(sirius::ast::node const& expr);
+
   [[nodiscard]] std::vector<input_column_binding> const& input_columns() const noexcept
   {
     return _input_columns;
@@ -157,7 +181,7 @@ class translation_context {
   {
     return _narrow_domain_comparison_count;
   }
-  [[nodiscard]] bool has_subquery_error() const noexcept { return _has_subquery_error; }
+  [[nodiscard]] bool has_subquery_error() const noexcept { return _subquery_error_checks > 0; }
   /**
    * @brief Returns the overflow sites of the produced expressions in the order their statements
    * appear in @c body_code(), leaving out those under a TRY and the conversion of a TRY_CAST, which
@@ -173,7 +197,20 @@ class translation_context {
   [[nodiscard]] register_value produce_reference(sirius::ast::reference const& expr);
   [[nodiscard]] register_value produce_constant(sirius::ast::constant const& expr);
   [[nodiscard]] register_value produce_comparison(sirius::ast::comparison const& expr);
-  [[nodiscard]] register_value produce_conjunction(sirius::ast::conjunction const& expr);
+  /**
+   * @brief Where DuckDB evaluates a node: in a condition through `Select`, or as a value through
+   * `Execute`.
+   */
+  enum class operand_position : std::uint8_t { condition, value };
+
+  /** @brief The point in the body that @c mark_operand records before an operand is produced. */
+  struct operand_mark {
+    std::size_t body_size;
+    std::size_t subquery_error_checks;
+  };
+
+  [[nodiscard]] register_value produce_conjunction(sirius::ast::conjunction const& expr,
+                                                   operand_position position);
   [[nodiscard]] register_value produce_between(sirius::ast::between const& expr);
   [[nodiscard]] register_value produce_case_expr(sirius::ast::case_expr const& expr);
   [[nodiscard]] register_value produce_coalesce(sirius::ast::coalesce const& expr);
@@ -203,6 +240,25 @@ class translation_context {
   void emit_reg_val_assign(std::string_view type_name,
                            std::string_view name,
                            std::string_view expr);
+
+  /** @brief Records the current end of the body and the number of subquery-error checks so far. */
+  [[nodiscard]] operand_mark mark_operand() const noexcept
+  {
+    return operand_mark{_body.size(), _subquery_error_checks};
+  }
+
+  /**
+   * @brief Returns whether the operand produced since @p mark, whose result is @p operand, can
+   * raise a SQL error: Overflow Poison, or a scalar subquery that returned more than one row.
+   */
+  [[nodiscard]] bool can_raise_since(operand_mark mark,
+                                     register_value const& operand) const noexcept
+  {
+    return operand.can_overflow || _subquery_error_checks > mark.subquery_error_checks;
+  }
+
+  /** @brief Wraps the statements emitted since @p mark in `if (condition) { ... }`. */
+  void guard_since(operand_mark mark, std::string_view condition);
 
   /**
    * @brief Records @p site when its own operation can raise Overflow Poison, and returns whether
@@ -300,7 +356,7 @@ class translation_context {
   std::vector<like_pattern_binding> _like_patterns;
   std::vector<overflow_site> _overflow_sites;
   std::size_t _narrow_domain_comparison_count{0};
-  bool _has_subquery_error{false};
+  std::size_t _subquery_error_checks{0};
   std::string _prelude;
   std::string _body;
   std::size_t _next_var_id{0};

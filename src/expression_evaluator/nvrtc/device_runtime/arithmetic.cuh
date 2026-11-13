@@ -27,22 +27,52 @@
 #include "codegen/stdint_shim.hpp"
 
 //===----------KLEENE AND/OR----------===//
-// Both operands were evaluated, so Overflow Poison in either one poisons the result even where the
-// other one is a deciding FALSE (AND) or TRUE (OR).
+// `translation_context` folds each AND or OR operand into an accumulator with `eval_kleene_and` or
+// `eval_kleene_or`. Both arguments were evaluated, so Overflow Poison in either one poisons the
+// result even where the other one is a deciding FALSE (AND) or TRUE (OR); they test for that FALSE
+// (TRUE) first, under `!poisoned`, so that for operands that cannot overflow the compiler emits the
+// same code as for plain Kleene logic. Where the generated code may skip a later operand for a row,
+// it runs that operand only while one of the predicates below holds for the accumulator.
+
+// Whether a later AND operand may change the accumulator: false only for a FALSE without Overflow
+// Poison.
+__device__ __forceinline__ bool kleene_and_may_change(reg_val<bool> acc)
+{
+  return !(acc.valid && !acc.overflow && !acc.val);
+}
+
+// Whether a later OR operand may change the accumulator: false only for a TRUE without Overflow
+// Poison.
+__device__ __forceinline__ bool kleene_or_may_change(reg_val<bool> acc)
+{
+  return !(acc.valid && !acc.overflow && acc.val);
+}
+
+// Whether DuckDB's `Select` runs a later operand of an AND condition for the row: only while every
+// earlier operand is TRUE.
+__device__ __forceinline__ bool condition_and_continues(reg_val<bool> acc)
+{
+  return acc.valid && !acc.overflow && acc.val;
+}
+
 __device__ __forceinline__ reg_val<bool> eval_kleene_and(reg_val<bool> acc, reg_val<bool> rhs)
 {
-  if (acc.overflow || rhs.overflow) { return reg_val<bool>{false, true, true}; }
-  if ((acc.valid && !acc.val) || (rhs.valid && !rhs.val)) {
-    return reg_val<bool>{false, true, false};
-  }
+  bool const poisoned  = acc.overflow || rhs.overflow;
+  bool const acc_false = acc.valid && !acc.val;
+  bool const rhs_false = rhs.valid && !rhs.val;
+  if (!poisoned && (acc_false || rhs_false)) { return reg_val<bool>{false, true, false}; }
+  if (poisoned) { return reg_val<bool>{false, true, true}; }
   if (acc.valid && rhs.valid) { return reg_val<bool>{true, true, false}; }
   return reg_val<bool>{false, false, false};
 }
 
 __device__ __forceinline__ reg_val<bool> eval_kleene_or(reg_val<bool> acc, reg_val<bool> rhs)
 {
-  if (acc.overflow || rhs.overflow) { return reg_val<bool>{false, true, true}; }
-  if ((acc.valid && acc.val) || (rhs.valid && rhs.val)) { return reg_val<bool>{true, true, false}; }
+  bool const poisoned = acc.overflow || rhs.overflow;
+  bool const acc_true = acc.valid && acc.val;
+  bool const rhs_true = rhs.valid && rhs.val;
+  if (!poisoned && (acc_true || rhs_true)) { return reg_val<bool>{true, true, false}; }
+  if (poisoned) { return reg_val<bool>{false, true, true}; }
   if (acc.valid && rhs.valid) { return reg_val<bool>{false, true, false}; }
   return reg_val<bool>{false, false, false};
 }
