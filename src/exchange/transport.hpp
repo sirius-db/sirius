@@ -165,6 +165,12 @@ class transport {
   /// are dropped.
   ~transport();
 
+  /// Stops the engine thread and wakes every sender and wait_sent() waiter; a send() that was
+  /// waiting for room, or that starts afterwards, drops its batch. For an owner that shuts down
+  /// while other threads may still be inside the transport, which they keep alive until they
+  /// return. The destructor calls it.
+  void stop();
+
   transport(transport const&)            = delete;
   transport& operator=(transport const&) = delete;
 
