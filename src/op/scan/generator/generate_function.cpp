@@ -25,7 +25,6 @@
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 #include <duckdb/storage/statistics/node_statistics.hpp>
 
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -85,17 +84,6 @@ value_type parse_value_type(const std::string& column, const std::string& type_n
                                 type_name + "' (expected INTEGER, BIGINT, DOUBLE or VARCHAR)");
 }
 
-duckdb::LogicalType to_logical_type(value_type type)
-{
-  switch (type) {
-    case value_type::int32: return duckdb::LogicalType::INTEGER;
-    case value_type::int64: return duckdb::LogicalType::BIGINT;
-    case value_type::float64: return duckdb::LogicalType::DOUBLE;
-    case value_type::varchar: return duckdb::LogicalType::VARCHAR;
-  }
-  throw duckdb::InternalException("sirius_generate: unknown value_type");
-}
-
 [[noreturn]] void invalid_column(const std::string& column, const std::string& problem)
 {
   throw duckdb::BinderException("sirius_generate: column '" + column + "': " + problem);
@@ -139,51 +127,16 @@ column_spec parse_column(const duckdb::Value& entry, std::size_t index)
   }
   column.dist = *parsed;
 
+  // Missing or NULL means 0. The values are checked by validation_error.
   auto number = [&](const char* name) {
     const auto* value = field(name);
-    auto const result = value == nullptr ? 0.0 : value->GetValue<double>();
-    if (!std::isfinite(result)) {
-      invalid_column(column.name, std::string("'") + name + "' must be finite");
-    }
-    return result;
+    return value == nullptr ? 0.0 : value->GetValue<double>();
   };
   column.p1            = number("p1");
   column.p2            = number("p2");
   column.cardinality   = number("cardinality");
   column.null_fraction = number("null_fraction");
   return column;
-}
-
-void validate_column(const column_spec& column)
-{
-  if (column.null_fraction < 0 || column.null_fraction > 1) {
-    invalid_column(column.name, "null_fraction must be in [0, 1]");
-  }
-  if (column.cardinality < 0) { invalid_column(column.name, "cardinality must not be negative"); }
-  switch (column.dist) {
-    case distribution::uniform:
-      if (column.p1 > column.p2) {
-        invalid_column(column.name, "uniform requires p1 (low) <= p2 (high)");
-      }
-      break;
-    case distribution::normal:
-      if (column.p2 < 0) { invalid_column(column.name, "normal requires p2 (stddev) >= 0"); }
-      break;
-    case distribution::zipf:
-      if (column.p1 <= 0) { invalid_column(column.name, "zipf requires p1 (exponent) > 0"); }
-      if (column.cardinality < 1) { invalid_column(column.name, "zipf requires cardinality >= 1"); }
-      break;
-    case distribution::few_distinct:
-      if (column.p1 < 1) {
-        invalid_column(column.name, "few_distinct requires p1 (distinct values) >= 1");
-      }
-      break;
-    case distribution::sequential:
-    case distribution::sequential_desc: break;
-  }
-  if (column.type == value_type::varchar && (column.p1 < 1 || column.p1 > column.p2)) {
-    invalid_column(column.name, "VARCHAR requires 1 <= p1 (min length) <= p2 (max length)");
-  }
 }
 
 generator_spec parse_spec(const duckdb::TableFunctionBindInput& input)
@@ -220,7 +173,7 @@ generator_spec parse_spec(const duckdb::TableFunctionBindInput& input)
   spec.columns.reserve(entries.size());
   for (std::size_t i = 0; i < entries.size(); ++i) {
     auto column = parse_column(entries[i], i);
-    validate_column(column);
+    if (auto const problem = validation_error(column)) { invalid_column(column.name, *problem); }
     for (auto const& earlier : spec.columns) {
       if (duckdb::StringUtil::CIEquals(earlier.name, column.name)) {
         invalid_column(column.name, "duplicate column name");
@@ -229,25 +182,6 @@ generator_spec parse_spec(const duckdb::TableFunctionBindInput& input)
     spec.columns.push_back(std::move(column));
   }
   return spec;
-}
-
-/// The bind callback, with the signature DuckDB's table_function_bind_t requires.
-duckdb::unique_ptr<duckdb::FunctionData> generate_bind(
-  duckdb::ClientContext&,
-  duckdb::TableFunctionBindInput& input,
-  duckdb::vector<duckdb::LogicalType>& return_types,
-  duckdb::vector<duckdb::Identifier>& names)
-{
-  auto result  = duckdb::make_uniq<GenerateFunctionData>();
-  result->spec = parse_spec(input);
-
-  return_types.clear();
-  names.clear();
-  for (auto const& column : result->spec.columns) {
-    return_types.push_back(to_logical_type(column.type));
-    names.emplace_back(column.name);
-  }
-  return result;
 }
 
 duckdb::unique_ptr<duckdb::NodeStatistics> generate_cardinality(
@@ -269,24 +203,38 @@ void generate_function(duckdb::ClientContext&, duckdb::TableFunctionInput&, duck
 
 }  // namespace
 
+duckdb::LogicalType to_logical_type(value_type type)
+{
+  switch (type) {
+    case value_type::int32: return duckdb::LogicalType::INTEGER;
+    case value_type::int64: return duckdb::LogicalType::BIGINT;
+    case value_type::float64: return duckdb::LogicalType::DOUBLE;
+    case value_type::varchar: return duckdb::LogicalType::VARCHAR;
+  }
+  throw duckdb::InternalException("sirius_generate: unknown value_type");
+}
+
 duckdb::unique_ptr<duckdb::FunctionData> GenerateBind(
-  duckdb::ClientContext& context,
+  duckdb::ClientContext&,
   duckdb::TableFunctionBindInput& input,
   duckdb::vector<duckdb::LogicalType>& return_types,
-  duckdb::vector<duckdb::string>& names)
+  duckdb::vector<duckdb::Identifier>& names)
 {
-  duckdb::vector<duckdb::Identifier> identifiers;
-  auto result = generate_bind(context, input, return_types, identifiers);
+  auto result  = duckdb::make_uniq<GenerateFunctionData>();
+  result->spec = parse_spec(input);
+
+  return_types.clear();
   names.clear();
-  for (auto const& identifier : identifiers) {
-    names.push_back(identifier.GetIdentifierName());
+  for (auto const& column : result->spec.columns) {
+    return_types.push_back(to_logical_type(column.type));
+    names.emplace_back(column.name);
   }
   return result;
 }
 
 duckdb::TableFunction get_generate_function()
 {
-  duckdb::TableFunction generate(kGenerateFunctionName, {}, generate_function, generate_bind);
+  duckdb::TableFunction generate(kGenerateFunctionName, {}, generate_function, GenerateBind);
   generate.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs& options) {
     options.Add("num_batches", duckdb::LogicalType::UBIGINT);
     options.Add("rows_per_batch", duckdb::LogicalType::UBIGINT);

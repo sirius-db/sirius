@@ -51,7 +51,13 @@
 //   total length `L = p1 + counter_hash(..., STR_LEN) % (p2 - p1 + 1)` (no suffix if `L` is
 //   shorter than the prefix). Requires `1 <= p1 <= p2`. So `ORDER BY s` orders by key whenever
 //   every key fits in `p1` digits.
+//
+// `validation_error` holds every rule a column must satisfy; the bind and the kernels both call
+// it, so a spec that binds is a spec the kernels accept.
 
+#include "memory/size_arithmetic.hpp"
+
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -125,48 +131,185 @@ struct generator_spec {
   friend bool operator==(const generator_spec&, const generator_spec&) = default;
 };
 
-/// Bytes per row used for reservations: the sum of the fixed widths (4 / 8 / 8), plus
-/// `(p1 + p2) / 2 + 4` for each VARCHAR column (mean length plus one offset), plus
-/// `ceil(columns_with_nulls / 8)` for the null masks. Never returns 0 for a non-empty spec.
-[[nodiscard]] inline std::size_t estimated_row_bytes(const generator_spec& spec) noexcept
+/// The reason `column` cannot be generated, or nullopt when it is valid. The name is not part of
+/// the text: callers prefix it with `sirius_generate: column '<name>': `.
+[[nodiscard]] inline std::optional<std::string> validation_error(const column_spec& column)
 {
-  constexpr auto max_bytes = std::numeric_limits<std::size_t>::max();
-  auto add                 = [](std::size_t a, std::size_t b) noexcept {
-    return b > max_bytes - a ? max_bytes : a + b;
-  };
+  // Checked first, so that every comparison below is free of NaN.
+  if (!std::isfinite(column.p1)) { return "'p1' must be finite"; }
+  if (!std::isfinite(column.p2)) { return "'p2' must be finite"; }
+  if (!std::isfinite(column.cardinality)) { return "'cardinality' must be finite"; }
+  if (!std::isfinite(column.null_fraction)) { return "'null_fraction' must be finite"; }
+  if (column.null_fraction < 0 || column.null_fraction > 1) {
+    return "null_fraction must be in [0, 1]";
+  }
+  if (column.cardinality < 0) { return "cardinality must not be negative"; }
+  switch (column.dist) {
+    case distribution::uniform:
+      if (column.p1 > column.p2) { return "uniform requires p1 (low) <= p2 (high)"; }
+      break;
+    case distribution::normal:
+      if (column.p2 < 0) { return "normal requires p2 (stddev) >= 0"; }
+      break;
+    case distribution::zipf:
+      if (column.p1 <= 0) { return "zipf requires p1 (exponent) > 0"; }
+      if (column.cardinality < 1) { return "zipf requires cardinality >= 1"; }
+      break;
+    case distribution::few_distinct:
+      if (column.p1 < 1) { return "few_distinct requires p1 (distinct values) >= 1"; }
+      break;
+    case distribution::sequential:
+    case distribution::sequential_desc: break;
+    default: return "unknown distribution";
+  }
+  switch (column.type) {
+    case value_type::int32:
+    case value_type::int64:
+    case value_type::float64: break;
+    case value_type::varchar:
+      // A row's length must fit in a cudf::size_type (int32).
+      if (column.p1 < 1 || column.p1 > column.p2 ||
+          column.p2 > static_cast<double>(std::numeric_limits<std::int32_t>::max())) {
+        return "VARCHAR requires 1 <= p1 (min length) <= p2 (max length) <= 2147483647";
+      }
+      break;
+    default: return "unknown type";
+  }
+  return std::nullopt;
+}
+
+/// Upper bound of the number of decimal digits of any VARCHAR key of `column` (the int64 draw
+/// clamped to >= 0) over `total_rows` rows, in [1, 19]. Follows the int64 draws of "Value
+/// semantics"; whenever the largest key is not known to stay below 10^18 (a draw that can wrap
+/// around int64, an unvalidated spec), the answer is 19, the digits of the largest int64.
+[[nodiscard]] inline std::size_t max_key_digits(const column_spec& column,
+                                                std::uint64_t total_rows) noexcept
+{
+  constexpr std::size_t max_digits = 19;
+  const double last_row            = total_rows == 0 ? 0 : static_cast<double>(total_rows - 1);
+  const bool clamped               = column.cardinality > 0;
+  double largest                   = 0;
+  switch (column.dist) {
+    case distribution::uniform:
+      largest = clamped ? std::min(column.p2, column.p1 + column.cardinality) : column.p2;
+      break;
+    case distribution::normal:
+      // Box-Muller over a 53-bit uniform never leaves mean +- 8.6 stddev.
+      largest = clamped ? column.cardinality : column.p1 + 9 * std::abs(column.p2);
+      break;
+    case distribution::zipf: largest = column.cardinality; break;
+    case distribution::few_distinct: largest = column.p1; break;
+    case distribution::sequential:
+    case distribution::sequential_desc: {
+      if (clamped) {
+        largest = column.p1 + column.cardinality;
+        break;
+      }
+      // The step as the kernels use it: rounded to the nearest integer, 0 => 1.
+      const double rounded  = std::round(column.p2);
+      const double step     = rounded == 0 ? 1 : rounded;
+      const double distance = std::abs(step) * last_row;
+      // Far enough to wrap around int64: any key is possible.
+      if (!(std::abs(column.p1) + distance < 0x1.0p62)) { return max_digits; }
+      const bool rising = (step > 0) == (column.dist == distribution::sequential);
+      largest           = column.p1 + (rising ? distance : 0);
+      break;
+    }
+    default: return max_digits;
+  }
+  // The kernels round parameters to the nearest int64; + 1 covers that.
+  largest += 1;
+  if (!(largest < 1e18)) { return max_digits; }  // NaN too
+  std::size_t digits = 1;
+  for (double limit = 10; largest >= limit; limit *= 10) {
+    ++digits;
+  }
+  return digits;
+}
+
+/// Bytes per row used for reservations when only `output_columns` (indices into `spec.columns`,
+/// see generate_batch) are produced: the sum of the fixed widths (4 / 8 / 8), plus the expected
+/// length and one 4-byte offset for each VARCHAR column, plus `ceil(columns_with_nulls / 8)` for
+/// the null masks. Indices outside the spec count as nothing. Never returns 0 for a non-empty
+/// selection.
+///
+/// A VARCHAR row is `max(L, digits(key))` characters with `L` uniform in [p1, p2]. The estimate
+/// is the mean of that for a key of `d = max_key_digits` digits: `(p1 + p2) / 2` when `d <= p1`,
+/// `d` when `d >= p2`, and `(p1 + p2) / 2 + k * (k + 1) / (2 * (p2 - p1 + 1))` with `k = d - p1`
+/// in between. It is an upper bound of the mean row length, since no key has more digits.
+[[nodiscard]] inline std::size_t estimated_row_bytes(
+  const generator_spec& spec, const std::vector<std::size_t>& output_columns) noexcept
+{
+  using sirius::memory::saturating_add;
+  // Saturates; bind rejects a product that overflows.
+  constexpr auto max_rows = std::numeric_limits<std::uint64_t>::max();
+  const bool overflows =
+    spec.rows_per_batch != 0 && spec.num_batches > max_rows / spec.rows_per_batch;
+  const auto total_rows          = overflows ? max_rows : spec.num_batches * spec.rows_per_batch;
   std::size_t bytes              = 0;
   std::size_t columns_with_nulls = 0;
-  for (const auto& column : spec.columns) {
+  for (const auto index : output_columns) {
+    if (index >= spec.columns.size()) { continue; }
+    const auto& column = spec.columns[index];
     switch (column.type) {
-      case value_type::int32: bytes = add(bytes, 4); break;
+      case value_type::int32: bytes = saturating_add(bytes, 4); break;
       case value_type::int64:
-      case value_type::float64: bytes = add(bytes, 8); break;
+      case value_type::float64: bytes = saturating_add(bytes, 8); break;
       case value_type::varchar: {
         // An unvalidated spec may carry NaN, negative or huge lengths; keep the estimate finite.
-        const double mean = (column.p1 + column.p2) / 2;
-        std::size_t chars = 0;
-        if (mean >= static_cast<double>(std::numeric_limits<std::int32_t>::max())) {
-          chars = static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
-        } else if (mean > 0) {
+        constexpr auto max_length = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+        const auto digits         = static_cast<double>(max_key_digits(column, total_rows));
+        double mean               = (column.p1 + column.p2) / 2;
+        if (digits >= column.p2) {
+          mean = digits;
+        } else if (digits > column.p1) {
+          const double below = digits - column.p1;
+          mean += below * (below + 1) / (2 * (column.p2 - column.p1 + 1));
+        }
+        std::size_t chars = static_cast<std::size_t>(digits);  // also what a NaN mean gets
+        if (mean >= max_length) {
+          chars = static_cast<std::size_t>(max_length);
+        } else if (mean > digits) {
           chars = static_cast<std::size_t>(std::ceil(mean));
         }
-        bytes = add(bytes, add(chars, 4));
+        bytes = saturating_add(bytes, saturating_add(chars, 4));
         break;
       }
     }
     if (column.null_fraction > 0) { ++columns_with_nulls; }
   }
-  return add(bytes, (columns_with_nulls + 7) / 8);
+  return saturating_add(bytes, (columns_with_nulls + 7) / 8);
 }
 
-/// `rows_per_batch * estimated_row_bytes`, saturating at the largest std::size_t.
-[[nodiscard]] inline std::size_t estimated_batch_bytes(const generator_spec& spec) noexcept
+/// Every column of the spec, in spec order: the selection that produces the whole batch.
+[[nodiscard]] inline std::vector<std::size_t> all_columns(const generator_spec& spec)
 {
-  constexpr auto max_bytes = std::numeric_limits<std::size_t>::max();
-  const auto row_bytes     = estimated_row_bytes(spec);
-  if (row_bytes == 0 || spec.rows_per_batch == 0) { return 0; }
-  if (spec.rows_per_batch > max_bytes / row_bytes) { return max_bytes; }
-  return static_cast<std::size_t>(spec.rows_per_batch) * row_bytes;
+  std::vector<std::size_t> columns(spec.columns.size());
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    columns[i] = i;
+  }
+  return columns;
+}
+
+/// Bytes per row of the whole spec. Never returns 0 for a non-empty spec.
+[[nodiscard]] inline std::size_t estimated_row_bytes(const generator_spec& spec)
+{
+  return estimated_row_bytes(spec, all_columns(spec));
+}
+
+/// `rows_per_batch * estimated_row_bytes(spec, output_columns)`, saturating at the largest
+/// std::size_t.
+[[nodiscard]] inline std::size_t estimated_batch_bytes(
+  const generator_spec& spec, const std::vector<std::size_t>& output_columns) noexcept
+{
+  return sirius::memory::saturating_mul(static_cast<std::size_t>(spec.rows_per_batch),
+                                        estimated_row_bytes(spec, output_columns));
+}
+
+/// `rows_per_batch * estimated_row_bytes(spec)`, saturating at the largest std::size_t.
+[[nodiscard]] inline std::size_t estimated_batch_bytes(const generator_spec& spec)
+{
+  return estimated_batch_bytes(spec, all_columns(spec));
 }
 
 }  // namespace sirius::op::scan::generator

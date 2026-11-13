@@ -46,11 +46,15 @@ struct GenerateFunctionData : public duckdb::TableFunctionData {
 /// Parses named parameters num_batches, rows_per_batch, seed (default 0) and columns
 /// (LIST(STRUCT(name VARCHAR, type VARCHAR, dist VARCHAR, p1 DOUBLE, p2 DOUBLE,
 /// cardinality DOUBLE, null_fraction DOUBLE))) into a generator_spec; validates; fills names/types.
+/// This is the bind callback of get_generate_function().
 duckdb::unique_ptr<duckdb::FunctionData> GenerateBind(
   duckdb::ClientContext& context,
   duckdb::TableFunctionBindInput& input,
   duckdb::vector<duckdb::LogicalType>& return_types,
-  duckdb::vector<duckdb::string>& names);
+  duckdb::vector<duckdb::Identifier>& names);
+
+/// The DuckDB type of a generated column: INTEGER, BIGINT, DOUBLE or VARCHAR.
+duckdb::LogicalType to_logical_type(value_type type);
 
 /// The one TableFunction definition (bind, throwing body, cardinality, named params,
 /// projection_pushdown = false). Used for catalog registration AND as the trusted reference in

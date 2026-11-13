@@ -25,15 +25,19 @@
  */
 
 #include "catch.hpp"
+#include "op/scan/generator/generator_detail.cuh"
 
 #include <duckdb.hpp>
 #include <duckdb/main/appender.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -193,6 +197,80 @@ const std::string kSortColumns =
   "{name: 'k2', type: 'INTEGER', dist: 'uniform', p1: -100, p2: 100, null_fraction: 0.05}, "
   "{name: 's', type: 'VARCHAR', dist: 'uniform', p1: 3, p2: 9, null_fraction: 0.1}";
 
+// Columns whose aggregates have a host reference: `g` is the global row and `f` is
+// `counter_hash(..., VALUE_A) % 1000`, so their sums do not depend on which task, stream or GPU
+// produced a batch.
+const std::string kSummedColumns =
+  "{name: 'g', type: 'BIGINT', dist: 'sequential', p1: 0, p2: 1}, "
+  "{name: 'f', type: 'BIGINT', dist: 'few_distinct', p1: 1000}, "
+  "{name: 's', type: 'VARCHAR', dist: 'uniform', p1: 4, p2: 8, null_fraction: 0.1}";
+
+constexpr std::uint64_t kSummedDistinct = 1000;
+
+std::string summed_query(std::uint64_t num_batches,
+                         std::uint64_t rows_per_batch,
+                         std::uint64_t seed)
+{
+  return "SELECT count(*), sum(g), sum(f), count(DISTINCT g) FROM " +
+         generate_call(num_batches, rows_per_batch, seed, kSummedColumns);
+}
+
+/// What `summed_query` must return, computed on the host from the generator's hash.
+std::vector<std::int64_t> summed_reference(std::uint64_t num_batches,
+                                           std::uint64_t rows_per_batch,
+                                           std::uint64_t seed)
+{
+  namespace detail = sirius::op::scan::generator::detail;
+  auto const rows  = num_batches * rows_per_batch;
+  std::uint64_t f  = 0;
+  for (std::uint64_t batch = 0; batch < num_batches; ++batch) {
+    for (std::uint64_t row = 0; row < rows_per_batch; ++row) {
+      f += detail::counter_hash(seed, batch, row, 1, detail::VALUE_A) % kSummedDistinct;
+    }
+  }
+  return {static_cast<std::int64_t>(rows),
+          static_cast<std::int64_t>(rows * (rows - 1) / 2),
+          static_cast<std::int64_t>(f),
+          static_cast<std::int64_t>(rows)};
+}
+
+/// The single row of `summed_query` run on @p con, or @p error set. The function has no CPU
+/// body, so a result means the GPU produced it.
+std::vector<std::int64_t> summed_row(duckdb::Connection& con,
+                                     std::string const& query,
+                                     std::string& error)
+{
+  auto result = con.Query(query);
+  if (!result) {
+    error = "no result";
+    return {};
+  }
+  if (result->HasError()) {
+    error = result->GetError();
+    return {};
+  }
+  if (result->RowCount() != 1) {
+    error = "expected one row, got " + std::to_string(result->RowCount());
+    return {};
+  }
+  std::vector<std::int64_t> row;
+  auto cells = result->Collection().GetRows();
+  for (duckdb::idx_t c = 0; c < result->ColumnCount(); ++c) {
+    row.push_back(cells.GetValue(c, 0).GetValue<std::int64_t>());
+  }
+  return row;
+}
+
+/// `summed_row`, requiring success.
+std::vector<std::int64_t> summed_row(duckdb::Connection& con, std::string const& query)
+{
+  std::string error;
+  auto row = summed_row(con, query, error);
+  INFO(error);
+  REQUIRE(error.empty());
+  return row;
+}
+
 constexpr std::uint64_t kSortBatches      = 8;
 constexpr std::uint64_t kSortRowsPerBatch = 2500;
 constexpr std::uint64_t kSortRows         = kSortBatches * kSortRowsPerBatch;
@@ -338,6 +416,99 @@ TEST_CASE_METHOD(GenerateFixture,
     REQUIRE(last_batch.size() == rows_per_batch);
     CHECK(filtered == last_batch);
   }
+}
+
+TEST_CASE_METHOD(GenerateFixture,
+                 "sirius_generate columns do not depend on which columns the query references",
+                 "[integration][gpu_execution][sirius_generate]")
+{
+  // Only the referenced columns are generated; each must keep the values it has in SELECT *.
+  auto const source = generate_call(4, 1000, 7, kKeyedColumns);
+  auto const all    = gpu_rows("SELECT * FROM " + source, false);
+  REQUIRE(all.size() == 4000);
+
+  auto project = [&](std::vector<std::size_t> const& columns) {
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(all.size());
+    for (auto const& row : all) {
+      std::vector<std::string> projected;
+      for (auto const column : columns) {
+        projected.push_back(row[column]);
+      }
+      rows.push_back(std::move(projected));
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  };
+
+  CHECK(gpu_rows("SELECT k1 FROM " + source) == project({1}));
+  CHECK(gpu_rows("SELECT s FROM " + source) == project({3}));
+  // Out of spec order, skipping columns in between.
+  CHECK(gpu_rows("SELECT s, g FROM " + source) == project({3, 0}));
+  CHECK(gpu_rows("SELECT x, k1 FROM " + source) == project({2, 1}));
+}
+
+//===----------------------------------------------------------------------===//
+// Concurrency
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GenerateFixture,
+                 "sirius_generate queries on concurrent connections each produce every batch",
+                 "[integration][gpu_execution][sirius_generate]")
+{
+  constexpr std::uint64_t num_batches    = 64;
+  constexpr std::uint64_t rows_per_batch = 10000;
+  constexpr std::size_t num_connections  = 4;
+  auto const query                       = summed_query(num_batches, rows_per_batch, 7);
+  auto const expected                    = summed_reference(num_batches, rows_per_batch, 7);
+
+  CHECK(summed_row(*con, query) == expected);
+
+  // Each query plans its own GENERATOR and so its own batch counter: no batch may be lost or
+  // produced twice when they run at the same time.
+  std::vector<std::unique_ptr<duckdb::Connection>> connections;
+  for (std::size_t i = 0; i < num_connections; ++i) {
+    connections.push_back(
+      sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()
+        ? std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection())
+        : std::make_unique<duckdb::Connection>(*db));
+  }
+  std::vector<std::vector<std::int64_t>> rows(num_connections);
+  std::vector<std::string> errors(num_connections);
+  {
+    std::vector<std::thread> threads;
+    for (std::size_t i = 0; i < num_connections; ++i) {
+      threads.emplace_back([&, i] { rows[i] = summed_row(*connections[i], query, errors[i]); });
+    }
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+  for (std::size_t i = 0; i < num_connections; ++i) {
+    CAPTURE(i);
+    CAPTURE(errors[i]);
+    CHECK(errors[i].empty());
+    CHECK(rows[i] == expected);
+  }
+}
+
+TEST_CASE("sirius_generate produces every batch once when tasks spread over two GPUs",
+          "[integration][gpu_execution][sirius_generate][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  // The `[integration][multi_gpu]` tags make the `shared_env_listener` in `unittest.cpp` activate
+  // this environment; resuming it again here would replace its live SiriusContext.
+  auto* env = sirius::test::acquire_integration_env_for(2);
+  REQUIRE(env != nullptr);
+  REQUIRE(env->is_active());
+
+  constexpr std::uint64_t num_batches    = 256;
+  constexpr std::uint64_t rows_per_batch = 4000;
+  auto con = std::make_unique<duckdb::Connection>(env->make_connection());
+  // The reference is the same one the one-GPU test above checks against: a batch does not
+  // depend on the device that generated it.
+  CHECK(summed_row(*con, summed_query(num_batches, rows_per_batch, 7)) ==
+        summed_reference(num_batches, rows_per_batch, 7));
 }
 
 //===----------------------------------------------------------------------===//

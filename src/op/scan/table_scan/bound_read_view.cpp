@@ -93,17 +93,6 @@ void number(std::string& out, uint64_t value)
 
 void boolean(std::string& out, bool value) { append(out, 'b', value ? "1" : "0"); }
 
-duckdb::LogicalType generator_column_type(generator::value_type type)
-{
-  switch (type) {
-    case generator::value_type::int32: return duckdb::LogicalType::INTEGER;
-    case generator::value_type::int64: return duckdb::LogicalType::BIGINT;
-    case generator::value_type::float64: return duckdb::LogicalType::DOUBLE;
-    case generator::value_type::varchar: return duckdb::LogicalType::VARCHAR;
-  }
-  throw std::runtime_error("sirius_generate capture has an unknown column type");
-}
-
 // Hashes the canonical, length-delimited encoding of the spec, so the result depends only on
 // the spec's values. Doubles contribute their bit pattern.
 uint64_t generator_spec_hash(generator::generator_spec const& spec)
@@ -436,7 +425,7 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     if (!typed) throw std::runtime_error("generator capture has no GenerateFunctionData");
     auto const& spec = typed->spec;
     for (auto const& column : spec.columns) {
-      identity.bound_types.push_back(generator_column_type(column.type));
+      identity.bound_types.push_back(generator::to_logical_type(column.type));
       identity.bound_names.push_back(column.name);
     }
     identity.data_view = generator_identity{

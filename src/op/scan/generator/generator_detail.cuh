@@ -17,7 +17,7 @@
 #pragma once
 
 // Internal to the generator: included by generator_batch.cu, generator_strings.cu and their
-// tests. The three hash helpers define the generator's determinism; changing them changes every
+// tests. The hash helpers define the generator's determinism; changing them changes every
 // generated value.
 
 #include "op/scan/generator/generator_spec.hpp"
@@ -35,6 +35,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace sirius::op::scan::generator::detail {
 
@@ -53,6 +56,39 @@ CUDF_HOST_DEVICE inline std::uint64_t mix64(std::uint64_t x) noexcept
   return x;
 }
 
+/// The splitmix64 increment, added before each link of the counter_hash chain.
+inline constexpr std::uint64_t hash_increment = 0x9e3779b97f4a7c15ULL;
+
+/// The (seed, batch) links of counter_hash: the same for every value of one batch, so it is
+/// computed once on the host and passed to the kernels.
+CUDF_HOST_DEVICE inline std::uint64_t batch_key(std::uint64_t seed, std::uint64_t batch) noexcept
+{
+  return mix64((mix64(seed + hash_increment) ^ batch) + hash_increment);
+}
+
+/// The row link of counter_hash: the same for every (column, salt) stream of one row.
+CUDF_HOST_DEVICE inline std::uint64_t row_key(std::uint64_t batch_key, std::uint64_t row) noexcept
+{
+  return mix64((batch_key ^ row) + hash_increment);
+}
+
+/// The last link of counter_hash, from `row_key(batch_key(seed, batch), row)`.
+CUDF_HOST_DEVICE inline std::uint64_t counter_hash_from_row_key(std::uint64_t row_key,
+                                                                std::uint32_t column,
+                                                                std::uint32_t salt) noexcept
+{
+  return mix64((row_key ^ ((static_cast<std::uint64_t>(column) << 32) | salt)) + hash_increment);
+}
+
+/// counter_hash from `batch_key(seed, batch)`.
+CUDF_HOST_DEVICE inline std::uint64_t counter_hash_from_batch_key(std::uint64_t batch_key,
+                                                                  std::uint64_t row,
+                                                                  std::uint32_t column,
+                                                                  std::uint32_t salt) noexcept
+{
+  return counter_hash_from_row_key(row_key(batch_key, row), column, salt);
+}
+
 /// mix64 chain over (seed, batch, row, (uint64(column) << 32) | salt). Each link adds the
 /// splitmix64 increment, so the all-zero input does not hash to 0.
 CUDF_HOST_DEVICE inline std::uint64_t counter_hash(std::uint64_t seed,
@@ -61,12 +97,7 @@ CUDF_HOST_DEVICE inline std::uint64_t counter_hash(std::uint64_t seed,
                                                    std::uint32_t column,
                                                    std::uint32_t salt) noexcept
 {
-  constexpr std::uint64_t increment = 0x9e3779b97f4a7c15ULL;
-  std::uint64_t h                   = mix64(seed + increment);
-  h                                 = mix64((h ^ batch) + increment);
-  h                                 = mix64((h ^ row) + increment);
-  h = mix64((h ^ ((static_cast<std::uint64_t>(column) << 32) | salt)) + increment);
-  return h;
+  return counter_hash_from_batch_key(batch_key(seed, batch), row, column, salt);
 }
 
 /// Top 53 bits of `h` as a double in [0, 1).
@@ -75,11 +106,21 @@ CUDF_HOST_DEVICE inline double to_unit(std::uint64_t h) noexcept
   return static_cast<double>(h >> 11) * 0x1.0p-53;
 }
 
-/// One column's raw draw, before it is narrowed or formatted into its output type.
+/// Throws std::invalid_argument with the text of validation_error when `column` is not valid.
+inline void check_column(const column_spec& column)
+{
+  if (const auto problem = validation_error(column)) {
+    throw std::invalid_argument("sirius_generate: column '" + column.name + "': " + *problem);
+  }
+}
+
+/// One column's draw, in the vector of its type; the other two vectors are empty. An INTEGER
+/// column is drawn already narrowed, so it never holds 8 bytes per row.
 struct drawn_column {
-  rmm::device_uvector<std::int64_t> ints;  // used for int32/int64/varchar (size rows, else 0)
-  rmm::device_uvector<double> doubles;     // used for float64 (size rows, else 0)
-  rmm::device_buffer null_mask;            // empty when null_fraction == 0
+  rmm::device_uvector<std::int64_t> ints;    // int64 / varchar (the key before formatting)
+  rmm::device_uvector<std::int32_t> ints32;  // int32
+  rmm::device_uvector<double> doubles;       // float64
+  rmm::device_buffer null_mask;              // empty when null_fraction == 0
   cudf::size_type null_count{0};
 };
 
@@ -113,6 +154,17 @@ namespace sirius::op::scan::generator {
 /// generator_batch.cu.
 /// @throws std::out_of_range if batch_index >= spec.num_batches.
 std::unique_ptr<cudf::table> generate_batch(const generator_spec& spec,
+                                            std::uint64_t batch_index,
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr);
+
+/// Generates only `output_columns` of batch `batch_index`, in the order given. Each entry is an
+/// index into `spec.columns` and is also the column index the values are hashed with, so every
+/// output column is identical to that column of the full batch; the other columns are never
+/// drawn. Defined in generator_batch.cu.
+/// @throws std::out_of_range if batch_index >= spec.num_batches or an entry is not a spec column.
+std::unique_ptr<cudf::table> generate_batch(const generator_spec& spec,
+                                            const std::vector<std::size_t>& output_columns,
                                             std::uint64_t batch_index,
                                             rmm::cuda_stream_view stream,
                                             rmm::device_async_resource_ref mr);

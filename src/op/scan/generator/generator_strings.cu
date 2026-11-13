@@ -37,8 +37,7 @@ struct format_varchar_fn {
   const cudf::bitmask_type* null_mask;  // nullptr when there are no nulls
   std::int64_t min_length;              // p1
   std::uint64_t length_range;           // p2 - p1 + 1
-  std::uint64_t seed;
-  std::uint64_t batch_index;
+  std::uint64_t batch_key;              // detail::batch_key(seed, batch_index)
   std::uint32_t column_index;
 
   cudf::size_type* d_sizes{nullptr};
@@ -51,8 +50,9 @@ struct format_varchar_fn {
       if (d_chars == nullptr) { d_sizes[idx] = 0; }
       return;
     }
-    const auto row = static_cast<std::uint64_t>(idx);
-    auto key       = static_cast<std::uint64_t>(keys[idx] < 0 ? 0 : keys[idx]);
+    // Every hash of this row shares the row link of the chain.
+    const auto row_hash = row_key(batch_key, static_cast<std::uint64_t>(idx));
+    auto key            = static_cast<std::uint64_t>(keys[idx] < 0 ? 0 : keys[idx]);
 
     std::int64_t digits = 1;
     for (auto rest = key / 10; rest != 0; rest /= 10) {
@@ -61,7 +61,7 @@ struct format_varchar_fn {
     const auto prefix_length = digits > min_length ? digits : min_length;
     const auto drawn_length =
       min_length +
-      static_cast<std::int64_t>(counter_hash(seed, batch_index, row, column_index, salt::STR_LEN) %
+      static_cast<std::int64_t>(counter_hash_from_row_key(row_hash, column_index, salt::STR_LEN) %
                                 length_range);
     const auto length = drawn_length > prefix_length ? drawn_length : prefix_length;
 
@@ -78,7 +78,7 @@ struct format_varchar_fn {
     const auto suffix_length = static_cast<std::uint32_t>(length - prefix_length);
     for (std::uint32_t i = 0; i < suffix_length; ++i) {
       out[prefix_length + i] = static_cast<char>(
-        'a' + counter_hash(seed, batch_index, row, column_index, salt::STR_CHAR_BASE + i) % 26);
+        'a' + counter_hash_from_row_key(row_hash, column_index, salt::STR_CHAR_BASE + i) % 26);
     }
   }
 };
@@ -95,11 +95,11 @@ std::unique_ptr<cudf::column> format_varchar(cudf::device_span<const std::int64_
                                              rmm::cuda_stream_view stream,
                                              rmm::device_async_resource_ref mr)
 {
-  // A row's length must fit in a size_type. Written so that NaN fails too.
-  constexpr auto max_length = static_cast<double>(std::numeric_limits<cudf::size_type>::max());
-  if (!(column.p1 >= 1 && column.p1 <= column.p2 && column.p2 <= max_length)) {
-    throw std::invalid_argument("generator: VARCHAR column '" + column.name +
-                                "' requires 1 <= p1 <= p2 <= 2147483647");
+  // generate_batch has validated the column already; this guards direct callers.
+  check_column(column);
+  if (column.type != value_type::varchar) {
+    throw std::invalid_argument("generator: format_varchar needs a VARCHAR column, got '" +
+                                column.name + "'");
   }
   if (keys.size() > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::invalid_argument("generator: too many rows for one VARCHAR column");
@@ -122,8 +122,7 @@ std::unique_ptr<cudf::column> format_varchar(cudf::device_span<const std::int64_
                                          : nullptr,
                        .min_length   = min_length,
                        .length_range = static_cast<std::uint64_t>(max_drawn - min_length + 1),
-                       .seed         = seed,
-                       .batch_index  = batch_index,
+                       .batch_key    = batch_key(seed, batch_index),
                        .column_index = column_index};
 
   auto [offsets, chars] = cudf::strings::detail::make_strings_children(fn, rows, stream, mr);

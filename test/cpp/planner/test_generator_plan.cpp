@@ -21,6 +21,9 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_generator.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -29,9 +32,12 @@
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -166,6 +172,7 @@ TEST_CASE("sirius_generate plans to a GENERATOR source carrying the bound spec",
   auto const& source = leaf.Cast<sirius::op::sirius_physical_generator>();
   CHECK(source.is_source());
   CHECK(source.spec() == expected_spec());
+  CHECK(source.output_columns() == std::vector<std::size_t>{0, 1});
   CHECK(source.estimated_cardinality == kNumBatches * kRowsPerBatch);
   REQUIRE(source.types.size() == 2);
 
@@ -181,7 +188,7 @@ TEST_CASE("sirius_generate plans to a GENERATOR source carrying the bound spec",
   CHECK(record.contract.view->identity->source.kind == source_kind::generator);
 }
 
-TEST_CASE("sirius_generate keeps the projection above the GENERATOR source",
+TEST_CASE("sirius_generate under a sort generates only the referenced column",
           "[planner][generator_plan][shared_context]")
 {
   generator_plan_fixture fixture;
@@ -198,39 +205,171 @@ TEST_CASE("sirius_generate keeps the projection above the GENERATOR source",
   std::vector<SiriusPhysicalOperatorType> path;
   auto& leaf = leaf_of(*physical, path);
   REQUIRE(leaf.type == SiriusPhysicalOperatorType::GENERATOR);
-  // The source still produces every column of the spec.
+  // The source keeps the whole spec but produces k1 alone: 's' is never generated.
   auto const& source = leaf.Cast<sirius::op::sirius_physical_generator>();
   CHECK(source.spec() == expected_spec());
-  CHECK(source.types.size() == 2);
+  CHECK(source.output_columns() == std::vector<std::size_t>{0});
+  REQUIRE(source.types.size() == 1);
+  CHECK(source.types.front() == sirius::from_duckdb(duckdb::LogicalType::BIGINT));
   CHECK(source.estimated_cardinality == kNumBatches * kRowsPerBatch);
+  REQUIRE(source.total_source_input_bytes().has_value());
+  CHECK(*source.total_source_input_bytes() == kNumBatches * kRowsPerBatch * 8);
 
-  REQUIRE_FALSE(path.empty());
-  CHECK(path.back() == SiriusPhysicalOperatorType::PROJECTION);
   bool sorted = false;
   for (auto type : path) {
     sorted |= type == SiriusPhysicalOperatorType::ORDER_BY;
+    CHECK(type != SiriusPhysicalOperatorType::PROJECTION);
   }
   CHECK(sorted);
 }
 
-TEST_CASE("sirius_generate selects reordered and later columns above the source",
+TEST_CASE("SELECT of one sirius_generate column plans a bare GENERATOR of that column",
+          "[planner][generator_plan][shared_context]")
+{
+  generator_plan_fixture fixture;
+  auto logical = fixture.logical("SELECT k1 FROM " + generate_call());
+  plan_test_generator generator(*fixture.con.context);
+  auto physical = generator.plan_tree(*logical);
+  REQUIRE(physical);
+
+  // No PROJECTION above the source: the GENERATOR is the whole plan.
+  REQUIRE(physical->type == SiriusPhysicalOperatorType::GENERATOR);
+  CHECK(physical->children.empty());
+  auto const& source = physical->Cast<sirius::op::sirius_physical_generator>();
+  CHECK(source.spec() == expected_spec());
+  CHECK(source.output_columns() == std::vector<std::size_t>{0});
+  REQUIRE(source.types.size() == 1);
+  CHECK(source.types.front() == sirius::from_duckdb(duckdb::LogicalType::BIGINT));
+
+  // The estimates cover the BIGINT column only; the VARCHAR bytes of 's' are excluded.
+  auto const k1_bytes = kRowsPerBatch * 8;
+  REQUIRE(sirius::op::scan::generator::estimated_batch_bytes(expected_spec()) > k1_bytes);
+  REQUIRE(source.total_source_input_bytes().has_value());
+  CHECK(*source.total_source_input_bytes() == kNumBatches * k1_bytes);
+  CHECK(source.no_history_peak_memory_estimate(sirius::op::input_stats{}) == 2 * k1_bytes);
+}
+
+TEST_CASE("count(*) over sirius_generate generates one column for the row count",
           "[planner][generator_plan][shared_context]")
 {
   generator_plan_fixture fixture;
   plan_test_generator generator(*fixture.con.context);
-  for (auto const* select : {"SELECT s FROM ", "SELECT s, k1 FROM "}) {
-    CAPTURE(select);
-    auto logical  = fixture.logical(select + generate_call());
+
+  // Once types are resolved, a LogicalGet that references nothing names its first column
+  // (LogicalGet::GetAnyColumn; sirius_generate has no virtual columns), and the plan above
+  // expects that column's type.
+  {
+    auto logical = fixture.logical("SELECT count(*) FROM " + generate_call());
+    auto& get    = generate_get(*logical);
+    REQUIRE(get.GetColumnIds().size() == 1);
+    CHECK_FALSE(get.GetColumnIds().front().IsVirtualColumn());
+    CHECK(get.GetColumnIds().front().GetPrimaryIndex() == 0);
+
+    auto physical = generator.plan_tree(*logical);
+    REQUIRE(physical);
+    std::vector<SiriusPhysicalOperatorType> path;
+    auto& leaf = leaf_of(*physical, path);
+    REQUIRE(leaf.type == SiriusPhysicalOperatorType::GENERATOR);
+    auto const& source = leaf.Cast<sirius::op::sirius_physical_generator>();
+    CHECK(source.output_columns() == std::vector<std::size_t>{0});
+    REQUIRE(source.types.size() == 1);
+    CHECK(source.estimated_cardinality == kNumBatches * kRowsPerBatch);
+    for (auto type : path) {
+      CHECK(type != SiriusPhysicalOperatorType::PROJECTION);
+    }
+  }
+
+  // A read with no column ids and no resolved types gets the narrowest column of the spec.
+  {
+    auto logical = fixture.logical(
+      "SELECT count(*) FROM sirius_generate(num_batches := 4, rows_per_batch := 1000, seed := 42, "
+      "columns := ["
+      "{name: 's', type: 'VARCHAR', dist: 'uniform', p1: 8, p2: 16, cardinality: 0, "
+      "null_fraction: 0.0}, "
+      "{name: 'b', type: 'BIGINT', dist: 'uniform', p1: 0, p2: 1000, cardinality: 0, "
+      "null_fraction: 0.0}, "
+      "{name: 'i', type: 'INTEGER', dist: 'uniform', p1: 0, p2: 1000, cardinality: 0, "
+      "null_fraction: 0.0}])");
+    auto& get = generate_get(*logical);
+    get.ClearColumnIds();
+    auto physical = generator.create_plan(get);
+    REQUIRE(physical);
+    REQUIRE(physical->type == SiriusPhysicalOperatorType::GENERATOR);
+    auto const& source = physical->Cast<sirius::op::sirius_physical_generator>();
+    CHECK(source.output_columns() == std::vector<std::size_t>{2});
+    REQUIRE(source.types.size() == 1);
+    CHECK(source.types.front() == sirius::from_duckdb(duckdb::LogicalType::INTEGER));
+    CHECK(*source.total_source_input_bytes() == kNumBatches * kRowsPerBatch * 4);
+  }
+}
+
+TEST_CASE("The plan dump of a sirius_generate-only plan forbids CPU replay",
+          "[planner][generator_plan][shared_context]")
+{
+  generator_plan_fixture fixture;
+  auto logical = fixture.logical("SELECT * FROM " + generate_call());
+  plan_test_generator generator(*fixture.con.context);
+  auto physical = generator.create_plan(generate_get(*logical));
+  REQUIRE(physical);
+  REQUIRE(physical->type == SiriusPhysicalOperatorType::GENERATOR);
+
+  auto const& source = physical->Cast<sirius::op::sirius_physical_generator>();
+  REQUIRE(source.read_views() == generator.read_views);
+  REQUIRE(source.contract_id() != 0);
+  auto const& entry = source.read_views()->entry(source.contract_id());
+  REQUIRE(entry.contract.view);
+  CHECK_FALSE(entry.contract.view->replay_policy.permits_cpu_replay);
+  CHECK(entry.contract.view->replay_policy.reason == "generator");
+
+  sirius::pipeline::pipeline_build_context build_context(nullptr);
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_context);
+  sirius::pipeline::sirius_pipeline_build_state state;
+  state.set_pipeline_source(*pipeline, *physical);
+  sirius::pipeline::pipeline_conversion_result result{{pipeline}, {}, 1};
+  for (auto const& dump : {sirius::pipeline::dump_pipeline_conversion_result(result),
+                           sirius::pipeline::dump_pipeline_schedule_raw(result)}) {
+    CAPTURE(dump);
+    CHECK(dump.find("plan_cpu_replay=forbidden veto=stream scope=gpu_plan") != std::string::npos);
+    CHECK(dump.find(" source=sirius_generate kind=generator ") != std::string::npos);
+    CHECK(dump.find(" profile=sirius.generate.v1 ") != std::string::npos);
+    CHECK(dump.find("scan_cpu_replay=forbidden scan_replay_veto=generator") != std::string::npos);
+  }
+
+  // A generator built without a contract leaves the plan-wide policy incomplete.
+  sirius::op::sirius_physical_generator bare(source.types, source.spec(), 0);
+  auto bare_pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_context);
+  state.set_pipeline_source(*bare_pipeline, bare);
+  sirius::pipeline::pipeline_conversion_result bare_result{{bare_pipeline}, {}, 1};
+  CHECK(sirius::pipeline::dump_pipeline_conversion_result(bare_result)
+          .find("plan_cpu_replay=forbidden veto=incomplete") != std::string::npos);
+}
+
+TEST_CASE("sirius_generate produces later and reordered columns without a projection",
+          "[planner][generator_plan][shared_context]")
+{
+  generator_plan_fixture fixture;
+  plan_test_generator generator(*fixture.con.context);
+  struct expectation {
+    char const* select;
+    std::vector<std::size_t> output_columns;
+  };
+  for (auto const& expected : {expectation{"SELECT s FROM ", {1}},
+                               expectation{"SELECT s, k1 FROM ", {1, 0}},
+                               expectation{"SELECT * FROM ", {0, 1}}}) {
+    CAPTURE(expected.select);
+    auto logical  = fixture.logical(expected.select + generate_call());
     auto physical = generator.create_plan(generate_get(*logical));
     REQUIRE(physical);
-    REQUIRE(physical->type == SiriusPhysicalOperatorType::PROJECTION);
-    REQUIRE(physical->types.size() == generate_get(*logical).GetColumnIds().size());
-    CHECK(physical->types.front() == sirius::from_duckdb(duckdb::LogicalType::VARCHAR));
-    REQUIRE(physical->children.size() == 1);
-    auto const& child = *physical->children.front();
-    REQUIRE(child.type == SiriusPhysicalOperatorType::GENERATOR);
-    CHECK(child.types.size() == 2);
-    CHECK(child.Cast<sirius::op::sirius_physical_generator>().spec() == expected_spec());
+    REQUIRE(physical->type == SiriusPhysicalOperatorType::GENERATOR);
+    auto const& source = physical->Cast<sirius::op::sirius_physical_generator>();
+    CHECK(source.spec() == expected_spec());
+    CHECK(source.output_columns() == expected.output_columns);
+    REQUIRE(source.types.size() == expected.output_columns.size());
+    for (std::size_t i = 0; i < source.types.size(); ++i) {
+      CHECK(source.types[i] == sirius::from_duckdb(expected.output_columns[i] == 0
+                                                     ? duckdb::LogicalType::BIGINT
+                                                     : duckdb::LogicalType::VARCHAR));
+    }
   }
 }
 

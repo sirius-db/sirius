@@ -26,6 +26,12 @@
 //   rank is 1.
 // - double parameters that mean integers (bounds, start, step, D, N, cardinality) are rounded to
 //   the nearest int64 and saturate at its limits.
+//
+// The (seed, batch) part of the hash is the same for a whole batch: it is computed once on the
+// host (detail::batch_key) and the kernels hash from it.
+//
+// Each nullable column costs one stream synchronization per batch: cudf::null_count blocks until
+// the column's mask kernel has run and its count is back on the host.
 
 #include "op/scan/generator/generator_detail.cuh"
 
@@ -57,13 +63,9 @@ constexpr std::uint32_t zipf_round_salt = 0x80000000U;
 
 constexpr double two_pi = 6.283185307179586476925286766559;
 
-/// Rounds `value` to the nearest int64, saturating at the int64 limits.
-std::int64_t to_int64(double value, const column_spec& column, const char* what)
+/// Rounds a finite `value` to the nearest int64, saturating at the int64 limits.
+std::int64_t to_int64(double value)
 {
-  if (!std::isfinite(value)) {
-    throw std::invalid_argument("sirius_generate: column '" + column.name + "': " + what +
-                                " must be finite");
-  }
   const double rounded = std::round(value);
   if (rounded >= 0x1.0p63) { return std::numeric_limits<std::int64_t>::max(); }
   if (rounded < -0x1.0p63) { return std::numeric_limits<std::int64_t>::min(); }
@@ -106,8 +108,7 @@ CUDF_HOST_DEVICE inline double zipf_h_integral_inverse(double x, double s) noexc
 
 /// Everything a draw kernel needs, by value. Which fields are meaningful depends on `dist`.
 struct draw_params {
-  std::uint64_t seed{0};
-  std::uint64_t batch{0};
+  std::uint64_t batch_key{0};  // detail::batch_key(seed, batch)
   std::uint64_t first_row{0};  // global row of row 0: batch * rows_per_batch
   std::uint32_t column{0};
   distribution dist{distribution::uniform};
@@ -127,7 +128,7 @@ struct draw_params {
   [[nodiscard]] CUDF_HOST_DEVICE std::uint64_t hash(std::uint64_t row,
                                                     std::uint32_t salt) const noexcept
   {
-    return detail::counter_hash(seed, batch, row, column, salt);
+    return detail::counter_hash_from_batch_key(batch_key, row, column, salt);
   }
 };
 
@@ -268,10 +269,13 @@ struct validity_word_fn {
   }
 };
 
-struct narrow_fn {
-  __device__ std::int32_t operator()(std::int64_t value) const noexcept
+/// The INTEGER draw of one row: the int64 draw narrowed with wrap-around.
+struct int32_draw_fn {
+  int_draw_fn draw;
+
+  __device__ std::int32_t operator()(std::int64_t index) const noexcept
   {
-    return static_cast<std::int32_t>(static_cast<std::uint32_t>(value));
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(draw(index)));
   }
 };
 
@@ -286,20 +290,17 @@ cudf::size_type checked_rows(const generator_spec& spec)
   return static_cast<cudf::size_type>(spec.rows_per_batch);
 }
 
-/// Validates the column and turns it into kernel parameters.
+/// Validates the column (validation_error) and turns it into kernel parameters.
 draw_params make_params(const generator_spec& spec,
                         std::size_t column_index,
                         std::uint64_t batch_index)
 {
   const column_spec& column = spec.columns[column_index];
-  const bool as_double      = column.type == value_type::float64;
-  auto fail                 = [&](const std::string& what) {
-    throw std::invalid_argument("sirius_generate: column '" + column.name + "': " + what);
-  };
+  detail::check_column(column);
+  const bool as_double = column.type == value_type::float64;
 
   draw_params p;
-  p.seed      = spec.seed;
-  p.batch     = batch_index;
+  p.batch_key = detail::batch_key(spec.seed, batch_index);
   p.first_row = batch_index * spec.rows_per_batch;
   p.column    = static_cast<std::uint32_t>(column_index);
   p.dist      = column.dist;
@@ -309,34 +310,23 @@ draw_params make_params(const generator_spec& spec,
   // The cardinality clamp applies to the int64 draws of uniform / normal / sequential* only.
   auto set_clamp = [&](std::int64_t base) {
     if (as_double || !(column.cardinality > 0)) { return; }
-    p.clamp      = to_int64(column.cardinality, column, "cardinality");
+    p.clamp      = to_int64(column.cardinality);
     p.clamp_base = base;
   };
 
   switch (column.dist) {
     case distribution::uniform: {
-      if (!std::isfinite(column.p1) || !std::isfinite(column.p2) || column.p2 < column.p1) {
-        fail("uniform needs finite bounds with lo <= hi");
-      }
       if (!as_double) {
-        p.lo          = to_int64(column.p1, column, "lo");
-        const auto hi = to_int64(column.p2, column, "hi");
+        p.lo          = to_int64(column.p1);
+        const auto hi = to_int64(column.p2);
         p.range       = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(p.lo) + 1;
         set_clamp(p.lo);
       }
       break;
     }
-    case distribution::normal: {
-      if (!std::isfinite(column.p1) || !std::isfinite(column.p2)) {
-        fail("normal needs a finite mean and stddev");
-      }
-      set_clamp(0);
-      break;
-    }
+    case distribution::normal: set_clamp(0); break;
     case distribution::zipf: {
-      if (!std::isfinite(column.p1) || !(column.p1 > 0)) { fail("zipf needs an exponent s > 0"); }
-      if (!(column.cardinality >= 1)) { fail("zipf needs cardinality >= 1"); }
-      p.distinct       = to_int64(column.cardinality, column, "cardinality");
+      p.distinct       = to_int64(column.cardinality);
       p.zipf_s         = column.p1;
       p.zipf_h_x1      = zipf_h_integral(1.5, p.zipf_s) - 1.0;
       p.zipf_h_n       = zipf_h_integral(static_cast<double>(p.distinct) + 0.5, p.zipf_s);
@@ -344,26 +334,18 @@ draw_params make_params(const generator_spec& spec,
                                  zipf_h_integral(2.5, p.zipf_s) - zipf_h(2.0, p.zipf_s), p.zipf_s);
       break;
     }
-    case distribution::few_distinct: {
-      if (!(column.p1 >= 1)) { fail("few_distinct needs D >= 1"); }
-      p.distinct = to_int64(column.p1, column, "D");
-      break;
-    }
+    case distribution::few_distinct: p.distinct = to_int64(column.p1); break;
     case distribution::sequential:
     case distribution::sequential_desc: {
-      if (!std::isfinite(column.p1) || !std::isfinite(column.p2)) {
-        fail("sequential needs a finite start and step");
-      }
       if (column.p2 == 0) { p.p2 = 1; }
       if (!as_double) {
-        p.lo   = to_int64(column.p1, column, "start");
-        p.step = to_int64(p.p2, column, "step");
+        p.lo   = to_int64(column.p1);
+        p.step = to_int64(p.p2);
         if (p.step == 0) { p.step = 1; }  // a step that rounds to 0
         set_clamp(p.lo);
       }
       break;
     }
-    default: fail("unknown distribution");
   }
   return p;
 }
@@ -386,19 +368,30 @@ drawn_column draw_column(const generator_spec& spec,
   const cudf::size_type rows = checked_rows(spec);
   const column_spec& column  = spec.columns[column_index];
   const draw_params params   = make_params(spec, column_index, batch_index);
-  const bool as_double       = column.type == value_type::float64;
   const auto policy          = rmm::exec_policy_nosync(stream, mr);
+  const auto size_if         = [&](bool used) { return used ? static_cast<std::size_t>(rows) : 0; };
 
-  drawn_column out{rmm::device_uvector<std::int64_t>(as_double ? 0 : rows, stream, mr),
-                   rmm::device_uvector<double>(as_double ? rows : 0, stream, mr),
-                   rmm::device_buffer{0, stream, mr},
-                   0};
+  drawn_column out{
+    rmm::device_uvector<std::int64_t>(
+      size_if(column.type == value_type::int64 || column.type == value_type::varchar), stream, mr),
+    rmm::device_uvector<std::int32_t>(size_if(column.type == value_type::int32), stream, mr),
+    rmm::device_uvector<double>(size_if(column.type == value_type::float64), stream, mr),
+    rmm::device_buffer{0, stream, mr},
+    0};
   const thrust::counting_iterator<std::int64_t> first_row{0};
-  if (as_double) {
-    thrust::transform(
-      policy, first_row, first_row + rows, out.doubles.begin(), double_draw_fn{params});
-  } else {
-    thrust::transform(policy, first_row, first_row + rows, out.ints.begin(), int_draw_fn{params});
+  switch (column.type) {
+    case value_type::int32:
+      thrust::transform(
+        policy, first_row, first_row + rows, out.ints32.begin(), int32_draw_fn{{params}});
+      break;
+    case value_type::int64:
+    case value_type::varchar:
+      thrust::transform(policy, first_row, first_row + rows, out.ints.begin(), int_draw_fn{params});
+      break;
+    case value_type::float64:
+      thrust::transform(
+        policy, first_row, first_row + rows, out.doubles.begin(), double_draw_fn{params});
+      break;
   }
 
   if (column.null_fraction > 0 && rows > 0) {
@@ -411,6 +404,7 @@ drawn_column draw_column(const generator_spec& spec,
                       first_row + words,
                       bits,
                       validity_word_fn{params, column.null_fraction, rows});
+    // Blocks on `stream`: the one synchronization per nullable column per batch.
     out.null_count = cudf::null_count(bits, 0, rows, stream);
   }
   return out;
@@ -423,29 +417,37 @@ std::unique_ptr<cudf::table> generate_batch(const generator_spec& spec,
                                             rmm::cuda_stream_view stream,
                                             rmm::device_async_resource_ref mr)
 {
+  return generate_batch(spec, all_columns(spec), batch_index, stream, mr);
+}
+
+std::unique_ptr<cudf::table> generate_batch(const generator_spec& spec,
+                                            const std::vector<std::size_t>& output_columns,
+                                            std::uint64_t batch_index,
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr)
+{
   if (batch_index >= spec.num_batches) {
     throw std::out_of_range("sirius_generate: batch " + std::to_string(batch_index) +
                             " is out of range (" + std::to_string(spec.num_batches) + " batches)");
   }
-  const cudf::size_type rows = checked_rows(spec);
+  checked_rows(spec);  // throws for a batch no cudf column can hold, even with no columns
 
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(spec.columns.size());
-  for (std::size_t i = 0; i < spec.columns.size(); ++i) {
+  columns.reserve(output_columns.size());
+  // `i` is the column's index in the spec, which is what its values are hashed with.
+  for (const std::size_t i : output_columns) {
+    if (i >= spec.columns.size()) {
+      throw std::out_of_range("sirius_generate: column " + std::to_string(i) +
+                              " is out of range (" + std::to_string(spec.columns.size()) +
+                              " columns)");
+    }
     const column_spec& column = spec.columns[i];
     auto drawn                = detail::draw_column(spec, i, batch_index, stream, mr);
     switch (column.type) {
-      case value_type::int32: {
-        rmm::device_uvector<std::int32_t> narrowed(rows, stream, mr);
-        thrust::transform(rmm::exec_policy_nosync(stream, mr),
-                          drawn.ints.begin(),
-                          drawn.ints.end(),
-                          narrowed.begin(),
-                          narrow_fn{});
+      case value_type::int32:
         columns.push_back(std::make_unique<cudf::column>(
-          std::move(narrowed), std::move(drawn.null_mask), drawn.null_count));
+          std::move(drawn.ints32), std::move(drawn.null_mask), drawn.null_count));
         break;
-      }
       case value_type::int64:
         columns.push_back(std::make_unique<cudf::column>(
           std::move(drawn.ints), std::move(drawn.null_mask), drawn.null_count));

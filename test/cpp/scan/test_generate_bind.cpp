@@ -203,8 +203,12 @@ TEST_CASE("sirius_generate rejects invalid column specs naming the column", "[ge
   bad("type: 'BIGINT', dist: 'few_distinct', p1: 0", {"few_distinct"});
   bad("type: 'VARCHAR', dist: 'uniform', p1: 0, p2: 4", {"VARCHAR"});
   bad("type: 'VARCHAR', dist: 'sequential', p1: 8, p2: 4", {"VARCHAR"});
+  // A row's length must fit a cudf::size_type: the string kernel could not produce this column.
+  bad("type: 'VARCHAR', dist: 'uniform', p1: 1, p2: 1e10", {"VARCHAR", "2147483647"});
   bad("type: 'BIGINT', dist: 'uniform', cardinality: -1", {"cardinality"});
   bad("type: 'DOUBLE', dist: 'uniform', p1: 'nan'::DOUBLE", {"p1", "finite"});
+  bad("type: 'DOUBLE', dist: 'normal', p2: 'inf'::DOUBLE", {"p2", "finite"});
+  bad("type: 'BIGINT', dist: 'uniform', null_fraction: 'nan'::DOUBLE", {"null_fraction", "finite"});
 
   require_bind_error(fixture,
                      generate_sql(column("dup", "type: 'BIGINT', dist: 'uniform'") + ", " +

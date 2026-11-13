@@ -24,6 +24,7 @@
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_generator.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"  // IWYU pragma: keep
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -524,10 +525,22 @@ char const* dump_evidence_scope(op::scan::certificate_evidence_scope scope)
 //! the scan manager later matches against pinned entries.
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
-  if (op.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
-    auto const& stream = op.Cast<op::sirius_physical_streaming_source>();
-    if (stream.contract_id() != 0 && stream.read_views()) {
-      auto const& entry    = stream.read_views()->entry(stream.contract_id());
+  // Stream and generator leaves have no ingestible; their identity is the contract alone.
+  if (op.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE ||
+      op.type == op::SiriusPhysicalOperatorType::GENERATOR) {
+    std::shared_ptr<transparent::read_view_registry> registry;
+    op::scan::scan_contract_id id = 0;
+    if (op.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+      auto const& stream = op.Cast<op::sirius_physical_streaming_source>();
+      registry           = stream.read_views();
+      id                 = stream.contract_id();
+    } else {
+      auto const& generator = op.Cast<op::sirius_physical_generator>();
+      registry              = generator.read_views();
+      id                    = generator.contract_id();
+    }
+    if (id != 0 && registry) {
+      auto const& entry    = registry->entry(id);
       auto const& contract = entry.contract;
       auto const* identity =
         contract.view && contract.view->identity ? contract.view->identity.get() : nullptr;
@@ -660,6 +673,10 @@ void dump_plan_replay_policy(std::ostringstream& out, pipeline_conversion_result
       id               = scan.contract_id();
     } else if (node.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
       auto const& scan = node.Cast<op::sirius_physical_streaming_source>();
+      registry         = scan.read_views();
+      id               = scan.contract_id();
+    } else if (node.type == op::SiriusPhysicalOperatorType::GENERATOR) {
+      auto const& scan = node.Cast<op::sirius_physical_generator>();
       registry         = scan.read_views();
       id               = scan.contract_id();
     } else

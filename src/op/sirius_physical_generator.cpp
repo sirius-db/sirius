@@ -17,6 +17,7 @@
 #include "op/sirius_physical_generator.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/input_free_operator_data.hpp"
 #include "op/scan/generator/generator_detail.cuh"
 #include "sirius/exception.hpp"
@@ -41,17 +42,6 @@ namespace {
 
 constexpr auto max_bytes = std::numeric_limits<std::size_t>::max();
 
-std::size_t saturating_add(std::size_t a, std::size_t b) noexcept
-{
-  return b > max_bytes - a ? max_bytes : a + b;
-}
-
-std::size_t saturating_mul(std::size_t a, std::size_t b) noexcept
-{
-  if (a == 0 || b == 0) { return 0; }
-  return a > max_bytes / b ? max_bytes : a * b;
-}
-
 sirius::type_id output_type_id(scan::generator::value_type type)
 {
   using scan::generator::value_type;
@@ -69,21 +59,45 @@ sirius::type_id output_type_id(scan::generator::value_type type)
 sirius_physical_generator::sirius_physical_generator(duckdb::vector<sirius::logical_type> types,
                                                      scan::generator::generator_spec spec,
                                                      duckdb::idx_t estimated_cardinality)
+  : sirius_physical_generator(
+      std::move(types), spec, scan::generator::all_columns(spec), estimated_cardinality)
+{
+}
+
+sirius_physical_generator::sirius_physical_generator(
+  duckdb::vector<sirius::logical_type> types,
+  scan::generator::generator_spec spec,
+  std::vector<std::size_t> output_columns,
+  duckdb::idx_t estimated_cardinality,
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views,
+  scan::scan_contract_id contract_id)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GENERATOR, std::move(types), estimated_cardinality),
-    _spec(std::move(spec))
+    _spec(std::move(spec)),
+    _output_columns(std::move(output_columns)),
+    _read_views(std::move(read_views)),
+    _contract_id(contract_id)
 {
-  // generate_batch emits one column per spec column, in spec order; the declared output types
-  // must describe exactly that table.
-  if (this->types.size() != _spec.columns.size()) {
+  // generate_batch emits one column per output column, in that order; the declared output
+  // types must describe exactly that table. A table without columns cannot carry a row count.
+  if (_output_columns.empty()) {
+    throw sirius::internal_exception("[sirius_physical_generator] no output columns");
+  }
+  if (this->types.size() != _output_columns.size()) {
     throw sirius::internal_exception(
       "[sirius_physical_generator] output has " + std::to_string(this->types.size()) +
-      " types but the generator spec has " + std::to_string(_spec.columns.size()) + " columns");
+      " types but the generator produces " + std::to_string(_output_columns.size()) + " columns");
   }
-  for (std::size_t i = 0; i < _spec.columns.size(); ++i) {
-    if (this->types[i].id() != output_type_id(_spec.columns[i].type)) {
+  for (std::size_t i = 0; i < _output_columns.size(); ++i) {
+    auto const column = _output_columns[i];
+    if (column >= _spec.columns.size()) {
+      throw sirius::internal_exception("[sirius_physical_generator] output column " +
+                                       std::to_string(column) + " is not one of the spec's " +
+                                       std::to_string(_spec.columns.size()) + " columns");
+    }
+    if (this->types[i].id() != output_type_id(_spec.columns[column].type)) {
       throw sirius::internal_exception("[sirius_physical_generator] output type of column " +
-                                       std::to_string(i) + " ('" + _spec.columns[i].name +
+                                       std::to_string(i) + " ('" + _spec.columns[column].name +
                                        "') does not match the generator spec");
     }
   }
@@ -113,8 +127,8 @@ std::unique_ptr<operator_data> sirius_physical_generator::get_next_task_input_da
   if (all_ports_empty()) { return nullptr; }
   auto const batch = _next_batch.fetch_add(1, std::memory_order_acq_rel);
   if (batch >= _spec.num_batches) { return nullptr; }
-  return std::make_unique<input_free_operator_data>(scan::generator::estimated_batch_bytes(_spec),
-                                                    batch);
+  return std::make_unique<input_free_operator_data>(
+    scan::generator::estimated_batch_bytes(_spec, _output_columns), batch);
 }
 
 //===----------------------------------------------------------------------===//
@@ -140,10 +154,10 @@ std::unique_ptr<operator_data> sirius_physical_generator::execute(const operator
   auto* mem_space = &generator_input->get_gpu_memory_space();
   auto mr         = mem_space->get_default_allocator();
 
-  // The batch depends only on (spec, batch index), so an OOM retry of the same input
-  // regenerates identical data.
-  auto output_table =
-    scan::generator::generate_batch(_spec, *batch_index, rmm::cuda_stream_view{stream.get()}, mr);
+  // The batch depends only on (spec, output columns, batch index), so an OOM retry of the same
+  // input regenerates identical data.
+  auto output_table = scan::generator::generate_batch(
+    _spec, _output_columns, *batch_index, rmm::cuda_stream_view{stream.get()}, mr);
 
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
@@ -158,19 +172,17 @@ std::size_t sirius_physical_generator::no_history_peak_memory_estimate(const inp
 {
   // Columns are generated one at a time, so the peak is the finished columns plus one column's
   // temporaries: the draw buffers, and for VARCHAR the offsets and chars being built. 2x the
-  // batch covers that except for narrow batches, where the int64 draw behind an INTEGER column
-  // is larger than its share of the output; one extra int64 buffer covers those.
-  auto const batch_bytes = scan::generator::estimated_batch_bytes(_spec);
-  auto const draw_bytes =
-    saturating_mul(static_cast<std::size_t>(_spec.rows_per_batch), sizeof(std::int64_t));
-  return saturating_add(saturating_mul(batch_bytes, 2), draw_bytes);
+  // batch covers that.
+  return sirius::memory::saturating_mul(
+    scan::generator::estimated_batch_bytes(_spec, _output_columns), 2);
 }
 
 std::optional<std::size_t> sirius_physical_generator::total_source_input_bytes() const
 {
   if (_spec.num_batches > max_bytes) { return max_bytes; }
-  return saturating_mul(static_cast<std::size_t>(_spec.num_batches),
-                        scan::generator::estimated_batch_bytes(_spec));
+  return sirius::memory::saturating_mul(
+    static_cast<std::size_t>(_spec.num_batches),
+    scan::generator::estimated_batch_bytes(_spec, _output_columns));
 }
 
 sirius::OrderPreservationType sirius_physical_generator::output_order_preservation() const

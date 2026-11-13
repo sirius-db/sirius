@@ -345,6 +345,10 @@ TEST_CASE("generator strings: argument validation and empty input", "[generator_
     format_column({.keys = {1}, .p1 = std::numeric_limits<double>::quiet_NaN(), .p2 = 4}),
     std::invalid_argument);
   REQUIRE_THROWS_AS(format_column({.keys = {1}, .p1 = 1, .p2 = 1e12}), std::invalid_argument);
+  // The largest length is accepted by the check (no rows, so nothing that long is built).
+  REQUIRE(format_column({.keys = {}, .p1 = 1, .p2 = 2147483647.0})->size() == 0);
+  REQUIRE_THROWS_AS(format_column({.keys = {}, .p1 = 1, .p2 = 2147483648.0}),
+                    std::invalid_argument);
 
   const auto empty = format_column({.keys = {}, .p1 = 2, .p2 = 4});
   REQUIRE(empty->size() == 0);

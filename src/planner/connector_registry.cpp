@@ -362,7 +362,7 @@ connector make_sirius_stream_source_connector()
 // stream source's byte class and replay veto.
 connector make_sirius_generate_connector()
 {
-  return {.function_name              = "sirius_generate",
+  return {.function_name              = op::scan::generator::kGenerateFunctionName,
           .kind                       = kind::generator,
           .registry_profile           = "sirius.generate.v1",
           .bind_data_matches          = matches_bind<op::scan::generator::GenerateFunctionData>,
@@ -505,7 +505,8 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
   }
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
-  if (name == "sirius_generate") return {op::scan::generator::get_generate_function()};
+  if (name == op::scan::generator::kGenerateFunctionName)
+    return {op::scan::generator::get_generate_function()};
   // Iceberg is initialized at extension load, never during a planning lookup.
   return {};
 }

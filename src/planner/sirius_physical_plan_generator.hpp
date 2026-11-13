@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/catalog/dependency_list.hpp"
+#include "duckdb/common/column_index.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
@@ -213,12 +214,17 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_streaming_source_plan(
     duckdb::LogicalGet& op);
 
-  //! Builds the GENERATOR source a `sirius_generate(...)` read stands for from its bound spec,
-  //! under a projection when the query references only some of its columns. The leaf has no
-  //! scan metadata; its contract is allocated and recorded as supported so plan-wide contract
-  //! accounting sees it.
+  //! Builds the GENERATOR source a `sirius_generate(...)` read stands for from its bound spec.
+  //! It generates only the columns the query references. The leaf has no scan metadata; its
+  //! contract is allocated and recorded as supported so plan-wide contract accounting sees it.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_generator_plan(
     duckdb::LogicalGet& op);
+
+  //! Captures the read view of a source that produces its batches itself (a stream or a
+  //! generator), allocates its scan contract over @p column_ids under the stream materializer
+  //! with @p profile, and records it as supported. Returns the contract id.
+  sirius::op::scan::scan_contract_id allocate_stream_contract(
+    duckdb::LogicalGet& op, duckdb::vector<duckdb::ColumnIndex> column_ids, std::string profile);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);

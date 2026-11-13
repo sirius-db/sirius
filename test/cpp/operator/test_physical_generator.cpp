@@ -28,15 +28,19 @@
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/column/column_view.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -50,6 +54,7 @@ using sirius::op::scan::generator::distribution;
 using sirius::op::scan::generator::estimated_batch_bytes;
 using sirius::op::scan::generator::generator_spec;
 using sirius::op::scan::generator::value_type;
+using sirius::test::operator_utils::copy_column_to_host;
 
 /// INTEGER, BIGINT and DOUBLE columns (VARCHAR is covered by the string kernel's own tests).
 generator_spec numeric_spec(std::uint64_t num_batches, std::uint64_t rows_per_batch)
@@ -86,19 +91,6 @@ std::uint64_t sequence_of(const sirius::op::operator_data& input)
   return *generator_input->sequence();
 }
 
-template <typename T>
-std::vector<T> to_host(cudf::column_view column, ::cuda::stream_ref stream)
-{
-  std::vector<T> host(static_cast<std::size_t>(column.size()));
-  REQUIRE(cudaMemcpyAsync(host.data(),
-                          column.data<T>(),
-                          host.size() * sizeof(T),
-                          cudaMemcpyDeviceToHost,
-                          stream.get()) == cudaSuccess);
-  stream.sync();
-  return host;
-}
-
 struct host_batch {
   std::vector<std::int32_t> i;
   std::vector<std::int64_t> b;
@@ -122,9 +114,9 @@ host_batch execute_to_host(sirius_physical_generator& source,
   REQUIRE(table.column(0).type().id() == cudf::type_id::INT32);
   REQUIRE(table.column(1).type().id() == cudf::type_id::INT64);
   REQUIRE(table.column(2).type().id() == cudf::type_id::FLOAT64);
-  return {to_host<std::int32_t>(table.column(0), stream),
-          to_host<std::int64_t>(table.column(1), stream),
-          to_host<double>(table.column(2), stream)};
+  return {copy_column_to_host<std::int32_t>(table.column(0), stream),
+          copy_column_to_host<std::int64_t>(table.column(1), stream),
+          copy_column_to_host<double>(table.column(2), stream)};
 }
 
 }  // namespace
@@ -282,14 +274,87 @@ TEST_CASE("generator memory estimates follow the spec", "[operator][physical_gen
   stats.num_batches = 1;
   stats.bytes       = batch_bytes;
   stats.type        = sirius::op::operator_data_type::INPUT_FREE;
-  CHECK(source->no_history_peak_memory_estimate(stats) >= 2 * batch_bytes);
-  CHECK(source->no_history_peak_memory_estimate(stats) <= 3 * batch_bytes);
+  CHECK(source->no_history_peak_memory_estimate(stats) == 2 * batch_bytes);
 
   // A spec too large for std::size_t saturates and does not wrap.
   auto huge           = numeric_spec(std::numeric_limits<std::uint64_t>::max(), rows);
-  huge.rows_per_batch = std::numeric_limits<std::int32_t>::max();
+  huge.rows_per_batch = std::numeric_limits<std::uint64_t>::max() / 2;
   sirius_physical_generator huge_source(numeric_types(), huge, 0);
   CHECK(*huge_source.total_source_input_bytes() == std::numeric_limits<std::size_t>::max());
+  CHECK(huge_source.no_history_peak_memory_estimate(stats) ==
+        std::numeric_limits<std::size_t>::max());
+}
+
+TEST_CASE("generator produces and reserves only its output columns",
+          "[operator][physical_generator]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu    = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu);
+  rmm::cuda_stream stream;
+
+  constexpr std::uint64_t num_batches = 3;
+  constexpr std::uint64_t rows        = 1000;
+  auto const spec                     = numeric_spec(num_batches, rows);
+
+  // DOUBLE then INTEGER: columns 2 and 0 of the spec, out of order; BIGINT is never drawn.
+  sirius_physical_generator subset(
+    {logical_type::make(sirius::type_id::DOUBLE), logical_type::make(sirius::type_id::INTEGER)},
+    spec,
+    {2, 0},
+    num_batches * rows);
+  CHECK(subset.spec() == spec);
+  CHECK(subset.output_columns() == std::vector<std::size_t>{2, 0});
+
+  auto const subset_bytes = rows * (8 + 4);
+  REQUIRE(estimated_batch_bytes(spec, subset.output_columns()) == subset_bytes);
+  CHECK(*subset.total_source_input_bytes() == num_batches * subset_bytes);
+  sirius::op::input_stats stats;
+  CHECK(subset.no_history_peak_memory_estimate(stats) == 2 * subset_bytes);
+
+  auto full = make_generator(num_batches, rows);
+  for (std::uint64_t batch = 0; batch < num_batches; ++batch) {
+    auto subset_input = subset.get_next_task_input_data();
+    auto full_input   = full->get_next_task_input_data();
+    REQUIRE(subset_input);
+    REQUIRE(full_input);
+    CHECK(subset_input->get_estimated_size_in_bytes() == subset_bytes);
+    subset_input->prepare_for_processing(gpu, stream);
+    full_input->prepare_for_processing(gpu, stream);
+
+    auto output = subset.execute(*subset_input, stream);
+    auto& batches =
+      dynamic_cast<sirius::op::pipelineable_operator_data&>(*output).get_data_batches();
+    REQUIRE(batches.size() == 1);
+    auto ro    = batches[0]->to_read_only();
+    auto table = sirius::get_cudf_table_view(ro);
+    REQUIRE(table.num_columns() == 2);
+    REQUIRE(table.num_rows() == static_cast<cudf::size_type>(rows));
+    REQUIRE(table.column(0).type().id() == cudf::type_id::FLOAT64);
+    REQUIRE(table.column(1).type().id() == cudf::type_id::INT32);
+
+    // Each column has the values it has in the full batch.
+    auto const expected = execute_to_host(*full, *full_input, rows, stream);
+    CHECK(copy_column_to_host<double>(table.column(0), stream) == expected.d);
+    CHECK(copy_column_to_host<std::int32_t>(table.column(1), stream) == expected.i);
+  }
+  CHECK_FALSE(subset.get_next_task_input_data());
+}
+
+TEST_CASE("generator rejects output columns that disagree with its spec",
+          "[operator][physical_generator]")
+{
+  auto const spec    = numeric_spec(1, 10);
+  auto const integer = logical_type::make(sirius::type_id::INTEGER);
+  auto const bigint  = logical_type::make(sirius::type_id::BIGINT);
+  // No columns, a column outside the spec, a type for another column, a missing type.
+  CHECK_THROWS_AS(sirius_physical_generator({}, spec, std::vector<std::size_t>{}, 10),
+                  sirius::internal_exception);
+  CHECK_THROWS_AS(sirius_physical_generator({integer}, spec, {3}, 10), sirius::internal_exception);
+  CHECK_THROWS_AS(sirius_physical_generator({integer}, spec, {1}, 10), sirius::internal_exception);
+  CHECK_THROWS_AS(sirius_physical_generator({bigint}, spec, {1, 0}, 10),
+                  sirius::internal_exception);
+  CHECK_NOTHROW(sirius_physical_generator({bigint, integer}, spec, {1, 0}, 10));
 }
 
 TEST_CASE("query::build_indices lists a GENERATOR source among the scan operators",
@@ -363,7 +428,7 @@ TEST_CASE("generator batches do not depend on the order tasks run in",
   }
 }
 
-TEST_CASE("generator peak estimate covers the int64 draw behind a narrow INTEGER batch",
+TEST_CASE("generator peak estimate for a narrow INTEGER-only spec is twice the batch",
           "[operator][physical_generator]")
 {
   constexpr std::uint64_t rows = 4096;
@@ -383,6 +448,159 @@ TEST_CASE("generator peak estimate covers the int64 draw behind a narrow INTEGER
   stats.num_batches = 1;
   stats.bytes       = batch_bytes;
   stats.type        = sirius::op::operator_data_type::INPUT_FREE;
-  // Finished INT32 column + its int64 draw buffer exceed 2x the 4-byte-per-row batch.
-  CHECK(source.no_history_peak_memory_estimate(stats) >= batch_bytes + rows * sizeof(std::int64_t));
+  // An INTEGER column is drawn at its own width: the finished column plus one draw buffer.
+  CHECK(source.no_history_peak_memory_estimate(stats) == 2 * batch_bytes);
+}
+
+namespace {
+
+struct mixed_host_batch {
+  std::vector<std::int32_t> i;
+  std::vector<std::int64_t> b;
+  std::vector<bool> b_valid;
+  std::vector<double> d;
+  std::vector<std::string> s;
+  friend bool operator==(const mixed_host_batch&, const mixed_host_batch&) = default;
+};
+
+/// Copies @p count elements at @p device to the host on @p stream and waits for that stream
+/// alone. The blocking cudaMemcpy would wait for every stream of the device.
+template <typename T>
+std::vector<T> copy_on_stream(const T* device, std::size_t count, ::cuda::stream_ref stream)
+{
+  std::vector<T> host(count);
+  if (count != 0 &&
+      cudaMemcpyAsync(
+        host.data(), device, count * sizeof(T), cudaMemcpyDeviceToHost, stream.get()) !=
+        cudaSuccess) {
+    throw std::runtime_error("cudaMemcpyAsync failed");
+  }
+  stream.sync();
+  return host;
+}
+
+/// Runs one task of @p source on @p stream and copies the batch to the host, waiting only on the
+/// batch's writer event and @p stream.
+mixed_host_batch execute_mixed_to_host(sirius_physical_generator& source,
+                                       const sirius::op::operator_data& input,
+                                       ::cuda::stream_ref stream)
+{
+  auto output   = source.execute(input, stream);
+  auto& batches = dynamic_cast<sirius::op::pipelineable_operator_data&>(*output).get_data_batches();
+  if (batches.size() != 1) { throw std::runtime_error("expected one generated batch"); }
+  auto ro                 = batches[0]->to_read_only();
+  auto const writer_event = ro.get_writer_event();
+  if (writer_event == nullptr) { throw std::runtime_error("generated batch has no writer event"); }
+  if (cudaStreamWaitEvent(stream.get(), writer_event, 0) != cudaSuccess) {
+    throw std::runtime_error("cudaStreamWaitEvent failed");
+  }
+  auto table = sirius::get_cudf_table_view(ro);
+  if (table.num_columns() != 4) { throw std::runtime_error("expected four generated columns"); }
+  auto const rows = static_cast<std::size_t>(table.num_rows());
+  mixed_host_batch host;
+  host.i = copy_column_to_host<std::int32_t>(table.column(0), stream);
+  host.b = copy_column_to_host<std::int64_t>(table.column(1), stream);
+  host.d = copy_column_to_host<double>(table.column(2), stream);
+
+  host.b_valid.assign(rows, true);
+  if (auto const* mask = table.column(1).null_mask()) {
+    auto const words = copy_on_stream(mask, (rows + 31) / 32, stream);
+    for (std::size_t row = 0; row < rows; ++row) {
+      host.b_valid[row] = (words[row / 32] >> (row % 32)) & 1u;
+    }
+  }
+
+  cudf::strings_column_view strings(table.column(3));
+  auto const offsets = copy_on_stream(strings.offsets().data<cudf::size_type>(), rows + 1, stream);
+  auto const chars   = copy_on_stream(
+    strings.chars_begin(rmm::cuda_stream_view{stream.get()}), offsets.back(), stream);
+  host.s.reserve(rows);
+  for (std::size_t row = 0; row < rows; ++row) {
+    host.s.emplace_back(chars.data() + offsets[row], chars.data() + offsets[row + 1]);
+  }
+  return host;
+}
+
+}  // namespace
+
+TEST_CASE("generator execute is stream-safe under concurrent tasks",
+          "[operator][physical_generator]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu    = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu);
+
+  constexpr std::uint64_t num_batches = 16;
+  constexpr std::uint64_t rows        = 20000;
+  constexpr std::size_t num_threads   = 4;
+  generator_spec spec;
+  spec.columns        = {{"i", value_type::int32, distribution::uniform, 0, 1000},
+                         {"b", value_type::int64, distribution::normal, 0, 1e6, 0, 0.2},
+                         {"d", value_type::float64, distribution::uniform, 0, 1},
+                         {"s", value_type::varchar, distribution::uniform, 8, 16}};
+  spec.num_batches    = num_batches;
+  spec.rows_per_batch = rows;
+  spec.seed           = 11;
+  auto const types    = [] {
+    return duckdb::vector<logical_type>{logical_type::make(sirius::type_id::INTEGER),
+                                        logical_type::make(sirius::type_id::BIGINT),
+                                        logical_type::make(sirius::type_id::DOUBLE),
+                                        logical_type::make(sirius::type_id::VARCHAR)};
+  };
+
+  // Reference: every batch, one after another on one stream.
+  std::vector<mixed_host_batch> serial;
+  {
+    rmm::cuda_stream stream;
+    sirius_physical_generator source(types(), spec, num_batches * rows);
+    for (std::uint64_t batch = 0; batch < num_batches; ++batch) {
+      auto input = source.get_next_task_input_data();
+      REQUIRE(input);
+      input->prepare_for_processing(gpu, stream);
+      serial.push_back(execute_mixed_to_host(source, *input, stream));
+    }
+  }
+  REQUIRE(serial[0].i.size() == rows);
+  REQUIRE(serial[0].s.size() == rows);
+  REQUIRE(std::count(serial[0].b_valid.begin(), serial[0].b_valid.end(), false) > 0);
+  REQUIRE(serial[0] != serial[1]);
+
+  sirius_physical_generator source(types(), spec, num_batches * rows);
+  std::vector<std::unique_ptr<sirius::op::operator_data>> inputs;
+  for (std::uint64_t batch = 0; batch < num_batches; ++batch) {
+    inputs.push_back(source.get_next_task_input_data());
+    REQUIRE(inputs.back());
+    REQUIRE(sequence_of(*inputs.back()) == batch);
+  }
+
+  // Thread t runs batches t, t + 4, ... on its own stream; nothing synchronizes the device
+  // between the threads' launches.
+  std::vector<mixed_host_batch> concurrent(num_batches);
+  std::vector<std::string> errors(num_threads);
+  std::vector<std::thread> threads;
+  for (std::size_t t = 0; t < num_threads; ++t) {
+    threads.emplace_back([&, t] {
+      try {
+        rmm::cuda_stream stream;
+        for (std::size_t batch = t; batch < num_batches; batch += num_threads) {
+          inputs[batch]->prepare_for_processing(gpu, stream);
+          concurrent[batch] = execute_mixed_to_host(source, *inputs[batch], stream);
+        }
+      } catch (const std::exception& e) {
+        errors[t] = e.what();
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  for (std::size_t t = 0; t < num_threads; ++t) {
+    CAPTURE(t);
+    REQUIRE(errors[t].empty());
+  }
+  for (std::uint64_t batch = 0; batch < num_batches; ++batch) {
+    CAPTURE(batch);
+    CHECK(concurrent[batch] == serial[batch]);
+  }
 }
