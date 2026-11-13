@@ -188,7 +188,8 @@ python3 scripts/compare_answers.py "$OUT/client.txt" --ref-client "$OUT/ref.txt"
 ```
 
 It prints one line per run and exits 1 unless every run is `match` or `match up to a LIMIT
-tie`. Rows compare in any order, numbers within `1e-6` relative or `0.01` absolute; a text
+tie`; a query the reference has and the run does not is `NOT RUN`, and also exits 1. Rows
+compare in any order, numbers within `1e-6` relative or `0.01` absolute; a text
 `diff` does not work, because float digits and the order of equal rows differ. Q3 and Q18 end
 in `ORDER BY ... LIMIT` and may return different rows that tie at the cut: `--ties` names their
 order columns. At SF10000 the plain DuckDB needs about 15 minutes for 22 queries and 1 TB of
