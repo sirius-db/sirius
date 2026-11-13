@@ -1020,6 +1020,16 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     return collect(*read);
   }
   if (ranks_.empty() && !replay) { auto_start_locked(context); }
+  if (ranks_.empty() && !replay) {
+    // A recovery that failed leaves no ranks. Spawned ranks are started again here, as
+    // auto_start_locked does for registered ones; a cluster that was stopped stays stopped.
+    bool retry = false;
+    {
+      std::lock_guard lock{state_mutex_};
+      retry = state_ == cluster_state::failed && options_.ranks > 0;
+    }
+    if (retry) { recover_locked(context); }
+  }
   if (ranks_.empty()) {
     std::lock_guard lock{state_mutex_};
     throw IOException(reason_.empty()
