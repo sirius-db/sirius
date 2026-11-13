@@ -44,6 +44,10 @@ START_TIMEOUT_SECONDS = (
 )
 UNKNOWN_TYPE = st.SqlType("UNKNOWN", "varchar")  # until DESCRIBE supplies the real one
 _SENTINEL = "siriusfuzz"
+# After a fatal device error Sirius refuses GPU work until the process restarts. The first
+# marker is that refusal, raised for every later query; the second is the fatal error itself.
+_GPU_RUNTIME_GONE = "gpu runtime is unavailable"
+_GPU_DEAD_MARKERS = (_GPU_RUNTIME_GONE, "cuda context unavailable")
 _ERROR_LINE = re.compile(r"^[A-Za-z ]+ Error: ")
 _FALLBACK_BANNER = (
     "=============================================\n",
@@ -669,7 +673,7 @@ class Session:
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / f"{name}.parquet"
             self.execute(
-                f"COPY \"{name}\" TO {sql_literal(str(path))} "
+                f'COPY "{name}" TO {sql_literal(str(path))} '
                 f"(FORMAT PARQUET, ROW_GROUP_SIZE {int(row_group_size)})"
             )
             self.execute(f'ALTER TABLE "{name}" RENAME TO "{name}__base"')
@@ -752,6 +756,20 @@ class Session:
             "budget": timeout + TEARDOWN_SECONDS,  # the run, then a killed shell's exit
             "dataset": self.current_alias,
         }
+        out = self._run_once(sql, gpu, timeout, state)
+        if out.status == "error" and _GPU_RUNTIME_GONE in out.error.lower():
+            # An earlier query broke the runtime: judge this one on a fresh shell.
+            self.shell.kill()
+            out = self._run_once(sql, gpu, timeout, state)
+        if out.status == "error" and any(
+            m in out.error.lower() for m in _GPU_DEAD_MARKERS
+        ):
+            self.shell.kill()  # the next run starts a fresh shell
+        return self._record(phase, state, out)
+
+    def _run_once(
+        self, sql: str, gpu: bool, timeout: float, state: dict[str, Any]
+    ) -> RunResult:
         self._ensure_alive(state)
         state["started_at"] = time.time()  # the run's budget starts after any restart
         if self.evidence_path:
@@ -772,7 +790,7 @@ class Session:
             )
         if self.shell.alive:
             self.set_gpu(False)
-        return self._record(phase, state, out)
+        return out
 
     def _record(
         self, phase: str, state: dict[str, Any], result: RunResult
