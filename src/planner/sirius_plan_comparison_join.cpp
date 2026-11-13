@@ -783,6 +783,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     hj.mark_join_build_switch_ratio   = op_params.mark_join_build_switch_ratio;
     hj.runtime_distinct_build_probe   = op_params.enable_runtime_distinct_build_probe;
     hj.max_build_probe_resident_bytes = op_params.max_build_probe_resident_bytes;
+    hj.build_fold_policy              = op_params.build_fold_policy;
     hj.dynamic_filter_signature       = sirius::op::dynamic_filter_join_signature(
       duckdb::JoinTypeToString(op.join_type), condition_spellings);
     hj.set_single_join_error_on_multiple_rows(

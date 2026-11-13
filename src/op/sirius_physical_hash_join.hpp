@@ -316,6 +316,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! planning time. 0 disables BUILD_PROBE for all joins including MARK.
   uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
 
+  //! Rule deciding whether a single-partition STANDARD or MIXED_JOIN build folds into one batch,
+  //! applied by `bind_partition_inputs`. Set from operator_params at planning time.
+  op::build_fold_policy build_fold_policy = op::build_fold_policy::legacy_filter_coupled;
+
   //! `dynamic_filter_join_signature` of this join's type and conditions, which names the join in
   //! its `[dynamic_filter_key]` lines independently of operator IDs. Set at planning time;
   //! `sirius_pipeline_converter` passes it to the session with the join's occurrence and ID.
@@ -411,6 +415,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
+
+  /// @brief The join's execution mode; BUILD_PROBE once `get_partition_strategy` selects it.
+  [[nodiscard]] HASH_JOIN_MODE join_mode() const noexcept { return _join_mode.load(); }
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
