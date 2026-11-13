@@ -25,7 +25,7 @@ DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 3. **OnFinalizePrepare** (`SiriusContext::OnFinalizePrepare`): After DuckDB generates its CPU physical plan, this hook:
    - Retrieves the stored logical plan copy
    - Calls `sirius_physical_plan_generator::create_plan()` — the single source of truth for GPU support
-   - If successful, stashes DuckDB's CPU physical plan (kept for runtime fallback) and replaces `prepared.physical_plan` with a `PhysicalSiriusExecution` operator (a DuckDB `PhysicalOperator` subclass)
+   - If successful, stashes DuckDB's CPU physical plan (kept for eligible SELECT runtime fallback) and replaces `prepared.physical_plan` with a `PhysicalSiriusExecution` operator (a DuckDB `PhysicalOperator` subclass)
    - If `create_plan()` throws (unsupported operator/type), the CPU plan is left in place — plan-time fallback. When `enable_duckdb_fallback` is false the error is surfaced instead of silently running on CPU.
 
 4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
@@ -48,7 +48,9 @@ This path is still supported but is no longer the primary way to use Sirius.
 
 For transparent execution, DuckDB's executor calls `PhysicalSiriusExecution::GetData()` which lazily triggers the Sirius GPU engine on the first call. It creates a `sirius_interface`, wraps the Sirius physical plan in a `sirius_prepared_statement_data`, and calls `sirius_execute_query()`.
 
-If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the operator runs the stashed DuckDB CPU plan on a private `duckdb::Executor` bound to the same `ClientContext` — so the fallback executes under the same transaction and MVCC snapshot as the failed attempt, including that transaction's own uncommitted writes. The GPU result is fully materialized before any row is emitted, so the fallback cannot duplicate rows. S3-reading queries have no CPU path and surface a clear error instead of falling back. A `runtime_fallbacks` counter and a WARN log record each occurrence.
+For SELECT, a runtime GPU failure can run the stashed DuckDB CPU plan when `enable_duckdb_fallback` is true and replay policy permits it. Replay uses a private `duckdb::Executor` bound to the same `ClientContext`, preserving the transaction and MVCC snapshot, including its own uncommitted writes. The SELECT result is fully materialized before any row is emitted, so replay cannot duplicate delivered rows. S3-reading queries and user interrupts do not replay. A `runtime_fallbacks` counter and a WARN log record each runtime replay.
+
+Accepted [Parquet COPY](parquet-output.md#failure-and-cleanup) never replays a runtime failure, even with fallback enabled: files may already be externally visible. After work retires and cleanup is attempted, the error surfaces to the client. Unsupported COPY options can still fall back during planning, before GPU export starts.
 
 ## Step 3: Query Lifecycle Setup
 
@@ -193,7 +195,7 @@ If any task throws an exception during execution:
 3. The error surfaces as an error-carrying result at `PhysicalSiriusExecution::GetData()`.
    Shared pools and managers remain available for other queries.
 
-On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.
+On the transparent SELECT path, an error may trigger the same-transaction CPU replay described in Step 2, subject to the fallback setting and replay policy. User interrupts and S3-reading queries do not replay. Runtime COPY failures also never replay: after asynchronous work retires, Sirius attempts to clean up files owned by the export and returns the error. See [Parquet failure and cleanup](parquet-output.md#failure-and-cleanup).
 
 ## Sequence Diagram
 

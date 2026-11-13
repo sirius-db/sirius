@@ -1,11 +1,15 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "output/parquet_writer.hpp"
 
+#include "helper/timestamp_semantics.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
+
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -73,6 +77,14 @@ cudf::column_view parquet_view(parquet_field const& field,
                                std::vector<std::unique_ptr<cudf::column>>& owners,
                                ::cuda::stream_ref stream)
 {
+  // cuDF scales raw seconds ticks during Parquet encoding. Normalize first so
+  // +/-infinity and NULL survive, and finite overflow is rejected like CPU COPY.
+  // This also applies to timestamp children reached recursively below.
+  if (column.type().id() == cudf::type_id::TIMESTAMP_SECONDS) {
+    owners.push_back(temporal::cast_to_microseconds_checked(
+      column, stream, rmm::mr::get_current_device_resource_ref()));
+    return owners.back()->view();
+  }
   // Sirius carries DECIMAL(1..4,s) as unscaled INT16. Parquet/cuDF require
   // DECIMAL32: widen the unscaled integer, then attach the scale without rescaling.
   if (field.type.is_decimal() && field.type.decimal_precision() <= 4 &&
