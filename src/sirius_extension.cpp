@@ -3001,22 +3001,6 @@ static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
                    params->enable_dynamic_filter_multi_partition);
 }
 
-static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
-                                                SetScope scope,
-                                                Value& parameter)
-{
-  auto const bytes = UBigIntValue::Get(parameter);
-  if (bytes == 0) {
-    throw InvalidInputException(
-      "max_dynamic_filter_bloom_bytes_per_gpu must be greater than zero; set "
-      "enable_dynamic_filter_multi_partition = false to disable Bloom accumulation");
-  }
-  auto* params                                   = get_operator_params(context, scope);
-  params->max_dynamic_filter_bloom_bytes_per_gpu = bytes;
-  SIRIUS_LOG_DEBUG("Updated config MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU to {}",
-                   params->max_dynamic_filter_bloom_bytes_per_gpu);
-}
-
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
@@ -3649,16 +3633,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_dynamic_filter_multi_partition),
     SetEnableDynamicFilterMultiPartition);
-
-  add_sirius_option(
-    config,
-    option_visibility::internal,
-    "max_dynamic_filter_bloom_bytes_per_gpu",
-    "Aggregate aligned Bloom-array budget in bytes per GPU for multi-partition accumulation; "
-    "must be greater than zero",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
-    SetMaxDynamicFilterBloomBytesPerGpu);
 
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",

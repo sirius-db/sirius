@@ -20,7 +20,7 @@
 #include "creator/config.hpp"
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
-#include "op/dynamic_filter/config.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -152,7 +152,7 @@ constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
-  /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
+  /// Construct defaults with a shared batch size and 8x BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
@@ -228,9 +228,12 @@ struct operator_params {
   /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
   bool enable_dynamic_filter_multi_partition = true;
 
-  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
-  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
-    sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Engine-owned per-GPU Bloom-array cap, always 4x this query's scan batch size.
+  /// Saturate overflow; YAML and SQL cannot override the budget independently.
+  [[nodiscard]] uint64_t max_dynamic_filter_bloom_bytes_per_gpu() const noexcept
+  {
+    return memory::saturating_mul(4, scan_task_batch_size);
+  }
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
