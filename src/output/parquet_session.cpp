@@ -100,7 +100,6 @@ void parquet_session::write(input_id const& id,
   {
     std::lock_guard guard(mutex_);
     start_locked();
-    if (id.empty()) throw std::runtime_error("Parquet input requires stable retry identity");
     if (positioned_ && *positioned_ != position.has_value())
       throw std::runtime_error("Cannot mix positioned and unpositioned Parquet inputs");
     positioned_         = position.has_value();

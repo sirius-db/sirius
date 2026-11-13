@@ -1,6 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "operator_execution_context.hpp"
 #include "output/parquet_spec.hpp"
 
 #include <atomic>
@@ -19,7 +20,7 @@ class parquet_session {
   ~parquet_session();
   parquet_session(parquet_session const&)            = delete;
   parquet_session& operator=(parquet_session const&) = delete;
-  using input_id                                     = std::vector<std::uint64_t>;
+  using input_id                                     = logical_task_id;
   using write_part = std::function<void(std::size_t, std::filesystem::path const&)>;
   void write(input_id const& id,
              std::optional<std::size_t> position,

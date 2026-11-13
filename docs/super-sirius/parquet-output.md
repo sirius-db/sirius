@@ -82,7 +82,10 @@ schema-only part with zero rows.
 Every part is first reserved with exclusive creation. An existing filename causes
 an error without overwriting it. The export tracks only files it successfully
 reserved. Failed encoding attempts remove their owned parts before retrying; a
-completed input is recorded only once. Concurrent exports into the same directory
+completed logical input is recorded only once. Retry accounting uses the query and
+original task ID, so separate CTE/UNION deliveries of the same physical batch are
+counted separately while rescheduled attempts retain their identity. Physical
+batch IDs and shared storage remain unchanged. Concurrent exports into the same directory
 are not a supported coordination mechanism: they can fail directory validation or
 filename reservation, but failed reservations do not grant ownership of another
 writer's file.
