@@ -344,13 +344,13 @@ struct telemetry_config {
 };
 
 /// Parameters controlling Simpatico compression. The unprefixed fields apply to
-/// pin_table(tier=>'host'); the spill_ fields apply to batches the downgrade
+/// pin_table(tier=>'host' or 'gpu'); the spill_ fields apply to batches the downgrade
 /// executor spills to the host or disk tier.
 struct compression_config {
-  /// When true, pin_table(tier=>'host') attempts to compress each chunk with
-  /// Simpatico before storing it in host memory. Falls back to uncompressed
-  /// host storage when no plan file is found for a table or compression fails.
-  bool enable_pin_table_compression{false};
+  /// Attempt Simpatico compression for host/GPU pins by default. Explicit table
+  /// plans override automatic spill-policy selection; size/ratio gates and
+  /// encoding failures may leave chunks uncompressed. A per-call opt-out wins.
+  bool enable_pin_table_compression{true};
 
   /// Minimum chunk size (uncompressed bytes) below which compression is
   /// skipped and the chunk is stored uncompressed.  0 = no threshold.
@@ -368,9 +368,9 @@ struct compression_config {
   /// Directory containing per-table Simpatico plan files for input-table
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);
   /// its contents are the multi-column plan DSL (columns separated by "---"
-  /// lines) passed verbatim to simpatico::compress_with_plan.  If no file
-  /// exists for a table, that table is pinned uncompressed regardless of the
-  /// enable flag.  Empty string = feature disabled.
+  /// lines) passed to simpatico::compress_with_plan after column selection.
+  /// An empty directory setting or absent usable table plan selects plans
+  /// automatically, using the same per-column policy as spill compression.
   std::string input_plan_dir{};
 
   /// Store batches the downgrade executor spills to the host or disk tier

@@ -205,6 +205,8 @@ struct host_pin_result {
 /// and @ref materialize_all_batches_compressed.
 struct compression_pin_config {
   bool enabled{false};
+  /// Empty selects the spill policy automatically for each materialized chunk.
+  /// Nonempty is an explicit, already column-selected table plan.
   std::string plan_dsl;
   std::size_t min_batch_size_bytes{0};
   /// Keep the compressed form only if header+payload <= this fraction of the
@@ -233,6 +235,8 @@ struct device_pin_chunk {
 /// chunks may be interleaved within a single pin.
 struct device_pin_result {
   std::vector<device_pin_chunk> chunks;
+  /// Retained for raw-only results, which use column-major insertion and merge semantics.
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
   /// Chunk-major stored-column metadata, recorded from each GPU table right before it is
   /// compressed or split into device columns. Parallel to @c chunks and their columns.
   pinned_column_storage_matrix column_storage;

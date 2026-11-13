@@ -184,19 +184,19 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 
 ### Input-table compression (`sirius.compression`)
 
-These settings control optional Simpatico compression when
-`pin_table` caches input tables. Prefer the per-call
-`CALL pin_table(..., compression => true)` argument to request compression for a specific pin.
-The settings below supply the default for calls that omit the argument and configure plan lookup
-and retention gates. Compression also requires a matching plan in `input_plan_dir`; otherwise the
-table is pinned uncompressed.
+Simpatico compression is enabled by default when `pin_table` caches input tables on
+the host or GPU. Use `CALL pin_table(..., compression => false)` to opt out for a specific
+pin, or `SET pin_table_compression = false` for the session default. Matching table plans
+in `input_plan_dir` override automatic selection; without one, each chunk uses the same
+type/sample-based plan selection as spill compression, after carrier narrowing. The
+size and actual compressed-footprint gates below still apply.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
-| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Default for `pin_table` calls that omit the `compression` argument. |
+| `enable_pin_table_compression` | `pin_table_compression` | bool | true | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
-| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
+| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Optional directory of per-table Simpatico plan overrides. An empty path or no usable matching file selects plans automatically. |
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
 `max_compressed_fraction` values instead of silently changing retention behavior.
@@ -992,8 +992,8 @@ retention gates.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `pin_table_compression` | false | Default for `pin_table` calls that omit the `compression` argument. |
-| `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
+| `pin_table_compression` | true | Default for `pin_table` calls that omit the `compression` argument. |
+| `pin_table_input_compression_plan_dir` | (empty) | Optional directory of per-table Simpatico plan overrides (`<table_name>.<ext>`, multi-column plan DSL). Without a usable matching file, plans are selected automatically. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join) and as late materialization's proof for a group-by-rowid ride. Affects pins and plans made after it is set. |
