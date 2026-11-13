@@ -186,6 +186,29 @@ floating-point keys because Sirius does not admit those keys for the `ALL` forms
 
 **Phase 2c cast quarantine.** `features.casts.float_to_int` is off by default and on in gaps mode. A one-expression `CAST(FLOAT AS BIGINT)` check differs at negative half values (signature `83b0c0ed`), so default runs do not emit those casts.
 
+**Phase 2c expressions and data.** The scalar function list includes `upper`,
+`round` (FLOAT/DOUBLE with optional constant INTEGER precision), and date arithmetic.
+`features.scalar_functions.gap_enabled` adds `lower`, `abs`, and unary minus in gaps
+mode; those missed the initial per-shape 95% admission gate.
+`features.expressions.simple_case` adds `CASE x WHEN value`;
+`features.aggregates.expression_args` adds `sum` and `count` over CASE and `min`/`max`
+over casts in gaps mode while aggregate-expression acceptance is investigated. Accepted functions also reach filters, CASE branches, and grouping keys;
+`features.scalar_functions.window_args` adds them to window arguments in gaps mode.
+`features.scalar_functions.join_neighbours` tries `upper` on
+non-key join comparisons in gaps mode. The generator keeps computed floating-point
+values out of exact grouping and ordering keys by default.
+
+`features.casts.integer_to_varchar`, `.decimal_to_integer`, `.integer_to_decimal`,
+`.decimal_to_double`, `.date_timestamp`, and `.try_cast` control cast boundary
+shapes. Integer narrowing and sign changes remain in gaps mode while overflow
+behavior differs; decimal scale reduction and timestamp second/millisecond
+casts also remain in gaps mode because one-expression checks found mismatches.
+`data.edge_values.unicode_case` exposes Unicode case-mapping differences in
+gaps mode. The edge-value switches for NaN/infinity, negative zero, date
+extremes, rounding ties such as `0.125`, and strings over 64 KiB are independently
+configurable. The long-string switch inserts at most one such value per small dataset;
+DuckDB-native GPU scans currently decline overflow strings.
+
 **Sirius YAML.** `--sirius-config` selects it (repeat the flag to alternate across workers);
 otherwise the configuration's `sirius.configs` applies (by default the integration YAML and
 `config/partition16k.yaml`, whose 16 KiB budgets split the small fuzz tables into several hash

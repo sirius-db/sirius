@@ -63,8 +63,9 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(switch)
         self.assertEqual(f.aggregates.distinct, "on")
         self.assertEqual(cfg.variants.per_query, 0)
-        # Correctness knobs, data shape and the CPU-vs-GPU oracle are untouched.
-        self.assertFalse(f.casts.to_varchar)
+        # Gaps mode also explores float/decimal formatting casts.
+        self.assertTrue(f.casts.to_varchar)
+        # Data shape and the CPU-vs-GPU oracle are untouched.
         self.assertEqual(f.types, default.features.types)
         self.assertEqual(cfg.oracle, default.oracle)
         # Every preset names a real key and changes it from the shipped default.

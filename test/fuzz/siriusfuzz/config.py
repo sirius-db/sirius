@@ -81,6 +81,7 @@ class Aggregates:
     distinct: str = "on"  # off | grouped_only | on
     filter: bool = True
     filter_subquery: bool = gap_switch(False)
+    expression_args: bool = gap_switch(False)
 
 
 @dataclass
@@ -112,8 +113,16 @@ class ScalarFunctions:
             "millisecond",
             "microsecond",
             "date_trunc",
+            "upper",
+            "round",
+            "date_arith",
         ]
     )
+    gap_enabled: list[str] = field(
+        default_factory=list, metadata={"gaps": ["lower", "abs", "negate"]}
+    )
+    join_neighbours: bool = gap_switch(False)
+    window_args: bool = gap_switch(False)
     weights: dict[str, float] = field(
         default_factory=lambda: {"like": 2.0, "regexp_replace": 0.5}
     )
@@ -138,6 +147,7 @@ class ScalarFunctions:
 @dataclass
 class Expressions:
     case: bool = True
+    simple_case: bool = gap_switch(False)
     coalesce: bool = True
     in_list: bool = True
     between: bool = True
@@ -150,8 +160,27 @@ class Expressions:
 class Casts:
     enabled: bool = True
     temporal_numeric: bool = gap_switch(False)
-    float_to_int: bool = gap_switch(False)  # 83b0c0ed: FLOAT -> BIGINT rounds differently
-    to_varchar: bool = False  # runs on the GPU; number formatting differs (mismatches)
+    float_to_int: bool = gap_switch(
+        False
+    )  # 83b0c0ed: FLOAT -> BIGINT rounds differently
+    integer_narrowing: bool = gap_switch(False)
+    integer_sign_change: bool = gap_switch(False)
+    integer_out_of_range: bool = gap_switch(False)
+    integer_to_varchar: bool = True
+    decimal_scale: bool = gap_switch(
+        False
+    )  # reducing scale rounds on CPU, truncates on GPU
+    decimal_to_integer: bool = True
+    integer_to_decimal: bool = True
+    decimal_to_double: bool = True
+    date_timestamp: bool = True
+    timestamp_units: bool = gap_switch(
+        False
+    )  # second/millisecond casts truncate on GPU
+    try_cast: bool = True
+    to_varchar: bool = gap_switch(
+        False
+    )  # float/decimal formatting or planner support differs
     targets: list[str] = field(
         default_factory=lambda: ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
     )
@@ -241,9 +270,12 @@ class Strings:
 class EdgeValues:
     probability: float = 0.02
     int_extremes: bool = True
-    negative_zero: bool = False
-    nan_inf: bool = False
-    date_extremes: bool = False
+    negative_zero: bool = True
+    nan_inf: bool = True
+    rounding_ties: bool = gap_switch(False)
+    date_extremes: bool = True
+    unicode_case: bool = gap_switch(False)  # GPU case mapping differs for ß and İ
+    long_string: bool = gap_switch(False)
 
 
 @dataclass

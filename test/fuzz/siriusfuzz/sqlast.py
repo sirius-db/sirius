@@ -84,6 +84,16 @@ class Arith(Expr):
 
 
 @dataclass
+class Unary(Expr):
+    op: str
+    child: Expr
+    kind: str
+
+    def sql(self) -> str:
+        return f"({self.op}{self.child.sql()})"
+
+
+@dataclass
 class Compare(Expr):
     op: str  # = <> < <= > >= "IS DISTINCT FROM" "IS NOT DISTINCT FROM"
     left: Expr
@@ -147,6 +157,7 @@ class Cast(Expr):
     child: Expr
     type: st.SqlType
     try_: bool = False
+    family: str | None = None
 
     @property
     def kind(self) -> str:  # type: ignore[override]
@@ -157,7 +168,7 @@ class Cast(Expr):
         return f"{fn}({self.child.sql()} AS {self.type.name})"
 
     def label(self) -> str:
-        return f"Cast({self.type.kind})"
+        return f"Cast({self.family or self.type.kind})"
 
 
 @dataclass
@@ -174,6 +185,22 @@ class Case(Expr):
             parts.append(f"ELSE {self.else_.sql()}")
         parts.append("END")
         return "(" + " ".join(parts) + ")"
+
+
+@dataclass
+class SimpleCase(Expr):
+    operand: Expr
+    whens: list[tuple[Expr, Expr]]
+    else_: Expr | None
+    kind: str
+
+    def sql(self) -> str:
+        parts = ["CASE", self.operand.sql()]
+        for value, result in self.whens:
+            parts.append(f"WHEN {value.sql()} THEN {result.sql()}")
+        if self.else_ is not None:
+            parts.append(f"ELSE {self.else_.sql()}")
+        return "(" + " ".join(parts) + " END)"
 
 
 @dataclass
@@ -231,6 +258,7 @@ class Agg(Expr):
     distinct: bool = False
     kind: str = "unknown"
     filter: Expr | None = None
+    family: str | None = None
 
     def sql(self) -> str:
         if self.name == "count_star":
@@ -244,7 +272,7 @@ class Agg(Expr):
         return body
 
     def label(self) -> str:
-        return f"Agg({self.name}{',distinct' if self.distinct else ''}{',filter' if self.filter else ''})"
+        return f"Agg({self.name}{',distinct' if self.distinct else ''}{',filter' if self.filter else ''}{',expression:' + self.family if self.family else ''})"
 
 
 @dataclass
@@ -287,9 +315,10 @@ class Window(Expr):
     order_by: list["OrderItem"]
     kind: str = "unknown"
     frame: str | None = None
+    arg_family: str | None = None
 
     def label(self) -> str:
-        return f"Window({self.name}{',running' if self.frame else ''})"
+        return f"Window({self.name}{',running' if self.frame else ''}{',arg:' + self.arg_family if self.arg_family else ''})"
 
     def sql(self) -> str:
         inner = (

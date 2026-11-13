@@ -208,6 +208,8 @@ class DataGenerator:
             self.cfg.data.large.fraction > 0
             and rng.random() < self.cfg.data.large.fraction
         )
+        self._large = large
+        self._long_string_used = False
         lo, hi = self.cfg.data.large.dims if large else self.cfg.data.tables
         n_tables = rng.randint(lo, hi)
         tables: list[Table] = []
@@ -380,6 +382,8 @@ class DataGenerator:
                 choices.append(-0.0)
             if ev.nan_inf:
                 choices += [float("nan"), float("inf"), float("-inf")]
+            if ev.rounding_ties:
+                choices += [2.5, 0.125, -1.5]
             return rng.choice(choices) if choices else None
         if typ.kind == "date" and ev.date_extremes:
             return rng.choice(
@@ -390,7 +394,19 @@ class DataGenerator:
                 [dt.datetime(1970, 1, 1), dt.datetime(2262, 4, 11, 23, 47, 16)]
             )
         if typ.kind == "varchar":
-            return rng.choice(["", " ", "%", "_", "''", "\\"])
+            choices = ["", " ", "   ", "%", "_", "''", "\\", "a%b", "a_b"]
+            if ev.unicode_case:
+                choices += ["straße", "İstanbul", "ǅ", "😀"]
+            if (
+                ev.long_string
+                and not getattr(self, "_large", False)
+                and not getattr(self, "_long_string_used", False)
+            ):
+                choices.append("a" * 65537)
+            value = rng.choice(choices)
+            if len(value) > 65536:
+                self._long_string_used = True
+            return value
         return None
 
     def _random_string(self) -> str:

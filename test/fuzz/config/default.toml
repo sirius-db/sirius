@@ -53,13 +53,17 @@ functions = ["sum", "count", "count_star", "min", "max", "avg"]   # first: nonde
 distinct = "on"  # off | grouped_only | on
 filter = true
 filter_subquery = false
+expression_args = false
 
 [features.scalar_functions]
 enabled = ["add", "sub", "mul", "div", "int_div", "mod",
            "substring", "like", "contains", "prefix", "suffix", "strlen", "length",
            "regexp_replace", "concat", "concat_operator",
            "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
-           "date_trunc"]
+           "date_trunc", "upper", "round", "date_arith"]
+gap_enabled = []       # lower/abs/unary minus await the 95% admission gate
+join_neighbours = false
+window_args = false
 date_trunc_units = ["day", "hour", "minute", "second"]  # year/quarter/month/week fall back
 [features.scalar_functions.weights]
 like = 2.0
@@ -67,6 +71,7 @@ regexp_replace = 0.5
 
 [features.expressions]
 case = true
+simple_case = false
 coalesce = true
 in_list = true
 between = true
@@ -78,6 +83,17 @@ try = false
 enabled = true
 temporal_numeric = false  # declined in translate_cast
 float_to_int = false      # 83b0c0ed: FLOAT -> BIGINT rounds negative half values differently
+integer_narrowing = false
+integer_sign_change = false
+integer_out_of_range = false  # gaps: unchecked overflow and signed-to-unsigned casts
+integer_to_varchar = true
+decimal_scale = false     # scale reduction rounds on CPU, truncates on GPU
+decimal_to_integer = true
+integer_to_decimal = true
+decimal_to_double = true
+date_timestamp = true
+timestamp_units = false   # second/millisecond casts truncate on GPU
+try_cast = true
 to_varchar = false        # runs on the GPU, but number formatting differs from DuckDB (mismatches)
 targets = ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
 
@@ -116,9 +132,12 @@ max_len = 40
 [data.edge_values]
 probability = 0.02
 int_extremes = true
-negative_zero = false
-nan_inf = false
-date_extremes = false
+negative_zero = true
+nan_inf = true
+rounding_ties = false
+date_extremes = true
+unicode_case = false
+long_string = false
 
 [data.pin]
 tables_fraction = 0.0

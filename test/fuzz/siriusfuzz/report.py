@@ -612,6 +612,27 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
         claimed.append("window")
     if f.distinct:
         claimed.append("distinct")
+    for name in ("upper", "round", "date_arith"):
+        if name in f.scalar_functions.enabled:
+            claimed.append(f"func:{name}")
+    if f.expressions.simple_case:
+        claimed.append("expr:simple_case")
+    for name in (
+        "integer_to_varchar",
+        "decimal_to_integer",
+        "integer_to_decimal",
+        "decimal_to_double",
+        "date_timestamp",
+        "try_cast",
+    ):
+        if getattr(f.casts, name):
+            claimed.append(f"cast_boundary:{name}")
+    if f.aggregates.expression_args:
+        claimed += [
+            "agg:expression:sum_case",
+            "agg:expression:count_case",
+            "agg:expression:cast_minmax",
+        ]
     return claimed
 
 

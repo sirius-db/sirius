@@ -45,11 +45,13 @@ from .sqlast import (
     OrderItem,
     Query,
     ScalarSubquery,
+    SimpleCase,
     Select,
     SelectItem,
     SetOp,
     TableRef,
     Try,
+    Unary,
     Window,
     has_computed_float,
     walk,
@@ -133,10 +135,22 @@ class QueryGenerator:
             self.join_types.append("full")
         if self.f.cross_join and "cross" not in self.join_types:
             self.join_types.append("cross")
-        self.funcs = set(self.f.scalar_functions.enabled)
+        self.funcs = set(
+            self.f.scalar_functions.enabled + self.f.scalar_functions.gap_enabled
+        )
         self.func_weights = dict(self.f.scalar_functions.weights)
         self.aggs = list(self.f.aggregates.functions)
         self.cast_targets = st.types_from_names(self.f.casts.targets)
+        self.int_cast_targets = [
+            st.TINYINT,
+            st.SMALLINT,
+            st.INTEGER,
+            st.BIGINT,
+            st.UTINYINT,
+            st.USMALLINT,
+            st.UINTEGER,
+            st.UBIGINT,
+        ]
         self._alias_n = 0
         self._cte_n = 0
 
@@ -591,6 +605,19 @@ class QueryGenerator:
         # A simple derived key exercises the projection below the aggregate.
         if col.kind in ("date", "timestamp") and self._func_enabled("year"):
             return Func("year", [col], kind="int")
+        if col.kind == "varchar" and self._func_enabled("upper") and r < 0.82:
+            self._note("func:upper")
+            return Func("upper", [col], "varchar")
+        if col.kind == "varchar" and self._func_enabled("lower") and r < 0.9:
+            self._note("func:lower")
+            return Func("lower", [col], "varchar")
+        if (
+            col.kind == "float"
+            and self.f.float_exact_keys
+            and self._func_enabled("round")
+        ):
+            self._note("func:round")
+            return Func("round", [col, Literal(1, st.INTEGER)], "float")
         if col.kind == "varchar" and self._func_enabled("substring"):
             return Func(
                 "substring",
@@ -742,8 +769,11 @@ class QueryGenerator:
             return TableRef(name, alias), ScopeTable(alias, cols)
         pq = self.f.complexity.query
         if depth < self.f.subqueries.max_depth and rng.random() < pq:
-            sub = self._gen_select(depth + 1, outer=None, exact_outputs=True)
-            cols = self._output_columns(sub, alias)
+            try:
+                sub = self._gen_select(depth + 1, outer=None, exact_outputs=True)
+                cols = self._output_columns(sub, alias)
+            except GenerationFailed:
+                cols = []  # a nested grouping may have no legal keys; use a base table
             if cols:
                 self._note("derived_table")
                 return Derived(sub, alias), ScopeTable(alias, cols)
@@ -843,6 +873,13 @@ class QueryGenerator:
         if self.f.joins.inequality and rng.random() < 0.2 and others:
             l2, r2 = rng.choice(others)
             self._note("join:inequality")
+            if (
+                self.f.scalar_functions.join_neighbours
+                and l2.kind == r2.kind == "varchar"
+                and self._func_enabled("upper")
+            ):
+                l2, r2 = Func("upper", [l2], "varchar"), Func("upper", [r2], "varchar")
+                self._note("func:upper")
             cond = Logical("AND", [cond, Compare(rng.choice(["<", ">", "<>"]), l2, r2)])
         elif rng.random() < 0.15 and others:
             l2, r2 = rng.choice(others)
@@ -945,6 +982,7 @@ class QueryGenerator:
             "case": 0.6 if ex.case else 0,
             "coalesce": 0.6 if ex.coalesce else 0,
             "cast": 0.5 if self.f.casts.enabled else 0,
+            "cast_boundary": 0,
             "try": 0.2 if ex.try_ else 0,
             "scalar_subquery": (
                 0.4
@@ -968,10 +1006,26 @@ class QueryGenerator:
                 ),
                 "strlen": self._fw("strlen") + self._fw("length"),
                 "extract": sum(self._fw(f) for f in EXTRACT_TS),
+                "abs": self._fw("abs"),
+                "negate": self._fw("negate"),
+                "date_arith": self._fw("date_arith"),
                 **generic,
+                "cast_boundary": (
+                    0.8
+                    if (
+                        self.f.casts.integer_narrowing
+                        or self.f.casts.integer_sign_change
+                        or self.f.casts.decimal_to_integer
+                    )
+                    else 0
+                ),
             }
         elif kind == "float":
             choices = {
+                "round": self._fw("round"),
+                "abs": self._fw("abs"),
+                "negate": self._fw("negate"),
+                "cast_boundary": 0.3 if self.f.casts.decimal_to_double else 0,
                 "arith": (
                     2.0
                     if any(self._func_enabled(f) for f in ("add", "sub", "mul", "div"))
@@ -981,6 +1035,8 @@ class QueryGenerator:
             }
         elif kind == "decimal":
             choices = {
+                "abs": self._fw("abs"),
+                "negate": self._fw("negate"),
                 "arith": (
                     1.5
                     if any(self._func_enabled(f) for f in ("add", "sub", "mul"))
@@ -990,6 +1046,8 @@ class QueryGenerator:
             }
         elif kind == "varchar":
             choices = {
+                "upper": self._fw("upper"),
+                "lower": self._fw("lower"),
                 "substring": self._fw("substring"),
                 "concat": self._fw("concat"),
                 "concat_operator": self._fw("concat_operator"),
@@ -998,16 +1056,62 @@ class QueryGenerator:
             }
             if not self.f.casts.to_varchar:
                 choices["cast"] = 0
+            if self.f.casts.integer_to_varchar:
+                choices["cast_boundary"] = 0.3
         elif kind == "timestamp":
             choices = {"date_trunc": self._fw("date_trunc"), **generic}
         elif kind == "date":
-            choices = {**generic, "cast": 0}
+            choices = {**generic, "cast": 0, "date_arith": self._fw("date_arith")}
+            choices["cast_boundary"] = 0.3 if self.f.casts.date_timestamp else 0
         else:
             raise GenerationFailed(kind)
+        if kind == "float" and self.f.casts.decimal_to_double:
+            choices["cast_boundary"] = 0.3
+        if kind == "decimal" and (
+            self.f.casts.decimal_scale or self.f.casts.integer_to_decimal
+        ):
+            choices["cast_boundary"] = 0.3
+        if kind == "timestamp" and (
+            self.f.casts.date_timestamp or self.f.casts.timestamp_units
+        ):
+            choices["cast_boundary"] = 0.3
+        if kind == "int" and (
+            self.f.casts.integer_narrowing
+            or self.f.casts.integer_sign_change
+            or self.f.casts.decimal_to_integer
+        ):
+            choices["cast_boundary"] = 0.3
         what = self._pick(choices)
         self._note(f"expr:{what}")
         if what == "arith":
             return self._gen_arith(kind, scope, depth)
+        if what in ("upper", "lower"):
+            self._note(f"func:{what}")
+            return Func(what, [self._gen_expr("varchar", scope, depth + 1)], "varchar")
+        if what == "round":
+            cols = scope.columns("float")
+            arg = rng.choice(cols) if cols else self._literal("float", st.DOUBLE)
+            args = [arg]
+            if rng.random() < 0.5:
+                args.append(Literal(rng.randint(-2, 6), st.INTEGER))
+            self._note("func:round")
+            return Func("round", args, "float")
+        if what in ("abs", "negate"):
+            cols = [
+                c
+                for c in scope.columns(kind)
+                if c.type != st.HUGEINT and (what != "negate" or c.type.signed)
+            ]
+            arg = rng.choice(cols) if cols else self._literal(kind, CONCRETE[kind])
+            self._note(f"func:{what}")
+            return Func("abs", [arg], kind) if what == "abs" else Unary("-", arg, kind)
+        if what == "date_arith":
+            left = self._gen_expr("date", scope, depth + 1)
+            self._note("func:date_arith")
+            if kind == "int":
+                return Arith("-", left, self._gen_expr("date", scope, depth + 1), "int")
+            op = rng.choice(["+", "-"])
+            return Arith(op, left, Literal(rng.randint(0, 30), st.INTEGER), "date")
         if what == "strlen":
             fn = rng.choice([f for f in ("strlen", "length") if f in self.funcs])
             return Func(fn, [self._gen_expr("varchar", scope, depth + 1)], kind="int")
@@ -1083,6 +1187,8 @@ class QueryGenerator:
             return Func("coalesce", args, kind=kind)
         if what == "cast":
             return self._gen_cast(kind, scope, depth)
+        if what == "cast_boundary":
+            return self._gen_cast_boundary(kind, scope, depth)
         if what == "try":
             return Try(self._gen_expr(kind, scope, depth + 1))
         if what == "scalar_subquery":
@@ -1154,6 +1260,16 @@ class QueryGenerator:
         else_ = (
             self._gen_expr(kind, scope, depth + 1) if self.rng.random() < 0.8 else None
         )
+        if self.f.expressions.simple_case and self.rng.random() < 0.3:
+            cols = scope.columns("int")
+            if cols:
+                operand = self.rng.choice(cols)
+                values = [
+                    (self._literal("int", operand.type, allow_null=False), result)
+                    for _, result in whens
+                ]
+                self._note("expr:simple_case")
+                return SimpleCase(operand, values, else_, kind)
         return Case(whens, else_, kind=kind)
 
     def _gen_cast(self, kind: str, scope: Scope, depth: int) -> Expr:
@@ -1186,6 +1302,118 @@ class QueryGenerator:
         try_ = src_kind == "varchar" or (self.f.expressions.try_ and rng.random() < 0.3)
         self._note(f"cast:{src_kind}->{kind}" + (":try" if try_ else ""))
         return Cast(self._gen_expr(src_kind, scope, depth + 1), target, try_=try_)
+
+    def _gen_cast_boundary(self, kind: str, scope: Scope, depth: int) -> Expr:
+        c = self.f.casts
+        rng = self.rng
+        candidates: list[tuple[str, Expr, st.SqlType]] = []
+        ints = scope.columns("int")
+        decimals = scope.columns("decimal")
+        dates = scope.columns("date")
+        timestamps = scope.columns("timestamp")
+        if kind == "int":
+            for source in ints:
+                for target in self.int_cast_targets:
+                    if source.type == target:
+                        continue
+                    src_lo, src_hi = source.type.int_range()
+                    dst_lo, dst_hi = target.int_range()
+                    if src_lo >= dst_lo and src_hi <= dst_hi:
+                        # Widening is always in range, including signedness changes.
+                        if (
+                            c.integer_sign_change
+                            and source.type.signed != target.signed
+                        ):
+                            candidates.append(("integer_sign_change", source, target))
+                        elif (
+                            c.integer_narrowing and source.type.signed == target.signed
+                        ):
+                            candidates.append(("integer_narrowing", source, target))
+                    elif c.integer_out_of_range and (
+                        c.integer_narrowing or c.integer_sign_change
+                    ):
+                        # Gaps mode deliberately exposes unchecked overflow and sign changes.
+                        family = (
+                            "integer_sign_change"
+                            if source.type.signed != target.signed
+                            else "integer_narrowing"
+                        )
+                        candidates.append((family, source, target))
+                    elif c.integer_narrowing and source.type.signed == target.signed:
+                        # Narrow only rows within target bounds. Out-of-range rows stay NULL.
+                        guarded = Case(
+                            [
+                                (
+                                    Logical(
+                                        "AND",
+                                        [
+                                            Compare(
+                                                ">=",
+                                                source,
+                                                Literal(dst_lo, source.type),
+                                            ),
+                                            Compare(
+                                                "<=",
+                                                source,
+                                                Literal(dst_hi, source.type),
+                                            ),
+                                        ],
+                                    ),
+                                    source,
+                                )
+                            ],
+                            None,
+                            kind="int",
+                        )
+                        candidates.append(("integer_narrowing", guarded, target))
+            if c.decimal_to_integer:
+                candidates += [("decimal_to_integer", d, st.BIGINT) for d in decimals]
+        elif kind == "varchar" and c.integer_to_varchar:
+            candidates += [("integer_to_varchar", i, st.VARCHAR) for i in ints]
+        elif kind == "decimal":
+            if c.decimal_scale:
+                candidates += [
+                    ("decimal_scale", d, st.decimal_type(18, 2))
+                    for d in decimals
+                    if d.type.scale != 2
+                ]
+            if c.integer_to_decimal:
+                candidates += [
+                    ("integer_to_decimal", i, st.DECIMAL_18_4)
+                    for i in ints
+                    if i.type.bits <= 32
+                ]
+        elif kind == "float" and c.decimal_to_double:
+            candidates += [("decimal_to_double", d, st.DOUBLE) for d in decimals]
+        elif kind == "timestamp":
+            if c.date_timestamp:
+                candidates += [("date_timestamp", d, st.TIMESTAMP) for d in dates]
+            if c.timestamp_units:
+                candidates += [
+                    ("timestamp_units", t, target)
+                    for t in timestamps
+                    for target in (
+                        st.TIMESTAMP_S,
+                        st.TIMESTAMP_MS,
+                        st.TIMESTAMP,
+                        st.TIMESTAMP_NS,
+                    )
+                    if t.type != target
+                ]
+        elif kind == "date" and c.date_timestamp:
+            candidates += [("date_timestamp", t, st.DATE) for t in timestamps]
+        if not candidates:
+            raise GenerationFailed("no enabled cast boundary")
+        families = sorted({family for family, _, _ in candidates})
+        chosen_family = rng.choice(families)
+        family, source, target = rng.choice(
+            [candidate for candidate in candidates if candidate[0] == chosen_family]
+        )
+        self._note(f"cast_boundary:{family}")
+        try_cast = c.try_cast and rng.random() < 0.3
+        if try_cast:
+            self._note("cast_boundary:try_cast")
+        return Cast(source, target, try_=try_cast, family=family)
 
     def _gen_scalar_subquery(self, kind: str, scope: Scope, depth: int) -> Expr:
         sub = self._gen_select(
@@ -1234,7 +1462,9 @@ class QueryGenerator:
             if partition_candidates and rng.random() < (0.9 if fact_tables else 0.7)
             else []
         )
-        order_cols = [c for c in cols if numeric(c) or partitionable(c)]
+        order_cols = [
+            c for c in cols if numeric(c) or partitionable(c) or c.kind == "int"
+        ]
         first = rng.choice(order_cols)
         order = [OrderItem(first, desc=rng.random() < 0.5)]
         choices = [
@@ -1290,11 +1520,34 @@ class QueryGenerator:
                     kind="int",
                 )
             arg = rng.choice(candidates)
+            if (
+                self.f.scalar_functions.window_args
+                and arg.kind == "varchar"
+                and self._func_enabled("upper")
+                and rng.random() < 0.5
+            ):
+                arg = Func("upper", [arg], "varchar")
+                self._note("func:upper")
+            elif (
+                self.f.scalar_functions.window_args
+                and arg.kind == "float"
+                and self._func_enabled("round")
+                and rng.random() < 0.5
+            ):
+                arg = Func("round", [arg, Literal(1, st.INTEGER)], "float")
+                self._note("func:round")
         kind = "int" if name == "count" else ("float" if name == "avg" else arg.kind)
         frame = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" if running else None
         if self.f.window_gaps and running and rng.random() < 0.25:
             frame = rng.choice([None, "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"])
-        win = Window(name, arg, part, order, kind=kind, frame=frame)
+        arg_family = (
+            arg.name
+            if isinstance(arg, Func) and arg.name in ("upper", "round")
+            else None
+        )
+        win = Window(
+            name, arg, part, order, kind=kind, frame=frame, arg_family=arg_family
+        )
         if name == "sum" and arg is not None and arg.kind == "int":
             return Cast(win, st.BIGINT)
         return win
@@ -1430,6 +1683,27 @@ class QueryGenerator:
             return self._maybe_filter_agg(
                 Agg("count_star", None, kind="int"), scope, depth
             )
+        if self.f.aggregates.expression_args and rng.random() < 0.15:
+            ints = [c for c in scope.columns("int") if c.type.signed]
+            if ints:
+                col = rng.choice(ints)
+                pred = Compare(">", col, Literal(0, col.type))
+                shape = rng.choice(["sum_case", "count_case", "cast_minmax"])
+                self._note(f"agg:expression:{shape}")
+                if shape == "sum_case":
+                    arg = Case([(pred, col)], Literal(0, col.type), kind="int")
+                    return Cast(
+                        Agg("sum", arg, kind="int", family="sum_case"), st.BIGINT
+                    )
+                if shape == "count_case":
+                    arg = Case([(pred, Literal(1, st.INTEGER))], None, kind="int")
+                    return Agg("count", arg, kind="int", family="count_case")
+                return Agg(
+                    rng.choice(["min", "max"]),
+                    Cast(col, st.BIGINT),
+                    kind="int",
+                    family="cast_minmax",
+                )
         if name in ("sum", "avg"):
             kind = rng.choice(["int", "float", "decimal"])
             arg = self._gen_expr(kind, scope, depth + 1)
@@ -1566,7 +1840,22 @@ def exact_type(expr: Expr) -> st.SqlType | None:
                 return st.HUGEINT
             return t
         return exact_type(expr.arg) if expr.arg is not None else None
+    if isinstance(expr, Unary):
+        return exact_type(expr.child)
+    if isinstance(expr, SimpleCase):
+        result_types = [exact_type(value) for _, value in expr.whens]
+        if expr.else_ is not None:
+            result_types.append(exact_type(expr.else_))
+        return (
+            result_types[0]
+            if result_types and all(t == result_types[0] for t in result_types)
+            else None
+        )
     if isinstance(expr, Func):
+        if expr.name in ("upper", "lower"):
+            return st.VARCHAR
+        if expr.name in ("round", "abs"):
+            return exact_type(expr.args[0])
         if expr.name in ("strlen", "length") or expr.name in EXTRACT_TS:
             return st.BIGINT
         if expr.name == "date_trunc":
@@ -1581,6 +1870,10 @@ def exact_type(expr: Expr) -> st.SqlType | None:
     ):
         return st.BOOLEAN
     if isinstance(expr, Arith):
+        if expr.left.kind == "date" and expr.right.kind == "int":
+            return st.DATE
+        if expr.left.kind == expr.right.kind == "date" and expr.op == "-":
+            return st.BIGINT
         if expr.op == "||":
             return st.VARCHAR
         if expr.op == "/":

@@ -755,6 +755,7 @@ class Session:
             "started_at": time.time(),
             "budget": timeout + TEARDOWN_SECONDS,  # the run, then a killed shell's exit
             "dataset": self.current_alias,
+            "shell_restarts_before": self.restarts,
         }
         out = self._run_once(sql, gpu, timeout, state)
         if out.status == "error" and _GPU_RUNTIME_GONE in out.error.lower():
@@ -795,7 +796,12 @@ class Session:
     def _record(
         self, phase: str, state: dict[str, Any], result: RunResult
     ) -> RunResult:
-        state.update(status=result.status, elapsed=result.elapsed, error=result.error)
+        state.update(
+            status=result.status,
+            elapsed=result.elapsed,
+            error=result.error,
+            shell_restarts_after=self.restarts,
+        )
         if result.result is not None:
             state["row_count"] = result.result.row_count
         self.evidence[phase] = state

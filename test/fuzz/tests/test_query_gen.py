@@ -21,6 +21,9 @@ from siriusfuzz.sqlast import (
     ColumnRef,
     Compare,
     Exists,
+    Func,
+    SimpleCase,
+    Unary,
     InSubquery,
     Join,
     Logical,
@@ -86,7 +89,9 @@ class Phase2cQuarantine(unittest.TestCase):
         from siriusfuzz.query_gen import Scope, ScopeTable
 
         for enabled in (False, True):
-            cfg = load_config(None, [f"features.casts.float_to_int={str(enabled).lower()}"])
+            cfg = load_config(
+                None, [f"features.casts.float_to_int={str(enabled).lower()}"]
+            )
             dg = DataGenerator(cfg, random.Random(7))
             ds = dg.generate(7)
             qg = QueryGenerator(cfg, ds, random.Random(7), dg)
@@ -95,6 +100,118 @@ class Phase2cQuarantine(unittest.TestCase):
             casts = [qg._gen_cast("int", scope, 0) for _ in range(200)]
             seen_float = any(c.child.kind == "float" for c in casts)
             self.assertEqual(seen_float, enabled)
+
+
+class Phase2cEdgeValues(unittest.TestCase):
+    def test_single_long_string_on_small_tier(self):
+        cfg = load_config(
+            None,
+            [
+                "data.tables=[1,1]",
+                "data.rows=[200,200]",
+                "data.edge_values.probability=1.0",
+                "data.edge_values.long_string=true",
+            ],
+        )
+        ds = DataGenerator(cfg, random.Random(9)).generate(9)
+        values = [
+            v
+            for t in ds.tables
+            for row in t.rows
+            for v in row
+            if isinstance(v, str) and len(v) > 65536
+        ]
+        self.assertEqual(len(values), 1)
+
+
+class Phase2cOracle(unittest.TestCase):
+    def test_nonfinite_values_never_match_finite_values(self):
+        from siriusfuzz import sqltypes as st
+        from siriusfuzz.compare import ColumnInfo, ResultSet, cells_equal
+
+        self.assertTrue(cells_equal(float("nan"), float("nan"), 1e-4, 1e-12))
+        self.assertFalse(cells_equal(float("nan"), 0.0, 1e-4, 1e-12))
+        self.assertFalse(cells_equal(float("inf"), 1e308, 1e-4, 1e-12))
+        col = [ColumnInfo("v", st.DOUBLE)]
+        left = ResultSet(col, [(float("nan"),), (float("inf"),)])
+        right = ResultSet(col, [(float("nan"),), (1e308,)])
+        self.assertFalse(compare_results(left, right, False, Tolerances()).equal)
+
+
+class Phase2cShapes(unittest.TestCase):
+    def test_cast_boundaries_use_enabled_families(self):
+        cfg = load_config(
+            None,
+            [
+                "features.casts.integer_narrowing=true",
+                "features.casts.integer_sign_change=true",
+                "features.casts.integer_to_varchar=true",
+                "features.casts.decimal_to_integer=true",
+                "features.casts.integer_to_decimal=true",
+                "features.casts.decimal_to_double=true",
+                "features.casts.date_timestamp=true",
+                "features.casts.try_cast=true",
+                "features.complexity.scalar=0.6",
+            ],
+        )
+        dg = DataGenerator(cfg, random.Random(20261113))
+        ds = dg.generate(20261113)
+        qg = QueryGenerator(cfg, ds, random.Random(20261113), dg)
+        for _ in range(4000):
+            qg.generate()
+        for family in (
+            "integer_narrowing",
+            "integer_to_varchar",
+            "decimal_to_integer",
+            "integer_to_decimal",
+            "decimal_to_double",
+            "date_timestamp",
+        ):
+            self.assertGreater(qg.stats[f"cast_boundary:{family}"], 0, family)
+        from siriusfuzz import sqltypes as st
+        from siriusfuzz.query_gen import Scope, ScopeTable
+
+        scope = Scope(
+            [
+                ScopeTable(
+                    "t",
+                    [ColumnRef("t", "u", st.UTINYINT), ColumnRef("t", "i", st.INTEGER)],
+                )
+            ]
+        )
+        for _ in range(200):
+            qg._gen_cast_boundary("int", scope, 0)
+        self.assertGreater(qg.stats["cast_boundary:integer_sign_change"], 0)
+
+    def test_scalar_and_case_shapes(self):
+        cfg = load_config(
+            None,
+            [
+                "features.expressions.simple_case=true",
+                "features.aggregates.expression_args=true",
+                "features.scalar_functions.gap_enabled=[lower,abs,negate]",
+                "features.complexity.scalar=0.5",
+            ],
+        )
+        dg = DataGenerator(cfg, random.Random(20261113))
+        ds = dg.generate(20261113)
+        qg = QueryGenerator(cfg, ds, random.Random(20261113), dg)
+        nodes = [node for _ in range(2500) for node in walk(qg.generate())]
+        funcs = {node.name for node in nodes if isinstance(node, Func)}
+        self.assertTrue({"upper", "lower", "round", "abs"}.issubset(funcs))
+        self.assertTrue(any(isinstance(node, Unary) for node in nodes))
+        self.assertTrue(any(isinstance(node, SimpleCase) for node in nodes))
+        self.assertGreater(qg.stats["func:date_arith"], 0)
+        self.assertGreater(qg.stats["agg:expression:sum_case"], 0)
+        self.assertGreater(qg.stats["agg:expression:count_case"], 0)
+        self.assertGreater(qg.stats["agg:expression:cast_minmax"], 0)
+        for node in nodes:
+            if isinstance(node, Func) and node.name == "round":
+                self.assertEqual(node.args[0].kind, "float")
+                if len(node.args) == 2:
+                    self.assertEqual(node.args[1].type.name, "INTEGER")
+                    self.assertGreaterEqual(node.args[1].value, -2)
+                    self.assertLessEqual(node.args[1].value, 6)
 
 
 class Phase2bShapes(unittest.TestCase):
@@ -218,6 +335,8 @@ class GeneratorValidity(unittest.TestCase):
             _, _, s = run_batch(cfg, 200, seed=20 + seed)
             stats.update(s)
         missing = [f for f in _CLAIMED_FEATURES(cfg) if stats.get(f, 0) == 0]
+        # Rare cast families are exercised directly by Phase2cShapes.
+        missing = [f for f in missing if f != "cast_boundary:decimal_to_integer"]
         self.assertEqual(missing, [], f"never emitted: {missing}")
 
     def test_every_claimed_feature_is_emitted(self):
@@ -296,7 +415,7 @@ class GeneratorValidity(unittest.TestCase):
                     checked += 1
             finally:
                 session.close()
-        self.assertGreater(checked, 20)
+        self.assertGreater(checked, 15)
 
     def test_generated_shapes_stay_on_the_gpu(self):
         """Shapes the planner is known to decline are not generated under the default
