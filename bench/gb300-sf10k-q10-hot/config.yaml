@@ -1,0 +1,48 @@
+sirius:
+  topology:
+    num_gpus: 1
+    gpus_per_query: 0
+
+  operator_params:
+    max_build_hash_table_bytes: 8Gi
+
+  compression:
+    enable_spill_compression: true
+
+  memory:
+    gpu:
+      usage_limit_fraction: 0.95
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.6
+    host:
+      capacity_bytes: 450Gi
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.9
+      downgrade_stop_fraction: 0.8
+      pool_size: 512
+      initial_number_pools: 225
+    disk:
+      disk_id: 0
+      capacity_bytes: 1Ti
+      downgrade_root_dirs: "/mnt/datasets/spill"
+
+  executor:
+    task_creator:
+      num_threads: 4
+    pipeline:
+      num_threads: 8
+    downgrade:
+      num_threads: 8
+    scan_manager:
+      num_threads: 24
+      backend: sirius
+      uring_n_reactors: 4
+      max_readahead_scans: 8
+      cache:
+        mode: sirius
+        eviction: lru
+        min_prefetching_budget_fraction: 0.05
+        eviction_threshold_fraction: 0.8
+      memory_prefetcher:
+        enable: false
