@@ -117,6 +117,16 @@ bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
     build_rows, key_domain, key.build_key_proven_unique, plan.domain_coverage_threshold());
 }
 
+/// The share of the key's value domain that @p build_rows build keys cover, a static estimate of
+/// the share of probe rows the filter keeps. Empty when the domain is unknown.
+std::optional<double> estimated_selectivity_of(dynamic_filter_publish_plan::admitted_key const& key,
+                                               std::size_t build_rows) noexcept
+{
+  if (key.build_key_value_domain == 0) { return std::nullopt; }
+  return std::min(
+    1.0, static_cast<double>(build_rows) / static_cast<double>(key.build_key_value_domain));
+}
+
 /**
  * @brief The filters one admitted key publishes; a null filter publishes nothing.
  */
@@ -416,6 +426,9 @@ struct dynamic_filter_publication_session::state {
         auto& key             = per_key[active_keys[index]];
         key.membership        = filter;
         key.membership_domain = filter->domain();
+        if (estimated_selectivity[index]) {
+          filter->set_estimated_selectivity(*estimated_selectivity[index]);
+        }
       }
       std::optional<std::chrono::steady_clock::duration> latency;
       auto const counts = fan_out(plan, producers, per_key, [&] {
@@ -482,6 +495,7 @@ struct dynamic_filter_publication_session::state {
   std::optional<complete_build_inventory> inventory;
   std::vector<bool> claimed;  // One entry per inventory batch, in inventory order
   std::vector<std::size_t> active_keys;
+  std::vector<std::optional<double>> estimated_selectivity;  // One entry per active key
   std::optional<detail::accumulated_bloom_builder> builder;
   dynamic_filter_stats_snapshot outcome;  // The accumulation's counts, recorded when it settles
   std::optional<completion> accumulation_result;
@@ -603,6 +617,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     auto const rows           = inventory->total_rows();
     std::vector<detail::accumulated_bloom_builder::key> keys;
     std::vector<std::size_t> active_keys;
+    std::vector<std::optional<double>> estimated_selectivity;
     for (std::size_t index = 0; index < probe_types.size(); ++index) {
       auto const& bindings = probe_types[index];
       if (bindings.empty()) { continue; }
@@ -634,6 +649,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       }
       if (rows == 0) { continue; }
       active_keys.push_back(index);
+      estimated_selectivity.push_back(estimated_selectivity_of(key, rows));
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
@@ -678,9 +694,10 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       }
       operation.claimed = std::move(claimed);
       operation.inventory.emplace(std::move(*inventory));
-      operation.active_keys = std::move(active_keys);
-      operation.builder     = std::move(built);
-      operation.current     = state::phase::COLLECTING;
+      operation.active_keys           = std::move(active_keys);
+      operation.estimated_selectivity = std::move(estimated_selectivity);
+      operation.builder               = std::move(built);
+      operation.current               = state::phase::COLLECTING;
       // Start counters are visible at once; the attempt's outcome is recorded when it settles.
       selection.accumulations_started               = 1;
       selection.accumulation_expected_contributions = expected;
@@ -1182,7 +1199,12 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
         }
         case membership_filter_kind::none: break;
       }
-      if (filters.membership) { ++outcome.membership_filters_built; }
+      if (filters.membership) {
+        ++outcome.membership_filters_built;
+        if (auto const selectivity = estimated_selectivity_of(admitted_key, valid_rows)) {
+          filters.membership->set_estimated_selectivity(*selectivity);
+        }
+      }
       if (filters.zone_map) { ++outcome.zone_map_filters_built; }
       SIRIUS_LOG_DEBUG(
         "[publish_dynamic_filters] dynamic filter key {}: build_rows={} (valid={}) zone_map={} "

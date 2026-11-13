@@ -81,6 +81,9 @@ class dynamic_filter_publish_plan final {
     dynamic_filter_condition_shape key_shape{};
     // Exact base-table row bound; 0 disables coverage gating.
     std::size_t build_key_domain_cardinality = 0;
+    /// A bound on the distinct values the build key can take: the row count of the base scan its
+    /// values come from, through any join. Looser than the domain above. 0 means unknown.
+    std::size_t build_key_value_domain = 0;
     // Required before row count can represent key-domain coverage.
     bool build_key_proven_unique = false;
     // NULL-safe equality: retain probe NULLs as conservative false positives.
