@@ -128,6 +128,7 @@ enum class operator_data_type : uint8_t {
   PARTITIONED,
   GPU_SCAN,
   INPUT_FREE,
+  WINDOWED_MERGE,
 };
 
 /**

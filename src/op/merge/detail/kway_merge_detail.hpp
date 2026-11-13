@@ -1,0 +1,155 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/span.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <cstdint>
+#include <memory>
+#include <span>
+
+namespace sirius::op::merge::detail {
+
+/// Device view of a kway_key_comparator; defined in detail/kway_comparator.cuh (CUDA sources only).
+struct kway_key_device_view;
+
+/**
+ * @brief Host owner of the device state needed to compare rows across k key windows (pimpl).
+ *
+ * Move-only. The comparator must outlive every kernel that uses its device view.
+ */
+class kway_key_comparator {
+ public:
+  /**
+   * @brief Build the comparator for k key windows.
+   *
+   * @param key_windows key_windows[i] holds only the key columns of window i, in key order.
+   * @param column_order One entry per key column.
+   * @param null_precedence One entry per key column.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param mr Device memory resource used for the comparator's device state.
+   */
+  static kway_key_comparator create(std::span<const cudf::table_view> key_windows,
+                                    std::span<const cudf::order> column_order,
+                                    std::span<const cudf::null_order> null_precedence,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr);
+
+  kway_key_comparator(kway_key_comparator&&) noexcept;
+  kway_key_comparator& operator=(kway_key_comparator&&) noexcept;
+  ~kway_key_comparator();
+
+  /// Number of key windows (k) the comparator was created with.
+  [[nodiscard]] int32_t num_inputs() const noexcept;
+
+  /// Device state; defined by the comparator's CUDA source.
+  struct impl;
+
+ private:
+  explicit kway_key_comparator(std::unique_ptr<impl>);
+  std::unique_ptr<impl> _impl;
+  friend struct kway_key_device_view device_view_of(const kway_key_comparator&);
+};
+
+/**
+ * @brief Multi-sequence selection ("co-rank") of the k windows at each requested rank.
+ *
+ * out[r * k + i] = c_i(ranks[r]): per-input counts with Σ_i c_i = ranks[r] such that every
+ * selected row orders before (by the comparator, incl. tie-break) every unselected row.
+ *
+ * @param cmp Comparator over the k key windows.
+ * @param lengths Row count of each window (k entries).
+ * @param ranks The ranks to split at; each in [0, Σ lengths].
+ * @param out Receives ranks.size() * k counts.
+ * @param stream CUDA stream used for kernel launches.
+ */
+void corank_split(const kway_key_comparator& cmp,
+                  cudf::device_span<const cudf::size_type> lengths,
+                  cudf::device_span<const cudf::size_type> ranks,
+                  cudf::device_span<cudf::size_type> out,
+                  rmm::cuda_stream_view stream);
+
+/**
+ * @brief target = min(max_rows, r_safe, Σ lengths) as defined on bounded_kway_merge.
+ *
+ * Returns it on the host (syncs).
+ *
+ * @param cmp Comparator over the k key windows.
+ * @param lengths Row count of each window (k entries).
+ * @param truncated One flag per window: non-zero when its source run has unread rows beyond it.
+ * @param max_rows Upper bound on the rows emitted.
+ * @param stream CUDA stream used for kernel launches.
+ */
+cudf::size_type safe_target(const kway_key_comparator& cmp,
+                            cudf::device_span<const cudf::size_type> lengths,
+                            cudf::device_span<const std::uint8_t> truncated,
+                            cudf::size_type max_rows,
+                            rmm::cuda_stream_view stream);
+
+/// Default output rows per tile of tile_merge.
+inline constexpr cudf::size_type kDefaultTileRows = 2048;
+
+/**
+ * @brief Merge each output tile independently, producing an (input, row) gather map.
+ *
+ * For tile t in [0, tiles), tile_coranks[t*k .. t*k+k) and [(t+1)*k ..) bound its sub-ranges;
+ * writes the merged order of output rows [t*tile_rows, min((t+1)*tile_rows, target)) as
+ * (input, row) pairs. tiles = ceil(target / tile_rows).
+ *
+ * @param cmp Comparator over the k key windows.
+ * @param lengths Row count of each window (k entries).
+ * @param tile_coranks (tiles + 1) * k co-ranks: the corank_split of ranks 0, tile_rows, ...,
+ *        target.
+ * @param target Total output rows.
+ * @param tile_rows Output rows per tile (the last tile may be shorter).
+ * @param out_input Receives the source window of each output row (target entries).
+ * @param out_row Receives the row within that window of each output row (target entries).
+ * @param stream CUDA stream used for kernel launches.
+ */
+void tile_merge(const kway_key_comparator& cmp,
+                cudf::device_span<const cudf::size_type> lengths,
+                cudf::device_span<const cudf::size_type> tile_coranks,
+                cudf::size_type target,
+                cudf::size_type tile_rows,
+                cudf::device_span<std::int32_t> out_input,
+                cudf::device_span<cudf::size_type> out_row,
+                rmm::cuda_stream_view stream);
+
+/**
+ * @brief Gather rows from k windows into one table.
+ *
+ * output row j = windows[src_input[j]].row(src_row[j]); all columns incl. null masks and STRING.
+ *
+ * @param windows The k windows; all share one schema.
+ * @param src_input Source window of each output row.
+ * @param src_row Row within the source window of each output row.
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ * @param mr Device memory resource used to allocate the output table.
+ */
+std::unique_ptr<cudf::table> gather_kway(std::span<const cudf::table_view> windows,
+                                         cudf::device_span<const std::int32_t> src_input,
+                                         cudf::device_span<const cudf::size_type> src_row,
+                                         rmm::cuda_stream_view stream,
+                                         rmm::device_async_resource_ref mr);
+
+}  // namespace sirius::op::merge::detail

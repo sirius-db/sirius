@@ -27,10 +27,13 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace YAML {
 class Node;
@@ -77,6 +80,10 @@ constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  /
 
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
+
+/// Default for sort_merge_max_fan_in: the most runs one MERGE_SORT task reads. A partition with
+/// more runs is merged in passes.
+inline constexpr uint64_t DEFAULT_SORT_MERGE_MAX_FAN_IN = 64;
 
 /// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
 /// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only
@@ -145,6 +152,45 @@ constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 
 }  // namespace config
 
+/// Merge path for MERGE_SORT. one_shot is the legacy concat-then-merge path, kept for A/B
+/// testing against the windowed path.
+enum class sort_merge_mode : uint8_t {
+  automatic,  ///< "auto": windowed under memory pressure or when any input is not on the GPU
+  windowed,   ///< "windowed": always the windowed k-way merge
+  one_shot,   ///< "one_shot": always the legacy concat-then-merge
+};
+
+/// Parse a sort_merge_mode setting value: "auto", "windowed" or "one_shot", case-insensitive.
+/// Returns std::nullopt for anything else.
+[[nodiscard]] inline std::optional<sort_merge_mode> parse_sort_merge_mode(
+  std::string_view value) noexcept
+{
+  auto equals_ignore_case = [](std::string_view lhs, std::string_view rhs) noexcept {
+    if (lhs.size() != rhs.size()) { return false; }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+      const char c     = lhs[i];
+      const char lower = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+      if (lower != rhs[i]) { return false; }
+    }
+    return true;
+  };
+  if (equals_ignore_case(value, "auto")) { return sort_merge_mode::automatic; }
+  if (equals_ignore_case(value, "windowed")) { return sort_merge_mode::windowed; }
+  if (equals_ignore_case(value, "one_shot")) { return sort_merge_mode::one_shot; }
+  return std::nullopt;
+}
+
+/// The setting spelling of a sort_merge_mode: "auto", "windowed" or "one_shot".
+[[nodiscard]] inline std::string_view to_string(sort_merge_mode mode) noexcept
+{
+  switch (mode) {
+    case sort_merge_mode::automatic: return "auto";
+    case sort_merge_mode::windowed: return "windowed";
+    case sort_merge_mode::one_shot: return "one_shot";
+  }
+  return "auto";
+}
+
 /// Parameters controlling operator-level resource sizing.
 /// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
@@ -172,6 +218,22 @@ struct operator_params {
 
   /// Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0.
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+
+  /// Merge path for MERGE_SORT (SET sort_merge_mode): auto, windowed or one_shot.
+  sort_merge_mode sort_merge_mode_setting = sort_merge_mode::automatic;
+
+  /// Maximum rows per input window (n) of the windowed merge (0 = derive per device).
+  uint64_t sort_merge_window_rows = 0;
+
+  /// Output chunk target (bytes) per windowed merge task (0 = derive per device).
+  uint64_t sort_merge_output_bytes = 0;
+
+  /// In auto mode, the windowed path is taken when partition + output exceed this fraction of
+  /// the GPU (0 = derive from the device's GPU memory size).
+  double sort_merge_one_shot_max_fraction = 0;
+
+  /// Most runs one merge task reads; a partition with more runs is merged in passes.
+  uint64_t sort_merge_max_fan_in = config::DEFAULT_SORT_MERGE_MAX_FAN_IN;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
