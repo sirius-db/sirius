@@ -1540,6 +1540,7 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     partition->children.push_back(std::move(sample));
 
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
+    merge->set_merge_settings(sirius::op::merge::merge_settings::from(op_params));
 
     bool is_identity = (original_projections.size() == order_ptr->types.size());
     if (is_identity) {
