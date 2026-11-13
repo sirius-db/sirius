@@ -205,6 +205,8 @@ struct host_pin_result {
 /// and @ref materialize_all_batches_compressed.
 struct compression_pin_config {
   bool enabled{false};
+  /// Empty selects the spill policy automatically for each materialized chunk.
+  /// Nonempty is an explicit, already column-selected table plan.
   std::string plan_dsl;
   std::size_t min_batch_size_bytes{0};
   /// Keep the compressed form only if header+payload <= this fraction of the
@@ -233,6 +235,8 @@ struct device_pin_chunk {
 /// chunks may be interleaved within a single pin.
 struct device_pin_result {
   std::vector<device_pin_chunk> chunks;
+  /// Optional native statistics captured before encoding, parallel to chunks.
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
   /// Chunk-major stored-column metadata, recorded from each GPU table right before it is
   /// compressed or split into device columns. Parallel to @c chunks and their columns.
   pinned_column_storage_matrix column_storage;
@@ -281,16 +285,15 @@ host_pin_result materialize_pin_to_host(
 /// fails to compress usefully) is kept as an uncompressed device chunk instead, so
 /// @c device_pin_result::chunks may interleave the two forms in emission order.
 /// Carrier narrowing runs before compression exactly as in @ref materialize_pin_to_host.
-/// Zone-map capture is forced off:
-/// @c device_pin_result carries no statistics and @c insert_pinned_entry_device stores
-/// none, so device pins keep the statless-pin serving behavior.
+/// When requested, zone maps are captured before narrowing and compression, carried
+/// in @c device_pin_result, and retained by @c insert_pinned_entry_device.
 ///
 /// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
-///                            (column_ids) order — drives the carrier narrowing. Empty is
-///                            valid only when narrowing is off.
+///                            (column_ids) order — drives narrowing and zone-map capture.
+///                            Empty is valid only when narrowing is off and yields no stats.
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
-/// \param options             Per-pin materialization behavior (carrier narrowing).
+/// \param options             Per-pin materialization behavior (narrowing and statistics).
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,

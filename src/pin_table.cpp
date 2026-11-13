@@ -18,6 +18,7 @@
 
 #include "compression/compressed_representation.hpp"
 #include "compression/device_compressed_blob.hpp"
+#include "compression/spill_compression.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "helper/numeric_narrowing.hpp"
@@ -532,7 +533,7 @@ std::string compression_failure_warning(std::string_view what,
     narrowed +=
       i < compression.column_names.size() ? compression.column_names[i] : std::to_string(i);
   }
-  if (!narrowed.empty()) {
+  if (!narrowed.empty() && !compression.plan_dsl.empty()) {
     message += ". This pin narrowed carriers before compression (" + narrowed +
                "); a plan block with a width-explicit op (bitextract/bitjoin) is authored against "
                "the native element width and cannot encode a narrowed column";
@@ -595,13 +596,27 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   const std::size_t uncompressed_bytes = tbl.alloc_size();
   if (uncompressed_bytes < compression.min_batch_size_bytes) { return false; }
 
+  // Plan the actual stored carriers, in pinned-column order, independently for
+  // each chunk. Reuse spill's type/sample policy; explicit table plans win.
+  auto plan = compression.plan_dsl;
+  if (plan.empty()) {
+    bool all_stored = true;
+    for (auto const& column : tbl.view()) {
+      auto column_plan = sirius::compression::default_spill_plan(column, stream);
+      all_stored       = all_stored && column_plan == "input -> identity\n";
+      if (!plan.empty()) { plan += "---\n"; }
+      plan += column_plan;
+    }
+    if (all_stored) { return false; }
+  }
+
   // `tbl` was decoded on `stream` (the caller's materialize stream). The pool
   // streams are NOT ordered after `stream`, so synchronize first to ensure the
   // table is fully resident before the pool streams read it — mirrors the
   // parallel decompress path in compression_converters.cpp.
   stream.sync();
   auto ct = simpatico::compress_with_plan(tbl.view(),
-                                          compression.plan_dsl,
+                                          plan,
                                           compress_pool(),
                                           rmm::mr::get_current_device_resource_ref(),
                                           compression.column_names);
@@ -728,7 +743,7 @@ host_pin_result materialize_pin_to_host(
       out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
-      if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
+      if (compression.enabled && !compression_failed && tbl) {
         try {
           compressed_this_chunk = compress_and_stage_batch(
             *tbl,
@@ -835,10 +850,6 @@ device_pin_result materialize_all_batches_compressed(
   device_pin_result out;
   bool compression_failed = false;
 
-  // The device insert path stores no statistics sidecar (device_pin_result carries none), so a
-  // capture would be computed and dropped — force it off.
-  options.capture_chunk_stats = false;
-
   out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
@@ -849,13 +860,15 @@ device_pin_result materialize_all_batches_compressed(
         cucascade::memory::memory_space* src_space,
         ::cuda::stream_ref stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
       const std::int64_t chunk_rows = tbl->num_rows();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(chunk_rows));
       out.column_storage.emplace_back(std::move(column_storage));
 
-      if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
+      if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
+
+      if (compression.enabled && !compression_failed && tbl) {
         try {
           compress_and_stage_batch(
             *tbl,
@@ -868,10 +881,10 @@ device_pin_result materialize_all_batches_compressed(
                 std::uint64_t payload_bytes,
                 std::size_t uncompressed_bytes,
                 std::shared_ptr<const sirius::per_column_byte_sizes> column_sizes) {
-              // Free the uncompressed source now that the batch is compressed, BEFORE
-              // allocating the payload, so it reuses that space (avoids a pin-time peak
-              // spike at large scale factors).
-              tbl.reset();
+              // Automatic compression is best-effort: retain the source until staging
+              // succeeds so allocation failures can still pin it raw. Explicit plans
+              // retain their existing lower-peak staging path for large tuned pins.
+              if (!compression.plan_dsl.empty()) { tbl.reset(); }
               auto blob = std::make_shared<sirius::compressed_device_blob>();
 
               // Lay every compressed leaf out in one contiguous device buffer at an

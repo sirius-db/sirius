@@ -87,6 +87,18 @@ inline pinned_entry_census census_entry(duckdb::Connection& con, const std::stri
         }
         return false;
       }
+      if (!entry.data_batches_by_column.empty()) {
+        out.chunks = entry.chunk_memory_spaces.size();
+        for (auto const& column_chunks : entry.data_batches_by_column) {
+          auto const& columns = column_chunks.second;
+          REQUIRE(columns.size() == out.chunks);
+          for (auto const& column : columns) {
+            REQUIRE(column);
+            out.stored_bytes += column->alloc_size();
+          }
+        }
+        return false;
+      }
       out.chunks = entry.host_chunks.size();
       for (auto const& chunk : entry.host_chunks) {
         REQUIRE(chunk);

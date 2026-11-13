@@ -354,7 +354,8 @@ void run_deferred_query(deferred_query_case const& c)
   // GPU tier: a deferral addresses rows by their position in device-resident
   // pinned storage, so nothing installs against a host pin.
   auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(customer_glob) +
-                       ", tier='gpu', name=" + sirius::test::sql_literal(pin_name) + ");");
+                       ", tier='gpu', name=" + sirius::test::sql_literal(pin_name) +
+                       ", compression => " + (c.compressed_pin ? "true" : "false") + ");");
   REQUIRE(pin);
   if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
@@ -570,7 +571,7 @@ TEST_CASE("the bigger bundle owns the port and the smaller one rides along",
   for (auto const& [path, name] : {std::pair{files.customer, "late_mat_rider_customer"},
                                    std::pair{files.nation, "late_mat_rider_nation"}}) {
     auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(path.string()) +
-                         ", tier='gpu', name='" + name + "');");
+                         ", tier='gpu', name='" + name + "', compression => false);");
     REQUIRE(pin);
     if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
     REQUIRE_FALSE(pin->HasError());

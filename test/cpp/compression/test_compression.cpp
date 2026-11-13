@@ -21,7 +21,7 @@
 //    * compressed pin → cached scan result equality vs. uncompressed pin
 //    * column-subset projection correctness
 //    * compressed footprint < uncompressed logical size
-//    * fallback when no plan / chunk below threshold
+//    * automatic plans without a file, and size/ratio fallbacks
 
 #include <catch.hpp>
 #include <compression/plan_utils.hpp>
@@ -74,7 +74,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 //   2. Pin it with tier='host' and compression enabled.
 //   3. SELECT from the cached table and compare against the raw table.
 //   4. Verify compressed_bytes < uncompressed_bytes in the pinned_entry.
-//   5. Verify fallback (no plan / small chunk) does not error.
+//   5. Verify automatic plan selection and raw-storage fallbacks.
 
 #include "operator/mgpu_test_utils.hpp"
 #include "sirius_context.hpp"
@@ -309,7 +309,7 @@ TEST_CASE("pin_table compression - compression parameter overrides session setti
   fs::remove_all(tmp);
 }
 
-TEST_CASE("pin_table compression - empty plan dir pins uncompressed",
+TEST_CASE("pin_table compression - empty plan dir selects plans automatically",
           "[compression][pin_table][isolated_context]")
 {
   if (no_gpu()) { return; }
@@ -330,10 +330,113 @@ TEST_CASE("pin_table compression - empty plan dir pins uncompressed",
   require_ok(pin, "pin with empty plan dir");
   auto const census = sirius::test::census_entry(con, "t_emptydir");
   REQUIRE(census.chunks > 0);
-  REQUIRE(census.compressed_chunks == 0);
+  REQUIRE(census.compressed_chunks == census.chunks);
 
   run_ok(con, "CALL unpin_table('t_emptydir');", "unpin empty plan dir");
 
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - default automatic plans round trip mixed columns",
+          "[compression][pin_table][automatic_pin][isolated_context]")
+{
+  if (no_gpu()) { return; }
+  auto const tier = GENERATE(std::string{"host"}, std::string{"gpu"});
+  CAPTURE(tier);
+  auto [tmp, yaml_path] = make_comp_env("automatic-" + tier);
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp,
+    "SELECT range AS k, CASE WHEN range % 17 = 0 THEN NULL ELSE (range % 8)::VARCHAR END AS s, "
+    "(range % 100)::DECIMAL(12,2) AS d, DATE '2020-01-01' + (range % 100)::INTEGER AS dt, "
+    "(range % 2) * 1.5::DOUBLE AS f, ('item_' || range::VARCHAR) AS u FROM range(131072)",
+    1);
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con     = env.make_connection();
+  auto glob    = sirius::test::mgpu::parquet_glob(tmp);
+  auto enabled = con.Query("SELECT current_setting('pin_table_compression')::BOOLEAN");
+  require_ok(enabled, "compression default");
+  REQUIRE(enabled->Collection().GetValue(0, 0).GetValue<bool>());
+  // Exercise the default 1 MiB size gate on full-width data, independently of narrowing.
+  run_ok(con, "SET enable_compressed_materialization=false", "full-width carriers");
+  std::string const query =
+    "SELECT count(*), sum(k), count(s), sum(length(s)), sum(d), min(dt), max(dt), sum(f), "
+    "sum(length(u)), min(u), max(u) "
+    "FROM read_parquet('" +
+    glob + "')";
+  run_ok(con, "SET gpu_execution=false", "CPU reference");
+  auto expected = con.Query(query);
+  require_ok(expected, "CPU reference");
+  run_ok(con, "SET gpu_execution=true", "GPU execution");
+
+  bool expect_compressed = true;
+  std::string argument;
+  SECTION("no plan directory") {}
+  SECTION("directory only has another table's plan")
+  {
+    auto const plan_dir = tmp / "plans";
+    write_plan_file(plan_dir, "another_table", bitpack_plan(1));
+    run_ok(con, "SET pin_table_input_compression_plan_dir='" + plan_dir.string() + "'", "plan dir");
+  }
+  SECTION("explicit identity plan takes precedence over automatic selection")
+  {
+    auto const plan_dir = tmp / "plans";
+    std::string identity;
+    for (int i = 0; i < 6; ++i) {
+      if (i > 0) { identity += "---\n"; }
+      identity += "input -> identity\n";
+    }
+    write_plan_file(plan_dir, "t_auto", identity);
+    run_ok(con, "SET pin_table_input_compression_plan_dir='" + plan_dir.string() + "'", "plan dir");
+    expect_compressed = false;
+  }
+  SECTION("actual compressed-size gate can reject automatic plans")
+  {
+    run_ok(con, "SET pin_table_compression_max_compressed_fraction=0", "reject compressed output");
+    expect_compressed = false;
+  }
+  SECTION("per-call compression opt-out")
+  {
+    argument          = ", compression => false";
+    expect_compressed = false;
+  }
+  run_ok(con,
+         "CALL pin_table('" + glob + "', tier='" + tier + "', name='t_auto'" + argument + ")",
+         "pin");
+  auto const census = sirius::test::census_entry(con, "t_auto");
+  REQUIRE(census.chunks > 0);
+  REQUIRE(census.compressed_chunks == (expect_compressed ? census.chunks : 0));
+  auto const before = sirius::test::get_transparent_execution_stats(con);
+  auto actual       = con.Query(query);
+  require_ok(actual, "GPU cached scan");
+  sirius::test::require_transparent_execution_delta(
+    before, sirius::test::get_transparent_execution_stats(con), 1, 0, 1);
+  for (duckdb::idx_t i = 0; i < 11; ++i) {
+    CHECK(actual->Collection().GetValue(i, 0) == expected->Collection().GetValue(i, 0));
+  }
+  run_ok(con, "CALL unpin_table('t_auto')", "unpin");
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - all-identity automatic plans remain raw",
+          "[compression][pin_table][automatic_pin][isolated_context]")
+{
+  if (no_gpu()) { return; }
+  auto const tier       = GENERATE(std::string{"host"}, std::string{"gpu"});
+  auto [tmp, yaml_path] = make_comp_env("identity-auto-" + tier);
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT CASE WHEN range % 3 = 0 THEN NULL ELSE 'abc' END AS s FROM range(1000)", 1);
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes=0", "remove size gate");
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction=1.5", "allow expansion");
+  run_ok(con, "CALL pin_table('" + glob + "', tier='" + tier + "', name='t_short')", "pin");
+  REQUIRE(sirius::test::census_entry(con, "t_short").compressed_chunks == 0);
+  auto result = con.Query("SELECT count(*), count(s) FROM read_parquet('" + glob + "')");
+  require_ok(result, "short-string scan");
+  CHECK(result->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000));
+  CHECK(result->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(666));
+  run_ok(con, "CALL unpin_table('t_short')", "unpin");
   fs::remove_all(tmp);
 }
 
@@ -852,7 +955,7 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
 
   auto [tmp, yaml_path] = make_comp_env("noplan");
 
-  // Plan dir exists but has no file matching 't_noplan' — must pin uncompressed.
+  // No matching plan: automatic compression still observes the default 1 MiB size gate.
   // SUM(k) = 0+1+...+999 = 999*1000/2 = 499500
   auto plan_dir = tmp / "plans";
   fs::create_directories(plan_dir);
@@ -1852,11 +1955,8 @@ TEST_CASE("pin_table compression - heterogeneous narrow widths widen post-decode
   fs::remove_all(tmp);
 }
 
-// Compression engages only when the plan resolver finds a plan for the pinned table, not from
-// pin_table_compression alone. With the setting on but no plan file covering this table, nothing
-// hands the pin to Simpatico, so no chunk may end up compressed while narrowing still proceeds
-// independently and stores its selected carrier.
-TEST_CASE("pin_table compression - no plan file for the table pins uncompressed",
+// Automatic plans are selected after narrowing and remain active with an absent table override.
+TEST_CASE("pin_table compression - automatic plans preserve narrowed carriers",
           "[compression][pin_table][isolated_context]")
 {
   if (no_gpu()) { return; }
@@ -1874,9 +1974,7 @@ TEST_CASE("pin_table compression - no plan file for the table pins uncompressed"
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
 
-  // Runtime settings may be staged in either order, so setting the enable flag before the plan
-  // directory is valid. The final pin must nevertheless make the inactive state visible rather
-  // than silently accepting a compression request it cannot honor.
+  // An empty plan-directory setting is the normal automatic-selection path.
   {
     sirius::test::scoped_recording_log_sink logs{"warn"};
     auto pin_without_plan_source =
@@ -1888,17 +1986,15 @@ TEST_CASE("pin_table compression - no plan file for the table pins uncompressed"
       if (record.message.find("pin_table_input_compression_plan_dir is empty") !=
           std::string::npos) {
         ++missing_plan_source_warnings;
-        REQUIRE(record.level == sirius::log::level::warn);
-        REQUIRE(record.message.find("pinning uncompressed") != std::string::npos);
       }
     }
-    REQUIRE(missing_plan_source_warnings == 1);
+    REQUIRE(missing_plan_source_warnings == 0);
   }
-  REQUIRE(sirius::test::census_entry(con, "t_noplan").compressed_chunks == 0);
+  REQUIRE(sirius::test::census_entry(con, "t_noplan").compressed_chunks > 0);
   run_ok(con, "CALL unpin_table('t_noplan');", "unpin without plan source");
 
   // A plan directory holding a plan for some OTHER table: the resolver finds no plan for this
-  // one, so compression never engages.
+  // one, so the automatic policy still applies.
   auto plan_dir = tmp / "plans";
   write_plan_file(plan_dir, "some_other_table", bitpack_plan(2));
   run_ok(
@@ -1908,7 +2004,7 @@ TEST_CASE("pin_table compression - no plan file for the table pins uncompressed"
   require_ok(pin, "pin no-plan");
 
   auto const census = sirius::test::census_entry(con, "t_noplan");
-  REQUIRE(census.compressed_chunks == 0);
+  REQUIRE(census.compressed_chunks == census.chunks);
   REQUIRE(census.all_columns_narrowed);
   REQUIRE(census.first_chunk_carriers ==
           std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT16}});

@@ -1,6 +1,15 @@
 # Compressed pinning: putting hot columns on the GPU
 
-`pin_table` can store pinned chunks Simpatico-compressed on either tier:
+`pin_table` attempts Simpatico compression by default on either host or GPU tiers,
+without requiring a plan file:
+
+```sql
+CALL pin_table('/data/lineitem/*.parquet', tier => 'gpu', name => 'lineitem');
+-- Opt out for one pin:
+-- CALL pin_table(..., compression => false);
+```
+
+An optional table plan overrides automatic selection:
 
 ```sql
 SET pin_table_input_compression_plan_dir = '/path/to/plans';  -- <table>.txt per table
@@ -11,7 +20,16 @@ CALL pin_table('/data/lineitem/*.parquet',
                compression => true);
 ```
 
-Tables with no plan file pin uncompressed. Each plan file carries one `---`-separated DSL
+Without a usable table plan, each materialized chunk uses the same per-column policy as
+[spill compression](memory-management.md#spill-compression). It samples up to 65,536 values:
+integer-valued columns choose bitpacking, delta-bitpacking, or delta-RLE-bitpacking, with
+more elaborate plans requiring over 10% estimated size savings. Strings with at least
+4,096 rows use a dictionary with bitpacked indices when at most 10% of the sample is
+distinct; otherwise they use ANS characters and delta-bitpacked offsets. Other eligible
+fixed-width columns use bitpacking; short strings and unsupported types are stored as is.
+Selection runs after carrier narrowing and in pinned-column order.
+
+Each explicit plan file carries one `---`-separated DSL
 block per full-table column in schema order; a pin of a column subset selects the matching
 blocks (`select_plan_blocks`). Each pin reads its plan from the calling connection's
 `pin_table_input_compression_plan_dir`; plans are not stored in a process-wide registry.
@@ -35,13 +53,27 @@ directly. Interfaces: `src/compression/compressed_representation.hpp`
 (`decode_equality_pushdown`), `src/compression/compression_converters.cpp` (predicate
 translation), threaded through `sirius_scan_manager::prepare_for_query`.
 
-The compression settings can be staged before a table is pinned. Compression becomes active only
-when `CALL pin_table(..., compression => true)` requests it, the plan-directory setting is
-non-empty, and a matching table plan exists. `pin_table` warns and pins uncompressed when
-compression is requested but the plan directory is empty; a missing table plan likewise warns and
-falls back. The batch-size and compressed-fraction settings are inert until a matching plan
-activates compression. The existing `pin_table_compression` setting remains the default for calls
-that omit the `compression` argument; an explicit argument always wins.
+The `pin_table_compression` setting defaults to true; an explicit `compression` argument
+always wins. Chunks below 1 MiB remain raw by default. After encoding, compression is
+kept only when header plus payload is at most 75% of the original device footprint.
+All-identity automatic plans skip encoding. Encoding failures leave subsequent chunks raw;
+automatic GPU pins retain their source until staging succeeds so staging failures can
+also fall back. An explicit plan that does not cover the pinned columns is rejected with
+a warning and the pin stays raw; it is not silently replaced by an automatic plan.
+The `parquet` pin tier continues to cache file bytes without this decode/compress step.
+
+When pinned zone-map capture is enabled, supported native min/max statistics are
+retained for compressed chunks on both tiers, so entire chunks can be pruned before decode.
+
+Fully raw automatic GPU results retain the ordinary column-major storage and incremental
+column-merge behavior. GPU pins containing compressed chunks retain their existing
+replacement behavior on re-pin: pin the full intended column set in one call, or opt out
+of compression when incremental column merging is required.
+
+The current late-materialization installer declines compressed origins because their
+null counts cannot be checked without decoding. Those queries use ordinary decoding and
+materialization instead. Use `compression => false` when evaluating raw-pin deferral;
+compression does not imply that late materialization will be admitted.
 
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 

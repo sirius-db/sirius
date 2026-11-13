@@ -109,7 +109,8 @@ TEST_CASE_METHOD(NativeFilterFixture,
   // an unrelated reason — the join's fan-out is still uncollapsed at the port — and
   // the control below could not tell a working plan from a rejected one. The pin
   // proves it, because late materialization is on.
-  run_ok("CALL pin_table(format='duckdb', name='c', tier='gpu');");
+  // This control tests the filtered-scan refusal, independently of compressed-origin refusal.
+  run_ok("CALL pin_table(format='duckdb', name='c', tier='gpu', compression => false);");
 
   // Control. Without it a decline proves nothing: a query that never had a
   // deferral to install declines for free, and the case below would pass on a
