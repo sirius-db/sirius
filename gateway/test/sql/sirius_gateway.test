@@ -201,6 +201,57 @@ WITH s AS (FROM sirius_gateway_stop()) SELECT count(*) FROM sirius_gateway_statu
 ----
 gateway's console
 
+# Nor in a statement that is neither a SELECT nor a CALL: the ranks would run it.
+statement error con2
+CREATE TABLE t_exit AS FROM sirius_rank_exit();
+----
+gateway's console
+
+statement error con2
+INSERT INTO t FROM sirius_rank_exit();
+----
+gateway's console
+
+statement error con2
+COPY (FROM sirius_rank_exit()) TO '/dev/null';
+----
+gateway's console
+
+statement error con2
+CREATE VIEW v_exit AS FROM "sirius_rank_exit" /* quoted */ ();
+----
+gateway's console
+
+statement error con2
+CREATE MACRO m_servers() AS TABLE FROM quack_server_list();
+----
+gateway's console
+
+statement error con2
+EXPLAIN ANALYZE FROM sirius_gateway_stop();
+----
+gateway's console
+
+statement error con2
+SET VARIABLE n = (SELECT count(*) FROM sirius_rank_exit());
+----
+gateway's console
+
+# A function clients may call still runs on the gateway only.
+statement error con2
+CREATE TABLE t_status AS FROM sirius_gateway_status();
+----
+only be called in a SELECT or a CALL
+
+# Such a name that is not called passes: here in a string and as a column.
+statement ok con2
+CREATE TABLE t_names AS SELECT 'sirius_rank_exit()' AS quack_note;
+
+query T con2
+SELECT quack_note FROM t_names;
+----
+sirius_rank_exit()
+
 # A statement that runs on the gateway reads nothing there but the gateway's own functions.
 statement error con2
 SELECT * FROM sirius_gateway_status(), query('FROM sirius_gateway_stop()');
