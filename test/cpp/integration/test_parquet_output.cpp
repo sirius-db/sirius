@@ -1,5 +1,6 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "log/logging.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "output/parquet_writer.hpp"
 #include "sirius/exception.hpp"
 #include "utils/gpu_execution_fixture.hpp"
@@ -8,8 +9,14 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/callback_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/version_config.hpp>
+
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <unistd.h>
 
@@ -35,6 +42,7 @@ struct export_directory {
   ~export_directory() { std::filesystem::remove_all(path); }
 };
 std::string quote(std::filesystem::path const& path) { return "'" + path.string() + "'"; }
+constexpr auto empty_nested_query = "SELECT ar FROM export_empty_nested";
 }  // namespace
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
@@ -204,8 +212,13 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   list.type    = logical_type::make(type_id::LIST);
   decimal.name = "element";
   list.children.push_back(decimal);
-  spec.fields = {nested, list};
-  output::write_empty_parquet(spec, root.path / "nested.parquet");
+  spec.fields              = {nested, list};
+  auto const caller_device = rmm::get_current_cuda_device();
+  output::write_empty_parquet(spec, root.path / "nested.parquet", caller_device.value());
+  REQUIRE(rmm::get_current_cuda_device() == caller_device);
+  REQUIRE_THROWS(
+    output::write_empty_parquet(spec, root.path / "missing/nested.parquet", caller_device.value()));
+  REQUIRE(rmm::get_current_cuda_device() == caller_device);
   run_ok("SET gpu_execution=false");
   auto schema =
     con->Query("DESCRIBE SELECT * FROM read_parquet(" + quote(root.path / "nested.parquet") + ")");
@@ -627,7 +640,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                        "1970-01-01 00:02:03",
                        "false"},
                       {"NULL", "NULL", "NULL", "NULL", "NULL", "true"}});
-  output::write_empty_parquet(spec, root.path / "empty.parquet");
+  output::write_empty_parquet(
+    spec, root.path / "empty.parquet", rmm::get_current_cuda_device().value());
   auto empty =
     con->Query("SELECT count(*) FROM read_parquet(" + quote(root.path / "empty.parquet") + ")");
   REQUIRE_FALSE(empty->HasError());
@@ -842,4 +856,136 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     REQUIRE(field[2] == std::to_string(precision));
     REQUIRE(field[3] == "2");
   }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY finalizes an empty nested schema on a configured device",
+                 "[parquet_export_gpu][integration][parquet_empty_device]")
+{
+  export_directory root;
+  auto const caller_device = rmm::get_current_cuda_device();
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_empty_nested(ar INTEGER[1])");
+  run_ok("CHECKPOINT");
+  auto copy = [&](auto const& path) {
+    return "COPY (" + std::string(empty_nested_query) + ") TO " + quote(path) +
+           " (FORMAT PARQUET, PER_THREAD_OUTPUT true)";
+  };
+  run_ok(copy(root.path / "cpu"));
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto exported = con->Query(copy(root.path / "gpu"));
+  if (exported->HasError()) UNSCOPED_INFO(exported->GetError());
+  REQUIRE_FALSE(exported->HasError());
+  REQUIRE(exported->Collection().GetRows().GetValue(0, 0).ToString() == "0");
+  REQUIRE(rmm::get_current_cuda_device() == caller_device);
+  run_ok("SET gpu_execution=false");
+  auto read_schema = [&](auto const& path) {
+    auto schema =
+      con->Query("DESCRIBE SELECT * FROM read_parquet(" + quote(path / "*.parquet") + ")");
+    REQUIRE_FALSE(schema->HasError());
+    return sirius::test::collect_rows(*schema);
+  };
+  REQUIRE(read_schema(root.path / "gpu") == read_schema(root.path / "cpu"));
+  auto metadata = con->Query("SELECT num_rows, created_by FROM parquet_file_metadata(" +
+                             quote(root.path / "gpu/*.parquet") + ")");
+  REQUIRE_FALSE(metadata->HasError());
+  REQUIRE(metadata->Collection().GetRows().GetValue(0, 0).ToString() == "0");
+  REQUIRE(metadata->Collection().GetRows().GetValue(1, 0).ToString().find("cudf") !=
+          std::string::npos);
+}
+
+TEST_CASE("Empty nested COPY avoids an excluded ambient GPU and restores the caller device",
+          "[parquet_export_gpu][multi_gpu][isolated_context][parquet_empty_device]")
+{
+  if (!sirius::test::has_gpus(2)) SKIP("Requires two visible GPUs for subset [1]");
+  rmm::cuda_set_device_raii const caller_guard{rmm::cuda_device_id{0}};
+  export_directory root;
+  auto config_path = root.path / "gpu1.yaml";
+  {
+    std::ofstream config(config_path);
+    config << R"(sirius:
+  topology:
+    gpu_ids: [1]
+  memory:
+    gpu:
+      usage_limit_fraction: 0.2
+    host:
+      capacity_bytes: 32000000000
+      initial_number_pools: 2
+      pool_size: 128
+      block_size: 1048576
+)";
+  }
+  auto db = sirius::test::open_sirius_db((root.path / "subset.db").c_str(), config_path);
+  duckdb::Connection con(*db);
+  auto run_ok = [&](std::string const& sql) {
+    auto result = con.Query(sql);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto runtime = sirius::test::get_registered_sirius_context(con);
+  auto spaces =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(spaces.size() == 1);
+  REQUIRE(spaces.front()->get_device_id() == 1);
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_empty_nested(ar INTEGER[1])");
+  run_ok("CHECKPOINT");
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+
+  // Install only after runtime initialization, which may probe every visible GPU.
+  // Any RMM allocation on excluded GPU0 during export is a regression.
+  std::atomic<std::size_t> excluded_allocations{0};
+  rmm::mr::callback_memory_resource reject_excluded
+  {
+#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+    [](::cuda::stream_ref, std::size_t, std::size_t, void* arg) -> void* {
+#else
+    [](std::size_t, ::cuda::stream_ref, void* arg) -> void* {
+#endif
+      ++*static_cast<std::atomic<std::size_t>*>(arg);
+      throw std::logic_error("Empty export allocated on excluded GPU0");
+    },
+#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+      [](::cuda::stream_ref, void*, std::size_t, std::size_t, void*) {},
+#else
+      [](void*, std::size_t, ::cuda::stream_ref, void*) {},
+#endif
+      &excluded_allocations
+  };
+  auto previous =
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{0},
+                                     ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+                                       rmm::device_async_resource_ref{reject_excluded}});
+  absl::Cleanup restore_resource = [&] {
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{0}, std::move(previous));
+  };
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  auto exported = con.Query("COPY (" + std::string(empty_nested_query) + ") TO " +
+                            quote(root.path / "out") + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  if (exported->HasError()) UNSCOPED_INFO(exported->GetError());
+  REQUIRE_FALSE(exported->HasError());
+  REQUIRE(exported->Collection().GetRows().GetValue(0, 0).ToString() == "0");
+  REQUIRE(excluded_allocations.load() == 0);
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+  run_ok("SET gpu_execution=false");
+  auto schema =
+    con.Query("DESCRIBE SELECT * FROM read_parquet(" + quote(root.path / "out/*.parquet") + ")");
+  REQUIRE_FALSE(schema->HasError());
+  REQUIRE(schema->RowCount() == 1);
+
+  sirius::output::parquet_field element;
+  element.name = "element";
+  element.type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  sirius::output::parquet_field list;
+  list.name     = "li";
+  list.type     = sirius::logical_type::make(sirius::type_id::LIST);
+  list.children = {element};
+  sirius::output::parquet_export_spec spec;
+  spec.fields = {list};
+  REQUIRE_THROWS(sirius::output::write_empty_parquet(spec, root.path / "missing/part.parquet", 1));
+  REQUIRE(excluded_allocations.load() == 0);
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
 }
