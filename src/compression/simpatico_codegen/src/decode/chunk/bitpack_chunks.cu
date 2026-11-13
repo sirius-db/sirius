@@ -22,6 +22,7 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/std/type_traits>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -34,16 +35,28 @@ namespace simpatico::chunk {
 
 namespace {
 
-/// Per-chunk decode parameters, uploaded for the chunks of one call.
+/// Per-chunk decode parameters of a whole node, built from chunk_count / chunk_bits and uploaded
+/// once per state.
 struct chunk_meta {
-  std::uint64_t min_lo;     ///< chunk_min, low 64 bits (zero-extended from the element width)
-  std::uint64_t min_hi;     ///< chunk_min, high 64 bits (16-byte elements only)
-  std::int64_t word_begin;  ///< first packed word of the chunk, relative to the staged words
+  std::int64_t word_begin;  ///< first packed word of the chunk, from the start of `packed`
   std::int32_t n_words;     ///< packed words of the chunk
   std::int32_t count;       ///< values in the chunk
   std::int32_t bits;        ///< bits per residual
   std::int32_t pad;
 };
+
+/// Little-endian element at `bytes`, which may sit at any address when !aligned (a leaf buffer
+/// can start at any payload offset).
+template <typename U>
+__device__ __forceinline__ U load_element(const std::uint8_t* __restrict__ bytes, bool aligned)
+{
+  if (aligned) { return *reinterpret_cast<const U*>(bytes); }
+  std::uint64_t v = 0;
+  for (std::size_t k = 0; k < sizeof(U); ++k) {
+    v |= static_cast<std::uint64_t>(bytes[k]) << (8 * k);
+  }
+  return static_cast<U>(v);
+}
 
 constexpr int kThreadsPerBlock = 256;
 
@@ -88,30 +101,41 @@ __device__ __forceinline__ unsigned __int128 unpack_one_128(const std::uint32_t*
   return v & mask;
 }
 
-/// out[i] = value at position first_pos + i of the uploaded chunks (chunk = position / 1024),
+/// The staged device inputs of chunks [chunk_begin, chunk_end) of one node.
+struct staged_chunks {
+  const chunk_meta* meta{nullptr};      ///< entry of chunk_begin
+  const std::uint8_t* mins{nullptr};    ///< chunk_min element of chunk_begin
+  const std::uint32_t* words{nullptr};  ///< packed words from chunk_begin's first word
+  std::int64_t word_base{0};            ///< chunk_begin's first word, from the start of `packed`
+  bool mins_aligned{false};             ///< mins can be loaded as whole elements
+};
+
+/// out[i] = value at position first_pos + i of the staged chunks (chunk = position / 1024),
 /// for i in [0, n). Src is the element's type (its width wraps the sum and its signedness
 /// extends it); positions past a chunk's count are left unwritten.
 template <typename Src, typename Out>
-__global__ void unpack_kernel(const chunk_meta* __restrict__ meta,
-                              const std::uint32_t* __restrict__ words,
+__global__ void unpack_kernel(staged_chunks in,
                               std::int64_t first_pos,
                               std::int64_t n,
                               Out* __restrict__ out)
 {
+  using U              = typename ::cuda::std::make_unsigned<Src>::type;
   const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) { return; }
-  const std::int64_t pos = first_pos + i;
-  const chunk_meta m     = meta[pos / kChunkRows];
-  const auto idx         = static_cast<std::int32_t>(pos % kChunkRows);
+  const std::int64_t pos   = first_pos + i;
+  const std::int64_t chunk = pos / kChunkRows;
+  const chunk_meta m       = in.meta[chunk];
+  const auto idx           = static_cast<std::int32_t>(pos % kChunkRows);
   if (idx >= m.count) { return; }
-  std::uint64_t v = m.min_lo;
-  if (m.bits != 0) { v += unpack_one(words + m.word_begin, m.n_words, m.bits, idx); }
+  std::uint64_t v = load_element<U>(in.mins + chunk * sizeof(U), in.mins_aligned);
+  if (m.bits != 0) {
+    v += unpack_one(in.words + (m.word_begin - in.word_base), m.n_words, m.bits, idx);
+  }
   out[i] = static_cast<Out>(static_cast<Src>(v));
 }
 
 /// The 16-byte counterpart; out holds two uint64 (low, high) per value.
-__global__ void unpack_kernel_128(const chunk_meta* __restrict__ meta,
-                                  const std::uint32_t* __restrict__ words,
+__global__ void unpack_kernel_128(staged_chunks in,
                                   std::int64_t first_pos,
                                   std::int64_t n,
                                   std::uint64_t* __restrict__ out)
@@ -119,12 +143,17 @@ __global__ void unpack_kernel_128(const chunk_meta* __restrict__ meta,
   using u128           = unsigned __int128;
   const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) { return; }
-  const std::int64_t pos = first_pos + i;
-  const chunk_meta m     = meta[pos / kChunkRows];
-  const auto idx         = static_cast<std::int32_t>(pos % kChunkRows);
+  const std::int64_t pos   = first_pos + i;
+  const std::int64_t chunk = pos / kChunkRows;
+  const chunk_meta m       = in.meta[chunk];
+  const auto idx           = static_cast<std::int32_t>(pos % kChunkRows);
   if (idx >= m.count) { return; }
-  u128 v = (static_cast<u128>(m.min_hi) << 64) | m.min_lo;
-  if (m.bits != 0) { v += unpack_one_128(words + m.word_begin, m.n_words, m.bits, idx); }
+  const std::uint8_t* min = in.mins + chunk * 16;
+  u128 v = (static_cast<u128>(load_element<std::uint64_t>(min + 8, in.mins_aligned)) << 64) |
+           load_element<std::uint64_t>(min, in.mins_aligned);
+  if (m.bits != 0) {
+    v += unpack_one_128(in.words + (m.word_begin - in.word_base), m.n_words, m.bits, idx);
+  }
   out[2 * i]     = static_cast<std::uint64_t>(v);
   out[2 * i + 1] = static_cast<std::uint64_t>(v >> 64);
 }
@@ -138,16 +167,14 @@ void cuda_try(cudaError_t status, char const* what)
 }
 
 template <typename Src, typename Out>
-void launch_unpack(const chunk_meta* meta,
-                   const std::uint32_t* words,
+void launch_unpack(staged_chunks const& in,
                    std::int64_t first_pos,
                    std::int64_t n,
                    Out* out,
                    rmm::cuda_stream_view stream)
 {
   auto const blocks = static_cast<unsigned>((n + kThreadsPerBlock - 1) / kThreadsPerBlock);
-  unpack_kernel<Src, Out>
-    <<<blocks, kThreadsPerBlock, 0, stream.value()>>>(meta, words, first_pos, n, out);
+  unpack_kernel<Src, Out><<<blocks, kThreadsPerBlock, 0, stream.value()>>>(in, first_pos, n, out);
   cuda_try(cudaGetLastError(), "unpack kernel launch");
 }
 
@@ -165,16 +192,18 @@ struct bitpack_state {
   explicit bitpack_state(bitpack_locator const& locator) : loc(locator) {}
 
   bitpack_locator loc;
-  // Host metadata of chunks [0, counts.size()), read once; word_prefix[c] is chunk c's first
-  // word in `packed` and has one more entry than counts.
+  // The node's chunk metadata, read from chunk_count / chunk_bits once (the first decode) and
+  // kept for the state's lifetime: 5 bytes per 1024 rows on the wire. word_prefix[c] is chunk
+  // c's first word in `packed` and has one more entry than counts. The host needs the prefix to
+  // know which packed bytes a span covers; nothing else is read back, so a decode after the
+  // first never waits for the stream.
+  bool loaded{false};
+  std::size_t elem_size{0};
   std::vector<std::int32_t> counts;
-  std::vector<std::uint8_t> bits;
   std::vector<std::int64_t> word_prefix{0};
-  // Per-call transients, kept (grow-only) so a call allocates nothing in the steady state.
-  std::vector<std::uint8_t> host_mins;
-  std::vector<chunk_meta> host_meta;
+  std::vector<chunk_meta> host_meta;  ///< source of the one upload; alive until the state dies
   rmm::device_buffer device_meta;
-  rmm::device_buffer aligned_words;
+  rmm::device_buffer aligned_words;  ///< grow-only scratch for an unaligned `packed`
 
   [[nodiscard]] std::size_t device_bytes() const noexcept
   {
@@ -207,111 +236,83 @@ struct bitpack_state {
     return s;
   }
 
-  /// Reads chunk_count / chunk_bits of the chunks not seen yet, up to chunk_end.
-  void extend_prefix(leaf_access& leaves, std::int64_t chunk_end, rmm::cuda_stream_view stream)
+  /// Reads the whole node's chunk_count / chunk_bits, builds the word prefix and uploads the
+  /// per-chunk metadata. The only host readback (and stream wait) of the state.
+  void load(leaf_access& leaves, shape const& s, rmm::cuda_stream_view stream)
   {
-    auto const known = static_cast<std::int64_t>(counts.size());
-    if (chunk_end <= known) { return; }
-    auto const extra = static_cast<std::size_t>(chunk_end - known);
-    std::vector<std::int32_t> new_counts(extra);
-    std::vector<std::uint8_t> new_bits(extra);
+    auto const n = static_cast<std::size_t>(s.num_chunks);
+    std::vector<std::int32_t> node_counts(n);
+    std::vector<std::uint8_t> node_bits(n);
     leaves.host_bytes(loc.chunk_count.leaf,
                       loc.chunk_count.buffer,
-                      static_cast<std::uint64_t>(known) * sizeof(std::int32_t),
-                      extra * sizeof(std::int32_t),
-                      new_counts.data(),
+                      0,
+                      n * sizeof(std::int32_t),
+                      node_counts.data(),
                       stream);
-    leaves.host_bytes(loc.chunk_bits.leaf,
-                      loc.chunk_bits.buffer,
-                      static_cast<std::uint64_t>(known),
-                      extra,
-                      new_bits.data(),
-                      stream);
-    for (std::size_t i = 0; i < extra; ++i) {
-      auto const count = new_counts[i];
-      if (count < 0 || count > kChunkRows || new_bits[i] > 128) {
+    leaves.host_bytes(loc.chunk_bits.leaf, loc.chunk_bits.buffer, 0, n, node_bits.data(), stream);
+
+    std::vector<std::int64_t> prefix{0};
+    std::vector<chunk_meta> meta(n);
+    prefix.reserve(n + 1);
+    for (std::size_t c = 0; c < n; ++c) {
+      auto const count = node_counts[c];
+      if (count < 0 || count > kChunkRows || node_bits[c] > s.elem_size * 8) {
         throw std::runtime_error("bitpack chunk decode: corrupt chunk metadata");
       }
       std::int64_t const n_words =
-        count == 0 ? 1 : (static_cast<std::int64_t>(count) * new_bits[i] + 31) >> 5;
-      counts.push_back(count);
-      bits.push_back(new_bits[i]);
-      word_prefix.push_back(word_prefix.back() + n_words);
+        count == 0 ? 1 : (static_cast<std::int64_t>(count) * node_bits[c] + 31) >> 5;
+      meta[c] =
+        chunk_meta{prefix.back(), static_cast<std::int32_t>(n_words), count, node_bits[c], 0};
+      prefix.push_back(prefix.back() + n_words);
     }
-  }
-
-  /// What a kernel needs to decode chunks [chunk_begin, chunk_end).
-  struct staged {
-    const chunk_meta* meta{nullptr};
-    const std::uint32_t* words{nullptr};
-    std::size_t elem_size{0};
-  };
-
-  /// Stages the metadata and packed words of chunks [chunk_begin, chunk_end) (non-empty range).
-  staged stage(leaf_access& leaves,
-               std::int64_t chunk_begin,
-               std::int64_t chunk_end,
-               rmm::cuda_stream_view stream)
-  {
-    auto const& column = leaves.column();
-    auto const s       = describe(column);
-    if (chunk_begin < 0 || chunk_end <= chunk_begin || chunk_end > s.num_chunks) {
-      throw std::invalid_argument("bitpack chunk decode: chunks [" + std::to_string(chunk_begin) +
-                                  ", " + std::to_string(chunk_end) +
-                                  ") are not within the node's " + std::to_string(s.num_chunks));
-    }
-    extend_prefix(leaves, chunk_end, stream);
-
-    auto const n = static_cast<std::size_t>(chunk_end - chunk_begin);
-    host_mins.resize(n * s.elem_size);
-    leaves.host_bytes(loc.chunk_min.leaf,
-                      loc.chunk_min.buffer,
-                      static_cast<std::uint64_t>(chunk_begin) * s.elem_size,
-                      n * s.elem_size,
-                      host_mins.data(),
-                      stream);
-
-    auto const word_begin = word_prefix[static_cast<std::size_t>(chunk_begin)];
-    auto const word_end   = word_prefix[static_cast<std::size_t>(chunk_end)];
-    host_meta.assign(n, chunk_meta{});
-    for (std::size_t i = 0; i < n; ++i) {
-      auto const c = static_cast<std::size_t>(chunk_begin) + i;
-      auto& m      = host_meta[i];
-      if (bits[c] > s.elem_size * 8) {
-        throw std::runtime_error("bitpack chunk decode: chunk_bits wider than the element");
-      }
-      // Little-endian: the low min(8, size) bytes, then the high 8 of a 16-byte element.
-      std::memcpy(
-        &m.min_lo, host_mins.data() + i * s.elem_size, std::min<std::size_t>(s.elem_size, 8));
-      if (s.elem_size == 16) { std::memcpy(&m.min_hi, host_mins.data() + i * s.elem_size + 8, 8); }
-      m.word_begin = word_prefix[c] - word_begin;
-      m.n_words    = static_cast<std::int32_t>(word_prefix[c + 1] - word_prefix[c]);
-      m.count      = counts[c];
-      m.bits       = bits[c];
-    }
-
-    auto const meta_bytes = n * sizeof(chunk_meta);
-    if (device_meta.size() < meta_bytes) {
-      device_meta = rmm::device_buffer(meta_bytes, stream, leaves.mr());
-    }
-    // host_meta stays alive (and unchanged) until the next call on this state.
-    cuda_try(
-      cudaMemcpyAsync(
-        device_meta.data(), host_meta.data(), meta_bytes, cudaMemcpyHostToDevice, stream.value()),
-      "chunk metadata upload");
-
-    staged out;
-    out.meta      = static_cast<const chunk_meta*>(device_meta.data());
-    out.elem_size = s.elem_size;
-
-    auto const packed_bytes = static_cast<std::uint64_t>(word_end - word_begin) * 4;
-    if (static_cast<std::uint64_t>(word_end) * 4 > range_of(column, loc.packed).size) {
+    if (static_cast<std::uint64_t>(prefix.back()) * 4 >
+        range_of(leaves.column(), loc.packed).size) {
       throw std::runtime_error("bitpack chunk decode: packed is shorter than its chunks");
     }
+
+    rmm::device_buffer uploaded(n * sizeof(chunk_meta), stream, leaves.mr());
+    cuda_try(
+      cudaMemcpyAsync(
+        uploaded.data(), meta.data(), uploaded.size(), cudaMemcpyHostToDevice, stream.value()),
+      "chunk metadata upload");
+    counts      = std::move(node_counts);
+    word_prefix = std::move(prefix);
+    host_meta   = std::move(meta);
+    device_meta = std::move(uploaded);
+    elem_size   = s.elem_size;
+    loaded      = true;
+  }
+
+  /// Stages the metadata, minima and packed words of chunks [chunk_begin, chunk_end) (a
+  /// non-empty range) on the device.
+  staged_chunks stage(leaf_access& leaves,
+                      std::int64_t chunk_begin,
+                      std::int64_t chunk_end,
+                      rmm::cuda_stream_view stream)
+  {
+    if (!loaded) {
+      auto const s = describe(leaves.column());
+      check_range(chunk_begin, chunk_end, s.num_chunks);
+      load(leaves, s, stream);
+    } else {
+      check_range(chunk_begin, chunk_end, static_cast<std::int64_t>(counts.size()));
+    }
+
+    auto const c0 = static_cast<std::size_t>(chunk_begin);
+    auto const n  = static_cast<std::size_t>(chunk_end - chunk_begin);
+    staged_chunks out;
+    out.meta      = static_cast<const chunk_meta*>(device_meta.data()) + c0;
+    out.word_base = word_prefix[c0];
+    out.mins      = reinterpret_cast<const std::uint8_t*>(leaves.device_bytes(
+      loc.chunk_min.leaf, loc.chunk_min.buffer, c0 * elem_size, n * elem_size, stream));
+    out.mins_aligned =
+      reinterpret_cast<std::uintptr_t>(out.mins) % std::min<std::size_t>(elem_size, 8) == 0;
+
+    auto const packed_bytes = static_cast<std::uint64_t>(word_prefix[c0 + n] - word_prefix[c0]) * 4;
     if (packed_bytes != 0) {
       auto const* bytes = leaves.device_bytes(loc.packed.leaf,
                                               loc.packed.buffer,
-                                              static_cast<std::uint64_t>(word_begin) * 4,
+                                              static_cast<std::uint64_t>(word_prefix[c0]) * 4,
                                               packed_bytes,
                                               stream);
       if (reinterpret_cast<std::uintptr_t>(bytes) % alignof(std::uint32_t) != 0) {
@@ -328,6 +329,15 @@ struct bitpack_state {
       out.words = reinterpret_cast<const std::uint32_t*>(bytes);
     }
     return out;
+  }
+
+  static void check_range(std::int64_t chunk_begin, std::int64_t chunk_end, std::int64_t num_chunks)
+  {
+    if (chunk_begin < 0 || chunk_end <= chunk_begin || chunk_end > num_chunks) {
+      throw std::invalid_argument("bitpack chunk decode: chunks [" + std::to_string(chunk_begin) +
+                                  ", " + std::to_string(chunk_end) +
+                                  ") are not within the node's " + std::to_string(num_chunks));
+    }
   }
 };
 
@@ -354,16 +364,15 @@ class bitpack_decoder final : public chunk_decoder {
                span.chunk_begin + (span.skip_head + span.take + kChunkRows - 1) / kChunkRows);
     auto const staged = _state.stage(leaves, span.chunk_begin, chunk_end, stream);
     auto const width  = static_cast<std::size_t>(cudf::size_of(leaves.column().dtype));
-    if (staged.elem_size != width) {
+    if (_state.elem_size != width) {
       throw unsupported_chunk_decode("bitpack chunk decode: the packed element is " +
-                                     std::to_string(staged.elem_size) + " bytes, the column's " +
+                                     std::to_string(_state.elem_size) + " bytes, the column's " +
                                      std::to_string(width));
     }
     auto* const out =
       static_cast<std::byte*>(dst.data) + static_cast<std::size_t>(dst.dst_row_offset) * width;
     auto launch = [&]<typename T>(T*) {
-      launch_unpack<T, T>(
-        staged.meta, staged.words, span.skip_head, span.take, reinterpret_cast<T*>(out), stream);
+      launch_unpack<T, T>(staged, span.skip_head, span.take, reinterpret_cast<T*>(out), stream);
     };
     switch (width) {
       case 1: launch(static_cast<std::uint8_t*>(nullptr)); break;
@@ -374,11 +383,7 @@ class bitpack_decoder final : public chunk_decoder {
         auto const blocks =
           static_cast<unsigned>((span.take + kThreadsPerBlock - 1) / kThreadsPerBlock);
         unpack_kernel_128<<<blocks, kThreadsPerBlock, 0, stream.value()>>>(
-          staged.meta,
-          staged.words,
-          span.skip_head,
-          span.take,
-          reinterpret_cast<std::uint64_t*>(out));
+          staged, span.skip_head, span.take, reinterpret_cast<std::uint64_t*>(out));
         cuda_try(cudaGetLastError(), "unpack kernel launch");
         break;
       }
@@ -433,7 +438,7 @@ void unpack_bitpack_chunks(leaf_access& leaves,
 {
   if (chunk_end == chunk_begin) { return; }
   auto const staged = state.stage(leaves, chunk_begin, chunk_end, stream);
-  if (staged.elem_size > sizeof(std::int64_t)) {
+  if (state.elem_size > sizeof(std::int64_t)) {
     throw unsupported_chunk_decode("bitpack chunk decode: 16-byte elements do not fit int64");
   }
   // One 1024-value block per chunk; the last chunk's block ends at its count.
@@ -443,10 +448,8 @@ void unpack_bitpack_chunks(leaf_access& leaves,
   auto const type_id     = state.loc.value_type.id();
   bool const is_unsigned = type_id == cudf::type_id::UINT8 || type_id == cudf::type_id::UINT16 ||
                            type_id == cudf::type_id::UINT32 || type_id == cudf::type_id::UINT64;
-  auto launch = [&]<typename T>(T*) {
-    launch_unpack<T, std::int64_t>(staged.meta, staged.words, 0, n, out, stream);
-  };
-  switch (staged.elem_size) {
+  auto launch = [&]<typename T>(T*) { launch_unpack<T, std::int64_t>(staged, 0, n, out, stream); };
+  switch (state.elem_size) {
     case 1:
       is_unsigned ? launch(static_cast<std::uint8_t*>(nullptr))
                   : launch(static_cast<std::int8_t*>(nullptr));

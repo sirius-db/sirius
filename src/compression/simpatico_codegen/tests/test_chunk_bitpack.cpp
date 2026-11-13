@@ -105,8 +105,9 @@ bool same_buffer(request const& r, chunk::buffer_ref ref)
   return std::get<0>(r) == ref.leaf && std::get<1>(r) == ref.buffer;
 }
 
-/// Asserts that the logged requests touch only the metadata and packed words of chunks
-/// [chunk_begin, chunk_end) (chunk_count / chunk_bits may start earlier: the prefix needs them).
+/// Asserts that the logged requests touch only the minima and packed words of chunks
+/// [chunk_begin, chunk_end), both staged on the device with no host readback. chunk_count /
+/// chunk_bits are the exception: the state reads the whole node's once, on its first decode.
 void expect_requests(device_leaf_access const& access,
                      chunk::bitpack_locator const& loc,
                      bitpack_reference const& ref,
@@ -137,11 +138,20 @@ void expect_requests(device_leaf_access const& access,
       (c1 - c0) * ref.elem_size) {
     fail("chunk_min bytes requested != the span's");
   }
-  if (!access.requests_within(loc.chunk_count.leaf, loc.chunk_count.buffer, 0, c1 * 4)) {
-    fail("chunk_count requested past the span");
+  auto const count_bytes = access.requested_bytes(loc.chunk_count.leaf, loc.chunk_count.buffer);
+  auto const bits_bytes  = access.requested_bytes(loc.chunk_bits.leaf, loc.chunk_bits.buffer);
+  auto const nc          = static_cast<std::uint64_t>(ref.num_chunks());
+  if (!(count_bytes == 0 && bits_bytes == 0) && !(count_bytes == nc * 4 && bits_bytes == nc)) {
+    fail("chunk_count / chunk_bits not read whole, once");
   }
-  if (!access.requests_within(loc.chunk_bits.leaf, loc.chunk_bits.buffer, 0, c1)) {
-    fail("chunk_bits requested past the span");
+  // Only that one-time load may copy to the host (each host copy waits for the stream).
+  if (access.host_requests().size() != (count_bytes == 0 ? 0U : 2U)) {
+    fail("a decode read bytes back to the host");
+  }
+  for (auto const& r : access.host_requests()) {
+    if (!same_buffer(r, loc.chunk_count) && !same_buffer(r, loc.chunk_bits)) {
+      fail("chunk_min or packed was read back to the host");
+    }
   }
   if (!access.requests_within(loc.packed.leaf, loc.packed.buffer, word_begin, word_end)) {
     fail("packed requested outside the span's words");
@@ -506,7 +516,8 @@ int test_primitive_extension(rmm::cuda_stream_view stream)
   return 6;
 }
 
-/// The count / bits prefix is read once, and only as far as a call needs.
+/// chunk_count / chunk_bits of the whole node are read once, on the first decode; no later
+/// decode copies anything to the host (so none waits for the stream).
 int test_prefix_cache(rmm::cuda_stream_view stream)
 {
   column_options options;
@@ -521,18 +532,17 @@ int test_prefix_cache(rmm::cuda_stream_view stream)
     return fx.access.requested_bytes(fx.loc.chunk_bits.leaf, fx.loc.chunk_bits.buffer);
   };
 
+  expect(fx.access.requests().empty(), "prefix: building the decoder requests no bytes");
   check_span(fx, {2, 3, 0, 1024}, 0, stream);
-  expect(count_bytes() == 3 * 4 && bits_bytes() == 3, "prefix: first call reads chunks [0, 3)");
-  check_span(fx, {1, 2, 10, 500}, 0, stream);
-  expect(count_bytes() == 0 && bits_bytes() == 0, "prefix: a covered span reads no counts");
-  check_span(fx, {2, 3, 0, 1024}, 0, stream);
-  expect(count_bytes() == 0 && bits_bytes() == 0, "prefix: a repeated span reads no counts");
-  check_span(fx, {4, 5, 0, 1024}, 0, stream);
-  expect(count_bytes() == 2 * 4 && bits_bytes() == 2, "prefix: extends by chunks [3, 5) only");
-  expect(fx.access.requests_within(fx.loc.chunk_count.leaf, fx.loc.chunk_count.buffer, 12, 20),
-         "prefix: the extension starts at the first unseen chunk");
-  check_span(fx, {0, 7, 0, fx.rows()}, 0, stream);
-  expect(count_bytes() == 2 * 4 && bits_bytes() == 2, "prefix: extends by chunks [5, 7) only");
+  expect(count_bytes() == 7 * 4 && bits_bytes() == 7,
+         "prefix: the first decode reads the whole node's counts and bits");
+  expect(fx.access.host_requests().size() == 2, "prefix: the first decode makes two host reads");
+  for (auto const& span : std::vector<chunk::chunk_span>{
+         {1, 2, 10, 500}, {2, 3, 0, 1024}, {4, 5, 0, 1024}, {0, 7, 0, fx.rows()}, {6, 7, 0, 100}}) {
+    check_span(fx, span, 0, stream);
+    expect(fx.access.host_requests().empty(), "prefix: a later decode reads nothing to the host");
+    expect(count_bytes() == 0 && bits_bytes() == 0, "prefix: a later decode re-reads counts");
+  }
   expect(fx.decoder->state_bytes() > 0, "prefix: the decoder reports its device state");
   return 1;
 }
