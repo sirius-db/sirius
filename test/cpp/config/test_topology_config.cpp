@@ -56,9 +56,9 @@ TEST_CASE("parsed hardware configuration resolves independently after copying",
                    "    gpu: { usage_limit_bytes: 1Gi }\n"
                    "    host: { capacity_bytes: 2Gi }\n"
                    "  operator_params: { concat_batch_bytes: 123456789 }\n"
-                   "  telemetry: { exporter: ndjson, output_directory: deferred_telemetry }\n");
+                   "  telemetry: { output_directory: deferred_telemetry }\n");
   auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
-  CHECK(parsed.get_telemetry_config().exporter == sirius::QUENT_NDJSON_EXPORTER);
+  CHECK(parsed.get_telemetry_config().output_directory == "deferred_telemetry");
   CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
 
   auto copy = parsed;
@@ -76,6 +76,15 @@ TEST_CASE("parsed hardware configuration resolves independently after copying",
   auto another                                      = parsed.resolve(discovery.get_topology());
   CHECK(resolved.get_operator_params().concat_batch_bytes == 987654321);
   CHECK(another.get_operator_params().concat_batch_bytes == 123456789);
+}
+
+TEST_CASE("sirius_config rejects the removed telemetry.exporter key", "[topology_config][config]")
+{
+  scoped_yaml yaml("sirius_telemetry_exporter.yaml",
+                   "sirius:\n"
+                   "  telemetry: { exporter: ndjson }\n");
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path));
 }
 
 TEST_CASE("sirius_config parses topology.gpus_per_query", "[topology_config][config]")

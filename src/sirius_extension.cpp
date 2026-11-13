@@ -3061,17 +3061,6 @@ static void SetEnableDecimalSumStatsBound(ClientContext& context, SetScope scope
                    params->enable_decimal_sum_stats_bound);
 }
 
-static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context, scope);
-  if (params->use_hw_decompression != BooleanValue::Get(parameter)) {
-    throw InvalidInputException(
-      "use_hw_decompression is startup-only; configure sirius.operator_params.use_hw_decompression "
-      "in YAML");
-  }
-  SIRIUS_LOG_DEBUG("Updated config USE_HW_DECOMPRESSION to {}", params->use_hw_decompression);
-}
-
 static void SetAdmissionBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes                = UBigIntValue::Get(parameter);
@@ -3669,16 +3658,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
-
-  config.AddExtensionOption(
-    "use_hw_decompression",
-    "Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default "
-    "(opt-in). When enabled and every GPU reports hardware-decompression support in cucascade "
-    "topology, Sirius exports LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context. Only "
-    "enable this on GPUs known to support hardware decompression",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.use_hw_decompression),
-    SetUseHwDecompression);
 
   config.AddExtensionOption(
     "admission_bytes_per_gpu",

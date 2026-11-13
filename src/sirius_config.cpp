@@ -246,17 +246,6 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
     }
   }
   {
-    // Deprecated: the reactor priority tiers replaced prefetch-reactor
-    // partitioning. Consume any value (including null) without deserializing,
-    // always warn, then ignore it so configs that still name it keep loading.
-    if (r.has("prefetch_reactors")) {
-      std::ignore = r.optional_node("prefetch_reactors");
-      SIRIUS_LOG_WARN(
-        "'uring.prefetch_reactors' is deprecated and ignored: the reactor priority tiers replaced "
-        "prefetch-reactor partitioning; remove the key from the config");
-    }
-  }
-  {
     // Signed, so a negative value is reported as itself rather than wrapped.
     std::optional<long long> slices;
     r.optional("slices_per_pass", slices);
@@ -502,10 +491,6 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_nvtx", opt.enable_nvtx);
-  r.optional("exporter", opt.exporter, [](std::string const& value) {
-    if (value == QUENT_NDJSON_EXPORTER) { return true; }
-    throw std::runtime_error("must be ndjson");
-  });
   r.optional("output_directory", opt.output_directory, [](std::string const& value) {
     if (!value.empty()) return true;
     throw std::runtime_error("must not be empty");

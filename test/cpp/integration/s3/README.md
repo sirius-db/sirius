@@ -18,9 +18,6 @@ toolchain is required. Server startup is opt-in through `SIRIUS_TEST_S3_AUTO`.
 | `make s3-test` | Non-large, non-AWS S3 integration cases; AUTO and STRICT enabled |
 | `make s3-test-large` | Two processes: cache-enabled SF10 cases plus SF1 TPC-H and glob-scale, then cache-disabled SF10 cases |
 | `make s3-test-aws` | Manual AWS cases; STRICT enabled; supply the endpoint, bucket and temporary credentials |
-| `make s3-tpch` | Deprecated; still enables TPCH and runs both tiny and SF1 suites |
-| `make s3-test-aws-sigv4` | Deprecated; forwards to `s3-test-aws` |
-| `make s3-test-aws-broker` | Deprecated; prints a warning and runs nothing |
 
 The S3 make targets pass `--order decl` to run cases in declaration order.
 The manual equivalent of `make s3-test` is:
@@ -41,7 +38,6 @@ Makefile selector, not from any one tag:
 | `make s3-test-large`, first process | `[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]` |
 | `make s3-test-large`, second process | `[s3][sql][large][large-nocache]` |
 | `make s3-test-aws` | `[s3][aws]` |
-| `make s3-tpch` (deprecated) | `[s3][integration][sql][tpch]` |
 
 Adjacent tags mean AND; commas separate OR alternatives. Keep the
 gate tags when retagging a case. `[integration]` also tells the listener
