@@ -22,6 +22,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <vector>
 
 namespace sirius::op::merge {
@@ -81,8 +82,13 @@ class windowed_merge_input final : public operator_data {
   [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override;
 
   /// Halves window_rows (floor kShrinkWindowRowsFloor) and output_target_bytes (floor 16 MiB);
-  /// returns false when both are already at their floors.
+  /// returns false when both are already at their floors. Calls the shrink observer when it
+  /// returns true.
   bool shrink_for_retry() override;
+
+  /// Called, with no argument, each time shrink_for_retry() shrinks the task; the operator that
+  /// made the input counts its shrinks through it. May be called from any thread.
+  void set_shrink_observer(std::function<void()> observer);
 
   /// The sort partition being merged.
   [[nodiscard]] std::size_t partition() const noexcept;
@@ -115,6 +121,7 @@ class windowed_merge_input final : public operator_data {
   std::size_t _compressed_runs;
   std::size_t _fetch_columns;
   std::size_t _string_columns;
+  std::function<void()> _shrink_observer;
   cucascade::memory::memory_space* _gpu_memory_space = nullptr;
 };
 

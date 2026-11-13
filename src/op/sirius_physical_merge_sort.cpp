@@ -29,6 +29,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/merge/merge_chunk_position.hpp"
+#include "op/merge/merge_sort_stats_log.hpp"
 #include "op/merge/windowed_merge_input.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -80,18 +81,6 @@ process_counter_state& process_counter_storage()
   return state;
 }
 
-void add_round_stats(merge::merge_round_stats& total, const merge::merge_round_stats& stats)
-{
-  total.rounds += stats.rounds;
-  total.rows_out += stats.rows_out;
-  total.refill_rows += stats.refill_rows;
-  total.refill_bytes += stats.refill_bytes;
-  total.refill_truncated += stats.refill_truncated;
-  total.window_growths += stats.window_growths;
-  total.compacted_rows += stats.compacted_rows;
-  total.fallback_conversions += stats.fallback_conversions;
-}
-
 /// Applies @p update to the operator's counters and to the process-wide ones.
 template <typename Update>
 void count(merge_sort_counters& operator_counters, Update update)
@@ -100,6 +89,29 @@ void count(merge_sort_counters& operator_counters, Update update)
   auto& process = process_counter_storage();
   std::lock_guard<std::mutex> lg(process.mutex);
   update(process.counters);
+}
+
+/// Whether the operator has nothing left to merge: no task in flight, no run of an armed
+/// partition unread, and no batch waiting in a partition that is not armed yet. With the input
+/// complete before the first task, this holds at the commit of the operator's last task only.
+template <typename Partitions>
+bool no_work_left(const Partitions& partitions, ::cucascade::shared_data_repository& repo)
+{
+  for (auto const& [partition, state] : partitions) {
+    if (state.in_flight || !state.runs.empty()) { return false; }
+  }
+  auto const num_partitions = repo.num_partitions();
+  for (std::size_t p = 0; p < num_partitions; ++p) {
+    auto const it = partitions.find(p);
+    if ((it == partitions.end() || !it->second.armed) && repo.size(p) > 0) { return false; }
+  }
+  return true;
+}
+
+/// The operator's one statistics line; @p counters are its final ones.
+void log_stats(std::size_t operator_id, const merge_sort_counters& counters)
+{
+  SIRIUS_LOG_INFO("{}", merge::format_merge_sort_stats(operator_id, counters));
 }
 
 bool same_position(const merge::merge_input_cursor& a, const merge::merge_input_cursor& b)
@@ -516,6 +528,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
     state.armed = true;
     auto input  = make_one_shot_input(partition, repo);
     if (input) {
+      // In flight until execute() commits it, so the statistics line waits for it.
+      state.in_flight = true;
       count(_counters, [](merge_sort_counters& counters) { ++counters.one_shot_partitions; });
     }
     return input;
@@ -818,6 +832,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::make_windowed_input(
       std::count_if(plan.fetch_cols.begin(), plan.fetch_cols.end(), [&state](auto column) {
         return state.column_types[column].id() == cudf::type_id::STRING;
       })));
+  // The input shrinks outside the operator, when the executor retries its task after an OOM.
+  input->set_shrink_observer([this] {
+    std::lock_guard<std::mutex> lg(_drain_mutex);
+    count(_counters, [](merge_sort_counters& counters) { ++counters.shrinks; });
+  });
   if (!device_bytes.empty()) {
     input->set_preferred_device_id(
       std::max_element(device_bytes.begin(), device_bytes.end(), [](auto const& a, auto const& b) {
@@ -847,7 +866,40 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   if (input_data.get_type() == operator_data_type::WINDOWED_MERGE) {
     return execute_windowed(dynamic_cast<const merge::windowed_merge_input&>(input_data), stream);
   }
-  return execute_one_shot(dynamic_cast<const pipelineable_operator_data&>(input_data), stream);
+  auto const& one_shot = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto output          = execute_one_shot(one_shot, stream);
+
+  // Commit: the partition's only task is done. An input that get_next_task_input_data() did not
+  // make has no partition in flight and commits nothing.
+  auto* repo = ports.empty() ? nullptr : ports.begin()->second->repo;
+  std::optional<merge_sort_counters> final_counters;
+  bool more_tasks = false;
+  if (auto const position = one_shot.get_position(); position.has_value() && repo != nullptr) {
+    auto const partition = _merge_settings.mode == sort_merge_mode::one_shot
+                             ? *position
+                             : merge::split_merge_chunk_position(*position).first;
+    std::lock_guard<std::mutex> lg(_drain_mutex);
+    auto const it = _partitions.find(partition);
+    if (it != _partitions.end() && it->second.in_flight &&
+        it->second.route == merge::merge_route::one_shot) {
+      it->second.in_flight = false;
+      // A partition whose arming met a locked run gets another attempt.
+      bool deferred = false;
+      for (auto& [p, other] : _partitions) {
+        deferred           = deferred || other.arm_deferred;
+        other.arm_deferred = false;
+      }
+      more_tasks = deferred && has_armable_partition(*repo);
+      if (no_work_left(_partitions, *repo)) { final_counters = _counters; }
+    }
+  }
+  if (final_counters.has_value()) { log_stats(operator_id, *final_counters); }
+  if (more_tasks) {
+    if (auto pipeline = get_pipeline()) {
+      if (auto* creator = pipeline->get_task_creator()) { creator->schedule(this); }
+    }
+  }
+  return output;
 }
 
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_one_shot(
@@ -1066,6 +1118,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
   std::vector<std::shared_ptr<cucascade::data_batch>> consumed_batches;
   consumed_batches.reserve(consumed_ids.size());
   bool more_tasks = false;
+  std::optional<merge_sort_counters> final_counters;
   {
     std::lock_guard<std::mutex> lg(_drain_mutex);
     auto& state = _partitions.at(partition);
@@ -1107,7 +1160,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
     count(_counters, [&](merge_sort_counters& counters) {
       ++counters.windowed_tasks;
       if (!final_pass) { ++counters.intermediate_tasks; }
-      add_round_stats(counters.rounds, stats);
+      merge::accumulate(counters.rounds, stats);
     });
     state.task_runs.clear();
     state.in_flight = false;
@@ -1116,6 +1169,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
       other.arm_deferred = false;
     }
     more_tasks = has_armable_partition(*repo);
+    if (no_work_left(_partitions, *repo)) { final_counters = _counters; }
   }
   // Outside the mutex: frees the windows of a merger the partition no longer needs.
   kept.reset();
@@ -1129,6 +1183,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
     rows_out,
     stats.refill_rows,
     stats.fallback_conversions);
+  if (final_counters.has_value()) { log_stats(operator_id, *final_counters); }
 
   // Nothing else asks this operator for its next task when one of its own tasks finishes.
   if (more_tasks) {

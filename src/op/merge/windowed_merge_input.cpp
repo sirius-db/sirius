@@ -98,7 +98,14 @@ bool windowed_merge_input::shrink_for_retry()
   const bool window_shrunk = halve_to_floor(_cfg.window_rows, kShrinkWindowRowsFloor);
   const bool output_shrunk =
     halve_to_floor(_cfg.output_target_bytes, kShrinkOutputTargetBytesFloor);
-  return window_shrunk || output_shrunk;
+  if (!window_shrunk && !output_shrunk) { return false; }
+  if (_shrink_observer) { _shrink_observer(); }
+  return true;
+}
+
+void windowed_merge_input::set_shrink_observer(std::function<void()> observer)
+{
+  _shrink_observer = std::move(observer);
 }
 
 std::size_t windowed_merge_input::partition() const noexcept { return _partition; }
