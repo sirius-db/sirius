@@ -28,7 +28,7 @@ namespace sirius::exchange {
 ///   (note_exchange_joined), since only a process that has must restart to join other ranks;
 /// - `CALL sirius_rank_exit()`: replies, then shuts Sirius down and ends the process, for the
 ///   rank's launcher to start it again. The exchange's peers are fixed once it connects, so
-///   joining a new set of ranks takes a new process.
+///   joining a new set of ranks takes a new process. Refused in a process that has not joined.
 void register_rank_control_functions(duckdb::DatabaseInstance& instance);
 
 /// Records that this process's exchange connected to its peers, which it cannot change after.
