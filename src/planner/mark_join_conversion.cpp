@@ -16,6 +16,12 @@
 
 #include "planner/mark_join_conversion.hpp"
 
+#include "log/logging.hpp"
+#include "planner/dynamic_filter/build_filter_evidence.hpp"
+#include "sirius_context.hpp"
+
+#include <duckdb/common/enums/expression_type.hpp>
+#include <duckdb/common/enums/join_type.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
@@ -109,6 +115,92 @@ void simplify_null_safe_semi_conditions(duckdb::ClientContext& context,
                                  cond.RightReference()->Copy(),
                                  duckdb::ExpressionType::COMPARE_EQUAL);
   }
+}
+
+// DuckDB flips a SEMI join when its filter target is at least this many times larger than the
+// outer side (JoinFilterBuildSideHeuristics::SEMI_JOIN_FILTER_TARGET_RATIO).
+constexpr duckdb::idx_t outer_build_ratio = 3;
+
+bool reads_cte(duckdb::LogicalOperator const& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_CTE_REF) return true;
+  for (auto const& child : op.children) {
+    if (child && reads_cte(*child)) return true;
+  }
+  return false;
+}
+
+// A right-family join publishes before its probe is read, by accumulating a Bloom filter, and
+// accumulation takes INT32 and INT64 keys only (accumulated_bloom_builder::supports).
+bool is_early_publication_key(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionType() != duckdb::ExpressionType::BOUND_COLUMN_REF) return false;
+  auto const type = expr.GetReturnType().id();
+  return type == duckdb::LogicalTypeId::INTEGER || type == duckdb::LogicalTypeId::BIGINT;
+}
+
+/// Every condition must be the same kind of equality, so that the flipped join is a plain hash
+/// join: a right-family join has no nested-loop fallback, and a residual would have to be
+/// translated again with its sides swapped. One key must also be publishable.
+bool conditions_allow_outer_build(duckdb::LogicalComparisonJoin const& join)
+{
+  bool publishable = false;
+  for (auto const& cond : join.conditions) {
+    if (!cond.IsComparison()) return false;
+    auto const type = cond.GetComparisonType();
+    if (type != duckdb::ExpressionType::COMPARE_EQUAL &&
+        type != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      return false;
+    }
+    if (type != join.conditions.front().GetComparisonType()) return false;
+    publishable = publishable || (is_early_publication_key(cond.GetLHS()) &&
+                                  is_early_publication_key(cond.GetRHS()));
+  }
+  return publishable;
+}
+
+/// DuckDB chooses build sides while the join is still MARK, which has no flipped form, so a
+/// converted join builds on its subquery and its dynamic filter reaches only the outer rows. This
+/// makes the choice DuckDB could not: when the outer side is the small, filtered one, build on it
+/// (RIGHT_SEMI or RIGHT_ANTI) so that its keys filter the subquery's scans. Returns whether the
+/// join was flipped.
+bool build_on_small_outer_side(duckdb::ClientContext& context, duckdb::LogicalComparisonJoin& join)
+{
+  // Publication is the flip's only gain, and a right-family join needs these settings for it.
+  if (!right_family_publication_enabled(*duckdb::query_operator_options(context))) return false;
+  if (!conditions_allow_outer_build(join)) return false;
+
+  auto& outer    = *join.children[0];
+  auto& subquery = *join.children[1];
+  // A CTE read on the outer side marks the delim rewrite's join-back. Its subquery is already
+  // restricted by the CTE's keys, and target discovery does not descend through a right-family
+  // join, so a flip would hide the outer-row read from the joins above.
+  if (reads_cte(outer)) return false;
+  if (!build_subtree_is_filtering(outer) && !build_subtree_has_filtering_join(outer)) return false;
+
+  auto const outer_rows    = outer.EstimateCardinality(context);
+  auto const subquery_rows = subquery.EstimateCardinality(context);
+  if (outer_rows > subquery_rows / outer_build_ratio) return false;
+
+  // The steps of DuckDB's FlipChildren (build_probe_side_optimizer.cpp), which is not exported.
+  // A SEMI or ANTI join emits its left child through the left projection map and the RIGHT form
+  // emits its right child through the right one, so the join's output bindings stay the same.
+  std::swap(join.children[0], join.children[1]);
+  join.join_type = duckdb::InverseJoinType(join.join_type);
+  for (auto& cond : join.conditions) {
+    cond = duckdb::JoinCondition(cond.RightReference()->Copy(),
+                                 cond.LeftReference()->Copy(),
+                                 duckdb::FlipComparisonExpression(cond.GetComparisonType()));
+  }
+  std::swap(join.left_projection_map, join.right_projection_map);
+
+  SIRIUS_LOG_INFO(
+    "[mark_join_conversion] Building a converted {} join on its outer side (outer est {} rows, "
+    "subquery est {} rows).",
+    duckdb::JoinTypeToString(join.join_type),
+    outer_rows,
+    subquery_rows);
+  return true;
 }
 
 struct ancestor_info {
@@ -205,7 +297,11 @@ struct converter {
 
     join.join_type = to_anti ? duckdb::JoinType::ANTI : duckdb::JoinType::SEMI;
     filter.expressions.erase(filter.expressions.begin() + static_cast<std::ptrdiff_t>(found));
-    if (!to_anti) simplify_null_safe_semi_conditions(context, join);
+    // A flipped join keeps its keys as they are: simplifying key by key could leave a mix of
+    // plain and null-safe equalities, and a right-family join publishes null-safe keys too.
+    if (!build_on_small_outer_side(context, join) && !to_anti) {
+      simplify_null_safe_semi_conditions(context, join);
+    }
     ++converted;
 
     if (filter.expressions.empty()) {

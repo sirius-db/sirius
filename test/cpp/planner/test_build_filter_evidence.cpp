@@ -20,6 +20,7 @@
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
+#include "sirius_config.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/enum_util.hpp>
@@ -260,6 +261,21 @@ TEST_CASE("a semi or anti join carries join evidence", "[dynamic_filter][evidenc
     auto const outer = make_join_over(make_get(), make_projection_over(make_typed_join(join_type)));
     REQUIRE(build_subtree_has_filtering_join(*outer));
   }
+}
+
+TEST_CASE("a right-family join publishes only with filters, accumulation and a Bloom budget",
+          "[dynamic_filter][evidence]")
+{
+  sirius::operator_params params;
+  params.enable_dynamic_filter                 = true;
+  params.enable_dynamic_filter_multi_partition = true;
+  REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() > 0);
+  CHECK(sirius::planner::right_family_publication_enabled(params));
+
+  SECTION("dynamic filters off") { params.enable_dynamic_filter = false; }
+  SECTION("Bloom accumulation off") { params.enable_dynamic_filter_multi_partition = false; }
+  SECTION("no Bloom budget") { params.scan_task_batch_size = 0; }
+  CHECK_FALSE(sirius::planner::right_family_publication_enabled(params));
 }
 
 TEST_CASE("joins that can keep every row carry no join evidence", "[dynamic_filter][evidence]")

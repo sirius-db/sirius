@@ -660,8 +660,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     bool const discovery_runs =
       build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
       !gpu_spaces.empty() && !host_spaces.empty() &&
-      (!needs_early_publication || (op_params.enable_dynamic_filter_multi_partition &&
-                                    op_params.max_dynamic_filter_bloom_bytes_per_gpu() > 0));
+      (!needs_early_publication || right_family_publication_enabled(op_params));
     if (discovery_runs) {
       bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
