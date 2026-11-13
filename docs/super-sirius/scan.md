@@ -719,8 +719,12 @@ repository/task spilling they use `reclaim_mode::idle`; only if a known byte tar
 unmet after dispatched spills settle do they use `reclaim_mode::forced`. Predicate-only
 requests use an unbounded deficit, still capped at releasable bytes. Credit is capped at the
 pre-pass releasable snapshot, since only overflow above the reservation relieves HOST
-pressure. Chunks inside the reservation are kept; with no DISK target, a cache with no such
-overflow makes the HOST monitor back off.
+pressure. Chunks inside the reservation are kept.
+
+With no DISK target, the executor skips repository and task spilling, since there is nowhere
+to convert into. A cache with no overflow makes the HOST monitor back off. A monitor request
+that frees nothing, because all overflow is pinned or loading, delays the next one, doubling
+from `monitor_period` up to `max(monitor_period, 1 s)`.
 
 Idle reclaim preserves subscribed chunks; forced reclaim may discard their cached staging
 buffers. Both modes leave pinned readers and in-flight loads untouched. Only the default

@@ -16,12 +16,16 @@
 
 #include "catch.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "memory/topology_index.hpp"
+#include "parallel/task.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "utils/convertible_task_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -182,9 +186,11 @@ struct reclaim_fixture {
     return handle;
   }
 
-  void start(Tier tier                                = Tier::HOST,
-             bool bind_cache                          = true,
-             std::chrono::milliseconds monitor_period = 0ms)
+  void start(
+    Tier tier                                                                     = Tier::HOST,
+    bool bind_cache                                                               = true,
+    std::chrono::milliseconds monitor_period                                      = 0ms,
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* task_queue = nullptr)
   {
     auto* space = sirius::scan_test_utils::get_space(*memory, tier);
     REQUIRE(space != nullptr);
@@ -192,7 +198,7 @@ struct reclaim_fixture {
       .thread_pool    = {.num_threads = 1, .thread_name_prefix = "cache_reclaim"},
       .monitor_period = monitor_period};
     executor = std::make_unique<downgrade_executor>(
-      lifecycle, config, repositories, space->get_id(), space, *memory);
+      lifecycle, config, repositories, space->get_id(), space, *memory, task_queue);
     if (bind_cache) { executor->set_fs_cache(&fs_cache()); }
     executor->start();
   }
@@ -217,6 +223,48 @@ void dispose_and_wait(reclaim_fixture& fixture, cache::cache_handle& handle)
   }
   REQUIRE(unsubscribed());
 }
+
+template <typename Predicate>
+bool wait_until(Predicate predicate, std::chrono::milliseconds timeout = 5s)
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= deadline) { return false; }
+    std::this_thread::sleep_for(1ms);
+  }
+  return true;
+}
+
+/// Holds chunks in `loading`, as an in-flight read would: no reclaim mode may take them.
+class loading_hold {
+ public:
+  explicit loading_hold(cache::cache_handle const& handle)
+  {
+    for (auto* chunk : *handle.chunks()) {
+      cache::chunk_fill fill{};
+      if (!chunk->state.take_loading(fill)) {
+        // The destructor does not run for a throwing constructor: revert what was taken.
+        release();
+        FAIL("a prepared chunk could not be moved to loading");
+      }
+      _chunks.push_back(chunk);
+    }
+  }
+  ~loading_hold() { release(); }
+  loading_hold(loading_hold const&)            = delete;
+  loading_hold& operator=(loading_hold const&) = delete;
+
+  void release()
+  {
+    for (auto* chunk : _chunks) {
+      [[maybe_unused]] bool const reverted = chunk->state.mark_load_failed();
+    }
+    _chunks.clear();
+  }
+
+ private:
+  std::vector<cache::cached_chunk*> _chunks;
+};
 
 // Merely sizing this candidate proves the repository path was entered. No converter is
 // needed: an idle cache hit must satisfy the request before any repository work is planned.
@@ -371,6 +419,78 @@ TEST_CASE("HOST downgrade satisfies a target from idle cache before repositories
   for (auto* chunk : *live.chunks()) {
     CHECK(chunk->state.get_state() == cache::chunk_state::allocated);
   }
+}
+
+TEST_CASE("HOST downgrade without DISK skips repository and task spills",
+          "[downgrade_executor][fs_cache]")
+{
+  std::atomic<std::size_t> repository_reads{0};
+  std::atomic<std::size_t> task_reads{0};
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> tasks{
+    sirius::test::flat_key_extractor()};
+  reclaim_fixture fixture;
+  auto* host = sirius::scan_test_utils::get_space(*fixture.memory, Tier::HOST);
+  REQUIRE(host != nullptr);
+  REQUIRE(fixture.memory->get_memory_spaces_for_tier(Tier::DISK).empty());
+
+  auto const query_id = sirius::make_query_id(1);
+  fixture.lifecycle.open_query(query_id);
+  auto& manager         = *fixture.repositories.create_for_query(query_id);
+  auto repository_batch = cucascade::data_batch::make(
+    1, std::make_unique<counted_host_representation>(*host, repository_reads));
+  auto repository = std::make_unique<cucascade::shared_data_repository>();
+  repository->add_data_batch(repository_batch);
+  manager.add_new_repository(1, "out", std::move(repository));
+
+  for (std::uint64_t id : {2, 3}) {
+    auto batch = cucascade::data_batch::make(
+      id, std::make_unique<counted_host_representation>(*host, task_reads));
+    REQUIRE(tasks.push(sirius::test::make_test_gpu_task(id, {batch})));
+  }
+
+  auto const reads_before = std::pair{repository_reads.load(), task_reads.load()};
+  fixture.start(Tier::HOST, /*bind_cache=*/false, 0ms, &tasks);
+  CHECK(fixture.executor->request_free_memory_and_wait(1) == 0);
+  // Sizing a candidate would prove TIER 1 or TIER 2 ran with nothing to convert into; an
+  // extracted task would also have been requeued behind its sibling.
+  CHECK(repository_reads.load() == reads_before.first);
+  CHECK(task_reads.load() == reads_before.second);
+  CHECK(tasks.size() == 2);
+  for (std::uint64_t id : {2, 3}) {
+    auto task = tasks.try_pop();
+    REQUIRE(task.has_value());
+    CHECK((*task)->get_task_id() == id);
+  }
+  fixture.executor->stop();
+}
+
+TEST_CASE("HOST monitor without DISK backs off while the cache cannot release anything",
+          "[downgrade_executor][fs_cache]")
+{
+  reclaim_fixture fixture{0};
+  auto live   = fixture.prepare(0, 4);
+  auto& cache = fixture.fs_cache();
+  REQUIRE(cache.releasable_bytes() == cache.claimed_bytes());
+  auto* host = sirius::scan_test_utils::get_space(*fixture.memory, Tier::HOST);
+  REQUIRE(host != nullptr);
+  auto pressure = host->make_reservation_upto(host->get_max_memory());
+  REQUIRE(host->should_downgrade_memory());
+
+  loading_hold hold{live};
+  auto const claimed = cache.claimed_bytes();
+  fixture.start(Tier::HOST, true, 1ms);
+  // Without back-off the 1 ms monitor re-fires about 200 times in this window. With it, the
+  // intervals double from 1 ms, so about 8 requests fit.
+  std::this_thread::sleep_for(200ms);
+  auto const stalled_requests = fixture.executor->monitor_requests_issued_for_testing();
+  CHECK(stalled_requests >= 1);
+  CHECK(stalled_requests <= 20);
+  CHECK(cache.claimed_bytes() == claimed);
+
+  // Back-off is a timer, not a latch: once the reads finish the monitor reclaims within the cap.
+  hold.release();
+  CHECK(wait_until([&] { return cache.claimed_bytes() == 0; }));
+  pressure.reset();
 }
 
 TEST_CASE("HOST downgrade force-reclaims only an unmet byte target",

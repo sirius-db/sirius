@@ -240,6 +240,8 @@ class downgrade_executor {
   std::thread _processing_thread;
   std::thread _monitor_thread;
   std::atomic<bool> _monitor_request_enqueued{false};
+  // Whether the last completed monitor request made no progress; read by the monitor's back-off.
+  std::atomic<bool> _monitor_request_stalled{false};
   std::atomic<bool> _running{false};
   std::atomic<bool> _paused{false};
   // Serializes lifecycle changes and cache rebinding, never acquired by executor threads.
