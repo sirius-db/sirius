@@ -37,11 +37,20 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
+#include "expression/ast/cast.hpp"
+#include "expression/ast/coalesce.hpp"
+#include "expression/ast/constant.hpp"
+#include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/cudf_sort_order.hpp"
+#include "op/discard_copy_function.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -54,6 +63,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_discard_sink.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
@@ -2488,6 +2498,89 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   return plan;
 }
 
+namespace {
+
+//! The order check of a discard sink placed on @p root: the ORDER BY keys as columns of @p root's
+//! output. The check is left off (and the reason logged) when @p root is not an ORDER BY, or a
+//! key is an expression or a column the ORDER BY does not output.
+sirius::op::discard_sink_options discard_order_check(
+  const sirius::op::sirius_physical_operator& root)
+{
+  if (root.type != sirius::op::SiriusPhysicalOperatorType::ORDER_BY) {
+    SIRIUS_LOG_DEBUG(
+      "sirius_discard: check_order disabled, the query's root is {} and not ORDER BY",
+      sirius::op::SiriusPhysicalOperatorToString(root.type));
+    return {};
+  }
+  auto const& order = root.Cast<sirius::op::sirius_physical_order>();
+  sirius::op::discard_sink_options options;
+  for (auto const& key : order.orders) {
+    std::optional<std::size_t> output_column;
+    if (key.expression->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      auto const input_column = key.expression->Cast<duckdb::BoundReferenceExpression>().Index();
+      if (order.projections.empty()) {
+        output_column = input_column;
+      } else {
+        auto const it = std::find(order.projections.begin(), order.projections.end(), input_column);
+        if (it != order.projections.end()) { output_column = it - order.projections.begin(); }
+      }
+    }
+    if (!output_column) {
+      SIRIUS_LOG_DEBUG(
+        "sirius_discard: check_order disabled, ORDER BY key {} is not a column of the output",
+        key.expression->ToString());
+      return {};
+    }
+    options.key_columns.push_back(static_cast<cudf::size_type>(*output_column));
+    options.column_order.push_back(sirius::op::to_cudf_order(key.type));
+    options.null_precedence.push_back(sirius::op::to_cudf_null_order(key.type, key.null_order));
+  }
+  options.check_order = !options.key_columns.empty();
+  return options;
+}
+
+//! `COPY (query) TO … (FORMAT sirius_discard)`: @p query → DISCARD_SINK → SUM of the per-batch
+//! row counts → the COPY result, one BIGINT row.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_discard_copy(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> query, bool check_order)
+{
+  auto const bigint  = sirius::from_duckdb(duckdb::LogicalType::BIGINT);
+  auto const hugeint = sirius::from_duckdb(duckdb::LogicalType::HUGEINT);
+
+  auto sink = duckdb::make_uniq<sirius::op::sirius_physical_discard_sink>(
+    query->types,
+    check_order ? discard_order_check(*query) : sirius::op::discard_sink_options{},
+    query->estimated_cardinality);
+  sink->children.push_back(std::move(query));
+
+  // SUM(BIGINT) is HUGEINT, as DuckDB binds it.
+  std::vector<std::unique_ptr<sirius::ast::node>> count;
+  count.push_back(std::make_unique<sirius::ast::node>(sirius::ast::reference{0, bigint}));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
+  aggregates.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::aggregate{sirius::aggregate_id::sum, std::move(count), hugeint, false}));
+  auto sum = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate>(
+    duckdb::vector<sirius::logical_type>{hugeint},
+    std::move(aggregates),
+    1,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  sum->children.push_back(std::move(sink));
+
+  // COPY returns a BIGINT, and 0 for a query without rows, where the SUM is NULL.
+  std::vector<std::unique_ptr<sirius::ast::node>> alternatives;
+  alternatives.push_back(std::make_unique<sirius::ast::node>(sirius::ast::cast{
+    std::make_unique<sirius::ast::node>(sirius::ast::reference{0, hugeint}), bigint}));
+  alternatives.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::constant{sirius::value{std::int64_t{0}}, bigint}));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+  select_list.push_back(
+    std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(alternatives), bigint}));
+  return push_projection(
+    std::move(sum), duckdb::vector<sirius::logical_type>{bigint}, std::move(select_list), 1);
+}
+
+}  // namespace
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
 {
@@ -2542,10 +2635,19 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
       plan = create_plan(op.Cast<duckdb::LogicalTopN>());
       break;
-    case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE:
-      throw duckdb::NotImplementedException("Copy to file not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalCopyToFile>());
+    case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE: {
+      // Only the discard format runs on the GPU; every real file format stays on DuckDB.
+      auto& copy = op.Cast<duckdb::LogicalCopyToFile>();
+      if (!(copy.function.name == sirius::op::kDiscardCopyFormat) || !copy.bind_data ||
+          op.children.size() != 1 || op.types.size() != 1 ||
+          op.types[0].id() != duckdb::LogicalTypeId::BIGINT) {
+        throw duckdb::NotImplementedException("Copy to file not supported");
+      }
+      plan =
+        plan_discard_copy(create_plan(*op.children[0]),
+                          copy.bind_data->Cast<sirius::op::discard_copy_bind_data>().check_order);
       break;
+    }
     case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN:
       plan = create_plan(op.Cast<duckdb::LogicalDummyScan>());
       break;

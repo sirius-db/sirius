@@ -231,7 +231,11 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
                   const std::shared_ptr<sirius_pipeline>& src,
                   const std::shared_ptr<sirius_pipeline>& dst) {
     auto const port_id = consumer.input_port_for(*source_op);
-    auto const barrier = consumer.input_barrier_for(*source_op);
+    // The discard sink drops each batch as it arrives, so its input streams: under a FULL barrier
+    // the whole result would wait in the sink's repository until the producer finishes.
+    auto const barrier = consumer.type == op::SiriusPhysicalOperatorType::DISCARD_SINK
+                           ? op::MemoryBarrierType::PIPELINE
+                           : consumer.input_barrier_for(*source_op);
     repository_wirings_.push_back({port_id, barrier, source_op, src, dst});
   };
 
