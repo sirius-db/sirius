@@ -66,6 +66,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! Whether each partition is released as one group once the source pipeline finishes.
   [[nodiscard]] bool concat_all() const { return _concat_all; }
 
+  //! Group-size target when the CONCAT does not concatenate whole partitions.
+  [[nodiscard]] uint64_t concat_batch_bytes() const noexcept { return _concat_batch_bytes; }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 

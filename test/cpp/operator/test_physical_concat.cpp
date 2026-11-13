@@ -16,9 +16,12 @@
 
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/partition/build_fold.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "operator/partition_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -35,10 +38,12 @@
 #include <pipeline/sirius_pipeline.hpp>
 
 #include <atomic>
+#include <format>
 #include <limits>
 #include <mutex>
 #include <numeric>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -102,8 +107,9 @@ auto& get_shared_memory_manager()
 hash_join_test_fixture create_test_hash_join(
   duckdb::JoinType join_type,
   duckdb::vector<duckdb::LogicalType> output_types,
-  uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES,
-  bool mixed_filter             = false)
+  uint64_t hash_partition_bytes       = sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+  bool mixed_filter                   = false,
+  uint64_t max_build_hash_table_bytes = sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES)
 {
   hash_join_test_fixture fixture;
 
@@ -158,7 +164,7 @@ hash_join_test_fixture create_test_hash_join(
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (empty = all)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,                                                            // estimated_cardinality
-    sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    max_build_hash_table_bytes,
     std::move(filter_plan),
     hash_partition_bytes);
 
@@ -1794,4 +1800,132 @@ TEST_CASE("sirius_physical_concat counts compressed batches at their decoded siz
   auto hint = concat_op.get_next_task_hint();
   REQUIRE(hint.has_value());
   CHECK(hint->hint == TaskCreationHint::READY);
+}
+
+TEST_CASE("a single-partition build already forms one CONCAT group at the default sizes",
+          "[partition][build_fold]")
+{
+  // A two-input exchange sizes the join from the complete, measured build, and the CONCAT groups
+  // the same decoded bytes. With the CONCAT target equal to the partition target, a build small
+  // enough for one partition is therefore one group whether or not it folds.
+  auto const defaults = GENERATE(sirius::operator_params{},
+                                 sirius::operator_params::with_batch_size(512ULL * 1024 * 1024));
+  REQUIRE(defaults.concat_batch_bytes == defaults.hash_partition_bytes);
+  auto const target = defaults.hash_partition_bytes;
+  auto const layout = GENERATE_COPY(values<std::vector<uint64_t>>({
+    {1},
+    {target},
+    {target - 1, 1},
+    {target / 2, target - target / 2},
+    {target / 3, target / 3, target - 2 * (target / 3)},
+    std::vector<uint64_t>(64, target / 64),
+  }));
+  auto const total  = std::accumulate(layout.begin(), layout.end(), uint64_t{0});
+  REQUIRE(natural_num_partitions(total, target, 1) == 1);
+  // One more byte would take a second partition.
+  CHECK(natural_num_partitions(target + 1, target, 1) == 2);
+
+  auto const hosts = get_shared_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
+  REQUIRE_FALSE(hosts.empty());
+  auto* host = const_cast<memory_space*>(hosts.front());
+  sirius_physical_concat concat(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    0,
+    false,
+    defaults.concat_batch_bytes);
+  concat.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  cucascade::shared_data_repository repo;
+  // Metadata-only batches: the group is planned and claimed, never executed.
+  std::vector<std::shared_ptr<data_batch>> batches;
+  for (auto const bytes : layout) {
+    batches.push_back(
+      data_batch::make(sirius::get_next_batch_id(),
+                       std::make_unique<compressed_size_representation>(*host, bytes, bytes)));
+  }
+  auto const group = claim_concat_input(concat, repo, batches, 0);
+  CHECK(dynamic_cast<partitioned_operator_data&>(*group).get_data_batches() == batches);
+  CHECK(repo.total_size() == 0);
+  CHECK(concat.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("the build fold policy decides whether a single-partition build CONCAT folds",
+          "[physical_partition][build_fold]")
+{
+  auto const policy = GENERATE(
+    build_fold_policy::legacy_filter_coupled, build_fold_policy::never, build_fold_policy::bounded);
+  bool const mixed_filter = GENERATE(false, true);
+  // A zero BUILD_PROBE table budget keeps an INNER join STANDARD; the default admits BUILD_PROBE,
+  // whose fold does not consult the rule. A mixed join never runs BUILD_PROBE.
+  uint64_t const table_budget =
+    GENERATE(uint64_t{0}, sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+  bool const build_probe = !mixed_filter && table_budget > 0;
+  INFO("policy=" << to_string(policy) << " mixed_filter=" << mixed_filter
+                 << " table_budget=" << table_budget);
+  auto* space                          = get_shared_mem_space();
+  auto fixture                         = create_test_hash_join(duckdb::JoinType::INNER,
+                                                               {duckdb::LogicalType::INTEGER},
+                                       sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+                                       mixed_filter,
+                                       table_budget);
+  fixture.hash_join->build_fold_policy = policy;
+  fixture.hash_join->set_active_gpu_ids({space->get_device_id()});
+  REQUIRE(fixture.hash_join->publishes_dynamic_filters() == mixed_filter);
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_partition build(
+    types, 4, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, true));
+  sirius_physical_partition probe(
+    types, 9, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
+  sirius_physical_concat build_concat(types, 4, false, 1);
+  sirius_physical_concat probe_concat(types, 9, false, 1);
+  build.add_next_port_after_sink({&build_concat, "input"});
+  probe.add_next_port_after_sink({&probe_concat, "input"});
+  cucascade::shared_data_repository build_repo;
+  cucascade::shared_data_repository probe_repo;
+  auto attach = [](sirius_physical_operator& op, cucascade::shared_data_repository& repo) {
+    auto port  = std::make_unique<sirius_physical_operator::port>();
+    port->type = MemoryBarrierType::FULL;
+    port->repo = &repo;
+    op.add_port("default", std::move(port));
+  };
+  attach(build, build_repo);
+  attach(probe, probe_repo);
+  // Two INT64 columns: 16 bytes per row, the per-row hash-table estimate the bounded rule needs.
+  std::vector<int64_t> const keys{0, 1, 2, 3};
+  build_repo.add_data_batch(
+    make_two_column_batch<int64_t, int64_t>(*space, keys, keys, cudf::type_id::INT64), 0);
+  probe_repo.add_data_batch(make_int32_batch(*space, 9), 0);
+  size_t id = 100;
+  number_operator_tree(build, id);
+  number_operator_tree(probe, id);
+  bind_partition_inputs(*fixture.hash_join, build, probe, &build_concat);
+  sirius::test::scoped_recording_log_sink log{"debug"};
+  REQUIRE(build.get_next_task_input_data() != nullptr);
+
+  std::vector<std::string> decisions;
+  for (auto const& record : log.records()) {
+    if (record.message.starts_with("[build_fold] ")) { decisions.push_back(record.message); }
+  }
+  CHECK(fixture.hash_join->is_build_probe_mode() == build_probe);
+  if (build_probe) {
+    CHECK(build_concat.concat_all());
+    CHECK(decisions.empty());
+    return;
+  }
+  bool const expected = policy == build_fold_policy::bounded ||
+                        (policy == build_fold_policy::legacy_filter_coupled && mixed_filter);
+  CHECK(build_concat.concat_all() == expected);
+  REQUIRE(decisions.size() == 1);
+  auto const& line = decisions.front();
+  INFO(line);
+  CHECK_THAT(
+    line,
+    Catch::Matchers::ContainsSubstring(std::format("join={} policy={} mode={} rows=4 ",
+                                                   fixture.hash_join->get_operator_id(),
+                                                   to_string(policy),
+                                                   mixed_filter ? "MIXED_JOIN" : "STANDARD")) &&
+      Catch::Matchers::ContainsSubstring(" concat_batch_bytes=1 ") &&
+      Catch::Matchers::ContainsSubstring(
+        std::format(" publishes_filters={} fold={}", mixed_filter, expected)));
 }
