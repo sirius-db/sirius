@@ -1,0 +1,52 @@
+[workstation] syncing /home/felipe/sirius/.worktrees/ws-d7931a22-3ecb-4bcc-8514-34bfa14af105 -> felipe@192.168.0.248:/mnt/disk_2/sirius-scalable-sort
+[workstation] building (release + extension)
+[workstation] running: build/release/test/cpp/sirius_unittest \[copy_discard\]\,\[merge_sort_stats_log\]\,\[merger_stats\]\,\[physical_discard_sink\]\,\[discard_copy_plan\]\,\[discard_copy_function\] 
+Filters: [copy_discard],[merge_sort_stats_log],[merger_stats],[physical_discard_sink],[discard_copy_plan],[discard_copy_function]
+Randomness seeded to: 4286001837
+Running: sirius_discard check_order is off when the ORDER BY keys are not output columns
+Running: windowed_merger leaves the new counters untouched when run() throws
+Running: sirius_discard COPY does not accumulate the query's output on the device
+Running: sirius_physical_discard_sink counts a HOST batch without converting it
+Running: sirius_physical_discard_sink order check compares timestamp and decimal keys
+Running: sirius_discard leaves an existing target alone
+Running: sirius_discard function and registration
+Running: sirius_discard bind data
+Running: sirius_physical_discard_sink order check honours the null placement
+Running: sirius_discard check_order carries the ORDER BY keys into the sink
+Running: sirius_physical_discard_sink order check covers the seam between batches of one task
+Running: sirius_physical_discard_sink keeps no reference to its input
+Running: format_merge_sort_stats writes every counter in the documented order
+Running: sirius_physical_discard_sink rejects order options that do not match the keys
+Running: sirius_physical_discard_sink leaves tasks without a position out of the cross-task check
+Running: sirius_discard COPY of a query without ORDER BY plans with the order check off
+Running: sirius_physical_discard_sink order check compares string keys
+Running: sirius_discard returns the row count and creates no file
+Running: sirius_physical_discard_sink counts rows and bytes and emits one count row per task
+Running: merge sort in automatic mode logs one line for one-shot and windowed partitions
+Running: sirius_discard options
+Running: COPY to a file format still declines to DuckDB
+Running: sirius_physical_discard_sink order check compares several keys in turn
+Running: sirius_physical_discard_sink order check counts a shuffled batch
+Running: sirius_physical_discard_sink logs its summary once even without an order check
+Running: windowed_merger reads no refill bytes from GPU runs and bounds the rows of a round
+Running: sirius_discard COPY of an ORDER BY plans MERGE_SORT into a streaming discard sink
+Running: sirius_physical_discard_sink order check honours descending keys
+Running: sirius_physical_discard_sink without order check ignores unsorted input
+Running: windowed_merger splits its refill bytes by the tier and representation read
+Running: sirius_discard COPY with check_order reports no order violation
+Running: merge sort counts the window shrinks of its tasks retried after an OOM
+Running: sirius_discard COPY over a table matches the CPU copy function
+Running: sirius_physical_discard_sink order check sorts NaN after every float, as cudf does
+Running: a COPY to another format stays on DuckDB
+Running: sirius_physical_discard_sink order check accepts sorted input
+Running: sirius_physical_discard_sink compares tasks that share a position in arrival order
+Running: accumulate sums the counters and keeps the round bounds
+Running: sirius_discard COPY returns the row count of an ORDER BY over generated data
+Running: one-shot merge sort logs one statistics line when its last task commits
+Running: sirius_discard COPY plan returns the query's row count
+Running: sirius_physical_discard_sink order check counts batches out of order across positions
+Running: windowed merge sort logs one statistics line when its last task commits
+===============================================================================
+All tests passed (2958 assertions in 43 test cases)
+
+suite_rc=0

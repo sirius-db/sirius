@@ -1,0 +1,6 @@
+{
+  "status": "error",
+  "error": "Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 202: OOM at operator MERGE_SORT (index 0)",
+  "wall_s": 8.8303234220366,
+  "load_s": 0.43849123298423365
+}

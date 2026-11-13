@@ -1,0 +1,84 @@
+[workstation] syncing /home/felipe/sirius/.worktrees/ws-d7931a22-3ecb-4bcc-8514-34bfa14af105 -> felipe@192.168.0.248:/mnt/disk_2/sirius-scalable-sort
+[workstation] building (release + extension)
+[workstation] running: python test/sort_performance/sort_merge_bench.py --gpu-limit-bytes 4294967296 --scale 3 --device 0 --validate --out-dir /mnt/disk_2/sort_merge_bench/smoke 
+[00:02:01.645] GPU limit 4294967296 bytes (4.00 GiB), data 3x the limit, GPU index 0
+[00:02:01.645] Matrix: 5 datasets x 2 modes x 2 compression x 1 repeat = 20 runs
+[00:02:01.645]   uniform-1key: 101 x 8000000 rows = 808000000 rows, 16 bytes/row, 12.04 GiB
+[00:02:01.645]   zipf-1key: 101 x 8000000 rows = 808000000 rows, 16 bytes/row, 12.04 GiB
+[00:02:01.645]   normal-multikey: 58 x 8000000 rows = 464000000 rows, 28 bytes/row, 12.10 GiB
+[00:02:01.645]   few_distinct-strings: 73 x 8000000 rows = 584000000 rows, 22 bytes/row, 11.97 GiB
+[00:02:01.645]   sequential: 101 x 8000000 rows = 808000000 rows, 16 bytes/row, 12.04 GiB
+[00:02:01.645]   [1/20] uniform-1key  mode=one_shot  compression=false  repeat=1
+[00:02:01.645]   [2/20] uniform-1key  mode=one_shot  compression=true  repeat=1
+[00:02:01.645]   [3/20] uniform-1key  mode=windowed  compression=false  repeat=1
+[00:02:01.645]   [4/20] uniform-1key  mode=windowed  compression=true  repeat=1
+[00:02:01.645]   [5/20] zipf-1key  mode=one_shot  compression=false  repeat=1
+[00:02:01.645]   [6/20] zipf-1key  mode=one_shot  compression=true  repeat=1
+[00:02:01.645]   [7/20] zipf-1key  mode=windowed  compression=false  repeat=1
+[00:02:01.645]   [8/20] zipf-1key  mode=windowed  compression=true  repeat=1
+[00:02:01.645]   [9/20] normal-multikey  mode=one_shot  compression=false  repeat=1
+[00:02:01.645]   [10/20] normal-multikey  mode=one_shot  compression=true  repeat=1
+[00:02:01.645]   [11/20] normal-multikey  mode=windowed  compression=false  repeat=1
+[00:02:01.645]   [12/20] normal-multikey  mode=windowed  compression=true  repeat=1
+[00:02:01.645]   [13/20] few_distinct-strings  mode=one_shot  compression=false  repeat=1
+[00:02:01.645]   [14/20] few_distinct-strings  mode=one_shot  compression=true  repeat=1
+[00:02:01.645]   [15/20] few_distinct-strings  mode=windowed  compression=false  repeat=1
+[00:02:01.645]   [16/20] few_distinct-strings  mode=windowed  compression=true  repeat=1
+[00:02:01.645]   [17/20] sequential  mode=one_shot  compression=false  repeat=1
+[00:02:01.645]   [18/20] sequential  mode=one_shot  compression=true  repeat=1
+[00:02:01.646]   [19/20] sequential  mode=windowed  compression=false  repeat=1
+[00:02:01.646]   [20/20] sequential  mode=windowed  compression=true  repeat=1
+[00:02:01.647] Results: /mnt/disk_2/sort_merge_bench/smoke
+[00:02:01.647] --- [1/20] uniform-1key__one_shot__uncompressed__r1 ---
+[00:02:02.821]   error in 0.0s, peak GPU 4696 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:02.822] --- [2/20] uniform-1key__one_shot__compressed__r1 ---
+[00:02:03.665]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:03.665] --- [3/20] uniform-1key__windowed__uncompressed__r1 ---
+[00:02:04.508]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:04.508] --- [4/20] uniform-1key__windowed__compressed__r1 ---
+[00:02:05.352]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:05.353] --- [5/20] zipf-1key__one_shot__uncompressed__r1 ---
+[00:02:06.247]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:06.247] --- [6/20] zipf-1key__one_shot__compressed__r1 ---
+[00:02:07.090]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:07.090] --- [7/20] zipf-1key__windowed__uncompressed__r1 ---
+[00:02:07.985]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:07.985] --- [8/20] zipf-1key__windowed__compressed__r1 ---
+[00:02:08.877]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:08.878] --- [9/20] normal-multikey__one_shot__uncompressed__r1 ---
+[00:02:09.721]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:09.721] --- [10/20] normal-multikey__one_shot__compressed__r1 ---
+[00:02:10.563]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:10.564] --- [11/20] normal-multikey__windowed__uncompressed__r1 ---
+[00:02:11.456]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:11.457] --- [12/20] normal-multikey__windowed__compressed__r1 ---
+[00:02:12.299]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:12.300] --- [13/20] few_distinct-strings__one_shot__uncompressed__r1 ---
+[00:02:13.192]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:13.193] --- [14/20] few_distinct-strings__one_shot__compressed__r1 ---
+[00:02:14.036]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:14.036] --- [15/20] few_distinct-strings__windowed__uncompressed__r1 ---
+[00:02:14.929]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:14.930] --- [16/20] few_distinct-strings__windowed__compressed__r1 ---
+[00:02:15.773]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:15.774] --- [17/20] sequential__one_shot__uncompressed__r1 ---
+[00:02:16.617]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:16.618] --- [18/20] sequential__one_shot__compressed__r1 ---
+[00:02:17.460]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:17.461] --- [19/20] sequential__windowed__uncompressed__r1 ---
+[00:02:18.304]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:18.304] --- [20/20] sequential__windowed__compressed__r1 ---
+[00:02:19.146]   error in 0.0s, peak GPU 4682 MiB: InvalidInputException: Invalid Input Error: sirius_generate requires Sirius GPU execution (SET gpu_execution = true)
+[00:02:19.147] Wrote /mnt/disk_2/sort_merge_bench/smoke/results.csv
+[00:02:19.147] Wrote /mnt/disk_2/sort_merge_bench/smoke/results.md
+[00:02:19.147] FAILED: uniform-1key mode=windowed compression=false repeat=1: error
+[00:02:19.147] FAILED: uniform-1key mode=windowed compression=true repeat=1: error
+[00:02:19.147] FAILED: zipf-1key mode=windowed compression=false repeat=1: error
+[00:02:19.147] FAILED: zipf-1key mode=windowed compression=true repeat=1: error
+[00:02:19.147] FAILED: normal-multikey mode=windowed compression=false repeat=1: error
+[00:02:19.147] FAILED: normal-multikey mode=windowed compression=true repeat=1: error
+[00:02:19.147] FAILED: few_distinct-strings mode=windowed compression=false repeat=1: error
+[00:02:19.147] FAILED: few_distinct-strings mode=windowed compression=true repeat=1: error
+[00:02:19.147] FAILED: sequential mode=windowed compression=false repeat=1: error
+[00:02:19.147] FAILED: sequential mode=windowed compression=true repeat=1: error
+suite_rc=1

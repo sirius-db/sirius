@@ -1,0 +1,200 @@
+[2026-11-13 00:08:28.987] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:28.994] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:28.994] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:31.064] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 860886670 bytes (monitor request #11)
+[2026-11-13 00:08:31.116] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 44 batches, 866502960 bytes in 52.32 ms (15795.6 MB/s), satisfied=true | to_host: 44/866502960 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:32.392] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 878188483 bytes (monitor request #12)
+[2026-11-13 00:08:32.442] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 45 batches, 886459360 bytes in 50.80 ms (16640.7 MB/s), satisfied=true | to_host: 45/886459360 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:33.761] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 875576530 bytes (monitor request #13)
+[2026-11-13 00:08:33.814] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 45 batches, 877243152 bytes in 52.77 ms (15853.5 MB/s), satisfied=true | to_host: 45/877243152 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:35.039] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 862699723 bytes (monitor request #14)
+[2026-11-13 00:08:35.090] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 44 batches, 866910560 bytes in 50.72 ms (16299.3 MB/s), satisfied=true | to_host: 44/866910560 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:36.368] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 861036652 bytes (monitor request #15)
+[2026-11-13 00:08:36.419] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 44 batches, 866899056 bytes in 51.24 ms (16135.0 MB/s), satisfied=true | to_host: 44/866899056 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:38.311] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 863754856 bytes (monitor request #16)
+[2026-11-13 00:08:38.361] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 43 batches, 868569504 bytes in 50.01 ms (16562.6 MB/s), satisfied=true | to_host: 43/868569504 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:40.657] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 885967593 bytes (monitor request #17)
+[2026-11-13 00:08:40.701] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 34 batches, 893257552 bytes in 44.85 ms (18993.1 MB/s), satisfied=true | to_host: 34/893257552 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:43.283] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 863582886 bytes (monitor request #18)
+[2026-11-13 00:08:43.312] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 866833264 bytes in 29.49 ms (28034.1 MB/s), satisfied=true | to_host: 22/866833264 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:45.275] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 862746973 bytes (monitor request #19)
+[2026-11-13 00:08:45.305] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 865462560 bytes in 30.01 ms (27500.1 MB/s), satisfied=true | to_host: 22/865462560 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:47.619] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 878033933 bytes (monitor request #20)
+[2026-11-13 00:08:47.650] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 887251728 bytes in 30.22 ms (27997.1 MB/s), satisfied=true | to_host: 22/887251728 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:50.157] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 885671869 bytes (monitor request #21)
+[2026-11-13 00:08:50.188] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 888054032 bytes in 31.34 ms (27021.1 MB/s), satisfied=true | to_host: 22/888054032 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:52.452] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 871335468 bytes (monitor request #22)
+[2026-11-13 00:08:52.468] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:52.483] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 872883184 bytes in 30.98 ms (26869.8 MB/s), satisfied=true | to_host: 22/872883184 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:52.656] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:52.678] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:52.861] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:52.862] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:52.888] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.124] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.124] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.365] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.365] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.565] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.565] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.768] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:53.768] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.059] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.059] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.135] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.267] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.468] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.469] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.710] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.710] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.933] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:54.933] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.002] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.141] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.445] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.445] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.510] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.666] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.666] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:55.667] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:08:58.490] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 895463212 bytes (monitor request #23)
+[2026-11-13 00:08:58.523] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 896473776 bytes in 33.07 ms (25854.7 MB/s), satisfied=true | to_host: 22/896473776 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:08:59.959] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 881835129 bytes (monitor request #24)
+[2026-11-13 00:08:59.992] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 21 batches, 889953664 bytes in 32.51 ms (26109.0 MB/s), satisfied=true | to_host: 21/889953664 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:01.429] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 875837728 bytes (monitor request #25)
+[2026-11-13 00:09:01.456] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 20 batches, 878360480 bytes in 27.43 ms (30534.7 MB/s), satisfied=true | to_host: 20/878360480 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:02.779] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 863293549 bytes (monitor request #26)
+[2026-11-13 00:09:02.811] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 867278960 bytes in 31.92 ms (25910.7 MB/s), satisfied=true | to_host: 22/867278960 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:04.056] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 859565104 bytes (monitor request #27)
+[2026-11-13 00:09:04.088] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 866852288 bytes in 31.70 ms (26078.6 MB/s), satisfied=true | to_host: 22/866852288 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:06.471] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 876577302 bytes (monitor request #28)
+[2026-11-13 00:09:06.503] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 22 batches, 877739232 bytes in 32.42 ms (25819.6 MB/s), satisfied=true | to_host: 22/877739232 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:08.594] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 881628508 bytes (monitor request #29)
+[2026-11-13 00:09:08.628] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 20 batches, 883345776 bytes in 34.16 ms (24664.2 MB/s), satisfied=true | to_host: 20/883345776 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:11.139] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 912376706 bytes (monitor request #30)
+[2026-11-13 00:09:11.173] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 20 batches, 917665936 bytes in 34.21 ms (25585.4 MB/s), satisfied=true | to_host: 20/917665936 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:13.107] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:13.457] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:13.683] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:13.793] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.093] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.093] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.359] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.505] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.505] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.642] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.863] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:14.864] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.077] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.077] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.255] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.255] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.397] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.510] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.779] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.779] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.780] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.927] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:15.928] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:16.130] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:16.345] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:16.684] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:16.887] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:17.080] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:17.251] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:17.356] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:18.455] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 884242536 bytes (monitor request #31)
+[2026-11-13 00:09:18.484] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 16 batches, 885722992 bytes in 28.67 ms (29458.5 MB/s), satisfied=true | to_host: 16/885722992 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:19.773] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 921808131 bytes (monitor request #32)
+[2026-11-13 00:09:19.803] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 18 batches, 928793568 bytes in 29.96 ms (29567.7 MB/s), satisfied=true | to_host: 18/928793568 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:21.424] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 924016439 bytes (monitor request #33)
+[2026-11-13 00:09:21.457] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 18 batches, 933066352 bytes in 32.94 ms (27017.4 MB/s), satisfied=true | to_host: 18/933066352 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:23.427] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 922772927 bytes (monitor request #34)
+[2026-11-13 00:09:23.452] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 17 batches, 933648064 bytes in 24.63 ms (36149.7 MB/s), satisfied=true | to_host: 17/933648064 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:24.773] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:25.116] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:25.117] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:25.468] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:25.564] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:25.864] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:25.912] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:26.163] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:26.491] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:26.626] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:26.774] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:27.196] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:27.196] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:27.541] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:27.542] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:28.317] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 890761352 bytes (monitor request #35)
+[2026-11-13 00:09:28.340] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 14 batches, 894139312 bytes in 22.82 ms (37360.7 MB/s), satisfied=true | to_host: 14/894139312 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 00:09:29.213] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:29.568] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:29.568] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:29.905] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:29.905] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:30.239] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:30.561] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:30.562] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:30.886] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:31.212] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:31.524] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:31.525] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:31.825] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.045] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.045] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.045] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.129] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.193] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.358] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.385] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.467] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.576] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.582] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.678] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.767] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.794] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.887] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:32.961] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.008] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.098] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.154] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.218] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.307] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.345] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.428] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.515] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.534] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.641] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.723] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.724] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.829] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.910] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:33.929] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.011] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.092] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.111] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.191] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.277] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.294] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.378] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.464] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.479] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.564] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.617] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.659] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.734] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.819] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.884] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:34.972] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:35.111] [info] [sirius_physical_merge_sort.cpp:114] [merge_sort][stats] op=4 windowed_partitions=12 one_shot_partitions=0 windowed_tasks=1618 intermediate_tasks=1421 mergers_built=932 rounds=665741 rows_out=4338795730 round_rows_min=5 round_rows_max=71922 refill_rows=2144802018 refill_bytes=34316832288 refill_bytes_host=0 refill_bytes_disk=0 refill_bytes_compressed=34316832288 runs_read_compressed=2342 window_growths=0 compacted_rows=645513203 fallback_conversions=0 shrinks=0
+[2026-11-13 00:09:35.112] [warning] [gpu_pipeline_task.cpp:83] gpu_pipeline_task: operator 'DISCARD_SINK' (id=5) output batch 0 column count mismatch: got 1, expected 2
+[2026-11-13 00:09:35.112] [info] [sirius_physical_discard_sink.cpp:355] [discard_sink] rows=808000000 bytes=12928000000 order_violations=0
+[2026-11-13 00:09:35.147] [info] [sirius_context.cpp:587] QueryEnd
+[2026-11-13 00:09:35.147] [info] [sirius_context.cpp:240] [host_pool] HOST:0 QueryEnd instance=0x7cd475598cc0 connection=1 window=2 query=4 allocated=273678336 bytes peak=5913968640 bytes free_blocks=5371
+[2026-11-13 00:09:35.147] [info] [sirius_context.cpp:255] [gpu_pool] GPU:0 QueryEnd instance=0x7cd475598cc0 connection=1 window=2 query=4 allocated=0 bytes peak=4294967296 bytes reserved=0 bytes
+[2026-11-13 00:09:35.147] [info] [sirius_context.cpp:721] [window] end instance=0x7cd475598cc0 connection=1 window=2 query=4 outcome=ok
+[2026-11-13 00:09:35.147] [info] [physical_sirius_execution.cpp:527] Transparent GPU execution: query completed
+[2026-11-13 00:09:35.147] [info] [sirius_context.cpp:2268] Connection closed.
+[2026-11-13 00:09:35.154] [info] [task_scheduler.cpp:298] Task queue interrupted, exiting management event loop.
+[2026-11-13 00:09:35.154] [info] [gpu_pipeline_executor.cpp:143] GPU Pipeline Executor: task queue interrupted, stopping publisher loop

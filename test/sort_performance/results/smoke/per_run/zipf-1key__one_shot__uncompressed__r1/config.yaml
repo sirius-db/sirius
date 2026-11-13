@@ -1,0 +1,6 @@
+sirius:
+  memory:
+    gpu:
+      usage_limit_bytes: 4294967296
+    disk:
+      downgrade_root_dirs: /mnt/disk_2/sirius_spill/sort_bench_20261113_000730/zipf-1key__one_shot__uncompressed__r1

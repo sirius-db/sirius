@@ -1,0 +1,74 @@
+[workstation] syncing /home/felipe/sirius/.worktrees/ws-d7931a22-3ecb-4bcc-8514-34bfa14af105 -> felipe@192.168.0.248:/mnt/disk_2/sirius-scalable-sort
+[workstation] building (release + extension)
+[workstation] running: python test/sort_performance/sort_merge_bench.py --gpu-limit-bytes 4294967296 --scale 3 --device 0 --validate --out-dir /mnt/disk_2/sort_merge_bench/smoke 
+[00:07:30.062] GPU limit 4294967296 bytes (4.00 GiB), data 3x the limit, GPU index 0
+[00:07:30.062] Matrix: 5 datasets x 2 modes x 2 compression x 1 repeat = 20 runs
+[00:07:30.062]   uniform-1key: 101 x 8000000 rows = 808000000 rows, 16 bytes/row, 12.04 GiB
+[00:07:30.062]   zipf-1key: 101 x 8000000 rows = 808000000 rows, 16 bytes/row, 12.04 GiB
+[00:07:30.062]   normal-multikey: 58 x 8000000 rows = 464000000 rows, 28 bytes/row, 12.10 GiB
+[00:07:30.062]   few_distinct-strings: 73 x 8000000 rows = 584000000 rows, 22 bytes/row, 11.97 GiB
+[00:07:30.062]   sequential: 101 x 8000000 rows = 808000000 rows, 16 bytes/row, 12.04 GiB
+[00:07:30.062]   [1/20] uniform-1key  mode=one_shot  compression=false  repeat=1
+[00:07:30.062]   [2/20] uniform-1key  mode=one_shot  compression=true  repeat=1
+[00:07:30.062]   [3/20] uniform-1key  mode=windowed  compression=false  repeat=1
+[00:07:30.062]   [4/20] uniform-1key  mode=windowed  compression=true  repeat=1
+[00:07:30.062]   [5/20] zipf-1key  mode=one_shot  compression=false  repeat=1
+[00:07:30.062]   [6/20] zipf-1key  mode=one_shot  compression=true  repeat=1
+[00:07:30.062]   [7/20] zipf-1key  mode=windowed  compression=false  repeat=1
+[00:07:30.062]   [8/20] zipf-1key  mode=windowed  compression=true  repeat=1
+[00:07:30.062]   [9/20] normal-multikey  mode=one_shot  compression=false  repeat=1
+[00:07:30.062]   [10/20] normal-multikey  mode=one_shot  compression=true  repeat=1
+[00:07:30.062]   [11/20] normal-multikey  mode=windowed  compression=false  repeat=1
+[00:07:30.062]   [12/20] normal-multikey  mode=windowed  compression=true  repeat=1
+[00:07:30.062]   [13/20] few_distinct-strings  mode=one_shot  compression=false  repeat=1
+[00:07:30.062]   [14/20] few_distinct-strings  mode=one_shot  compression=true  repeat=1
+[00:07:30.062]   [15/20] few_distinct-strings  mode=windowed  compression=false  repeat=1
+[00:07:30.062]   [16/20] few_distinct-strings  mode=windowed  compression=true  repeat=1
+[00:07:30.062]   [17/20] sequential  mode=one_shot  compression=false  repeat=1
+[00:07:30.062]   [18/20] sequential  mode=one_shot  compression=true  repeat=1
+[00:07:30.062]   [19/20] sequential  mode=windowed  compression=false  repeat=1
+[00:07:30.062]   [20/20] sequential  mode=windowed  compression=true  repeat=1
+[00:07:30.073] Results: /mnt/disk_2/sort_merge_bench/smoke
+[00:07:30.073] --- [1/20] uniform-1key__one_shot__uncompressed__r1 ---
+[00:07:34.331]   ok in 3.2s, peak GPU 7030 MiB
+[00:07:34.331] --- [2/20] uniform-1key__one_shot__compressed__r1 ---
+[00:07:38.431]   ok in 3.1s, peak GPU 6778 MiB
+[00:07:38.431] --- [3/20] uniform-1key__windowed__uncompressed__r1 ---
+[00:07:44.942]   ok in 5.5s, peak GPU 6038 MiB
+[00:07:44.942] --- [4/20] uniform-1key__windowed__compressed__r1 ---
+[00:07:52.697]   ok in 6.8s, peak GPU 5846 MiB
+[00:07:52.697] --- [5/20] zipf-1key__one_shot__uncompressed__r1 ---
+[00:08:02.616]   oom in 8.8s, peak GPU 7638 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 202: OOM at operator MERGE_SORT (index 0)
+[00:08:02.617] --- [6/20] zipf-1key__one_shot__compressed__r1 ---
+[00:08:15.191]   oom in 11.6s, peak GPU 7510 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 202: OOM at operator MERGE_SORT (index 0)
+[00:08:15.191] --- [7/20] zipf-1key__windowed__uncompressed__r1 ---
+[00:08:22.245]   ok in 6.1s, peak GPU 5714 MiB
+[00:08:22.245] --- [8/20] zipf-1key__windowed__compressed__r1 ---
+[00:09:35.542]   ok in 72.4s, peak GPU 5776 MiB
+[00:09:35.542] --- [9/20] normal-multikey__one_shot__uncompressed__r1 ---
+[00:09:38.841]   ok in 2.3s, peak GPU 6536 MiB
+[00:09:38.841] --- [10/20] normal-multikey__one_shot__compressed__r1 ---
+[00:09:44.392]   ok in 4.5s, peak GPU 6612 MiB
+[00:09:44.393] --- [11/20] normal-multikey__windowed__uncompressed__r1 ---
+[00:09:50.893]   ok in 5.5s, peak GPU 5316 MiB
+[00:09:50.894] --- [12/20] normal-multikey__windowed__compressed__r1 ---
+[00:10:09.765]   ok in 17.9s, peak GPU 5186 MiB
+[00:10:09.765] --- [13/20] few_distinct-strings__one_shot__uncompressed__r1 ---
+[00:11:33.167]   oom in 82.3s, peak GPU 5530 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 148: OOM at operator MERGE_SORT (index 0)
+[00:11:33.167] --- [14/20] few_distinct-strings__one_shot__compressed__r1 ---
+[00:12:55.455]   oom in 81.4s, peak GPU 5766 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 146: OOM at operator MERGE_SORT (index 0)
+[00:12:55.455] --- [15/20] few_distinct-strings__windowed__uncompressed__r1 ---
+[00:13:03.870]   ok in 7.4s, peak GPU 4822 MiB
+[00:13:03.871] --- [16/20] few_distinct-strings__windowed__compressed__r1 ---
+[00:13:12.769]   ok in 8.1s, peak GPU 4902 MiB
+[00:13:12.770] --- [17/20] sequential__one_shot__uncompressed__r1 ---
+[00:13:20.296]   oom in 6.5s, peak GPU 5010 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 213: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[00:13:20.297] --- [18/20] sequential__one_shot__compressed__r1 ---
+[00:13:27.319]   oom in 6.0s, peak GPU 5140 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 214: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[00:13:27.319] --- [19/20] sequential__windowed__uncompressed__r1 ---
+[00:13:35.525]   ok in 7.2s, peak GPU 5072 MiB
+[00:13:35.526] --- [20/20] sequential__windowed__compressed__r1 ---
+[00:13:45.434]   ok in 9.0s, peak GPU 4976 MiB
+[00:13:45.434] Wrote /mnt/disk_2/sort_merge_bench/smoke/results.csv
+[00:13:45.434] Wrote /mnt/disk_2/sort_merge_bench/smoke/results.md
+suite_rc=0

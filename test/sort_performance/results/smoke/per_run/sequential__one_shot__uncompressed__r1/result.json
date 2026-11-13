@@ -1,0 +1,6 @@
+{
+  "status": "error",
+  "error": "Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 213: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory",
+  "wall_s": 6.461852649052162,
+  "load_s": 0.44846704497467726
+}

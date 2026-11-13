@@ -1,0 +1,10 @@
+sirius:
+  memory:
+    host:
+      capacity_bytes: 4294967296
+    gpu:
+      usage_limit_bytes: 4294967296
+    disk:
+      downgrade_root_dirs: /mnt/disk_2/sirius_spill/sort_bench_20261113_001428/uniform-1key__windowed__compressed__r1
+  compression:
+    spill_min_batch_bytes: 1048576

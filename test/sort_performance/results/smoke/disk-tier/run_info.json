@@ -1,0 +1,90 @@
+{
+  "started": "2026-11-13T00:14:28",
+  "host": "felipe-TRX50-AERO-D",
+  "argv": [
+    "--gpu-limit-bytes",
+    "4294967296",
+    "--scale",
+    "3",
+    "--device",
+    "0",
+    "--validate",
+    "--datasets",
+    "uniform-1key,normal-multikey",
+    "--modes",
+    "windowed",
+    "--base-config",
+    "/mnt/disk_2/sort_merge_bench/smoke-disk-base.yml",
+    "--timeout-s",
+    "1200",
+    "--out-dir",
+    "/mnt/disk_2/sort_merge_bench/smoke-disk"
+  ],
+  "extension": "/mnt/disk_2/sirius-scalable-sort/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension",
+  "seed": 42,
+  "datasets": {
+    "uniform-1key": {
+      "description": "BIGINT uniform key + DOUBLE payload",
+      "columns": [
+        {
+          "name": "k",
+          "type": "BIGINT",
+          "dist": "uniform",
+          "p1": 0,
+          "p2": 1000000000000000
+        },
+        {
+          "name": "v",
+          "type": "DOUBLE",
+          "dist": "uniform",
+          "p1": 0,
+          "p2": 1
+        }
+      ],
+      "keys": [
+        "k"
+      ],
+      "num_batches": 101,
+      "rows_per_batch": 8000000,
+      "rows": 808000000,
+      "row_width": 16,
+      "bytes": 12928000000
+    },
+    "normal-multikey": {
+      "description": "INTEGER normal + BIGINT uniform + VARCHAR(8-16) keys",
+      "columns": [
+        {
+          "name": "k1",
+          "type": "INTEGER",
+          "dist": "normal",
+          "p1": 0,
+          "p2": 1000000
+        },
+        {
+          "name": "k2",
+          "type": "BIGINT",
+          "dist": "uniform",
+          "p1": 0,
+          "p2": 1000000000000000
+        },
+        {
+          "name": "s",
+          "type": "VARCHAR",
+          "dist": "uniform",
+          "p1": 8,
+          "p2": 16
+        }
+      ],
+      "keys": [
+        "k1",
+        "k2",
+        "s"
+      ],
+      "num_batches": 58,
+      "rows_per_batch": 8000000,
+      "rows": 464000000,
+      "row_width": 28,
+      "bytes": 12992000000
+    }
+  }
+}
