@@ -26,14 +26,18 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_reduce.cuh>
 #include <cuda/functional>
 #include <cuda_runtime.h>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/scan.h>
 #include <thrust/tabulate.h>
 #include <thrust/transform.h>
 
@@ -42,9 +46,12 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace simpatico {
@@ -349,6 +356,280 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
   return output;
 }
 
+// Small variable-width dictionary: every (key, destination byte shift) pair is pre-rendered as
+// masked 32-bit words in shared memory, so a row's chars are a few word ORs into a shared stage
+// that each tile of kSmallDictTile rows then writes out with aligned 16B stores. The word table
+// and the stage are sized from the longest key and stay under the 48 KiB default together.
+constexpr int kSmallDictThreads    = 256;
+constexpr int kSmallDictRowsPerThr = 4;
+constexpr int kSmallDictTile       = kSmallDictThreads * kSmallDictRowsPerThr;
+constexpr int kSmallDictMaxKeys    = 256;
+constexpr int kSmallDictMaxLen     = 32;
+constexpr int kSmallDictMaxTable   = 8 << 10;
+
+// Words per pre-rendered key: a key of up to max_len bytes shifted by up to 3 bytes.
+constexpr int small_dict_words_per_key(int max_len) { return (max_len + 3) / 4 + 1; }
+constexpr int small_dict_stage_bytes(int max_len) { return 32 + kSmallDictTile * max_len; }
+
+// The tile's keys, read as one int4 per thread when the indices are 16B-aligned and the tile full.
+template <bool Vec>
+__device__ void load_tile_keys(int32_t const* __restrict__ ix,
+                               cudf::size_type n,
+                               int64_t first_row,
+                               int32_t (&key)[kSmallDictRowsPerThr])
+{
+  if (Vec && first_row + kSmallDictRowsPerThr <= n) {
+    int4 const v = *reinterpret_cast<int4 const*>(ix + first_row);
+    key[0] = v.x, key[1] = v.y, key[2] = v.z, key[3] = v.w;
+    return;
+  }
+#pragma unroll
+  for (int j = 0; j < kSmallDictRowsPerThr; ++j)
+    key[j] = first_row + j < n ? ix[first_row + j] : -1;
+}
+
+// Shared key offsets rebased to the first key; a key of -1 (past the end) has length zero.
+__device__ void load_key_offsets(int32_t const* __restrict__ key_offsets,
+                                 int32_t num_keys,
+                                 int32_t* koff)
+{
+  int32_t const k0 = key_offsets[0];
+  for (int k = static_cast<int>(threadIdx.x); k <= num_keys; k += kSmallDictThreads)
+    koff[k] = key_offsets[k] - k0;
+}
+
+__device__ int32_t key_length(int32_t const* koff, int32_t key)
+{
+  return key < 0 ? 0 : koff[key + 1] - koff[key];
+}
+
+template <bool Vec>
+__global__ void __launch_bounds__(kSmallDictThreads)
+  small_dict_tile_bytes(int32_t const* __restrict__ ix,
+                        cudf::size_type n,
+                        int32_t const* __restrict__ key_offsets,
+                        int32_t num_keys,
+                        int64_t num_tiles,
+                        int32_t* __restrict__ tile_bytes)
+{
+  using block_reduce = cub::BlockReduce<int32_t, kSmallDictThreads>;
+  __shared__ typename block_reduce::TempStorage reduce_storage;
+  __shared__ int32_t koff[kSmallDictMaxKeys + 1];
+  load_key_offsets(key_offsets, num_keys, koff);
+  __syncthreads();
+  for (int64_t tile = blockIdx.x; tile < num_tiles; tile += gridDim.x) {
+    int32_t key[kSmallDictRowsPerThr];
+    load_tile_keys<Vec>(ix, n, tile * kSmallDictTile + threadIdx.x * kSmallDictRowsPerThr, key);
+    int32_t sum = 0;
+#pragma unroll
+    for (int j = 0; j < kSmallDictRowsPerThr; ++j)
+      sum += key_length(koff, key[j]);
+    sum = block_reduce(reduce_storage).Sum(sum);
+    if (threadIdx.x == 0) tile_bytes[tile] = sum;
+    __syncthreads();
+  }
+}
+
+// Writes the strings offsets and chars of every tile, starting each at its scanned tile base.
+// Dynamic shared memory: the stage (small_dict_stage_bytes) followed by the word table.
+template <bool Vec>
+__global__ void __launch_bounds__(kSmallDictThreads)
+  small_dict_gather(int32_t const* __restrict__ ix,
+                    cudf::size_type n,
+                    int32_t const* __restrict__ key_offsets,
+                    char const* __restrict__ key_chars,
+                    int32_t num_keys,
+                    int32_t max_len,
+                    int64_t num_tiles,
+                    int32_t const* __restrict__ tile_base,
+                    int32_t* __restrict__ out_offsets,
+                    char* __restrict__ out)
+{
+  using block_scan = cub::BlockScan<int32_t, kSmallDictThreads>;
+  __shared__ typename block_scan::TempStorage scan_storage;
+  __shared__ int32_t koff[kSmallDictMaxKeys + 1];
+  extern __shared__ __align__(16) uint32_t dynamic_smem[];
+  int const stage_words   = small_dict_stage_bytes(max_len) / 4;
+  int const words_per_key = small_dict_words_per_key(max_len);
+  uint32_t* const stage32 = dynamic_smem;
+  uint32_t* const table   = dynamic_smem + stage_words;
+  char* const stage       = reinterpret_cast<char*>(stage32);
+
+  int const tid = static_cast<int>(threadIdx.x);
+  load_key_offsets(key_offsets, num_keys, koff);
+  for (int w = tid; w < stage_words; w += kSmallDictThreads)
+    stage32[w] = 0;
+  __syncthreads();
+  // table[(k * 4 + s) * words_per_key + i]: word i of key k when its first byte lands at byte s.
+  int32_t const k0 = key_offsets[0];
+  for (int e = tid; e < num_keys * 4 * words_per_key; e += kSmallDictThreads) {
+    int const k = e / (4 * words_per_key), s = (e / words_per_key) % 4, i = e % words_per_key;
+    int const len = key_length(koff, k);
+    uint32_t v    = 0;
+    for (int b = 0; b < 4; ++b) {
+      int const j = 4 * i + b - s;
+      if (j >= 0 && j < len)
+        v |= static_cast<uint32_t>(static_cast<unsigned char>(key_chars[k0 + koff[k] + j]))
+             << (8 * b);
+    }
+    table[e] = v;
+  }
+  __syncthreads();
+
+  for (int64_t tile = blockIdx.x; tile < num_tiles; tile += gridDim.x) {
+    int64_t const first_row = tile * kSmallDictTile + tid * kSmallDictRowsPerThr;
+    int32_t key[kSmallDictRowsPerThr];
+    load_tile_keys<Vec>(ix, n, first_row, key);
+    int32_t const base = tile_base[tile];
+    int32_t len[kSmallDictRowsPerThr];
+#pragma unroll
+    for (int j = 0; j < kSmallDictRowsPerThr; ++j)
+      len[j] = key_length(koff, key[j]);
+    int32_t pos[kSmallDictRowsPerThr];
+    int32_t bytes;
+    block_scan(scan_storage).ExclusiveSum(len, pos, bytes);
+
+    if (Vec && first_row + kSmallDictRowsPerThr <= n) {
+      *reinterpret_cast<int4*>(out_offsets + first_row) =
+        make_int4(base + pos[0], base + pos[1], base + pos[2], base + pos[3]);
+    } else {
+#pragma unroll
+      for (int j = 0; j < kSmallDictRowsPerThr; ++j)
+        if (first_row + j < n) out_offsets[first_row + j] = base + pos[j];
+    }
+    if (tile == num_tiles - 1 && tid == 0) out_offsets[n] = base + bytes;
+
+    // Rows share their boundary words, so each ORs its words into the zeroed stage.
+    int64_t const abase = base & ~int64_t{15};
+    int const shift     = static_cast<int>(base - abase);
+#pragma unroll
+    for (int j = 0; j < kSmallDictRowsPerThr; ++j) {
+      if (key[j] < 0) continue;
+      int const d         = shift + pos[j];
+      int const s         = d & 3;
+      uint32_t const* src = table + (key[j] * 4 + s) * words_per_key;
+      for (int i = 0; i < (s + len[j] + 3) >> 2; ++i)
+        atomicOr(&stage32[(d >> 2) + i], src[i]);
+    }
+    __syncthreads();
+
+    int const end = shift + bytes;
+    for (int lo = tid * 16; lo < end; lo += kSmallDictThreads * 16) {
+      int const hi = lo + 16;
+      if (lo >= shift && hi <= end) {
+        *reinterpret_cast<uint4*>(out + abase + lo) = *reinterpret_cast<uint4 const*>(stage + lo);
+      } else {
+        for (int b = max(lo, shift); b < min(hi, end); ++b)
+          out[abase + b] = stage[b];
+      }
+      *reinterpret_cast<uint4*>(stage + lo) = make_uint4(0, 0, 0, 0);
+    }
+    __syncthreads();
+  }
+}
+
+// Blocks that fit on the device at once; the small-dictionary kernels loop over tiles from there.
+// Cached per device, kernel and shared-memory size, which take few distinct values.
+template <typename Kernel>
+int64_t resident_blocks(Kernel kernel, std::size_t dynamic_smem)
+{
+  int device = 0;
+  throw_if_cuda_error(cudaGetDevice(&device), "dictionary decode: current device");
+  auto const key = std::tuple{device, reinterpret_cast<void const*>(kernel), dynamic_smem};
+  static std::mutex mu;
+  static std::map<std::tuple<int, void const*, std::size_t>, int64_t> cache;
+  {
+    std::lock_guard lock{mu};
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+  }
+  int sms = 0, per_sm = 0;
+  throw_if_cuda_error(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device),
+                      "dictionary decode: SM count");
+  throw_if_cuda_error(
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kSmallDictThreads, dynamic_smem),
+    "dictionary decode: occupancy");
+  auto const blocks = int64_t{sms} * std::max(per_sm, 1);
+  std::lock_guard lock{mu};
+  return cache.emplace(key, blocks).first->second;
+}
+
+// Null-free decode of a small variable-width dictionary: per-tile byte counts and their scan give
+// each tile's chars base, then small_dict_gather writes the offsets and chars. nullptr =
+// ineligible.
+std::unique_ptr<cudf::column> try_decode_small_dictionary(cudf::strings_column_view const& keys,
+                                                          cudf::column_view const& indices,
+                                                          decode_frame& frame)
+{
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
+  if (indices.null_count() > 0 || keys.parent().null_count() > 0) return nullptr;
+  if (indices.type().id() != cudf::type_id::INT32) return nullptr;
+  if (keys.offsets().type().id() != cudf::type_id::INT32) return nullptr;
+  auto const num_keys = keys.size();
+  auto const n_rows   = indices.size();
+  if (num_keys <= 0 || num_keys > kSmallDictMaxKeys || n_rows == 0) return nullptr;
+
+  auto const* const d_key_offsets = keys.offsets().data<int32_t>() + keys.offset();
+  std::vector<int32_t> key_offsets(static_cast<std::size_t>(num_keys) + 1);
+  read_device_bytes_completed(
+    key_offsets.data(), d_key_offsets, key_offsets.size() * sizeof(int32_t), stream);
+  int32_t max_len = 0;
+  for (cudf::size_type k = 0; k < num_keys; ++k)
+    max_len = std::max(max_len, key_offsets[k + 1] - key_offsets[k]);
+  auto const table_bytes =
+    static_cast<std::size_t>(num_keys) * 4 * small_dict_words_per_key(max_len) * sizeof(uint32_t);
+  if (max_len <= 0 || max_len > kSmallDictMaxLen || table_bytes > kSmallDictMaxTable ||
+      static_cast<int64_t>(n_rows) * max_len > std::numeric_limits<cudf::size_type>::max())
+    return nullptr;
+
+  auto const* const ix = indices.data<int32_t>();
+  bool const vec       = reinterpret_cast<std::uintptr_t>(ix) % 16 == 0;
+  auto const num_tiles = (static_cast<int64_t>(n_rows) + kSmallDictTile - 1) / kSmallDictTile;
+  rmm::device_uvector<int32_t> tile_base(static_cast<std::size_t>(num_tiles) + 1, stream, mr);
+  {
+    auto const kernel = vec ? small_dict_tile_bytes<true> : small_dict_tile_bytes<false>;
+    auto const grid   = std::min(num_tiles, resident_blocks(kernel, 0));
+    kernel<<<static_cast<unsigned>(grid), kSmallDictThreads, 0, stream.get()>>>(
+      ix, n_rows, d_key_offsets, num_keys, num_tiles, tile_base.data());
+    throw_if_cuda_error(cudaGetLastError(), "dictionary decode: tile byte counts");
+  }
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, mr),
+                         tile_base.begin(),
+                         tile_base.end(),
+                         tile_base.begin(),
+                         int32_t{0});
+  int32_t total_bytes = 0;
+  read_device_bytes_completed(
+    &total_bytes, tile_base.data() + num_tiles, sizeof total_bytes, stream);
+
+  auto offsets = cudf::make_fixed_width_column(
+    cudf::data_type{cudf::type_id::INT32}, n_rows + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+  rmm::device_buffer chars(static_cast<std::size_t>(total_bytes), stream, mr);
+  {
+    auto const kernel = vec ? small_dict_gather<true> : small_dict_gather<false>;
+    auto const smem   = static_cast<std::size_t>(small_dict_stage_bytes(max_len)) + table_bytes;
+    auto const grid   = std::min(num_tiles, resident_blocks(kernel, smem));
+    kernel<<<static_cast<unsigned>(grid), kSmallDictThreads, smem, stream.get()>>>(
+      ix,
+      n_rows,
+      d_key_offsets,
+      keys.chars_begin(stream),
+      num_keys,
+      max_len,
+      num_tiles,
+      tile_base.data(),
+      offsets->mutable_view().data<int32_t>(),
+      static_cast<char*>(chars.data()));
+    throw_if_cuda_error(cudaGetLastError(), "dictionary decode: small-dictionary gather");
+  }
+  return cudf::make_strings_column(
+    n_rows,
+    std::move(offsets),
+    std::move(chars),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+}
+
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
   cudf::column_view const& col, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
@@ -446,6 +727,9 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
   cudf::dictionary_column_view dv(dict_column->view());
   if (auto output = try_decode_constant_width(
         cudf::strings_column_view(dv.keys()), dv.indices(), constant_key_width, frame))
+    return output;
+  if (auto output =
+        try_decode_small_dictionary(cudf::strings_column_view(dv.keys()), dv.indices(), frame))
     return output;
   return cudf::dictionary::decode(dict_column->view(), stream, mr);
 }

@@ -968,6 +968,31 @@ int main()
         roundtrip_once(t_empty->view(), plan, 1, "string_all_empty");
       }
 
+      // Small variable-width dictionaries take the shared-memory gather: row counts on either
+      // side of its 1024-row tile, an empty key, keys at and past its 32-byte limit (the latter
+      // falls back to cuDF), and bitpacked indices and key offsets.
+      std::string const k32(32, 'x');
+      std::string const k33(33, 'y');
+      std::vector<std::vector<std::string>> const key_sets = {
+        {"DELIVER IN PERSON", "COLLECT COD", "NONE", "TAKE BACK RETURN"},
+        {"", "a", "bc", "def", k32},
+        {"short", k33}};
+      for (auto const& keys : key_sets) {
+        for (int rows : {1, 5, 1023, 1024, 1025, 300001}) {
+          std::vector<std::string> values(static_cast<std::size_t>(rows));
+          for (int r = 0; r < rows; ++r)
+            values[static_cast<std::size_t>(r)] = keys[(r * 7 + r / 3) % keys.size()];
+          auto t = make_strings_table(values, {}, stream);
+          for (char const* plan :
+               {"input -> dictionary\n",
+                "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                "dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"}) {
+            roundtrip_once(t->view(), plan, 1, "small_variable_width_dictionary");
+          }
+        }
+      }
+
       // The canonical childless empty column (cudf::make_empty_column).
       {
         std::vector<std::unique_ptr<cudf::column>> cols;
