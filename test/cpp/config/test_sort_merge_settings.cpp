@@ -324,9 +324,9 @@ TEST_CASE("sort_merge config-file keys reject invalid values", "[sort_merge_sett
              std::pair{"sort_merge_output_bytes: -1", "must be non-negative"},
              std::pair{"sort_merge_max_fan_in: -1", "must be non-negative"},
              std::pair{"sort_merge_output_bytes: 1023KiB", "must be 0 (derive) or at least 1 MiB"},
-             std::pair{"sort_merge_one_shot_max_fraction: 1.5", "must be 0 (derive) or in (0, 1]"},
-             std::pair{"sort_merge_one_shot_max_fraction: -0.1", "must be 0 (derive) or in (0, 1]"},
-             std::pair{"sort_merge_one_shot_max_fraction: .nan", "must be 0 (derive) or in (0, 1]"},
+             std::pair{"sort_merge_one_shot_max_fraction: 1.5", "value out of range"},
+             std::pair{"sort_merge_one_shot_max_fraction: -0.1", "value out of range"},
+             std::pair{"sort_merge_one_shot_max_fraction: .nan", "value out of range"},
              std::pair{"sort_merge_max_fan_in: 1", "must be at least 2"},
              std::pair{"sort_merge_max_fan_in: 0", "must be at least 2"});
   CAPTURE(line);

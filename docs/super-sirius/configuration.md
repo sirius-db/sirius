@@ -4,7 +4,7 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 ## `sirius_config`
 
-**File:** `src/include/sirius_config.hpp`
+**File:** `src/sirius_config.hpp`
 
 The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
@@ -602,7 +602,7 @@ S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` 
 
 ## Operator Parameters
 
-**File:** `src/include/sirius_config.hpp` — `operator_params` struct
+**File:** `src/sirius_config.hpp` — `operator_params` struct
 
 The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
 `concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
@@ -706,9 +706,11 @@ The per-task budget is `B = 0.5 × G / T`.
 | `sort_merge_output_bytes` | `clamp(B / 16, 64 MiB, 1 GiB)` |
 | `sort_merge_one_shot_max_fraction` | 0.20 below 16 GiB of total GPU memory, 0.25 below 64 GiB, otherwise 0.33 |
 
-The operator currently takes `G` from the GPU memory space that holds most of the partition's
-bytes and `T` from the default GPU pipeline executor width, not the configured
-`executor.pipeline.num_threads`. A partition with no batch on the GPU reuses the last GPU space the
+For a planned query, `G` comes from the GPU memory space that holds most of the partition's bytes
+(the smallest GPU space when no run is on a GPU) and `T` is the configured
+`executor.pipeline.num_threads`. A MERGE_SORT built without the plan generator has no budget
+provider: it uses the default executor width, and a partition with no batch on the GPU reuses the
+last GPU space the
 operator saw, or sizes for 8 GiB and logs a warning when it has seen none. The derived values are
 logged at DEBUG level (`sort merge config: ...`).
 
@@ -721,7 +723,7 @@ fails to load with the same rule, prefixed with `'operator_params.<key>'`.
 | `sort_merge_window_rows` | 0, or at least 1024 |
 | `sort_merge_output_bytes` | 0, or at least 1 MiB |
 | `sort_merge_one_shot_max_fraction` | 0, or in (0, 1]; NaN and infinity are rejected |
-| `sort_merge_max_fan_in` | at least 2 |
+| `sort_merge_max_fan_in` | at least 2 (values above 4096, the merge kernel's limit, are treated as 4096) |
 
 The variables are session settings: `SET GLOBAL` is rejected and `RESET` restores the config-file
 value. After an OOM a windowed task may run with a smaller window and output target than these

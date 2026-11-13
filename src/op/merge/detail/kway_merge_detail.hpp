@@ -36,7 +36,11 @@ struct kway_key_device_view;
 /**
  * @brief Host owner of the device state needed to compare rows across k key windows (pimpl).
  *
- * Move-only. The comparator must outlive every kernel that uses its device view.
+ * Move-only. create() does not wait on the stream: its device state is filled by a copy queued on
+ * that stream, which reads host memory the comparator owns. The comparator must therefore stay
+ * alive until the stream has run that copy and every kernel that uses its device view (in
+ * practice: until the next synchronize of the stream), and its device view must only be used on
+ * the stream it was created with.
  */
 class kway_key_comparator {
  public:
@@ -135,21 +139,36 @@ void tile_merge(const kway_key_comparator& cmp,
                 cudf::device_span<cudf::size_type> out_row,
                 rmm::cuda_stream_view stream);
 
+/// A small device array that gather_kway copies to the host in the same wait on the stream as
+/// its own counts. `source` and `destination` have the same number of entries.
+struct gather_read_back {
+  cudf::device_span<const cudf::size_type> source;
+  std::span<cudf::size_type> destination;
+};
+
 /**
  * @brief Gather rows from k windows into one table.
  *
  * output row j = windows[src_input[j]].row(src_row[j]); all columns incl. null masks and STRING.
+ * The null counts of the output are exact; those of the windows are not read (a row is null when
+ * its bit in the window's null mask is clear).
+ *
+ * Waits on the stream once to read back the null counts and STRING chars sizes of all columns,
+ * and once more when there is a STRING column, whatever the number of columns and windows.
+ * Everything queued on @p stream has run when it returns.
  *
  * @param windows The k windows; all share one schema.
  * @param src_input Source window of each output row.
  * @param src_row Row within the source window of each output row.
  * @param stream CUDA stream used for device memory operations and kernel launches.
  * @param mr Device memory resource used to allocate the output table.
+ * @param read_back Optional device array to copy to the host in the first wait.
  */
 std::unique_ptr<cudf::table> gather_kway(std::span<const cudf::table_view> windows,
                                          cudf::device_span<const std::int32_t> src_input,
                                          cudf::device_span<const cudf::size_type> src_row,
                                          rmm::cuda_stream_view stream,
-                                         rmm::device_async_resource_ref mr);
+                                         rmm::device_async_resource_ref mr,
+                                         gather_read_back read_back = {});
 
 }  // namespace sirius::op::merge::detail

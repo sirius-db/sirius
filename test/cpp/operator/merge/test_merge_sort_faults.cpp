@@ -48,6 +48,7 @@
 #include "utils/utils.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
@@ -285,6 +286,51 @@ bool same_cursors(const std::vector<merge::merge_input_cursor>& lhs,
 // The operator, driven task by task
 // ---------------------------------------------------------------------------
 
+/// Set while the calling thread is inside the MERGE_SORT's execute().
+thread_local bool t_in_merge_execute = false;
+
+/// The MERGE_SORT's input repository; remembers the intermediate runs merge tasks add to it.
+class intermediate_run_repository final : public cucascade::shared_data_repository {
+ public:
+  void add_data_batch_unlocked(const std::shared_ptr<cucascade::data_batch>& batch,
+                               std::size_t partition = 0) override
+  {
+    cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
+    if (!t_in_merge_execute) { return; }
+    std::lock_guard<std::mutex> lock(_mutex);
+    _intermediate.push_back(batch);
+  }
+
+  [[nodiscard]] std::size_t intermediate_runs() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _intermediate.size();
+  }
+
+  /// How many intermediate runs still alive are off the GPU tier right now. A run that is
+  /// locked (being moved, or being read) is not counted.
+  [[nodiscard]] std::size_t count_intermediate_off_gpu() const
+  {
+    std::vector<std::shared_ptr<cucascade::data_batch>> alive;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      for (auto const& weak : _intermediate) {
+        if (auto batch = weak.lock()) { alive.push_back(std::move(batch)); }
+      }
+    }
+    std::size_t off_gpu = 0;
+    for (auto const& batch : alive) {
+      auto const ro = batch->try_to_read_only();
+      if (ro.has_value() && ro->get_current_tier() != Tier::GPU) { ++off_gpu; }
+    }
+    return off_gpu;
+  }
+
+ private:
+  mutable std::mutex _mutex;
+  std::vector<std::weak_ptr<cucascade::data_batch>> _intermediate;
+};
+
 std::unique_ptr<sirius_physical_merge_sort> make_merge(cucascade::shared_data_repository& repo,
                                                        merge::merge_settings settings)
 {
@@ -305,7 +351,7 @@ std::unique_ptr<sirius_physical_merge_sort> make_merge(cucascade::shared_data_re
                  MemoryBarrierType::FULL, &repo, nullptr, nullptr));
   op->set_merge_settings(settings);
   // A fixed device budget, so the route and the fan-in do not depend on the test's GPU limit.
-  op->set_device_budget_provider([] {
+  op->set_device_budget_provider([](const memory_space*) {
     return merge::device_budget{
       .gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 1};
   });
@@ -1042,6 +1088,190 @@ void check_fallback_merge(fault_fixture& fx, MakeUnreadable&& make_unreadable)
 
 }  // namespace
 
+TEST_CASE("merge sort fan-in passes stay exact while the downgrade executor spills their runs",
+          "[merge_sort_faults]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  constexpr std::size_t num_partitions = 3;
+  constexpr std::size_t runs_per_part  = 6;
+  constexpr std::size_t rows_per_run   = 30000;
+  auto const query                     = sirius::make_query_id(1);
+
+  fault_fixture fx;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(query);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(query);
+
+  // A repository of some other operator, registered first: with equal priorities the sweep
+  // would spill it before the merge's input.
+  auto bystander_owner = std::make_unique<cucascade::shared_data_repository>();
+  std::vector<test_run> bystanders;
+  for (std::size_t i = 0; i < 4; ++i) {
+    bystanders.push_back(add_sorted_run(
+      *bystander_owner,
+      *fx.gpu,
+      random_rows(rows_per_run, 1000, 0, static_cast<std::uint32_t>(90 + i))->view()));
+  }
+  auto merge_owner = std::make_unique<intermediate_run_repository>();
+  auto& repo       = *merge_owner;
+  repo.set_num_partitions(num_partitions);
+  std::vector<std::vector<test_run>> runs(num_partitions);
+  std::size_t run_bytes = 0;
+  for (std::size_t p = 0; p < num_partitions; ++p) {
+    for (std::size_t r = 0; r < runs_per_part; ++r) {
+      auto const index = p * runs_per_part + r;
+      runs[p].push_back(add_sorted_run(repo,
+                                       *fx.gpu,
+                                       random_rows(rows_per_run,
+                                                   20000,
+                                                   static_cast<std::int64_t>(index * rows_per_run),
+                                                   static_cast<std::uint32_t>(100 + index))
+                                         ->view(),
+                                       p));
+      run_bytes = sirius::get_batch_rows_and_bytes(*runs[p].back().batches[0]).bytes;
+    }
+  }
+
+  auto op = make_merge(repo,
+                       {.mode         = sirius::sort_merge_mode::windowed,
+                        .window_rows  = 2048,
+                        .output_bytes = 256 * 1024,
+                        .max_fan_in   = 2});
+  // What repository wiring copies onto the input repository of a windowed sort.
+  auto const policy = op->input_residency_policy("default");
+  REQUIRE(policy.downgrade_priority == 100);
+  REQUIRE_FALSE(policy.materialize_inputs_on_gpu);
+  repo.set_downgrade_priority(policy.downgrade_priority);
+  repo_mgr.add_new_repository(1, "out", std::move(bystander_owner));
+  repo_mgr.add_new_repository(2, "default", std::move(merge_owner));
+
+  auto const count_on = [](const std::vector<test_run>& group, Tier tier) {
+    return static_cast<std::size_t>(std::count_if(
+      group.begin(), group.end(), [tier](auto& run) { return tier_of(*run.batches[0]) == tier; }));
+  };
+  auto const merge_runs_off_gpu = [&] {
+    std::size_t total = 0;
+    for (auto const& group : runs) {
+      total += group.size() - count_on(group, Tier::GPU);
+    }
+    return total;
+  };
+
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{0}};
+  sirius::parallel::downgrade_executor downgrader(lifecycle,
+                                                  config,
+                                                  repo_registry,
+                                                  cucascade::memory::memory_space_id(Tier::GPU, 0),
+                                                  fx.gpu,
+                                                  *fx.manager);
+  downgrader.start();
+
+  // Before the merge starts: the sweep takes the merge's runs, not the bystander's batches.
+  REQUIRE(downgrader.request_free_memory_and_wait(3 * run_bytes) > 0);
+  REQUIRE(merge_runs_off_gpu() >= 1);
+  REQUIRE(count_on(bystanders, Tier::GPU) == bystanders.size());
+
+  merge_output output;
+  std::atomic<std::size_t> tasks_started{0};
+  std::atomic<std::size_t> tasks_done{0};
+  std::atomic<int> in_flight{0};
+  std::atomic<bool> merge_done{false};
+  std::mutex error_mutex;
+  std::string error;
+  auto const worker = [&] {
+    try {
+      rmm::cuda_stream stream;
+      ::cuda::stream_ref const stream_ref{stream.value()};
+      while (true) {
+        in_flight.fetch_add(1);
+        auto input = op->get_next_task_input_data();
+        if (!input) {
+          // Nothing to arm: either every partition has a task in flight, or the merge is done.
+          if (in_flight.fetch_sub(1) == 1) { break; }
+          std::this_thread::yield();
+          continue;
+        }
+        tasks_started.fetch_add(1);
+        input->prepare_for_processing(fx.gpu, stream_ref);
+        t_in_merge_execute = true;
+        auto result        = op->execute(*input, stream_ref);
+        t_in_merge_execute = false;
+        output.add(*result);
+        tasks_done.fetch_add(1);
+        in_flight.fetch_sub(1);
+      }
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      error = e.what();
+    }
+  };
+
+  // The downgrade requests race the merge tasks from here on.
+  std::atomic<std::size_t> freed_during_merge{0};
+  std::atomic<std::size_t> requests_during_merge{0};
+  std::atomic<std::size_t> intermediate_off_gpu{0};
+  std::thread spiller([&] {
+    while (!merge_done.load()) {
+      auto const freed = downgrader.request_free_memory_and_wait(run_bytes);
+      if (tasks_started.load() > 0 && !merge_done.load()) {
+        freed_during_merge.fetch_add(freed);
+        requests_during_merge.fetch_add(1);
+      }
+      intermediate_off_gpu.fetch_add(repo.count_intermediate_off_gpu());
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  std::vector<std::thread> workers;
+  for (int i = 0; i < 3; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto& thread : workers) {
+    thread.join();
+  }
+  merge_done.store(true);
+  spiller.join();
+  downgrader.stop();
+
+  INFO("merge error: " << error);
+  REQUIRE(error.empty());
+  // Several tasks per partition, with downgrades landing between and during them.
+  CHECK(tasks_done.load() > num_partitions);
+  CHECK(requests_during_merge.load() > 0);
+  CHECK(freed_during_merge.load() > 0);
+  // Every run, the intermediate ones included, was read to its end and popped.
+  CHECK(repo.total_size() == 0);
+  REQUIRE_FALSE(op->get_next_task_input_data());
+  // Six runs under a fan-in of two take four intermediate merges and then the final one, and
+  // the sweep caught intermediate runs between the task that wrote them and the one that read
+  // them.
+  auto const counters = op->counters();
+  CHECK(counters.windowed_partitions == num_partitions);
+  CHECK(counters.intermediate_tasks >= 4 * num_partitions);
+  CHECK(repo.intermediate_runs() >= 4 * num_partitions);
+  CHECK(intermediate_off_gpu.load() > 0);
+
+  for (std::size_t p = 0; p < num_partitions; ++p) {
+    CAPTURE(p);
+    // A pass reorders runs, so rows with equal keys need not keep the run order: compare the
+    // key order, and the rows as a set (ids are unique).
+    auto const merged = output.partition_table(p);
+    auto const keys   = cudf::table_view{{merged->view().column(0)}};
+    REQUIRE(cudf::is_sorted(keys, {cudf::order::ASCENDING}, {cudf::null_order::AFTER}));
+    std::vector<cudf::table_view> inputs;
+    for (auto const& run : runs[p]) {
+      inputs.push_back(run.rows->view());
+    }
+    auto const all      = cudf::concatenate(inputs);
+    auto const expected = cudf::sort(all->view());
+    auto const actual   = cudf::sort(merged->view());
+    REQUIRE(actual->num_rows() == expected->num_rows());
+    REQUIRE(tables_equal(actual->view(), expected->view()));
+  }
+}
+
 TEST_CASE("windowed merge converts a packed host run to the GPU once", "[merge_sort_faults]")
 {
   if (!has_gpu()) { SKIP("No GPU available"); }
@@ -1145,6 +1375,9 @@ TEST_CASE("merge sort task that runs out of memory is retried with smaller windo
   REQUIRE(as_windowed(first).final_pass());
   REQUIRE(scheduler.run(s.make_probe(0, 0), std::move(first)));
   REQUIRE(s.output.num_chunks() == 1);
+  // The partition keeps the merger of its first task, with the rows it buffered.
+  REQUIRE(s.op->counters().mergers_built == 1);
+  auto const refilled_by_first = s.op->counters().rounds.refill_rows;
 
   auto second         = s.op->get_next_task_input_data();
   auto const& input   = as_windowed(second);
@@ -1180,10 +1413,23 @@ TEST_CASE("merge sort task that runs out of memory is retried with smaller windo
   }
   // The failed attempts emitted nothing: one chunk per completed task.
   REQUIRE(s.output.num_chunks() == 2);
+  // The first attempt continued the kept merger, which its failure destroyed; each retry built
+  // its own, for its smaller windows, and only the one that completed was counted and kept.
+  auto const after_retries = s.op->counters();
+  CHECK(after_retries.mergers_built == 1 + oom_attempts);
+  CHECK(after_retries.windowed_tasks == 2);
+  // The retry read again what the destroyed merger had buffered.
+  CHECK(after_retries.rounds.refill_rows > refilled_by_first);
 
   s.finish(scheduler);
   REQUIRE_FALSE(scheduler.completion->has_error());
   CHECK(s.repo.total_size() == 0);
+  // A task after the retry runs with the partition's own sizes again, so it builds one more
+  // merger, which then serves the rest of the partition.
+  auto const done = s.op->counters();
+  CHECK(done.mergers_built <= 2 + oom_attempts);
+  CHECK(done.windowed_tasks == s.output.num_chunks());
+  CHECK(done.rounds.rows_out == 4 * rows_per_run);
   s.require_exact_output();
 }
 

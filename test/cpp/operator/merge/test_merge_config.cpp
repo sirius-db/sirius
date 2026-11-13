@@ -18,6 +18,7 @@
 // one-shot fraction and fan-in, the route choice, pass planning and the task memory estimate.
 // GPU-free.
 
+#include "op/merge/bounded_kway_merge.hpp"
 #include "op/merge/merge_config.hpp"
 
 #include <catch.hpp>
@@ -31,6 +32,7 @@ using sirius::op::merge::choose_route;
 using sirius::op::merge::derive_merge_config;
 using sirius::op::merge::device_budget;
 using sirius::op::merge::estimate_task_bytes;
+using sirius::op::merge::kMaxKwayMergeInputs;
 using sirius::op::merge::kMinExplicitWindowRows;
 using sirius::op::merge::kWindowRowsFloor;
 using sirius::op::merge::merge_route;
@@ -135,6 +137,15 @@ TEST_CASE("derive_merge_config caps the fan-in so the window stays at its floor"
     merge_settings settings;
     settings.max_fan_in = 0;
     CHECK(derive_merge_config(settings, device(24 * kGiB), 100, 32).fan_in == 2);
+  }
+
+  SECTION("a max_fan_in above the merge kernel's limit is clamped to it")
+  {
+    merge_settings settings;
+    settings.max_fan_in = 1'000'000;
+    // 1-byte rows: the task budget alone would allow far more than 4096 runs.
+    CHECK(derive_merge_config(settings, device(80 * kGiB), 100'000, 1).fan_in ==
+          kMaxKwayMergeInputs);
   }
 }
 

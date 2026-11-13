@@ -216,14 +216,16 @@ std::vector<bool> validity_to_host(const cudf::column_view& col)
     valid[i] = ((words[i / 32] >> (i % 32)) & 1U) != 0;
     if (!valid[i]) { ++nulls; }
   }
-  REQUIRE(col.null_count() == nulls);
+  // The null count of a window column is an upper bound; only the mask is exact.
+  REQUIRE(col.null_count() >= nulls);
   return valid;
 }
 
 std::vector<int64_t> int_column_to_host(const cudf::column_view& col)
 {
   REQUIRE(col.type().id() == cudf::type_id::INT64);
-  REQUIRE(col.null_count() == 0);
+  auto const valid = validity_to_host(col);
+  REQUIRE(std::all_of(valid.begin(), valid.end(), [](bool v) { return v; }));
   return device_to_host<int64_t>(col.head(), static_cast<std::size_t>(col.size()));
 }
 
@@ -483,6 +485,7 @@ TEST_CASE("window_buffer grows the chars slots for a row that does not fit", "[w
   REQUIRE(result.rows_written == 3);
   REQUIRE_FALSE(result.source_exhausted);
   REQUIRE(window.device_bytes() == bytes_before);
+  REQUIRE(window.chars_growths() == 0);
 
   // Row 3 alone does not fit behind the carried tail: both chars slots double, the tail survives.
   window.consume(2, fixture.stream_view());
@@ -493,15 +496,20 @@ TEST_CASE("window_buffer grows the chars slots for a row that does not fit", "[w
 
   // Row 5 does not fit even after doubling once more.
   window.consume(3, fixture.stream_view());
-  REQUIRE_THROWS_AS(fixture.refill(window, batch, 5), std::runtime_error);
+  REQUIRE(window.chars_growths() == 1);
+  REQUIRE_THROWS_AS(fixture.refill(window, batch, 5),
+                    sirius::op::merge::detail::window_row_too_large_error);
   REQUIRE(window.size() == 0);
   REQUIRE(window.device_bytes() == bytes_before + 2 * 64 + 2 * 128);
+  REQUIRE(window.chars_growths() == 2);
 
   // The window stays usable: the slots have grown, so the retry fits the row.
-  REQUIRE_THROWS_AS(fixture.refill(window, batch, 5), std::runtime_error);
+  REQUIRE_THROWS_AS(fixture.refill(window, batch, 5),
+                    sirius::op::merge::detail::window_row_too_large_error);
   result = fixture.refill(window, batch, 5);
   REQUIRE(result.rows_written == 3);
   REQUIRE(result.source_exhausted);
+  REQUIRE(window.chars_growths() == 4);
   REQUIRE(window_to_host(window, fixture.stream) == rows.slice(5, 8));
 }
 
@@ -816,4 +824,138 @@ TEST_CASE("window_buffer orders work across a change of stream", "[window_buffer
   }
   other.synchronize();
   REQUIRE(window_to_host(window, fixture.stream) == rows.slice(window_begin, read_end));
+}
+
+TEST_CASE("window_buffer sizes each STRING column from its own estimate", "[window_buffer]")
+{
+  using namespace sirius::test::operator_utils;
+  window_buffer_fixture fixture;
+  constexpr std::size_t window_rows = 256;
+  constexpr std::size_t source_rows = 600;
+  // (INT64, one 100-byte STRING, three 4-byte STRINGs).
+  std::vector<cudf::data_type> const types{cudf::data_type{cudf::type_id::INT64},
+                                           cudf::data_type{cudf::type_id::STRING},
+                                           cudf::data_type{cudf::type_id::STRING},
+                                           cudf::data_type{cudf::type_id::STRING},
+                                           cudf::data_type{cudf::type_id::STRING}};
+  auto const mr = get_resource_ref(*fixture.memory.gpu0);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_numeric_column(
+    types[0], source_rows, cudf::mask_state::UNALLOCATED, fixture.stream, mr));
+  for (std::size_t width : {100, 4, 4, 4}) {
+    std::vector<std::string> values(source_rows);
+    for (std::size_t i = 0; i < source_rows; ++i) {
+      values[i] = std::string(width, static_cast<char>('a' + (i + width) % 26));
+    }
+    cols.push_back(make_string_column(values, fixture.stream, mr));
+  }
+  fixture.stream.synchronize();
+  auto batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(cols)),
+                                       *fixture.memory.gpu0,
+                                       fixture.stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), fixture.memory.host0, fixture.stream);
+  }
+  fixture.stream.synchronize();
+  std::array<std::size_t, 5> const cols_all{0, 1, 2, 3, 4};
+  auto refill = [&](window_buffer& window, std::size_t row_begin) {
+    auto ro = batch->to_read_only();
+    return window.refill(sirius::row_range_reader_registry::get(),
+                         ro,
+                         cols_all,
+                         row_begin,
+                         nullptr,
+                         nullptr,
+                         fixture.stream_view());
+  };
+
+  SECTION("per-column estimates hold a full window and no more")
+  {
+    window_buffer window(types, window_rows, {0, 100, 4, 4, 4}, fixture.stream_view(), mr);
+    auto const mask_bytes = cudf::bitmask_allocation_size_bytes(window_rows);
+    auto const offsets    = (window_rows + 1) * sizeof(int32_t);
+    auto const per_slot   = (window_rows * sizeof(int64_t) + mask_bytes) +
+                          (window_rows * 100 * 5 / 4 + mask_bytes + offsets) +
+                          3 * (window_rows * 4 * 5 / 4 + mask_bytes + offsets);
+    REQUIRE(window.device_bytes() == 2 * per_slot);
+
+    // A full window refills in one call, also behind a carried tail.
+    auto result = refill(window, 0);
+    REQUIRE(result.rows_written == window_rows);
+    REQUIRE(result.data_bytes_written[1] == window_rows * 100);
+    REQUIRE(result.data_bytes_written[2] == window_rows * 4);
+    window.consume(200, fixture.stream_view());
+    result = refill(window, window_rows);
+    REQUIRE(result.rows_written == 200);
+    REQUIRE(window.size() == window_rows);
+    REQUIRE(window.chars_growths() == 0);
+    REQUIRE(window.device_bytes() == 2 * per_slot);
+  }
+
+  SECTION("one estimate for every STRING column stops the wide column short")
+  {
+    // The average of the four columns: the 100-byte column fits only 35% of a window.
+    window_buffer window(types, window_rows, 28, fixture.stream_view(), mr);
+    auto const result = refill(window, 0);
+    REQUIRE(result.rows_written == window_rows * 28 * 5 / 4 / 100);
+    REQUIRE_FALSE(result.source_exhausted);
+  }
+
+  SECTION("the estimates must match the columns")
+  {
+    REQUIRE_THROWS_AS(
+      window_buffer(
+        types, window_rows, std::vector<std::size_t>{100, 4, 4, 4}, fixture.stream_view(), mr),
+      std::invalid_argument);
+  }
+}
+
+TEST_CASE("window_buffer view reports null counts as an upper bound", "[window_buffer]")
+{
+  window_buffer_fixture fixture;
+  std::mt19937 rng(47);
+  auto const rows  = make_rows(400, 10, rng);
+  auto const batch = make_host_batch(fixture.memory, rows, fixture.stream);
+  auto window      = fixture.make_window(128, 10);
+
+  // By default every column may hold NULLs: it carries the slot's mask and counts every row.
+  std::size_t window_begin = 0;
+  std::size_t read_end     = 0;
+  for (std::size_t consumed : {0, 1, 31, 33, 64, 100}) {
+    CAPTURE(consumed);
+    window.consume(consumed, fixture.stream_view());
+    window_begin += consumed;
+    read_end += fixture.refill(window, batch, read_end).rows_written;
+    fixture.stream.synchronize();
+    auto const view = window.view();
+    REQUIRE(static_cast<std::size_t>(view.num_rows()) == window.size());
+    for (auto const& col : view) {
+      REQUIRE(col.nullable());
+      REQUIRE(col.null_count() == view.num_rows());
+    }
+    // The mask bits and the rows are those of the source.
+    REQUIRE(window_to_host(window, fixture.stream) == rows.slice(window_begin, read_end));
+  }
+
+  // The flags can only change while the window is empty.
+  REQUIRE_THROWS_AS(window.set_null_free({true, false, false}), std::logic_error);
+  window.consume(window.size(), fixture.stream_view());
+  REQUIRE_THROWS_AS(window.set_null_free({true, false}), std::invalid_argument);
+
+  // A column declared null-free has no mask and an exact null count of 0.
+  window.set_null_free({true, false, false});
+  read_end = fixture.refill(window, batch, 0).rows_written;
+  window.consume(37, fixture.stream_view());
+  read_end += fixture.refill(window, batch, read_end).rows_written;
+  fixture.stream.synchronize();
+  auto const view = window.view();
+  REQUIRE_FALSE(view.column(0).nullable());
+  REQUIRE(view.column(0).null_count() == 0);
+  REQUIRE(view.column(1).nullable());
+  REQUIRE(view.column(1).null_count() == view.num_rows());
+  REQUIRE(view.column(2).null_count() == view.num_rows());
+  REQUIRE(window_to_host(window, fixture.stream) == rows.slice(37, read_end));
 }

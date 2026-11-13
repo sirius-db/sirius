@@ -20,9 +20,8 @@
 #include "op/merge/bounded_kway_merge.hpp"
 #include "op/merge/windowed_merge.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "utils/test_validation_utility.hpp"
 
-#include <cudf/aggregation.hpp>
-#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -30,7 +29,6 @@
 #include <cudf/filling.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
@@ -62,6 +60,29 @@ namespace sirius::test::merge_utils {
 // ---------------------------------------------------------------------------
 // Reference bounded merge (the oracle)
 // ---------------------------------------------------------------------------
+
+/// @p table with the exact null count of every column: the windows of a windowed merge report an
+/// upper bound, which libcudf algorithms do not accept.
+inline cudf::table_view with_exact_null_counts(const cudf::table_view& table,
+                                               rmm::cuda_stream_view stream)
+{
+  std::vector<cudf::column_view> columns;
+  columns.reserve(static_cast<std::size_t>(table.num_columns()));
+  for (const auto& col : table) {
+    const auto nulls =
+      col.nullable() && col.size() > 0
+        ? cudf::null_count(col.null_mask(), col.offset(), col.offset() + col.size(), stream)
+        : 0;
+    columns.emplace_back(col.type(),
+                         col.size(),
+                         col.head(),
+                         nulls > 0 ? col.null_mask() : nullptr,
+                         nulls,
+                         col.offset(),
+                         std::vector<cudf::column_view>(col.child_begin(), col.child_end()));
+  }
+  return cudf::table_view{columns};
+}
 
 /**
  * @brief Reference implementation of op::merge::bounded_kway_merge, usable as a bounded_merge_fn.
@@ -107,7 +128,8 @@ inline op::merge::bounded_merge_result reference_bounded_merge(
     cudf::numeric_scalar<std::int32_t> zero(0, true, stream);
     tags.push_back(cudf::make_column_from_scalar(window_idx, rows, stream));
     tags.push_back(cudf::sequence(rows, zero, stream));
-    std::vector<cudf::column_view> cols(windows[i].begin(), windows[i].end());
+    const auto window = with_exact_null_counts(windows[i], stream);
+    std::vector<cudf::column_view> cols(window.begin(), window.end());
     cols.push_back(tags[tags.size() - 2]->view());
     cols.push_back(tags[tags.size() - 1]->view());
     tagged.emplace_back(cols);
@@ -235,22 +257,11 @@ inline std::unique_ptr<cudf::table> expected_full_sort(std::span<const cudf::tab
   return stable_sort(all->view(), keys);
 }
 
-/// True when both tables have the same types, row count and values (NULL equals NULL).
+/// True when both tables have the same types, row count, row validity and values. Valid values
+/// are compared by their bits (NaN equals NaN, -0 differs from +0); NULL equals NULL.
 inline bool tables_equal(const cudf::table_view& lhs, const cudf::table_view& rhs)
 {
-  if (lhs.num_columns() != rhs.num_columns() || lhs.num_rows() != rhs.num_rows()) { return false; }
-  for (cudf::size_type c = 0; c < lhs.num_columns(); ++c) {
-    if (lhs.column(c).type() != rhs.column(c).type()) { return false; }
-    if (lhs.num_rows() == 0) { continue; }
-    const cudf::data_type bool_type{cudf::type_id::BOOL8};
-    auto equal = cudf::binary_operation(
-      lhs.column(c), rhs.column(c), cudf::binary_operator::NULL_EQUALS, bool_type);
-    auto all = cudf::reduce(
-      equal->view(), *cudf::make_all_aggregation<cudf::reduce_aggregation>(), bool_type);
-    const auto& all_equal = static_cast<const cudf::numeric_scalar<bool>&>(*all);
-    if (!all_equal.is_valid() || !all_equal.value()) { return false; }
-  }
-  return true;
+  return ::sirius::test::expect_tables_equivalent_impl(lhs, rhs);
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@
 // holds many sorted runs.
 
 #include <catch.hpp>
+#include <op/sirius_physical_merge_sort.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <algorithm>
@@ -41,6 +42,13 @@ namespace {
 
 /// Compare every result column position by position: the query's order is total.
 constexpr std::size_t kAllColumns = std::numeric_limits<std::size_t>::max();
+
+/// What a query's sort is required to have done, read from the merge sort counters.
+enum class merge_check {
+  windowed,      ///< the windowed run merged at least one partition through windowed tasks
+  intermediate,  ///< and some of those tasks were intermediate fan-in passes
+  none,  ///< the plan has no merge sort, or the sort has no rows: only the result is checked
+};
 
 /// The rows of one result, each rendered as one string.
 struct query_rows {
@@ -88,6 +96,10 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
     run_ok("SET " + name + " = '" + value + "';");
   }
 
+  /// Set by a case whose fan-in cap is below its run count: its windowed runs must take
+  /// intermediate passes.
+  bool expect_intermediate_passes = false;
+
   /// Creates and persists a table, so the GPU native scan reads it from disk.
   void create_table(const std::string& name, const std::string& select)
   {
@@ -101,10 +113,15 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
    * The leading @p key_columns result columns must be the query's sort keys: they are compared
    * position by position. The full rows are compared as multisets, since rows with equal keys may
    * come out in any order. With kAllColumns the query's order must be total, and the full rows
-   * are compared position by position.
+   * are compared position by position. @p check says which merge route the runs must have taken.
    */
-  void check_order(const std::string& query, std::size_t key_columns = kAllColumns)
+  void check_order(const std::string& query,
+                   std::size_t key_columns = kAllColumns,
+                   merge_check check       = merge_check::windowed)
   {
+    if (check == merge_check::windowed && expect_intermediate_passes) {
+      check = merge_check::intermediate;
+    }
     INFO(query);
     run_ok("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
@@ -115,8 +132,8 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
     auto cpu = collect(*cpu_result, key_columns);
     cpu_result.reset();
 
-    auto windowed = run_on_gpu(query, "windowed", key_columns);
-    auto one_shot = run_on_gpu(query, "one_shot", key_columns);
+    auto windowed = run_on_gpu(query, "windowed", key_columns, check);
+    auto one_shot = run_on_gpu(query, "one_shot", key_columns, check);
 
     require_same_keys(cpu, windowed, "windowed");
     require_same_keys(cpu, one_shot, "one_shot");
@@ -187,18 +204,39 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
   }
 
   /// Runs @p query with the given sort_merge_mode and requires that it ran on the GPU.
-  query_rows run_on_gpu(const std::string& query, const std::string& mode, std::size_t key_columns)
+  query_rows run_on_gpu(const std::string& query,
+                        const std::string& mode,
+                        std::size_t key_columns,
+                        merge_check check)
   {
     INFO("sort_merge_mode = " << mode);
     run_ok("SET sort_merge_mode = '" + mode + "';");
+    sirius::op::sirius_physical_merge_sort::reset_process_counters();
     auto const before = sirius::test::get_transparent_execution_stats(*con);
     auto result       = con->Query(query);
     auto const after  = sirius::test::get_transparent_execution_stats(*con);
+    auto const merges = sirius::op::sirius_physical_merge_sort::process_counters();
     REQUIRE(result);
     if (result->HasError()) { UNSCOPED_INFO("GPU error: " << result->GetError()); }
     REQUIRE_FALSE(result->HasError());
     // Exactly one GPU execution and no fallback.
     sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    // The route the merge took: a query that silently merged one-shot under 'windowed' fails.
+    if (mode == "one_shot") {
+      REQUIRE(merges.windowed_partitions == 0);
+      REQUIRE(merges.windowed_tasks == 0);
+      if (check != merge_check::none) { REQUIRE(merges.one_shot_partitions >= 1); }
+    } else if (check != merge_check::none) {
+      REQUIRE(merges.windowed_partitions >= 1);
+      REQUIRE(merges.one_shot_partitions == 0);
+      REQUIRE(merges.windowed_tasks >= merges.windowed_partitions);
+      REQUIRE(merges.rounds.rows_out > 0);
+      if (check == merge_check::intermediate) {
+        REQUIRE(merges.intermediate_tasks >= 1);
+      } else {
+        REQUIRE(merges.intermediate_tasks == 0);
+      }
+    }
     return collect(*result, key_columns);
   }
 
@@ -384,6 +422,7 @@ TEST_CASE_METHOD(OrderByWindowedFixture,
                  "[integration][gpu_execution][order_by_windowed]")
 {
   set("sort_merge_max_fan_in", "2");
+  expect_intermediate_passes = true;
   create_table("ow_fan",
                "SELECT CASE WHEN i % 11 = 0 THEN NULL "
                "            ELSE CAST(hash(i) % 20000 AS INTEGER) END AS k, "
@@ -451,7 +490,8 @@ TEST_CASE_METHOD(OrderByWindowedFixture,
   check_order(
     "SELECT * FROM (SELECT k, id FROM ow_sub ORDER BY k NULLS FIRST, id DESC) AS sub "
     "LIMIT 300000");
-  check_order("SELECT k, id FROM ow_sub ORDER BY k, id LIMIT 100");
+  // A small LIMIT is planned as a top-n, with no merge sort.
+  check_order("SELECT k, id FROM ow_sub ORDER BY k, id LIMIT 100", kAllColumns, merge_check::none);
 }
 
 TEST_CASE_METHOD(OrderByWindowedFixture,
@@ -469,5 +509,6 @@ TEST_CASE_METHOD(OrderByWindowedFixture,
   check_order("SELECT k, s, id FROM ow_small WHERE id < 100 ORDER BY k, id DESC");
   check_order("SELECT k, s FROM ow_small WHERE id = 42 ORDER BY k");
   // No rows reach the sort.
-  check_order("SELECT k, s FROM ow_small WHERE id < 0 ORDER BY k, s");
+  check_order(
+    "SELECT k, s FROM ow_small WHERE id < 0 ORDER BY k, s", kAllColumns, merge_check::none);
 }

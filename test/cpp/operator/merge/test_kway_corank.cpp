@@ -530,3 +530,27 @@ TEST_CASE("safe_target matches the host reference for random windows", "[kway_co
     CHECK(fixture.target(truncated, max_rows) == fixture.expected_target(truncated, max_rows));
   }
 }
+
+TEST_CASE("safe_target matches the host reference across fan-ins", "[kway_corank]")
+{
+  // k = 2 leaves most lanes of a warp without an input, 64 gives every lane two and 256 eight.
+  const auto k = GENERATE(std::size_t{2}, std::size_t{64}, std::size_t{256});
+  std::mt19937 rng(static_cast<unsigned>(900 + k));
+
+  // Windows without rows are included; a truncated one forces the target to 0.
+  const corank_fixture fixture(random_int_windows(random_lengths(k, 40, rng), 50, 0.1, rng), false);
+
+  for (int round = 0; round < 12; ++round) {
+    // Few truncated windows in the first rounds, so the bound is not always the same small one.
+    const unsigned one_in = round < 6 ? 40 : 3;
+    std::vector<uint8_t> truncated;
+    for (std::size_t i = 0; i < fixture.k(); ++i) {
+      // The first rounds only truncate windows with rows; the others also hit the empty ones.
+      const bool allowed = round >= 9 || fixture.lengths()[i] > 0;
+      truncated.push_back(allowed && rng() % one_in == 0 ? 1 : 0);
+    }
+    const auto max_rows = static_cast<cudf::size_type>(rng() % (2 * fixture.total() + 1));
+    INFO("k " << k << ", round " << round << ", max_rows " << max_rows);
+    CHECK(fixture.target(truncated, max_rows) == fixture.expected_target(truncated, max_rows));
+  }
+}

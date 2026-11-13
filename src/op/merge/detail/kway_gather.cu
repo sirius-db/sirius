@@ -20,12 +20,18 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/iterator.cuh>
+#include <cudf/detail/sizes_to_offsets_iterator.cuh>
+#include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/detail/valid_if.cuh>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/strings_column_factories.cuh>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/strings/utilities.hpp>
 #include <cudf/utilities/bit.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_checks.hpp>
@@ -35,9 +41,13 @@
 #include <rmm/exec_policy.hpp>
 
 #include <cuda/iterator>
+#include <cuda_runtime_api.h>
+#include <thrust/scan.h>
 #include <thrust/transform.h>
 
+#include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -110,11 +120,17 @@ struct string_pair_fn {
   }
 };
 
-/// The output null mask of one column and its null count; an empty buffer when no window's column
-/// is nullable.
+/// The byte size of a string_index_pair.
+struct pair_size_fn {
+  __device__ cudf::size_type operator()(cudf::strings::detail::string_index_pair const& pair) const
+  {
+    return pair.second;
+  }
+};
+
+/// The output null mask of one column; an empty buffer when no window's column is nullable.
 struct gathered_validity {
   rmm::device_buffer mask;
-  cudf::size_type null_count{0};
   rmm::device_uvector<cudf::bitmask_type const*> masks;
   rmm::device_uvector<cudf::size_type> mask_offsets;
   bool nullable{false};
@@ -125,10 +141,14 @@ struct gathered_validity {
   }
 };
 
+/// Builds the output null mask from the null mask bit of every source row (the null counts of the
+/// windows are not read) and adds the number of valid rows to @p valid_count, a zeroed device
+/// counter. Does not wait on the stream.
 gathered_validity gather_validity(std::span<const cudf::table_view> windows,
                                   cudf::size_type column,
                                   gather_map map,
                                   cudf::size_type rows,
+                                  cudf::size_type* valid_count,
                                   rmm::cuda_stream_view stream,
                                   rmm::device_async_resource_ref mr)
 {
@@ -143,14 +163,22 @@ gathered_validity gather_validity(std::span<const cudf::table_view> windows,
     nullable        = nullable || col.nullable();
   }
   gathered_validity result{rmm::device_buffer{},
-                           0,
                            cudf::detail::make_device_uvector_async(masks, stream, temp_mr),
                            cudf::detail::make_device_uvector_async(mask_offsets, stream, temp_mr),
                            nullable};
   if (nullable) {
-    auto const begin = cuda::counting_iterator<cudf::size_type>{0};
-    std::tie(result.mask, result.null_count) =
-      cudf::detail::valid_if(begin, begin + rows, result.device_fn(map), stream, mr);
+    // cudf::detail::valid_if without its read-back of the count.
+    result.mask = cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream, mr);
+    constexpr cudf::size_type block_size{256};
+    cudf::detail::grid_1d const grid{rows, block_size};
+    cudf::detail::valid_if_kernel<block_size>
+      <<<grid.num_blocks, grid.num_threads_per_block, 0, stream.value()>>>(
+        static_cast<cudf::bitmask_type*>(result.mask.data()),
+        cuda::counting_iterator<cudf::size_type>{0},
+        rows,
+        result.device_fn(map),
+        valid_count);
+    CUDF_CUDA_TRY(cudaPeekAtLastError());
   }
   return result;
 }
@@ -182,46 +210,53 @@ rmm::device_buffer gather_fixed_values(std::span<const cudf::table_view> windows
   return values;
 }
 
-std::unique_ptr<cudf::column> gather_fixed_width(std::span<const cudf::table_view> windows,
-                                                 cudf::size_type column,
-                                                 gather_map map,
-                                                 cudf::size_type rows,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr)
+rmm::device_buffer gather_fixed_width(std::span<const cudf::table_view> windows,
+                                      cudf::size_type column,
+                                      gather_map map,
+                                      cudf::size_type rows,
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr)
 {
-  auto const type = windows.front().column(column).type();
-  rmm::device_buffer values;
-  switch (cudf::size_of(type)) {
-    case 1:
-      values = gather_fixed_values<std::uint8_t>(windows, column, map, rows, stream, mr);
-      break;
-    case 2:
-      values = gather_fixed_values<std::uint16_t>(windows, column, map, rows, stream, mr);
-      break;
-    case 4:
-      values = gather_fixed_values<std::uint32_t>(windows, column, map, rows, stream, mr);
-      break;
-    case 8:
-      values = gather_fixed_values<std::uint64_t>(windows, column, map, rows, stream, mr);
-      break;
-    case 16:
-      values = gather_fixed_values<unsigned __int128>(windows, column, map, rows, stream, mr);
-      break;
+  switch (cudf::size_of(windows.front().column(column).type())) {
+    case 1: return gather_fixed_values<std::uint8_t>(windows, column, map, rows, stream, mr);
+    case 2: return gather_fixed_values<std::uint16_t>(windows, column, map, rows, stream, mr);
+    case 4: return gather_fixed_values<std::uint32_t>(windows, column, map, rows, stream, mr);
+    case 8: return gather_fixed_values<std::uint64_t>(windows, column, map, rows, stream, mr);
+    case 16: return gather_fixed_values<unsigned __int128>(windows, column, map, rows, stream, mr);
     default:
       throw std::invalid_argument("gather_kway: unsupported fixed-width size in column " +
                                   std::to_string(column));
   }
-  auto validity = gather_validity(windows, column, map, rows, stream, mr);
-  return std::make_unique<cudf::column>(
-    type, rows, std::move(values), std::move(validity.mask), validity.null_count);
 }
 
-std::unique_ptr<cudf::column> gather_strings(std::span<const cudf::table_view> windows,
-                                             cudf::size_type column,
-                                             gather_map map,
-                                             cudf::size_type rows,
-                                             rmm::cuda_stream_view stream,
-                                             rmm::device_async_resource_ref mr)
+/// One output column whose kernels are queued; its null count, and the chars size of a STRING
+/// column, are still on the device.
+struct pending_column {
+  gathered_validity validity;
+  rmm::device_buffer values;                                  ///< Fixed-width only.
+  std::optional<rmm::device_uvector<string_source>> sources;  ///< STRING only.
+  std::unique_ptr<cudf::column> offsets;                      ///< STRING only: int32 offsets.
+};
+
+/// The (pointer, size) pair of every output row of a STRING column.
+auto string_pairs(pending_column const& pending, gather_map map)
+{
+  return cuda::transform_iterator(
+    cuda::counting_iterator<cudf::size_type>{0},
+    string_pair_fn{
+      map, pending.sources->data(), pending.validity.nullable, pending.validity.device_fn(map)});
+}
+
+/// Queues the null mask and the int32 offsets of a STRING column; the last offset, the chars
+/// size, also goes to the device slot @p chars_bytes with 64 bits. Does not wait on the stream.
+pending_column start_strings(std::span<const cudf::table_view> windows,
+                             cudf::size_type column,
+                             gather_map map,
+                             cudf::size_type rows,
+                             cudf::size_type* valid_count,
+                             std::int64_t* chars_bytes,
+                             rmm::cuda_stream_view stream,
+                             rmm::device_async_resource_ref mr)
 {
   auto const temp_mr = cudf::get_current_device_resource_ref();
   std::vector<string_source> sources(windows.size());
@@ -240,24 +275,69 @@ std::unique_ptr<cudf::column> gather_strings(std::span<const cudf::table_view> w
                            : static_cast<void const*>(offsets.data<std::int32_t>() + col.offset());
     sources[i]         = string_source{strings.chars_begin(stream), first, large};
   }
-  auto const d_sources = cudf::detail::make_device_uvector_async(sources, stream, temp_mr);
-  auto validity        = gather_validity(windows, column, map, rows, stream, mr);
+  pending_column pending{
+    gather_validity(windows, column, map, rows, valid_count, stream, mr),
+    rmm::device_buffer{},
+    cudf::detail::make_device_uvector_async(sources, stream, temp_mr),
+    cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, rows + 1, cudf::mask_state::UNALLOCATED, stream, mr)};
 
-  auto const pairs = cuda::transform_iterator(
-    cuda::counting_iterator<cudf::size_type>{0},
-    string_pair_fn{map, d_sources.data(), validity.nullable, validity.device_fn(map)});
-  auto const sizes = cuda::transform_iterator(
-    pairs,
-    cuda::proclaim_return_type<cudf::size_type>(
-      [] __device__(cudf::strings::detail::string_index_pair const& pair) { return pair.second; }));
+  // The first pass of cudf's make_offsets_child_column, without its read-back of the total: the
+  // scan accumulates in 64 bits, stores 32-bit offsets and saves the exact total in the slot.
+  // The input has rows + 1 values; the last one (0) is never added.
+  auto const sizes = cuda::transform_iterator(string_pairs(pending, map), pair_size_fn{});
+  auto const input = cudf::detail::make_counting_transform_iterator(
+    0, cudf::strings::detail::string_offsets_fn{sizes, rows});
+  auto* const d_offsets = pending.offsets->mutable_view().data<std::int32_t>();
+  thrust::exclusive_scan(
+    rmm::exec_policy_nosync(stream, temp_mr),
+    input,
+    input + rows + 1,
+    cudf::detail::make_sizes_to_offsets_iterator(d_offsets, d_offsets + rows + 1, chars_bytes),
+    std::int64_t{0});
+  return pending;
+}
 
-  // Switches to int64 offsets past the large-strings threshold.
-  auto [offsets, bytes] =
-    cudf::strings::detail::make_offsets_child_column(sizes, sizes + rows, stream, mr);
-  auto chars =
-    cudf::strings::detail::make_chars_buffer(offsets->view(), bytes, pairs, rows, stream, mr);
-  return cudf::make_strings_column(
-    rows, std::move(offsets), chars.release(), validity.null_count, std::move(validity.mask));
+/// Gathers the chars of a STRING column once its chars size is on the host.
+std::unique_ptr<cudf::column> finish_strings(pending_column&& pending,
+                                             gather_map map,
+                                             cudf::size_type rows,
+                                             cudf::size_type null_count,
+                                             std::int64_t chars_bytes,
+                                             rmm::cuda_stream_view stream,
+                                             rmm::device_async_resource_ref mr)
+{
+  auto const pairs     = string_pairs(pending, map);
+  auto const threshold = cudf::strings::get_offset64_threshold();
+  CUDF_EXPECTS(cudf::strings::is_large_strings_enabled() || chars_bytes < threshold,
+               "Size of output exceeds the column size limit",
+               std::overflow_error);
+  if (chars_bytes >= threshold) {
+    // Past the large-strings threshold the offsets are int64: cudf builds them again (it waits
+    // on the stream for the total).
+    auto const sizes = cuda::transform_iterator(pairs, pair_size_fn{});
+    std::tie(pending.offsets, chars_bytes) =
+      cudf::strings::detail::make_offsets_child_column(sizes, sizes + rows, stream, mr);
+  }
+  auto chars = cudf::strings::detail::make_chars_buffer(
+    pending.offsets->view(), chars_bytes, pairs, rows, stream, mr);
+  return cudf::make_strings_column(rows,
+                                   std::move(pending.offsets),
+                                   chars.release(),
+                                   null_count,
+                                   std::move(pending.validity.mask));
+}
+
+/// Copies @p read_back.source to the host and waits for it.
+void copy_to_host(gather_read_back const& read_back, rmm::cuda_stream_view stream)
+{
+  if (read_back.source.empty()) { return; }
+  CUDF_CUDA_TRY(cudaMemcpyAsync(read_back.destination.data(),
+                                read_back.source.data(),
+                                read_back.source.size() * sizeof(cudf::size_type),
+                                cudaMemcpyDeviceToHost,
+                                stream.value()));
+  stream.synchronize();
 }
 
 void validate_schema(std::span<const cudf::table_view> windows)
@@ -286,11 +366,15 @@ void validate_schema(std::span<const cudf::table_view> windows)
 
 }  // namespace
 
+// Every column's kernels are queued first; the null counts and the STRING chars sizes they
+// leave on the device then come back in one copy, together with the caller's read-back, so the
+// waits on the stream do not grow with the number of columns or windows.
 std::unique_ptr<cudf::table> gather_kway(std::span<const cudf::table_view> windows,
                                          cudf::device_span<const std::int32_t> src_input,
                                          cudf::device_span<const cudf::size_type> src_row,
                                          rmm::cuda_stream_view stream,
-                                         rmm::device_async_resource_ref mr)
+                                         rmm::device_async_resource_ref mr,
+                                         gather_read_back read_back)
 {
   validate_schema(windows);
   if (src_input.size() != src_row.size()) {
@@ -299,18 +383,92 @@ std::unique_ptr<cudf::table> gather_kway(std::span<const cudf::table_view> windo
   if (src_input.size() > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::invalid_argument("gather_kway: the map exceeds the column size limit");
   }
+  if (read_back.source.size() != read_back.destination.size()) {
+    throw std::invalid_argument("gather_kway: the read-back source and destination differ in size");
+  }
   auto const rows = static_cast<cudf::size_type>(src_input.size());
-  if (rows == 0) { return cudf::empty_like(windows.front()); }
+  if (rows == 0) {
+    copy_to_host(read_back, stream);
+    return cudf::empty_like(windows.front());
+  }
 
   gather_map const map{src_input.data(), src_row.data()};
-  auto const num_columns = windows.front().num_columns();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(static_cast<std::size_t>(num_columns));
-  for (cudf::size_type c = 0; c < num_columns; ++c) {
-    columns.push_back(windows.front().column(c).type().id() == cudf::type_id::STRING
-                        ? gather_strings(windows, c, map, rows, stream, mr)
-                        : gather_fixed_width(windows, c, map, rows, stream, mr));
+  auto const temp_mr     = cudf::get_current_device_resource_ref();
+  auto const num_columns = static_cast<std::size_t>(windows.front().num_columns());
+  auto const is_string   = [&](std::size_t c) {
+    return windows.front().column(static_cast<cudf::size_type>(c)).type().id() ==
+           cudf::type_id::STRING;
+  };
+  std::size_t num_strings = 0;
+  for (std::size_t c = 0; c < num_columns; ++c) {
+    num_strings += is_string(c) ? 1 : 0;
   }
+
+  // What comes back from the device, as 64-bit words: the chars size of every STRING column,
+  // then, as size_type, the valid rows of every column and the caller's read-back.
+  auto const num_counts = num_columns + read_back.source.size();
+  rmm::device_uvector<std::int64_t> totals(num_strings + (num_counts + 1) / 2, stream, temp_mr);
+  CUDF_CUDA_TRY(
+    cudaMemsetAsync(totals.data(), 0, totals.size() * sizeof(std::int64_t), stream.value()));
+  auto* const d_chars_bytes = totals.data();
+  auto* const d_valid_count = reinterpret_cast<cudf::size_type*>(totals.data() + num_strings);
+  if (!read_back.source.empty()) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(d_valid_count + num_columns,
+                                  read_back.source.data(),
+                                  read_back.source.size() * sizeof(cudf::size_type),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.value()));
+  }
+
+  std::vector<pending_column> pending;
+  pending.reserve(num_columns);
+  for (std::size_t c = 0, s = 0; c < num_columns; ++c) {
+    auto const column = static_cast<cudf::size_type>(c);
+    if (is_string(c)) {
+      pending.push_back(start_strings(
+        windows, column, map, rows, d_valid_count + c, d_chars_bytes + s++, stream, mr));
+    } else {
+      // The values before the validity, so a rejected width throws before anything else.
+      auto values = gather_fixed_width(windows, column, map, rows, stream, mr);
+      pending.push_back(
+        pending_column{gather_validity(windows, column, map, rows, d_valid_count + c, stream, mr),
+                       std::move(values),
+                       std::nullopt,
+                       nullptr});
+    }
+  }
+
+  // The one wait every call makes.
+  auto const host_totals = cudf::detail::make_pinned_vector_async(totals, stream);
+  stream.synchronize();
+  std::vector<cudf::size_type> counts(num_counts);
+  std::memcpy(
+    counts.data(), host_totals.data() + num_strings, num_counts * sizeof(cudf::size_type));
+  if (!read_back.source.empty()) {
+    std::memcpy(read_back.destination.data(),
+                counts.data() + num_columns,
+                read_back.source.size() * sizeof(cudf::size_type));
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(num_columns);
+  for (std::size_t c = 0, s = 0; c < num_columns; ++c) {
+    auto& column          = pending[c];
+    auto const null_count = column.validity.nullable ? rows - counts[c] : 0;
+    if (is_string(c)) {
+      columns.push_back(
+        finish_strings(std::move(column), map, rows, null_count, host_totals[s++], stream, mr));
+    } else {
+      columns.push_back(std::make_unique<cudf::column>(
+        windows.front().column(static_cast<cudf::size_type>(c)).type(),
+        rows,
+        std::move(column.values),
+        std::move(column.validity.mask),
+        null_count));
+    }
+  }
+  // The chars of the STRING columns are gathered after the read-back.
+  if (num_strings > 0) { stream.synchronize(); }
   return std::make_unique<cudf::table>(std::move(columns));
 }
 

@@ -27,7 +27,10 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "sirius_config.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
+
+#include <rmm/cuda_device.hpp>
 
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -283,6 +286,8 @@ class pumping_task_creator final : public sirius::creator::task_creator {
 struct harness_options {
   std::size_t num_partitions   = 1;
   std::size_t executor_threads = 1;
+  /// GPU memory spaces, each with its own executor of `executor_threads` threads.
+  std::size_t num_gpus = 1;
 };
 
 /**
@@ -297,6 +302,8 @@ struct merge_harness {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
   memory_space* gpu  = nullptr;
   memory_space* host = nullptr;
+  /// The GPU memory space of each device; gpus[0] == gpu.
+  std::vector<memory_space*> gpus;
   observed_input_repository input;
   std::unique_ptr<recording_merge_sort> merge;
   ordered_collector collector;
@@ -314,14 +321,18 @@ struct merge_harness {
   std::atomic<std::size_t> rearms_from_execute{0};
 
   explicit merge_harness(harness_options options = {})
-    : manager{initialize_memory_manager(1,
+    : manager{initialize_memory_manager(options.num_gpus,
                                         {.gpu_bytes                = 512 * kMiB,
                                          .gpu_reservation_fraction = 0.9,
                                          .divide_among_gpus        = false,
                                          .per_stream_tracking      = false})}
   {
-    gpu = const_cast<memory_space*>(manager->get_memory_space(Tier::GPU, 0));
-    REQUIRE(gpu != nullptr);
+    for (std::size_t device = 0; device < options.num_gpus; ++device) {
+      gpus.push_back(
+        const_cast<memory_space*>(manager->get_memory_space(Tier::GPU, static_cast<int>(device))));
+      REQUIRE(gpus.back() != nullptr);
+    }
+    gpu        = gpus.front();
     auto hosts = manager->get_memory_spaces_for_tier(Tier::HOST);
     REQUIRE_FALSE(hosts.empty());
     host = const_cast<memory_space*>(hosts.front());
@@ -401,12 +412,14 @@ struct merge_harness {
                                                 .concurrent_tasks    = 1})
   {
     merge->set_merge_settings(merge::merge_settings::from(params));
-    merge->set_device_budget_provider([budget] { return budget; });
+    merge->set_device_budget_provider([budget](const memory_space*) { return budget; });
   }
 
   /**
    * @brief Add one sorted run of @p rows rows to @p partition: keys drawn from
    * [key_base, key_base + key_range), so runs share keys, and the payload described at host_rows.
+   *
+   * The run is created in the GPU memory space of @p device.
    *
    * @return The run's rows, in run order.
    */
@@ -414,8 +427,11 @@ struct merge_harness {
                     std::size_t run_index,
                     std::size_t rows,
                     std::int64_t key_base  = 0,
-                    std::int64_t key_range = 5000)
+                    std::int64_t key_range = 5000,
+                    std::size_t device     = 0)
   {
+    auto& space = *gpus.at(device);
+    rmm::cuda_set_device_raii on_device{rmm::cuda_device_id{space.get_device_id()}};
     std::vector<std::int64_t> keys(rows);
     auto seed = static_cast<std::uint64_t>(partition * 7919 + run_index * 104729 + 12345);
     for (auto& key : keys) {
@@ -435,8 +451,8 @@ struct merge_harness {
                                          merge_utils::make_column(payload, cudf::type_id::INT64));
     auto stream = default_stream();
     auto batch  = sirius::make_data_batch(
-      std::make_unique<cudf::table>(table->view(), stream, get_resource_ref(*gpu)),
-      *gpu,
+      std::make_unique<cudf::table>(table->view(), stream, get_resource_ref(space)),
+      space,
       stream,
       sirius::telemetry::batch_telemetry_info{});
     input.add_data_batch(batch, partition);
@@ -526,6 +542,9 @@ struct merge_harness {
       if (partition && merge::split_merge_chunk_position(position).first != *partition) {
         continue;
       }
+      // A chunk is read on the device of the task that produced it.
+      auto const device = batch->to_read_only().get_memory_space()->get_device_id();
+      rmm::cuda_set_device_raii on_device{rmm::cuda_device_id{device}};
       auto const view = sirius::get_cudf_table_view(*batch);
       REQUIRE(view.num_columns() == 2);
       auto const keys    = copy_column_to_host<std::int64_t>(view.column(0));
@@ -848,6 +867,14 @@ TEST_CASE("windowed merge sort with more runs than the fan-in cap merges in pass
   // A pass reorders runs, so equal keys need not keep the run order.
   require_sorted_rows(test.collected(), expected);
 
+  // A merger lasts for one intermediate pass, or for the final pass.
+  auto const counters = test.merge->counters();
+  REQUIRE(counters.windowed_partitions == 1);
+  REQUIRE(counters.windowed_tasks == records.size());
+  REQUIRE(counters.intermediate_tasks == intermediate_tasks);
+  REQUIRE(counters.mergers_built >= 2);
+  REQUIRE(counters.mergers_built <= records.size());
+
   // The intermediate runs were consumed and popped too.
   test.require_inputs_popped();
   for (auto id : intermediate_ids) {
@@ -878,6 +905,75 @@ TEST_CASE("windowed merge sort merges runs spread over the GPU and HOST tiers",
   REQUIRE(test.rearms_from_execute.load() == records.size() - 1);
   REQUIRE(test.collected() == expected);
   REQUIRE(test.pipeline->is_pipeline_finished());
+  test.require_inputs_popped();
+}
+
+TEST_CASE("windowed merge sort reads each HOST row once across the tasks of a partition",
+          "[merge_sort_continuation]")
+{
+  constexpr std::size_t num_runs     = 8;
+  constexpr std::size_t rows_per_run = 3000;
+  merge_harness test;
+  test.configure(small_window_params());
+  std::vector<host_rows> runs;
+  for (std::size_t run = 0; run < num_runs; ++run) {
+    runs.push_back(test.add_run(0, run, rows_per_run));
+    test.downgrade_to_host(run);
+  }
+  auto const total_rows = num_runs * rows_per_run;
+  auto const expected   = full_sort(concatenate(runs));
+
+  test.run();
+
+  auto const records = test.merge->records();
+  REQUIRE(records.size() >= 4);
+  REQUIRE(require_chunk_chain(records, 0) == records.size());
+  REQUIRE(test.collected() == expected);
+
+  // One merger served every task, so the rows a task buffered and did not emit were not read
+  // again by the next one: a merger per task would read about (k - 1) windows more per task.
+  auto const counters = test.merge->counters();
+  REQUIRE(counters.windowed_partitions == 1);
+  REQUIRE(counters.one_shot_partitions == 0);
+  REQUIRE(counters.windowed_tasks == records.size());
+  REQUIRE(counters.intermediate_tasks == 0);
+  REQUIRE(counters.mergers_built == 1);
+  REQUIRE(counters.rounds.rows_out == total_rows);
+  REQUIRE(counters.rounds.refill_rows >= total_rows);
+  REQUIRE(counters.rounds.refill_rows <= total_rows + total_rows / 100);
+  REQUIRE(counters.rounds.fallback_conversions == 0);
+  test.require_inputs_popped();
+}
+
+TEST_CASE("windowed merge sort keeps its merger when a run ends before the others",
+          "[merge_sort_continuation]")
+{
+  merge_harness test;
+  test.configure(small_window_params());
+  std::vector<host_rows> runs;
+  // Run 0 holds only the smallest keys, so it is read to its end by the first tasks.
+  runs.push_back(test.add_run(0, 0, 2000, 0, 500));
+  for (std::size_t run = 1; run < 5; ++run) {
+    runs.push_back(test.add_run(0, run, 4000, 0, 5000));
+  }
+  test.downgrade_to_host(0);
+  test.downgrade_to_host(2);
+  test.downgrade_to_host(4);
+  std::size_t host_rows_total = runs[0].size() + runs[2].size() + runs[4].size();
+  auto const expected         = full_sort(concatenate(runs));
+
+  test.run();
+
+  auto const records = test.merge->records();
+  REQUIRE(records.size() >= 4);
+  // The first task still read run 0; the last ones no longer did.
+  REQUIRE(records.front().runs == 5);
+  REQUIRE(records.back().runs < 5);
+  REQUIRE(test.collected() == expected);
+  auto const counters = test.merge->counters();
+  REQUIRE(counters.mergers_built == 1);
+  REQUIRE(counters.rounds.refill_rows >= host_rows_total);
+  REQUIRE(counters.rounds.refill_rows <= host_rows_total + host_rows_total / 100);
   test.require_inputs_popped();
 }
 
@@ -937,4 +1033,61 @@ TEST_CASE("merge sort automatic mode routes by the one-shot share of the GPU",
     REQUIRE(test.pipeline->is_pipeline_finished());
     test.require_inputs_popped();
   }
+}
+
+TEST_CASE("windowed merge sort merges runs spread over two GPUs, one partition per device",
+          "[merge_sort_mgpu][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { SKIP("needs two GPUs"); }
+  constexpr std::size_t num_partitions = 4;
+  constexpr std::size_t runs_per_part  = 6;
+  merge_harness test{{.num_partitions = num_partitions, .executor_threads = 2, .num_gpus = 2}};
+  test.configure(small_window_params());
+  // Four runs of a partition on its own device and two on the other one: the task goes to the
+  // device holding most of the partition, and the other two runs are moved to it whole.
+  std::vector<std::vector<host_rows>> runs(num_partitions);
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    for (std::size_t run = 0; run < runs_per_part; ++run) {
+      auto const home   = partition % 2;
+      auto const device = run % 3 == 2 ? 1 - home : home;
+      runs[partition].push_back(test.add_run(partition,
+                                             run,
+                                             4000 + 300 * run,
+                                             static_cast<std::int64_t>(partition) * 10000,
+                                             5000,
+                                             device));
+    }
+  }
+
+  test.run();
+
+  auto const records = test.merge->records();
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    CAPTURE(partition);
+    REQUIRE(require_chunk_chain(records, partition) >= 3);
+    REQUIRE(test.collected(partition) == full_sort(concatenate(runs[partition])));
+  }
+  REQUIRE(sorted_by_key(test.collected()));
+  REQUIRE(test.pipeline->is_pipeline_finished());
+
+  // Partitions were merged on both devices, at the same time.
+  std::map<int, std::size_t> tasks_per_device;
+  test.scheduler->visit_executors(
+    [&](int device, const sirius::pipeline::gpu_pipeline_executor& executor) {
+      tasks_per_device[device] = executor.get_metrics().tasks_executed;
+    });
+  REQUIRE(tasks_per_device.size() == 2);
+  for (auto const& [device, tasks] : tasks_per_device) {
+    CAPTURE(device);
+    REQUIRE(tasks >= 3);
+  }
+  REQUIRE(test.merge->peak_running() >= 2);
+
+  // The runs on the other device were converted whole, once each; nothing was read by row range.
+  auto const counters = test.merge->counters();
+  REQUIRE(counters.windowed_partitions == num_partitions);
+  REQUIRE(counters.windowed_tasks == records.size());
+  REQUIRE(counters.rounds.fallback_conversions >= num_partitions);
+  REQUIRE(counters.rounds.fallback_conversions <= num_partitions * runs_per_part);
+  test.require_inputs_popped();
 }

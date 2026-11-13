@@ -664,9 +664,11 @@ the plan generator installs the query's settings.
 The sizes of a windowed partition (`merge::derived_merge_config`: window rows, output target,
 fan-in, one-shot fraction) are derived once at arming from the settings, the device's GPU memory and
 the partition's run count and row width. `set_device_budget_provider()` supplies the GPU memory and
-task concurrency; without a provider the operator uses the GPU memory space that holds most of the
-partition's bytes (or the last one it saw, or 8 GiB with a warning when it has seen none) and the
-default GPU executor width.
+task concurrency. The plan generator installs `make_device_budget_provider()`, which reports the
+GPU memory space holding most of the partition's bytes (the smallest GPU space when no run is on a
+GPU) and the configured GPU executor thread count. A directly constructed operator has no
+provider: it uses the majority space (or the last one it saw, or 8 GiB with a warning when it has
+seen none) and the default GPU executor width.
 
 #### Continuation tasks
 
@@ -680,43 +682,72 @@ one `run_state` per run, the next output chunk index and an `in_flight` flag.
   `get_batch_ids()` and `get_data_batch_by_id()`. The batches are not popped and the task does not
   subscribe them, so they stay spillable while tasks are queued and running. Zero-row batches are
   popped at arming.
+- **Arming never waits for a batch lock under `_drain_mutex`.** `on_input_batch_pushed()` records
+  each run's rows and bytes when it arrives, and arming uses `try_to_read_only()`. A run that is
+  locked by a tier move counts as off the GPU. When such a run was never sized, or no readable
+  batch exposes the schema, the partition stays unarmed (`arm_deferred`): a committing task makes
+  it armable again, and when no task is in flight the task-creation thread waits for that batch
+  outside the mutex and arms again.
 - **One task per partition at a time.** Each task starts from the cursors the previous one
   committed. Different partitions run in parallel. `get_next_task_hint()` returns READY only when
   some partition has runs and no task in flight, and no hint otherwise.
-- **One positioned chunk per task.** A task copies the cursors, resolves the batch ids, and runs
-  one `merge::windowed_merger::run()`, which returns one table of about `output_target_bytes`. A
-  final-pass task fetches the output columns plus the keys they lack, drops the key-only columns
-  and publishes one batch.
+- **One positioned chunk per task.** A task runs one `merge::windowed_merger::run()`, which
+  returns one table of about `output_target_bytes`. A final-pass task fetches the output columns
+  plus the keys they lack, drops the key-only columns and publishes one batch.
+- **One merger per task chain.** The `windowed_merger` is kept in the partition's state between
+  tasks (`partition_merger`: the merger, its cursors and the run ids they belong to), so rows a
+  task read into a window buffer but did not emit are not read again by the next task. A task
+  moves it out under `_drain_mutex`, runs it without the mutex, and puts it back at commit. A new
+  merger is built when the task's GPU memory space or window sizes differ (an OOM shrink), when the
+  run set changes (an intermediate pass starts or ends), and after any failed task. A run that
+  ends before the others does not force a rebuild. Between tasks the merger holds references to
+  the unread batches and its window buffers stay allocated on the GPU
+  (see [Windowed Merge Memory](memory-management.md#windowed-merge-memory)).
 - **Positions.** The output position is `(partition << 32) | chunk`
   (`merge::make_merge_chunk_position()`), which orders chunks by partition, then by chunk. It
   throws when either part reaches 2^32. In `auto` and `windowed` mode one-shot partitions use the
   same encoding with chunk 0. In `one_shot` mode the position is the partition index.
-- **Commit → pop → `schedule(this)`.** After the merge returns, the task commits under
-  `_drain_mutex`: it pops every batch that was read to the end (which frees it), stores the
-  cursors rebased to the remaining batches, advances the chunk index and clears `in_flight`. It
+- **Commit → pop → `schedule(this)`.** After the merge returns, the task calls
+  `windowed_merger::rebase_consumed()`, which drops the merger's references to the batches read to
+  the end and rebases its cursors to the remaining ones. It then commits under `_drain_mutex`: it
+  pops those batches (which frees them), copies the cursors to the partition's runs by run id,
+  advances the chunk index, returns the merger to the partition and clears `in_flight`. It
   then calls `task_creator::schedule(this)` when some partition can produce a task, because nothing
   else asks an operator for its next task when one of its own tasks finishes (see
   [Self-Rescheduling Operators](task-creator.md#self-rescheduling-operators)).
 - **Retry.** The partition's cursors change only at commit. A task that fails (for example on OOM)
-  leaves them and `in_flight` unchanged, and the rescheduled task replays from the same cursors,
+  leaves them and `in_flight` unchanged and destroys the merger it held, which frees its window
+  buffers. The rescheduled task builds a new merger and replays from the same cursors,
   possibly with smaller windows (see [Shrink Before Retry](memory-management.md#shrink-before-retry)).
   A task that returns no rows while a cursor is not exhausted throws `internal_exception`.
+- **Counters.** `merge_sort_counters` counts the partitions armed on each route, the windowed and
+  intermediate tasks, the mergers built and the summed `merge::merge_round_stats`. `counters()`
+  reads one operator's; `process_counters()` / `reset_process_counters()` are process-wide, for
+  tests and diagnostics (they are not per query).
 
 #### Bounded k-way merge round
 
 `windowed_merger::run()` repeats rounds until the accumulated output reaches
-`output_target_bytes` or every cursor is exhausted, then concatenates the rounds into one table.
+`output_target_bytes` (counted with `cudf::table::alloc_size()`, on the host) or every cursor is
+exhausted, then concatenates the rounds into one table.
 With `n` = `window_rows`, each round does the following:
 
 1. **Windows.** Every run that is not exhausted gets a window of at most `n` rows of its current
    batch, starting at the cursor. A window never spans two batches of a run.
-   - A batch on the GPU tier in the task's memory space is windowed with `cudf::slice` over a
-     read-locked view. Nothing is copied. The lock is held until the batch is finished or `run()`
-     returns.
-   - Any other batch is read into a `detail::window_buffer`: two preallocated slots of `n` rows
-     per run. `consume()` copies the unread tail to the front of the other slot, and `refill()`
-     appends rows after it with `cucascade::read_rows_into`, under a read lock held only for that
-     refill (see [Row-Range Readers](memory-management.md#row-range-readers)).
+   - A `gpu_table_representation` batch in the task's memory space is windowed as offset column
+     views over a read-locked table. Nothing is copied. The lock is held until the batch is
+     finished or `run()` returns.
+   - Any other batch is read into a `detail::window_buffer`: two preallocated slots per run, of
+     `min(n, largest remaining batch of the run)` rows, with each STRING column's chars sized from
+     that column's own bytes per row in the batch metadata. Consuming rows only moves a start
+     offset. When fewer rows are left than half of what the last refill held, `consume()` copies
+     the unread tail to the front of the other slot and `refill()` appends rows after it with
+     `cucascade::read_rows_into`, under a read lock held only for that refill (see
+     [Row-Range Readers](memory-management.md#row-range-readers)). A row is copied at most once.
+     A row that does not fit a STRING slot grows the slots (`window_row_too_large_error` is
+     handled by the merger). The buffer is freed when the run ends or its batch is found on the
+     GPU.
+   - A window's `null_count()` is an upper bound (exact only when 0): the kernel reads the masks.
 2. **Safe bound.** A window is *truncated* when its run has unread rows beyond it. The round emits
    `target = min(n, r_safe, Σ window rows)` rows, where `r_safe` is the smallest, over the
    truncated windows, of the rank of the window's last row in the combined order, plus one
@@ -725,16 +756,22 @@ With `n` = `window_rows`, each round does the following:
 3. **Co-rank.** `detail::corank_split()` finds, for an output rank `r`, how many rows of each
    window are among the first `r` rows of the merged order. It is evaluated at every tile boundary
    (`kDefaultTileRows` = 2048 output rows) and at `target`.
-4. **Tile merge.** `detail::tile_merge()` merges each tile independently, one thread per tile with
-   a tournament tree in shared memory, and writes an `(input, row)` gather map of `target`
-   entries. It accepts at most 4096 windows.
+4. **Tile merge.** `detail::tile_merge()` merges each tile independently and writes an
+   `(input, row)` gather map of `target` entries. A tile is split into sub-tiles, one thread
+   each with a tournament tree in shared memory; the split is chosen from the tile count, the
+   device's SM count and the shared memory the fan-in needs. It accepts at most
+   `kMaxKwayMergeInputs` (4096) windows; the configured fan-in is clamped to that.
 5. **Gather.** `detail::gather_kway()` copies the selected rows of all fetched columns, with null
-   masks and STRING data, into the round's output table.
+   masks and STRING data, into the round's output table. The null counts, the STRING sizes and
+   the consumed counts come back to the host in one read.
 6. **Advance.** The co-ranks at `target` are the rows consumed from each window. Cursors advance by
    them and the window buffers drop the consumed rows.
 
 `bounded_kway_merge()` never materializes the `k × n` window rows, and it breaks ties by window
 index and then row, so the result matches a stable merge. Nested key types are not supported.
+The key comparator copies the column views of all windows to the device in one asynchronous
+copy, so a call waits on the stream twice (the target, then the gather's read-back), three times
+with a STRING column, whatever the fan-in.
 
 #### Fan-in cap and intermediate runs
 

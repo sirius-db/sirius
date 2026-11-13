@@ -186,7 +186,7 @@ there is no separate repository completion protocol.
 | Method | Behavior |
 |--------|----------|
 | `get_next_task_hint()` | Base class first. A READY hint is kept only when some partition can produce a task: it has runs and no task in flight. Otherwise no hint; the task in flight schedules the operator again. |
-| `get_next_task_input_data()` | Mutex-locked (`_drain_mutex`): takes the lowest partition that has runs and no task in flight. The first call for a partition chooses its route. One-shot: pops ALL batches of the partition into a `pipelineable_operator_data`. Windowed: peeks the batches without popping them and returns a `windowed_merge_input` with a copy of the partition's cursors, marking the partition in flight. |
+| `get_next_task_input_data()` | Mutex-locked (`_drain_mutex`): takes the lowest partition that has runs and no task in flight. The first call for a partition chooses its route. Arming takes no blocking batch lock under the mutex: a partition whose run is locked by a tier move and could not be sized is deferred until a task commits, or, when no task is in flight, the call waits for that batch outside the mutex and arms again. One-shot: pops ALL batches of the partition into a `pipelineable_operator_data`. Windowed: peeks the batches without popping them and returns a `windowed_merge_input` with a copy of the partition's cursors, marking the partition in flight. |
 | Why custom | A one-shot merge must drain the entire partition; a windowed merge is a chain of tasks per partition, each starting from the cursors the previous one committed |
 
 The windowed route uses the two mechanisms described under

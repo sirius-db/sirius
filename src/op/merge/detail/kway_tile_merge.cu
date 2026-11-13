@@ -21,9 +21,10 @@
 // tree. All of a thread's state is in shared memory, transposed (element e of thread t at
 // [e * blockDim.x + t]) so the lanes of a warp that touch the same element hit different banks.
 //
-// Limit: k <= kTileMergeMaxInputs (4096), where one thread's state (40 KiB) still fits the default
+// Limit: k <= kMaxKwayMergeInputs (4096), where one thread's state (40 KiB) still fits the default
 // 48 KiB of shared memory of a CTA; tile_merge throws std::invalid_argument for a larger k.
 
+#include "op/merge/bounded_kway_merge.hpp"
 #include "op/merge/detail/kway_comparator.cuh"
 #include "op/merge/detail/kway_merge_detail.hpp"
 
@@ -34,15 +35,15 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sirius::op::merge::detail {
 
 namespace {
 
-/// Largest fan-in tile_merge accepts.
-constexpr std::int32_t kTileMergeMaxInputs = 4096;
 /// Shared memory a CTA may use.
 constexpr std::size_t kTileMergeSharedBytes = 40 * 1024;
 /// Most threads per CTA.
@@ -61,8 +62,10 @@ constexpr std::size_t thread_state_bytes(std::int32_t padded_inputs)
          (2 * sizeof(cudf::size_type) + sizeof(std::uint16_t));
 }
 
-static_assert(thread_state_bytes(kTileMergeMaxInputs) <= kTileMergeSharedBytes);
-static_assert(kTileMergeMaxInputs <= UINT16_MAX);
+// The public fan-in limit is what one thread's state and the 16-bit tree entries allow.
+static_assert(thread_state_bytes(static_cast<std::int32_t>(kMaxKwayMergeInputs)) <=
+              kTileMergeSharedBytes);
+static_assert(kMaxKwayMergeInputs <= UINT16_MAX);
 
 /// Thread `threadIdx.x` of block `blockIdx.x` merges sub-tile `threadIdx.x % sub_tiles` of tile
 /// `blockIdx.x * (blockDim.x / sub_tiles) + threadIdx.x / sub_tiles`. The shared memory holds
@@ -230,14 +233,28 @@ __global__ void tile_merge_kernel(kway_key_device_view keys,
   }
 }
 
+/// SM count of the calling thread's current device. The attribute is queried once per device.
+int current_device_sm_count()
+{
+  static std::mutex mutex;
+  static std::vector<int> sm_counts;  // by device ordinal; 0: not queried yet
+  int device = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  const auto slot = static_cast<std::size_t>(device);
+  const std::lock_guard lock(mutex);
+  if (sm_counts.size() <= slot) { sm_counts.resize(slot + 1, 0); }
+  if (sm_counts[slot] == 0) {
+    int sm_count = 0;
+    CUDF_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+    sm_counts[slot] = std::max(sm_count, 1);
+  }
+  return sm_counts[slot];
+}
+
 /// Sub-tiles per tile that bring the merge threads to about kTileMergeThreadsPerSm per SM.
 std::int32_t sub_tiles_for_device(cudf::size_type tiles)
 {
-  int device   = 0;
-  int sm_count = 0;
-  CUDF_CUDA_TRY(cudaGetDevice(&device));
-  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-  const std::int64_t threads = std::max<std::int64_t>(sm_count, 1) * kTileMergeThreadsPerSm;
+  const std::int64_t threads = current_device_sm_count() * kTileMergeThreadsPerSm;
   return static_cast<std::int32_t>(
     std::min<std::int64_t>((threads - 1) / tiles + 1, kTileMergeMaxBlockThreads));
 }
@@ -255,10 +272,10 @@ void tile_merge_impl(const kway_key_comparator& cmp,
                      rmm::cuda_stream_view stream)
 {
   const std::int32_t k = cmp.num_inputs();
-  if (k > kTileMergeMaxInputs) {
+  if (static_cast<std::size_t>(k) > kMaxKwayMergeInputs) {
     throw std::invalid_argument("tile_merge: " + std::to_string(k) +
                                 " inputs exceed the supported fan-in of " +
-                                std::to_string(kTileMergeMaxInputs));
+                                std::to_string(kMaxKwayMergeInputs));
   }
   if (lengths.size() != static_cast<std::size_t>(k)) {
     throw std::invalid_argument("tile_merge: lengths needs one entry per input");

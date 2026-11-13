@@ -26,7 +26,6 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <cuda_runtime_api.h>
 #include <thrust/tabulate.h>
 
 #include <cstddef>
@@ -112,6 +111,8 @@ bounded_merge_result bounded_kway_merge(std::span<const cudf::table_view> window
     key_windows.push_back(window.select(keys.key_cols));
     host_lengths.push_back(window.num_rows());
   }
+  // Nothing waits on the stream before safe_target: the comparator and the two arrays below are
+  // filled by asynchronous copies.
   const auto cmp = detail::kway_key_comparator::create(
     key_windows, keys.column_order, keys.null_precedence, stream, temp_mr);
   const auto lengths     = cudf::detail::make_device_uvector_async(host_lengths, stream, temp_mr);
@@ -140,17 +141,18 @@ bounded_merge_result bounded_kway_merge(std::span<const cudf::table_view> window
   rmm::device_uvector<cudf::size_type> out_row(static_cast<std::size_t>(target), stream, temp_mr);
   detail::tile_merge(cmp, lengths, coranks, target, tile_rows, out_input, out_row, stream);
 
-  result.output = detail::gather_kway(windows, out_input, out_row, stream, mr);
-
-  // Second sync: consumed[i] = c_i(target). It also lets every kernel above finish before the
-  // comparator and the scratch buffers go away.
+  // Second sync, inside the gather: consumed[i] = c_i(target) comes back with the gather's own
+  // counts. The gather returns once the stream has run everything queued above, so the
+  // comparator and the scratch buffers can go away.
   result.consumed.resize(k);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(result.consumed.data(),
-                                coranks.data() + tiles * k,
-                                k * sizeof(cudf::size_type),
-                                cudaMemcpyDeviceToHost,
-                                stream.value()));
-  stream.synchronize();
+  result.output = detail::gather_kway(
+    windows,
+    out_input,
+    out_row,
+    stream,
+    mr,
+    detail::gather_read_back{
+      cudf::device_span<const cudf::size_type>{coranks.data() + tiles * k, k}, result.consumed});
   return result;
 }
 

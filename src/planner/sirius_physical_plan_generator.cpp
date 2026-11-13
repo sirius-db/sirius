@@ -1507,7 +1507,8 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
 //! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                   const sirius::operator_params& op_params)
+                   const sirius::operator_params& op_params,
+                   duckdb::SiriusContext* sirius_ctx)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> order_op) {
     auto* order_ptr = &order_op->Cast<sirius::op::sirius_physical_order>();
@@ -1541,6 +1542,14 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
 
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
     merge->set_merge_settings(sirius::op::merge::merge_settings::from(op_params));
+    if (sirius_ctx != nullptr && sirius_ctx->is_initialized()) {
+      // Windows are sized from the real GPU memory spaces and the configured executor width.
+      merge->set_device_budget_provider(
+        sirius::op::sirius_physical_merge_sort::make_device_budget_provider(
+          sirius_ctx->get_memory_manager(),
+          static_cast<std::size_t>(
+            std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads))));
+    }
 
     bool is_identity = (original_projections.size() == order_ptr->types.size());
     if (is_identity) {
@@ -1942,7 +1951,9 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
       wrap_ungrouped_aggregate(slot);
       break;
-    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY: wrap_order_by(slot, op_params); break;
+    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY:
+      wrap_order_by(slot, op_params, compressed_materialization_observer);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:

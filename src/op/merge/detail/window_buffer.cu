@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+#include "memory/size_arithmetic.hpp"
 #include "op/merge/detail/window_buffer.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -117,12 +119,33 @@ struct column_state {
 /// n * est * 1.25, saturating.
 std::size_t chars_capacity(std::size_t rows, std::size_t est_bytes_per_row)
 {
-  constexpr auto max = std::numeric_limits<std::size_t>::max();
-  if (est_bytes_per_row != 0 && rows > max / est_bytes_per_row) { return max; }
-  auto const bytes = rows * est_bytes_per_row;
-  auto const slack = bytes / 4;
-  return bytes > max - slack ? max : bytes + slack;
+  auto const bytes = sirius::memory::saturating_mul(rows, est_bytes_per_row);
+  return sirius::memory::saturating_add(bytes, bytes / 4);
 }
+
+/// Pinned host memory for one device read-back, from cuDF's pinned resource (a pool: taking and
+/// returning it does not synchronize the device). Allocation and release are ordered on a stream.
+class pinned_read_back {
+ public:
+  pinned_read_back(std::size_t count, ::cuda::stream_ref stream)
+    : _mr(cudf::get_pinned_memory_resource()),
+      _stream(stream),
+      _bytes(count * sizeof(int64_t)),
+      _data(_mr.allocate(stream, _bytes, alignof(int64_t)))
+  {
+  }
+  ~pinned_read_back() { _mr.deallocate(_stream, _data, _bytes, alignof(int64_t)); }
+  pinned_read_back(const pinned_read_back&)            = delete;
+  pinned_read_back& operator=(const pinned_read_back&) = delete;
+
+  [[nodiscard]] int64_t* data() const noexcept { return static_cast<int64_t*>(_data); }
+
+ private:
+  rmm::host_device_async_resource_ref _mr;
+  ::cuda::stream_ref _stream;
+  std::size_t _bytes;
+  void* _data;
+};
 
 template <typename Offset>
 void carry_string_tail(const column_slot& src,
@@ -159,9 +182,9 @@ struct window_buffer::impl {
   rmm::device_async_resource_ref mr;
   /// Stream of the last device work on the slots; later work on another stream waits for it.
   cudaStream_t last_stream{nullptr};
-  /// Null counts of the active slot, computed by view() when stale.
-  mutable std::vector<cudf::size_type> null_counts;
-  mutable bool null_counts_valid{true};
+  /// Columns the caller declared free of NULLs (set_null_free); view() gives them no mask.
+  std::vector<bool> null_free;
+  std::size_t growths{0};
 
   impl(std::size_t capacity_rows, rmm::device_async_resource_ref resource, cudaStream_t stream)
     : capacity(capacity_rows), mr(resource), last_stream(stream)
@@ -182,25 +205,41 @@ struct window_buffer::impl {
     CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventDestroy(event));
     CUCASCADE_CUDA_TRY(wait_status);
     last_stream = stream;
+    // The slots are released on the stream of the latest work on them.
+    for (auto& col : columns) {
+      for (auto& slot : col.slots) {
+        slot.data.set_stream(::cuda::stream_ref{stream});
+        slot.mask.set_stream(::cuda::stream_ref{stream});
+        slot.offsets.set_stream(::cuda::stream_ref{stream});
+      }
+    }
   }
 
-  /// Reads back the chars end of the STRING columns whose end only the device knows.
+  /// Reads back the chars end of the STRING columns whose end only the device knows: the copies
+  /// land in one pinned buffer and the stream is synchronized once.
   void resolve_chars_ends(cudaStream_t stream)
   {
-    std::vector<int64_t> ends(columns.size(), 0);
-    bool pending = false;
-    for (std::size_t i = 0; i < columns.size(); ++i) {
-      auto& col = columns[i];
+    auto const pending = std::any_of(columns.begin(), columns.end(), [](auto const& col) {
+      return col.is_string() && !col.chars_end_exact;
+    });
+    if (!pending) { return; }
+    pinned_read_back const read_back(columns.size(), ::cuda::stream_ref{stream});
+    auto* const ends = read_back.data();
+    auto status      = cudaSuccess;
+    for (std::size_t i = 0; i < columns.size() && status == cudaSuccess; ++i) {
+      auto const& col = columns[i];
       if (!col.is_string() || col.chars_end_exact) { continue; }
       auto const* last_offset = static_cast<const std::uint8_t*>(col.slots[active].offsets.data()) +
                                 size * col.offset_width;
       // Little-endian: an int32 offset fills the low half of the zeroed int64.
-      CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(&ends[i], last_offset, col.offset_width, cudaMemcpyDeviceToHost, stream));
-      pending = true;
+      ends[i] = 0;
+      status =
+        cudaMemcpyAsync(&ends[i], last_offset, col.offset_width, cudaMemcpyDeviceToHost, stream);
     }
-    if (!pending) { return; }
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream));
+    // Also after a failed copy: the pinned buffer must not be released under a copy in flight.
+    auto const sync_status = cudaStreamSynchronize(stream);
+    CUCASCADE_CUDA_TRY(status);
+    CUCASCADE_CUDA_TRY(sync_status);
     for (std::size_t i = 0; i < columns.size(); ++i) {
       auto& col = columns[i];
       if (!col.is_string() || col.chars_end_exact) { continue; }
@@ -230,7 +269,8 @@ struct window_buffer::impl {
   }
 
   /// Doubles the chars of every STRING column in both slots, keeping the active slot's bytes.
-  /// Returns false if no column could grow.
+  /// The reader reports neither the column that was short nor the bytes it needed, so the
+  /// columns cannot be grown one by one. Returns false if no column could grow.
   bool grow_chars(::cuda::stream_ref stream)
   {
     std::vector<std::array<rmm::device_buffer, 2>> grown(columns.size());
@@ -262,6 +302,7 @@ struct window_buffer::impl {
       columns[i].slots[0].data = std::move(grown[i][0]);
       columns[i].slots[1].data = std::move(grown[i][1]);
     }
+    ++growths;
     return true;
   }
 };
@@ -271,7 +312,23 @@ window_buffer::window_buffer(std::vector<cudf::data_type> fetch_types,
                              std::size_t est_string_bytes_per_row,
                              rmm::cuda_stream_view stream,
                              rmm::device_async_resource_ref mr)
+  : window_buffer(std::vector<cudf::data_type>(fetch_types),
+                  window_rows,
+                  std::vector<std::size_t>(fetch_types.size(), est_string_bytes_per_row),
+                  stream,
+                  mr)
 {
+}
+
+window_buffer::window_buffer(std::vector<cudf::data_type> fetch_types,
+                             std::size_t window_rows,
+                             std::vector<std::size_t> est_chars_bytes_per_row,
+                             rmm::cuda_stream_view stream,
+                             rmm::device_async_resource_ref mr)
+{
+  if (est_chars_bytes_per_row.size() != fetch_types.size()) {
+    throw std::invalid_argument("window_buffer: one chars estimate per fetched column is needed");
+  }
   if (window_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()) - 1) {
     throw std::invalid_argument("window_buffer: window_rows exceeds the cudf row limit");
   }
@@ -285,24 +342,24 @@ window_buffer::window_buffer(std::vector<cudf::data_type> fetch_types,
   auto const sref = ::cuda::stream_ref{stream.value()};
   auto state      = std::make_unique<impl>(window_rows, mr, stream.value());
   state->columns.reserve(fetch_types.size());
-  state->null_counts.assign(fetch_types.size(), 0);
+  state->null_free.assign(fetch_types.size(), false);
   auto const mask_bytes =
     cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(window_rows));
-  for (auto const& type : fetch_types) {
+  for (std::size_t i = 0; i < fetch_types.size(); ++i) {
     auto& col = state->columns.emplace_back();
-    col.type  = type;
+    col.type  = fetch_types[i];
     std::size_t data_bytes{0};
     std::size_t offsets_bytes{0};
     if (col.is_string()) {
-      auto const est_chars = chars_capacity(window_rows, est_string_bytes_per_row);
-      auto const int32_ok =
-        est_string_bytes_per_row == 0 || window_rows <= max_int32_chars / est_string_bytes_per_row;
-      col.offset_width = int32_ok ? sizeof(int32_t) : sizeof(int64_t);
-      data_bytes       = std::max(est_chars, min_chars_bytes);
+      auto const est_bytes = est_chars_bytes_per_row[i];
+      auto const est_chars = chars_capacity(window_rows, est_bytes);
+      auto const int32_ok  = est_bytes == 0 || window_rows <= max_int32_chars / est_bytes;
+      col.offset_width     = int32_ok ? sizeof(int32_t) : sizeof(int64_t);
+      data_bytes           = std::max(est_chars, min_chars_bytes);
       if (int32_ok) { data_bytes = std::min(data_bytes, max_int32_chars); }
       offsets_bytes = (window_rows + 1) * col.offset_width;
     } else {
-      col.width  = cudf::size_of(type);
+      col.width  = cudf::size_of(col.type);
       data_bytes = window_rows * col.width;
     }
     for (auto& slot : col.slots) {
@@ -322,17 +379,6 @@ cudf::table_view window_buffer::view() const
 {
   auto const& state = *_impl;
   auto const rows   = static_cast<cudf::size_type>(state.size);
-  if (!state.null_counts_valid) {
-    // Counting reads the masks back, so it waits for the work enqueued on the slots.
-    for (std::size_t i = 0; i < state.columns.size(); ++i) {
-      auto const* mask =
-        static_cast<const cudf::bitmask_type*>(state.columns[i].slots[state.active].mask.data());
-      state.null_counts[i] =
-        rows == 0 ? 0 : cudf::null_count(mask, 0, rows, ::cuda::stream_ref{state.last_stream});
-    }
-    state.null_counts_valid = true;
-  }
-
   std::vector<cudf::column_view> views;
   views.reserve(state.columns.size());
   for (std::size_t i = 0; i < state.columns.size(); ++i) {
@@ -342,7 +388,9 @@ cudf::table_view window_buffer::view() const
       views.emplace_back(col.type, 0, nullptr, nullptr, 0);
       continue;
     }
-    auto const null_count = state.null_counts[i];
+    // Counting the nulls would read the mask back once per column and refill: the count is an
+    // upper bound instead, and 0 only for a column known to hold no NULL.
+    auto const null_count = state.null_free[i] ? 0 : rows;
     auto const* mask =
       null_count > 0 ? static_cast<const cudf::bitmask_type*>(slot.mask.data()) : nullptr;
     if (col.is_string()) {
@@ -356,6 +404,23 @@ cudf::table_view window_buffer::view() const
     }
   }
   return cudf::table_view{views};
+}
+
+void window_buffer::set_null_free(std::vector<bool> null_free)
+{
+  auto& state = *_impl;
+  if (null_free.size() != state.columns.size()) {
+    throw std::invalid_argument("window_buffer::set_null_free: one flag per column is needed");
+  }
+  if (state.size != 0) {
+    throw std::logic_error("window_buffer::set_null_free: the window holds rows");
+  }
+  state.null_free = std::move(null_free);
+}
+
+void window_buffer::use_stream(rmm::cuda_stream_view stream)
+{
+  _impl->order_after_last(stream.value());
 }
 
 std::size_t window_buffer::size() const noexcept { return _impl->size; }
@@ -373,6 +438,8 @@ std::size_t window_buffer::device_bytes() const noexcept
   return bytes;
 }
 
+std::size_t window_buffer::chars_growths() const noexcept { return _impl->growths; }
+
 void window_buffer::consume(std::size_t consumed, rmm::cuda_stream_view stream)
 {
   auto& state = *_impl;
@@ -386,8 +453,6 @@ void window_buffer::consume(std::size_t consumed, rmm::cuda_stream_view stream)
       col.chars_end       = 0;
       col.chars_end_exact = true;
     }
-    std::fill(state.null_counts.begin(), state.null_counts.end(), 0);
-    state.null_counts_valid = true;
     return;
   }
 
@@ -423,9 +488,8 @@ void window_buffer::consume(std::size_t consumed, rmm::cuda_stream_view stream)
       col.chars_end_exact = false;
     }
   }
-  state.active            = 1 - state.active;
-  state.size              = tail;
-  state.null_counts_valid = false;
+  state.active = 1 - state.active;
+  state.size   = tail;
 }
 
 cucascade::row_range_result window_buffer::refill(
@@ -433,42 +497,43 @@ cucascade::row_range_result window_buffer::refill(
   const cucascade::read_only_data_batch& batch,
   std::span<const std::size_t> fetch_cols,
   std::size_t row_begin,
-  std::unique_ptr<cucascade::row_range_reader_state>* state,
+  std::unique_ptr<cucascade::row_range_reader_state>* reader_state,
   cucascade::memory::reservation* scratch,
   rmm::cuda_stream_view stream)
 {
-  auto& self = *_impl;
-  if (fetch_cols.size() != self.columns.size()) {
+  auto& state = *_impl;
+  if (fetch_cols.size() != state.columns.size()) {
     throw std::invalid_argument("window_buffer::refill: fetch_cols does not match the columns");
   }
   auto const sref = ::cuda::stream_ref{stream.value()};
-  self.order_after_last(stream.value());
-  self.resolve_chars_ends(stream.value());
+  state.order_after_last(stream.value());
+  state.resolve_chars_ends(stream.value());
 
   cucascade::row_range_request request;
   request.columns   = fetch_cols;
   request.row_begin = row_begin;
-  request.max_rows  = self.capacity - self.size;
+  request.max_rows  = state.capacity - state.size;
 
-  // The reader may write past size() even when it throws; the masks are stale from here on.
-  self.null_counts_valid = false;
-  auto dst               = self.destinations();
-  auto result = cucascade::read_rows_into(readers, batch, request, dst, sref, scratch, state);
+  auto dst = state.destinations();
+  auto result =
+    cucascade::read_rows_into(readers, batch, request, dst, sref, scratch, reader_state);
   if (result.rows_written == 0 && !result.source_exhausted && request.max_rows > 0) {
     // One row does not fit a STRING slot.
-    if (self.grow_chars(sref)) {
-      dst    = self.destinations();
-      result = cucascade::read_rows_into(readers, batch, request, dst, sref, scratch, state);
+    if (state.grow_chars(sref)) {
+      dst    = state.destinations();
+      result = cucascade::read_rows_into(readers, batch, request, dst, sref, scratch, reader_state);
     }
     if (result.rows_written == 0 && !result.source_exhausted) {
-      throw std::runtime_error(
+      throw window_row_too_large_error(
         "window_buffer::refill: a single row does not fit the window's STRING slot");
     }
   }
 
-  self.size += result.rows_written;
-  for (std::size_t i = 0; i < self.columns.size(); ++i) {
-    if (self.columns[i].is_string()) { self.columns[i].chars_end += result.data_bytes_written[i]; }
+  state.size += result.rows_written;
+  for (std::size_t i = 0; i < state.columns.size(); ++i) {
+    if (state.columns[i].is_string()) {
+      state.columns[i].chars_end += result.data_bytes_written[i];
+    }
   }
   return result;
 }

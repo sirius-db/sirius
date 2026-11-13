@@ -322,13 +322,34 @@ TEST_CASE("tile merge matches the reference merged order", "[kway_tile_merge]")
 
 TEST_CASE("tile merge handles the largest fan-ins", "[kway_tile_merge]")
 {
-  // 1024 inputs leave room for only a few tiles per block; 4096 is the documented limit.
-  const auto k = GENERATE(std::size_t{1024}, std::size_t{4096});
+  // The shared memory of a block holds the state of 16 merge threads at 256 inputs, of 4 at 1024
+  // and of 1 at 4096 (the documented limit), which caps the sub-tiles tile_merge chooses from the
+  // device as well as the forced ones.
+  const auto k = GENERATE(std::size_t{256}, std::size_t{1024}, std::size_t{4096});
   std::mt19937 rng(77 + static_cast<unsigned>(k));
   const auto data = make_case(int_windows(random_lengths(k, 6, rng), 50, 0.0, rng),
                               {cudf::order::ASCENDING},
                               {cudf::null_order::AFTER});
   check_targets(data, {7, 100, 2048});
+}
+
+TEST_CASE("tile merge splits tiles at a large fan-in on a small input", "[kway_tile_merge]")
+{
+  // Small enough for compute-sanitizer's racecheck: 1024 inputs of 1 or 2 rows, 100-row tiles and
+  // 4 sub-tiles per tile, the most that 1024 inputs allow. Every thread hands its end co-ranks to
+  // its right neighbour through shared memory.
+  const std::size_t k = 1024;
+  std::mt19937 rng(1024);
+  std::vector<cudf::size_type> lengths;
+  for (std::size_t i = 0; i < k; ++i) {
+    lengths.push_back(1 + static_cast<cudf::size_type>(rng() % 2));
+  }
+  const auto data = make_case(
+    int_windows(lengths, 50, 0.0, rng), {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+  auto cmp = make_comparator(data);
+  check_tile_merge(data, cmp, data.total_rows(), 100, 4);
+  // A short last tile: its last sub-tiles have no rows.
+  check_tile_merge(data, cmp, data.total_rows() - 130, 100, 4);
 }
 
 TEST_CASE("tile merge breaks heavy ties by input, then by row", "[kway_tile_merge]")

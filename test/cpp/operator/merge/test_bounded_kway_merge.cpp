@@ -690,6 +690,56 @@ TEST_CASE("bounded_kway_merge breaks ties by window, then row, across tile bound
   REQUIRE(result.consumed == std::vector<cudf::size_type>{n, n, n, n, 0, 0, 0});
 }
 
+TEST_CASE("bounded_kway_merge reads the null masks, not the windows' null counts",
+          "[bounded_kway_merge]")
+{
+  std::mt19937 rng(606);
+  // Small windows and windows of several tiles.
+  const auto n = GENERATE(cudf::size_type{40}, cudf::size_type{3000});
+  auto input   = make_case(random_lengths(9, n, rng), make_orders(1, 1), rng());
+
+  // Every nullable column of every window now reports all of its rows as NULL: an upper bound of
+  // the real count (about one row in ten is NULL), as a window over a larger buffer may carry.
+  std::vector<cudf::table_view> inflated;
+  for (const auto& window : input.windows) {
+    std::vector<cudf::column_view> columns;
+    for (const auto& column : window) {
+      columns.emplace_back(
+        column.type(),
+        column.size(),
+        column.head(),
+        column.null_mask(),
+        column.nullable() ? column.size() : 0,
+        column.offset(),
+        std::vector<cudf::column_view>(column.child_begin(), column.child_end()));
+    }
+    inflated.emplace_back(columns);
+  }
+  input.windows = std::move(inflated);
+  REQUIRE(input.windows.front().column(kIntKey).null_count() == input.lengths.front());
+
+  std::vector<std::uint8_t> truncated(input.lengths.size(), 0);
+  const auto all = static_cast<cudf::size_type>(input.total_rows());
+  CHECK(check_against_oracle(input, truncated, all) == all);
+  check_against_oracle(input, truncated, all / 3);
+  truncated[4] = 1;
+  truncated[8] = 1;
+  CHECK(check_against_oracle(input, truncated, all) < all);
+
+  // The output's own null counts are exact.
+  const auto result = run_merge(input, truncated, all);
+  const auto rows   = result.output->num_rows();
+  REQUIRE(rows > 0);
+  for (cudf::size_type c = 0; c < result.output->num_columns(); ++c) {
+    const auto column = result.output->view().column(c);
+    INFO("column " << c);
+    REQUIRE(column.nullable() == (c != kWindowColumns - 1));
+    if (column.nullable()) {
+      CHECK(column.null_count() == cudf::null_count(column.null_mask(), 0, rows));
+    }
+  }
+}
+
 TEST_CASE("bounded_kway_merge runs on a non-default stream", "[bounded_kway_merge]")
 {
   std::mt19937 rng(4242);

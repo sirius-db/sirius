@@ -11,6 +11,16 @@ target_sources(
           window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
+          merge/merge_config.cpp
+          merge/windowed_merge_input.cpp
+          merge/detail/run_fallback.cpp
+          merge/bounded_kway_merge.cu
+          merge/windowed_merge.cu
+          merge/detail/kway_comparator.cu
+          merge/detail/kway_corank.cu
+          merge/detail/kway_tile_merge.cu
+          merge/detail/kway_gather.cu
+          merge/detail/window_buffer.cu
           order/gpu_order_impl.cpp
           partition/gpu_partition_impl.cpp
           partition/partition_exchange.cpp

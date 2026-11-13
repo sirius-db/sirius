@@ -255,11 +255,17 @@ estimate_task_bytes = 2 × (k − g) × n × w     // two window-buffer slots pe
 ```
 
 `k` is the number of runs the task reads, `g` how many of them are entirely on the GPU tier (they
-are sliced in place), `n` is `window_rows`, `w` the estimated row width of the fetched columns and
+are windowed in place), `n` is `window_rows`, `w` the estimated row width of the fetched columns and
 `key_w` that of the key columns. The arithmetic saturates. `n` and `output_target_bytes` are the
 task's current values, so the estimate drops after a
 [shrink](#shrink-before-retry). See [Sort Merge](configuration.md#sort-merge) for how `n` and the
 output target are derived.
+
+**Window buffers outlive a task.** The partition keeps its merger between tasks, so the window
+buffers of its non-GPU runs (up to about one window per such run) stay allocated on the GPU while
+no task of the partition is in flight, outside any task reservation. Each task's estimate still
+counts them. They are freed when the partition finishes, when a task fails (an OOM retry starts
+from empty windows), when the merger is rebuilt, and with the operator.
 
 ### Runs stay spillable
 
@@ -269,7 +275,9 @@ The runs of a windowed partition stay in the operator's input repository for the
   a pipelineable input, and the repository sweep skips subscribed batches; a windowed task
   subscribes none, so its runs remain tier-1 downgrade candidates, ahead of the query's other
   repositories, while tasks are queued and running.
-- A batch is popped, and so freed, only when a task that read it to the end commits.
+- A batch is popped, and so freed, only when a task that read it to the end commits. The kept
+  merger drops its reference to such a batch first (`rebase_consumed()`); it holds references to
+  the unread batches between tasks, which does not stop them from being spilled.
 - Intermediate runs written by a fan-in pass are added to the same repository and spill like the
   original runs.
 - Final-pass output chunks wait in the downstream repository until the merge pipeline finishes,
@@ -299,9 +307,9 @@ Readers serve fixed-width and STRING columns. LIST, STRUCT and DICTIONARY32 colu
 one refill (`cucascade::read_rows_into`, which orders the stream after the batch's writer and
 records the reader event). Between refills the batch is idle and can be downgraded. Whatever tier
 the next refill's lock observes is the tier it reads: a different representation resets the
-reader state, and a batch that has arrived on the GPU in the task's memory space is sliced from
-then on. A GPU batch used as a slice stays read-locked until the task has finished it or
-returns, so it becomes spillable again at the task boundary at the latest.
+reader state, and a batch that has arrived on the GPU in the task's memory space is windowed in
+place from then on. A GPU batch windowed in place stays read-locked until the task has finished
+it or returns, so it becomes spillable again at the task boundary at the latest.
 
 ## Memory Consumption History
 

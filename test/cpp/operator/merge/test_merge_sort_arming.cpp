@@ -15,12 +15,15 @@
  */
 
 #include "catch.hpp"
+#include "data/sirius_row_range_reader_registry.hpp"
 #include "helper/type_conversions.hpp"
 #include "operator/operator_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -30,9 +33,12 @@
 #include <op/sirius_physical_merge_sort.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <vector>
 
 using namespace sirius::op;
@@ -45,7 +51,7 @@ namespace {
 constexpr std::size_t kGiB = std::size_t{1} << 30;
 
 /// A fixed device budget, so window sizes do not depend on the test memory manager.
-merge::device_budget large_budget()
+merge::device_budget large_budget(const memory_space* = nullptr)
 {
   return {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 1};
 }
@@ -167,6 +173,32 @@ merge::windowed_merge_input& require_windowed_input(const std::unique_ptr<operat
   return dynamic_cast<merge::windowed_merge_input&>(*input);
 }
 
+/// Longest a call that must not wait for a batch lock may take.
+constexpr std::chrono::seconds kPrompt{5};
+
+/// Runs @p call on another thread and requires that it returns within kPrompt.
+template <typename Call>
+auto require_prompt(Call call)
+{
+  auto result = std::async(std::launch::async, std::move(call));
+  REQUIRE(result.wait_for(kPrompt) == std::future_status::ready);
+  return result.get();
+}
+
+/// A windowed MERGE_SORT over @p repo whose base task hint is READY whenever the repository holds
+/// data, so what a test sees is the operator's own gating.
+std::unique_ptr<sirius_physical_merge_sort> make_windowed_merge(data_repository& repo)
+{
+  auto merge = std::make_unique<sirius_physical_merge_sort>(
+    bigint_types(1), key_on_column_0(), duckdb::vector<std::size_t>{0}, 0);
+  merge->add_port("default",
+                  std::make_unique<sirius_physical_operator::port>(
+                    MemoryBarrierType::PIPELINE, &repo, nullptr, nullptr));
+  merge->set_merge_settings({.mode = sirius::sort_merge_mode::windowed});
+  merge->set_device_budget_provider(large_budget);
+  return merge;
+}
+
 class late_mat_merge_sort : public sirius_physical_merge_sort {
  public:
   using sirius_physical_merge_sort::sirius_physical_merge_sort;
@@ -249,7 +281,7 @@ TEST_CASE("merge sort automatic mode goes windowed when the partition exceeds th
   auto merge = make_merge(repo);
   merge->set_merge_settings({.mode = sirius::sort_merge_mode::automatic});
   // 16 KiB of runs plus their output do not fit the one-shot share of a 4 KiB device.
-  merge->set_device_budget_provider([] {
+  merge->set_device_budget_provider([](const memory_space*) {
     return merge::device_budget{
       .gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 4096, .concurrent_tasks = 1};
   });
@@ -599,4 +631,136 @@ TEST_CASE("merge sort no-history estimate of a windowed task is its input's size
   input_stats pipelineable{
     .num_batches = 3, .bytes = 12345, .type = operator_data_type::PIPELINEABLE};
   REQUIRE(merge->no_history_peak_memory_estimate(pipelineable) == 2 * 12345);
+}
+
+TEST_CASE("merge sort arming does not wait for a run locked by a tier move while a task runs",
+          "[merge_sort_arming]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  if (!sirius::row_range_reader_registry::is_initialized()) {
+    sirius::row_range_reader_registry::initialize();
+  }
+  data_repository repo;
+  repo.set_num_partitions(2);
+  repo.add_data_batch(make_sorted_batch(*space, 10), 0);
+  repo.add_data_batch(make_sorted_batch(*space, 10), 0);
+  auto locked_run = make_sorted_batch(*space, 10);
+  repo.add_data_batch(locked_run, 1);
+  repo.add_data_batch(make_sorted_batch(*space, 10), 1);
+  auto merge = make_windowed_merge(repo);
+
+  auto first = merge->get_next_task_input_data();
+  REQUIRE(require_windowed_input(first).partition() == 0);
+
+  // What a downgrade holds for the whole move of a batch to another tier.
+  std::optional<mutable_data_batch> tier_move = locked_run->to_mutable();
+
+  // Arming partition 1 needs the size of the locked run: it is left for later, at once.
+  auto const while_locked = require_prompt([&] { return merge->get_next_task_input_data(); });
+  REQUIRE_FALSE(while_locked);
+  // The partition comes back when the task in flight commits, so no hint is given until then.
+  auto const hint_while_locked = require_prompt([&] { return merge->get_next_task_hint(); });
+  REQUIRE_FALSE(hint_while_locked.has_value());
+  REQUIRE(merge->counters().windowed_partitions == 1);
+
+  // The commit of partition 0's task does not wait for the lock either.
+  rmm::cuda_stream stream;
+  ::cuda::stream_ref const stream_ref{stream.value()};
+  first->prepare_for_processing(space, stream_ref);
+  auto const committed = require_prompt([&] { return merge->execute(*first, stream_ref); });
+  REQUIRE(committed);
+  REQUIRE(repo.size(0) == 0);
+  auto const hint_after_commit = require_prompt([&] { return merge->get_next_task_hint(); });
+  REQUIRE(hint_after_commit.has_value());
+  REQUIRE(hint_after_commit->hint == TaskCreationHint::READY);
+
+  // With no task in flight nothing else would arm the partition again, so the call waits for
+  // the tier move. It waits without the operator's mutex: the hint is still answered.
+  auto second = std::async(std::launch::async, [&] { return merge->get_next_task_input_data(); });
+  REQUIRE(second.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
+  auto const hint_while_waiting = require_prompt([&] { return merge->get_next_task_hint(); });
+  REQUIRE(hint_while_waiting.has_value());
+
+  tier_move.reset();
+  REQUIRE(second.wait_for(kPrompt) == std::future_status::ready);
+  auto const armed = second.get();
+  auto& windowed   = require_windowed_input(armed);
+  REQUIRE(windowed.partition() == 1);
+  REQUIRE(windowed.cursors().size() == 2);
+  REQUIRE(merge->counters().windowed_partitions == 2);
+  REQUIRE(merge->counters().one_shot_partitions == 0);
+}
+
+TEST_CASE("merge sort arms around a locked run whose size was recorded when it arrived",
+          "[merge_sort_arming]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  data_repository repo;
+  auto merge = make_windowed_merge(repo);
+  auto a     = make_sorted_batch(*space, 10);
+  auto b     = make_sorted_batch(*space, 20);
+  // As the upstream operator pushes its runs.
+  merge->push_data_batch_partitioned("default", a, 0);
+  merge->push_data_batch_partitioned("default", b, 0);
+
+  auto tier_move = b->to_mutable();
+  auto const input =
+    require_prompt([&] { return std::shared_ptr{merge->get_next_task_input_data()}; });
+  REQUIRE(input);
+  auto& windowed = dynamic_cast<merge::windowed_merge_input&>(*input);
+  REQUIRE(windowed.cursors().size() == 2);
+  REQUIRE(windowed.cursors()[0].run.batch_rows == std::vector<std::size_t>{10});
+  REQUIRE(windowed.cursors()[1].run.batch_rows == std::vector<std::size_t>{20});
+  REQUIRE(repo.size(0) == 2);
+}
+
+TEST_CASE("merge sort device budget provider reports the GPU spaces and the executor width",
+          "[merge_sort_arming]")
+{
+  auto manager    = initialize_memory_manager(1,
+                                              {.gpu_bytes                = std::size_t{128} << 20,
+                                               .gpu_reservation_fraction = 0.75,
+                                               .divide_among_gpus        = false,
+                                               .per_stream_tracking      = false});
+  auto const* gpu = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu != nullptr);
+  auto const provider = sirius_physical_merge_sort::make_device_budget_provider(*manager, 6);
+
+  // No run on a GPU: the smallest GPU space.
+  auto const unknown = provider(nullptr);
+  REQUIRE(unknown.concurrent_tasks == 6);
+  REQUIRE(unknown.gpu_total_bytes == gpu->get_max_memory());
+  REQUIRE(unknown.gpu_available_bytes == gpu->get_available_memory());
+  REQUIRE(unknown.gpu_total_bytes > 0);
+  // The space holding most of the partition.
+  auto const named = provider(gpu);
+  REQUIRE(named.gpu_total_bytes == gpu->get_max_memory());
+  REQUIRE(sirius_physical_merge_sort::make_device_budget_provider(*manager, 0)(nullptr)
+            .concurrent_tasks == 1);
+
+  // The operator asks its provider with the space that holds the partition's GPU runs.
+  auto* space = const_cast<memory_space*>(gpu);
+  data_repository repo;
+  repo.add_data_batch(make_sorted_batch(*space, 10));
+  repo.add_data_batch(make_sorted_batch(*space, 10));
+  auto merge = make_merge(repo);
+  REQUIRE_FALSE(merge->has_device_budget_provider());
+  merge->set_merge_settings({.mode = sirius::sort_merge_mode::windowed});
+  const memory_space* asked = nullptr;
+  std::size_t calls         = 0;
+  merge->set_device_budget_provider([&](const memory_space* preferred) {
+    asked = preferred;
+    ++calls;
+    return provider(preferred);
+  });
+  REQUIRE(merge->has_device_budget_provider());
+  auto input = merge->get_next_task_input_data();
+  require_windowed_input(input);
+  REQUIRE(calls == 1);
+  REQUIRE(asked == gpu);
+  input.reset();
+  merge.reset();
+  while (repo.pop_next_data_batch(0)) {}
 }

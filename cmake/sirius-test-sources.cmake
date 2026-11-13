@@ -37,6 +37,7 @@ set(TEST_SOURCES
     test/cpp/compression/test_spill_compression.cpp
     test/cpp/config/test_c_api_config.cpp
     test/cpp/config/test_config.cpp
+    test/cpp/config/test_sort_merge_settings.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_scan_manager_config.cpp
@@ -134,6 +135,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_order_by_windowed.cpp
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
@@ -260,6 +262,20 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_single_join.cpp
     test/cpp/operator/test_physical_mixed_filter_join.cpp
     test/cpp/operator/test_physical_merge_sort.cpp
+    test/cpp/operator/merge/test_merge_config.cpp
+    test/cpp/operator/merge/test_windowed_merge_input.cpp
+    test/cpp/operator/merge/test_kway_comparator.cpp
+    test/cpp/operator/merge/test_kway_corank.cpp
+    test/cpp/operator/merge/test_kway_tile_merge.cpp
+    test/cpp/operator/merge/test_kway_gather.cpp
+    test/cpp/operator/merge/test_bounded_kway_merge.cpp
+    test/cpp/operator/merge/test_window_buffer.cpp
+    test/cpp/operator/merge/test_windowed_merger.cpp
+    test/cpp/operator/merge/test_run_fallback.cpp
+    test/cpp/operator/merge/test_merge_sort_arming.cpp
+    test/cpp/operator/merge/test_windowed_merge_differential.cpp
+    test/cpp/operator/merge/test_merge_sort_continuation.cpp
+    test/cpp/operator/merge/test_merge_sort_faults.cpp
     test/cpp/operator/test_physical_order.cpp
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp

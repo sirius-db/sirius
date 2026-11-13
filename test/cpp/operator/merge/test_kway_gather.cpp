@@ -449,6 +449,28 @@ std::vector<cudf::table_view> views_of(std::vector<std::unique_ptr<cudf::table>>
   return views;
 }
 
+/// The same windows through column views that report every row of a nullable column as NULL:
+/// a null count that is only an upper bound of the real one.
+std::vector<cudf::table_view> with_inflated_null_counts(
+  std::vector<cudf::table_view> const& windows)
+{
+  std::vector<cudf::table_view> out;
+  for (auto const& window : windows) {
+    std::vector<cudf::column_view> columns;
+    for (auto const& col : window) {
+      columns.emplace_back(col.type(),
+                           col.size(),
+                           col.head(),
+                           col.null_mask(),
+                           col.nullable() ? col.size() : 0,
+                           col.offset(),
+                           std::vector<cudf::column_view>(col.child_begin(), col.child_end()));
+    }
+    out.emplace_back(columns);
+  }
+  return out;
+}
+
 }  // namespace
 
 TEST_CASE("gather_kway matches concatenate + gather on a mixed schema", "[kway_gather]")
@@ -675,4 +697,81 @@ TEST_CASE("gather_kway rejects mismatched and unsupported schemas", "[kway_gathe
   REQUIRE_THROWS_AS(run_gather({int32->view(), int32->view()}, host_map{{0, 1}, {1}}),
                     std::invalid_argument);
   REQUIRE_NOTHROW(gather({int32->view(), int32->view()}));
+}
+
+TEST_CASE("gather_kway counts nulls from the masks, not from the windows' null counts",
+          "[kway_gather]")
+{
+  std::mt19937 rng{31};
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  for (std::size_t i = 0; i < 6; ++i) {
+    // Window 0 has no null mask at all; in the others each column is nullable at random.
+    std::vector<bool> nullable(kMixedColumns, false);
+    for (std::size_t c = 0; i > 0 && c < nullable.size(); ++c) {
+      nullable[c] = rng() % 3 != 0;
+    }
+    tables.push_back(make_mixed_window(50 + rng() % 300, nullable, rng));
+  }
+  auto const windows  = views_of(tables);
+  auto const inflated = with_inflated_null_counts(windows);
+  auto const map      = random_map(windows, 2000, rng);
+
+  // require_equivalent also compares the output's null counts with its masks.
+  auto const actual   = run_gather(inflated, map);
+  auto const expected = reference_gather(windows, map);
+  require_equivalent(actual->view(), expected->view());
+}
+
+TEST_CASE("gather_kway copies the caller's read-back to the host", "[kway_gather]")
+{
+  std::mt19937 rng{57};
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  for (std::size_t i = 0; i < 4; ++i) {
+    tables.push_back(make_mixed_window(100, std::vector<bool>(kMixedColumns, i % 2 == 0), rng));
+  }
+  auto const windows = views_of(tables);
+
+  // An odd and an even number of entries: the counts share 64-bit words with them.
+  auto const entries = GENERATE(std::size_t{1}, std::size_t{4}, std::size_t{37});
+  std::vector<cudf::size_type> values(entries);
+  for (auto& value : values) {
+    value = static_cast<cudf::size_type>(rng());
+  }
+  auto const source = to_device(values);
+
+  SECTION("with rows to gather")
+  {
+    auto const map   = random_map(windows, 700, rng);
+    auto const input = to_device(map.input);
+    auto const row   = to_device(map.row);
+    std::vector<cudf::size_type> destination(entries, -1);
+    auto const actual =
+      gather_kway(windows, input, row, test_stream(), test_mr(), {source, destination});
+    // No synchronize here: the copy has completed when gather_kway returns.
+    CHECK(destination == values);
+    auto const expected = reference_gather(windows, map);
+    require_equivalent(actual->view(), expected->view());
+  }
+
+  SECTION("with an empty map")
+  {
+    auto const none_input = to_device(std::vector<std::int32_t>{});
+    auto const none_row   = to_device(std::vector<cudf::size_type>{});
+    std::vector<cudf::size_type> destination(entries, -1);
+    auto const actual =
+      gather_kway(windows, none_input, none_row, test_stream(), test_mr(), {source, destination});
+    CHECK(destination == values);
+    CHECK(actual->num_rows() == 0);
+  }
+
+  SECTION("a destination of another size is rejected")
+  {
+    auto const map   = random_map(windows, 10, rng);
+    auto const input = to_device(map.input);
+    auto const row   = to_device(map.row);
+    std::vector<cudf::size_type> destination(entries + 1, -1);
+    CHECK_THROWS_AS(
+      gather_kway(windows, input, row, test_stream(), test_mr(), {source, destination}),
+      std::invalid_argument);
+  }
 }

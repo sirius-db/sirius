@@ -17,9 +17,10 @@
 #include "op/merge/merge_config.hpp"
 
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
+#include "op/merge/bounded_kway_merge.hpp"
 
 #include <algorithm>
-#include <limits>
 #include <numeric>
 
 namespace sirius::op::merge {
@@ -41,25 +42,16 @@ constexpr std::size_t kWindowCeilingDivisor = 16;
 /// The output chunk target is 1/kOutputBudgetDivisor of the task budget.
 constexpr std::size_t kOutputBudgetDivisor = 16;
 
-constexpr std::size_t kSaturated = std::numeric_limits<std::size_t>::max();
-
-std::size_t sat_add(std::size_t a, std::size_t b) noexcept
-{
-  std::size_t out{};
-  return __builtin_add_overflow(a, b, &out) ? kSaturated : out;
-}
-
-std::size_t sat_mul(std::size_t a, std::size_t b) noexcept
-{
-  std::size_t out{};
-  return __builtin_mul_overflow(a, b, &out) ? kSaturated : out;
-}
+using sirius::memory::saturating_add;
+using sirius::memory::saturating_mul;
 
 /// The largest fan-in whose windows fit the task budget with n at its floor, within [2, max].
+/// The merge kernel takes at most kMaxKwayMergeInputs windows, whatever the setting says.
 std::size_t fan_in_cap(std::size_t task_budget, std::size_t row_width, std::size_t max_fan_in)
 {
-  auto const max_f         = std::max<std::size_t>(max_fan_in, 2);
-  auto const bytes_per_run = sat_mul(sat_mul(kWindowCopies, kWindowRowsFloor), row_width);
+  auto const max_f = std::clamp<std::size_t>(max_fan_in, 2, kMaxKwayMergeInputs);
+  auto const bytes_per_run =
+    saturating_mul(saturating_mul(kWindowCopies, kWindowRowsFloor), row_width);
   return std::clamp<std::size_t>(task_budget / bytes_per_run, 2, max_f);
 }
 
@@ -91,9 +83,9 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
   if (settings.window_rows != 0) {
     window_rows = std::max<std::size_t>(settings.window_rows, kMinExplicitWindowRows);
   } else {
-    auto const run_bytes = sat_mul(fan_in, w);
-    auto const fit       = b / sat_mul(kWindowCopies, run_bytes);
-    auto const ceiling   = g / sat_mul(kWindowCeilingDivisor, run_bytes);
+    auto const run_bytes = saturating_mul(fan_in, w);
+    auto const fit       = b / saturating_mul(kWindowCopies, run_bytes);
+    auto const ceiling   = g / saturating_mul(kWindowCeilingDivisor, run_bytes);
     // The ceiling is applied last, so it wins when it is below the floor: memory comes first.
     window_rows = std::max<std::size_t>(std::min(std::max(fit, kWindowRowsFloor), ceiling), 1);
   }
@@ -141,7 +133,7 @@ merge_route choose_route(sort_merge_mode mode,
     case sort_merge_mode::automatic: break;
   }
   if (inputs.any_non_gpu) { return merge_route::windowed; }
-  auto const needed    = sat_add(inputs.partition_bytes, inputs.output_bytes);
+  auto const needed    = saturating_add(inputs.partition_bytes, inputs.output_bytes);
   auto const threshold = one_shot_fraction * static_cast<double>(gpu_total_bytes);
   return static_cast<double>(needed) > threshold ? merge_route::windowed : merge_route::one_shot;
 }
@@ -174,13 +166,14 @@ std::size_t estimate_task_bytes(std::size_t k,
 {
   auto const buffered_runs = k - std::min(gpu_runs, k);
   // Window buffers (two copies each) of the runs that are not sliced in place.
-  auto total = sat_mul(sat_mul(2, buffered_runs), sat_mul(window_rows, row_width));
+  auto total =
+    saturating_mul(saturating_mul(2, buffered_runs), saturating_mul(window_rows, row_width));
   // One window of gathered output rows plus its 8-byte gather-map entries.
-  total = sat_add(total, sat_mul(window_rows, sat_add(row_width, 8)));
+  total = saturating_add(total, saturating_mul(window_rows, saturating_add(row_width, 8)));
   // Key columns of every run's window.
-  total = sat_add(total, sat_mul(sat_mul(k, window_rows), key_row_width));
-  total = sat_add(total, sat_mul(2, output_target_bytes));
-  return sat_add(total, largest_fallback_run_bytes);
+  total = saturating_add(total, saturating_mul(saturating_mul(k, window_rows), key_row_width));
+  total = saturating_add(total, saturating_mul(2, output_target_bytes));
+  return saturating_add(total, largest_fallback_run_bytes);
 }
 
 }  // namespace sirius::op::merge

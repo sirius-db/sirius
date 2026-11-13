@@ -19,6 +19,7 @@
 #include "compression/decompression_pushdown_policy.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/host_column_carrier.hpp"
 #include "exec/thread_pool.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
@@ -156,18 +157,6 @@ void warn_if_cache_not_built(cucascade::io::ioctx& io_ctx)
     "cache (construction failed, or its chunk size differs from the backend's staging block "
     "size); running without a cache",
     to_string(io_ctx.type()));
-}
-
-// Actual cuDF carrier of one column of an uncompressed pinned host chunk, rebuilt from the
-// chunk's host column metadata. Keyed on the DECIMAL type ids, not on a nonzero scale: a
-// DECIMAL(p,0) column has cuDF scale 0 and must still take the two-argument fixed-point
-// constructor.
-cudf::data_type host_column_carrier(cucascade::memory::column_metadata const& meta)
-{
-  auto const id         = static_cast<cudf::type_id>(meta.type_id);
-  auto const is_decimal = id == cudf::type_id::DECIMAL32 || id == cudf::type_id::DECIMAL64 ||
-                          id == cudf::type_id::DECIMAL128;
-  return is_decimal ? cudf::data_type{id, meta.scale} : cudf::data_type{id};
 }
 
 namespace {
@@ -3350,7 +3339,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
       if (host == nullptr || !host->get_host_table()) { return std::nullopt; }
       auto const& host_columns = host->get_host_table()->columns;
       if (column >= host_columns.size()) { return std::nullopt; }
-      return host_column_carrier(host_columns[column]);
+      return sirius::host_column_carrier(host_columns[column]);
     });
   // Normalize the optional zone-map capture
   bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();

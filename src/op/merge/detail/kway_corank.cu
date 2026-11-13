@@ -23,8 +23,7 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/transform_reduce.h>
+#include <thrust/reduce.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -189,24 +188,37 @@ struct target_bounds {
   int64_t total;   ///< Σ lengths
 };
 
-struct window_bounds_fn {
-  kway_key_device_view view;
-  const cudf::size_type* lengths;
-  const std::uint8_t* truncated;
-
-  __device__ target_bounds operator()(int32_t i) const noexcept
-  {
-    const cudf::size_type len = lengths[i];
-    if (truncated[i] == 0) { return {std::numeric_limits<int64_t>::max(), len}; }
-    // Nothing can be emitted before a truncated window with no rows is refilled.
-    if (len == 0) { return {0, 0}; }
-    int64_t rank = len - 1;
-    for (int32_t j = 0; j < view.num_inputs; ++j) {
-      if (j != i) { rank += lower_bound(view, j, 0, lengths[j], i, len - 1); }
-    }
-    return {rank + 1, len};
+/// One warp (one block of 32 threads) per window i. Lane l counts, in the inputs l, l + 32, ...,
+/// the rows that order before the last row of window i; the warp adds the counts up. A window
+/// that is not truncated does not bound the target.
+__global__ void window_bounds_kernel(kway_key_device_view view,
+                                     const cudf::size_type* lengths,
+                                     const std::uint8_t* truncated,
+                                     target_bounds* out)
+{
+  const int lane            = static_cast<int>(threadIdx.x);
+  const auto i              = static_cast<int32_t>(blockIdx.x);
+  const cudf::size_type len = lengths[i];
+  // Both early exits depend on the window only, so the whole warp takes them together.
+  if (truncated[i] == 0) {
+    if (lane == 0) { out[i] = {std::numeric_limits<int64_t>::max(), len}; }
+    return;
   }
-};
+  // Nothing can be emitted before a truncated window with no rows is refilled.
+  if (len == 0) {
+    if (lane == 0) { out[i] = {0, 0}; }
+    return;
+  }
+  int64_t before = 0;
+  for (int32_t j = lane; j < view.num_inputs; j += kWarpSize) {
+    if (j != i) { before += lower_bound(view, j, 0, lengths[j], i, len - 1); }
+  }
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    before += __shfl_down_sync(0xFFFF'FFFFu, before, offset);
+  }
+  // The rank of the last row is (len - 1) + before.
+  if (lane == 0) { out[i] = {before + len, len}; }
+}
 
 struct combine_bounds_fn {
   __device__ target_bounds operator()(const target_bounds& a, const target_bounds& b) const noexcept
@@ -267,15 +279,18 @@ cudf::size_type safe_target(const kway_key_comparator& cmp,
     throw std::invalid_argument("safe_target: one truncated flag per key window is required");
   }
 
-  // One thread per window, one binary search per (truncated window, other window) pair. The
+  // One warp per window, one binary search per (truncated window, other window) pair. The
   // result of the reduction is the only device-to-host copy.
-  const auto bounds = thrust::transform_reduce(
-    rmm::exec_policy_nosync(stream),
-    thrust::counting_iterator<int32_t>(0),
-    thrust::counting_iterator<int32_t>(cmp.num_inputs()),
-    window_bounds_fn{device_view_of(cmp), lengths.data(), truncated.data()},
-    target_bounds{std::numeric_limits<int64_t>::max(), 0},
-    combine_bounds_fn{});
+  const auto temp_mr = cudf::get_current_device_resource_ref();
+  rmm::device_uvector<target_bounds> window_bounds(lengths.size(), stream, temp_mr);
+  window_bounds_kernel<<<static_cast<unsigned>(lengths.size()), kWarpSize, 0, stream.value()>>>(
+    device_view_of(cmp), lengths.data(), truncated.data(), window_bounds.data());
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  const auto bounds = thrust::reduce(rmm::exec_policy_nosync(stream, temp_mr),
+                                     window_bounds.begin(),
+                                     window_bounds.end(),
+                                     target_bounds{std::numeric_limits<int64_t>::max(), 0},
+                                     combine_bounds_fn{});
   return static_cast<cudf::size_type>(
     std::min({static_cast<int64_t>(max_rows), bounds.r_safe, bounds.total}));
 }

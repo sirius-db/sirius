@@ -116,6 +116,9 @@ struct merge_round_stats {
   std::size_t rows_out{0};              ///< rows emitted
   std::size_t refill_rows{0};           ///< rows read into window buffers
   std::size_t refill_bytes{0};          ///< data bytes read into window buffers
+  std::size_t refill_truncated{0};      ///< refills that a full STRING slot stopped short
+  std::size_t window_growths{0};        ///< times a window buffer grew its STRING slots
+  std::size_t compacted_rows{0};        ///< buffered rows copied to the front before a refill
   std::size_t fallback_conversions{0};  ///< batches converted whole to the GPU tier
 };
 
@@ -128,15 +131,33 @@ using bounded_merge_fn = std::function<bounded_merge_result(std::span<const cudf
                                                             rmm::device_async_resource_ref)>;
 
 /**
- * @brief Runs rounds of a bounded k-way merge for one task.
+ * @brief Runs rounds of a bounded k-way merge over the runs of one partition, one task per run().
  *
- * GPU-tier batches are windows via cudf::slice of a read-locked view (locked for the whole
- * run()); other tiers use a detail::window_buffer per run, read-locked only during each refill.
- * A window never spans two batches of a run (a short window at a batch end is "truncated").
- * Stops when the accumulated output reaches cfg.output_target_bytes or every cursor is
- * exhausted, and returns ONE table (0 rows only if all inputs were already exhausted).
- * `cursors` are written back only when run() returns normally. Batches without a reader go
- * through detail::convert_run_batch_to_gpu once. Move-only.
+ * Each round merges one window per run: at most window_rows rows of the run's current batch,
+ * from its cursor on. A window never spans two batches of a run (a short window at a batch end
+ * is "truncated"). A batch that is an uncompressed table in the task's GPU space is windowed in
+ * place, as a view of its rows under a read lock held until the batch is finished or run()
+ * ends. Any other batch is read through its row-range reader into a detail::window_buffer of
+ * the run, read-locked only during each refill; a batch without a reader goes through
+ * detail::convert_run_batch_to_gpu once. The null count of a window's columns is an upper bound
+ * (exact only when 0): the merge kernel must read the masks.
+ *
+ * run() stops when its output reaches cfg.output_target_bytes or every cursor is exhausted, and
+ * returns ONE table (0 rows only if all inputs were already exhausted). `cursors` are written
+ * back only when run() returns normally.
+ *
+ * The merger may be kept for several run() calls (the tasks of one partition). The window
+ * buffers live as long as the merger: a later run() continues with the rows an earlier one read
+ * but did not emit, as long as the cursors are where that run() left them (rebase_consumed()
+ * keeps them consistent); rows buffered for another position are dropped. A run() that throws
+ * drops and frees every buffer, so a retry reads them again from the unchanged cursors. No read
+ * lock outlives a run().
+ *
+ * Lifetime: the cursor span, the reader registry, the GPU space and the memory resource the
+ * buffers were allocated from (the `mr` of the run() calls, which must be the same resource in
+ * every call) must outlive the merger. Each run() may use its own stream; the stream of the
+ * previous run() must still be a live stream when the next run() starts, and the stream of the
+ * last run() when the merger is destroyed. Not thread-safe: one call at a time. Move-only.
  */
 class windowed_merger {
  public:
@@ -170,14 +191,27 @@ class windowed_merger {
   /**
    * @brief Merge until the output target is reached or every cursor is exhausted.
    *
-   * @param stream CUDA stream used for device memory operations and kernel launches.
-   * @param mr Device memory resource used for windows, scratch and the output table.
+   * @param stream CUDA stream used for device memory operations and kernel launches; may differ
+   *        from one call to the next.
+   * @param mr Device memory resource used for windows, scratch and the output table; the same
+   *        resource in every call, and it must outlive the merger.
    * @param stats Optional counters, added to (not reset); may be nullptr.
    * @return ONE table with the fetched columns in fetch_cols order.
    */
   std::unique_ptr<cudf::table> run(rmm::cuda_stream_view stream,
                                    rmm::device_async_resource_ref mr,
                                    merge_round_stats* stats = nullptr);
+
+  /**
+   * @brief Forgets the batches every run has read to the end, after a run() that returned.
+   *
+   * For each run i, drops the merger's references to the first cursors[i].batch batches, erases
+   * them from cursors[i].run and sets cursors[i].batch to 0. Rows already buffered are kept, so
+   * the next run() continues without reading them again. The caller may then pop those batches.
+   * An exhausted run is left with no batches and stays exhausted. Touches no device memory and
+   * does not throw.
+   */
+  void rebase_consumed();
 
   /// Merger state; defined by the merger's source.
   struct impl;

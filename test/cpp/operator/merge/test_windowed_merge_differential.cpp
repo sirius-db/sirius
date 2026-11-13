@@ -995,6 +995,12 @@ TEST_CASE("windowed merge is exact when long STRING payloads truncate windows by
   CHECK(outcome.calls > 1);
   // 24 000 spilled rows fit 6 windows of 4096 rows per run; byte-truncated refills need more.
   CHECK(outcome.stats.rounds > 6);
+  // The byte-limited path was taken: refills stopped short on chars. A 1024-row window is sized
+  // below the 150 KB rows, so its buffers also grew their STRING slots. Even so no row was
+  // carried twice.
+  CHECK(outcome.stats.refill_truncated > 0);
+  if (window_rows == 1024) { CHECK(outcome.stats.window_growths > 0); }
+  CHECK(outcome.stats.compacted_rows <= outcome.stats.refill_rows);
 }
 
 TEST_CASE("windowed merge is exact with long STRING keys", "[windowed_merge_differential]")
