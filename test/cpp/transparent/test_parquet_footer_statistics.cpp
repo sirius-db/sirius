@@ -292,6 +292,7 @@ TEST_CASE_METHOD(ParquetFilesFixture,
 {
   using sirius::transparent::detail::merged_statistics_cache_capacity;
   using sirius::transparent::detail::merged_statistics_cache_size;
+  using sirius::transparent::detail::row_count_cache_size;
   // Pairs of 17 files give 136 distinct lists, more than the cache keeps.
   constexpr int files = 17;
   for (int file = 2; file < files; ++file) {
@@ -308,6 +309,7 @@ TEST_CASE_METHOD(ParquetFilesFixture,
     }
   }
   CHECK(merged_statistics_cache_size() <= merged_statistics_cache_capacity);
+  CHECK(row_count_cache_size() <= merged_statistics_cache_capacity);
 }
 
 namespace {

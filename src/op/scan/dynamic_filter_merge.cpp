@@ -600,7 +600,8 @@ std::unique_ptr<application_program_state> prepare_state(
   // A fused or gathered-once probe runs on every row, so a filter that removes a negligible share
   // of the batch does not repay it, however selective it is on the rows earlier filters kept. Judge
   // each filter by the publisher's estimate, after the stronger ones, so the first batch need not
-  // learn it.
+  // learn it. The combined sample then covers only the filters that stay, which could read as a
+  // channel that removes nothing, so a batch that skips one records no combined sample.
   {
     std::vector<selected_step> kept;
     for (auto const& step : program->membership) {
@@ -613,6 +614,7 @@ std::unique_ptr<application_program_state> prepare_state(
       }
       if (step.estimated_selectivity && survival < 1.0 &&
           survival * (1.0 - *step.estimated_selectivity) < k_negligible_removed_share) {
+        program->sample_combined = false;
         continue;
       }
       kept.push_back(step);

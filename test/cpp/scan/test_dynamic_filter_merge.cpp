@@ -1987,6 +1987,7 @@ TEST_CASE("a filter's static keep estimate lets a later filter that removes litt
   auto filters = std::make_shared<sirius_dynamic_filter_set>();
   dynamic_filter_consumer consumer(
     filters, {.mode = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS}, {});
+  auto& gate    = consumer_test_access::gate(consumer);
   auto producer = filters->register_producer({0, 1});
   REQUIRE(producer.push_filter(0, first));
   REQUIRE(producer.push_filter(1, second));
@@ -2002,6 +2003,11 @@ TEST_CASE("a filter's static keep estimate lets a later filter that removes litt
   stream.sync();
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 10);
+
+  // The batch applied only the first filter, so it must not stand as the channel's combined sample:
+  // a partial sample that keeps every row could disable a channel whose skipped filter was never
+  // tested.
+  CHECK(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
 }
 
 TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",

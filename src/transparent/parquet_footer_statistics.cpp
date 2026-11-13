@@ -112,7 +112,8 @@ std::mutex cache_mutex;
 std::unordered_map<std::string, cache_entry> cache;
 
 /// Total rows of the files of each scan add_statistics last covered, keyed like the merged
-/// statistics. Rewritten by every query that plans the scan, so a changed file shows up next time.
+/// statistics and bounded like them. Rewritten by every query that plans the scan, so a changed
+/// file shows up next time.
 std::mutex row_count_mutex;
 std::unordered_map<std::string, std::size_t> row_counts;
 
@@ -367,7 +368,12 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   }
   {
     std::lock_guard guard(row_count_mutex);
-    row_counts[merge_cache_key(get)] = total_rows;
+    auto const key = merge_cache_key(get);
+    if (!row_counts.contains(key) &&
+        row_counts.size() >= detail::merged_statistics_cache_capacity) {
+      row_counts.erase(row_counts.begin());
+    }
+    row_counts[key] = total_rows;
   }
   if (single_file) { return false; }
   auto const merge_key        = merge_cache_key(get);
@@ -435,6 +441,12 @@ std::size_t detail::merged_statistics_cache_size()
 {
   std::lock_guard guard(merge_mutex);
   return merges.size();
+}
+
+std::size_t detail::row_count_cache_size()
+{
+  std::lock_guard guard(row_count_mutex);
+  return row_counts.size();
 }
 
 }  // namespace sirius::transparent

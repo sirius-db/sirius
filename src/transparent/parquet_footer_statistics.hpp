@@ -67,6 +67,8 @@ namespace detail {
 inline constexpr std::size_t merged_statistics_cache_capacity = 128;
 /// The number of scans whose merged statistics are cached, for tests.
 std::size_t merged_statistics_cache_size();
+/// The number of scans whose row counts are cached, for tests. Bounded like the merged statistics.
+std::size_t row_count_cache_size();
 }  // namespace detail
 
 }  // namespace sirius::transparent
