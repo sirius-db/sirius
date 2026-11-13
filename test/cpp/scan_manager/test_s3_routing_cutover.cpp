@@ -280,12 +280,14 @@ class range_s3_server {
   ~range_s3_server()
   {
     _stop.store(true);
+    // Shutting the listener down wakes a blocked accept(). accept_loop() still reads
+    // _listen_fd until it sees _stop, so close and invalidate it only after the join.
+    if (_listen_fd >= 0) { ::shutdown(_listen_fd, SHUT_RDWR); }
+    if (_thread.joinable()) { _thread.join(); }
     if (_listen_fd >= 0) {
-      ::shutdown(_listen_fd, SHUT_RDWR);
       ::close(_listen_fd);
       _listen_fd = -1;
     }
-    if (_thread.joinable()) { _thread.join(); }
     {
       // Wake keep-alive connection threads blocked waiting for a next request.
       std::lock_guard lock{_connections_mutex};
